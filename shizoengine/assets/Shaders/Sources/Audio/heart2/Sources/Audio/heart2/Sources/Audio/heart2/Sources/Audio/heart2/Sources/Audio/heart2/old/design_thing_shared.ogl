@@ -1,0 +1,53 @@
+#define PI 3.14
+#define TWO_PI 6.28
+
+#define TIMESCALE 0.5
+
+#define BLUR_STRENGTH 2.0
+#define BLUR_RANGE 2.7
+
+#define UI_COLOR vec4(0.5, 0.8, 1.0, 1.0)
+
+float hash12(vec2 x)
+{
+ 	return fract(sin(dot(x, vec2(43.5287, 41.12871))) * 523.582);   
+}
+
+vec2 hash21(float x)
+{
+ 	return fract(sin(x * vec2(24.0181, 52.1984)) * 5081.4972);   
+}
+
+float hash11(float x)
+{
+ 	return fract(sin(x * 42.146291) * 4215.4827);   
+}
+
+vec2 hash22(vec2 x)
+{
+ 	return fract(sin(x * mat2x2(24.4372, 12.47864, 32.3874, 29.4873)) * 4762.832);  
+}
+
+mat2x2 rotationMatrix(in float angle)
+{
+ 	return mat2x2(-cos(angle), sin(angle), -sin(angle), -cos(angle));   
+}
+
+//Blur function
+vec4 blur(in sampler2D sampler, in vec2 fragCoord, in vec2 resolution)
+{
+    vec2 uv = fragCoord / resolution;
+    float blurStrength = distance(uv, vec2(0.5));
+    blurStrength = pow(blurStrength, BLUR_RANGE) * (resolution.x / 100.0) * BLUR_STRENGTH;
+    vec4 sum = vec4(0.0);
+    vec2 pixelSize = vec2(1.0) / resolution;
+	for (float x = -1.0; x <= 1.0; x += 1.0)
+    {
+     	for (float y = -1.0; y <= 1.0; y += 1.0)
+        {
+            sum += texture(sampler, uv + vec2(x, y) * pixelSize * blurStrength);
+        }
+    }
+
+    return sum / 9.0;
+}
