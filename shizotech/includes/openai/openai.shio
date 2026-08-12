@@ -1,0 +1,1077 @@
+
+#include "loop_detect"
+#include "simple_json"
+
+import curl;
+
+class openai_stream
+{
+	managed stream_curl = None;
+	
+	api_url = "";
+	auth_token = "none";
+	stream_reasoning = "";
+	stream_content = "";
+	stream_text = "";
+	stream_raw = "";
+	repetition_check = 0;
+	
+	last_usage = None;
+	
+	__init__(
+		api_url, 
+		auth_token = "none"
+	) {
+		this.api_url = api_url;
+		this.auth_token = auth_token;
+	}
+	
+	__deinit__() {
+		if(stream_curl)
+			std.free(stream_curl);
+		
+		try {
+			if(last_usage ?? false) {
+				token_usage_global = std.global("_global_token_usage");
+				
+				if(!token_usage_global["usage"].prompt_tokens) token_usage_global["usage"].prompt_tokens = 0;
+				if(!token_usage_global["usage"].completion_tokens) token_usage_global["usage"].completion_tokens = 0;
+				if(!token_usage_global["usage"].total_tokens) token_usage_global["usage"].total_tokens = 0;
+				
+				token_usage_global["usage"].prompt_tokens += last_usage.prompt_tokens;
+				token_usage_global["usage"].completion_tokens += last_usage.completion_tokens;
+				token_usage_global["usage"].total_tokens += last_usage.total_tokens;
+			}
+		}
+		catch(e) {}
+	}
+	
+	start(sub_url, &body)
+	{
+		try {
+			if(last_usage ?? false) {
+				token_usage_global = std.global("_global_token_usage");
+				
+				if(!token_usage_global["usage"].prompt_tokens) token_usage_global["usage"].prompt_tokens = 0;
+				if(!token_usage_global["usage"].completion_tokens) token_usage_global["usage"].completion_tokens = 0;
+				if(!token_usage_global["usage"].total_tokens) token_usage_global["usage"].total_tokens = 0;
+				
+				token_usage_global["usage"].prompt_tokens += last_usage.prompt_tokens;
+				token_usage_global["usage"].completion_tokens += last_usage.completion_tokens;
+				token_usage_global["usage"].total_tokens += last_usage.total_tokens;
+				
+				last_usage = None;
+			}
+		}
+		catch(e) {}
+		
+		//_body = *body;
+	
+		headers = [
+		  "Content-Type" = "application/json",
+		  "Authorization" = "Bearer " + auth_token,
+		];
+		
+		stream_reasoning = "";
+		stream_content = "";
+		stream_text = "";
+		stream_raw = "";
+		repetition_check = 0;
+		
+		_chunked_stream = "";
+		
+		stream_curl = curl.curl();
+		
+		if(body.stream)
+			body.stream_options.include_usage = true;
+			body.stream_options.continuous_usage_stats = true;
+		
+		stream_curl.start_stream("POST", api_url + sub_url, body, headers, 0);
+	}
+	
+	poll()
+	{
+		if(!stream_curl)
+			std.error("No stream!");
+			return None;
+		
+		if(_stop_stream)
+			return None;
+		
+		raw_chunk = "";
+		
+		for(1) {
+			if(_stop_stream)
+				return None;
+			
+			temp_chunk = stream_curl.poll_stream();
+			if(!temp_chunk) {
+				if(_chunked_stream.empty()) //Still process rest of buffer...
+					return None;
+				break;
+			}
+			
+			_chunked_stream += std.string(temp_chunk);
+			//Check for SSE event end \n
+			if(_chunked_stream.contains("\n"))
+				break;
+		}
+		
+		if(_stop_stream)
+			return None;
+		
+		endline_index = _chunked_stream.find("\n");
+		if(endline_index >= 0) {
+			raw_chunk = _chunked_stream.substr(0, endline_index);
+			_chunked_stream = _chunked_stream.substr(endline_index).ltrim();
+		}
+		else {
+			raw_chunk = _chunked_stream;
+			_chunked_stream = "";
+		}
+
+		if(raw_chunk.empty())
+			//std.error("Cannot get raw chunk.");
+			return None;
+
+		stream_raw += raw_chunk;
+		
+		_last_raw = raw_chunk;
+		
+		raw_chunk = raw_chunk.removeprefix("data: ");
+		
+		if(raw_chunk.starts("[DONE]"))
+			return None;
+		
+		chunk = std.json(raw_chunk, true);
+
+		if(!chunk)
+			std.error("Chunk error (1): ", std.string(raw_chunk));
+			//std.print(_body.messages);
+			return None;
+		
+		if(chunk.error ?? false)
+		{
+			std.error("Chunk error (2): ", chunk.error.message);
+			//std.print(_body.messages);
+			return None;
+		}
+		
+		check_reasoning = false;
+		check_content = false;
+		
+		if(chunk.choices ?? false)
+		{		
+			if(std.is_json(chunk.choices) && chunk.choices.size() >= 1)
+			{
+				if(chunk.choices[0].delta.reasoning_content)
+					stream_reasoning += chunk.choices[0].delta.reasoning_content;
+					check_reasoning = true;
+				if(chunk.choices[0].delta.reasoning) // ??? idk when they changed that
+					stream_reasoning += chunk.choices[0].delta.reasoning;
+					check_reasoning = true;
+				if(chunk.choices[0].delta.content)
+					stream_content += chunk.choices[0].delta.content;
+					check_content = true;
+				if(chunk.choices[0].text)
+					stream_text += chunk.choices[0].text;
+			}
+			else {
+				std.error("Chunk error (3): ", chunk.error.message);
+				//std.print(_body.messages);
+				return None;
+			}
+		}
+
+		last_usage = chunk.usage;
+
+		length_per_step = 10;
+		
+		max_repeat = repetition_check == 0 ? 1000 : 50; 
+		
+		if(check_reasoning) {
+			if(loop_detect(
+				stream_reasoning, 
+				repetition_check * length_per_step, 
+				(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
+			) {
+				std.error("Endless repetition check triggered.");
+				stop();
+				return None;
+			}
+		}
+		
+		if(check_content) {
+			if(loop_detect(
+				stream_content, 
+				repetition_check * length_per_step, 
+				(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
+			) {
+				std.error("Endless repetition check triggered.");
+				stop();
+				return None;
+			}
+		}
+		
+		if(check_reasoning || check_content)
+			repetition_check++;
+		
+		if(repetition_check >= 10)
+			repetition_check = 0;
+		
+		return chunk;
+	}
+	
+	answer()
+	{
+		for(poll()) {}
+
+		if(_stop_stream)
+			return None;
+		
+		return [reasoning=stream_reasoning, content=stream_content, text=stream_text, raw=stream_raw];
+	}
+	
+	stop()
+	{
+		_stop_stream = true;
+		if(stream_curl)
+			stream_curl.stop_stream();
+	}
+	
+	_chunked_stream = "";
+	
+	//For debugging
+	_last_raw = None;
+	//_body = None;
+	_stop_stream = false;
+}
+
+class toolset
+{
+	tools = None;
+	tool_callbacks = None;
+	
+	add_tool(
+		name,
+		description,
+		parameters,
+		callback
+	){
+		//Check if it already exist and if so, overwrite silently
+		found_tool = false;
+		for(i = 0; i < tools.size(); i++)
+		{
+			if(tools[i].function.name == name) {
+				tools[i] = [
+					type = "function",
+					function = [
+						name = name,
+						description = description ?? "",
+						parameters = simple_json(parameters),
+					]
+				];
+				found_tool = true;
+				break;
+			}
+		}
+		
+		if(!found_tool) {
+			tools.push_back([
+				type = "function",
+				function = [
+					name = name,
+					description = description ?? "",
+					parameters = simple_json(parameters),
+				]
+			]);
+		}
+		
+		tool_callbacks[name] = callback;
+	}
+
+	find_tool(name) {
+		for(i = 0; i < tools.size(); i++)
+		{
+			if(tools[i].function.name == name) {
+				return tools[i].function;
+			}
+		}
+		
+		return None;
+	}
+}
+
+class openai_api
+{
+	managed stream = None;
+
+	body = [stream=true, reasoning_effort="medium"];
+	ts = None;
+	
+	on_reason = None;
+	on_text = None;
+	on_tool = None;
+	
+	pre_answer = "";
+	
+	__init__(
+		api_url, 
+		model = None,
+		sys_prompt = None,
+		auth_token = "none"
+	) {
+		stream = openai_stream(api_url, auth_token);
+		if(model)
+			body.model = model;
+		if(sys_prompt) {
+			system_prompt(sys_prompt);
+		}
+	}
+	
+	__deinit__() {
+		std.free(stream);
+	}
+	
+	system_prompt(prompt)
+	{
+		prompt = prompt.rstrip_lines();
+		
+		if(body.messages.size() == 0) {
+			body.messages.push_back(
+				["role" = "system", "content" = prompt]
+			);
+		}
+		else(body.messages[0].role != "system") {
+			body.messages.insert(0,
+				["role" = "system", "content" = prompt]
+			);
+		}
+		else {
+			body.messages[0].content = prompt;
+		}
+	}
+	
+	set_tools(_toolset) {
+		if(std.is_class(_toolset, toolset))
+			ts = _toolset;
+			body.tools = ts.tools; //Dont copy json, can edit in toolset directly without updating body
+	}
+	
+	add_image_url(img_url) {
+		if(body.messages && body.messages[-1].role == "user") {
+			body.messages[-1].content.push_back([
+				type="image_url",
+				image_url=[url=img_url]
+			]);
+		}
+		else {
+			body.messages.push_back(
+				["role" = "user", "content" = [
+						[
+							type="text",
+							text=""
+						],
+						[
+							type="image_url",
+							image_url=[url=img_url]
+						]
+					]
+				]);
+		}
+	}
+	
+	add_image_raw(raw_image_data, img_type = "png") {
+		add_image_url("data:image/"+img_type+";base64,"+std.base64_encode(raw_image_data));
+	}
+	
+	add_image(path) {
+		ext = fileio.file_ext(path);
+		add_image_raw(fileio.read_file(path), ext);
+	}
+	
+	ask(prompt)
+	{
+		if(_force_stop)
+			return None;
+		
+		prompt = prompt.rstrip_lines();
+		
+		if(body.messages && body.messages[-1].role == "user") {
+			body.messages[-1].content[0].text = prompt;
+		}
+		else {
+			body.messages.push_back(
+				["role" = "user", "content" = prompt]
+			);
+		}
+		
+		//First, get token count
+		token_count_info = token_count_body(body);
+		current_tokens = token_count_info.tokens;
+		max_total_tokens = token_count_info.max_tokens;
+		
+		if(max_total_tokens == 0)
+			std.error("Cannot get max tokens!");
+			body.messages.push_back(
+				["role" = "assistant", "content" = pre_answer]
+			);
+			return None;
+		
+		//Truncate history if necessary
+		//Only triggers after half the context is overshoot, but reduces it to 1/3 so it doesnt instantly trigger again...
+		max_iter = 100;
+		if(current_tokens > max_total_tokens/2) {
+			for(current_tokens > max_total_tokens/3 &&
+				body.messages.size() > 1 && max_iter)
+			{
+				std.warn("Truncating history...");
+				if(body.messages[0].role == "system")
+				{
+					body.messages.remove(1);
+					for(body.messages[1].role != "user")
+						body.messages.remove(1);
+				}
+				else
+				{
+					body.messages.remove(0);
+					for(body.messages[0].role != "user")
+						body.messages.remove(0);
+				}
+				
+				token_count_info = token_count_body(body);
+				current_tokens = token_count_info.tokens;
+
+				max_iter--;
+			}
+		}
+		
+		if(max_iter == 0 || body.messages.size() == 0 || (body.messages.size() == 1 && body.messages[0].role != "user"))
+			std.error("Prompt too long.");
+			return None;
+		
+		has_preanswer = false;
+		
+		if(pre_answer)
+		{
+			has_preanswer = true;
+			body.add_generation_prompt = false;
+			body.continue_final_message = true;
+			body.messages.push_back(
+					["role" = "assistant", "content" = pre_answer]
+				);
+		}
+		else
+		{
+			has_preanswer = false;
+			body.add_generation_prompt = true;
+			body.continue_final_message = false;
+		}
+		
+		pre_answer = "";
+		
+		body.stream = true;
+		stream.start("/v1/chat/completions", body);
+		
+		for (chunk = stream.poll()) {
+			if(!chunk.choices)
+				break;
+			delta = &chunk.choices[0].delta;
+			if(delta.reasoning_content && std.is_function(on_reason))
+				on_reason(delta.reasoning_content);
+			else if(delta.reasoning && std.is_function(on_reason))
+				on_reason(delta.reasoning);
+			if(delta.content && std.is_function(on_text))
+				on_text(delta.content);
+			
+			if(_force_stop)
+				break;
+		}
+		
+		answer_content = stream.answer();
+		
+		if(has_preanswer) {
+			body.messages[-1].content += answer_content.content;
+		}
+		else {
+			body.messages.push_back(
+					["role" = "assistant", "content" = answer_content.content]
+				);
+		}
+		
+		if(answer_content.reasoning)
+			body.messages[-1].reasoning_content = answer_content.reasoning;
+		
+		return answer_content.content;
+	}
+
+	task(prompt, _toolset = None)
+	{	
+		_force_stop = false;
+		
+		if(std.is_string(prompt))
+			prompt = prompt.rstrip_lines();
+	
+		set_tools(_toolset);
+		
+		if(body.messages && body.messages[-1].role == "user") {
+			body.messages[-1].content[0].text = prompt;
+		}
+		else {
+			body.messages.push_back(
+				["role" = "user", "content" = prompt]
+			);
+		}
+		
+		//First, get token count
+		token_count_info = token_count_body(body);
+		current_tokens = token_count_info.tokens;
+		max_total_tokens = token_count_info.max_tokens;
+		
+		if(max_total_tokens == 0)
+			std.error("Cannot get max tokens!");
+			std.print(body.tools);
+			std.print(_toolset.tools);
+			body.messages.push_back(
+				["role" = "assistant", "content" = pre_answer]
+			);
+			return None;
+		
+		//Truncate history if necessary
+		//Only triggers after half the context is overshoot, but reduces it to 1/3 so it doesnt instantly trigger again...
+		max_iter = 100;
+		if(current_tokens > max_total_tokens/2) {
+			for(current_tokens > max_total_tokens/3 &&
+				body.messages.size() > 1 && max_iter)
+			{
+				std.warn("Truncating history...");
+				if(body.messages[0].role == "system")
+				{
+					body.messages.remove(1);
+					for(body.messages[1].role != "user")
+						body.messages.remove(1);
+				}
+				else
+				{
+					body.messages.remove(0);
+					for(body.messages[0].role != "user")
+						body.messages.remove(0);
+				}
+				
+				token_count_info = token_count_body(body);
+				current_tokens = token_count_info.tokens;
+
+				max_iter--;
+			}
+		}
+		
+		if(max_iter == 0 || body.messages.size() == 0 || (body.messages.size() == 1 && body.messages[0].role != "user"))
+			std.error("Prompt too long.");
+			return None;
+		
+		has_preanswer = false;
+		
+		if(pre_answer)
+		{
+			has_preanswer = true;
+			body.add_generation_prompt = false;
+			body.continue_final_message = true;
+			body.messages.push_back(
+					["role" = "assistant", "content" = pre_answer]
+				);
+		}
+		else
+		{
+			has_preanswer = false;
+			body.add_generation_prompt = true;
+			body.continue_final_message = false;
+		}
+			
+		pre_answer = "";
+		
+		body.stream = true;
+		stream.start("/v1/chat/completions", body);
+		
+		parallel_tool_calls = std.json();
+		
+		streamed_response = "";
+		
+		for (chunk = stream.poll()) {
+		
+			if(!chunk)
+				std.print("streaming error!");
+				continue;
+		
+			if(!chunk.choices)
+				break;
+		
+			delta = None;
+		
+			//Sometimes weird things happen...
+			try {
+				delta = &chunk.choices[0].delta;
+			}
+			catch(e) {
+				std.print("Catched streaming error.\n");
+				std.print(stream._last_raw);
+				//std.input();
+				continue;
+			}
+			
+			finish_reason = chunk.choices[0].finish_reason ?? "";
+			streamed_response += delta.content ?? "";
+			
+			if(delta.reasoning_content && std.is_function(on_reason))
+				on_reason(delta.reasoning_content);
+			else if(delta.reasoning && std.is_function(on_reason))
+				on_reason(delta.reasoning);
+			if(delta.content && std.is_function(on_text))
+				on_text(delta.content);
+					
+			if(delta.tool_calls)
+			{	
+				if(parallel_tool_calls.size() < delta.tool_calls.size())
+				{
+					parallel_tool_calls.push_back([
+						calls = None
+					]);
+				}
+
+				for(i = 0; i < delta.tool_calls.size(); i++)
+				{
+					tool_call = &delta.tool_calls[i];
+					
+					if(!tool_call.function)
+						continue;
+					
+					calls = &parallel_tool_calls[i].calls;
+					
+					if(tool_call.index >= calls.size())
+					{
+						calls.push_back([
+							name="", 
+							arguments="",
+						]);
+					}
+					
+					last_call = &calls[calls.size()-1];
+					
+					if(delta.tool_calls[i].id ?? false)
+						last_call.id = tool_call.id;
+					
+					last_call.name += tool_call.function.name ?? "";
+					last_call.arguments += tool_call.function.arguments ?? "";
+				}
+				
+				if(!finish_reason)
+					continue;
+			}
+			
+			if(parallel_tool_calls.size() || finish_reason == "tool_calls")
+			{
+				assistant_tool_calls = [];
+				tool_results = [];
+				
+				for(i = 0; i < parallel_tool_calls.size(); i++)
+				{	
+					tool_wait = [];
+
+					for(j = 0; j < parallel_tool_calls[i].calls.size(); j++)
+					{
+						tool_name = parallel_tool_calls[i].calls[j].name;
+						tool_arguments = std.json(parallel_tool_calls[i].calls[j].arguments);
+						tool_callid = parallel_tool_calls[i].calls[j].id;
+						
+						if(!tool_name)
+							continue;
+						
+						//Call tools, restart stream.
+						if(std.is_function(on_tool))
+							on_tool(tool_name, tool_arguments);
+					
+						tool_results.push_back([
+							result = "",
+							id = tool_callid,
+						]);
+						
+						assistant_tool_calls.push_back([
+							id = std.string(tool_callid),
+							type = "function",
+							function = [
+								name = std.string(tool_name),
+								arguments = std.string(tool_arguments),
+							]
+						]);
+						
+						tool_result_index = tool_results.size() - 1;
+						
+						tool_thread_fn = [this, &tool_results, tool_name, tool_arguments, tool_result_index]() {
+							
+							tool_result = None;
+						
+							try {
+								if(this.ts.tool_callbacks.has(tool_name)) {
+									tool_result = this.ts.tool_callbacks[tool_name](tool_arguments);
+								}
+								else
+								{
+									tool_result = [
+										error = "The tool you tried to call does not exist.",
+										available_tools = this.ts.tools,
+									];
+								}
+							}
+							catch(e) {
+								//std.error("Tool error: ", e);
+								if(this.ts.tool_callbacks.has(tool_name))
+									tool_result = "The tool encountered an unexpected error.\nMaybe check your arguments and try again.\nTool definition:\n" + this.ts.find_tool(tool_name);
+								else
+								{
+									tool_result = [
+										error = "The tool you tried to call does not exist.",
+										available_tools = this.ts.tools,
+									];
+								}
+							}
+							
+							if(!tool_result)
+								tool_result = "";
+						
+							tool_results[tool_result_index].result = std.string(tool_result);
+						};
+						
+						tool_thread = std.thread(tool_thread_fn);
+						tool_wait.push_back(tool_thread);	
+						tool_thread.run();
+					}
+				
+					for(j = 0; j < tool_wait.size(); j++) {
+						tool_wait[j].join();
+					}
+				}
+				
+				if(has_preanswer) {
+					body.messages[-1].content += streamed_response;
+				}
+				else {
+					body.messages.push_back(
+						["role" = "assistant", "content" = streamed_response]
+					);
+				}
+				
+				if(assistant_tool_calls) {					
+					body.messages[-1].tool_calls = assistant_tool_calls;
+				}
+				
+				for(i = 0; i < tool_results.size(); i++)
+				{
+					body.messages.push_back(
+						[role = "tool", tool_call_id = tool_results[i].id, content = tool_results[i].result]
+					);
+				}
+				
+				parallel_tool_calls = std.json();	
+				streamed_response = "";
+				
+				//If any toolcall set a custom pre_answer.. handle that here
+				if(pre_answer)
+				{
+					has_preanswer = true;
+					body.add_generation_prompt = false;
+					body.continue_final_message = true;
+					body.messages.push_back(
+							["role" = "assistant", "content" = pre_answer]
+						);
+				}
+				else
+				{
+					has_preanswer = false;
+					body.add_generation_prompt = true;
+					body.continue_final_message = false;
+				}
+				
+				if(_force_stop)
+					break;
+				
+				pre_answer = "";
+				
+				body.stream = true;
+				stream.start("/v1/chat/completions", body);
+				
+				continue;
+			}
+		
+			if(_force_stop)
+				break;
+		}
+
+		if(has_preanswer) {
+			body.messages[-1].content += streamed_response;
+		}
+		else(streamed_response) {
+			body.messages.push_back(
+				["role" = "assistant", "content" = streamed_response]
+			);
+		}
+		
+		answer_content = stream.answer();
+			
+		if(answer_content.reasoning)
+			body.messages[-1].reasoning_content = answer_content.reasoning;
+		
+		return answer_content.content;
+		
+	}
+
+	get_json(prompt, schema)
+	{
+		prompt = prompt.rstrip_lines();
+	
+		json_schema = simple_json(schema);
+	
+		prompt = prompt + "\n\n" + schema_to_prompt(json_schema);
+		
+		body.messages.push_back(
+			["role" = "user", "content" = prompt]
+		);
+		
+		// First, get token count
+		token_count_info = token_count_body(body);
+		current_tokens = token_count_info.tokens;
+		max_total_tokens = token_count_info.max_tokens;
+		
+		// Truncate history if necessary
+		for(current_tokens > max_total_tokens/2 &&
+			body.messages.size() > 1)
+		{
+			if(body.messages[0].role == "system")
+			{
+				body.messages.remove(1);
+				for(body.messages[1].role != "user")
+					body.messages.remove(1);
+			}
+			else
+			{
+				body.messages.remove(0);
+				for(body.messages[0].role != "user")
+					body.messages.remove(0);
+			}
+		}
+		
+		// Try up to 2 times without structured output
+		temperature = 0.0;
+		old_temperature = body.temperature;
+		
+		for(max_cc = 2; max_cc > 0; max_cc--)
+		{
+			body.temperature = temperature;
+			body.stream = false;
+			stream.start("/v1/chat/completions", body);
+			answer = stream.answer();
+			
+			if(temperature < 1.0)
+				temperature += 0.5;
+			if(temperature > 1.0)
+				temperature = 1.0;
+			
+			result_json = std.json(answer.content);
+			invalid_json = 0;
+			
+			if(!result_json)
+				invalid_json = 1;
+			
+			if(!invalid_json)
+			{
+				test_props = &json_schema.properties;
+				test_required = &json_schema.required;
+				
+				for(i = 0; i < test_required.size(); i++)
+				{
+					test_key = test_required[i];
+					
+					if(!result_json.has(test_key))
+					{
+						invalid_json = 1;
+						break;
+					}
+					
+					prop = &test_props[test_key];
+					
+					if(prop.enum ?? false)
+					{
+						invalid_enum = 1;
+						for(j = 0; j < prop.enum.size(); j++)
+						{
+							if(result_json[test_key] == prop.enum[j])
+							{
+								invalid_enum = 0;
+								break;
+							}
+						}
+						if(invalid_enum)
+						{
+							invalid_json = 1;
+							break;
+						}
+					}
+					else(prop.type == "string")
+					{
+						result_json[test_key] = std.string(result_json[test_key]);
+					}
+					else(prop.type == "integer")
+					{
+						result_json[test_key] = std.int(result_json[test_key]);
+						if(prop.minimum ?? false && result_json[test_key] < prop.minimum)
+							result_json[test_key] = prop.minimum;
+						if(prop.maximum ?? false && result_json[test_key] > prop.maximum)
+							result_json[test_key] = prop.maximum;
+					}
+				}
+			}
+			
+			if(!invalid_json)
+			{
+				body.messages.push_back(
+					["role" = "assistant", "content" = answer.content]
+				);
+				body.temperature = old_temperature;
+				return result_json;
+			}
+			
+			std.print("\n\nInvalid json detected!\n\n");
+			std.print(answer);
+		}
+		
+		std.print("Using structured...");
+		
+		// Fallback to structured output
+		body.response_format = [
+			type = "json_schema",
+			json_schema = [
+				name = "schema",
+				schema = json_schema,
+			]
+		];
+		
+		body.stream = false;
+		stream.start("/v1/chat/completions", body);
+		answer = stream.answer();
+		
+		result_json = std.json(answer.content);
+		
+		body.messages.push_back(
+			["role" = "assistant", "content" = answer.content]
+		);
+		
+		body.remove("response_format");
+		
+		body.temperature = old_temperature;
+		
+		return result_json;
+	}
+
+	token_count_body(_body) {
+		_body.stream = false;
+		_body.include_usage = true;
+		_body.stream_options.include_usage = true;
+		_body.stream_options.continuous_usage_stats = true;
+		
+		stream.start("/tokenize", _body);
+		token_count_info = stream.poll();
+		res = stream.answer();
+		
+		if(!token_count_info.max_model_len) {
+			
+			std.warn("non vLLM endpoint without /tokenize ... using default 128k.");
+			
+			//Not vllm, use alternative approach and fixed context size for now
+			_body.stream = true;
+			stream.start("/v1/chat/completions", _body);
+			token_count_info = stream.poll();
+			stream.stop();
+			res = stream.answer();
+			
+			return [
+				tokens = token_count_info.usage.prompt_tokens,
+				max_tokens = 128000,
+			];
+		}
+		
+		return [
+			tokens = token_count_info.count,
+			max_tokens = token_count_info.max_model_len,
+		];
+	}
+
+	schema_to_prompt(schema)
+	{
+		txt = "Answer ONLY in valid JSON. Do not include explanations.\n";
+		txt += "The JSON must follow this structure:\n";
+
+		props = schema.properties;
+		req = schema.required;
+
+		for(i = 0; i < req.size(); i++)
+		{
+			key = req[i];
+			prop = props[key];
+
+			txt += "- \"" + key + "\": ";
+
+			if(prop.type)
+				txt += prop.type;
+
+			if(prop.enum ?? false)
+			{
+				txt += " (one of: ";
+				for(j = 0; j < prop.enum.size(); j++)
+				{
+					txt += "\"" + prop.enum[j] + "\"";
+					if(j+1 < prop.enum.size())
+						txt += ", ";
+				}
+				txt += ")";
+			}
+
+			if(prop.minimum ?? false || prop.maximum ?? false)
+			{
+				txt += " (";
+				if(prop.minimum ?? false)
+					txt += "min=" + prop.minimum;
+				if(prop.maximum ?? false)
+					txt += ", max=" + prop.maximum;
+				txt += ")";
+			}
+
+			if(prop.description ?? false)
+				txt += " — " + prop.description;
+
+			txt += "\n";
+		}
+
+		txt += "Return ONLY the JSON object.\n";
+
+		return txt;
+	}
+
+	set_temperature(temp)
+	{
+		body.temperature = temp;
+	}
+
+	clear()
+	{
+		for(body.messages.size() > 1) {
+			body.messages.erase(1); //Dont delete system prompt
+		}
+	}
+	
+	stop() {
+		_force_stop = true;
+		stream.stop();
+	}
+	
+	streamed_response = "";
+	_force_stop = false;
+}
+

@@ -1,0 +1,833 @@
+// ════════════════════════════════════════════
+//  Dashboard API Backend
+// ════════════════════════════════════════════
+// This module provides RESTful API endpoints for:
+// - Features Module (feature tracker)
+// - Bugs Module (bug tracker)
+// - History Module (action history)
+// - Settings Module (dashboard settings)
+// - Work Mode Module (agent activity control)
+// - Expert Groups Module (group chat functionality)
+//
+// All endpoints follow a common response format:
+// {
+//   "ok": true/false,
+//   "data": {...},  // Optional: response data
+//   "error": "..."  // Optional: error message
+// }
+//
+// Polling Strategy:
+// - Initial load: Frontend fetches all entries once
+// - Regular updates: Frontend polls every 2 seconds for updates
+// - Backend manages all data (AI agents add/remove/update entries)
+// - No human controls except initial creation/direct examination
+
+//Start webserver
+server = webserver.http_server(13337);
+server.static("", __DIR__ + "/web");
+
+// Initialize LevelDB for dashboard data persistence
+features_db = leveldb.db(agent_space + "dashboard/features.db");
+bugs_db = leveldb.db(agent_space + "dashboard/bugs.db");
+history_db = leveldb.db(agent_space + "dashboard/history.db");
+settings_db = leveldb.db(agent_space + "dashboard/settings.db");
+
+// Helper function to format API response
+format_api_response(ok, data = None, error = "") {
+    response = [ok = ok];
+    
+    if(ok && data)
+        response.data = data;
+    
+    if(!ok && error)
+        response.error = error;
+    
+    return std.string(response);
+}
+
+// Helper function to parse JSON from request body
+parse_request_body(body) {
+    try {
+        json = std.json(body);
+        // Check if JSON object is empty (size == 0)
+        if(json.size && json.size() == 0)
+            return None;
+        return json;
+    }
+    catch(e) {
+        return None;
+    }
+}
+
+// Helper function to get default settings
+get_default_settings() {
+    return [
+        maxActiveAgents = 5,
+        checkInterval = 5000
+    ];
+}
+
+// Helper function to get default work mode
+get_default_workmode() {
+    return [enabled = false];
+}
+
+// ════════════════════════════════════════════
+//  Background feature / bugs worker thread
+// ════════════════════════════════════════════
+
+workmode_step() {
+	std.print("workmode step!");
+	//std.input();
+
+	check_plan = "";
+	if(fileio.exists(".plan")) {
+		std.print("Unfinished plan!");
+		if(features_db.has(fileio.read_string(".plan/feature_id")))
+			check_plan = fileio.read_string(".plan/feature_id");
+		else
+			fileio.remove(".plan");
+	}
+
+	try {
+		managed iter = features_db.iter();
+
+		for(iter.valid()) {
+			key = iter.key();
+			if(!key)
+				break;
+			if(check_plan && key != check_plan)
+				continue;
+			check_plan = "";
+			
+			feature = iter.value();
+			if(!feature.status)
+				feature.status = "planned";
+			
+			if(feature.status == "planned") {
+				//First, initialize the workspace for this feature (.plan folder)
+				fileio.write_string(".plan/feature_id", key);
+				fileio.write_string(".plan/goal.md", feature.plan);
+				fileio.write_string(".plan/state.md", "# Initial state");
+				fileio.write_string(".plan/task_board.md", "# Tasks and todo's");
+				fileio.write_string(".plan/handover.md", "# Important notices to future agents");
+				fileio.write_string(".plan/failures.md", "# No failures reported yet");
+				fileio.write_string(".plan/activity.log", "# No activity yet");
+				
+				feature.status = "running";
+			}
+			
+			if(feature.status == "running") {
+				features_db.put(key, feature);
+				
+				new_agent = miniagent(cfg.api, None, "feature_agent", cfg.token);
+				new_agent.env.on_progress = [key](progress, summary) {
+					feature = features_db.get(key);
+					feature.progress = progress;
+					feature.description = summary;
+					features_db.put(key, feature);
+					std.print(summary);
+				};
+				
+				try {
+					for(!new_agent.env.plan_finished) {
+						res = new_agent.single_task(std.string(feature));
+						std.print("RESULT:\n\n"+res);
+						if(!res)
+							break;
+					}
+				}
+				catch(e) {
+					
+				}
+				
+				feature = features_db.get(key);
+				
+				feature.progress = 100;
+				feature.status = new_agent.env.plan_failed ? "error" : "success";
+				features_db.put(key, feature);
+				
+				//fileio.remove(".plan");
+			}
+			
+			//std.print(feature);
+			
+			//Does not return the key, but true/false
+			iter.next();
+		}
+	}
+	catch(e) {}
+}
+
+workmode_thread() {
+	for(1) {
+		
+		if(settings_db.exists("settings") && settings_db.get("settings").workmode.enabled == "true") {
+			try {
+				workmode_step();
+			}
+			catch(e) {
+				
+			}
+		}
+		
+		std.sleep(1000 * 5);
+	}
+}
+
+std.thread(workmode_thread).run();
+
+// ════════════════════════════════════════════
+//  Planner Chat API Endpoints
+// ════════════════════════════════════════════
+
+running_agents = [];
+
+conversations = leveldb.db(std.config_path("miniagent", "convdb"));
+
+//PRIVATE ADMIN AGENT
+server.route("POST", "^/api/adminagent", [this](req, res) {
+	
+	body = std.json(req.body);
+	
+	prompt = body.prompt;
+	
+	new_agent = miniagent(cfg.api, None, "planner/orchestrator", cfg.token);
+	new_agent.env.agent_space = agent_space;
+	
+	new_token = body.session_id ?? std.random_hash();
+	
+	if(body.session_id && conversations.exists("admin:"+body.session_id))
+		new_agent.llm_api.context.body.messages = conversations.get("admin:"+body.session_id);
+	
+	client_agent_id = req.client_ip;
+	
+	try {
+		if(running_agents.has(client_agent_id))
+		{
+			running_agents[client_agent_id].agent.stop();
+		}
+	}
+	catch(e) {
+		
+	}
+	
+	new_agent.on_action = [client_agent_id](action) {
+		
+		if(action.agent) {
+			//Handle worker
+			//Weird transformation
+			for(action.agent ?? false) {
+				agent = action.agent;
+				action = agent.action;
+				action.id = agent.id;
+			}
+			
+			action.agent = "worker";
+		}
+		else
+			action.agent = "planner";
+		
+		if(action.start_agent ?? false) {
+			action.spawn = action.start_agent;
+			action.id = action.start_agent;
+		}
+		
+		if(!action.has("text") && !action.has("tool") && !action.has("spawn"))
+			return;
+		
+		running_agents[client_agent_id].queue.push_back(action);
+	};
+	
+	running_agents[client_agent_id] = [
+		agent=new_agent,
+		token=new_token,
+		queue=[],
+		status="generating",
+		last_poll = std.millis(),
+	];
+	
+	start_agent = [new_token](prompt, client_ip, agt)
+	{
+		agt.task(prompt);
+		
+		if(running_agents.has(client_ip))
+			running_agents[client_ip].status = "done";
+		
+		result = conversations.batch([
+			["put", "admin:"+new_token, agt.llm_api.context.body.messages],
+		]);
+	};
+	
+	std.thread(start_agent).run(prompt, req.client_ip, new_agent);
+	
+	return [
+		body=[ok=1, session_id=new_token],
+	];
+	
+});
+
+server.route("POST", "^/api/adminagent/poll", [this](req, res) {
+	
+	try {		
+		body = std.json(req.body);
+		
+		if(!running_agents.has(req.client_ip))
+			return [body=[ok=true,status="done"]];
+		if(running_agents[req.client_ip].token != body.session_id)
+			std.print("Invalid session: ", body.session_id, " : ", running_agents[req.client_ip].token);
+			return [body=[ok=false,status="error"]];
+		
+		running_agents[req.client_ip].last_poll = std.millis();
+		
+		queue = &running_agents[req.client_ip].queue;
+		
+		if(!queue.size()) {
+			if(running_agents[req.client_ip].status == "done")
+				running_agents.erase(req.client_ip);	
+				return [body=[ok=true, status="done"]];
+			return [body=[ok=true, status="waiting"]];
+		}
+		
+		delta_queue = queue[0];
+		
+		queue.erase(0);
+
+		if(delta_queue.has("spawn"))
+		{
+			return [body=[ok=true, status="spawn", delta=delta_queue]];
+		}
+		
+		if(delta_queue.has("text")) {
+			for(i = 0; i < queue.size(); i++) {
+				if(queue[i].has("spawn"))
+					break;
+				if(delta_queue.has("id") && queue[i].id != delta_queue.id)
+					break;
+				if(queue[i].has("tool"))
+					break;
+				
+				delta_queue.text += queue[i].text;
+				queue.erase(i);
+				i--;
+			}
+		}
+		
+		if(delta_queue.has("tool") && delta_queue.tool.name) {
+			if(delta_queue.tool.name == "finalize") {
+				if(delta_queue.tool.args.assistant_answer)
+					delta_queue.text = "\n\n```\n[FINAL REPORT]\n" + delta_queue.tool.args.assistant_answer + "\n```";
+			}
+			else {
+				//Transform tool call to text...
+				delta_queue.text = "\n> [TOOL] " + delta_queue.tool.name;
+				
+				if(delta_queue.tool.args.has("path"))
+					delta_queue.text += " `" + delta_queue.tool.args.path + "`";
+				
+				delta_queue.text += "\n\n";	
+			}			
+		}
+
+		return [body=[ok=true, status="generating", delta=delta_queue]];
+	}
+	catch(e) {
+		return [body=[ok=false,status="error", error="internal server error."]];
+	}
+});
+
+server.route("POST", "^/api/adminagent/stop", [this](req, res) {
+	try {
+		if(running_agents.has(req.client_ip))
+			running_agents[req.client_ip].agent.stop();
+			running_agents.erase(req.client_ip);
+	}
+	catch(e) {
+		
+	}
+	
+	return [
+		body=[ok=true],
+	];
+});
+
+// ════════════════════════════════════════════
+//  Settings API Endpoints
+// ════════════════════════════════════════════
+
+// GET /api/settings - Get current settings
+server.route("GET", "^/api/settings$", [this](req, res) {
+    
+    if(!settings_db)
+        return [body = format_api_response(false, None, "Not enabled.")];
+    
+    try {
+        // Get existing settings or return defaults
+        if(settings_db.exists("settings")) {
+            settings = settings_db.get("settings");
+            return [body = format_api_response(true, settings)];
+        }
+        
+        // Return default settings
+        default_settings = get_default_settings();
+        return [body = format_api_response(true, default_settings)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// PUT /api/settings - Update settings
+server.route("PUT", "^/api/settings$", [this](req, res) {
+    
+    if(!settings_db)
+        return [body = format_api_response(false, None, "Not enabled.")];
+    
+    body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        // Get existing settings or create defaults
+		settings = None;
+        if(settings_db.exists("settings")) {
+            settings = settings_db.get("settings");
+        } else {
+            settings = get_default_settings();
+        }
+        
+        // Update provided fields
+        if(body.maxActiveAgents)
+            settings.maxActiveAgents = body.maxActiveAgents;
+        if(body.checkInterval)
+            settings.checkInterval = body.checkInterval;
+        
+        // Save to database
+        settings_db.put("settings", settings);
+        
+        return [body = format_api_response(true, settings)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// ════════════════════════════════════════════
+//  Work Mode API Endpoints
+// ════════════════════════════════════════════
+
+// GET /api/workmode - Get current work mode
+server.route("GET", "^/api/workmode$", [this](req, res) {
+    
+    if(!settings_db)
+        return [body = format_api_response(false, None, "Not enabled.")];
+    
+    try {
+        // Get existing settings
+        if(settings_db.exists("settings")) {
+            settings = settings_db.get("settings");
+            
+            // Get workmode from settings (nested structure)
+            if(settings.workmode) {
+                workmode = settings.workmode;
+                return [body = format_api_response(true, workmode)];
+            }
+            
+            // Return default work mode if not in settings
+            default_workmode = get_default_workmode();
+            return [body = format_api_response(true, default_workmode)];
+        }
+        
+        // Return default work mode if no settings exist
+        default_workmode = get_default_workmode();
+        return [body = format_api_response(true, default_workmode)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// PUT /api/workmode - Set work mode
+server.route("PUT", "^/api/workmode$", [this](req, res) {
+    
+    if(!settings_db)
+        return [body = format_api_response(false, None, "Not enabled.")];
+    
+    body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        // Get existing settings or create defaults
+		settings = None;
+        if(settings_db.exists("settings")) {
+            settings = settings_db.get("settings");
+        } else {
+            settings = get_default_settings();
+        }
+        
+        // Initialize workmode if it doesn't exist in settings
+        if(settings.workmode)
+            settings.workmode = get_default_workmode();
+        
+        // Update enabled state
+        if(body.enabled != None)
+            settings.workmode.enabled = body.enabled;
+        std.print(settings);
+        // Save settings to database
+        settings_db.put("settings", settings);
+        
+        return [body = format_api_response(true, settings.workmode)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// ════════════════════════════════════════════
+//  Features API Endpoints
+// ════════════════════════════════════════════
+
+// GET /api/features/list - Get all features
+server.route("GET", "^/api/features/list$", [this](req, res) {
+	
+	if(!features_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+    features = [];
+    
+    try {
+        managed iter = features_db.iter();
+        
+        for(iter.valid()) {
+			key = iter.key();
+            if(!key)
+                break;
+			
+            feature = iter.value();
+            
+            if(feature)
+                features.push_back(feature);
+			
+			//Does not return the key, but true/false
+			iter.next();
+		}
+		
+        return [body = format_api_response(true, features)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// GET /api/features/:id - Get specific feature
+server.route("GET", "^/api/features/([^/]+)$", [this](req, res) {
+	
+	if(!features_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	feature_id = req.matches[0];
+    
+    try {
+        if(features_db.exists(feature_id)) {
+            feature = features_db.get(feature_id);
+            return [body = format_api_response(true, feature)];
+        }
+        
+        return [body = format_api_response(false, None, "Feature not found")];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// POST /api/features - Create new feature
+server.route("POST", "^/api/features$", [this](req, res) {
+	
+	if(!features_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+    body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        // Generate new feature ID
+        feature_id = "feature_" + std.date("%d-%m-%Y_%H-%M-%S") + "_" + std.random_hash();
+        
+        // Create new feature with defaults
+        feature = [
+            id = feature_id,
+            createdAt = std.millis(),
+            updatedAt = std.millis(),
+            progress = 0,
+            status = "planned",
+        ];
+        
+        // Copy provided fields
+        if(body.title)
+            feature.title = body.title;
+        if(body.description)
+            feature.description = body.description;
+        if(body.priority)
+            feature.priority = body.priority;
+        if(body.category)
+            feature.category = body.category;
+        if(body.targetDate)
+            feature.targetDate = body.targetDate;
+		
+        // Save to database
+        features_db.put(feature_id, feature);
+		
+        return [body = format_api_response(true, feature)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// PUT /api/features/:id - Update feature
+server.route("PUT", "^/api/features/([^/]+)$", [this](req, res) {
+	
+	if(!features_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	feature_id = req.matches[0];
+    body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        if(!features_db.exists(feature_id)) {
+            return [body = format_api_response(false, None, "Feature not found")];
+        }
+        
+        feature = features_db.get(feature_id);
+        
+        // Update fields
+        feature.updatedAt = std.millis();
+        
+        if(body.title)
+            feature.title = body.title;
+        if(body.description)
+            feature.description = body.description;
+        if(body.priority)
+            feature.priority = body.priority;
+        if(body.category)
+            feature.category = body.category;
+        if(body.targetDate)
+            feature.targetDate = body.targetDate;
+        if(body.status)
+            feature.status = body.status;
+        if(body.progress)
+            feature.progress = body.progress;
+
+        // Save updated feature
+        features_db.put(feature_id, feature);
+        
+        // Log the update
+        std.print(std.string("[", std.date("%d-%m-%Y_%H-%M-%S"), "] Updated feature: id=", feature_id, ", updated fields: title=", feature.title, ", description=", feature.description, ", priority=", feature.priority, ", category=", feature.category, ", targetDate=", feature.targetDate, ", status=", feature.status, ", progress=", feature.progress));
+        
+        return [body = format_api_response(true, feature)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// DELETE /api/features/:id - Delete feature
+server.route("DELETE", "^/api/features/([^/]+)$", [this](req, res) {
+	
+	if(!features_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	feature_id = req.matches[0];
+    
+    try {
+        if(features_db.exists(feature_id)) {
+            features_db.delete(feature_id);
+            return [body = format_api_response(true)];
+        }
+        
+        return [body = format_api_response(false, None, "Feature not found")];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// ════════════════════════════════════════════
+//  History API Endpoints
+// ════════════════════════════════════════════
+
+// GET /api/history/list - Get all history entries
+server.route("GET", "^/api/history/list$", [this](req, res) {
+	
+	if(!history_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	history_entries = [];
+    
+    try {
+        managed iter = history_db.iter();
+        
+        for(iter.valid()) {
+			key = iter.key();
+            if(!key)
+                break;
+            
+            entry = history_db.get(key);
+            
+            if(entry)
+                history_entries.push_back(entry);
+			
+			iter.next();
+        }
+        
+        return [body = format_api_response(true, history_entries)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// GET /api/history/:id - Get specific history entry
+server.route("GET", "^/api/history/([a-zA-Z0-9_-]+)$", [this](req, res) {
+	
+	if(!history_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	history_id = req.matches[0];
+    
+    try {
+        if(history_db.exists(history_id)) {
+            entry = history_db.get(history_id);
+            return [body = format_api_response(true, entry)];
+        }
+        
+        return [body = format_api_response(false, None, "History entry not found")];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// POST /api/history - Create history entry
+server.route("POST", "^/api/history$", [this](req, res) {
+	
+	if(!history_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        // Generate new history ID
+        history_id = "history_" + std.date("%d-%m-%Y_%H-%M-%S") + "_" + std.random_hash();
+        
+        // Create history entry
+        entry = [
+            id = history_id,
+            timestamp = std.millis(),
+        ];
+        
+        // Copy provided fields
+        if(body.type)
+            entry.type = body.type;
+        if(body.description)
+            entry.description = body.description;
+        if(body.data)
+            entry.data = body.data;
+        if(body.revertAction)
+            entry.revertAction = body.revertAction;
+        
+        // Save to database
+        history_db.put(history_id, entry);
+        
+        return [body = format_api_response(true, entry)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// PUT /api/history/:id - Update history entry
+server.route("PUT", "^/api/history/([a-zA-Z0-9_-]+)$", [this](req, res) {
+	
+	if(!history_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	history_id = req.matches[0];
+    body = parse_request_body(req.body);
+    
+    if(!body) {
+        return [body = format_api_response(false, None, "Invalid request body")];
+    }
+    
+    try {
+        if(!history_db.exists(history_id)) {
+            return [body = format_api_response(false, None, "History entry not found")];
+        }
+        
+        entry = history_db.get(history_id);
+        
+        // Update fields
+        if(body.type)
+            entry.type = body.type;
+        if(body.description)
+            entry.description = body.description;
+        if(body.data)
+            entry.data = body.data;
+        if(body.revertAction)
+            entry.revertAction = body.revertAction;
+        
+        // Save updated entry
+        history_db.put(history_id, entry);
+        
+        // Log the update
+        std.print(std.string("[", std.date("%d-%m-%Y_%H-%M-%S"), "] Updated history entry: id=", history_id, ", updated fields: type=", entry.type, ", description=", entry.description, ", data=", entry.data, ", revertAction=", entry.revertAction));
+        
+        return [body = format_api_response(true, entry)];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+// DELETE /api/history/:id - Delete history entry
+server.route("DELETE", "^/api/history/([a-zA-Z0-9_-]+)$", [this](req, res) {
+	
+	if(!history_db)
+		return [body = format_api_response(false, None, "Not enabled.")];
+	
+	history_id = req.matches[0];
+    
+    try {
+        if(history_db.exists(history_id)) {
+            history_db.delete(history_id);
+            return [body = format_api_response(true)];
+        }
+        
+        return [body = format_api_response(false, None, "History entry not found")];
+    }
+    catch(e) {
+        return [body = format_api_response(false, None, std.string(e))];
+    }
+});
+
+server.start();
+			
+std.print("Webinterface: " + "http://localhost:13337\n");
+
+//std.system("start http://localhost:13337");

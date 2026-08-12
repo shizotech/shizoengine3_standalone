@@ -1,0 +1,252 @@
+// ============================================================================
+// __init__.shio — Main entry point and server initialization
+// ============================================================================
+
+// Import webserver module for HTTP server
+import webserver;
+
+#include "mcp_types.shio"
+#include "openai/openai"
+
+class mcpserver
+{
+	name = "";
+	port = 13338;
+	http = None;
+	clients = [];
+	tools = toolset();
+	
+	__init__(name, port, http_backend = webserver.http_server()) {
+		this.name = name;
+		this.port = port;
+		this.http = http_backend;
+		http.init(port);
+		
+		// Register MCP endpoint for POST requests
+		http.route("POST", "/mcp", this.mcp_handler);
+
+		// Register GET endpoint for server health check
+		http.route("GET", "/", [this](request_object, writer) {
+			if(!writer.write_header(200, "text/event-stream")) {
+				std.print("write header failed.");
+				return;
+			}
+			
+			client_id = std.random_hash(128);
+			
+			std.print(client_id);
+			
+			stream_write_cb = [this, writer, client_id](data) {
+				//data is a json with the response
+				send_sse = "event: message\ndata: " + data.compact_string() + "\n\n";
+				if(!writer.write(send_sse))
+					this.clients[client_id].stop = true;
+			};
+			
+			this.clients[client_id] = [
+				stream_writer = stream_write_cb,
+				stop = false,
+			];
+			
+			if(!writer.write("event: endpoint\ndata: /mcp?sessionid=" + client_id + "\n\n")) {
+				this.clients.erase(client_id);
+			}
+			
+			for(!this.clients[client_id].stop && writer.is_client_alive()) {
+				std.sleep(1000);
+			}
+			
+			std.print("client disconnected.");
+			
+			this.clients.erase(client_id);
+		});
+
+		// Start the server
+		http.start();
+
+		std.print("MCP Server started on port " + port);
+		std.print("MCP Endpoint: http://localhost:" + port);
+	}
+	
+	// Initialize handler
+	handle_initialize(req_params)
+	{
+		result = [protocolVersion=MCP_VERSION, capabilities=[tools=handle_tools_list(None)], serverInfo=[name=name, version="1.0.0"]];
+		return result;
+	}
+
+	// Tools/List handler
+	handle_tools_list(req_params)
+	{
+		list = [];
+				
+		for(i = 0; i < tools.tools.size(); i++) {
+			t = [
+				name=tools.tools[i].function.name,
+				description=tools.tools[i].function.description,
+				inputSchema=tools.tools[i].function.parameters,
+			];
+			
+			if(!t.inputSchema)
+				t.inputSchema = [type = "object", properties = []];
+			
+			list.push_back(t);
+		}
+		
+		//std.print(list);
+		
+		return [tools=list];
+	}
+
+	// Tools/Call handler
+	handle_tools_call(req_params, rpc_id)
+	{
+		try {
+			
+			tool_name = req_params.geti("name");
+			arguments = req_params.geti("arguments");
+
+			if (!tools.tool_callbacks.has(tool_name))
+			{
+				error_resp = create_jsonrpc_error(rpc_id, JSONRPC_TOOL_NOT_FOUND, "Tool doesnt exist.");
+				return error_resp;
+			}
+			
+			cb = tools.tool_callbacks[tool_name];
+
+			return create_jsonrpc_tool_response(rpc_id, cb(this, arguments));
+		}
+		catch(e) {}
+		
+		error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INTERNAL_ERROR, "Internal server error.");
+		return error_resp;
+	}
+
+	
+	// ============================================================================
+	// MCP Request Handler - defined LAST
+	// Processes JSON-RPC messages and routes to appropriate handlers
+	// ============================================================================
+	mcp_handler(request_object, writer)
+	{
+		std.print(request_object);
+		
+		// Guard: reject empty or null body before calling std.json()
+		body_str = std.string(request_object.body);
+		if (body_str == "")
+		{
+			error_resp = create_jsonrpc_error(-1, JSONRPC_PARSE_ERROR, "Empty or invalid request body");
+			return error_resp.string(0);
+		}
+
+		req = None;
+
+		// Wrap JSON parse in try/catch to handle malformed input gracefully
+		try {
+			req = std.json(body_str);
+		} catch (e) {
+			error_resp = create_jsonrpc_error(-1, JSONRPC_PARSE_ERROR, "Failed to parse JSON: " + std.string(e).string(0));
+			return error_resp.string(0);
+		}
+
+		// Extract method and id
+		method = req.geti("method");
+		rpc_id = req.geti("id");
+
+		if (!method)
+		{
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+
+		// Extract params
+		params = req.geti("params");
+
+		// Extract clientid
+		clientid = request_object.query_params.sessionid;
+		
+		if(!clients.has(clientid)) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+
+		// Declare all variables at top
+		response = "";
+		result = None;
+		error_resp = None;
+
+		// Route to appropriate handler
+		if (method == INIT_METHOD)
+		{
+			result = handle_initialize(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(INIT_METHOD + "/result", result);
+		}
+		else if (method == TOOLS_LIST_METHOD)
+		{
+			result = handle_tools_list(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(TOOLS_LIST_METHOD + "/result", result);
+		}
+		else if (method == TOOLS_CALL_METHOD)
+		{
+			response = handle_tools_call(params, rpc_id);
+		}
+		else if (method == PING_METHOD)
+		{
+			result = [status="ok"];
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(PING_METHOD + "/result", result);
+		}
+		else
+		{
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_METHOD_NOT_FOUND, "Method not found: " + method);
+			response = error_resp;
+		}
+
+		if(!clients.has(clientid)) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+		
+		clients[clientid].stream_writer(response);
+		
+		return [
+			body = "",
+		];
+	}
+
+}
+
+
+// Example Server configuration
+/*
+server_port = 3001;
+server = mcpserver("Test", server_port);
+
+server.tools.add_tool(
+"test_tool",
+"Execute a plan",
+[
+	manifest = "&string(): Plan manifest",
+	state = "&string(): Initial state",
+	taskboard = "&string(): Taskboard manifest",
+	num = "&int(): number",
+	//working_directory = "&string(): The working directory for the downstream agent.", 
+],
+[](svr, args)
+{	
+	std.print(args);
+	
+	return "Ok worked!";
+});
+
+// Keep server running
+std.sleep(-1);
+*/

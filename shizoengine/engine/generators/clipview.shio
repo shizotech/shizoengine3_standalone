@@ -1,0 +1,871 @@
+
+#include "generatoritem"
+
+using eigen;
+
+class clipview
+{
+	managed cnt_area = None;
+	managed grid = None;
+	managed items = [];
+	
+	managed preview_area = None;
+	managed layer_area = None;
+	
+	//Oder statt per row list einfach alle aktiven cells in einer liste und durchiterieren bis richtige row gefunden wurde ?? einfach
+	//Und moven funktioniert besser ?
+	
+	managed composition_shader = None;
+	
+	managed input_ctrl = None;
+	managed out_ctrl = None;
+	
+	active_preview = None;
+	active_cells = [];
+	
+	layer_controls = [];
+	
+	reset_active_state = false;
+	
+	__init__(parent)
+	{		
+		cnt_area = parent.widget().anchor(0);
+		
+		cnt = cnt_area.widget().anchor(0).anchor_bottom(25);
+		
+		grid = cnt.gridview()
+			.anchor(0)
+			.anchor_bottom(200)
+			.header_left_width(300)
+			.rows(0).cols(0)
+			.show_grid(true);
+
+		preview_area = cnt.window("PREVIEW").anchor_left(0).anchor_right(0.5, "percent").fixed_height(200).anchor_bottom(0).movable_y(true).clamp_move(false).resizable_right(true);
+		layer_area = cnt.window("LAYER").anchor_left(0.5,"percent").anchor_right(0).fixed_height(200).anchor_bottom(0).movable_y(true).clamp_move(false).resizable_left(true);
+	
+		preview_area.on_move([cnt, grid, preview_area, layer_area](pos, old_pos){
+			grid.anchor_bottom(cnt.height() - preview_area.y());
+			preview_area.fixed_height(cnt.height() - preview_area.y());
+			if(preview_area.y() < 0)
+				preview_area.anchor_top(2);
+			else
+				preview_area.clear_anchor_top();
+			
+			layer_area.y(pos.y);
+			layer_area.fixed_height(preview_area.fixed_height());
+		});
+
+		layer_area.on_move([cnt, grid, preview_area, layer_area](pos, old_pos){
+			grid.anchor_bottom(cnt.height() - layer_area.y());
+			layer_area.fixed_height(cnt.height() - layer_area.y());
+			if(layer_area.y() < 0)
+				layer_area.anchor_top(2);
+			else
+				layer_area.clear_anchor_top();
+			
+			preview_area.y(pos.y);
+			preview_area.fixed_height(layer_area.fixed_height());
+		});
+		
+		preview_area.on_resize([cnt, preview_area, layer_area](new_size, old_size) {
+			perc = new_size.x / cnt.width();
+			preview_area.anchor_right(1.0 - perc, "percent");
+			layer_area.anchor_left(perc, "percent");
+		});
+		
+		layer_area.on_resize([cnt, preview_area, layer_area](new_size, old_size) {
+			perc = new_size.x / cnt.width();
+			preview_area.anchor_right(perc, "percent");
+			layer_area.anchor_left(1.0 - perc, "percent");
+		});
+		
+		grid.dragdrop_enabled(true);
+		
+		grid.content().on_dragdrop_hover([this](payload, pos) {
+			return true;
+		});
+		
+		grid.on_cell_drop([this, grid](payload, row, col) {	
+			std.print(payload);
+			
+			if(payload.has("cell") && payload.has("item"))
+			{	
+				cell = grid.get_item_at(row, col);
+				
+				if(cell && cell.row() == payload.cell.row() && cell.col() == payload.cell.col())
+					return true;
+			
+				state = payload.item.save_state();
+				node_state = payload.item.node.serialize_json(true);
+				path = payload.item.path;
+			
+				if(!grid.screen().modifier_ctrl())
+					payload.item.on_close();
+			
+				//TODO:
+				//When the clip is dragged onto another clip, it is added to that clip
+				//Now this doesnt work yet because both clips are shaderstacks
+				//Would have to save each shader individually from the stack and then add them to the existing clip
+				//And also serialized each shaderstack item...
+			
+				item = None;
+				if(cell)
+					item = cell.attr.item.dispatch("add_generator", path);
+					ocb = cell.attr.preview_btn.on_change();
+					ocb(true);
+					return true;
+				else
+					item = this.add_generator(path, row, col);
+				item.load_state(state);
+				item.node.deserialize_json(node_state, true);
+				return true;
+			}
+			
+			
+			path = fileio.relative_path_cwd(payload.path);	
+			cell = grid.get_item_at(row, col);
+			if(cell)
+				cell.attr.item.dispatch("add_generator", path);
+				ocb = cell.attr.preview_btn.on_change();
+				ocb(true);
+				return true;
+				//std.print("Freeing existing cell...");
+				//std.free(cell.attr.item);
+			this.add_generator(path, row, col);
+			return true;
+		});
+		
+		
+		input_ctrl = cnt_area.control("IN", "default_io").anchor_left(0).anchor_bottom(0).fixed_height(25).fixed_width(50);
+		out_ctrl = cnt_area.control("OUT", "default_io").anchor_right(0).anchor_bottom(0).fixed_height(25).fixed_width(60);
+		
+		add_composition_shader();
+		
+		set_size(3,4);
+		
+		input_ctrl.callback([this](v){
+			this.link_shaders();
+		});
+	}
+
+	dispatch(cmd, value) {	
+		for(i = 0; i < items.size(); i++) {
+			if(cmd == "active" && value) {
+				//Do not set clips within the grid to active ! Only the layers
+				//Active should only be active_preview and active_cells and transit_b
+				if(items[i].extra_widgets && items[i].extra_widgets.cell && items[i].extra_widgets.cell.row() >= 0)
+					continue;
+			}
+			
+			items[i].dispatch(cmd, value);
+		}
+		
+		if(cmd == "active" && value) {
+			if(active_preview)
+				active_preview.attr.set_active(true);
+			for(i = 0; i < active_cells.size(); i++) {
+				if(active_cells[i])
+					active_cells[i].attr.set_active(true);
+			}
+			for(i = 0; i < layer_controls.size(); i++) {
+				if(layer_controls[i].transit_b)
+					layer_controls[i].transit_b.attr.set_active(true);
+			}
+		}
+		
+		return None;
+	}
+
+	set_size(rows, cols) {
+		old_rows = grid.rows();
+		old_cols = grid.cols();
+		
+		grid.rows(rows).cols(cols);
+		
+		active_cells.resize(rows);
+		
+		for(i = old_rows; i < grid.rows(); i++) {
+			add_layer_shader(i);
+		}
+
+		for(i = old_cols; i < grid.cols(); i++) {
+			if(grid.get_header_top_item(i))
+				continue;
+			trigger_btn = grid.add_header_top_item(i).controlbutton("COLUMN"+(i+1), "layer_trigger_"+i).anchor(0).hide_config_menu();
+			trigger_btn.callback([this, i](v){
+				if(!v)
+					return;
+				for(r = 0; r < this.grid.rows(); r++) {
+					item = grid.get_item_at(r, i);
+					if(item && item.attr.trigger_btn)
+						cb = item.attr.trigger_btn.callback();
+						cb(true);
+					else
+						cb = this.layer_controls[r].stop_btn.callback();
+						cb(true);
+				}
+			});
+		}
+	}
+
+	link_shaders() {
+			
+		try {
+			for(i = 0; i < active_cells.size(); i++) {
+				
+				if(!grid.get_header_left_item(i) || i >= layer_controls.size())
+					return; //initializing, return here
+				
+				cell = active_cells[i];
+				cell_item = cell ? cell.attr.item : None;
+				
+				layer = grid.get_header_left_item(i);
+				layer_item = layer ? layer.attr.item : None;
+				
+				cell_in = cell_item ? cell_item.dispatch("get_default_input") : None;
+				cell_out = cell_item ? cell_item.dispatch("get_default_output") : None;
+				
+				layer_in = layer_item ? layer_item.dispatch("get_default_input") : None;
+				layer_out = layer_item ? layer_item.dispatch("get_default_output") : None;
+				
+				last_layer_index = i+layer_controls[i].layer_input_offset.value();
+				last_layer_item = last_layer_index < layer_controls.size() ? layer_controls[i+layer_controls[i].layer_input_offset.value()].layer_item : None;
+				last_layer_out = last_layer_item ? last_layer_item.dispatch("get_default_output") : None;
+				
+				layer_transit_item = layer_controls[i].transit_b ? layer_controls[i].transit_b.attr.item : None;
+				layer_transit_in = layer_transit_item ? layer_transit_item.dispatch("get_default_input") : None;
+				layer_transit_out = layer_transit_item ? layer_transit_item.dispatch("get_default_output") : None;
+
+				//Link row active cell output to iChannel0 of the row layer shader, and the previous layer output into iChannel1 for mixing...
+				try {
+					
+					layer_in.value(cell_out ? cell_out.value() : None);
+				
+					if(last_layer_out) {
+						
+						if(cell_in)
+							cell_in.value(cell.attr.no_input.value() ? None : last_layer_out.value());
+		
+						layer_item.dispatch("set_input", [
+							name = "iChannel1",
+							value = last_layer_out.value(),
+							index = 0,
+						]);
+					}
+					else {
+						
+						if(cell_in)
+							cell_in.value(None);
+						
+						layer_item.dispatch("set_input", [
+							name = "iChannel1",
+							value = None,
+							index = 0,
+						]);
+					}
+					
+					
+					transit_out_value = layer_transit_out ? layer_transit_out.value() : None;
+					layer_item.dispatch("set_input", [
+						name = "iChannel2",
+						value = transit_out_value,
+						index = 0,
+					]);
+				
+				}
+				catch(e) {
+		
+				}
+				//std.print(cell_item.dispatch("get_default_input"));
+
+			}
+		
+			layer = grid.get_header_left_item(0);
+			layer_item = layer.attr.item;
+			layer_out = layer_item.dispatch("get_default_output").value();
+				
+			composition_shader.dispatch("get_default_input").value(layer_out);
+		}
+		catch(e) {}
+	}
+
+	add_layer_shader(row) {
+		if(grid.get_header_left_item(row))
+			return;
+		
+		layer = add_generator("engine/assets/layerblend.glsl", row, -1, "layer_shader_"+row);
+		layer.dispatch("no_delete", true);
+		cell = grid.get_header_left_item(row);
+		cell.attr.row = row; //This is a bit confusing, since header widgets internally only store (-1000,-1000) we have to store it extra
+		cell.attr.preview_btn.anchor_right(0.6,"percent").caption("LAYER"+(row+1));
+		
+		ctrl_cnt = cell.widget().anchor(0).anchor_left(0.4, "percent");
+		
+		master_ctrl = ctrl_cnt.controlslider("MASTER", "layer_ctrls_"+row).anchor_left(0).anchor_top(0).anchor_right(0).fixed_height(20);
+		mix_ctrl = ctrl_cnt.controlslider("MIX", "layer_ctrls_"+row).anchor_left(0).anchor_top(20).anchor_right(0).fixed_height(20);
+		trans_ctrl = ctrl_cnt.controlslider("TRANSITION", "layer_ctrls_"+row).anchor_left(0).anchor_top(40).anchor_right(0).fixed_height(20).max(60);
+		
+		stop_btn = ctrl_cnt.controlbutton("STOP", "layer_ctrls_"+row).anchor_top(60).anchor_left(0.0,"percent").anchor_right(0.7,"percent").fixed_height(20).hide_config_menu();
+		autoplay_backward = ctrl_cnt.controlbutton("<", "layer_ctrls_"+row).anchor_left(0.3, "percent").anchor_top(60).anchor_right(0.5,"percent").fixed_height(20).hide_config_menu().push(1);
+		autoplay_random = ctrl_cnt.controlbutton("RND", "layer_ctrls_"+row).anchor_left(0.5,"percent").anchor_top(60).anchor_right(0.2,"percent").fixed_height(20).hide_config_menu().push(1);
+		autoplay_forward = ctrl_cnt.controlbutton(">", "layer_ctrls_"+row).anchor_left(0.8,"percent").anchor_top(60).anchor_right(0.0,"percent").fixed_height(20).hide_config_menu().push(1);
+		
+		autoplay_backward.callback([autoplay_random, autoplay_forward](v) {
+			if(!v)
+				return;
+			autoplay_random.value(0, false);
+			autoplay_forward.value(0, false);
+		});
+		autoplay_random.callback([this, autoplay_backward, autoplay_forward, row](v) {
+			if(!v)
+				return;
+			autoplay_backward.value(0, false);
+			autoplay_forward.value(0, false);
+			this.layer_controls[row].autoplay_list = [];
+		});
+		autoplay_forward.callback([autoplay_random, autoplay_backward](v) {
+			if(!v)
+				return;
+			autoplay_random.value(0, false);
+			autoplay_backward.value(0, false);
+		});
+		
+		stop_btn.callback([this, row, autoplay_forward, autoplay_backward, autoplay_random](v){
+			if(!v)
+				return;
+			
+			autoplay_forward.value(0);
+			autoplay_backward.value(0);
+			autoplay_random.value(0);
+			
+			cur_cell = this.active_cells[row];
+			this.active_cells[row] = None;
+			
+			if(this.layer_controls[row].transit_b)
+				this.layer_controls[row].transit_b.outline(false);
+			this.layer_controls[row].transit_b = None;
+			
+			if(this.layer_controls[row].transit_c)
+				this.layer_controls[row].transit_c.outline(false);
+			this.layer_controls[row].transit_c = None;
+			
+			if(cur_cell)
+				cur_cell.attr.set_active(false);
+			
+			this.link_shaders();
+		});
+		
+		settings_area = layer.dispatch("get_settings_area", "Layer Settings").content().layout(nanogui.layout_vertical());
+		layer_name = settings_area.controltext("layer_name", "layer_name_"+row);
+		layer_input_offset = settings_area.controlint("Layer input from", "layer_input_"+row).value(1);
+		autoplay_vec = settings_area.controlvector("Autoplay", "autoplay_settings_"+row).content().layout(nanogui.layout_vertical());
+		autoplay_duration = autoplay_vec.controlfloat("DurationBeats", "autoplay_settings_"+row).value(64);
+		
+		
+		//No way this should fail, given how the headers are initialized, this should be fine.
+		for(row >= layer_controls.size())
+			layer_controls.push_back([]);
+		
+		layer_controls[row] = [
+			transition = trans_ctrl,
+			transition_time = 0.0,
+			last_autoplay_time = 0.0,
+			transit_b = None,
+			transit_c = None,
+			layer_item = layer,
+			row = row,
+			autoplay_list = [],
+			stop_btn = stop_btn,
+			layer_input_offset=layer_input_offset,
+		];
+		
+		//Create local ref
+		ctrls = layer_controls[row];
+		
+		ctrls.start_transition = [this](cell, item) {
+			row = cell.row();
+			ctrls = this.layer_controls[row]; //Dont lambda capture it to avoid cyclic refs
+			
+			transition_value = ctrls.transition.value();
+			
+			if(this.active_cells[row])
+				custom_transition = this.active_cells[row].attr.transition.value();
+				if(custom_transition >= 0.0)
+					transition_value = custom_transition;
+			
+			if(cell)
+				custom_transition = cell.attr.transition.value();
+				if(custom_transition >= 0.0)
+					transition_value = custom_transition;
+			
+			//Simple case
+			if(transition_value == 0) {
+				if(this.active_cells[row] && this.active_cells[row] != cell)
+					active_cell = this.active_cells[row];
+					this.active_cells[row] = None;
+					active_cell.attr.set_active(false);
+				this.active_cells[row] = cell;
+				cell.attr.set_active(true);
+				return;
+			}
+
+			//Avoid multi triggers...
+			
+			if(this.active_cells[row] && this.active_cells[row] == cell)
+				return;
+			
+			if(ctrls.transit_b && ctrls.transit_b == cell)
+				return;
+			
+			if(ctrls.transit_c && ctrls.transit_c == cell)
+				return;
+				
+			if(ctrls.transit_b)
+				if(ctrls.transit_c)
+					ctrls.transit_c.outline(false);
+				ctrls.transit_c = cell;
+				cell.outline(true);
+				cell.outline_color(vec4f(0.9, 0.0, 0.0, 0.8));
+			else
+				ctrls.transition_time = transition_value;
+				ctrls.transit_b = cell;
+				cell.attr.set_active(true);
+				ctrls.layer_item.dispatch("set_uniform", [
+					name = "TRANSITION",
+					value = 0.0,
+					index = 0,
+				]);
+		};
+		
+		layer_name.callback([cell](v){
+			cell.attr.preview_btn.caption(v);
+		});
+		
+		layer_input_offset.callback([this](v){
+			this.link_shaders();
+		});
+		
+		master_ctrl.callback([layer](v){
+			layer.dispatch("set_uniform", [
+				name = "MASTER",
+				value = v,
+				index = 0,
+			]);
+		});
+		
+		mix_ctrl.callback([layer](v){
+			layer.dispatch("set_uniform", [
+				name = "MIX",
+				value = v,
+				index = 0,
+			]);
+		});
+		
+		trans_ctrl.callback([layer, ctrls](v){
+			ctrls.transition_time = math.min(v, ctrls.transition_time);
+		});
+		
+		master_ctrl.value(1.0);
+		mix_ctrl.value(0.5);
+		
+		layer_name.value("LAYER"+(row+1));
+		
+		timeline = std.global("timeline");
+		
+		layer.dispatch("get_item", 0).dispatch("set_render_callback", [this, layer, row,
+		timeline, autoplay_forward, autoplay_random, autoplay_backward, autoplay_duration](){
+			ctrls = this.layer_controls[row]; //Dont lambda capture it to avoid cyclic refs, and other weird things
+			
+			//Autoplay
+			if(autoplay_forward.value()||autoplay_backward.value()||autoplay_random.value())
+			{	
+				t = timeline.cursor_pos.value();
+				dur = autoplay_duration.value();
+				
+				if(this.active_cells[row])
+					custom_dur = this.active_cells[row].attr.duration.value();
+					if(custom_dur >= 0.0)
+						dur = custom_dur;
+				
+				beat_due = (t - ctrls.last_autoplay_time) >= dur;
+				
+				if(beat_due)
+				{
+					ctrls.last_autoplay_time = t;
+					
+					cur_col = this.active_cells[row] ? this.active_cells[row].col() : 0;
+					
+					if(autoplay_forward.value())
+						has_trigger = false;
+						for(i = cur_col+1; i < this.grid.cols(); i++)
+							if(grid.get_item_at(row, i) && !grid.get_item_at(row, i).attr.autoplay_exclude.value())
+								trigger = grid.get_item_at(row, i).attr.trigger_btn.callback();
+								trigger(true);
+								has_trigger = true;
+								break;
+						if(!has_trigger)
+							for(i = 0; i < this.grid.cols(); i++)
+								if(grid.get_item_at(row, i) && !grid.get_item_at(row, i).attr.autoplay_exclude.value())
+									trigger = grid.get_item_at(row, i).attr.trigger_btn.callback();
+									trigger(true);
+									break;
+					else if(autoplay_backward.value())
+						has_trigger = false;
+						for(i = cur_col-1; i >= 0; i--)
+							if(grid.get_item_at(row, i) && !grid.get_item_at(row, i).attr.autoplay_exclude.value())
+								trigger = grid.get_item_at(row, i).attr.trigger_btn.callback();
+								trigger(true);
+								break;
+						if(!has_trigger)
+							for(i = this.grid.cols()-1; i >= 0; i--)
+								if(grid.get_item_at(row, i) && !grid.get_item_at(row, i).attr.autoplay_exclude.value())
+									trigger = grid.get_item_at(row, i).attr.trigger_btn.callback();
+									trigger(true);
+									break;
+					else if(autoplay_random.value())
+						if(!ctrls.autoplay_list)
+							full_list = [];
+							rnd_list = [];
+							for(i = 0; i < grid.cols(); i++)
+								full_list.push_back(i);
+							for(full_list.size())
+								rnd_index = math.random_int(0, full_list.size()-1);
+								rnd_list.push_back(full_list[rnd_index]);
+								full_list.erase(rnd_index);
+							ctrls.autoplay_list = rnd_list;
+						for(ctrls.autoplay_list.size())
+							i = ctrls.autoplay_list[0];
+							ctrls.autoplay_list.erase(0);
+							if(grid.get_item_at(row, i) && !grid.get_item_at(row, i).attr.autoplay_exclude.value())
+								trigger = grid.get_item_at(row, i).attr.trigger_btn.callback();
+								trigger(true);
+								break;
+				}
+			}
+			
+			transition_value = ctrls.transition.value();
+			
+			if(this.active_cells[row])
+				custom_transition = this.active_cells[row].attr.transition.value();
+				if(custom_transition >= 0.0)
+					transition_value = custom_transition;
+			
+			if(ctrls.transit_b)
+				custom_transition = ctrls.transit_b.attr.transition.value();
+				if(custom_transition >= 0.0)
+					transition_value = custom_transition;
+			
+			if(ctrls.transition_time <= 0.0) {
+				if(ctrls.transit_b) {
+					old_active = this.active_cells[row];
+					this.active_cells[row] = ctrls.transit_b;
+					ctrls.transit_b = None;
+					if(old_active)	
+						old_active.attr.set_active(false);
+					
+					ctrls.layer_item.dispatch("set_input", [
+							name = "iChannel2",
+							value = None,
+							index = 0,
+						]);
+					
+					this.active_cells[row].attr.set_active(true);			
+				}
+				
+				ctrls.layer_item.dispatch("set_uniform", [
+						name = "TRANSITION",
+						value = 0.0,
+						index = 0,
+					]);
+				
+				if(ctrls.transit_c) {
+					tmp = ctrls.transit_c;
+					ctrls.transit_c = None;
+					ctrls.start_transition(tmp, tmp.attr.item);
+				}
+				
+				return;
+			}
+			
+			perc = 1.0 - math.clamp(ctrls.transition_time / transition_value, 0, 1);
+	
+			ctrls.layer_item.dispatch("set_uniform", [
+				name = "TRANSITION",
+				value = perc,
+				index = 0,
+			]);
+			
+			real_fps = nanogui.current_context().real_fps();
+		
+			ctrls.transition_time = ctrls.transition_time - (1.0/real_fps);		
+		});
+	}
+	
+	add_composition_shader() {
+		if(composition_shader)
+			return;
+		
+		composition_shader = generator(preview_area, "engine/assets/composition.glsl", vec2f(0,0), "composition_shader", [no_header=true]);
+		composition_shader.window.anchor(0);
+		item_guid = composition_shader.guid;
+		items[item_guid] = composition_shader;
+		composition_shader.dispatch("get_default_input").visible(false);
+		
+		composition_shader.dispatch("set_render_callback", [this](){
+			if(this.reset_active_state)
+				this.reset_active_state--;
+				try {
+					for(r = 0; r < grid.rows(); r++) {
+						for(c = 0; c < grid.cols(); c++) {
+							item = grid.get_item_at(r,c);
+							if(item)
+								item.attr.set_active(false);
+						}
+					}
+				}
+				catch(e) {}		
+				
+				if(this.active_preview)
+					this.active_preview.attr.preview_btn.pushed(false);
+					cb = this.active_preview.attr.preview_btn.on_change();
+					cb(false);
+		});
+		
+		out_ctrl.value(composition_shader.dispatch("get_default_output").value());
+		out_ctrl.callback([this, out_ctrl](v){
+			out_ctrl.value(this.composition_shader.dispatch("get_default_output").value());
+		});
+	}
+
+	add_generator(path, row, col, guid = "") {
+		if(row >= 0 && col >= 0) {
+			new_rows = grid.rows();
+			new_cols = grid.cols();
+			
+			if(row >= new_rows-1)
+				new_rows = row+2;
+			if(col >= new_cols-1)
+				new_cols = col+2;
+			
+			set_size(new_rows, new_cols);
+		}
+		
+		layer_area.content().children_visible(false);
+		
+		cell = None;
+		shader_view = None;
+		
+		if(col >= 0)
+			cell = grid.add_item(row, col);
+			shader_view = cell.shader_view().anchor(2).anchor_bottom(20);
+		else
+			cell = grid.add_header_left_item(row);
+			shader_view = cell.shader_view().anchor(0).anchor_bottom(25).anchor_right(0.6,"percent");
+		
+		//Dont forget to save hash / name of this controlbutton too for reconstruction !!!
+		
+		trigger_btn = col >= 0 ? cell.controlbutton("TRIGGER_"+guid).anchor(0).anchor_bottom(20).transparent(1) : None;
+		preview_btn = cell.pushbutton(fileio.pure_name(path)).anchor_left(2).anchor_right(2).anchor_bottom(2).fixed_height(20).pushed(1);
+		
+		item = generator(layer_area, "engine/assets/shaderstack.asset", vec2f(0,0), guid, [no_header=true, custom_path=path]);
+		item.window.anchor(0);
+		item.extra_widgets = [cell=cell];
+		item_guid = item.guid;
+		
+		cell.attr.item = item;
+		cell.attr.preview_btn = preview_btn;
+		cell.attr.trigger_btn = trigger_btn;
+		
+		item.dispatch("on_items_changed", [this, shader_view, item](stackview) {
+			if(stackview.items.size() == 0)
+				item.on_close();
+				return;
+			try {
+				if(item.dispatch("get_default_output"))
+					shader_view.shader(item.dispatch("get_default_output").value());
+			}
+			catch(e) {}
+		});
+		
+		if(!item_guid || !item.dispatch("add_generator", path)) {
+			std.free(item);
+			std.free(cell);
+			return None;
+		}
+
+		this.items[item_guid] = item;
+		
+		item.on_close = [this, item_guid]() {
+			if(this.items.has(item_guid)) {
+				item = this.items[item_guid];
+				this.items.erase(item_guid);
+				std.free(item);
+			}
+		};
+		
+		//Fix trigger and preview "active" dispatch mess!!! add helper functions to get current row cell, aswell as item from cell etc...
+		if(trigger_btn)
+			
+			timeline = std.global("timeline");
+			//Call with value 2 to indicate that the callback was NOT called from the UI (mouse interaction)
+			trigger_btn.callback([this, cell, item, trigger_btn, timeline](v){
+				if(!v)
+					return;
+				row = cell.row();
+				this.layer_controls[row].start_transition(cell, item);
+				
+				if(trigger_btn.is_ui_callback())
+					cell.begin_dragdrop([cell=cell,item=item]);
+				
+				t = timeline.cursor_pos.value();
+				this.layer_controls[row].last_autoplay_time = t;
+			});
+		
+		preview_btn.on_change([this, cell, item, preview_btn](v){						
+			if(v) {
+				if(this.active_preview) {
+					this.active_preview.attr.preview_btn.pushed(false);
+					cb = this.active_preview.attr.preview_btn.on_change();
+					cb(false);				
+				}
+				
+				this.layer_area.content().children_visible(false);
+				item.window.visible(true);	
+				cell.attr.set_active(true);			
+				this.active_preview = cell;
+			}
+			else {
+				item.window.visible(false);
+				cell.attr.set_active(false);
+				this.active_preview = None;
+			}
+		});
+		
+		//Helper function
+		cell.attr.set_active = [this, cell, item, preview_btn](v) {
+			row = cell.row();
+			cell.outline(false);
+			if(v || row < 0) {
+				item.dispatch("active", true);
+				this.link_shaders();
+				if(row >= 0) {
+					if(this.active_cells[row] && this.active_cells[row] == cell)
+						cell.outline(true);
+						cell.outline_color(vec4f(0.0, 0.9, 0.0, 0.8));
+					else if(this.layer_controls[row].transit_b && this.layer_controls[row].transit_b == cell)
+						cell.outline(true);
+						cell.outline_color(vec4f(0.8, 0.8, 0.0, 0.8));
+				}
+			}
+			else {
+				if(row >= 0) {
+					if(
+						(this.active_cells[row] && this.active_cells[row] == cell) || 
+						(this.layer_controls[row].transit_b && this.layer_controls[row].transit_b == cell)
+					) 
+					{
+						return;
+					}
+				}
+				
+				item.dispatch("active", preview_btn.pushed());
+			}
+		};
+		
+		ocb = preview_btn.on_change();
+		ocb(true);
+		
+		default_in = item.dispatch("get_default_input");
+		if(default_in)
+			default_in.visible(false);
+		
+		if(row >= 0 && col >= 0) {
+			settings_area = item.dispatch("get_settings_area", "Clip Settings").content().layout(nanogui.layout_vertical());
+			layer_name = settings_area.controltext("layer_name", "layer_name_"+row);
+			cell.attr.no_input = settings_area.controlbutton("No Input").push(1);
+			
+			autoplay_vec = settings_area.controlvector("Autoplay", "autoplay_settings").content().layout(nanogui.layout_vertical());
+			
+			cell.attr.autoplay_exclude = autoplay_vec.controlbutton("Exclude").push(1);
+			cell.attr.duration = autoplay_vec.controlfloat("DurationBeats").min(-1).max(1024).value(-1);
+			cell.attr.transition = autoplay_vec.controlfloat("Transition").min(-1).max(1024).value(-1);
+			
+			layer_name.callback([cell](v){
+				cell.attr.preview_btn.caption(v);
+			});
+			
+			layer_name.value(cell.attr.preview_btn.caption());
+		}
+		
+		std.print("GUID: " + item_guid);
+		
+		return item;
+	}
+
+	save_state() {
+		states = [grid_states=[], rows=grid.rows(), cols=grid.cols()];
+			
+		for(i = 0; i < this.items.size(); i++) {
+			item = this.items[i];
+			try {
+				if(this.items.key(i) == "composition_shader")
+					states.grid_states.push_back([row=-1, col=-1, data=item.save_state()]);
+				else if(item.extra_widgets.cell.row() < 0)
+					states.grid_states.push_back([row=item.extra_widgets.cell.attr.row, col=-1, data=item.save_state()]);
+				else
+					states.grid_states.push_back([row=item.extra_widgets.cell.row(), col=item.extra_widgets.cell.col(), data=item.save_state()]);
+			}
+			catch(e) {}
+		}
+		
+		return states;
+	}
+
+	load_state(states) {
+		
+		for(i = 0; i < this.items.size(); i++) {
+			try {
+				if(this.items[i])
+					std.free(this.items[i]);
+			}
+			catch(e) {}
+		}
+		
+		this.items.clear();
+		
+		set_size(0,0);
+		
+		layer_controls.clear();
+		active_cells.clear();
+		
+		// Very special function, this avoids reloading same project GUID's while the current objects may not be destroyed yet
+		for(!grid.screen().garbage_cleared()) {
+			std.sleep(0);
+		}
+		
+		add_composition_shader();
+		
+		set_size(states.rows, states.cols);
+		
+		for(i = 0; i < states.grid_states.size(); i++) {
+			state = states.grid_states[i];
+			try {
+				item = None;
+				if(state.row == -1 && state.col == -1) //composition shader
+					item = composition_shader;
+				else if(state.col < 0) //layers
+					item = grid.get_header_left_item(state.row).attr.item;
+				else
+					item = add_generator(state.data.path, state.row, state.col, state.data.guid);
+				
+				item.load_state(state.data);
+				
+				if(state.row >= 0 && state.col >= 0)
+					item.dispatch("set_active", false);
+			}
+			catch(e) {}
+		}
+		
+		reset_active_state = 2; //Reset for 10 frames, hacky but might work
+	}
+}

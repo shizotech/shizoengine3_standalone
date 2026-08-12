@@ -1,0 +1,330 @@
+// ============================================================
+// homeassistant.shio — Home Assistant MQTT Discovery Helper
+// ============================================================
+//
+// Usage:
+//   #include "homeassistant"
+//   import mqtt;
+//
+//   ha = HomeAssistant("tcp://ha.local:1883", "user", "pass");
+//   ha.set_device("my_device", "My Device");
+//   ha.connect();
+//   ha.add_switch("lamp", "Desk Lamp", [](p) { std.print(p); });
+//   ha.publish_discovery();
+//   ha.publish_on_off("lamp", 1);
+//
+//   for(1)
+//       ha.update();
+//       std.sleep(1000);
+//
+// ============================================================
+
+import mqtt;
+
+class HomeAssistant
+{
+    __init__(broker, user = "", pass = "", client_id = "shizoscript")
+    {
+        this._broker    = broker;
+        this._user      = user;
+        this._pass      = pass;
+        this._client_id = client_id;
+        this._prefix    = "homeassistant";
+        this._connected = 0;
+        this._mq        = None;
+
+        this._dev_id    = "shizoscript";
+        this._dev_name  = "ShizoScript";
+        this._dev_mfr   = "Shizotech";
+        this._dev_model = "shizoscript";
+        this._dev_sw    = "1.0";
+
+        this._entities  = std.json();
+        this._handlers  = std.json();
+        this._sub_queue = [];
+    }
+
+    // ---------------------------------------------------------------
+    // Configuration (chainable)
+    // ---------------------------------------------------------------
+
+    // Set the HA MQTT Discovery prefix (default: "homeassistant")
+    set_prefix(prefix)
+    {
+        this._prefix = prefix;
+        return this;
+    }
+
+    // Configure the HA device block shared by all entities
+    set_device(id, name, manufacturer = "Shizotech", model = "shizoscript", sw_version = "1.0")
+    {
+        this._dev_id    = id;
+        this._dev_name  = name;
+        this._dev_mfr   = manufacturer;
+        this._dev_model = model;
+        this._dev_sw    = sw_version;
+        return this;
+    }
+
+    // ---------------------------------------------------------------
+    // Connection
+    // ---------------------------------------------------------------
+
+    // Connect to the MQTT broker. Returns 1 on success, 0 on failure.
+    connect()
+    {
+        this._mq = mqtt.mqtt();
+        this._mq.configure(this._broker, this._client_id);
+
+        this._mq.set_callbacks([this](topic, payload, qos, retained)
+        {
+            handler = this._handlers[topic];
+            if(handler != None)
+                handler(payload);
+        });
+
+        result = this._mq.connect(this._user, this._pass);
+        if(!result["ok"])
+        {
+            std.print("HomeAssistant: connect failed:", result["error"]);
+            this._mq = None;
+            return 0;
+        }
+
+        this._connected = 1;
+
+        // Subscribe to topics that were queued before connect
+        this._sub_queue.foreach([this](t)
+        {
+            this._mq.subscribe(t, 1);
+        });
+        this._sub_queue = [];
+
+        return 1;
+    }
+
+    // Disconnect and set availability to offline
+    disconnect()
+    {
+        if(this._connected)
+        {
+            this.set_availability(0);
+            this._mq.disconnect();
+            this._connected = 0;
+        }
+        return this;
+    }
+
+    // Returns 1 if connected to the broker
+    is_connected()
+    {
+        return this._connected;
+    }
+
+    // Poll for incoming MQTT commands. Call this regularly.
+    update()
+    {
+        if(this._connected)
+            this._mq.poll();
+        return this;
+    }
+
+    // ---------------------------------------------------------------
+    // Entity creators (chainable)
+    // ---------------------------------------------------------------
+
+    // Add an ON/OFF switch
+    //   on_command: callback(payload) — called with "ON" or "OFF"
+    add_switch(name, display_name, on_command = None, icon = "mdi:toggle-switch")
+    {
+        uid   = this._dev_id + "_" + name;
+        cmd   = this._dev_id + "/" + name + "/set";
+        state = this._dev_id + "/" + name + "/state";
+
+        config = '{' +
+            '"name":"'          + display_name + '",' +
+            '"unique_id":"'     + uid + '",' +
+            '"command_topic":"' + cmd + '",' +
+            '"state_topic":"'   + state + '",' +
+            '"payload_on":"ON","payload_off":"OFF",' +
+            '"icon":"' + icon + '",' +
+            this._avail_json() + ',' +
+            '"device":' + this._device_json() +
+        '}';
+
+        this._register("switch", uid, config, cmd, on_command);
+        return this;
+    }
+
+    // Add a binary sensor (read-only ON/OFF)
+    add_binary_sensor(name, display_name, device_class = "running", icon = "mdi:heart-pulse")
+    {
+        uid   = this._dev_id + "_" + name;
+        state = this._dev_id + "/" + name + "/state";
+
+        config = '{' +
+            '"name":"'         + display_name + '",' +
+            '"unique_id":"'    + uid + '",' +
+            '"state_topic":"'  + state + '",' +
+            '"payload_on":"ON","payload_off":"OFF",' +
+            '"device_class":"' + device_class + '",' +
+            '"icon":"' + icon + '",' +
+            this._avail_json() + ',' +
+            '"device":' + this._device_json() +
+        '}';
+
+        this._register("binary_sensor", uid, config, "", None);
+        return this;
+    }
+
+    // Add a press button
+    //   on_command: callback(payload) — called with "PRESS"
+    add_button(name, display_name, on_command = None, icon = "mdi:gesture-tap-button")
+    {
+        uid = this._dev_id + "_" + name;
+        cmd = this._dev_id + "/" + name + "/press";
+
+        config = '{' +
+            '"name":"'          + display_name + '",' +
+            '"unique_id":"'     + uid + '",' +
+            '"command_topic":"' + cmd + '",' +
+            '"payload_press":"PRESS",' +
+            '"icon":"' + icon + '",' +
+            this._avail_json() + ',' +
+            '"device":' + this._device_json() +
+        '}';
+
+        this._register("button", uid, config, cmd, on_command);
+        return this;
+    }
+
+    // Add a text/value sensor (read-only)
+    add_sensor(name, display_name, icon = "mdi:information", entity_category = "")
+    {
+        uid   = this._dev_id + "_" + name;
+        state = this._dev_id + "/" + name + "/state";
+
+        cat = "";
+        if(!entity_category.empty())
+            cat = '"entity_category":"' + entity_category + '",';
+
+        config = '{' +
+            '"name":"'        + display_name + '",' +
+            '"unique_id":"'   + uid + '",' +
+            '"state_topic":"' + state + '",' +
+            '"icon":"' + icon + '",' +
+            cat +
+            this._avail_json() + ',' +
+            '"device":' + this._device_json() +
+        '}';
+
+        this._register("sensor", uid, config, "", None);
+        return this;
+    }
+
+    // ---------------------------------------------------------------
+    // State publishing (chainable)
+    // ---------------------------------------------------------------
+
+    // Publish arbitrary state string for an entity
+    publish_state(name, value)
+    {
+        if(!this._connected)
+            return this;
+        this._mq.publish(this._dev_id + "/" + name + "/state", value, 1, 1);
+        return this;
+    }
+
+    // Publish ON or OFF based on a boolean/int
+    publish_on_off(name, is_on)
+    {
+        state = "OFF";
+        if(is_on)
+            state = "ON";
+        return this.publish_state(name, state);
+    }
+
+    // Publish all discovery configs to HA and set availability online
+    publish_discovery()
+    {
+        if(!this._connected)
+            return this;
+
+        this._entities.foreach([this](key, entry)
+        {
+            topic = this._prefix + "/" + entry["type"] + "/" + key + "/config";
+            this._mq.publish(topic, entry["config"], 1, 1);
+        });
+
+        this.set_availability(1);
+        return this;
+    }
+
+    // Remove an entity from HA (publishes empty retained config)
+    remove_entity(name)
+    {
+        uid = this._dev_id + "_" + name;
+        if(!this._connected)
+            return this;
+
+        entity = this._entities[uid];
+        if(entity == None)
+            return this;
+
+        topic = this._prefix + "/" + entity["type"] + "/" + uid + "/config";
+        this._mq.publish(topic, "", 1, 1);
+        return this;
+    }
+
+    // Set device availability (1 = online, 0 = offline)
+    set_availability(online)
+    {
+        if(!this._connected)
+            return this;
+
+        v = "offline";
+        if(online)
+            v = "online";
+
+        this._mq.publish(this._dev_id + "/availability", v, 1, 1);
+        return this;
+    }
+
+    // ---------------------------------------------------------------
+    // Internal
+    // ---------------------------------------------------------------
+
+    _device_json()
+    {
+        return '{"identifiers":["' + this._dev_id + '"],' +
+               '"name":"'          + this._dev_name + '",' +
+               '"manufacturer":"'  + this._dev_mfr + '",' +
+               '"model":"'         + this._dev_model + '",' +
+               '"sw_version":"'    + this._dev_sw + '"}';
+    }
+
+    _avail_json()
+    {
+        return '"availability_topic":"' + this._dev_id + '/availability",' +
+               '"payload_available":"online",' +
+               '"payload_not_available":"offline"';
+    }
+
+    _register(type, uid, config, cmd_topic, on_command)
+    {
+        this._entities[uid] = std.json();
+        this._entities[uid]["type"]   = type;
+        this._entities[uid]["config"] = config;
+
+        if(!cmd_topic.empty())
+        {
+            if(on_command != None)
+                this._handlers[cmd_topic] = on_command;
+
+            if(this._connected)
+                this._mq.subscribe(cmd_topic, 1);
+            else
+                this._sub_queue.push_back(cmd_topic);
+        }
+    }
+}

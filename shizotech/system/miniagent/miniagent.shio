@@ -1,0 +1,516 @@
+
+#include "openai/generic_agent"
+#include "miniagent_defs"
+
+//Helper functions to set console output color
+stdfcol(col) {
+	std.color(col, "black");
+}
+stdbcol(col) {
+	std.color("white", col);
+}
+
+def create_miniagent(api_url, model, system_role, auth_token);
+
+class miniagent
+{	
+	//shizoscript todo: add 'bind' keyword which automatically frees objects and classes for any var
+	managed llm_api = None;
+	managed skills = [];
+	
+	agent_id = std.random_hash();
+	role = "";
+	filesystem = None;
+	env = [];
+	action_history = [];
+	modified_files = [];
+
+	//Callbacks
+	on_action = None;
+	
+	//helper
+	added_tools = [];
+	
+	stopped = false;
+	
+	__init__(api_url = "http://localhost:8000", model = None, system_role = "executor", auth_token = "none")
+	{
+		//Load main system skills		
+		role = system_role;
+		
+		role_path = find_skill("roles", system_role);
+		
+		role_md_path = role_path + "/ROLE.md";
+		role_code_path = role_path + "/ROLE.shio";
+		
+		role_md = fileio.read_string(role_md_path).strip();
+		
+		if(!role_md) {
+			std.runtime_error("Cannot load ROLE.md ", role_md_path);
+			return;
+		}
+		
+		llm_api = generic_agent(api_url, model, role_md.replace([
+			"{{OS}}" = std.os_platform(),
+			"{{DATE}}" = std.date("%Y-%m-%d") + " (YYYY:MM:DD)",
+		]), auth_token);
+		
+		//Register default tools
+		if(!fileio.exists(role_code_path)) {
+			std.runtime_error("Cannot load ROLE.shio ", role_code_path);
+			return;
+		}
+			
+		//Prevent agent from escaping
+		filesystem = fileio.container(".");
+		
+		role_module = std.module();
+		role_module.load_file(role_code_path);
+		
+		if(role_module.has("add_tools"))
+			role_module.call("add_tools", this);
+		else
+			std.warn("ROLE.shio found but no tool entry point for: ", role);
+		
+		skills["role"] = [md = role_md, module = role_module];
+		
+		llm_api.on_text = [this](txt)
+		{
+			env["text"] += txt;
+			env["text_capture"] += txt;
+			
+			if(std.is_function(on_action)) {
+				on_action([
+					text = txt,
+				]);
+			}
+		};
+		
+		llm_api.on_analysis = [this](txt)
+		{
+			if(std.is_function(on_action)) {
+				on_action([
+					text = txt,
+				]);
+			}
+		};
+		
+		llm_api.on_tool = [this](toolname, toolargs)
+		{
+			if(std.is_function(on_action)) {
+				on_action([
+					tool = [
+						name = toolname,
+						args = toolargs,
+					],
+				]);
+			}
+		};
+		
+		llm_api.on_analysis = [this](txt) {
+			if(std.is_function(on_action)) {
+				on_action([
+					reasoning = txt,
+				]);
+			}
+		};
+	}
+	
+	__deinit__() {
+		
+	}
+	
+	find_skill(folder_name, skill_name) {
+		//First check local .agent directory...
+		skill_path = AGENT_DIR + folder_name + "/" + skill_name;
+		
+		//If not found, check default skills
+		if(!fileio.exists(skill_path))
+			skill_path = AGENT_ROOT_DIR + folder_name + "/" + skill_name;
+		
+		if(!fileio.exists(skill_path))
+			//std.runtime_error("Agent skill does not exist: ", skill_name);
+			return "";
+		
+		return skill_path;
+	}
+	
+	load_skill(skill_name) {
+		
+		std.cout("\n\nLoading skill: " + skill_name + "\n\n");
+		
+		if(skills.has(skill_name))
+			std.print("skill ", skill_name, " already loaded.");
+			return skills[skill_name].md;
+		
+		skill_path = find_skill("skills", skill_name);
+		
+		if(!skill_path) {
+			std.print("skill ", skill_name, " not found.");
+			return "";
+		}
+		
+		skill_md_path = skill_path + "/SKILL.md";
+		skill_code_path = skill_path + "/SKILL.shio";
+		
+		skill_md = fileio.read_string(skill_md_path).strip();
+		
+		skill_module = None;
+		
+		if(fileio.exists(skill_code_path)) {
+			skill_module = std.module();
+			skill_module.load_file(skill_code_path);
+			
+			added_tools = [];
+			
+			if(skill_module.has("add_tools"))
+				skill_module.call("add_tools", this);
+			else
+				std.warn("SKILL.shio found but no tool entry point for: ", skill_name);
+		}
+		
+		skills[skill_name] = [md = skill_md, module = skill_module, added_tools = added_tools];
+		
+		if(added_tools)
+			skill_md += "\n\n# Newly added tools\n\n" + std.string(added_tools);
+		
+		return skill_md;
+	}
+	
+	list_skills() {
+		local_skills = fileio.dirs(AGENT_DIR + "skills");
+		root_skills = fileio.dirs(AGENT_ROOT_DIR + "skills");
+		
+		final_skills = [];
+		
+		for(i = 0; i < local_skills.size(); i++) {
+			final_skills.push_back([name=local_skills[i]]);
+			
+			sum_path = fileio.exists(AGENT_DIR + "skills/" + local_skills[i] + "/summary.md");
+			if(fileio.exists(sum_path))
+				final_skills[-1].summary = fileio.read_string(sum_path);
+		}
+		
+		for(i = 0; i < root_skills.size(); i++) {
+			if(!final_skills.has_value(root_skills[i]))
+				final_skills.push_back(root_skills[i]);
+			
+			sum_path = fileio.exists(AGENT_DIR + "skills/" + root_skills[i] + "/summary.md");
+			if(fileio.exists(sum_path))
+				final_skills[-1].summary = fileio.read_string(sum_path);
+		}
+		
+		return final_skills;
+	}
+	
+	add_image_url(img_url) { return llm_api.add_image_url(img_url); }
+	add_image_raw(raw_image_data, img_type = "png") { return llm_api.add_image_raw(raw_image_data, img_type); }
+	add_image(path) { return llm_api.add_image(path); }
+	
+	task(prompt)
+	{
+		env["task"] = prompt;
+		env["text"] = "";
+		env["text_capture"] = "";
+		env["goals"] = "No goals set yet. Use 'set_goals'.";
+		env.reports = [];
+		
+		try
+		{
+			start_time = std.millis();
+			res = llm_api.task(prompt);
+			
+			delta_time = std.millis() - start_time;
+
+			if(env.use_finalize) {
+				
+				if(env.reports.size()) {
+					return [
+						ok=true, 
+						reports=env.reports,
+						execution_time_ms=delta_time,
+					];
+				}
+				else {
+					
+					//res returned something so agent must be alive, force it to report...
+					if(env.reports.size() == 0)
+						llm_api.task("Summarize your last actions so far with ONE SINGLE call to finalize()!\nDo not write or call anything else!");
+					
+					//Still no reports, but we have some text from the agent, return that
+					if(env.reports.size() == 0) {
+						return [
+							ok=true, 
+							reports=[[report=res]], 
+							execution_time_ms=delta_time
+						];
+					}
+					
+					return [
+						ok=true, 
+						reports=env.reports,
+						execution_time_ms=delta_time,
+					];	
+				}
+			}
+			else if(res) {
+				return [
+					ok=true, 
+					reports=[[report=res]],
+					execution_time_ms=delta_time,
+				];		
+			}
+			
+			return [ok=false, error="Agent returned nothing (maybe crashed).", execution_time_ms=delta_time];	
+		}
+		catch(e)
+		{
+			std.error("Task failed: ", e);
+			return [
+				ok=false,
+				error="The task failed to execute correctly (crash).",
+			];
+		}
+	}
+
+	single_task(prompt) {
+		result = task(prompt);
+		if(result.ok) {
+			return result.reports[0].report;
+		}
+		return "";
+	}
+
+	stop()
+	{
+		stopped = true;
+		
+		llm_api.stop();
+		
+		for(i = 0; i < _child_agents.size(); i++) {
+			try {
+				if(_child_agents[i])
+					_child_agents[i].stop();
+			}
+			catch(e) { }		
+		}
+	}
+	
+	add_tool(
+		name,
+		description,
+		params, 
+		callback,
+	)
+	{
+		//Bridge
+		llm_api.add_tool(name, description, params, [this, callback, name](agt, p) {
+			
+			toolid = std.random_hash();
+			
+			if(this.on_action) {
+				this.on_action([
+					tool_start=[
+						id=toolid,
+						args=p,
+						name=name,
+					]
+				]);		
+			}
+			
+			res = None;
+			
+			try {
+				res = callback(this, p);
+			}
+			catch(e) {	
+				res = [
+					ok = false,
+					error = "The tool call caused an unexpected exception.",
+				];
+			}
+			
+			if(this.on_action) {
+				this.on_action([
+					tool_end=[
+						id=toolid,
+						result=res,
+						name=name,
+					]
+				]);		
+			}
+			
+			return res;
+		});
+		
+		added_tools[name] = [
+			description = description,
+		];
+	}
+	
+	add_finalize_tool(create_report = true) {
+		
+		if(env.use_finalize)
+			return;
+		
+		if(create_report) {	
+			add_tool(
+				"finalize",
+				"Exit / Terminate execution.",
+				[
+					report_manifest = "&string(): The report manifest formatted in markdown",
+					conversation_title = "&string(): Short sentence describing the current conversation",
+				],
+				[this](agt, args)
+				{
+					this.stop();
+					
+					this.env.reports.push_back([report=args.report_manifest, time=std.millis(), time_str=std.timestamp()]);
+					
+					this.env.conversation_title = args.conversation_title;
+					
+					return "Report submitted, stop now.";
+				}
+			);
+		}
+		else {
+			add_tool(
+				"finalize",
+				"Exit / Terminate execution.",
+				[
+					conversation_title = "&string(): Short single sentence describing the current conversation",
+					assistant_answer = "&string(): Final answer of the assistant to the user.",
+				],
+				[this](agt, args)
+				{
+					this.stop();
+					this.env.conversation_title = args.conversation_title;
+					this.env.reports.push_back([report=args.assistant_answer, time=std.millis(), time_str=std.timestamp()]);
+					return "Stop now.";
+				}
+			);
+		}
+		
+		env.use_finalize = true;
+		
+		llm_api.context.body.messages[0].content += "\n\n" + (create_report ? AGENT_FINALIZE_PROMPT : AGENT_FINALIZE_PROMPT_SIMPLE);
+	}
+	
+	set_history(history) {
+		llm_api.context.body.messages = history;
+	}
+	
+	history() {
+		return llm_api.context.body.messages;
+	}
+	
+	subagent(system_role, log_actions = true)
+	{
+		sub_agt = create_miniagent(llm_api.api_base_url, llm_api.context.body.model, system_role, llm_api.context.stream.auth_token);
+		if(on_action && log_actions) {
+			sub_agt_id = sub_agt.agent_id;
+			sub_agt.on_action = [this, sub_agt_id](action) {
+				this.on_action([agent = [id=sub_agt_id, action=action]]);
+			};
+		}
+
+		//Clear old entries first
+		for(i = 0; i < _child_agents.size(); i++) {
+			if(_child_agents[i])
+				_child_agents.erase(i);
+				i--;
+		}
+
+		_child_agents.push_back(sub_agt);
+		
+		return sub_agt;
+	}
+	
+	simple_agent(system_role) 
+	{
+		sub_agt = generic_agent(llm_api.api_base_url, llm_api.context.body.model, system_role, llm_api.context.stream.auth_token);
+	
+		//Clear old entries first
+		for(i = 0; i < _child_agents.size(); i++) {
+			if(!_child_agents[i])
+				_child_agents.erase(i);
+				i--;
+		}
+
+		_child_agents.push_back(sub_agt);
+		
+		return sub_agt;
+	}
+	
+	simple_rag(query, data, context = "", return_format = "") {
+		managed rag_agt = subagent("simple_rag", false);
+		
+		//The order kind of matters for less token cache misses
+		rag_prompt = "<rag_data>\n" + std.string(data) + "</rag_data>\n";
+		
+		if(context) {
+			rag_prompt += "<rag_context>\n" + context + "</rag_context>\n";	
+		}
+		
+		rag_prompt += "<rag_query>\n" + query + "</rag_query>\n";
+		
+		if(return_format) {
+			rag_prompt += "<rag_return_format>\n" + return_format + "</rag_return_format>\n";	
+		}
+		
+		return rag_agt.single_task(rag_prompt).strip();
+	}
+	
+	report_back(txt)
+	{
+		if(std.is_function(on_action)) {
+			on_action([
+				text = txt,
+			]);
+		}
+	}
+	
+	//Internally used by some tools
+	_log_action(name, content) {
+	
+		entry = [
+			name=name,
+			content=content,
+			time=std.timestamp(),
+		];
+		
+		if(content.path)
+			modified_files.push_back(content.path);
+		if(content.src_path)
+			modified_files.push_back([source=content.src_path, destination=content.dst_path]);
+		
+		base_path = fileio.exists(AGENT_DIR) ? AGENT_DIR : ".backup/";
+		base_path += "action_logs/";
+		
+		backup_file_path = "";
+		
+		for(1) {
+			ts = std.timestamp();
+			ts = ts.replace("-", "_");
+			ts = ts.replace(":", "_");
+			ts = ts.replace(" ", "__");
+			
+			if(fileio.exists(base_path + ts + ".json"))
+				std.sleep(10);
+				continue;
+			backup_file_path = base_path + ts + ".json";
+			fileio.write_json(backup_file_path, entry);
+			break;
+		}
+		
+		entry.backup_file_path = backup_file_path;
+		action_history.push_back(entry);
+	}
+	
+	_child_agents = [];
+}
+
+create_miniagent(api_url, model, system_role, auth_token = None)
+{
+	return miniagent(api_url, model, system_role, auth_token);
+}

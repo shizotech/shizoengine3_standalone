@@ -1,0 +1,175 @@
+
+using eigen;
+
+#include "engine/generators/generatorview"
+
+class timeline
+{
+	managed window = None;
+	managed cursor_pos = None;
+	managed play_btn = None;
+	managed stop_btn = None;
+	managed bpm_ctrl = None;
+	managed timeline_generators = None;
+	
+	nudge_factor = 1.0;
+
+	// Persistent state — keep these between calls
+	phase_integral = 0.0;
+	smoothed_pd    = 0.0;
+	last_nudge     = 1.0;
+	last_phase     = 0.0;
+	
+	__init__(engine, main_menu) {
+
+		engine.timeline = this;
+
+		engine_global = std.global("timeline");
+		engine_global.set(this);
+
+		window = engine.screen.window(" ");
+		window.anchor_bottom(0)
+			.anchor_left(main_menu.asset_menu.window.fixed_width())
+			.anchor_right(0)
+			.position(vec2f(0,engine.screen.height() - 350))
+			.fixed_height(350)
+			.movable_y(true)
+			.clamp_move(false);
+		
+		window.on_layout([this, engine, main_menu](){			
+			pos = this.window.position();
+			generators_window = main_menu.generators_menu.window;
+			
+			if(pos.y < generators_window.y() + generators_window.height())
+				generators_window.fixed_height(pos.y);
+				generators_window.refresh_layout();
+				
+			this.window.fixed_height(engine.screen.height() - pos.y);
+		});
+		
+		window.on_move([this, engine, main_menu](pos, old_pos) {
+
+			this.window.refresh_layout();
+			
+			if(pos.y < 50.0 || pos.y > engine.screen.height())
+				this.window.position(old_pos);
+				this.window.fixed_height(engine.screen.height() - old_pos.y);
+				return;
+			
+			generators_window = main_menu.generators_menu.window;
+			
+			if(pos.y < generators_window.y() + generators_window.height())
+				generators_window.fixed_height(pos.y);
+				generators_window.refresh_layout();
+		
+			this.window.fixed_height(engine.screen.height() - pos.y);
+		});
+		
+		timeline_node = window.matrixnode("timeline").anchor(0);
+		
+		timeline_widget = timeline_node.timeline("Timeline").anchor(0);
+		
+		button_panel = window.button_panel().matrixnode("timeline_header").anchor(0).layout(nanogui.layout_horizontal());
+		
+		play_btn = button_panel.controlbutton("PLAY").push(true);
+		stop_btn = button_panel.controlbutton("STOP");
+		follow_btn = button_panel.controlbutton("FOLLOW").push(true);
+		bpm_ctrl = button_panel.controlfloat("BPM").fixed_width(150).value(150);
+		beat_ctrl = button_panel.controlfloat("BEAT").fixed_width(150).value(150);
+		pos_ctrl = button_panel.controlfloat("POSITION");
+		cursor_pos = pos_ctrl;
+		
+		stop_btn.callback([play_btn, pos_ctrl](v){
+			if(!v)
+				return;
+			play_btn.value(0);
+			pos_ctrl.value(0);
+		});
+		
+		pos_ctrl.callback([timeline_widget, beat_ctrl](v) {
+			beat_ctrl.value(math.fract(v));
+			timeline_widget.cursor(v);
+		});
+		
+		timeline_widget.scrub_callback([pos_ctrl](pos) {
+			pos_ctrl.value(pos);
+		});
+		
+		
+		timeline_generators = generatorview(timeline_node);
+		timeline_generators.area.visible(false);
+		timeline_generators.grid_size = 32.0;
+		
+		select_mode = button_panel.controlcombo("TIMELINE_MODE").items(["TIMELINE", "CONTROLS"]);
+		select_mode.on_change([timeline_widget, timeline_generators](v, txt) {
+			timeline_widget.visible(v == 0);
+			timeline_generators.area.visible(v != 0);
+		});
+		
+		engine.save_hooks["timeline_generators"] = [timeline_generators](){		
+			return timeline_generators.save_state();
+		};
+		
+		engine.load_hooks["timeline_generators"] = [timeline_generators](states){					
+			return timeline_generators.load_state(states);
+		};
+	}
+
+
+	set_bpm(bpm) {
+		bpm_ctrl.value(bpm);
+	}
+
+	phase_distance(desired, actual)
+	{
+		d = desired - actual;
+		d -= math.floor(d + 0.5);
+		return d;
+	}
+
+	nudge_position(phase)
+	{
+		real_frac = math.fract(phase);
+		cur_frac  = math.fract(cursor_pos.value());
+
+		// 1. Continuous phase distance (not just on wrap)
+		pd = phase_distance(real_frac, cur_frac);
+
+		// 2. Hysteresis: prevent 180° flips from noise when near ambiguity
+		//    If we were locked (small error) and suddenly jump near ±0.5,
+		//    clamp toward the previous direction instead of flipping.
+		if (math.abs(pd) > 0.45 && math.abs(smoothed_pd) < 0.25)
+		{
+			pd = math.sign(smoothed_pd) * 0.45;
+		}
+
+		// 3. Smooth the error (low-pass). This also filters out single-frame
+		//    ambiguity flips that slip past the hysteresis.
+		smoothed_pd = math.lerp(smoothed_pd, pd, 0.25);
+
+		// 4. Integral term: learns the permanent BPM offset.
+		//    This is what eliminates steady-state error without snapping.
+		//    Only integrate when we have reasonable confidence (error < 0.3).
+		if (math.abs(smoothed_pd) < 0.3)
+		{
+			phase_integral += smoothed_pd * 0.003;
+		}
+		// Clamp so a transient doesn't wind us up forever
+		phase_integral = math.clamp(phase_integral, -0.08, 0.08);
+
+		// 5. Proportional term: pulls phase into alignment.
+		//    Use a gentler curve than pow(4) — pow(1.5) or even linear
+		//    gives much faster convergence while still being soft.
+		p_term = math.sign(smoothed_pd) * math.pow(math.abs(smoothed_pd), 1.5) * 0.25;
+
+		// 6. Combine: 1.0 = nominal speed
+		nudge = 1.0 + phase_integral + p_term;
+
+		// 7. Rate-limit the nudge itself so the cursor never jerks
+		nudge = math.lerp(last_nudge, nudge, 0.35);
+		last_nudge = nudge;
+
+		last_phase = phase;
+		nudge_factor = nudge;
+	}
+}

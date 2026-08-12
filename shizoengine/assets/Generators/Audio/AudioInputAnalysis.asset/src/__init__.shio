@@ -1,0 +1,285 @@
+
+import subprocess;
+import ipc;
+
+using eigen;
+
+managed audio_check_thread = None;
+managed audio_process = None;
+managed ipc_handle = None;
+managed ipc_handle_in = None;
+
+ipc_name = "shizoserver_" + std.random_hash();
+
+dispatcher(generator, cmd, value) {
+
+}
+
+restart_audio_process() {
+	if(!audio_process || audio_process.exited()) {
+		std.print("starting audio...");
+		
+		try {
+			audio_process = None;
+		}
+		catch(e) {}
+		
+		exe_path = std.local_executable();
+		
+		args = [
+			exe_path,
+			"engine.processes.audio_process",
+			ipc_name,
+		];
+
+		audio_process = subprocess.process();
+		audio_process.terminate_on_destroy(true);
+		audio_process.start(args, std.wd(), false);
+		audio_process.terminate_on_destroy(true);
+		
+		std.print("audio started.");
+	}	
+}
+
+shader_src = R"(
+#version 330 core
+
+uniform sampler2D fftTexture;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+float line(float y, float center, float width)
+{
+    return 1.0 - smoothstep(width, width * 2.0, abs(y - center));
+}
+
+void main()
+{
+    vec2 uv = v_uv;
+
+    vec3 color = vec3(0.015, 0.018, 0.025);
+
+    // ------------------------------------------------------------
+    // Background Grid
+    // ------------------------------------------------------------
+    float gridX = smoothstep(0.98,1.0,abs(fract(uv.x*32.0)-0.5)*2.0);
+    float gridY = smoothstep(0.98,1.0,abs(fract(uv.y*16.0)-0.5)*2.0);
+
+    color += vec3(0.04)*(gridX+gridY)*0.25;
+
+    // ============================================================
+    // FFT
+    // ============================================================
+    if(uv.y < 0.5)
+    {
+        vec2 fuv = vec2(uv.x,0.25);
+
+        float fft = clamp(texture(fftTexture,fuv).r,0.0,1.0);
+
+        // Scale into top half
+        fft *= 0.48;
+
+        float bar = step(uv.y, fft);
+
+        // Nice vertical gradient
+        vec3 barColor =
+            mix(vec3(0.0,0.5,1.0),
+                vec3(0.0,1.0,0.75),
+                fft*2.0);
+
+        // Glow around bar edge
+        float glow = exp(-80.0*abs(uv.y-fft));
+
+        color += barColor * bar;
+        color += barColor * glow * 0.7;
+
+        // Peak highlight
+        color += vec3(1.0) * line(uv.y, fft, 0.002);
+
+        // Reflection
+        color += barColor * bar *
+                 (1.0-uv.y*2.0) *
+                 0.18;
+    }
+
+    // ============================================================
+    // Waveform
+    // ============================================================
+    else
+    {
+        vec2 wuv = vec2(uv.x,0.75);
+
+        float sample = texture(fftTexture,wuv).r;
+        sample = clamp(sample,-1.0,1.0);
+
+        float center = 0.75;
+
+        float ypos = center + sample*0.20;
+
+        float waveform = line(uv.y,ypos,0.003);
+
+        vec3 waveColor = vec3(1.0,0.35,0.15);
+
+        color += waveColor * waveform;
+
+        // Glow
+        color += waveColor * waveform * 2.0;
+
+        // Fill to center
+        float fill = smoothstep(0.0,0.01,
+            abs(uv.y-center)-abs(sample*0.20));
+
+        color += waveColor*(1.0-fill)*0.18;
+
+        // Center line
+        color += vec3(0.25)*line(uv.y,center,0.0015);
+    }
+
+    // Divider
+    color += vec3(0.15) * line(uv.y,0.5,0.001);
+
+    // Mild vignette
+    float vignette =
+        smoothstep(1.2,0.3,length(uv-0.5));
+
+    color *= vignette;
+
+    // Gamma
+    color = pow(color, vec3(0.85));
+
+    fragColor = vec4(color,1.0);
+}
+
+)";
+
+entry(generator, area) {	
+
+	top_area = area.vscroll().anchor(0).anchor_bottom(0);
+	//out_area = area.widget().anchor_bottom(0).fixed_height(20);
+	
+	area = top_area.content().layout(nanogui.layout_vertical());
+
+	sync = area.controlbutton("SYNC TIMELINE").push(1);
+	
+	out = area.control("FFT TEXTURE", "output_ctrls");
+
+	
+	beat_cnt = area.collapsable("Settings").expanded(true).content().layout(nanogui.layout_vertical());
+	fix_bpm = beat_cnt.controlfloat("Fix BPM").min(-1).max(999).value(-1);
+	phase = beat_cnt.controlslider("Phase offset").min(-0.5).max(0.5).value(0.0);
+	
+	break_treshold = beat_cnt.controlslider("Break Treshold").value(0.3);
+	drop_treshold = beat_cnt.controlslider("Drop Treshold").value(0.6);
+	
+	low_energy_cutoff = beat_cnt.controlslider("Low Energy Cutoff").min(20).max(20000).value(250);
+	high_energy_cutoff = beat_cnt.controlslider("High Energy Cutoff").min(20).max(20000).value(4000);
+	
+	vars_cnt = area.collapsable("Analysis").content().layout(nanogui.layout_vertical());
+	
+	bpm = vars_cnt.controlfloat("BPM").max(999);
+	beat = vars_cnt.controlslider("BEAT");
+	
+	low_energy = vars_cnt.controlslider("LOW ENERGY");
+	mid_energy = vars_cnt.controlslider("MID ENERGY");
+	high_energy = vars_cnt.controlslider("HIGH ENERGY");
+	
+	score = vars_cnt.controlslider("SCORE").max(10000);
+	break_ctrl = vars_cnt.controlslider("BREAK");
+	break_ctrl2 = vars_cnt.controlslider("BREAK INV");
+	
+	fft_cnt = area.collapsable("FFT").expanded(true).content().layout(nanogui.layout_vertical());
+	
+	fft_band_smoothing = fft_cnt.controlslider("Band Smoothing").max(50).value(5);
+	fft_attack = fft_cnt.controlslider("Attack").value(0.45);
+	fft_decay =  fft_cnt.controlslider("Decay").value(0.995);
+	fft_release = fft_cnt.controlslider("Release").value(0.08);
+	fft_nfloor = fft_cnt.controlslider("Noise Floor").value(0.08);
+	
+	fft_shader = fft_cnt.shader();
+	fft_shader.fragment_source(shader_src);
+	fft_shader.render_size(vec2i(1024,256));
+	
+	fft_image = fft_cnt.image().visible(false);
+	fft_texture = fft_image.texture();
+	fft_texture.pixel_format("r").component_format("float32").size(vec2i(512,2));
+	
+	fft_shader.input("fftTexture", fft_image);
+	
+	ipc_handle = ipc.ipc();
+	ipc_handle_in = ipc.ipc();
+	
+	ipc_handle.connect(ipc_name, true);
+
+	get_phase = [phase](current_phase) {
+		current_phase = phase.value() + current_phase;
+		if(current_phase > 1.0)
+			current_phase -= 1.0;
+		if(current_phase < 0.0)
+			current_phase += 1.0;
+		return current_phase;
+	};
+	
+	ipc_handle.on_message([beat, bpm, score, break_ctrl, break_ctrl2, get_phase, fft_texture,
+	low_energy, mid_energy, high_energy](msg) {
+		if(msg.type == "info") {
+			beat.value(get_phase(msg.phase));
+			score.value(msg.cum_score);
+			bpm_delta = msg.bpm - bpm.value();
+			bpm.value(bpm.value() + bpm_delta * 0.1);
+			break_ctrl.value(msg.break_detected);
+			break_ctrl2.value(!msg.break_detected);
+			
+			low_energy.value(msg.energy[0]);
+			mid_energy.value(msg.energy[1]);
+			high_energy.value(msg.energy[2]);
+			
+			texture_buffer = msg.normalized_bands + msg.waveform;
+			
+			fft_texture.upload_data(texture_buffer);
+		}
+		else if(msg.type == "beat")
+		{
+			//todo trigger beat control or something
+		}
+	});
+	
+	restart_audio_process();
+	
+	ipc_handle_in.connect(ipc_name+ "_in", false);
+	
+	timeline = std.global("timeline");
+	
+	generator.pre_callback([timeline, beat, bpm, sync, fix_bpm, break_treshold, drop_treshold,
+	fft_band_smoothing, fft_attack, fft_decay, fft_release, fft_nfloor,
+	low_energy_cutoff, high_energy_cutoff](generator){	
+		
+		//Always send current settings ?
+		ipc_handle_in.send([
+			fix_bpm = fix_bpm.value(),
+			break_treshold = break_treshold.value(),
+			drop_treshold = drop_treshold.value(),
+			band_smoothing = fft_band_smoothing.value(),
+			attack = fft_attack.value(),
+			release = fft_release.value(),
+			decay = fft_decay.value(),
+			noise_floor = fft_nfloor.value(),
+			low_cutoff = low_energy_cutoff.value(),
+			high_cutoff = high_energy_cutoff.value(),
+		]);
+		
+		restart_audio_process();
+		
+		current_phase = beat.value();
+		
+		if(sync.value())
+			timeline.set_bpm(bpm.value());
+			timeline.nudge_position(current_phase);
+	});
+	
+	out.value(fft_image);
+	out.callback([out, fft_image](v){
+		//Reset value back to shader...
+		out.value(fft_image);
+	});
+}

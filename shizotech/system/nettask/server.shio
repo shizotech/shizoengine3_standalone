@@ -1,0 +1,774 @@
+// ============================================================
+// nettask_server.shio — ShizoScript Service Daemon
+//
+// Features:
+//   - Auto-discovers & launches sub-scripts
+//   - Watchdog with crash-loop protection
+//   - Persistent task state in <task>/config.json
+//   - Task stdout/stderr piped to <task>/log.txt (10 MB max)
+//   - Optional shizonet API (if ./shizonet.json exists)
+//   - Optional HA MQTT bridge (if ./mqtt.json exists)
+//     with live log tail per task
+// ============================================================
+
+import subprocess;
+import mqtt;
+
+using std;
+
+print("=== nettask daemon starting ===");
+print("Working directory:", wd());
+
+// ---------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------
+MAX_CRASHES    = 5;
+CRASH_WINDOW   = 60000;
+MAX_LOG_BYTES  = 10485760;
+LOG_FILE       = "log.txt";
+LOG_OLD_FILE   = "log.old.txt";
+LOG_TAIL_LINES = 10;
+LOG_TICK_MOD   = 6;
+
+// ---------------------------------------------------------------
+// Platform detection
+// ---------------------------------------------------------------
+_platform = os_platform();
+_is_windows = _platform.split("windows").size() > 1;
+
+// ---------------------------------------------------------------
+// State
+// ---------------------------------------------------------------
+apps = [];
+ha_connected = 0;
+mq = None;
+tick_counter = 0;
+
+// ---------------------------------------------------------------
+// String helpers
+// ---------------------------------------------------------------
+
+// Sanitize a name for use in MQTT topics and HA unique_ids.
+// Replaces spaces and special characters with underscores.
+sanitize_id(name)
+{
+    unsafe = [" ", "/", "\\", '"', "'", "#", "+", "{", "}", "(", ")", "&", "?", "!"];
+    result = name;
+    unsafe.foreach([&result](ch)
+    {
+        parts = result.split(ch);
+        joined = "";
+        for(i = 0; i < parts.size(); i++)
+        {
+            if(i > 0)
+                joined = joined + "_";
+            joined = joined + parts[i];
+        }
+        result = joined;
+    });
+    return result;
+}
+
+// Escape a string for safe embedding inside a JSON double-quoted value.
+// Handles quotes, backslashes and control characters.
+escape_json(str)
+{
+    parts = str.split("\\");
+    str = "";
+    for(i = 0; i < parts.size(); i++)
+    {
+        if(i > 0)
+            str = str + "\\\\";
+        str = str + parts[i];
+    }
+
+    parts = str.split('"');
+    str = "";
+    for(i = 0; i < parts.size(); i++)
+    {
+        if(i > 0)
+            str = str + '\\"';
+        str = str + parts[i];
+    }
+
+    return str;
+}
+
+// Build a shell command that pipes output to log.txt.
+// On Linux, uses `exec` to replace the shell so PR_SET_PDEATHSIG
+// propagates directly to the shz process.
+// On Windows, quotes the path for cmd.exe.
+build_launch_cmd(entry_path)
+{
+    if(_is_windows)
+        return '"shz" "' + entry_path + '" >> "' + LOG_FILE + '" 2>&1';
+
+    // exec replaces /bin/sh with shz so the child inherits
+    // PR_SET_PDEATHSIG and dies when the daemon is killed.
+    return "exec shz " + entry_path + " >> " + LOG_FILE + " 2>&1";
+}
+
+// ---------------------------------------------------------------
+// Per-task config
+// ---------------------------------------------------------------
+load_task_config(task_dir)
+{
+    path = task_dir + "/config.json";
+    if(fileio.exists(path))
+    {
+        cfg = fileio.read_json(path);
+        cfg["enabled"]       = cfg["enabled"]       ?? 1;
+        cfg["restart_count"] = cfg["restart_count"] ?? 0;
+        cfg["total_starts"]  = cfg["total_starts"]  ?? 0;
+        cfg["last_start"]    = cfg["last_start"]    ?? "";
+        cfg["last_crash"]    = cfg["last_crash"]    ?? "";
+        cfg["last_stop"]     = cfg["last_stop"]     ?? "";
+        cfg["crash_loop"]    = cfg["crash_loop"]    ?? 0;
+        return cfg;
+    }
+
+    cfg = std.json();
+    cfg["enabled"]       = 1;
+    cfg["restart_count"] = 0;
+    cfg["total_starts"]  = 0;
+    cfg["last_start"]    = "";
+    cfg["last_crash"]    = "";
+    cfg["last_stop"]     = "";
+    cfg["crash_loop"]    = 0;
+    return cfg;
+}
+
+save_task_config(entry)
+{
+    path = entry.dir + "/config.json";
+    fileio.write_json(path, entry.cfg);
+}
+
+timestamp()
+{
+    return std.date("%Y-%m-%d %H:%M:%S");
+}
+
+// ---------------------------------------------------------------
+// Log management
+// ---------------------------------------------------------------
+rotate_log_if_needed(task_dir)
+{
+    log_path = task_dir + "/" + LOG_FILE;
+    if(!fileio.exists(log_path))
+        return;
+
+    content = fileio.read_text(log_path);
+    if(len(content) > MAX_LOG_BYTES)
+    {
+        old_path = task_dir + "/" + LOG_OLD_FILE;
+        fileio.write_text(old_path, content);
+        fileio.write_text(log_path, "");
+        print("Log rotated for", task_dir,
+              "(" + len(content) + " bytes -> " + LOG_OLD_FILE + ")");
+    }
+}
+
+read_log_tail(task_dir)
+{
+    log_path = task_dir + "/" + LOG_FILE;
+    if(!fileio.exists(log_path))
+        return "—";
+
+    content = fileio.read_text(log_path);
+    if(content.empty())
+        return "—";
+
+    lines = content.split("\n");
+    total = lines.size();
+
+    start = 0;
+    if(total > LOG_TAIL_LINES)
+        start = total - LOG_TAIL_LINES;
+
+    tail = "";
+    for(i = start; i < total; i++)
+    {
+        if(!lines[i].empty())
+        {
+            if(!tail.empty())
+                tail = tail + "\n";
+            tail = tail + lines[i];
+        }
+    }
+
+    // HA sensor state is limited to 255 characters
+    if(len(tail) > 255)
+    {
+        tail = tail.substr(len(tail) - 252);
+        tail = "..." + tail;
+    }
+
+    if(tail.empty())
+        tail = "—";
+
+    return tail;
+}
+
+// ---------------------------------------------------------------
+// Crash-loop detection
+// ---------------------------------------------------------------
+check_crash_loop(entry)
+{
+    now = millis();
+
+    fresh = [];
+    entry.crash_times.foreach([&fresh, &now](t)
+    {
+        if(now - t < CRASH_WINDOW)
+            fresh.push_back(t);
+    });
+    entry.crash_times = fresh;
+
+    if(entry.crash_times.size() >= MAX_CRASHES)
+    {
+        print("CRASH LOOP detected for", entry.dir,
+              "(" + entry.crash_times.size() + " crashes in " +
+              CRASH_WINDOW / 1000 + "s) — disabling task.");
+        entry.cfg["enabled"]    = 0;
+        entry.cfg["crash_loop"] = 1;
+        save_task_config(entry);
+        return 1;
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------
+// App management
+// ---------------------------------------------------------------
+find_app(name)
+{
+    for(i = 0; i < apps.size(); i++)
+    {
+        if(apps[i].dir == name)
+            return &apps[i];
+    }
+    return None;
+}
+
+get_app_info(entry)
+{
+    running = !entry.proc.exited();
+    return [
+        dir           = "" + entry.dir,
+        path          = "" + entry.path,
+        running       = running,
+        enabled       = entry.cfg["enabled"],
+        crash_loop    = entry.cfg["crash_loop"],
+        restart_count = entry.cfg["restart_count"],
+        total_starts  = entry.cfg["total_starts"],
+        last_start    = "" + entry.cfg["last_start"],
+        last_crash    = "" + entry.cfg["last_crash"],
+        last_stop     = "" + entry.cfg["last_stop"]
+    ];
+}
+
+def ha_publish_state(entry);
+
+launch_process(entry)
+{
+    rotate_log_if_needed(entry.dir);
+
+    entry.proc = subprocess.process();
+    entry.proc.start(
+        [build_launch_cmd(entry.path)],
+        entry.dir,
+        1
+    );
+
+    entry.cfg["total_starts"] = entry.cfg["total_starts"] + 1;
+    entry.cfg["last_start"]   = timestamp();
+    entry.cfg["crash_loop"]   = 0;
+    save_task_config(entry);
+}
+
+start_app(name)
+{
+    entry = find_app(name);
+    if(!entry)
+        return [success = 0, message = "App not found: " + name];
+
+    if(!entry.proc.exited())
+        return [success = 0, message = "Already running: " + name];
+
+    print("Starting:", name);
+    entry.cfg["enabled"]       = 1;
+    entry.cfg["restart_count"] = 0;
+    entry.cfg["crash_loop"]    = 0;
+    entry.crash_times          = [];
+    launch_process(entry);
+    ha_publish_state(entry);
+    return [success = 1, message = "Started: " + name];
+}
+
+stop_app(name)
+{
+    entry = find_app(name);
+    if(&entry)
+        return [success = 0, message = "App not found: " + name];
+
+    if(entry.proc.exited())
+    {
+        entry.cfg["enabled"] = 0;
+        save_task_config(entry);
+        ha_publish_state(entry);
+        return [success = 0, message = "Not running: " + name];
+    }
+
+    print("Stopping:", name);
+    entry.cfg["enabled"]   = 0;
+    entry.cfg["last_stop"] = timestamp();
+    entry.proc.kill();
+    save_task_config(entry);
+    ha_publish_state(entry);
+    return [success = 1, message = "Stopped: " + name];
+}
+
+restart_app(name)
+{
+    entry = find_app(name);
+    if(&entry)
+        return [success = 0, message = "App not found: " + name];
+
+    if(!entry.proc.exited())
+        entry.proc.kill();
+
+    sleep(500);
+
+    print("Restarting:", name);
+    entry.cfg["enabled"]       = 1;
+    entry.cfg["restart_count"] = 0;
+    entry.cfg["crash_loop"]    = 0;
+    entry.crash_times          = [];
+    launch_process(entry);
+    ha_publish_state(entry);
+    return [success = 1, message = "Restarted: " + name];
+}
+
+// ---------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------
+discover_and_start()
+{
+    app_list = fileio.dirs(".", 0);
+
+    app_list.foreach([](app)
+    {
+        app_dir = app;
+        app_entry_path = "";
+
+        if(fileio.exists(app + "/__init__.shio"))
+            app_entry_path = "__init__.shio";
+        else if(fileio.exists(app + "/__init__.shx"))
+            app_entry_path = "__init__.shx";
+
+        if(app_entry_path.empty())
+            return;
+
+        cfg = load_task_config(app_dir);
+        proc = subprocess.process();
+
+        if(cfg["enabled"] && !cfg["crash_loop"])
+        {
+            print("--- starting:", app_dir, "---");
+            rotate_log_if_needed(app_dir);
+            proc.start(
+                [build_launch_cmd(app_entry_path)],
+                app_dir,
+                1
+            );
+            cfg["total_starts"] = cfg["total_starts"] + 1;
+            cfg["last_start"]   = timestamp();
+        }
+        else if(cfg["crash_loop"])
+        {
+            print("--- skipping (crash loop):", app_dir, "---");
+        }
+        else
+        {
+            print("--- skipping (disabled):", app_dir, "---");
+        }
+
+        entry = [
+            proc        = proc,
+            path        = app_entry_path,
+            dir         = app_dir,
+            mqtt_id     = sanitize_id(app_dir),
+            cfg         = cfg,
+            crash_times = []
+        ];
+
+        apps.push_back(&entry);
+        save_task_config(&entry);
+    });
+
+    print("Discovered", apps.size(), "app(s).");
+}
+
+// ---------------------------------------------------------------
+// Shizonet (optional)
+// ---------------------------------------------------------------
+init_shizonet()
+{
+    if(!fileio.exists("shizonet.json"))
+    {
+        print("shizonet.json not found — shizonet API disabled.");
+        return;
+    }
+
+    cfg = fileio.read_json("shizonet.json");
+    port = cfg["port"] ?? 9100;
+    name = cfg["name"] ?? "nettask-daemon";
+
+    print("Initializing shizonet:", name, "on port", port);
+
+    net = shizonet.server(name, port);
+
+    net.on_get("ping", [](device, data) { return "pong"; });
+    net.on_get("list", [](device, data)
+    {
+        result = [];
+        for(i = 0; i < apps.size(); i++)
+            result.push_back(get_app_info(apps[i]));
+        return result;
+    });
+    net.on_get("status", [](device, data)
+    {
+        entry = find_app(data);
+        if(!entry) return [error = "App not found"];
+        return get_app_info(entry);
+    });
+    net.on_get("start",   [](device, data) { return start_app(data); });
+    net.on_get("stop",    [](device, data) { return stop_app(data); });
+    net.on_get("restart", [](device, data) { return restart_app(data); });
+
+    net.on_get("log", [](device, data)
+    {
+        entry = find_app(data);
+        if(!entry) return [error = "App not found"];
+        return read_log_tail(entry.dir);
+    });
+
+    print("Shizonet API online on port", port);
+}
+
+// ---------------------------------------------------------------
+// MQTT / Home Assistant
+// ---------------------------------------------------------------
+ha_publish_state(entry)
+{
+    if(!ha_connected)
+        return;
+
+    mid = entry.mqtt_id;
+
+    state = "OFF";
+    if(entry.cfg["enabled"] && !entry.proc.exited())
+        state = "ON";
+
+    mq.publish("nettask/" + mid + "/state", state, 1, 1);
+    mq.publish("nettask/" + mid + "/restarts", "" + entry.cfg["restart_count"], 1, 1);
+    mq.publish("nettask/" + mid + "/starts", "" + entry.cfg["total_starts"], 1, 1);
+
+    crash = entry.cfg["last_crash"];
+    if(crash == "")
+        crash = "—";
+    mq.publish("nettask/" + mid + "/last_crash", crash, 1, 1);
+
+    cl = "OK";
+    if(entry.cfg["crash_loop"])
+        cl = "CRASH LOOP";
+    mq.publish("nettask/" + mid + "/health", cl, 1, 1);
+}
+
+ha_publish_logs()
+{
+    if(!ha_connected)
+        return;
+
+    apps.foreach([](entry)
+    {
+        tail = read_log_tail(entry.dir);
+        mq.publish("nettask/" + entry.mqtt_id + "/log", tail, 1, 1);
+    });
+}
+
+init_mqtt()
+{
+    if(!fileio.exists("mqtt.json"))
+    {
+        print("mqtt.json not found — MQTT/HA bridge disabled.");
+        return;
+    }
+
+    cfg = fileio.read_json("mqtt.json");
+
+    broker      = cfg["broker"]      ?? "tcp://localhost:1883";
+    user        = cfg["user"]        ?? "";
+    pass        = cfg["pass"]        ?? "";
+    client_id   = cfg["client_id"]   ?? "nettask_daemon";
+    ha_prefix   = cfg["ha_prefix"]   ?? "homeassistant";
+    device_id   = cfg["device_id"]   ?? "nettask_daemon";
+    device_name = cfg["device_name"] ?? "Nettask Daemon";
+
+    print("Initializing MQTT:", broker, "as", client_id);
+
+    mq = mqtt.mqtt();
+    mq.configure(broker, client_id);
+
+    mq.set_callbacks([](topic, payload, qos, retained)
+    {
+        parts = topic.split("/");
+        if(parts.size() < 3)
+            return;
+        if(parts[0] != "nettask")
+            return;
+
+        mqtt_id = parts[1];
+        action  = parts[2];
+
+        // Find app by mqtt_id
+        entry = None;
+        for(i = 0; i < apps.size(); i++)
+        {
+            if(apps[i].mqtt_id == mqtt_id)
+            {
+                entry = apps[i];
+                break;
+            }
+        }
+        if(!entry)
+            return;
+
+        if(action == "set")
+        {
+            if(payload == "ON")
+                start_app(entry.dir);
+            else if(payload == "OFF")
+                stop_app(entry.dir);
+        }
+        else if(action == "restart")
+        {
+            if(payload == "PRESS")
+                restart_app(entry.dir);
+        }
+    });
+
+    result = mq.connect(user, pass);
+    if(!result["ok"])
+    {
+        print("MQTT connection failed:", result["error"]);
+        print("HA bridge disabled — daemon continues without MQTT.");
+        mq = None;
+        return;
+    }
+
+    ha_connected = 1;
+    print("MQTT connected.");
+
+    mq.subscribe("nettask/+/set", 1);
+    mq.subscribe("nettask/+/restart", 1);
+    mq.publish("nettask/availability", "online", 1, 1);
+
+    // ---- Parent device ----
+    area        = cfg["area"]        ?? "";
+
+	area_json = "";
+	if(!area.empty())
+		area_json = ',"suggested_area":"' + escape_json(area) + '"';
+
+	// Parent device block — add area
+	parent_dev = '{"identifiers":["' + device_id + '"],' +
+				 '"name":"' + escape_json(device_name) + '",' +
+				 '"manufacturer":"Shizotech",' +
+				 '"model":"nettask",' +
+				 '"sw_version":"1.0"' +
+				 area_json + '}';
+
+    mq.publish(
+        ha_prefix + "/sensor/" + device_id + "_task_count/config",
+        '{"name":"Tasks",' +
+        '"unique_id":"' + device_id + '_task_count",' +
+        '"state_topic":"nettask/task_count",' +
+        '"icon":"mdi:format-list-numbered",' +
+        '"availability_topic":"nettask/availability",' +
+        '"device":' + parent_dev + '}',
+        1, 1
+    );
+    mq.publish("nettask/task_count", "" + apps.size(), 1, 1);
+
+    // ---- Per-task child devices ----
+    apps.foreach([&ha_prefix, &device_id, &parent_dev, &area_json](entry)
+    {
+        mid  = entry.mqtt_id;
+        tid  = device_id + "_" + mid;
+        name = escape_json(entry.dir);
+
+        // Child device block — same area
+		task_dev = '{"identifiers":["' + tid + '"],' +
+				   '"name":"' + name + '",' +
+				   '"manufacturer":"Shizotech",' +
+				   '"model":"nettask-task",' +
+				   '"sw_version":"1.0",' +
+				   '"via_device":"' + device_id + '"' +
+				   area_json + '}';
+
+        avail = '"availability_topic":"nettask/availability",' +
+                '"payload_available":"online",' +
+                '"payload_not_available":"offline"';
+
+        mq.publish(ha_prefix + "/switch/" + tid + "/config",
+            '{"name":"Enabled",' +
+            '"unique_id":"' + tid + '_switch",' +
+            '"command_topic":"nettask/' + mid + '/set",' +
+            '"state_topic":"nettask/' + mid + '/state",' +
+            '"payload_on":"ON","payload_off":"OFF",' +
+            '"icon":"mdi:script-text-play",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/binary_sensor/" + tid + "_status/config",
+            '{"name":"Running",' +
+            '"unique_id":"' + tid + '_status",' +
+            '"state_topic":"nettask/' + mid + '/state",' +
+            '"payload_on":"ON","payload_off":"OFF",' +
+            '"device_class":"running",' +
+            '"icon":"mdi:heart-pulse",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/button/" + tid + "_restart/config",
+            '{"name":"Restart",' +
+            '"unique_id":"' + tid + '_restart",' +
+            '"command_topic":"nettask/' + mid + '/restart",' +
+            '"payload_press":"PRESS",' +
+            '"icon":"mdi:restart",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_path/config",
+            '{"name":"Script",' +
+            '"unique_id":"' + tid + '_path",' +
+            '"state_topic":"nettask/' + mid + '/path",' +
+            '"icon":"mdi:file-code",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+        mq.publish("nettask/" + mid + "/path", entry.path, 1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_restarts/config",
+            '{"name":"Restart Count",' +
+            '"unique_id":"' + tid + '_restarts",' +
+            '"state_topic":"nettask/' + mid + '/restarts",' +
+            '"icon":"mdi:counter",' +
+            '"state_class":"total_increasing",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_starts/config",
+            '{"name":"Total Starts",' +
+            '"unique_id":"' + tid + '_starts",' +
+            '"state_topic":"nettask/' + mid + '/starts",' +
+            '"icon":"mdi:play-circle-outline",' +
+            '"state_class":"total_increasing",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_last_crash/config",
+            '{"name":"Last Crash",' +
+            '"unique_id":"' + tid + '_last_crash",' +
+            '"state_topic":"nettask/' + mid + '/last_crash",' +
+            '"icon":"mdi:alert-circle-outline",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_health/config",
+            '{"name":"Health",' +
+            '"unique_id":"' + tid + '_health",' +
+            '"state_topic":"nettask/' + mid + '/health",' +
+            '"icon":"mdi:shield-check",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        mq.publish(ha_prefix + "/sensor/" + tid + "_log/config",
+            '{"name":"Log",' +
+            '"unique_id":"' + tid + '_log",' +
+            '"state_topic":"nettask/' + mid + '/log",' +
+            '"icon":"mdi:text-box-outline",' +
+            '"entity_category":"diagnostic",' +
+            avail + ',"device":' + task_dev + '}',
+            1, 1);
+
+        ha_publish_state(entry);
+		
+		mq.publish("nettask/" + mid + "/log", read_log_tail(entry.dir), 1, 1);
+
+    });
+
+    print("HA bridge online —", apps.size(), "task device(s) published.");
+}
+
+// ---------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------
+discover_and_start();
+init_shizonet();
+init_mqtt();
+
+poll_interval = 5000;
+if(fileio.exists("mqtt.json"))
+{
+    poll_cfg = fileio.read_json("mqtt.json");
+    poll_interval = poll_cfg["poll_interval"] ?? 5000;
+}
+
+print("=== nettask daemon running ===");
+
+// ---------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------
+for(1)
+{
+    if(ha_connected)
+        mq.poll();
+
+    sleep(poll_interval);
+    tick_counter = tick_counter + 1;
+
+    apps.foreach([](&entry)
+    {
+        if(entry.proc.exited() && entry.cfg["enabled"])
+        {
+            entry.crash_times.push_back(millis());
+            entry.cfg["restart_count"] = entry.cfg["restart_count"] + 1;
+            entry.cfg["last_crash"]    = timestamp();
+
+            if(check_crash_loop(entry))
+            {
+                print("Task disabled due to crash loop:", entry.dir);
+                ha_publish_state(entry);
+                return;
+            }
+
+            print("Crashed — restarting:", entry.dir,
+                  "(crash #" + entry.cfg["restart_count"] + ")");
+            launch_process(entry);
+        }
+
+        ha_publish_state(entry);
+    });
+
+    if(tick_counter > LOG_TICK_MOD)
+		tick_counter = 0;
+        ha_publish_logs();
+}

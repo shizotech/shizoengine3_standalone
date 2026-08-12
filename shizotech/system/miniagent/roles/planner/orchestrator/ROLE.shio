@@ -1,0 +1,169 @@
+
+#include "../../../miniagent"
+#include "../../SHARED"
+
+first_prompt = R"(
+Required skills: <SKILLS>
+
+The high-level goal is:
+
+```goal
+<GOAL>
+```
+
+No task list exists yet.
+
+Read required skills first if applicable.
+
+Then it's your responsibility to analyze this goal, investigate the required scope, and create the initial set of tasks using one or multiple calls to create_task and priority 'normal'.
+
+Create tasks that represent meaningful work units required to achieve the goal, split the work into logical actions.
+
+Do not implement anything yet.
+
+After creating the initial tasks, start a task by calling task_start.
+)";
+
+run_prompt = R"(
+```history
+<HISTORY>
+```
+
+Your current task is:
+
+```task
+<TASK>
+```
+
+Required skills: <SKILLS>
+
+Execute your current task only now.
+Follow the response format exactly.
+)";
+
+add_tools(agt)
+{
+	//This is needed because some models tend to loop forever without an exit...
+	//Or maybe not with this short system prompt?
+	//agt.add_finalize_tool(true);
+
+	add_read_tools(agt);
+	add_code_read_tools(agt);
+	add_skill_tools(agt);
+
+	agt.add_tool(
+		"execute_plan",
+		"Execute a plan",
+		[
+			goal = "&string(): The goal in great detail.",
+			git_message = "&string(): Short description what this is about, use words only, no symbols or quotes.",
+			skills = "array(string): List of required or useful skills that are needed or helpful to complete the task (if non are applicable, this is OPTIONAL)",
+		],
+		[](agt, args)
+		{	
+			if(agt.env.plan_in_progress)
+				return "Error: another plan is already running. Wait till the other plan finished.";
+		
+			agt.env.plan_in_progress = true;
+		
+			if(!args.git_message)
+				args.git_message = "dreamer commit";
+			
+			std.system("git add -A");
+			std.system("git commit -m \"before checkpoint: " + args.git_message.replace("\"", "'") + "\"");
+		
+			steps = 1;
+			
+			env = [taskboard = [], journals=[], task_stack=[], task_id=None];
+		
+			prompt = first_prompt.replace("<GOAL>", args.goal);
+			if(args.skills)
+				prompt = prompt.replace("<SKILLS>", "" + args.skills);
+		
+			try {
+				for(true) {
+
+					std.cout("\n[STEP " + steps + "]\n\n");
+					
+					//std.print(env);
+
+					managed executor = agt.subagent("planner/executor");
+					executor.env = env;
+					if(agt.on_action) {
+						executor.on_action = [agt](act) {
+							agt.on_action(act);
+						};
+					}
+					
+					executor.llm_api.context.body.messages[0].content = executor.llm_api.context.body.messages[0].content.replace("<GOAL>", args.goal); 
+					
+					step_result = None;
+					
+					current_task = None;
+					
+					has_open_tasks = false;
+					
+					for(i = 0; i < env.taskboard.size(); i++) {
+						if(env.taskboard[i].status == "in_progress")
+							current_task = std.string(env.taskboard[i]);
+						if(env.taskboard[i].status == "open")
+							has_open_tasks = true;
+					}
+					
+					if(!current_task) {
+						current_task = std.string(env.taskboard);
+						if(has_open_tasks)
+							current_task += "\n\nUse task_start to choose one of these tasks now before doing anything!";
+						else
+							current_task += "\n\nNo open tasks, create a new task or call plan_finished!";
+					}
+
+					try {
+						task_prompt = prompt.replace("<TASK>", std.string(current_task));
+						if(env.task_id)
+							task_prompt.replace("<HISTORY>", std.string(env.journals[env.task_id]));
+						else
+							task_prompt.replace("<HISTORY>", "No history yet.");
+						step_result = executor.task(prompt.replace("<TASK>", std.string(current_task)));
+					}
+					catch(e) {}
+					
+					last_report = step_result.reports ? step_result.reports[0].report : "no_report: The agent might have crashed during its run.";
+					
+					modified_files = executor.modified_files;
+					
+					if(env.plan_finished) {
+						std.system("git add -A");
+						std.system("git commit -m \"after checkpoint: " + args.git_message.replace("\"", "'") + "\"");
+						agt.env.plan_in_progress = false;
+						return env.taskboard;
+					}
+					
+					if(steps == 1) {
+						prompt = run_prompt;
+						if(args.skills)
+							prompt = prompt.replace("<SKILLS>", "" + args.skills);
+					}
+					
+					steps++;
+				}
+			}
+			catch(e) {}
+	
+			std.system("git add -A");
+			std.system("git commit -m \"after checkpoint: " + args.git_message.replace("\"", "'") + "\"");
+	
+			agt.env.plan_in_progress = false;
+			
+			agt.stop();
+			
+			std.print(env.taskboard);
+			std.print(env.journals);
+	
+			return [
+				ok=false,
+				error="Unknown error (agent loop exited unexpectedly).",
+			];
+		}
+	);
+}

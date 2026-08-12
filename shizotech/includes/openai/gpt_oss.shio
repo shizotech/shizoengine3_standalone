@@ -1,0 +1,882 @@
+
+//SIMPLIFIED JSON
+
+//simple_json = [
+//	brand = "&string(1,64): The brand of the car.",
+//	model = "string(1,64): The model.", //No &, its an optional parameter
+//	car_type = ["sedan", "SUV", "truck", "coupe"],
+//	car_data = [
+//		engine = "&string",
+//		revs = "&int(1,2000)"
+//	],
+//	
+//	car_nicknames = "&uarray(string,16,20)" //array or unique_array (uarray) (type, min, max)
+//];
+
+#include "harmony_context"
+#include "openai"
+
+class gpt_oss
+{
+	api_base_url = "http://localhost:8000";
+	context 	= harmony_context("");
+	model 		= None;
+	interfaces 	= None; //Use like interfaces["memory"] etc to add other functionalities
+	
+	//Use API standard values
+	temperature 	= None;
+	top_p 			= None;
+	top_k 			= None;
+	
+	//Callbacks
+	on_analysis = 0;
+	on_answer = 0;
+	on_tool = 0;
+	
+	//Internal 
+	tools 			= None;
+	tools_names 	= [];
+	web_query		= None;
+	web_fetch 		= None;
+	
+	max_total_tokens = 0;
+		
+	__init__(
+		api_url = "http://localhost:8000",
+		model_name = None, 
+		system_prompt = None
+	)
+	{
+		api_base_url = api_url;
+		
+		if(model_name)
+			model = model_name;
+		
+		context = harmony_context("");
+		
+		if(system_prompt)
+			context.system_prompt(system_prompt);
+		
+		web_query = [](args)
+		{	
+			std.print("web_query(): ", args);
+			return "This tool is currently unavailable.";
+		};
+		
+		web_fetch = [](args)
+		{	
+			std.print("web_fetch(): ", args);
+			return "This tool is currently unavailable.";
+		};
+	}
+	
+	__deinit__()
+	{
+		
+	}
+	
+	text(prompt, options = 0)
+	{
+		if(prompt.empty())
+			return "";
+		
+		use_history = options.use_history ?? true;
+		add_history = options.add_history ?? true;
+		
+		//Copy internal state
+		ctx = use_history ? context.copy(true,true) : context.copy(false,true);
+		
+		if(options.has("effort"))
+			ctx.effort = options.effort;
+		
+		if(options.tools)
+			ctx.tools = options.tools;
+		else
+			ctx.tools = "";
+		
+		ctx.user_prompt(prompt);
+					
+		res = run_harmony(ctx, options);
+
+		if(!use_history)
+			return res;
+
+		//Update internal state		
+		if(add_history)
+			context.prompt = ctx.prompt;
+
+		return res;
+	}
+	
+	task(prompt, options = 0)
+	{
+		if(prompt.empty())
+			return "";
+		
+		options.tools = simple_json_tools(tools);
+		
+		return text(prompt, options);
+	}
+	
+	get_json(prompt, schema, options = 0)
+	{
+		if(prompt.empty())
+			return 0;
+		
+		use_history = options.use_history ?? true;
+		add_history = options.add_history ?? true;
+		
+		ctx = use_history ? context.copy(true,true) : context.copy(false,true);
+		
+		json_schema = this.simple_json(schema);
+		
+		dev_fmt = "# Response Formats\n";
+		dev_fmt += "# json\n";
+		dev_fmt += "// You must return a JSON object matching the following schema:\n";
+		dev_fmt += json_schema;
+		
+		ctx.tools = "";
+		
+		ctx.system_prompt(dev_fmt);
+		
+		ctx.user_prompt(prompt);
+		
+		options.json_schema = json_schema;
+
+		res = run_harmony(ctx, options);
+
+		if(!use_history)
+			return res;
+
+		//Update internal state		
+		if(add_history)
+			context.prompt = ctx.prompt;
+		
+		return res;
+	}
+	
+	add_tool(
+		tool_name,
+		tool_description,
+		params, 
+		cb, 
+	)
+	{
+		tools[tool_name] = [
+				description = tool_description,
+				params = params,
+				cb = cb
+			];
+			
+		tools_names.push(tool_name);
+		
+		std.print("Added tool: ", tool_name);
+	}
+	
+	run_harmony(chat_template, options = 0)
+	{		
+		chat_template.remove_analysis();
+		
+		max_toks = token_count(chat_template.build_prompt());
+
+		for(max_toks.count > (max_toks.max_model_len / 2))
+		{
+			std.print("truncating context...");
+			chat_template.truncate(1);
+			max_toks = token_count(chat_template.build_prompt());
+		}
+		
+		if(options.has("json_schema"))
+		{
+			//First, reason once.
+			step_result = run_harmony_step(chat_template, "analysis");
+			
+			chat_template.role("assistant"); 
+			chat_template.token("channel");
+			chat_template.prompt += "final";
+			chat_template.token("message");
+			
+			result = run_optimized_json(&chat_template, options.json_schema);
+			//result = run_cmd("llm_json_" + model, [prompt=chat_template.build_prompt(), json_schema=options.json_schema, max_tokens = max_tokens_json, temperature=0.0]);
+			
+			chat_template.prompt += result.compact_string();
+			chat_template.token("end");
+			
+			if(result.crashed == 1 || result.answer_text.empty())
+				return None;
+			
+			return result;
+		}
+		
+		step_id = 0;
+		
+		force_next_channel = "";
+		last_channel = "";
+		
+		pre_answer = "";
+		if(options.has("pre_answer"))
+			pre_answer = options.pre_answer;
+		
+		for(1)
+		{	
+			step_result = run_harmony_step(&chat_template, force_next_channel, step_id, pre_answer);
+			force_next_channel = "";
+			pre_answer = "";
+			
+			if(step_result.finished)
+				return step_result.final;
+			if(step_result.status == "tool")
+				force_next_channel = "analysis";
+			last_channel = step_result.status;
+			step_id++;
+			
+			if(options.expect_tool ?? false)
+			{
+				force_next_channel = "commentary to";
+				options.expect_tool = false;
+			}
+			
+			if(options.no_tools ?? false)
+			{
+				force_next_channel = "final";
+			}
+		}
+	}
+	
+	run_harmony_step(chat_template, force_channel = "", step_id = 0, pre_answer = "", last_channel = "")
+	{
+		//Append system message
+		chat_template.role("assistant"); 
+		chat_template.token("channel");
+				
+		max_toks = token_count(chat_template.build_prompt());
+		max_total_tokens = max_toks.max_model_len;
+		
+		if(max_toks.count >= max_toks.max_model_len)
+			std.error("No more tokens left! " + max_toks.count);
+			return None;
+		
+		channel = force_channel;
+		
+		if(channel.empty())
+		{		
+			for(1)
+			{
+				local_api = openai_stream(api_base_url);
+			
+				//Could use run_choice here but this is a bit special
+				local_api.start("/v1/completions", [
+					model=model, 
+					temperature=0.0,
+					max_tokens=8,
+					prompt=chat_template.build_prompt()
+				]);
+				
+				channel_meta = local_api.answer();
+				if(!channel_meta)
+				{
+					std.error("Cannot get channel!");
+					continue;
+				}
+				
+				channel_text = channel_meta.text.strip();
+				
+				//Sanity checks (if structured output fails)
+				if(channel_text.starts("final"))
+					channel = "final";
+				else(channel_text.starts("commentary"))
+					channel = "commentary to";
+				else
+					channel = "analysis";
+				
+				if(last_channel == "analysis" && channel == "analysis")
+					channel = "commentary to";
+				
+				break;
+			}				
+		}
+		
+		if(channel.empty())
+			return 0;
+		
+		std.print("\n\nCHANNEL: " , channel, "\n\n");
+		
+		if(
+			channel == "analysis" || 
+			channel == "final"
+		)
+		{
+			chat_template.prompt += channel;
+			chat_template.token("message");
+			chat_template.prompt += pre_answer;
+			
+			text_content = "";
+			
+			model_params = [
+				prompt = chat_template.build_prompt(),
+				max_tokens = max_total_tokens/2,
+				stream=true,
+				stop = [
+					"assistantcommentary",
+					"assistantanalysis",
+					"assistantfinal",
+					".assistant",
+					"<|return|>",
+					"<|end|>"
+				]
+			];
+			
+			if(temperature)
+				model_params.temperature = temperature;
+			if(top_k)
+				model_params.top_k = top_k;
+			if(top_p)
+				model_params.top_p = top_p;
+			if(model)
+				model_params.model = model;
+
+			local_api = openai_stream(api_base_url);
+
+			local_api.start("/v1/completions", model_params);
+			
+			for (chunk = local_api.poll()) {
+				chunk_text = &chunk.choices[0].text;	
+				if(chunk_text) {
+					text_content += chunk_text;
+					
+					//Special edge case fix, ends on ".assistant" (add missing '.')
+					if(chunk.choices[0].stop_reason == ".assistant")
+						text_content += ".";
+					
+					if(channel == "analysis" && std.is_function(on_analysis))
+						on_analysis(step_id, chunk_text);
+					else(std.is_function(on_answer))
+						on_answer(step_id, chunk_text);				
+				}
+			}
+			
+			chat_template.prompt += text_content;
+			chat_template.token("end");
+			
+			if(channel == "final")
+				return [status="final", finished=1, final=text_content];
+			else(channel == "commentary")
+				return [status="commentary", finished=0, commentary=text_content];
+			else
+				return [status="analysis", finished=0, analysis=text_content];
+		}
+		else(channel.starts("commentary"))
+		{	
+			chat_template.prompt += channel + "=";
+			
+			choices = chat_template.tools_builtin ? ["browser.search", "browser.fetch"] : [];
+			
+			for(i = 0; i < tools.size(); i++)
+			{
+				if(!tools.key(i).empty())
+					choices.push("functions." + tools.key(i));
+			}
+			
+			//result = run_cmd("llm_choice_" + model, [prompt=chat_template.build_prompt(), choices=choices, temperature=0.0, top_p=0.9, top_k=1, max_tokens=4]);				
+			tool_choice = run_choice(chat_template.build_prompt(), choices);
+			
+			if(!tool_choice)
+				std.error("No tool chosen!");
+				return None;
+			
+			chat_template.prompt += tool_choice;
+
+			is_builtin_tool = tool_choice.starts("browser");
+			
+			get_tool_json = 0;
+			
+			chat_template.prompt += " <|constrain|>json";
+			chat_template.token("message");
+			
+			call_tool_name = tool_choice.substr(tool_choice.find(".")+1);
+			
+			if(!tools.has(call_tool_name) && !is_builtin_tool)
+				std.print("Error tool no exist: " + call_tool_name);
+				return None;
+			
+			if(is_builtin_tool)
+				if(call_tool_name == "fetch")
+					get_tool_json = simple_json(gpt_oss_builtin_fetch_def);
+				else
+					get_tool_json = simple_json(gpt_oss_builtin_search_def);
+			else
+				get_tool_json = simple_json(tools[call_tool_name].params);
+			
+			result = None;
+			
+			if(get_tool_json.size() != 0)
+			{
+				start_time = std.millis();
+				
+				//result = run_cmd("llm_json_" + model, [prompt=chat_template.build_prompt(), json_schema=get_tool_json, max_tokens=max_tokens_json, temperature=0.0]);				
+				result = run_optimized_json(&chat_template, get_tool_json);				
+				
+				if(!result)
+					std.error("Optimized json returnd None.");
+					return None;
+			}
+			
+			chat_template.prompt += result.compact_string();
+			
+			chat_template.token("call");
+			chat_template.token("end");
+			
+
+			if(std.is_function(on_tool))
+				on_tool(call_tool_name, result);
+			
+			tool_result = None;
+			
+			if(is_builtin_tool)
+			{
+				if(call_tool_name == "fetch")
+					tool_result = web_fetch(result);
+				else
+					tool_result = web_query(result);
+			}
+			else
+				tool_result = tools[call_tool_name].cb(this, result);
+			
+			if(std.is_json(tool_result))
+				tool_result = tool_result.compact_string();
+			
+			//<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>{"sunny": true, "temperature": 20}<|end|>
+			
+			chat_template.token("start");
+			if(is_builtin_tool)
+				chat_template.prompt += "browser." + call_tool_name + " to=assistant";
+			else
+				chat_template.prompt += "functions." + call_tool_name + " to=assistant";
+			chat_template.token("channel");
+			chat_template.prompt += "commentary";
+			chat_template.token("message");
+			chat_template.prompt += tool_result;
+			chat_template.token("end");
+			
+			return [status="tool", finished=0, tool=call_tool_name];
+		}
+
+		std.error(channel + " unknown channel!");
+		fileio.write_text("error_prompt.txt", chat_template.prompt);
+		return [status="std.error", finished=1, std.error=channel+" unknown channel"];
+	}
+	
+	run_choice(prompt, choices)
+	{
+		model_params = [
+			temperature=0.0,
+			max_tokens=8,
+			prompt=prompt
+		];
+		
+		if(model)
+			model_params.model = model;
+		
+		local_api = openai_stream(api_base_url);
+		
+		local_api.start("/v1/completions", model_params);	
+		answer = local_api.answer();
+		
+		if(!answer)
+			std.error("Received no answer.");
+			return None;
+		
+		for(i = 0; i < choices.size(); i++)
+		{
+			if(answer.text.starts(choices[i]))
+				return choices[i];
+		}
+		
+		//Not found, fallback to structured
+		model_params.structured_outputs = [choice=choices];
+		local_api.start("/v1/completions", model_params);	
+		answer = local_api.answer();
+		
+		//Sanity checks
+		if(!answer)
+			std.error("Received no answer.");
+			return None;
+		
+		for(i = 0; i < choices.size(); i++)
+		{
+			if(answer.text == choices[i])
+				return choices[i];
+		}
+
+		std.error("Invalid choice: ");
+		std.print(answer);
+		
+		return answer.text;
+	}
+	
+	summarize_text(text_to_sum, look_for)
+	{
+		return text("Summarize the following text according to the given criteria, write nothing else.\n\n" +
+				"Criteria:\n" + look_for + "\n\n" +
+				"Text:\n" + 
+				text_to_sum + "\n\n" +
+				"Summary:",
+				[use_history=0]
+			);
+	}
+	
+	token_count(str)
+	{
+		params = [
+			prompt = str;
+		];
+		
+		if(model)
+			params.model = model;
+		
+		for(i = 0; i < 10; i++)
+		{
+			local_api = openai_stream(api_base_url);
+			local_api.start("/tokenize", params);
+			token_count_info = local_api.poll();
+			if(token_count_info.max_model_len ?? false)
+				return token_count_info;
+			std.error("Cannot get max_model_len!");
+			std.print(token_count_info);
+		}
+	}
+	
+	run_optimized_json(&chat_template, schema)
+	{
+		model_params = [
+			temperature = 0.0,
+			prompt=chat_template.build_prompt(),
+			max_tokens = max_total_tokens/2,
+		];
+		
+		if(model)
+			model_params.model = model;
+		
+		//Try 4 times without structured.
+		for(max_cc = 4; max_cc > 0; max_cc--)
+		{			
+			local_api = openai_stream(api_base_url);
+			local_api.start("/v1/completions", model_params);
+			answer = local_api.answer();
+			
+			if(model_params.temperature < 1.0)
+				model_params.temperature += 0.5;		
+			if(model_params.temperature > 1.0)
+				model_params.temperature = 1.0;
+			
+			result_json = std.json(answer.text);
+			
+			invalid_json = 0;
+			
+			//Check for correct json, if not, force structured
+			test_props = &schema.properties;
+			test_required = &schema.required;
+			
+			for(i = 0; i < test_required.size(); i++)
+			{
+				test_key = test_required[i];
+				if(!result_json.has(test_key))
+					invalid_json = true;
+					break;
+				
+				prop = &test_props[test_key];
+				
+				if(prop.enum ?? false)
+				{
+					invalid_enum = 1;
+					for(j = 0; j < prop.enum.size(); j++)
+					{
+						if(result_json[test_key] == prop.enum[j])
+							invalid_enum = 0;
+							break;
+					}
+					if(invalid_enum)
+						invalid_json = true;
+						break;
+				}
+				else(prop.type == "string")
+				{
+					result_json[test_key] = std.string(result_json[test_key]);
+				}
+				else(prop.type == "integer")
+				{
+					result_json[test_key] = std.int(result_json[test_key]);
+					if(result_json[test_key] < prop.minimum)
+						result_json[test_key] = prop.minimum;
+					if(result_json[test_key] > prop.maximum)
+						result_json[test_key] = prop.maximum;				
+				}
+			}
+			
+			if(!invalid_json)
+				return result_json;
+			
+			std.print("\n\nInvalid json detected!\n\n");
+			std.print(result_json);
+		}
+
+		std.print("Using structured...");
+
+		//Fallback to structured
+		model_params.response_format = [
+			type = "json_schema",
+			json_schema =  [
+				name = "scheme",
+				schema = schema,
+			]
+		];
+		
+		local_api = openai_stream(api_base_url);
+		local_api.start("/v1/completions", model_params);
+		answer = local_api.answer();
+
+		result_json = std.json(answer.text);
+
+		return result_json;
+	}
+
+	fix_indent(code)
+	{
+		code_lines = code.split("\n");
+		code_result = "";
+		first_indent = -1;
+		for(i = 0; i < code_lines.size(); i++)
+		{
+			it = code_lines[i];
+			if(it.empty())
+				continue;
+			if(first_indent == -1)
+				first_indent = std.indentation(it);
+			code_result += it.substr(first_indent) + "\n";
+		}
+		
+		return code_result;
+	}
+	
+	json_result_to_text(&json_object)
+	{
+		str = "### " + json_object.tool_name + "\n";
+		
+		if(std.is_json(json_object.Results))
+		{
+			res = &json_object.Results;
+			for(i = 0; i < res.size(); i++)
+			{
+				str += "--- " + res.key(i) + "\n";
+				if(std.is_json(res[i]))
+					str += res[i].compact_string() + "\n\n";
+				else
+					str += res[i].trim() + "\n\n";
+			}
+		}
+		else
+		{
+			str += json_object.Results;
+		}
+		
+		return str.trim();
+	}
+	
+	default_key(obj, key_name, key_value)
+	{
+		if(!obj.has(key_name))
+			obj[key_name] = key_value;
+			return key_value;
+		return obj[key_name];
+	}
+	
+	simple_json(&json)
+	{
+		if(!std.is_json(json))
+			return [];
+		
+		json_schema = [type = "object"];
+
+		for(i = 0; i < json.size(); i++)
+		{
+			json_key = json.key(i);
+			
+			if(std.is_string(json[i]))
+			{
+				json_prop = &json_schema.properties[json_key];
+				
+				json_value = &json[i];
+				
+				if(json_value[0] == "&")
+					json_schema.required.push(json_key);
+					json_value = json_value.substr(1);
+				
+				comment_split = json_value.split(":", 2, true);
+				
+				paramdef_str = comment_split[0];
+				desc_str = comment_split.size() == 2 ? comment_split[1] : "";
+				
+				param_defs = paramdef_str.extract("(",")").split(",", -1, true);
+				
+				if(desc_str)
+					json_prop.description = desc_str;
+				
+				if(paramdef_str.starts("string"))
+				{
+					json_prop.type = "string";
+					if(param_defs.size() >= 1)
+						json_prop.minLength = std.int(param_defs[0]);
+					if(param_defs.size() >= 2)
+						json_prop.maxLength = std.int(param_defs[1]);
+				}
+				else(paramdef_str.starts("int"))
+				{
+					json_prop.type = "integer";
+					if(param_defs.size() >= 1)
+						json_prop.minimum = std.int(param_defs[0]);
+					if(param_defs.size() >= 2)
+						json_prop.maximum = std.int(param_defs[1]);
+				}
+				else(paramdef_str.starts("float"))
+				{
+					json_prop.type = "float";
+					if(param_defs.size() >= 1)
+						json_prop.minimum = std.float(param_defs[0]);
+					if(param_defs.size() >= 2)
+						json_prop.maximum = std.float(param_defs[1]);
+				}
+				else(paramdef_str.starts("array"))
+				{
+					json_prop.type = "array";
+					if(param_defs.size() >= 1)
+						json_prop.items.type = param_defs[0];
+					if(param_defs.size() >= 2)
+						json_prop.minItems = std.int(param_defs[1]);
+					if(param_defs.size() >= 3)
+						json_prop.maxItems = std.int(param_defs[2]);
+				}
+				else(paramdef_str.starts("uarray"))
+				{
+					json_prop.type = "array";
+					//json_prop.uniqueItems = 1; //Not supported by xgrammar
+					if(param_defs.size() >= 1)
+						json_prop.items.type = param_defs[0];
+					if(param_defs.size() >= 2)
+						json_prop.minItems = std.int(param_defs[1]);
+					if(param_defs.size() >= 3)
+						json_prop.maxItems = std.int(param_defs[2]);
+				}	
+				else
+					std.print("Unknown: " + paramdef_str);
+			}
+			else(std.is_list(json[i]))
+			{
+				json_schema.required.push(json_key);
+				json_schema.properties[json_key].type = "string";
+				json_schema.properties[json_key].enum = json[i];
+			}
+			else(std.is_json(json[i]))
+			{
+				json_schema.required.push(json_key);
+				json_schema.properties[json_key] = this.simple_json(json[i]);
+			}
+		}
+		
+		return json_schema;
+	}
+
+	simple_json_tools(&tool_json)
+	{
+		tmpl = gpt_oss_tool_template;
+		
+		tool_str = "";
+		
+		for(i = 0; i < tool_json.size(); i++)
+		{
+			//Tool name 
+			tool_name = tool_json.key(i);
+			tool_desc = tool_json[i].description;
+			tool_params = &tool_json[i].params;
+			
+			tool_str += "// " + tool_desc + "\n";
+			tool_str += "type " + tool_name + " = (_: {\n";
+			
+			tool_str += parse_tool_params(tool_params);
+			
+			tool_str += "}) => any;\n";
+		}
+		
+		return tmpl.replace("{{tools}}", tool_str);
+	}
+	
+	parse_tool_params(&tool_params)
+	{
+		res = "";
+		for(i = 0; i < tool_params.size(); i++)
+		{
+			json_value = &tool_params[i];
+			
+			if(std.is_string(json_value))
+			{
+				param_is_required = false;
+				
+				if(json_value[0] == "&")
+					param_is_required = true;
+					json_value = json_value.substr(1);
+				
+				comment_split = json_value.split(":", 2, true);
+				
+				param_def_str = comment_split[0];
+				
+				param_desc = comment_split.size() == 2 ? comment_split[1] : "";
+				
+				param_defs = param_def_str.extract("(",")").split(",", -1, true);
+							
+				if(param_desc)
+					res += "// " + param_desc.strip() + "\n";
+							
+				res += tool_params.key(i);
+				
+				if(!param_is_required)
+					res += "?";
+				
+				res += ": ";
+				
+				if(param_def_str.starts("string"))
+				{
+					res += "string,\n";
+				}
+				else(param_def_str.starts("int"))
+				{
+					res += "integer,\n";
+				}
+				else(param_def_str.starts("float"))
+				{
+					res += "float,\n";
+				}
+				else(param_def_str.starts("array") ||
+					param_def_str.starts("uarray"))
+				{
+					res += param_defs[0] + "[],\n";
+				}
+			}
+			else(std.is_list(json_value))
+			{
+				res += tool_params.key(i);
+				res += ": ";
+				
+				for(j = 0; j < json_value.size(); j++)
+				{
+					res += '''"''' + json_value[j] + '''"''';
+					
+					if(j == json_value.size()-1)
+						res += ",\n";
+					else
+						res += " | ";
+				}
+			}
+		}
+		
+		return res;
+	}
+};

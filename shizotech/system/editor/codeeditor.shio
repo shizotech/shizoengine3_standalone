@@ -1,0 +1,650 @@
+
+#include "miniagent/miniagent"
+
+import nanogui;
+
+using eigen;
+
+class widget_enable_scope
+{
+	widget = None;
+	
+	__init__(w) {
+		widget = w;
+		widget.enabled(false);
+	}
+	__deinit__() {
+		widget.enabled(true);
+	}
+}
+
+class codeeditor
+{
+	managed project_browser_container = None;
+	managed console_container = None;
+	managed filetabs = None;
+	managed filebrowser = None;
+
+	ai_connected = false;
+	ai_conversations = [];
+	ai_output_area = None;
+	
+	modified_files = [];
+	all_modified_files = [];
+	
+	__init__(parent) {
+	
+		project_browser_container = parent.window("");
+		project_browser_container.anchor_left(0).anchor_bottom(0).anchor_top(0).fixed_width(400).resizable_right(true).margin(0);
+		
+		screen_size = parent.size();
+
+		console_container = parent.window(" ");
+		console_container.anchor_left(project_browser_container.fixed_width())
+			.anchor_right(0)
+			.y(screen_size.y - 200)
+			.fixed_height(200)
+			.resizable_top(true)
+			.movable(false);
+	
+		console = console_container.content().textarea().anchor(0);
+	
+		project_tabs = project_browser_container.tabwidget().anchor(0).anchor_right(3);
+	
+		filebrowser = project_tabs.add_tab("PROJECT").anchor(0).filebrowser(".").anchor(0);
+		
+		filetabs = parent.tabwidget().anchor(0).anchor_left(project_browser_container.fixed_width()).anchor_bottom(console_container.fixed_height());
+				
+		project_browser_container.on_resize([this, filetabs, console_container](new_size, old_size){
+			filetabs.anchor_left(new_size.x);
+			console_container.anchor_left(new_size.x);
+		});
+		
+		console_container.on_resize([this, filetabs](new_size, old_size){
+			filetabs.anchor_bottom(new_size.y);
+		});
+		
+		filetabs.movable(true).closeable(true).on_close([this, filetabs](index) {
+			old_name = filetabs.tab_name(index);
+			
+			if(old_name.contains(" *")) {
+				save_result = filetabs.screen().modal_yes_no_cancel("Close without saving?");
+				if(save_result != "yes")
+					return;
+			}
+			
+			filetabs.remove_tab(index);
+		});
+		
+		filebrowser.on_double_click([this, filetabs](path) {
+			open(path);
+		});
+		
+		//Run scripts
+		run_panel = console_container.button_panel();
+		run_panel.layout(nanogui.layout_horizontal());
+		
+		compile_btn = run_panel.button("COMPILE");
+		run_btn = run_panel.button("RUN");
+		
+		ai_area = project_tabs.add_tab("AI AGENT").anchor(0);
+		ai_output_area = ai_area.vscroll().anchor(0).anchor_top(30).anchor_bottom(0.2, "percent");
+		ai_output_area.content().layout(nanogui.layout_vertical().spacing(15));
+		
+		ai_input_area = ai_area.widget().anchor(0).anchor_top(0.8, "percent");
+		
+		ai_conv_select = ai_area.combobox().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(30);
+		ai_conv_select.add_item("TEST 1").add_item("TEST2");
+		
+		ai_input = ai_input_area.textarea().anchor(3).anchor_top(25);
+		ai_input.background_color(eigen.vec4f(0.1,0.1,0.1,1));
+		
+		ai_send_area = ai_input_area.widget().anchor_top(0).anchor_right(0).anchor_left(0).fixed_height(25);
+		ai_send_area.layout(nanogui.layout_horizontal());
+		
+		ai_accept = ai_send_area.button("ACCEPT").enabled(false);
+		ai_reject = ai_send_area.button("REJECT").enabled(false);
+		ai_restore = ai_send_area.button("RESTORE").enabled(false);
+		ai_new = ai_send_area.button("NEW");
+		ai_send = ai_send_area.button("RUN AGENT");	
+		
+		ai_restore.on_click([this, ai_restore, ai_accept, ai_reject](){
+		
+		res = ai_restore.screen().modal_yes_no("This will restore every file to what it was before the AI did any changes to them.");
+			
+			if(res != "yes")
+				return;
+			
+			ai_accept.enabled(false);
+			ai_reject.enabled(false);
+			ai_restore.enabled(false);
+			
+			for(i = 0; i < all_modified_files.size(); i++) {
+				fileio.write_string(all_modified_files.key(i), all_modified_files[i]);
+				open(all_modified_files.key(i));
+			}
+			
+			all_modified_files = [];
+			modified_files = [];
+		});
+	
+		ai_new.on_click([this, ai_new, ai_accept, ai_reject, ai_restore, ai_send, ai_output_area, ai_input](){
+			
+			res = ai_new.screen().modal_yes_no("This will create a fresh agent instance, clearing current conversation and resetting agent state. Continue?");
+			
+			if(res != "yes")
+				return;
+			
+			// Clear conversations
+			ai_conversations = [];
+			
+			// Clear modified files for current session
+			modified_files = [];
+			
+			// Reset UI button states
+			ai_accept.enabled(false);
+			ai_reject.enabled(false);
+			ai_restore.enabled(false);
+			
+			// Clear AI output area
+			ai_output_area.textarea().text("");
+			
+			// Clear AI input
+			ai_input.text("");
+			
+			//Clear conv...
+			ai_output_area.content().clear_children();
+		});
+	
+		ai_send.on_click([this, ai_new, ai_input, ai_send, ai_accept, ai_reject, ai_restore, ai_output_area, ai_conv_select](){
+			
+			ai_output_area.textarea().anchor_left(3).anchor_right(10).append(ai_input.text()).background_color(eigen.vec4f(0.1,0.1,0.1,1)).wrap_text(true);	
+			
+			ai_prompt = ai_input.text();
+			
+			if(ai_prompt.empty())
+				return;
+			
+			ai_new_enabled = widget_enable_scope(ai_new);	
+			ai_send_enabled = widget_enable_scope(ai_send);
+					
+			ai_input.text("");
+			
+			this.modified_files = [];
+			
+			ai_accept.enabled(false);
+			ai_reject.enabled(false);
+			
+			//Read config
+			cfg = std.load_config("shizoscript_editor", "llm_config");
+			
+			if(!ai_connected) {		
+				if(!test_ai(cfg)) {
+					
+					form = [
+						[id="api",  	label="Api URL",  	type="text",   	placeholder = cfg.api ?? "http://localhost:8000"],
+						[id="model",   	label="Model",   	type="text",	default= cfg.model ?? ""],
+						[id="token", 	label="Auth token", type="text",  	default= cfg.token ?? ""]
+					];
+
+					res = ai_input.screen().modal_form(form, "Connect to openai v1 endpoint", "save", "cancel");
+					
+					if(res.choice != "submit")
+						return;	
+					
+					std.print(res);
+					
+					cfg.api = res.values.api;
+					cfg.token = res.values.token;
+					cfg.model = res.values.model;
+					
+					if(!test_ai(cfg))
+						return;
+					
+					std.save_config("shizoscript_editor", "llm_config", cfg);			
+				}
+			
+				ai_connected = true;
+			}
+	
+			//std.global for agent file lock ?
+			response_msg = None;
+			
+			agt = ai_conversations ? ai_conversations : miniagent(cfg.api, cfg.model, "planner", cfg.token);
+			
+			last_state = "";
+			
+			active_tools = [];
+			agent_containers = [];
+			
+			agt.on_action = [this, &active_tools, &agent_containers, &last_state, &response_msg, ai_output_area](action) {
+				if(action.text) {
+					if(*last_state != "text")
+						*last_state = "text";
+						std.cout("\n");
+						*response_msg = ai_output_area.textarea();
+						response_msg.wrap_text(true);
+					
+					stdfcol("white");
+					std.cout(action.text);
+					
+					response_msg.append(action.text);
+				}
+				else if(action.reasoning) {
+					
+					if(*last_state != "reasoning")
+						*last_state = "reasoning";
+						std.cout("\n");
+					
+					stdfcol("magenta");
+					std.cout(action.text);
+				}
+				
+				if(action.tool_start) {
+					if(*last_state != "tool")
+						*last_state = "tool";
+						std.cout("\n\n");
+						
+					stdfcol("yellow");
+					std.cout("[TOOL] ");
+					stdfcol("magenta");
+					std.cout(action.tool_start.name + "()", action.tool_start.args.has("path") ? "> " + action.tool_start.args.path : "", "\n");
+					stdfcol("white");
+					
+					tool_content = ai_output_area.collapsable(action.tool_start.name);
+					tool_content.content().layout(nanogui.layout_vertical());
+					tool_content.content().textarea().wrap_text(true).text(action.tool_start.args);
+					
+					tool_content.attr.phase = 0.0;
+					
+					tool_content.on_draw([tool_content](){
+						tool_content.attr.phase += 0.1;
+						if(tool_content.attr.phase >= math.PI * 2.0)
+							tool_content.attr.phase -= math.PI * 2.0;
+						
+						r = (math.sin(tool_content.attr.phase) + 1.0) / 2.0;
+											
+						tool_content.background_color(vec4f(r * 0.5 + 0.3,0,0,1));
+					});
+					
+					active_tools[action.tool_start.id] = tool_content;
+				}
+				else if(action.tool_end) {
+					active_tools[action.tool_end.id].on_draw(None);
+					active_tools[action.tool_end.id].background_color(vec4f(0.0,0,-1));
+					active_tools.erase(action.tool_end.id);
+				}
+				
+				if(action.agent) {
+				
+					//std.print(action);
+					
+					agent_action = action.agent.action;
+					
+					if(agent_action.operation == "write" || agent_action.operation == "edit") {
+						if(!modified_files.has(agent_action.path))
+							modified_files[agent_action.path].original = agent_action.old_content;
+						modified_files[agent_action.path].edit = agent_action.new_content;
+						
+						codebox = this.open(agent_action.path);
+						//fileio.write_string(agent_action.path + ".old.txt", modified_files[agent_action.path].original);
+						codebox.text(modified_files[agent_action.path].original).show_diffs(agent_action.new_content);
+					}
+				
+					if(action.agent.text) {
+						if(*last_state != "text")
+							*last_state = "text";
+							std.cout("\n");
+						
+						stdfcol("white");
+						std.cout(action.agent.text);
+						
+						response_msg.append(action.agent.text);
+					}
+					else if(action.agent.reasoning) {
+						
+						if(*last_state != "reasoning")
+							*last_state = "reasoning";
+							std.cout("\n");
+						
+						stdfcol("magenta");
+						std.cout(action.agent.text);
+					}
+					else if(action.agent.tool_start) {
+						if(*last_state != "tool")
+							*last_state = "tool";
+							std.cout("\n\n");
+							
+						stdfcol("yellow");
+						std.cout("[TOOL] ");
+						stdfcol("magenta");
+						std.cout(action.agent.tool_start.name + "()", action.agent.tool_start.args.has("path") ? "> " + action.agent.tool_start.args.path : "", "\n");
+						stdfcol("white");
+					}
+				}
+				
+				ai_output_area.scroll(1);
+			};
+			
+			current_tab = this.filetabs.tab_at();
+			current_file = ""; 
+			opened_files = [];
+			for(i = 0; i < _open_tabs.size(); i++) {
+				if(_open_tabs[i].tab == current_tab) {
+					current_file = fileio.relative_path(std.wd(), _open_tabs[i].path);
+				}
+				
+				//Always include the current file too...
+				opened_files.push_back(fileio.relative_path(std.wd(), _open_tabs[i].path));
+			}
+			
+			if(current_file) {
+				
+				usercontext = "<usercontext>\n";
+				usercontext += "  <timestamp>" + std.timestamp() + "</timestamp>\n";
+				usercontext += "  <current_file path=\"" + current_file + "\" />\n";
+				usercontext += "  <open_files>\n";
+				
+				for(i = 0; i < opened_files.size(); i++) {
+					usercontext += "    <file path=\"" + opened_files[i] + "\" ";
+					if(opened_files[i] == current_file)
+						usercontext += "active=\"true\" ";
+					usercontext += "/>\n";
+				}
+				
+				usercontext += "  </open_files>\n";
+				usercontext += "</usercontext>\n\n";
+
+				ai_prompt = usercontext + ai_prompt;			
+			}
+			
+			agt.task(ai_prompt);
+			
+			ai_conversations = agt;
+			
+			ai_conv_select.add_item(agt.env.conversation_title);
+			
+			if(modified_files) {
+				
+				ai_restore.enabled(true);
+				
+				ai_accept.enabled(true).on_click([this, ai_accept, ai_reject](){
+					ai_accept.enabled(false);
+					ai_reject.enabled(false);
+					for(i = 0; i < _open_tabs.size(); i++) {
+						_open_tabs[i].codebox.clear_diffs();
+					}
+				});
+				ai_reject.enabled(true).on_click([this, ai_accept, ai_reject](){
+					ai_accept.enabled(false);
+					ai_reject.enabled(false);
+					for(i = 0; i < modified_files.size(); i++) {
+						fileio.write_string(modified_files.key(i), modified_files[i].original);
+						open(modified_files.key(i));
+					}	
+				});
+				
+				for(i = 0; i < modified_files.size(); i++) {
+					if(!all_modified_files.has(modified_files.key(i))) {
+						all_modified_files[modified_files.key(i)] = modified_files[i].original;
+					}
+				}
+			}
+		});
+		
+	}
+	
+	open(path) {
+		tab_name = fileio.file_name(path);
+		abs_path = fileio.absolute_path(path);
+			
+		if(_open_tabs[abs_path].tab) {
+			std.print("already opened");
+			filetabs.set_active_tab(_open_tabs[abs_path].tab);
+			
+			//TODO: add check if contains unsaved text...
+			
+			_open_tabs[abs_path].codebox.text(fileio.read_string(abs_path));
+			return _open_tabs[abs_path].codebox;
+		}
+			
+		tab = filetabs.add_tab(tab_name, true);
+		codebox = tab.codebox().anchor(0);
+		
+		_open_tabs[abs_path] = [tab=tab, codebox=codebox, path=path, absolute_path=abs_path];
+		
+		//tab.on_close ...
+		
+		if(path.contains(".shio")) {
+			docs = shzdocs.get_all();
+
+			ns = &docs.namespaces;
+
+			for(i = 0; i < ns.size(); i++) {
+				for(j = 0; j < ns[i].functions.size(); j++) {
+					codebox.autocomplete_add_scoped_function(ns.key(i)+"."+ns[i].functions.key(j), ns[i].functions[j].description, ns[i].functions[j].params);
+				}
+			}
+			
+			codebox.on_context_changed([filetabs, tab](meta) {
+				// meta fields:
+				// meta["text"], meta["caret_offset"], meta["line"], meta["column"],
+				// meta["dotted_word"], meta["scope"], meta["prefix"], meta["scoped"],
+				// meta["text_changed"], meta["caret_changed"];
+				// Example:
+				// std.print("ctx: " + meta["dotted_word"]);
+				//std.print(meta);
+				if(meta.text_changed) {
+					old_name = filetabs.tab_name(tab);
+					if(!old_name.contains("*"))
+						filetabs.tab_name(tab, old_name + " *");
+				}
+			});
+
+			codebox.on_autocomplete([codebox, path](meta) {
+			
+				//std.print(meta);					
+				text = std.resolve_source_text(codebox.text(), fileio.file_dir(path), true, true);
+				//std.print(text);
+				
+				search_symbol = [&text, &search_symbol](symbol_name) {
+
+					if(!symbol_name)
+						return None;
+
+					std.print("Search: ", symbol_name);
+					
+					matches = text.regex_findall(symbol_name + "\\s*=\\s*[^;]*;");
+					for(i = 0; i < matches.size(); i++) {
+						match = matches[i];
+						match = match.substr(match.find("=")+1);
+						match = match.substr(0, match.find(";")).strip();
+						
+						//TODO HERE:
+						//The biggest clue obviously is if the class name is in the variable name like
+						//nanogui.widget wdgt = None; 
+						//Should check for these too!
+						
+						docs = shzdocs.get_path(match);
+
+						if(docs.found && docs.documentation.returns_class) {
+							class_name = docs.documentation.returns_class;
+							std.print("Found docs for class: ", class_name);
+							//Get path to the class that this var might be...
+							class_docs = shzdocs.get_class(class_name);
+							if(class_docs.documentation) {									
+								return class_docs.documentation;
+							}
+							std.print("no class doc");
+							return None;
+						}
+					
+						//try to resolve recursively...
+						scopes = match.smart_split(".");
+						
+						//Stop when not dotted...
+						if(scopes.size() <= 1)
+							continue;
+						
+						top_scope = scopes[0];
+						top_def = search_symbol(top_scope);
+						
+						if(top_def == None) {
+							std.print("not found.");
+							return None;
+						}
+						
+						//std.print(top_def);
+						
+						for(j = 1; j < scopes.size(); j++) {
+							scope = scopes[j].substr(0, scopes[j].find("(")).strip();
+							std.print(j, scope);
+							if(top_def.functions.has(scope)) {
+								def = &top_def.functions[scope];
+								if(def.returns_class) {
+									class_name = def.returns_class;
+									//Get path to the class that this var might be...
+									class_docs = shzdocs.get_class(class_name);
+									if(class_docs.documentation) {									
+										top_def = class_docs.documentation;
+										continue;
+									}
+									std.print("no class doc");
+									return None;
+								}
+								
+								//Okay this is a bit odd, but if the function exist, but doesnt
+								//return any class, we assume that it returns the object itself
+								//Like widget.anchor() -> return shz_widget again.
+								//This is for convenience
+								continue;
+							}
+							
+							std.print(top_def);
+							std.print("Cannot find: ", scope);
+							return None;						
+						}
+						
+						return top_def;
+						
+					}
+					
+					return None;
+				};
+				
+				//Try to resolve local var definitions...
+				scopes = meta.scope.smart_split(".");		
+				top_scope = scopes[0];		
+				top_def = search_symbol(top_scope);
+				
+				if(!top_def)
+					return None;
+				
+				if(scopes.size() == 1) //Were done here
+				{
+					//Transform results...
+					result = [];
+					funcs = &top_def.functions;
+					for(i = 0; i < funcs.size(); i++) {
+						result.push_back([
+							path=funcs.key(i),
+							description=funcs[i].description,
+							params=funcs[i].params,
+						]);
+					}
+					
+					return result;
+				}
+				
+				for(j = 1; j < scopes.size(); j++) {
+					scope = scopes[j].substr(0, scopes[j].find("(")).strip();
+					if(top_def.functions.has(scope)) {
+						def = &top_def.functions[scope];
+						if(def.returns_class) {
+							class_name = def.returns_class;
+							//Get path to the class that this var might be...
+							class_docs = shzdocs.get_class(class_name);
+							if(class_docs.documentation) {									
+								top_def = class_docs.documentation;
+								continue;
+							}
+							std.print("no class doc");
+							return None;
+						}
+					}
+					else {
+						std.print("Cannot find: ", scope);
+						return None;
+					}
+				}
+				
+				if(top_def) {
+					//Transform results...
+					result = [];
+					funcs = &top_def.functions;
+					for(i = 0; i < funcs.size(); i++) {
+						result.push_back([
+							path=funcs.key(i),
+							description=funcs[i].description,
+							params=funcs[i].params,
+						]);
+					}
+					
+					return result;
+				}
+				
+				return None;
+				
+				/*
+				// Return simple string list:
+				if(s == "math") {
+					return ["sin", "cos", "tan", "clamp"];
+				}
+
+				// Or return rich entries:
+				return [
+					[path="player.move", description="Move player", params=["x: float", "y: float"]],
+					[path="player.jump", description="Jump action", params=["strength: float"]]
+				];
+				*/
+			});
+		}
+	
+		codebox.text(fileio.read_string(path));			
+		codebox.on_save([filetabs, tab, path](meta) {
+			
+			std.print(meta);
+			fileio.write_string(path, meta.text);
+			
+			old_name = filetabs.tab_name(tab);
+			old_name = old_name.removesuffix(" *");
+			filetabs.tab_name(tab, old_name);
+		});
+	}
+	
+	test_ai(cfg) {
+		
+		if(!cfg)
+			return false;
+		
+		success = false;
+		
+		try {
+			//Test the api once
+			gpt = generic_agent(cfg.api, None, None, cfg.token);
+			test_result = gpt.text("This is a system test.\nAnswer with 'hello world'.\nDo not write anything else.");
+			if(test_result.find("hello world") < 0)
+				std.print(test_result);
+			else
+				std.print("online.\n");
+				success = true;
+		}
+		catch(e) {
+
+		}
+		
+		return success;
+	}
+	
+	_open_tabs = [];
+}

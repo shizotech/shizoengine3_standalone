@@ -1,0 +1,160 @@
+
+import tempfile;
+
+//This is specifically for qwen models
+output_format = R"(
+Output the result(s) in the following JSON format and write nothing else:
+```json
+[
+  {"bbox_2d": [x1, y1, x2, y2], "label": "type_of_component", "sub_label": "Reference_designator"},
+  ...
+]
+```
+)";
+
+transform_bbox(img, bbox) {
+	x1 = bbox[0] / 1000.0 * img.width();
+	x2 = bbox[2] / 1000.0 * img.width();
+	y1 = bbox[1] / 1000.0 * img.height();
+	y2 = bbox[3] / 1000.0 * img.height();
+	return [x1,y1,x2,y2];
+}
+
+get_screenshot() {
+	return "screenshot_ds.png";
+}
+
+take_screenshot() {
+	win32.screenshot("screenshot.bmp");	
+	tmp = bitmap.load("screenshot.bmp");
+	//tmp.downsample();
+	cs = win32.cursor_pos();
+	tmp.draw_circle(cs.x, cs.y, 15, bitmap.rgb(255, 0, 0));
+	tmp.save(get_screenshot());
+}
+
+remove_screenshot() {
+	fileio.remove("screenshot.bmp");
+	fileio.remove(get_screenshot());
+}
+
+class tmp_screenshot
+{
+	__init__() {
+		take_screenshot();
+	}
+	__deinit__() {
+		remove_screenshot();
+	}
+}
+
+add_tools(agt)
+{
+	agt.add_tool(
+		"desktop_state",
+		"Get information about the desktop (state, elements, visibility) using a prompt",
+		[
+			question = "&string(): What to look out for specifically",
+			context = "&string(): Context for this action",
+		],
+		[](agt, args)
+		{		
+			managed tmp = tmp_screenshot();
+			managed cva = agt.simple_agent(None);
+			
+			cva.add_image(get_screenshot());
+			
+			cva.on_text = [](txt)
+			{
+				std.cout(txt);
+			};
+			
+			cva.on_analysis = [](txt)
+			{
+				std.cout(txt);
+			};
+			
+			cva.set_temperature(0.5);
+			
+			return cva.task("# Task\n" + args.question + "\n\n# Context\n" + args.context + "\n\n# Response Format\n" + args.response_format + "\n\nAnswer short and precise as fast as possible.\nFocus on the question only, do not analyze the image further.");
+		}
+	);
+	
+	agt.add_tool(
+		"execute_gui_plan",
+		"Execute a GUI action plan",
+		[
+			manifest = "&string(): Plan manifest",
+		],
+		[](agt, args)
+		{	
+			managed executor = agt.subagent("visual/actionagent");
+			
+			if(agt.on_action) {
+				agt.on_action([start_agent=executor.agent_id]);	
+				executor.on_action = [agt](act) {
+					agt.on_action(act);
+				};
+			}
+			
+			executor.llm_api,set_temperature(0.1);
+			
+			executor.env.steps = [];
+			executor.env.current_step = None;
+			executor.env.task_finished = false;
+			
+			executor.env.next_required_action = "This is the first run, determine the first step for the task and call 'push_step'";
+			
+			remove_screenshot();
+			
+			for(true) {			
+				std.print("\n\n" + executor.env.steps + "\n\n" + executor.env.current_step);
+				
+				executor.llm_api.context.clear();
+				
+				//If this is the first time...
+				if(!fileio.exists(get_screenshot()))
+					take_screenshot();
+				
+				//Add last screenshot
+				executor.add_image(get_screenshot());
+				
+				//Now take new screenshot
+				take_screenshot();
+				executor.add_image(get_screenshot());
+				
+				prompt = "<task>\n";
+				prompt += args.manifest.strip();
+				prompt += "\n</task\n\n";
+				
+				prompt += "<steps_tree>\n";
+				prompt += executor.env.steps;
+				prompt += "\n</steps_tree>\n\n";
+				
+				prompt += "<current_step_id>\n";
+				if(executor.env.current_step) prompt += executor.env.current_step.id;
+				prompt += "\n</current_step_id>\n\n";
+				
+				prompt += "<next_required_action>\n";
+				prompt += executor.env.next_required_action ? executor.env.next_required_action : "Continue working on the current step, push a new step or check if the task is finished.\nImportant note: a finished step does not mean that the global task is actually finished.\nAlways check the current step in context to the global task!";
+				prompt += "\n</next_required_action>\n\n";
+				executor.env.next_required_action = "";
+
+				exec_result = executor.task(prompt);
+				
+				if(executor.env.task_finished) {
+					
+					if(agt.on_action)
+						agt.on_action([stop_agent=executor.agent_id]);
+					
+					remove_screenshot();
+					return [
+						ok=false,
+						status=executor.env.task_report,
+					];
+				}
+			}
+		}
+	);
+}
+	
