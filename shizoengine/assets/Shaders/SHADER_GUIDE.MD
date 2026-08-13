@@ -522,4 +522,25 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 
 ---
 
+## 12. Common Failures and Errors
+
+The engine injects header and footer code into the shader.
+These injections include the standard 'u_*' uniforms alongside other data.
+Make sure to not include standard uniforms in your shader code to avoid duplicate definitions.
+
+*Due to the injection of header code, the line numbers for glsl errors might be slightly off or show lines of code that are not directly part of your shader code!*
+
+If you encounter an error which seems to come from code which is not part of your shader code, then do not try to fix that and instead adapt your code to work with the given layout.
+
+*Prefer shadertoy format for the main function*
+
+Use 'void mainImage(...)' instead of 'void main(...)'.
+
+*Prefer clear channel names over iChannelX notation*
+
+Instead of enforcing iChannelX sampler2D uniforms, give them appropriate names to indicate what they are.
+The first (or main) input for any effect shader should be named 'input' or 'in'.
+
+---
+
 *Documentation based on implementation in `engine/generators/extensions/glsl/shader_loader.shio`*
