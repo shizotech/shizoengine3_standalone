@@ -1,5 +1,5 @@
 
-//@pushbutton
+//@pushbutton displayname="No Alpha"
 uniform int no_alpha;
 
 void mainImage( out vec4 fragColor, in vec2 p )
