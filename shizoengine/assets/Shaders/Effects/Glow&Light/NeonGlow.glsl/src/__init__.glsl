@@ -6,7 +6,7 @@ uniform float neon_intensity;
 //@float min=0.01 max=0.1 value=0.03
 uniform float neon_radius;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,1.0)
+//@rgb value=(0.0,1.0,1.0)
 uniform vec3 neon_color;
 
 //@float min=0.0 max=1.0 value=0.5

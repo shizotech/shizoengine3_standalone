@@ -11,7 +11,7 @@ uniform float gradient;
 //@slider min=0.0 max=2.0 value=1
 uniform float speed;
 
-//@vec3 min=(0,0,0) max=(1,1,1) value=(0.5,0.2,0.1)
+//@rgb value=(0.5,0.2,0.1)
 uniform vec3 base_color;
 
 //@enum options=(Test 1, Test2, Test 3)

@@ -12,7 +12,7 @@ uniform float tunnel_twist;
 //@int min=3 max=12 value=6
 uniform int tunnel_sides;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,1.0)
+//@rgb value=(0.0,1.0,1.0)
 uniform vec3 tunnel_colors;
 
 //@float min=0.1 max=10.0 value=3.0

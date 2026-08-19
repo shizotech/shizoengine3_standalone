@@ -3,10 +3,10 @@
 //
 // ==== Custom Uniform Controls ====
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2, 0.6, 1.0)
+//@rgb value=(0.2, 0.6, 1.0)
 uniform vec3 base_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 bg_color;
 
 //@float min=0.01 max=3.0 value=0.5

@@ -10,7 +10,7 @@ uniform float beat_freq;
 //@int min=1 max=64 value=8
 uniform int grid_x;
 
-//@vec3
+//@rgb
 uniform vec3 base_color;
 
 //@enum options=(Instant, Linear, Smoothstep, Sine Pulse)

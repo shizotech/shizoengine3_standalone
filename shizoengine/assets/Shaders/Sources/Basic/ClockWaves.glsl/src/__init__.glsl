@@ -20,7 +20,7 @@ uniform int clockwave_count;
 //@float min=1.0 max=30.0 value=10.0
 uniform float clockwave_freq;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.5,0.0,1.0)
+//@rgb value=(0.5,0.0,1.0)
 uniform vec3 clockwave_colors;
 
 //@float min=0.0 max=1.0 value=0.5

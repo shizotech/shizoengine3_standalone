@@ -6,7 +6,7 @@ uniform float plasma_speed;
 //@float min=0.0 max=3.0 value=1.0
 uniform float plasma_intensity;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.5,0.0)
+//@rgb value=(1.0,0.5,0.0)
 uniform vec3 plasma_colors;
 
 //@float min=0.1 max=10.0 value=3.0

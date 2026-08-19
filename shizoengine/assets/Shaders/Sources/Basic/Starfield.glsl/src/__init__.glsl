@@ -9,10 +9,10 @@ uniform float star_speed;
 //@float min=0.001 max=0.05 value=0.01
 uniform float star_size;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 star_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.05)
+//@rgb value=(0.0,0.0,0.05)
 uniform vec3 bg_color;
 
 //@int min=1 max=5 value=3

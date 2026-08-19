@@ -3,13 +3,13 @@
 //@vec2 min=(-1.0,-1.0) max=(1.0,1.0) value=(0.5,0.5)
 uniform vec2 gradient_direction;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.0,0.0)
+//@rgb value=(1.0,0.0,0.0)
 uniform vec3 color1;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,0.0)
+//@rgb value=(0.0,1.0,0.0)
 uniform vec3 color2;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,1.0)
+//@rgb value=(0.0,0.0,1.0)
 uniform vec3 color3;
 
 //@float min=0.01 max=3.0 value=0.5

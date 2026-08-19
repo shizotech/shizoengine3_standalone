@@ -3,7 +3,7 @@
 //@float min=0.01 max=2.0 value=0.5
 uniform float smoke_density;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.5,0.5,0.5)
+//@rgb value=(0.5,0.5,0.5)
 uniform vec3 smoke_color;
 
 //@float min=0.01 max=2.0 value=0.5

@@ -461,7 +461,7 @@ ColorShift.glsl/
 //@slider min=0.0 max=1.0 value=0.2
 uniform float shift_amount;
 
-//@vec3 value=(1.0, 0.0, 0.0)
+//@rgb value=(1.0, 0.0, 0.0)
 uniform vec3 shift_color;
 
 //@rgb

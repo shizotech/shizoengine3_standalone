@@ -6,6 +6,7 @@
 #define end 100.0
 
 uniform sampler2D input1;
+//@rgb
 uniform vec3 bug;
 
 float sphere_func(in vec3 pos, in float r)

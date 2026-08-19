@@ -9,7 +9,7 @@ uniform float kaleido_rotation;
 //@float min=0.01 max=2.0 value=0.5
 uniform float kaleido_speed;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.5,0.0)
+//@rgb value=(1.0,0.5,0.0)
 uniform vec3 kaleido_colors;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)

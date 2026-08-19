@@ -9,7 +9,7 @@ uniform float aurora_intensity;
 //@float min=0.1 max=2.0 value=0.8
 uniform float aurora_width;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,0.5)
+//@rgb value=(0.0,1.0,0.5)
 uniform vec3 aurora_colors;
 
 //@float min=1.0 max=15.0 value=5.0

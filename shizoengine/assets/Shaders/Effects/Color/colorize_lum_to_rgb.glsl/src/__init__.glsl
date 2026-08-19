@@ -6,7 +6,7 @@ uniform float Saturation;
 uniform float Value;
 //@slider min=-1.0 max=1.0 value=0.0
 uniform float HueOffset;
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.299,0.587,0.114)
+//@rgb value=(0.299,0.587,0.114)
 uniform vec3 LuminanceWeightsColor;
 //@slider min=-1.0 max=1.0 value=0.0
 uniform float Keep_Background;

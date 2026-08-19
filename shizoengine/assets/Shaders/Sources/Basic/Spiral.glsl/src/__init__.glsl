@@ -9,10 +9,10 @@ uniform float spiral_thickness;
 //@float min=0.0 max=0.5 value=0.05
 uniform float spiral_softness;
 
-//@vec3 min=(0,0,0) max=(1,1,1) value=(0,0,0)
+//@rgb value=(0,0,0)
 uniform vec3 fg_color;
 
-//@vec3 min=(0,0,0) max=(1,1,1) value=(1,1,1)
+//@rgb value=(1,1,1)
 uniform vec3 bg_color;
 
 //@float min=0.0 max=1.0 value=0.5

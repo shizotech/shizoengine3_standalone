@@ -3,10 +3,10 @@
 //@vec2 min=(0.01,0.01) max=(0.5,0.5) value=(0.1,0.1)
 uniform vec2 checker_size;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 color1;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 color2;
 
 //@float min=0.01 max=3.0 value=0.5

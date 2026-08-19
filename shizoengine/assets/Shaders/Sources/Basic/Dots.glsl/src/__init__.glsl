@@ -12,10 +12,10 @@ uniform float dot_softness;
 //@enum options=(Circle, Square, Diamond)
 uniform int dot_shape;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 dot_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 bg_color;
 
 //@float min=-180.0 max=180.0 value=0.0

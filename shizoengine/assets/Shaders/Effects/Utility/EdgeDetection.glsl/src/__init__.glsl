@@ -6,7 +6,7 @@ uniform float edge_strength;
 //@float min=0.5 max=5.0 value=1.0
 uniform float line_thickness;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 edge_color;
 
 //@float min=0.0 max=1.0 value=1.0

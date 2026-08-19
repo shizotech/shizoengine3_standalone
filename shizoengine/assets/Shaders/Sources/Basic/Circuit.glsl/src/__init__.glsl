@@ -7,7 +7,7 @@ uniform float circuit_speed;
 uniform float circuit_density;
 //@float min=5.0 max=50.0 value=20.0
 uniform float circuit_grid_size;
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,0.0)
+//@rgb value=(0.0,1.0,0.0)
 uniform vec3 circuit_colors;
 //@float min=0.0 max=2.0 value=0.5
 uniform float circuit_glow;

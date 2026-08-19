@@ -6,10 +6,10 @@ uniform float edge_threshold;
 //@float min=0.0 max=2.0 value=0.5
 uniform float glow_intensity;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 glow_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 edge_color;
 
 //@float min=0.0 max=1.0 value=0.7

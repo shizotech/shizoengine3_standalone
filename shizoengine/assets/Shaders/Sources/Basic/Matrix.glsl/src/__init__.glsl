@@ -3,7 +3,7 @@
 //@float min=0.1 max=5.0 value=2.0
 uniform float matrix_speed;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,1.0,0.0)
+//@rgb value=(0.0,1.0,0.0)
 uniform vec3 matrix_color;
 
 //@float min=0.1 max=2.0 value=1.0

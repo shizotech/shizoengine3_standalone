@@ -3,10 +3,10 @@
 //@float min=0.1 max=3.0 value=1.0
 uniform float fire_intensity;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.3,0.0)
+//@rgb value=(1.0,0.3,0.0)
 uniform vec3 fire_color1;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.8,0.1)
+//@rgb value=(1.0,0.8,0.1)
 uniform vec3 fire_color2;
 
 //@float min=0.0 max=3.0 value=1.0

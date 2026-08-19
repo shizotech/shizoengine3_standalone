@@ -4,7 +4,7 @@ uniform float beat_freq;
 uniform int grid_x;
 //@int min=1 max=64 value=4
 uniform int grid_y;
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.6,0.2)
+//@rgb value=(1.0,0.6,0.2)
 uniform vec3 base_color;
 //@float min=0.0 max=1.0 value=0.2
 uniform float color_variation;

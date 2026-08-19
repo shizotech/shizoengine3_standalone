@@ -23,7 +23,7 @@ uniform float crystal_freq;
 //@int min=1 max=6 value=4
 uniform int crystal_complexity;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.5,0.0)
+//@rgb value=(1.0,0.5,0.0)
 uniform vec3 crystal_colors;
 
 //@int min=3 max=12 value=6

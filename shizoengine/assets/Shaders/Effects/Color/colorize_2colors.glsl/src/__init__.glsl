@@ -1,9 +1,9 @@
 // ==== Custom Uniform Controls ====
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2,0.0,0.5)
+//@rgb value=(0.2,0.0,0.5)
 uniform vec3 colorA;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.9,0.2)
+//@rgb value=(1.0,0.9,0.2)
 uniform vec3 colorB;
 
 //@float min=0.1 max=3.0 value=1.0

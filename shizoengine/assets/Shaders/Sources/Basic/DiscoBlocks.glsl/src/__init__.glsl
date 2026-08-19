@@ -6,7 +6,7 @@ uniform int beat_division;
 uniform float beat_jitter;
 //@float min=0.0 max=1.0 value=0.6
 uniform float randomness;
-//@vec3 value=(1.0, 0.5, 0.3)
+//@rgb value=(1.0, 0.5, 0.3)
 uniform vec3 base_color;
 //@float min=0.0 max=1.0 value=0.3
 uniform float color_variation;

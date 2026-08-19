@@ -10,10 +10,10 @@ uniform vec2 dotgrid_spacing;
 //@float min=0.01 max=0.5 value=0.05
 uniform float dot_size;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2, 0.8, 1.0)
+//@rgb value=(0.2, 0.8, 1.0)
 uniform vec3 dot_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0, 0.0, 0.05)
+//@rgb value=(0.0, 0.0, 0.05)
 uniform vec3 bg_color;
 
 //@float min=0.1 max=5.0 value=1.5

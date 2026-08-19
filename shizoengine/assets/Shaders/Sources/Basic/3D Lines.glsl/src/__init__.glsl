@@ -15,10 +15,10 @@ uniform float wave_frequency;
 //@float min=-10.0 max=10.0 value=1.0
 uniform float wave_speed;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.1,0.6,1.0)
+//@rgb value=(0.1,0.6,1.0)
 uniform vec3 line_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 bg_color;
 
 //@float min=0.0 max=1.0 value=0.4

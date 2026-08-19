@@ -7,11 +7,11 @@
  //@slider min=0.05 max=5.0 value=1.0
  uniform float pulse_speed;
 
- //@vec3
- uniform vec3 pulse_color;
+ //@rgb
+uniform vec3 pulse_color;
 
- //@vec3
- uniform vec3 bg_color;
+ //@rgb
+uniform vec3 bg_color;
 
  //@int min=1 max=8 value=3
  uniform int ring_count;

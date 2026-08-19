@@ -8,6 +8,7 @@ uniform float particle_count;
 uniform float particle_speed;
 uniform float particle_gravity;
 uniform float particle_size;
+//@rgb
 uniform vec3  particle_colors;
 uniform float particle_life;
 uniform float particle_emission;

@@ -7,10 +7,10 @@
 //@slider min=0.1 max=5.0 value=1.0
 uniform float speed;
 
-//@vec3
+//@rgb
 uniform vec3 chase_color;
 
-//@vec3
+//@rgb
 uniform vec3 bg_color;
 
 //@int min=1 max=16 value=8

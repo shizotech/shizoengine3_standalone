@@ -16,7 +16,7 @@ uniform float scanline_flicker;
 //@slider min=0.0 max=10.0 value=3.0
 uniform float scanline_flicker_speed;
 
-//@slider vec3 min=0.0 max=1.0 value=0.0,0.0,0.2
+//@rgb value=(0.0,0.0,0.2)
 uniform vec3 scanline_color_tint;
 
 //@slider min=0.0 max=1.0 value=0.0

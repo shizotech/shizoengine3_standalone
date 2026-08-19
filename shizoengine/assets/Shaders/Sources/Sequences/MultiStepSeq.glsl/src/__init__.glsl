@@ -24,7 +24,7 @@ uniform int grid_x;
 uniform int grid_y;
 
 // Stage 1 controls
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0, 0.2, 0.2)
+//@rgb value=(1.0, 0.2, 0.2)
 uniform vec3 stage1_color;
 //@float min=0.0 max=10.0 value=0.0
 uniform float stage1_offset;
@@ -34,7 +34,7 @@ uniform float stage1_duration;
 uniform int stage1_shape;
 
 // Stage 2 controls
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2, 1.0, 0.2)
+//@rgb value=(0.2, 1.0, 0.2)
 uniform vec3 stage2_color;
 //@float min=0.0 max=10.0 value=2.0
 uniform float stage2_offset;
@@ -44,7 +44,7 @@ uniform float stage2_duration;
 uniform int stage2_shape;
 
 // Stage 3 controls
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2, 0.2, 1.0)
+//@rgb value=(0.2, 0.2, 1.0)
 uniform vec3 stage3_color;
 //@float min=0.0 max=10.0 value=4.0
 uniform float stage3_offset;
@@ -54,7 +54,7 @@ uniform float stage3_duration;
 uniform int stage3_shape;
 
 // Stage 4 controls
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0, 1.0, 0.2)
+//@rgb value=(1.0, 1.0, 0.2)
 uniform vec3 stage4_color;
 //@float min=0.0 max=10.0 value=6.0
 uniform float stage4_offset;
@@ -64,7 +64,7 @@ uniform float stage4_duration;
 uniform int stage4_shape;
 
 // Stage 5 controls
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0, 0.2, 1.0)
+//@rgb value=(1.0, 0.2, 1.0)
 uniform vec3 stage5_color;
 //@float min=0.0 max=10.0 value=8.0
 uniform float stage5_offset;

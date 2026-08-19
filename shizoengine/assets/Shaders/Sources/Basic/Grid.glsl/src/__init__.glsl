@@ -6,10 +6,10 @@ uniform vec2 grid_spacing;
 //@float min=0.001 max=0.1 value=0.005
 uniform float line_width;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 grid_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.0)
+//@rgb value=(0.0,0.0,0.0)
 uniform vec3 bg_color;
 
 //@float min=-180.0 max=180.0 value=0.0

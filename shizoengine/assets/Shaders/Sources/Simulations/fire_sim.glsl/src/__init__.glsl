@@ -6,13 +6,13 @@ uniform float fire_heat;
 //@float min=-1.0 max=1.0 value=0.0
 uniform float fire_wind;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.9,0.3)
+//@rgb value=(1.0,0.9,0.3)
 uniform vec3 fire_color_hot;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,0.4,0.0)
+//@rgb value=(1.0,0.4,0.0)
 uniform vec3 fire_color_mid;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.5,0.0,0.0)
+//@rgb value=(0.5,0.0,0.0)
 uniform vec3 fire_color_cold;
 
 //@float min=0.0 max=1.0 value=0.3

@@ -9,7 +9,7 @@ uniform int clean_frames;
 //@int min=1 max=60 value=5
 uniform int strobe_frames;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(1.0,1.0,1.0)
+//@rgb value=(1.0,1.0,1.0)
 uniform vec3 strobe_color;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)

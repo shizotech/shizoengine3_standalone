@@ -9,10 +9,10 @@ uniform float wave_amplitude;
 //@float min=0.1 max=20.0 value=5.0
 uniform float wave_frequency;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.2,0.5,1.0)
+//@rgb value=(0.2,0.5,1.0)
 uniform vec3 wave_color;
 
-//@vec3 min=(0.0,0.0,0.0) max=(1.0,1.0,1.0) value=(0.0,0.0,0.05)
+//@rgb value=(0.0,0.0,0.05)
 uniform vec3 bg_color;
 
 //@enum options=(Sine, Square, Sawtooth)
