@@ -1,4 +1,4 @@
 # Structure
 
-shizoengine/ contains the main progran (EDIT THAT)
-shizotech/ contains the shizoscript standard library (DO NOT EDIT THAT)
+vibevj/ contains the main program (EDIT THAT)
+shizotech/ contains the shizoscript standard library (DO NOT EDIT THAT, JUST USE FOR REFERENCE)
