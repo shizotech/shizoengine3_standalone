@@ -8,6 +8,12 @@ This documentation covers the shader format used in the engine, based on the imp
 
 Shaders are organized as directories with the `.glsl` extension.
 
+All shaders which produce output WITHOUT any input, are located in `assets/Shaders/Sources`.
+Shaders which need an input to work (=effects) are located in `assets/Shaders/Effects`.
+
+ALWAYS put new shaders in the right directory!
+Organize new shaders in logical subdirectories to keep it clean.
+
 ### Basic Structure
 
 ```
@@ -16,7 +22,7 @@ MyShader.glsl/
     ├── __init__.glsl      # Entry point (MANDATORY)
     ├── A.glsl             # Optional: additional render pass
     ├── B.glsl             # Optional: additional render pass
-    └── subdirectory/      # NOT rendered, only accessible via #include
+    └── subdirectory/      # NOT rendered, only accessible via #include (OPTIONAL)
         └── helper.glsl
 ```
 
@@ -34,7 +40,7 @@ MyShader.glsl/
 Shader inputs are declared as `uniform sampler2D` uniforms:
 
 ```glsl
-uniform sampler2D in;
+uniform sampler2D input;
 uniform sampler2D input1;
 uniform sampler2D input2;
 uniform sampler2D mask;
@@ -54,12 +60,12 @@ uniform sampler2D A;  // Will bind to src/A.glsl automatically
 
 | Name | Behavior |
 |------|----------|
-| `in` | Defines the DEFAULT input which should be used in shader chains |
+| `input` | Defines the DEFAULT input which should be used in shader chains |
 | `main_image` | Automatically binds to the `__init__` pass (first shader) |
 | `feedback` | Binds to itself (the current shader), use this for feedback effects |
 | `RenderMaskInput` | Binds to the render mask input |
 
-Each effect shader needs exactly one primary "in" input.
+Each effect shader needs exactly one primary "input" input.
 
 ---
 
@@ -335,110 +341,7 @@ Usage in `__init__.glsl`:
 
 ---
 
-## 6. Time System
-
-The engine provides a time uniform `u_time` updated each frame.
-
-### Time Uniform
-
-```glsl
-uniform float u_time;
-```
-
-### Time Modes
-
-Three time modes are available via UI controls:
-
-| Mode | Value | Behavior |
-|------|-------|----------|
-| **Freetime** | 0 | Time advances automatically: `time += 1/fps * multiplier` |
-| **Manual** | 1 | Time is user-controlled: `time *= multiplier` |
-| **Sync** | 2 | Time synced to timeline: `time = timeline.cursor_pos * multiplier` |
-
-### Time Controls
-
-| Control | Description | Default |
-|---------|-------------|---------|
-| **Time** | Current time value | 0.0 |
-| **Offset** | Time offset | 0.0 |
-| **Multiplier** | Time multiplier | 1.0 (range: -2 to 2) |
-
-### Time Wrapping
-
-Time is wrapped modulo **4096.0**:
-
-```glsl
-current_time = mod(current_time + time_offset, 4096.0);
-```
-
-### Usage Example
-
-```glsl
-uniform float u_time;
-
-void main() {
-    vec2 uv = v_uv;
-    float wave = sin(uv.x * 10.0 + u_time) * 0.5 + 0.5;
-    fragColor = vec4(vec3(wave), 1.0);
-}
-```
-
----
-
-## 7. Projection System
-
-The engine provides grid-based projection warping.
-
-### Projection Controls
-
-| Control | Description |
-|---------|-------------|
-| **Projection** | Enable/disable projection |
-| **Subdivide** | Subdivide grid (doubles X and Y) |
-| **Reset** | Reset grid to default |
-| **Grid X** | Grid divisions (horizontal) |
-| **Grid Y** | Grid divisions (vertical) |
-| **Fine X** | Fine subdivisions (horizontal) |
-| **Fine Y** | Fine subdivisions (vertical) |
-
-### Projection Grid
-
-- **Grid X/Y**: Number of grid cells
-- **Fine X/Y**: Subdivisions per cell
-- Default: 1x1 grid, 4x4 fine
-
-### Projection State
-
-Projection state can be saved/loaded for persistence.
-
----
-
-## 8. Output System
-
-### Monitor Output
-
-| Setting | Description | Options |
-|---------|-------------|---------|
-| **Type** | Monitor mode | `FULLSCREEN`, `WINDOWED` |
-| **Select** | Monitor selection | `No Monitor`, `Monitor 1`, `Monitor 2`, ... |
-
-### SPOUT Output
-
-| Setting | Description |
-|---------|-------------|
-| **Enable** | Enable SPOUT output |
-| **Name** | SPOUT sender name |
-
-### Render Mask
-
-| Setting | Description |
-|---------|-------------|
-| **Active** | Enable render mask |
-| **Input** | Mask texture input |
-
----
-
-## 9. Complete Example
+## 6. Complete Example
 
 Here's a complete example shader structure:
 
@@ -493,24 +396,23 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 
 ---
 
-## 10. Summary
+## 7. Summary
 
 | Feature | Description |
 |---------|-------------|
 | **Directory** | `.glsl` directory with `src/` subdirectory |
+| **Sources** | Are shaders without inputs |
+| **Effects** | Are shaders with require an input |
 | **Entry Point** | `src/__init__.glsl` (mandatory) |
 | **Passes** | Additional `.glsl` files in `src/` |
 | **Includes** | `#include path.glsl` relative to `src/` |
 | **Inputs** | `uniform sampler2D`, auto-binding by name |
 | **Annotations** | `//@settings`, `//@slider`, `//@float`, `//@int`, `//@vec2/3/4`, `//@ivec2/3/4`, `//@slidervec2/3/4`, `//@rgb`, `//@rgba`, `//@enum`, `//@button`, `//@pushbutton` |
 | **Shadertoy** | Auto-detected via `mainImage` function |
-| **Time** | `u_time` uniform with Freetime/Manual/Sync modes |
-| **Projection** | Grid-based warping with Subdivide/Reset |
-| **Output** | Monitor, SPOUT, Render Mask |
 
 ---
 
-## 11. Tips and Best Practices
+## 8. Tips and Best Practices
 
 1. **Always use `__init__.glsl`** as the entry point
 2. **Use subdirectories** for helper files to avoid them being rendered as passes
@@ -519,10 +421,12 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 5. **Use annotations** for all user-controllable parameters
 6. **Set reasonable defaults** in annotation parameters
 7. **Organize complex shaders** with `#include` for modular code
+8. **NEVER** write in 'assets/Shaders' directly. 
+9. **Always** place shaders either in 'assets/Shaders/Sources/<category>' or 'assets/Shaders/Effects/<category>'.
 
 ---
 
-## 12. Common Failures and Errors
+## 9. Common Failures and Errors
 
 The engine injects header and footer code into the shader.
 These injections include the standard 'u_*' uniforms alongside other data.
@@ -536,7 +440,7 @@ If you encounter an error which seems to come from code which is not part of you
 
 Use 'void mainImage(...)' instead of 'void main(...)'.
 
-*Prefer clear channel names over iChannelX notation*
+*Still prefer clear channel names over the classic shadertoy iChannelX notation*
 
 Instead of enforcing iChannelX sampler2D uniforms, give them appropriate names to indicate what they are.
 The first (or main) input for any effect shader should be named 'input' or 'in'.
@@ -544,3 +448,9 @@ The first (or main) input for any effect shader should be named 'input' or 'in'.
 ---
 
 *Documentation based on implementation in `engine/generators/extensions/glsl/shader_loader.shio`*
+
+## 10. Verification and shader compilation skill (VERY IMPORTANT!)
+
+If you have the skill 'test_glsl_shader' available, ALWAYS use it to verify EACH '.glsl' file in your new shader directory.
+Do NOT try to compile the shader directory with the '.glsl' extension directly, instead check each individual '.glsl' file within the shader's root directory.
+ALWAYS fix all glsl errors, do NOT ship broken shaders!
