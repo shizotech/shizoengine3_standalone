@@ -1,6 +1,6 @@
 # VJ Program
 
-A VJ (Video Jockey) application for live visual performances and creative video output.
+A VJ (Video Jockey) application for live visual performances and creative video output, written in shizoscript.
 
 ## Overview
 
@@ -12,6 +12,8 @@ This project provides a real-time visual generation and processing system with:
 - **Engine** - Core engine code for processing and asset management
 - **Source Code** - Application logic and menu system
 - **Projects** - Project configuration and state files
+
+The entire program is written in shizoscript, glsl and (on windows platforms) hlsl.
 
 ## Directory Structure
 
