@@ -1,5 +1,5 @@
 
-//@enum options=(No Blend, Add, Add Mask, Mix, Multiply, Chroma R, Chroma G, Chroma B)
+//@enum options=(No Blend, Add, Add Mask, Mix, Multiply, MultiplyInput, Chroma R, Chroma G, Chroma B)
 uniform int BLEND;
 
 //@pushbutton
@@ -54,7 +54,11 @@ void mainImage( out vec4 fragColor, in vec2 p )
 	{
 		fragColor = mix(c2, c1 * c2, MIX);
 	}
-	else if(BLEND >= 5 && BLEND <= 7) // CHROMA R/G/B
+	else if(BLEND == 5) //Mult
+	{
+		fragColor = mix(c1, c1 * c2, MIX);
+	}
+	else if(BLEND >= 6 && BLEND <= 8) // CHROMA R/G/B
 	{
 		float threshold = 0.4;  // Adjust this value for tighter keying
 		float sensitivity = 0.2;
