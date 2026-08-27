@@ -257,7 +257,7 @@ uniform sampler2D RenderMaskInput;
 
 **Note:** `iResolution` third component is the aspect ratio (`width / height`). `iFrame` auto-increments starting from 0 on the first frame.
 
-Do NOT add these uniforms info the shader yourself!
+Do NOT add these uniforms into your shader code yourself!
 
 ### Wrapper Code
 
@@ -451,6 +451,7 @@ The first (or main) input for any effect shader should be named 'input' or 'in'.
 
 ## 10. Verification and shader compilation skill (VERY IMPORTANT!)
 
-If you have the skill 'test_glsl_shader' available, ALWAYS use it to verify EACH '.glsl' file in your new shader directory.
-Do NOT try to compile the shader directory with the '.glsl' extension directly, instead check each individual '.glsl' file within the shader's root directory.
+If you have the skill 'test_glsl_shader' available, ALWAYS use it to verify EACH '.glsl' file with an entry point in your new shader directory.
+You do not need to test helper shader files as compiling the main shader files will automatically include them.
+Do NOT try to compile the shader directory with the '.glsl' extension directly, instead check each individual '.glsl' file with an entry point within the shader's root directory.
 ALWAYS fix all glsl errors, do NOT ship broken shaders!
