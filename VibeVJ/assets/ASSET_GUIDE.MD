@@ -95,6 +95,98 @@ generator.pre_callback([captured_vars](generator, tl_pos, pos_delta) {
 - `generator.pre_callback([...captures](generator, tl_pos, pos_delta){ ... })` — runs before the frame (see AudioInputAnalysis `__init__.shio`, line 261).
 - `generator.post_callback([...captures](generator, tl_pos, pos_delta){ ... })` — runs after the frame.
 
+## Input/Output Handling
+
+A generator exposes its inputs and outputs through `area.control` widgets (a `nanogui.midicontrolio`) or, for plain numbers, through the primitive controls `controlfloat`, `controlint` and `controlslider`. There are two output strategies:
+
+1. **Rich values** (arbitrary classes, types, primitives, etc.) go through a `nanogui.control` widget, which is a `nanogui.midicontrolio`. Technically ANY kind of generator value can be sent through it — the GLSL `shader_loader` (`engine/generators/extensions/glsl/shader_loader.shio`) just happens to send the shader object, but the same mechanism works for any class/type/primitive.
+2. **Primitive values** (a plain number) use the primitive controls `controlfloat`, `controlint` and `controlslider`, which are already used by several existing assets (SineGenerator, TriangleWave, PhaserGroup, AudioInputAnalysis).
+
+### Output — rich values (nanogui.control / midicontrolio)
+
+Modeled on `shader_loader.shio` (lines ~839-847). Create the output control, set its value, wire a callback that resets the value, and register the default output so the engine can query it via `get_default_output` (the shader_loader `dispatcher`, lines ~53-54):
+
+```
+out = io_panel.control("OUT", "output_ctrls");
+out.anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(70);
+out.value(shaders[0].shader);
+out.callback([out](v){
+    //Reset value back to shader...
+    out.value(shaders[0].shader);
+});
+
+default_output = out;
+```
+
+The `dispatcher` then exposes it to the engine:
+
+```
+if(cmd == "get_default_output")
+    return default_output;
+```
+
+### Input — rich values (nanogui.control aka nanogui.midicontrolio)
+
+Modeled on `shader_loader.shio` (lines ~663-690 in `parse_inputs`). Create an input control, wire `callback` to forward the incoming value to the target(s), and `on_unlink` to reset the value to `None` when the link is removed. A `default_input` is auto-detected by lowercased name ("in" / "input" / "ichannel0") (lines ~688-689):
+
+```
+in_ctrl = in_panel.control(input_name, "input_ctrls");
+in_ctrl.anchor_left((*total_inputs) * 100).anchor_top(0).anchor_bottom(0).fixed_width(100);
+
+in_ctrl.on_unlink([in_ctrl, input_name, input_entry](ctrl1, ctrl2){
+    if(ctrl2 == in_ctrl) {
+        for(sid = 0; sid < input_entry.size(); sid++)
+            input_entry[sid].input(input_name, None);
+    }
+});
+in_ctrl.callback([input_name, input_entry](v){
+    for(sid = 0; sid < input_entry.size(); sid++)
+        input_entry[sid].input(input_name, v);
+});
+
+lc = input_name.lowercase();
+if(!default_input && (lc == "input" || lc == "ichannel0"))
+    default_input = in_ctrl;
+```
+
+The engine can also push an input directly through the `dispatcher` `set_input` command (shader_loader, lines ~77-84): it looks up `inputs[value.name]` and forwards `value.value` to all registered targets.
+
+```
+if(cmd == "set_input") {
+    if(!inputs.has(value.name))
+        return false;
+    ins = inputs[value.name];
+    for(i = 0; i < ins.size(); i++)
+        ins[i].input(value.name, value.value);
+    return true;
+}
+```
+
+### Inspecting incoming values
+
+When handling specific generator inputs (or when overriding a `nanogui.midicontrolio` `on_link` callback), use `std.type` / `std.is_type` to inspect what kind of variable is coming in (class, type, primitive, etc.) so the input can be dispatched to the right handler.
+
+### Output — primitive values (controlfloat / controlint / controlslider)
+
+For a plain-number output, create the primitive control in `entry` and drive it in `update`. Modeled on SineGenerator (`assets/Generators/Math/SineGenerator.asset/src/__init__.shio`, line 20 in `entry` and line 47 in `update`):
+
+```
+entry(generator, area) {
+    area.layout(nanogui.layout_vertical());
+    freq = area.controlslider("Frequency").value(0.25);
+
+    out = area.controlslider("Output");
+}
+
+update(generator, tl_pos, pos_delta) {
+    v = math.sin(tl_pos * 2.0 * math.PI * freq.value());
+    v = 0.5 + v / 2.0;
+    out.value(v);
+}
+```
+
+`controlfloat` and `controlint` are used for floating and integer values respectively — see `PhaserGroup` (controlfloat "Phase Delay", controlint "Start device" / "End device" / "Priority") and `AudioInputAnalysis` (controlfloat "BPM", controlslider "BEAT" / "LOW ENERGY").
+
 # Nanogui UI and widget notes
 
 - UI elements are created directly from parent widgets, you have to keep that in mind when looking up documentation for certain UI widgets.
