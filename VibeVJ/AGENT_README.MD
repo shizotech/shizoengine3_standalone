@@ -47,7 +47,13 @@ The entire program is written in shizoscript, glsl and (on windows platforms) hl
 
 ## Quick Links
 
+### Navigation
+
 - [Engine Code Navigation](engine/README.md)
 - [Source Code Navigation](src/README.md)
 - [Assets Overview](assets/README.md)
+
+### Implementations
+
+- [Assets Creation Documentation](assets/ASSET_GUIDE.MD)
 - [Shader Documentation](assets/Shaders/SHADER_GUIDE.MD)

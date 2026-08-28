@@ -1,0 +1,258 @@
+// LFO Synth generator
+// Multiple LFO channels (default 3, up to 8). Each channel has a selectable
+// waveform (SINE/TRIANGLE/SAWTOOTH/SQUARE) plus freq/phase/bias/gain and a
+// per-channel output controlslider the engine can consume. Global FREE/SYNC
+// mode, optional master ADSR envelope, and an "active" dispatcher.
+import nanogui;
+
+managed vs = None;
+managed channel_list_area = None;
+
+// Global controls
+mode = None;
+envelope_attack = None;
+envelope_decay = None;
+envelope_sustain = None;
+envelope_release = None;
+trigger = None;
+
+// Channel bookkeeping
+channel_max = 0;
+channel_list = [];
+free_times = [];
+
+// Envelope runtime
+env_time = 0.0;
+env_firing = false;
+lfo_active = true;
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "active") {
+		lfo_active = value;
+	}
+}
+
+// Returns a [-1,1] waveform sample for the given waveform index and phase (radians).
+wave_value(type, phase_rad) {
+	if(type == 0) {
+		return math.sin(phase_rad);
+	}
+	else if(type == 1) {
+		// Triangle wave in [-1,1], period = 1 cycle
+		p = math.mod(phase_rad / (2.0 * math.PI), 1.0);
+		if(p < 0.25)
+			return 4.0 * p;
+		else if(p < 0.5)
+			return 2.0 - 4.0 * p;
+		else if(p < 0.75)
+			return 2.0 - 4.0 * p;
+		else
+			return 4.0 * p - 4.0;
+	}
+	else if(type == 2) {
+		return 2.0 * math.mod(phase_rad / (2.0 * math.PI), 1.0) - 1.0;
+	}
+	else {
+		return math.sign(math.sin(phase_rad));
+	}
+}
+
+// Adds a new LFO channel row into channel_list_area and registers it in channel_list.
+add_new_channel() {
+	ch_id = "CH" + channel_max;
+
+	row = channel_list_area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+
+	wf = row.controlcombo("Wave").fixed_width(90);
+	wf.items(["SINE", "TRIANGLE", "SAWTOOTH", "SQUARE"]);
+	freq = row.controlslider("Freq").min(0).max(2).value(0.25).fixed_width(90);
+	phase = row.controlslider("Phase").min(0).max(1).value(0.0).fixed_width(90);
+	bias = row.controlslider("Bias").min(-1).max(1).value(0.0).fixed_width(90);
+	gain = row.controlslider("Gain").min(0).max(2).value(1.0).fixed_width(90);
+	out = row.controlslider("Out").fixed_width(90);
+	del_btn = row.button("X").fixed_width(25).anchor_right(0);
+
+	channel_list[ch_id] = [id=ch_id, row=row, waveform=wf, freq=freq, phase=phase, bias=bias, gain=gain, out=out];
+	free_times[ch_id] = 0.0;
+
+	del_btn.on_click([row, ch_id]() {
+		if(channel_list.has(ch_id))
+			channel_list.erase(ch_id);
+		if(free_times.has(ch_id))
+			free_times.erase(ch_id);
+		std.free(row);
+	});
+
+	channel_max++;
+}
+
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
+
+	// Global mode: 0 = FREE, 1 = SYNC
+	mode = area.controlcombo("Mode");
+	mode.items(["FREE", "SYNC"]);
+
+	add_btn = area.button("ADD LFO CHANNEL");
+
+	// Master ADSR envelope
+	env_area = area.collapsable("Envelope").expanded(true);
+	env_inner = env_area.content().layout(nanogui.layout_vertical());
+	envelope_attack = env_inner.controlslider("Attack").min(0).max(5).value(0.1);
+	envelope_decay = env_inner.controlslider("Decay").min(0).max(5).value(0.2);
+	envelope_sustain = env_inner.controlslider("Sustain").min(0).max(1).value(0.5);
+	envelope_release = env_inner.controlslider("Release").min(0).max(5).value(0.3);
+	trigger = env_inner.controlbutton("Trigger");
+	trigger.get_button().on_click([]() {
+		env_time = 0.0;
+		env_firing = true;
+	});
+
+	// Scrollable dynamic channel list
+	vs = area.vscroll();
+	channel_list_area = vs.content().layout(nanogui.layout_vertical());
+
+	// Add button: allow up to 8 channels
+	add_btn.on_click([]() {
+		if(channel_max < 8)
+			add_new_channel();
+	});
+
+	// Default 3 channels
+	for(i = 0; i < 3; i++)
+		add_new_channel();
+}
+
+update(generator, tl_pos, pos_delta) {
+	// Compute master ADSR envelope factor in [0,1]
+	env = 1.0;
+	if(env_firing) {
+		a = envelope_attack.value();
+		d = envelope_decay.value();
+		s = envelope_sustain.value();
+		r = envelope_release.value();
+
+		if(env_time < a) {
+			env = env_time / (a + 0.0001);
+		}
+		else if(env_time < a + d) {
+			frac = (env_time - a) / (d + 0.0001);
+			env = s + (1.0 - s) * (1.0 - frac);
+		}
+		else if(env_time < a + d + r) {
+			env = s;
+		}
+		else {
+			frac = (env_time - a - d) / (r + 0.0001);
+			env = s * (1.0 - frac);
+			if(env < 0.0)
+				env = 0.0;
+			env_firing = false;
+		}
+
+		env_time += pos_delta;
+	}
+
+	for(i = 0; i < channel_list.size(); i++) {
+		ch_id = channel_list.key(i);
+		ch = channel_list[ch_id];
+		phase_rad = 0.0;
+
+		if(mode.value() == 0) {
+			free_times[ch_id] = free_times[ch_id] + pos_delta * ch.freq.value();
+			phase_rad = free_times[ch_id] * 2.0 * math.PI + ch.phase.value() * 2.0 * math.PI;
+		}
+		else {
+			phase_rad = tl_pos * 2.0 * math.PI * ch.freq.value() + ch.phase.value() * 2.0 * math.PI;
+		}
+
+		v = wave_value(ch.waveform.value(), phase_rad);
+
+		// Apply gain and bias, then scale [-1,1] -> [0,1]
+		v = v * ch.gain.value() + ch.bias.value();
+		v = 0.5 + v / 2.0;
+
+		// Apply envelope and clamp to [0,1]
+		v = v * env;
+		if(v < 0.0)
+			v = 0.0;
+		if(v > 1.0)
+			v = 1.0;
+
+		ch.out.value(v);
+	}
+}
+
+save_state() {
+	state = [channel_max=channel_max, mode=mode.value(), channels=[], envelope=[]];
+
+	for(i = 0; i < channel_list.size(); i++) {
+		ch_id = channel_list.key(i);
+		ch = channel_list[ch_id];
+		state.channels.push_back([
+			id=ch_id,
+			waveform=ch.waveform.value(),
+			freq=ch.freq.value(),
+			phase=ch.phase.value(),
+			bias=ch.bias.value(),
+			gain=ch.gain.value(),
+			out=ch.out.value(),
+		]);
+	}
+
+	state.envelope.push_back([
+		attack=envelope_attack.value(),
+		decay=envelope_decay.value(),
+		sustain=envelope_sustain.value(),
+		release=envelope_release.value(),
+	]);
+
+	return state;
+}
+
+load_state(state) {
+	if(state.has("mode"))
+		mode.value(state.mode);
+
+	// Tear down existing channel rows
+	for(i = 0; i < channel_list.size(); i++) {
+		ch_id = channel_list.key(i);
+		std.free(channel_list[ch_id].row);
+	}
+	channel_list.clear();
+	free_times.clear();
+	channel_max = 0;
+
+	if(state.has("channels")) {
+		for(i = 0; i < state.channels.size(); i++) {
+			c = state.channels[i];
+			add_new_channel();
+			ch_id = "CH" + (channel_max - 1);
+			rec = channel_list[ch_id];
+			if(c.has("waveform"))
+				rec.waveform.value(c.waveform);
+			if(c.has("freq"))
+				rec.freq.value(c.freq);
+			if(c.has("phase"))
+				rec.phase.value(c.phase);
+			if(c.has("bias"))
+				rec.bias.value(c.bias);
+			if(c.has("gain"))
+				rec.gain.value(c.gain);
+			if(c.has("out"))
+				rec.out.value(c.out);
+		}
+	}
+
+	if(state.has("envelope") && state.envelope.size() > 0) {
+		e = state.envelope[0];
+		if(e.has("attack"))
+			envelope_attack.value(e.attack);
+		if(e.has("decay"))
+			envelope_decay.value(e.decay);
+		if(e.has("sustain"))
+			envelope_sustain.value(e.sustain);
+		if(e.has("release"))
+			envelope_release.value(e.release);
+	}
+}

@@ -10,6 +10,7 @@ Generators are the core processing units of the VJ application. They can generat
 
 | Category | Description | Files |
 |----------|-------------|-------|
+| **Math** | Math-based waveform/LFO generators | SineGenerator.asset, TriangleWave.asset, LFOSynth.asset |
 | **Audio** | Audio analysis and reactive generators | AudioInputAnalysis.asset |
 | **Network** | Network input/output generators | artnet_receiver.asset, artnet_sender.asset, spout_receiver.asset |
 | **Output** | Output configuration generators | LEDMapping.asset |
@@ -19,6 +20,10 @@ Generators are the core processing units of the VJ application. They can generat
 
 ```
 Generators/
+├── Math/             # Math-based waveform/LFO generators
+│   ├── SineGenerator.asset
+│   ├── TriangleWave.asset
+│   └── LFOSynth.asset
 ├── Audio/            # Audio generators
 │   └── AudioInputAnalysis.asset
 ├── Network/          # Network generators
@@ -34,6 +39,12 @@ Generators/
 ```
 
 ## Generator Types
+
+### Math Generators
+Produce waveforms from mathematical functions.
+- **SineGenerator**: single sine LFO with free/sync mode and saturation.
+- **TriangleWave**: triangle waveform generator.
+- **LFOSynth**: multi-channel LFO synth with 4 selectable waveforms (sine/triangle/sawtooth/square), FREE/SYNC mode, optional ADSR envelope, and save/load state.
 
 ### Audio Generators
 Process audio input and generate reactive visual output based on audio analysis.

@@ -424,17 +424,19 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 8. **NEVER** write in 'assets/Shaders' directly. 
 9. **Always** place shaders either in 'assets/Shaders/Sources/<category>' or 'assets/Shaders/Effects/<category>'.
 
+*iTime and beat reactivity*
+iTime is not the time in seconds, but rather the current beat (where 1.0 time unit equals one beat)
+Use iTime for beat synced audio effects and make sure the animation loops correspond nicely to beats.
+
 ---
 
 ## 9. Common Failures and Errors
 
 The engine injects header and footer code into the shader.
-These injections include the standard 'u_*' uniforms alongside other data.
+These injections include the standard 'u_*' uniforms, shadertoy uniforms, a separate "main" entry (if mainImage shadertoy format is detected), alongside other data.
 Make sure to not include standard uniforms in your shader code to avoid duplicate definitions.
 
-*Due to the injection of header code, the line numbers for glsl errors might be slightly off or show lines of code that are not directly part of your shader code!*
-
-If you encounter an error which seems to come from code which is not part of your shader code, then do not try to fix that and instead adapt your code to work with the given layout.
+Do not try to fix the loader, make your code work with the loader instead.
 
 *Prefer shadertoy format for the main function*
 
