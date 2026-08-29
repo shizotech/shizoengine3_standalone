@@ -6,6 +6,13 @@ Working with shizoscript files `.shio` requires the shizoscript and shizoscript 
 Generators are specific shizoscript classes defined in the engine core code ( "engine/generators" ) tied to this program.
 There are generator entry loaders for different file extensions within "engine/generators/extensions" you can find relevant source code there only when necessary.
 
+## Design Your Own UI (View Composition)
+
+- A core concept of this program: users **design their own UI** by dragging a view (e.g. a `clipview` or `generatorview`) and dropping it inside another view to build individual, reusable UI setups.
+- Views are the composable UI building blocks: `generatorview`, `clipview`, `clipstackview`, `singleview` (defined in `engine/generators/*.shio`).
+- The engine wires up `on_dragdrop` / `on_dragdrop_hover` handlers on each of these view containers, so views can be nested and composed freely.
+- See also `engine/generators/README.md` and `assets/Views/README.md` for the view containers and their drag/drop handlers.
+
 ---
 
 ## 1. Directory Structure

@@ -67,6 +67,19 @@ See `assets/ASSET_GUIDE.MD` for the full asset authoring guide and `assets/Shade
 
 ---
 
+## Core Concept: "Design Your Own UI"
+
+The second core idea of VibeVJ is that **users design their own UI**. Instead of a fixed, hardcoded layout, the interface is built by **dragging a view and dropping it into another view** to nest and compose individual, reusable setups. The four composable view containers make this possible:
+
+- `generatorview.shio` — holds a free-floating group of generator windows in a scroll area (drag/drop handlers at `area.content().on_dragdrop_hover` ~lines 23-25 and `on_dragdrop` ~lines 27-33, which calls `add_generator`).
+- `clipview.shio` — the clip/timeline view (drag/drop handlers `on_dragdrop_hover` ~lines 101-103, `on_cell_drop` line 105, and `begin_dragdrop` for dragging clips and stacking effects at line 866).
+- `clipstackview.shio` — the clip stack view, which can itself be dragged into the clipview to stack effects onto sources (`on_dragdrop_hover` ~lines 25-27, `on_dragdrop` ~lines 29-38; see the TODO at line 4).
+- `singleview.shio` — a single-generator view with its own `on_dragdrop_hover` (~lines 20-22) and `on_dragdrop` (~lines 24-30) handlers.
+
+The engine wires `on_dragdrop` / `on_dragdrop_hover` handlers on each of these views so they can be nested and composed by the user. See `engine/generators/README.md` for the view-container overview and `assets/Views/README.md` for the user-facing view assets.
+
+---
+
 ## Directory Map
 
 ```
