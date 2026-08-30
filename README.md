@@ -1,3 +1,14 @@
+
+# Quick Links
+
+Linux variant:
+
+https://github.com/shizotech/shizoengine3_standalone_linux
+
+Dev version:
+
+https://github.com/shizotech/shizoengine3_dev
+
 # VibeVJ - Agentic coding VJ software
 
 If you want new features faster:
