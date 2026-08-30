@@ -2,7 +2,9 @@
 // Multiple LFO channels (default 3, up to 8). Each channel has a selectable
 // waveform (SINE/TRIANGLE/SAWTOOTH/SQUARE) plus freq/phase/bias/gain and a
 // per-channel output controlslider the engine can consume. Global FREE/SYNC
-// mode, optional master ADSR envelope, and an "active" dispatcher.
+// mode, a single global "Phase Delay" control that offsets all channels
+// uniformly, a deterministic master ADSR envelope (Attack/Decay/Sustain/
+// Release + Trigger), and an "active" dispatcher.
 import nanogui;
 
 managed vs = None;
@@ -10,6 +12,7 @@ managed channel_list_area = None;
 
 // Global controls
 mode = None;
+global_phase = None;
 envelope_attack = None;
 envelope_decay = None;
 envelope_sustain = None;
@@ -24,6 +27,10 @@ free_times = [];
 // Envelope runtime
 env_time = 0.0;
 env_firing = false;
+env_releasing = false;
+env_level = 0.0;
+env_release_level = 0.0;
+env_release_time = 0.0;
 lfo_active = true;
 
 dispatcher(generator, cmd, value) {
@@ -89,9 +96,15 @@ add_new_channel() {
 entry(generator, area) {
 	area.layout(nanogui.layout_vertical());
 
+	// Globals section: Mode combo + global Phase Delay slider, laid out in one row.
+	gl_row = area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+
 	// Global mode: 0 = FREE, 1 = SYNC
-	mode = area.controlcombo("Mode");
+	mode = gl_row.controlcombo("Mode").fixed_width(90);
 	mode.items(["FREE", "SYNC"]);
+
+	// Single global phase delay applied uniformly to ALL channels (0..1, default 0.0).
+	global_phase = gl_row.controlslider("Phase Delay").min(0).max(1).value(0.0).fixed_width(130);
 
 	add_btn = area.button("ADD LFO CHANNEL");
 
@@ -106,6 +119,14 @@ entry(generator, area) {
 	trigger.get_button().on_click([]() {
 		env_time = 0.0;
 		env_firing = true;
+		env_releasing = false;
+		env_release_time = 0.0;
+	});
+	release_btn = env_inner.controlbutton("Release");
+	release_btn.get_button().on_click([]() {
+		env_releasing = true;
+		env_release_time = 0.0;
+		env_release_level = (env_level > 0.0) ? env_level : 1.0;
 	});
 
 	// Scrollable dynamic channel list
@@ -124,47 +145,76 @@ entry(generator, area) {
 }
 
 update(generator, tl_pos, pos_delta) {
-	// Compute master ADSR envelope factor in [0,1]
+	// Compute master ADSR envelope factor in [0,1] (deterministic 4-stage ADSR).
+	// A (Attack): linear 0 -> 1 over 'a' seconds.
+	// D (Decay): 1 -> sustain over 'd' seconds.
+	// S (Sustain): hold at sustain level indefinitely (no auto release).
+	// R (Release): from current level -> 0 over 'r' seconds (triggered by Release button).
+	// If env_firing is false AND env_releasing is false: envelope is idle, env = 1.0.
 	env = 1.0;
-	if(env_firing) {
-		a = envelope_attack.value();
-		d = envelope_decay.value();
-		s = envelope_sustain.value();
-		r = envelope_release.value();
+
+	a = envelope_attack.value();
+	d = envelope_decay.value();
+	s = envelope_sustain.value();
+	r = envelope_release.value();
+
+	if(env_firing && !env_releasing) {
+		// Firing: advance time
+		env_time += pos_delta;
 
 		if(env_time < a) {
-			env = env_time / (a + 0.0001);
+			// Attack: linear 0 -> 1
+			env = (a > 0.0) ? env_time / a : 1.0;
 		}
 		else if(env_time < a + d) {
-			frac = (env_time - a) / (d + 0.0001);
-			env = s + (1.0 - s) * (1.0 - frac);
-		}
-		else if(env_time < a + d + r) {
-			env = s;
+			// Decay: linear 1 -> sustain
+			frac = (d > 0.0) ? (env_time - a) / d : 1.0;
+			env = 1.0 + (s - 1.0) * frac;
 		}
 		else {
-			frac = (env_time - a - d) / (r + 0.0001);
-			env = s * (1.0 - frac);
-			if(env < 0.0)
-				env = 0.0;
-			env_firing = false;
+			// Sustain: hold at sustain level indefinitely
+			env = s;
 		}
 
-		env_time += pos_delta;
+		// Track current level for release capture
+		env_level = env;
 	}
+	else if(env_releasing) {
+		// Release: linear decay from env_release_level -> 0 over 'r' seconds
+		env_release_time += pos_delta;
+		if(env_release_time >= r) {
+			env = 0.0;
+			env_releasing = false;
+			env_firing = false;
+		}
+		else {
+			frac = (r > 0.0) ? env_release_time / r : 1.0;
+			env = env_release_level * (1.0 - frac);
+		}
+		env_level = env;
+	}
+	// else: not firing and not releasing -> env stays at 1.0 (envelope idle/disabled)
+
+	if(env < 0.0)
+		env = 0.0;
+	if(env > 1.0)
+		env = 1.0;
 
 	for(i = 0; i < channel_list.size(); i++) {
 		ch_id = channel_list.key(i);
 		ch = channel_list[ch_id];
 		phase_rad = 0.0;
 
-		if(mode.value() == 0) {
-			free_times[ch_id] = free_times[ch_id] + pos_delta * ch.freq.value();
-			phase_rad = free_times[ch_id] * 2.0 * math.PI + ch.phase.value() * 2.0 * math.PI;
-		}
-		else {
-			phase_rad = tl_pos * 2.0 * math.PI * ch.freq.value() + ch.phase.value() * 2.0 * math.PI;
-		}
+		// Global phase delay offset (uniform across all channels)
+		global_offset = global_phase.value() * 2.0 * math.PI;
+
+	if(mode.value() == 0) {
+		free_times[ch_id] = free_times[ch_id] + pos_delta * ch.freq.value();
+		phase_rad = free_times[ch_id] * 2.0 * math.PI + ch.phase.value() * 2.0 * math.PI + global_offset;
+	}
+	else {
+		phase_rad = tl_pos * 2.0 * math.PI * ch.freq.value() + ch.phase.value() * 2.0 * math.PI + global_offset;
+	}
 
 		v = wave_value(ch.waveform.value(), phase_rad);
 
@@ -184,7 +234,7 @@ update(generator, tl_pos, pos_delta) {
 }
 
 save_state() {
-	state = [channel_max=channel_max, mode=mode.value(), channels=[], envelope=[]];
+	state = [channel_max=channel_max, mode=mode.value(), phase_delay=global_phase.value(), channels=[], envelope=[]];
 
 	for(i = 0; i < channel_list.size(); i++) {
 		ch_id = channel_list.key(i);
@@ -213,6 +263,8 @@ save_state() {
 load_state(state) {
 	if(state.has("mode"))
 		mode.value(state.mode);
+	if(state.has("phase_delay"))
+		global_phase.value(state.phase_delay);
 
 	// Tear down existing channel rows
 	for(i = 0; i < channel_list.size(); i++) {

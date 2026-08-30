@@ -10,7 +10,7 @@ Generators are the core processing units of the VJ application. They can generat
 
 | Category | Description | Files |
 |----------|-------------|-------|
-| **Math** | Math-based waveform/LFO generators | SineGenerator.asset, TriangleWave.asset, LFOSynth.asset |
+| **Math** | Math-based waveform/LFO generators | SineGenerator.asset, TriangleWave.asset, LFOSynth.asset, SawtoothWave.asset, SquareWave.asset, NoiseGenerator.asset, LFOClock.asset |
 | **Audio** | Audio analysis and reactive generators | AudioInputAnalysis.asset |
 | **Network** | Network input/output generators | artnet_receiver.asset, artnet_sender.asset, spout_receiver.asset |
 | **Output** | Output configuration generators | LEDMapping.asset |
@@ -23,7 +23,11 @@ Generators/
 ├── Math/             # Math-based waveform/LFO generators
 │   ├── SineGenerator.asset
 │   ├── TriangleWave.asset
-│   └── LFOSynth.asset
+│   ├── LFOSynth.asset
+│   ├── SawtoothWave.asset
+│   ├── SquareWave.asset
+│   ├── NoiseGenerator.asset
+│   └── LFOClock.asset
 ├── Audio/            # Audio generators
 │   └── AudioInputAnalysis.asset
 ├── Network/          # Network generators
@@ -45,6 +49,10 @@ Produce waveforms from mathematical functions.
 - **SineGenerator**: single sine LFO with free/sync mode and saturation.
 - **TriangleWave**: triangle waveform generator.
 - **LFOSynth**: multi-channel LFO synth with 4 selectable waveforms (sine/triangle/sawtooth/square), FREE/SYNC mode, optional ADSR envelope, and save/load state.
+- **SawtoothWave**: single-channel sawtooth LFO with FREE/SYNC mode, frequency, gain and bias.
+- **SquareWave**: single-channel square LFO with FREE/SYNC mode, frequency, gain and bias.
+- **NoiseGenerator**: white/pink noise source that emits a new random value at a user-configurable rate.
+- **LFOClock**: BPM-driven beat clock that pulses the output to 1.0 on each beat, then decays to 0 over a configurable decay duration.
 
 ### Audio Generators
 Process audio input and generate reactive visual output based on audio analysis.

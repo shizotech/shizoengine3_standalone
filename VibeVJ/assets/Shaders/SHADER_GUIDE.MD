@@ -457,3 +457,9 @@ If you have the skill 'test_glsl_shader' available, ALWAYS use it to verify EACH
 You do not need to test helper shader files as compiling the main shader files will automatically include them.
 Do NOT try to compile the shader directory with the '.glsl' extension directly, instead check each individual '.glsl' file with an entry point within the shader's root directory.
 ALWAYS fix all glsl errors, do NOT ship broken shaders!
+
+A note on compile errors with line numbers:
+
+- Do NOT get caught up in line numbers not matching your shader code!
+- Always look at the returned 'final_shader_with_lines' to identify the actual offending line
+- Identify the wrong code by looking at 'final_shader_with_lines' and then look for the wrong line's text in the actual shader files (identify by text, not line numbers)
