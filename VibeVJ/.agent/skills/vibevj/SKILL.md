@@ -9,6 +9,9 @@ Then use vibevj_query() to interact with the generator (get & set)
 
 If no generator is focused currently, hint the user to click on an item to make it visible to you.
 
+The whole program is build around dynamically placeable UI containers ("Views") which hold different kinds of generator assets.
+You can find both views and all asset types under "assets/".
+
 # vibevj_query()
 
 vibevj_query() takes two arguments:
@@ -94,3 +97,10 @@ Attribute controls do not belong to the generator directly, only their parent co
 You can get and set attribute controls just like any other regular control.
 
 ---
+
+# Fixtures
+
+Fixture definitions are located in assets/Fixtures using a simple json scheme
+To get an overview of the exact format and possible channel definitions, look at assets/Fixtures/example.json which showcases all possibilities
+You can create new fixtures there using regular file operation tools
+You can also look up specific fixture definitions there

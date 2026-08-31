@@ -157,3 +157,10 @@ The menu/UI code lives in `src/menu/`. See `src/README.md` for details.
 - [Shader Guide](assets/Shaders/SHADER_GUIDE.MD)
 
 Always check directory specific README.md's
+
+## Fixtures
+
+Fixture definitions are located in assets/Fixtures using a simple json scheme
+To get an overview of the exact format and possible channel definitions, look at assets/Fixtures/example.json which showcases all possibilities
+You can create new fixtures there using regular file operation tools
+You can also look up specific fixture definitions there when necessary
