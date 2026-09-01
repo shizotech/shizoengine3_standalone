@@ -32,6 +32,7 @@ MyShader.glsl/
 2. **Render Passes**: All `.glsl` files directly in `src/` (except `__init__.glsl`) become additional render passes
 3. **Subdirectories**: Files in `src/subdir/` are **NOT rendered**, only accessible via `#include`
 4. **Single File Fallback**: A single `.glsl` file (without directory structure) can also be used
+5. **Rich Controls**: Each shader should have uniform controls so every aspect of the shader can be modified, be really expressive on controls for the shader
 
 ---
 
