@@ -19,7 +19,7 @@ uniform float hsv_target_hue;
 //@slider min=0 max=2 value=0
 uniform int hsv_clip;
 
-uniform sampler2D hsv_input;
+uniform sampler2D input;
 
 vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -38,7 +38,7 @@ vec3 rgb2hsv(vec3 c) {
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
-    vec4 color = texture(hsv_input, uv);
+    vec4 color = texture(input, uv);
     vec3 rgb = color.rgb;
     
     // Convert to HSV

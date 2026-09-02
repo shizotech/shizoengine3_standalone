@@ -3,10 +3,8 @@
 //@rgb value=(1.0,0.0,0.0)
 uniform vec3 hue_color;
 
-// 'in' is a reserved GLSL keyword, so map the documented special
-// input name 'in' to a valid internal identifier for the compiler.
-#define in in_tex
-uniform sampler2D in;
+// Primary input sampler, named 'input' per the shader guide.
+uniform sampler2D input;
 
 vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -25,7 +23,7 @@ vec3 rgb2hsv(vec3 c) {
 
 void mainImage(out vec4 fragColor, vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
-    vec4 color = texture(in, uv);
+    vec4 color = texture(input, uv);
 
     // Hue of the RGB uniform = rotation amount (red=0, green=1/3)
     vec3 uniform_hsv = rgb2hsv(hue_color);

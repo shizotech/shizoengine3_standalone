@@ -25,7 +25,7 @@ uniform float kalie_offset_y;
 //@slider min=0.0 max=1.0 value=0.0
 uniform float kalie_blur;
 
-uniform sampler2D kalie_input;
+uniform sampler2D input;
 
 vec3 kaleidoscope(vec2 uv, float segments, float rotation, int mirror, float zoom, float time, float blur, float offset_x, float offset_y) {
     vec2 center = vec2(offset_x, offset_y);
@@ -65,7 +65,7 @@ vec3 kaleidoscope(vec2 uv, float segments, float rotation, int mirror, float zoo
         for (float i = -2.0; i <= 2.0; i++) {
             vec2 sample_uv = new_uv + vec2(i * offset_amt, i * offset_amt * 0.5);
             if (sample_uv.x >= 0.0 && sample_uv.x <= 1.0 && sample_uv.y >= 0.0 && sample_uv.y <= 1.0) {
-                color += texture(kalie_input, sample_uv).rgb;
+                color += texture(input, sample_uv).rgb;
             }
         }
         color /= samples;
@@ -73,7 +73,7 @@ vec3 kaleidoscope(vec2 uv, float segments, float rotation, int mirror, float zoo
     }
     
     if (new_uv.x >= 0.0 && new_uv.x <= 1.0 && new_uv.y >= 0.0 && new_uv.y <= 1.0) {
-        return texture(kalie_input, new_uv).rgb;
+        return texture(input, new_uv).rgb;
     }
     
     return vec3(0.0);

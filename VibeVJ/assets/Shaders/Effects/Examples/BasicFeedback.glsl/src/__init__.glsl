@@ -13,7 +13,7 @@ uniform float fade;
 //@vec2 min=(-0.1,-0.1) max=(0.1,0.1) value=(0.0,0.0)
 uniform vec2 offset;
 
-uniform sampler2D in;
+uniform sampler2D input;
 uniform sampler2D feedback;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
@@ -21,7 +21,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord.xy / iResolution.xy;
     
     // Sample the input
-    vec4 inputColor = texture(in, uv);
+    vec4 inputColor = texture(input, uv);
     
     // Sample the feedback (previous frame) with slight offset for motion
     vec2 feedbackUv = uv + offset;

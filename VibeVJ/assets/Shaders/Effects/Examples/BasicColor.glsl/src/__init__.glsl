@@ -12,7 +12,7 @@ uniform vec3 color1;
 //@rgb
 uniform vec3 color2;
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // uv coordinates: (0,0) at bottom-left, (1,1) at top-right
@@ -26,6 +26,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec3 gradient = mix(color1, color2, smoothstep(0.0, 1.0, t));
     
     // Mix with input texture for a blended effect
-    vec4 inputColor = texture(in, uv);
+    vec4 inputColor = texture(input, uv);
     fragColor = vec4(mix(inputColor.rgb, gradient, 0.7), 1.0);
 }

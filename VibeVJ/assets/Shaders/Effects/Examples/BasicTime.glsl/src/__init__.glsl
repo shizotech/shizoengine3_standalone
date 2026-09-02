@@ -16,7 +16,7 @@ uniform vec3 colorA;
 //@rgb
 uniform vec3 colorB;
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // uv coordinates centered at (0.5, 0.5)
@@ -48,6 +48,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec3 result = col * (0.3 + 0.7 * ring) + col * circle * 0.5;
     
     // Mix with input
-    vec4 inputColor = texture(in, uv);
+    vec4 inputColor = texture(input, uv);
     fragColor = vec4(mix(inputColor.rgb, result, 0.8), 1.0);
 }

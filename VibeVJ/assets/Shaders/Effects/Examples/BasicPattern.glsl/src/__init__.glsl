@@ -17,7 +17,7 @@ uniform int pattern_type;
 // that can be controlled with sliders and color pickers.
 // ============================================================
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
@@ -74,7 +74,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     col += vec3(0.02) * sin(uv.x * 20.0 + iTime);
     
     // Blend with input
-    vec4 inputColor = texture(in, uv);
+    vec4 inputColor = texture(input, uv);
     col = mix(inputColor.rgb, col, 0.7);
     
     fragColor = vec4(col, 1.0);

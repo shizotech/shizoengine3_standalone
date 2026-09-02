@@ -446,7 +446,8 @@ Use 'void mainImage(...)' instead of 'void main(...)'.
 *Still prefer clear channel names over the classic shadertoy iChannelX notation*
 
 Instead of enforcing iChannelX sampler2D uniforms, give them appropriate names to indicate what they are.
-The first (or main) input for any effect shader should be named 'input' or 'in'.
+The first (or main) input for any effect shader should be named 'uniform sampler2D input'.
+Make sure this doesnt conflict with other variables that might be named 'input'.
 
 ---
 

@@ -22,7 +22,7 @@ uniform vec2 spherize_light_dir;
 //@slider min=0.0 max=2.0 value=0.5
 uniform float spherize_highlight;
 
-uniform sampler2D tex;
+uniform sampler2D input;
 
 vec3 calculateLighting(vec3 normal, vec2 light_dir, float highlight) {
     vec3 light = normalize(vec3(light_dir, 1.0));
@@ -125,7 +125,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // Sample texture at distorted UV
     vec4 color = vec4(0.0);
     if (new_uv.x >= 0.0 && new_uv.x <= 1.0 && new_uv.y >= 0.0 && new_uv.y <= 1.0) {
-        color = texture(tex, new_uv);
+        color = texture(input, new_uv);
     }
     
     // Apply lighting based on rotated normal

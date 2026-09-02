@@ -22,7 +22,7 @@ uniform vec3 scanline_color_tint;
 //@slider min=0.0 max=1.0 value=0.0
 uniform float scanline_phosphor;
 
-uniform sampler2D scanline_input;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
@@ -37,7 +37,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     }
     
     // Sample the input texture
-    vec3 color = texture(scanline_input, coord).rgb;
+    vec3 color = texture(input, coord).rgb;
     
     // Scanline effect - alternating dark bands
     float scanline_pattern = sin(coord.y * scanline_density * 3.14159265) * 0.5 + 0.5;
@@ -56,9 +56,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     if (scanline_phosphor > 0.0) {
         float shift = scanline_phosphor * 0.002;
         vec3 phosphor;
-        phosphor.r = texture(scanline_input, coord + vec2(shift, 0.0)).r;
-        phosphor.g = texture(scanline_input, coord).g;
-        phosphor.b = texture(scanline_input, coord - vec2(shift, 0.0)).b;
+        phosphor.r = texture(input, coord + vec2(shift, 0.0)).r;
+        phosphor.g = texture(input, coord).g;
+        phosphor.b = texture(input, coord - vec2(shift, 0.0)).b;
         color = mix(color, phosphor, scanline_phosphor);
     }
     

@@ -24,15 +24,14 @@ uniform float fisheye_vignette;
 //@slider min=0.0 max=1.0 value=0.0
 uniform float fisheye_chromatic;
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 /**
  * Fisheye Lens Distortion Effect
  */
-// Custom format.
 
-void main() {
-    vec2 uv = v_uv;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord / iResolution.xy;
     
     // Calculate offset from center
     vec2 center = vec2(fisheye_center_x, fisheye_center_y);
@@ -64,15 +63,15 @@ void main() {
     vec3 color;
     if (fisheye_chromatic > 0.0) {
         float aberration = fisheye_chromatic * dist;
-        vec2 aberration_offset = normalize(offset) * aberration / textureSize(in, 0).xy;
+        vec2 aberration_offset = normalize(offset) * aberration / textureSize(input, 0).xy;
         
-        float r_ch = texture(in, new_uv + aberration_offset).r;
-        float g = texture(in, new_uv).g;
-        float b_ch = texture(in, new_uv - aberration_offset).b;
+        float r_ch = texture(input, new_uv + aberration_offset).r;
+        float g = texture(input, new_uv).g;
+        float b_ch = texture(input, new_uv - aberration_offset).b;
         
         color = vec3(r_ch, g, b_ch);
     } else {
-        color = texture(in, new_uv).rgb;
+        color = texture(input, new_uv).rgb;
     }
     
     // Vignette effect
@@ -82,5 +81,5 @@ void main() {
     
     color *= vignette;
     
-    fragColor = vec4(color, texture(in, uv).a);
+    fragColor = vec4(color, texture(input, uv).a);
 }
