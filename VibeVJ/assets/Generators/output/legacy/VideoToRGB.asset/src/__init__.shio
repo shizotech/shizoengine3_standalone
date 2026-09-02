@@ -1,0 +1,168 @@
+import nanogui;
+using eigen;
+
+managed avg_shader = None;
+managed vs = None;
+managed color_disp = None;
+managed in_ctrl = None;
+managed mask_ctrl = None;
+managed out_r = None;
+managed out_g = None;
+managed out_b = None;
+managed out_color = None;
+
+// Default input/output handles for engine routing.
+managed default_input = None;
+managed default_output = None;
+
+// Dispatcher exposes the default IN/OUT controls to the engine so the
+// IN/MASK inputs and the OUT output can be routed like any other generator.
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_input")
+		return default_input;
+	if(cmd == "get_default_output")
+		return default_output;
+}
+
+// Shader: renders the input image, but only where the MASK is non-black.
+// Masked-out areas are forced to black so the CPU average can ignore them.
+shader_src = R"(
+#version 330 core
+
+uniform sampler2D input;
+uniform sampler2D mask;
+
+void main()
+{
+    vec4 in_color = texture(input, v_uv);
+    vec4 m = texture(mask, v_uv);
+
+    float mmax = max(m.r, max(m.g, m.b));
+
+    if(mmax <= 0.001)
+    {
+        fragColor = vec4(0.0);
+        return;
+    }
+
+    fragColor = in_color;
+}
+)";
+
+// Compute the average color of the masked input on the CPU and push it to
+// the SENDER sliders (R/G/B) and the display. Called after each frame so the
+// latest rendered frame's readback is used.
+update_post(generator) {
+	buffer = avg_shader.pixel_buffer();
+	n = std.len(buffer);
+	if(n == 0)
+		return;
+
+	px = n / 3;
+	sr = 0.0;
+	sg = 0.0;
+	sb = 0.0;
+	cnt = 0;
+
+	for(i = 0; i < px; i++) {
+		r = buffer[i*3];
+		g = buffer[i*3+1];
+		b = buffer[i*3+2];
+		// Only count non-black (i.e. masked-in) pixels
+		if(r != 0 || g != 0 || b != 0) {
+			sr += r;
+			sg += g;
+			sb += b;
+			cnt++;
+		}
+	}
+
+	r_avg = 0.0;
+	g_avg = 0.0;
+	b_avg = 0.0;
+	if(cnt > 0) {
+		r_avg = sr / cnt / 255.0;
+		g_avg = sg / cnt / 255.0;
+		b_avg = sb / cnt / 255.0;
+	}
+
+	// notify_links=true so linked SENDERs (other controls) get updated.
+	out_r.value(r_avg, false, true);
+	out_g.value(g_avg, false, true);
+	out_b.value(b_avg, false, true);
+	out_color.value([r=r_avg, g=g_avg, b=b_avg]);
+	color_disp.rgb(r_avg, g_avg, b_avg);
+}
+
+entry(generator, area) {
+
+	generator.window.fixed_size(vec2f(480, 620));
+
+	vs = area.vscroll().anchor(0).anchor_bottom(0);
+	area = vs.content().layout(nanogui.layout_vertical());
+
+	// ---- Shader (masked input render) created FIRST ----
+	// Must exist before the IN/MASK input controls so their callbacks
+	// capture a valid (non-None) shader reference by value.
+	avg_shader = area.shader().fixed_height(200).anchor_left(0).anchor_right(0);
+	avg_shader.fragment_source(shader_src);
+	avg_shader.render_size(vec2i(256, 256));
+	avg_shader.pixel_readback(true);
+	avg_shader.output_component_format("uint8");
+	avg_shader.output_pixel_format("rgb");
+
+	// ---- Input panel: IN (video) + MASK ----
+	io_panel = area.widget().fixed_height(90).anchor_left(0).anchor_right(0).layout(nanogui.layout_vertical());
+
+	in_ctrl = io_panel.control("IN", "input_ctrls");
+	in_ctrl.on_unlink([in_ctrl, avg_shader](c1, c2) {
+		if(c2 == in_ctrl)
+			avg_shader.input("input", None);
+	});
+	in_ctrl.callback([avg_shader](v) {
+		avg_shader.input("input", v);
+	});
+	default_input = in_ctrl;
+
+	mask_ctrl = io_panel.control("MASK", "input_ctrls");
+	mask_ctrl.on_unlink([mask_ctrl, avg_shader](c1, c2) {
+		if(c2 == mask_ctrl)
+			avg_shader.input("mask", None);
+	});
+	mask_ctrl.callback([avg_shader](v) {
+		avg_shader.input("mask", v);
+	});
+
+	// ---- Average color display ----
+	color_disp = area.color_selector().fixed_height(60).anchor_left(0).anchor_right(0);
+
+	// ---- SENDER outputs (routable) ----
+	// These controlsliders are SENDERs: their value can be routed (drag&drop /
+	// link_to) to other generators' controlsliders.
+	out_r = area.controlslider("R", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+	out_g = area.controlslider("G", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+	out_b = area.controlslider("B", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+
+	// Rich output holding the whole RGB average (also routable).
+	out_color = area.control("OUT", "output_ctrls").anchor_left(0).anchor_right(0);
+	default_output = out_color;
+}
+
+save_state() {
+	return [
+		r = out_r.value(),
+		g = out_g.value(),
+		b = out_b.value(),
+	];
+}
+
+load_state(state) {
+	if(state.has("r"))
+		out_r.value(state.r, false, true);
+	if(state.has("g"))
+		out_g.value(state.g, false, true);
+	if(state.has("b"))
+		out_b.value(state.b, false, true);
+	if(state.has("r") && state.has("g") && state.has("b"))
+		color_disp.rgb(state.r, state.g, state.b);
+}

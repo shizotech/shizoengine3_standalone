@@ -1,172 +1,171 @@
-// ==== Custom Uniform Controls ====
+// Tunnel
+// An endless plasma tunnel: the viewer flies through a tunnel whose
+// walls are made of animated plasma. The pattern style is selectable
+// via `pattern_mode` (Classical, Waves, Vortex, Fire, Mosaic).
+// Shadertoy-style mainImage. iResolution / iTime / iFrame / iMouse are
+// engine-injected - do NOT redeclare them.
 
-//@float min=0.01 max=5.0 value=1.0
-uniform float tunnel_speed;
+//@settings dtype=float32 format=rgba
 
-//@float min=0.1 max=3.0 value=1.0
-uniform float tunnel_zoom;
+// ---- Configurable uniforms ----
+//@float min=0.05 max=1.0 value=0.3
+uniform float tunnel_size;
 
-//@float min=-3.14 max=3.14 value=0.0
-uniform float tunnel_twist;
+//@float min=0.0 max=1.0 value=0.5
+uniform float smoothness;
 
-//@int min=3 max=12 value=6
-uniform int tunnel_sides;
+//@float min=0.0 max=5.0 value=1.0
+uniform float rotation_speed;
 
-//@rgb value=(0.0,1.0,1.0)
-uniform vec3 tunnel_colors;
+//@rgb value=(1.0,0.6,0.2)
+uniform vec3 fg_colour;
 
-//@float min=0.1 max=10.0 value=3.0
-uniform float tunnel_depth;
+//@rgb value=(0.02,0.02,0.08)
+uniform vec3 bg_colour;
 
-//@float min=0.0 max=2.0 value=1.0
-uniform float tunnel_pulse;
+//@enum options=(Classical, Waves, Vortex, Fire, Mosaic)
+uniform int pattern_mode;
 
-//@float min=0.1 max=5.0 value=1.0
-uniform float tunnel_rings;
-
-// Hash function for pseudo-random values
-float hash(vec2 p)
-{
-    p = fract(p * vec2(234.34, 435.345));
-    p += dot(p, p + 34.345);
-    return fract(p.x * p.y);
+// =====================================================================
+// Helpers
+// =====================================================================
+// 2D hash for pseudo-random values.
+float hash(vec2 p) {
+    float n = dot(p, vec2(127.1, 311.7));
+    return fract(sin(n) * 43758.5453);
 }
 
-float hash1(float n)
-{
-    return fract(sin(n) * 43758.5453123);
+// Smooth 2D value noise (smoothstep-interpolated).
+float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    vec2 a = vec2(0.0, 0.0);
+    vec2 b = vec2(1.0, 0.0);
+    vec2 c = vec2(0.0, 1.0);
+    vec2 d = vec2(1.0, 1.0);
+    float v0 = hash(i);
+    float v1 = hash(i + a);
+    float v2 = hash(i + b);
+    float v3 = hash(i + c);
+    float v4 = hash(i + d);
+    float x0 = mix(v0, v2, f.x);
+    float x1 = mix(v1, v3, f.x);
+    float y0 = mix(v0, v1, f.y);
+    float y1 = mix(v2, v4, f.y);
+    return mix(x0, x1, f.y);
 }
 
-// Generate tunnel pattern based on polygon sides
-vec3 tunnel_pattern(vec2 uv, float time)
-{
-    // Polar coordinates
-    float r = length(uv);
-    float a = atan(uv.y, uv.x);
-
-    // Apply twist
-    a += tunnel_twist * time * 0.1;
-
-    // Scale and zoom
-    r *= tunnel_zoom;
-
-    // Depth effect - moving into tunnel
-    float depth = r * tunnel_depth;
-    float z = time * tunnel_speed * 0.5 + depth;
-
-    // Polygon shaping via radial folding
-    float side_angle = 6.28318 / float(tunnel_sides);
-    a = mod(a, side_angle) - side_angle * 0.5;
-
-    // Ring pattern
-    float ring_freq = tunnel_rings * 3.0;
-    float rings = sin(z * ring_freq) * 0.5 + 0.5;
-
-    // Pulse effect
-    float pulse = sin(time * tunnel_speed * 2.0) * tunnel_pulse * 0.5 + 0.5;
-
-    // Tunnel walls - alternating bright/dark segments
-    float wall_pattern = 0.0;
-    float segment = floor(a * float(tunnel_sides) / 3.14159);
-    wall_pattern = mod(segment, 2.0);
-
-    // Edge highlight for polygon facets
-    float facet_edge = abs(a) * float(tunnel_sides) * 0.3;
-    facet_edge = smoothstep(0.15, 0.0, facet_edge);
-
-    // Inner glow
-    float inner_glow = pow(1.0 - r, 3.0) * pulse;
-
-    // Spiral streaks inside tunnel
-    float spiral = sin(a * float(tunnel_sides) + z * 2.0) * 0.5 + 0.5;
-    spiral = pow(spiral, 2.0);
-
-    // Combine all pattern elements
-    float pattern = 0.0;
-    pattern += rings * 0.4;
-    pattern += wall_pattern * 0.3;
-    pattern += facet_edge * 0.5;
-    pattern += spiral * 0.2;
-    pattern += inner_glow * 0.6;
-
-    // Create repeating tunnel segments
-    float segment_length = 3.14159 / ring_freq;
-    float seg_pos = mod(z, segment_length);
-    float seg_fade = smoothstep(0.0, 0.1, seg_pos) * smoothstep(segment_length, segment_length - 0.1, seg_pos);
-
-    // Depth fog - fade distant segments
-    float fog = exp(-r * 0.8);
-
-    // Final pattern
-    pattern *= seg_fade * fog;
-    pattern = pow(pattern, 0.8) * pulse;
-
-    // Color mapping
-    vec3 col = vec3(0.0);
-    col = mix(col, tunnel_colors, pattern);
-
-    // Add color variation based on angle
-    float hue = fract(a / 6.28318 + time * 0.02);
-    vec3 hue_col;
-    hue_col.r = sin(6.28318 * hue * 0.5 + 0.0) * 0.5 + 0.5;
-    hue_col.g = sin(6.28318 * hue * 0.5 + 2.094) * 0.5 + 0.5;
-    hue_col.b = sin(6.28318 * hue * 0.5 + 4.188) * 0.5 + 0.5;
-
-    col = mix(col, col * hue_col, 0.3 * pulse);
-
-    // Add subtle star-like particles in tunnel
-    float star_field = 0.0;
-    vec2 star_uv = uv * 20.0 + vec2(time * 0.1, -time * 0.05);
-    float star_hash = hash(floor(star_uv));
-    if (star_hash > 0.95)
-    {
-        vec2 star_pos = fract(star_uv) - 0.5;
-        float star_dist = length(star_pos);
-        float star_brightness = hash(floor(star_uv) + 123.456);
-        float star_twinkle = sin(time * (1.0 + star_brightness * 5.0) + star_hash * 6.28) * 0.5 + 0.5;
-        star_field += smoothstep(0.05, 0.0, star_dist) * star_brightness * star_twinkle;
+// 5-octave fractal Brownian motion built on the value noise above.
+float fbm(vec2 p) {
+    float sum = 0.0;
+    float amp = 0.5;
+    vec2 p2 = p;
+    for (int k = 0; k < 5; k++) {
+        sum += amp * noise(p2);
+        p2 = p2 * 2.0 + vec2(13.7, 7.3);
+        amp *= 0.5;
     }
-    col += vec3(star_field * 0.5);
-
-    return col;
+    return sum;
 }
 
-void mainImage(out vec4 fragColor, in vec2 fragCoord)
-{
+// Hue-cycled "trippy" colour from a phase value.
+vec3 trippy_col(float phase) {
+    return 0.5 + 0.5 * cos(vec3(0.0, 2.09, 4.19) + 6.2832 + phase);
+}
+
+// =====================================================================
+// Plasma pattern generator
+// q.x = angle around the tunnel (radians), q.y = depth along the axis.
+// =====================================================================
+float plasma(vec2 q, float t, int mode) {
+    float pv = 0.0;
+    if (mode == 0) {
+        // Classical: standard superposition of sines.
+        float s1 = sin(q.x * 3.0 + t);
+        float s2 = sin(q.x * 5.0 - t * 1.3);
+        float s3 = sin(q.y * 2.0 + t * 0.7);
+        float s4 = sin((q.x + q.y) * 2.0 - t * 0.5);
+        pv = s1 + s2 + s3 + s4;
+        pv = 0.5 + 0.5 * (pv / 4.0);
+    } else if (mode == 1) {
+        // Waves: horizontal and diagonal sine bands running along the tunnel.
+        float w1 = sin(q.y * 3.0 + t);
+        float w2 = sin((q.x + q.y) * 2.0 - t * 0.8);
+        pv = 0.5 + 0.5 * (0.5 * (w1 + w2));
+    } else if (mode == 2) {
+        // Vortex: spiral distortion - the angle advances with depth,
+        // so the plasma swirls like a vortex down the tunnel.
+        float va = q.x + q.y * 0.8;
+        float s1 = sin(va * 4.0 - t * 1.2);
+        float s2 = sin(q.y * 2.0 + t * 0.6);
+        float s3 = sin(q.x * 6.0 + t);
+        pv = s1 + s2 + s3;
+        pv = 0.5 + 0.5 * (pv / 3.0);
+    } else if (mode == 3) {
+        // Fire: fbm noise flowing upward through the tunnel.
+        vec2 fp = vec2(q.x * 0.5, q.y * 0.3 - t * 0.4);
+        pv = fbm(fp);
+        pv = smoothstep(0.3, 0.9, pv);
+    } else {
+        // Mosaic: tiled plasma cells with per-cell random phase.
+        vec2 celluv = vec2(q.x * 4.0, q.y * 2.0);
+        vec2 cell = floor(celluv);
+        float h = hash(cell + vec2(floor(t * 2.0) * 7.13));
+        float cellp = sin(q.x * 4.0 - h * 6.2832 + t) * sin(q.y * 2.0 + h * 6.2832);
+        pv = 0.5 + 0.5 * cellp;
+        // Slight darkening at the cell boundaries for a tiled look.
+        vec2 cf = fract(celluv);
+        float bx = min(cf.x, 1.0 - cf.x);
+        float by = min(cf.y, 1.0 - cf.y);
+        float boundary = smoothstep(0.0, 0.15, min(bx, by));
+        pv *= 0.7 + 0.3 * boundary;
+    }
+    return pv;
+}
+
+// =====================================================================
+// Main
+// =====================================================================
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    // Normalised, aspect-corrected, centered coordinates.
     vec2 uv = fragCoord.xy / iResolution.xy;
-    vec2 uv_orig = uv;
+    vec2 p = uv - 0.5;
+    p.x *= iResolution.x / iResolution.y;
 
-    // Normalize with aspect ratio correction
-    uv.x = (uv.x - 0.5) * iResolution.x / iResolution.y + 0.5;
-    vec2 uv_center = uv - 0.5;
-    uv_center *= 1.0 / tunnel_zoom;
+    // ---- Polar coordinates of the ray on the tunnel surface ----
+    float r = length(p);
+    float a = atan(p.y, p.x) + iTime * rotation_speed;
 
-    float time = iTime * tunnel_speed;
+    // ---- Depth along the tunnel axis (perspective projection) ----
+    // The ray at radius r intersects the tunnel wall (fixed radius
+    // tunnel_size) at depth = tunnel_size / r.
+    float depth = tunnel_size / max(r, 0.0001);
+    // Endless forward motion: the whole field scrolls with iTime,
+    // so the plasma pattern flows toward the viewer forever.
+    float w = depth - iTime * 0.5;
 
-    // Create tunnel effect
-    vec3 tunnel_color = tunnel_pattern(uv_center, time);
+    // ---- Plasma on the tunnel wall ----
+    vec2 q = vec2(a, w);
+    float pv = plasma(q, iTime, pattern_mode);
 
-    // Add outer vignette / barrel distortion
-    float barrel = length(uv_orig - 0.5);
-    barrel = pow(barrel, 2.0) * 0.3;
-    float vignette = 1.0 - barrel;
+    // Depth fog: distant plasma fades into the background.
+    float fog = clamp(exp(-max(w, 0.0) * 0.08), 0.0, 1.0);
+    pv *= fog;
 
-    // Outer space / dark border
-    vec3 outer_space = vec3(0.0, 0.0, 0.02) * (1.0 - vignette);
+    // ---- Wall / background mask ----
+    // Smoothness controls the width of the edge transition.
+    float width = mix(0.01, 0.3, smoothness);
+    float edge = tunnel_size - width;
+    float wall_mask = 1.0 - smoothstep(edge, tunnel_size, r);
 
-    // Combine
-    vec3 final_color = mix(outer_space, tunnel_color, vignette);
+    // ---- Colours ----
+    // Plasma glow: fg_colour modulated by the plasma value, plus a
+    // subtle hue-cycled trippy tint around the vanishing point.
+    vec3 plasma_col = fg_colour * pv + 0.15 * trippy_col(a * 2.0 + iTime * 0.3);
 
-    // Add bloom/glow to bright areas
-    float brightness = length(final_color);
-    vec3 bloom = final_color * smoothstep(0.5, 1.5, brightness) * 0.3;
-    final_color += bloom;
+    // Inside the tunnel show the plasma wall, outside show the background.
+    vec3 col = mix(bg_colour, plasma_col, wall_mask);
 
-    // Tone mapping
-    final_color = final_color / (final_color + 0.5);
-
-    // Gamma correction
-    final_color = pow(final_color, vec3(0.95));
-
-    fragColor = vec4(final_color, 1.0);
+    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

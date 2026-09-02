@@ -1,0 +1,392 @@
+import nanogui;
+using eigen;
+
+managed view_shader = None;   // Left interactive view: displays the video input; mask shapes are painted on top via on_draw.
+managed mask_shader = None;   // Hidden low-res (default 32x32) shader that renders the user's mask shapes in white on black; resolution configurable via RES combo.
+managed avg_shader = None;    // Hidden low-res (default 32x32) VideoToRGB-style averaging shader (input + mask); resolution follows the RES combo.
+managed in_ctrl = None;
+managed out_r = None;
+managed out_g = None;
+managed out_b = None;
+managed out_color = None;
+managed color_disp = None;
+managed shape_select = None;
+managed clear_btn = None;
+managed res_ctrl = None;
+res_items = ["16", "32", "64", "128", "256", "512"];
+
+managed default_input = None;
+managed default_output = None;
+
+// Mask shapes: normalized [x1, y1, x2, y2, type] entries.
+// type 0 = rectangle, type 1 = line/segment (modeled on LEDMapping segments).
+mask_shapes = [];
+drag_start = None;
+drag_end = None;
+current_shape_type = 0;
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_input")
+		return default_input;
+	if(cmd == "get_default_output")
+		return default_output;
+}
+
+// Hidden mask shader: outputs pure black. The actual mask shapes are painted
+// white on top via the on_draw handler (nvgFill / nvgStroke), so the readback
+// buffer ends up white exactly where the user drew a shape.
+mask_shader_src = R"(
+#version 330 core
+
+void main()
+{
+    fragColor = vec4(0.0);
+}
+)";
+
+// VideoToRGB-style averaging shader: renders the video input, but only where
+// the mask is non-black (same masking logic as VideoToRGB.asset).
+avg_shader_src = R"(
+#version 330 core
+
+uniform sampler2D input;
+uniform sampler2D mask;
+
+void main()
+{
+    vec4 in_color = texture(input, v_uv);
+    vec4 m = texture(mask, v_uv);
+
+    float mmax = max(m.r, max(m.g, m.b));
+
+    if(mmax <= 0.001)
+    {
+        fragColor = vec4(0.0);
+        return;
+    }
+
+    fragColor = in_color;
+}
+)";
+
+// Display shader for the interactive left window: shows the video input and
+// lets the user draw mask shapes on top of it (nvgFill / nvgStroke).
+view_shader_src = R"(
+#version 330 core
+
+uniform sampler2D input;
+
+void main()
+{
+    fragColor = texture(input, v_uv);
+}
+)";
+
+// Paint the current mask shapes (white on black) onto the hidden mask shader's
+// readback buffer, and preview the in-progress drag shape.
+render_mask_shapes(shader) {
+	s = shader.render_size();
+	ctx = nanogui.current_context();
+
+	for(i = 0; i < mask_shapes.size(); i++) {
+		shp = mask_shapes[i];
+		x1 = shp.x1 * s.x;
+		y1 = shp.y1 * s.y;
+		x2 = shp.x2 * s.x;
+		y2 = shp.y2 * s.y;
+		st = shp.type;
+
+		if(st == 1) {
+			ctx.nvgBeginPath();
+			ctx.nvgMoveTo(vec2f(x1, y1));
+			ctx.nvgLineTo(vec2f(x2, y2));
+			ctx.nvgStrokeWidth(8.0);
+			ctx.nvgStrokeColor(vec4f(1, 1, 1, 1.0));
+			ctx.nvgStroke();
+		} else {
+			ctx.nvgBeginPath();
+			ctx.nvgRect(math.min(x1, x2), math.min(y1, y2), math.abs(x2 - x1), math.abs(y2 - y1));
+			ctx.nvgFillColor(vec4f(1, 1, 1, 1.0));
+			ctx.nvgFill();
+		}
+	}
+
+	// Preview the in-progress drag shape (semi-transparent)
+	if(drag_start != None && drag_end != None) {
+		x1 = drag_start.x * s.x;
+		y1 = drag_start.y * s.y;
+		x2 = drag_end.x * s.x;
+		y2 = drag_end.y * s.y;
+
+		ctx.nvgBeginPath();
+		if(current_shape_type == 1) {
+			ctx.nvgMoveTo(vec2f(x1, y1));
+			ctx.nvgLineTo(vec2f(x2, y2));
+			ctx.nvgStrokeWidth(8.0);
+			ctx.nvgStrokeColor(vec4f(1, 1, 1, 0.5));
+			ctx.nvgStroke();
+		} else {
+			ctx.nvgRect(math.min(x1, x2), math.min(y1, y2), math.abs(x2 - x1), math.abs(y2 - y1));
+			ctx.nvgFillColor(vec4f(1, 1, 1, 0.5));
+			ctx.nvgFill();
+		}
+	}
+}
+
+// Compute the average color of the masked-in video on the CPU and push it to
+// the SENDER sliders and color display. Called after each frame.
+update_post(generator) {
+	buffer = avg_shader.pixel_buffer();
+	n = buffer.size();
+	if(n == 0)
+		return;
+
+	px = n / 3;
+	sr = 0.0;
+	sg = 0.0;
+	sb = 0.0;
+	cnt = 0;
+
+	for(i = 0; i < px; i++) {
+		r = buffer[i*3];
+		g = buffer[i*3+1];
+		b = buffer[i*3+2];
+		// Only count non-black (masked-in) pixels
+		if(r != 0 || g != 0 || b != 0) {
+			sr += r;
+			sg += g;
+			sb += b;
+			cnt++;
+		}
+	}
+
+	r_avg = 0.0;
+	g_avg = 0.0;
+	b_avg = 0.0;
+	if(cnt > 0) {
+		r_avg = sr / cnt / 255.0;
+		g_avg = sg / cnt / 255.0;
+		b_avg = sb / cnt / 255.0;
+	}
+
+	// notify_links=true so linked SENDERs (other controls) get updated.
+	out_r.value(r_avg, false, true);
+	out_g.value(g_avg, false, true);
+	out_b.value(b_avg, false, true);
+	out_color.value([r=r_avg, g=g_avg, b=b_avg]);
+	color_disp.rgb(r_avg, g_avg, b_avg);
+}
+
+entry(generator, area) {
+	generator.window.fixed_size(vec2f(520, 560));
+
+	area.layout(None);
+
+	// ---- Left column: shape select, clear button, IN control ----
+	left_ctrls = area.widget().anchor_left(0).anchor_top(0).anchor_bottom(30).fixed_width(140).layout(nanogui.layout_vertical());
+
+	shape_select = left_ctrls.combobox("SHAPE").items(["Rectangle", "Line"]).selected(0);
+	shape_select.on_change([&current_shape_type](v, txt) {
+		current_shape_type = v;
+	});
+
+	clear_btn = left_ctrls.button("CLEAR MASK");
+	clear_btn.on_click([&mask_shapes, &drag_start, &drag_end]() {
+		mask_shapes = [];
+		drag_start = None;
+		drag_end = None;
+	});
+
+	// The IN control is created further down, after the view/avg shaders exist,
+	// so its callbacks can safely reference them as module globals.
+
+	// ---- Right area: interactive mask-drawing shader + color output ----
+	right_area = area.widget().anchor_left(140).anchor_right(0).anchor_top(0).anchor_bottom(30).layout(nanogui.layout_vertical());
+
+	// (1) Interactive view: displays the video input; user draws masks on top.
+	view_shader = right_area.shader().fixed_height(320).anchor_left(0).anchor_right(0);
+	view_shader.fragment_source(view_shader_src);
+	view_shader.render_size(vec2i(360, 240));
+
+	// Draw mask shapes (white, opaque for committed; semi-transparent for the
+	// in-progress drag) on top of the video.
+	view_shader.on_draw([&view_shader, &mask_shapes, &drag_start, &drag_end, &current_shape_type]() {
+		s = view_shader.size();
+		ctx = nanogui.current_context();
+		for(i = 0; i < mask_shapes.size(); i++) {
+			shp = mask_shapes[i];
+			x1 = shp.x1 * s.x;
+			y1 = shp.y1 * s.y;
+			x2 = shp.x2 * s.x;
+			y2 = shp.y2 * s.y;
+
+			if(shp.type == 1) {
+				ctx.nvgBeginPath();
+				ctx.nvgMoveTo(vec2f(x1, y1));
+				ctx.nvgLineTo(vec2f(x2, y2));
+				ctx.nvgStrokeWidth(6.0);
+				ctx.nvgStrokeColor(vec4f(1, 1, 1, 0.8));
+				ctx.nvgStroke();
+			} else {
+				ctx.nvgBeginPath();
+				ctx.nvgRect(math.min(x1, x2), math.min(y1, y2), math.abs(x2 - x1), math.abs(y2 - y1));
+				ctx.nvgFillColor(vec4f(1, 1, 1, 0.35));
+				ctx.nvgStrokeWidth(2.0);
+				ctx.nvgStrokeColor(vec4f(1, 1, 1, 0.9));
+				ctx.nvgFill();
+				ctx.nvgStroke();
+			}
+		}
+
+		if(drag_start != None && drag_end != None) {
+			x1 = drag_start.x * s.x;
+			y1 = drag_start.y * s.y;
+			x2 = drag_end.x * s.x;
+			y2 = drag_end.y * s.y;
+			ctx.nvgBeginPath();
+			if(current_shape_type == 1) {
+				ctx.nvgMoveTo(vec2f(x1, y1));
+				ctx.nvgLineTo(vec2f(x2, y2));
+				ctx.nvgStrokeWidth(6.0);
+				ctx.nvgStrokeColor(vec4f(1, 1, 1, 0.6));
+				ctx.nvgStroke();
+			} else {
+				ctx.nvgRect(math.min(x1, x2), math.min(y1, y2), math.abs(x2 - x1), math.abs(y2 - y1));
+				ctx.nvgFillColor(vec4f(1, 1, 1, 0.25));
+				ctx.nvgStrokeWidth(2.0);
+				ctx.nvgStrokeColor(vec4f(1, 1, 1, 0.7));
+				ctx.nvgFill();
+				ctx.nvgStroke();
+			}
+		}
+	});
+
+	// Mouse handlers on view_shader: drag-draw a new mask shape (LEDMapping-style).
+	view_shader.on_mouse_button([&view_shader, &mask_shapes, &drag_start, &drag_end, &current_shape_type](pos, button, down, mods) {
+		if(button != 0)
+			return false;
+		if(down)
+			drag_start = pos;
+		else {
+			drag_end = pos;
+			if(drag_start != None && drag_end != None) {
+				// Store the committed shape with normalized coordinates.
+				w = view_shader.width();
+				h = view_shader.height();
+				if(w > 0 && h > 0) {
+					mask_shapes.push_back([
+						x1 = drag_start.x / w,
+						y1 = drag_start.y / h,
+						x2 = drag_end.x / w,
+						y2 = drag_end.y / h,
+						type = current_shape_type,
+					]);
+				}
+				drag_start = None;
+				drag_end = None;
+			}
+		}
+		return true;
+	});
+	view_shader.on_mouse_motion([&drag_start, &drag_end](pos, rel, button, mods) {
+		if(drag_start != None)
+			drag_end = pos;
+		return true;
+	});
+
+	// (2) Hidden mask shader: white shapes on black, rendered via on_draw.
+	mask_shader = right_area.shader().visible(false).fixed_height(20);
+	mask_shader.fragment_source(mask_shader_src);
+	mask_shader.render_size(vec2i(32, 32));
+	mask_shader.pixel_readback(true);
+	mask_shader.output_component_format("uint8");
+	mask_shader.output_pixel_format("rgb");
+	mask_shader.on_draw([&mask_shader, &mask_shapes, &drag_start, &drag_end, &current_shape_type]() {
+		render_mask_shapes(mask_shader);
+	});
+
+	// (3) Hidden VideoToRGB-style averaging shader (input + mask).
+	avg_shader = right_area.shader().visible(false).fixed_height(20);
+	avg_shader.fragment_source(avg_shader_src);
+	avg_shader.render_size(vec2i(32, 32));
+	avg_shader.pixel_readback(true);
+	avg_shader.output_component_format("uint8");
+	avg_shader.output_pixel_format("rgb");
+
+	// Feed the mask shader's internal output texture into the averaging shader's
+	// "mask" uniform, and the video "input" uniform is set via the IN control.
+	mask_tex = mask_shader.texture();
+	avg_shader.input("mask", mask_tex);
+
+	// (3b) Resolution setting for the hidden mask + avg shaders (cascaded low-res
+	// rendering). Default is very low (32) to keep resource usage minimal; the
+	// user can raise it if more color precision is needed.
+	res_ctrl = left_ctrls.controlcombo("RES", "uniforms").fixed_height(30);
+	res_ctrl.items(res_items);
+	res_ctrl.selected_index(1); // 32 (default, very low)
+	res_ctrl.callback([&mask_shader, &avg_shader, res_items](v) {
+		if(v == None || v < 0 || v >= res_items.size())
+			return;
+		res = std.int(res_items[v]);
+		if(res <= 0)
+			return;
+		mask_shader.render_size(vec2i(res, res));
+		avg_shader.render_size(vec2i(res, res));
+	});
+
+	// IN input control (created now that view_shader and avg_shader exist; placed
+	// in the left column so it stays next to the shape/clear controls).
+	in_ctrl = left_ctrls.control("IN", "input_ctrls").fixed_height(30);
+	in_ctrl.on_unlink([&in_ctrl, &view_shader, &avg_shader](c1, c2) {
+		if(c2 == in_ctrl) {
+			view_shader.input("input", None);
+			avg_shader.input("input", None);
+		}
+	});
+	in_ctrl.callback([&view_shader, &avg_shader](v) {
+		view_shader.input("input", v);
+		avg_shader.input("input", v);
+	});
+	default_input = in_ctrl;
+
+	// (4) Color display + SENDER outputs.
+	color_disp = right_area.color_selector().fixed_height(60).anchor_left(0).anchor_right(0);
+
+	// These controlsliders are SENDERs: their value can be routed (drag&drop /
+	// link_to) to other generators' controlsliders.
+	out_r = right_area.controlslider("R", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+	out_g = right_area.controlslider("G", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+	out_b = right_area.controlslider("B", "output_ctrls").min(0).max(1.0).anchor_left(0).anchor_right(0);
+
+	// Rich output holding the whole RGB average (also routable).
+	out_color = right_area.control("OUT", "output_ctrls").anchor_left(0).anchor_right(0);
+	default_output = out_color;
+}
+
+save_state() {
+	return [
+		r = out_r.value(),
+		g = out_g.value(),
+		b = out_b.value(),
+		shape_type = current_shape_type,
+		shapes = mask_shapes,
+		res = res_ctrl.value(),
+	];
+}
+
+load_state(state) {
+	if(state.has("r"))
+		out_r.value(state.r, false, true);
+	if(state.has("g"))
+		out_g.value(state.g, false, true);
+	if(state.has("b"))
+		out_b.value(state.b, false, true);
+	if(state.has("shape_type"))
+		current_shape_type = state.shape_type;
+	if(state.has("shapes"))
+		mask_shapes = state.shapes;
+	if(state.has("res"))
+		res_ctrl.value(state.res, false, false);
+	if(state.has("r") && state.has("g") && state.has("b"))
+		color_disp.rgb(state.r, state.g, state.b);
+}
