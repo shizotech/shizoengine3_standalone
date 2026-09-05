@@ -2,6 +2,8 @@
 using eigen;
 using nanogui;
 
+#include "engine/interfaces/videorouter"
+
 //TODO: No midicontrols for groups and segments, only a dimmer control for "scenes", each scene has its own shader to grab the pixels
 
 //TODO: add "offset gap" so that pixels/channels can be further apart from each other
@@ -33,6 +35,9 @@ optimized_fixture_scenes = []; //Gets generated when the shader is build
 
 net = None;
 
+in_ctrl = None;
+out_ctrl = None;
+
 //Temp
 active_drag_start = None;
 active_drag_end = None;
@@ -51,6 +56,8 @@ rgb_types = [
 	"BRG",
 	"BGR"
 ];
+
+preset_save_path = __DIR__ + "/../";
 
 def build_scenes();
 def build_shader();
@@ -83,6 +90,61 @@ json_to_vec(v) {
 	return vec2f(v.x, v.y);
 }
 
+uv_to_pos(uv) {
+	return vec2f(uv.x * shader.width(), uv.y * shader.height());
+}
+
+pos_to_uv(pos) {
+	return vec2f(pos.x / std.float(shader.width()), pos.y / std.float(shader.height()));
+}
+
+distanceFromPointToLine(p1, p2, p3)
+{
+	x1 = p1[0];
+	y1 = p1[1];
+	
+	x2 = p2[0];
+	y2 = p2[1];
+	
+	x3 = p3[0];
+	y3 = p3[1];
+	
+	// Vector from p1 to p2
+	vx = x2 - x1;
+	vy = y2 - y1;
+	
+	// Vector from p1 to p3
+	wx = x3 - x1;
+	wy = y3 - y1;
+	
+	// Projection of p3 onto the line p1 -> p2 (dot product)
+	t = (wx * vx + wy * vy) / (vx * vx + vy * vy);
+	
+	// Clamp t to the range [0, 1] to ensure it's within the segment
+	t = math.max(0, math.min(1, t));
+	
+	// Find the closest point on the segment
+	closest_x = x1 + t * vx;
+	closest_y = y1 + t * vy;
+	
+	// Calculate the distance from p3 to the closest point on the segment
+	dx = x3 - closest_x;
+	dy = y3 - closest_y;
+	
+	// Return the Euclidean distance
+	return math.sqrt(dx * dx + dy * dy);
+}
+
+quantize_transform(transform) {
+	quant_transform = [];
+	for(i = 0; i < transform.size(); i++) {
+		pos = vec2f(transform[i].x*shader.width(), transform[i].y*shader.height());
+		pos = quantize_grid(pos);
+		quant_transform.push_back([x=pos.x/shader.width(), y=pos.y/shader.height()]);
+	}
+	return quant_transform;
+}
+
 create_splitter(parent, name, height=30) {
 	div = parent.widget().fixed_height(height).anchor_left(0).anchor_right(0);
 	label = div.label(name).anchor_left(0).anchor_right(0.5, "percent").fixed_height(height);
@@ -106,7 +168,8 @@ class FixtureSegment {
 		
 		select_div = area.widget().fixed_height(25).anchor_left(0).anchor_right(0);
 		edit_btn = select_div.pushbutton(">").anchor_left(0).fixed_width(25);
-		segment_name = select_div.textbox(segment.name).anchor(0).anchor_left(25).anchor_right(25);
+		save_btn = select_div.button("S").anchor_left(25).fixed_width(25);
+		segment_name = select_div.textbox(segment.name).anchor(0).anchor_left(50).anchor_right(25);
 		segment_name.on_change([this](v){
 			segment.name = v;
 		});
@@ -114,6 +177,26 @@ class FixtureSegment {
 		
 		//Ctrl area
 		ctrl_area = area.widget().layout(nanogui.layout_vertical()).visible(false);
+
+		save_btn.on_click([save_btn, segment](){
+			form = [
+				[id="name",  	label="Preset Name",  	type="text",   	placeholder = segment.name],
+			];
+			
+			engine = std.global("engine");
+			res = engine.screen.modal_form(form, "Save preset", "save", "cancel");		
+			if(res.choice != "submit")
+				return;
+			
+			//std.print(res);
+			
+			if(!res.values.name)
+				return;
+			
+			save_segment = segment.copy();
+			save_segment.type = "segment";
+			fileio.write_json(preset_save_path + "segments/" + res.values.name + ".json", save_segment);
+		});
 		
 		delete_btn.on_click([parent, index](){
 			parent.group.segments.erase(index);
@@ -287,19 +370,46 @@ class FixtureGroup {
 	
 	device_list = [];
 	
+	transform_uv_select = -1;
+	transform_uv_drag = None;
+	
+	edit_segments_btn = None;
+	transform_btn = None;
+	
 	__init__(parent, scene, index) {
 		group_index = index;
 		group = scene.groups[group_index];
 		
 		select_div = parent.group_area.widget().fixed_height(30).anchor_left(0).anchor_right(0);
 		edit_btn = select_div.pushbutton(">").anchor_left(0).fixed_width(25);
-		group_name = select_div.textbox(group.name).anchor(0).anchor_right(25).anchor_left(25);
+		save_btn = select_div.button("S").anchor_left(25).fixed_width(25);
+		group_name = select_div.textbox(group.name).anchor(0).anchor_right(25).anchor_left(50);
 		group_name.on_change([this](v){
 			group.name = v;
 		});
 		delete_btn = select_div.button("X").anchor_right(0).fixed_width(25);
 		
 		area = parent.group_area.widget().layout(nanogui.layout_vertical());
+		
+		save_btn.on_click([save_btn, group](){
+			form = [
+				[id="name",  	label="Preset Name",  	type="text",   	placeholder = group.name],
+			];
+			
+			engine = std.global("engine");
+			res = engine.screen.modal_form(form, "Save preset", "save", "cancel");		
+			if(res.choice != "submit")
+				return;
+			
+			//std.print(res);
+			
+			if(!res.values.name)
+				return;
+			
+			save_group = group.copy();
+			save_group.type = "group";
+			fileio.write_json(preset_save_path + "groups/" + res.values.name + ".json", save_group);
+		});
 		
 		delete_btn.on_click([parent, index](){
 			parent.scene.groups.erase(index);
@@ -363,19 +473,63 @@ class FixtureGroup {
 			build_shader_flag = true;
 		});
 		
+		create_splitter(area, "Angle", 20).intbox().anchor(0).min_value(-180).max_value(180).value(group.transform_angle).value_callback([this](v) {
+			group.transform_angle = v;
+			build_shader_flag = true;
+		});
 		
-		area.pushbutton("TRANSFORM").fixed_height(20);
-		area.button("RESET TRANSFORM").fixed_height(20);
-		area.button("MIRROR X").fixed_height(20);
-		area.button("MIRROR Y").fixed_height(20);
+		area.slider("Max Brightness").fixed_height(20).value(group.max_brightness).value_callback([this](v) {
+			group.max_brightness = v;
+			build_shader_flag = true;
+		});
+		
+		edit_segments_btn = area.pushbutton("DRAW NEW SEGMENTS").fixed_height(20);
+		transform_btn = area.pushbutton("TRANSFORM").fixed_height(20);
+		area.button("RESET TRANSFORM").fixed_height(20).on_click([this](){
+			group.transform_uv = [[x=0,y=0],[x=1,y=0],[x=1,y=1],[x=0,y=1]];
+			group.transform_angle = 0;
+			build_shader_flag = true;
+		});
+		area.button("MIRROR X").fixed_height(20).on_click([group](){
+			for(i = 0; i < group.segments.size(); i++) {
+				group.segments[i].start_pos.x = group.segments[i].start_pos.x;
+				group.segments[i].end_pos.x = 1.0 - group.segments[i].end_pos.x;
+				
+				//TODO reverse direction for 
+				//if(group.segments[i].height > 1)
+				//	tmp = group.segments[i].start_pos.copy();
+				//	group.segments[i].start_pos = group.segments[i].end_pos.copy();
+				//	group.segments[i].end_pos = tmp;
+			}
+			build_shader_flag = true;
+		});
+		area.button("MIRROR Y").fixed_height(20).on_click([group](){
+			for(i = 0; i < group.segments.size(); i++) {
+				group.segments[i].start_pos.y = group.segments[i].start_pos.y;
+				group.segments[i].end_pos.y = 1.0 - group.segments[i].end_pos.y;
+				
+				//TODO reverse direction for 
+				//if(group.segments[i].height > 1)
+				//	tmp = group.segments[i].start_pos.copy();
+				//	group.segments[i].start_pos = group.segments[i].end_pos.copy();
+				//	group.segments[i].end_pos = tmp;
+			}
+			build_shader_flag = true;
+		});
+		
 		area.pushbutton("WRAP UNIVERSES").fixed_height(20).pushed(group.wrap_leds).on_change([this, group](v){
 			group.wrap_leds = v;
 			build_shader_flag = true;
 		});
 		
-		area.slider("MAX BRIGHTNESS").fixed_height(20).value(group.max_brightness).value_callback([this,group](v) {
-			group.max_brightness = v;
-			build_shader_flag = true;
+		edit_segments_btn.on_change([transform_btn](v) {
+			if(v)
+				transform_btn.pushed(false);
+		});
+		
+		transform_btn.on_change([edit_segments_btn](v) {
+			if(v)
+				edit_segments_btn.pushed(false);
 		});
 		
 		area.visible(false);
@@ -394,63 +548,209 @@ class FixtureGroup {
 		scene_control_area.refresh_layout();
 	}
 	
-	draw_segments(ctx, is_active) {
+	on_drag_start(uv) {
+		if(transform_btn.pushed()) {
+			transform_uv_select = -1;
+	
+			for(i = 0; i < group.transform_uv.size(); i++)
+			{
+				rel_vec = uv - vec2f(group.transform_uv[i][0], group.transform_uv[i][1]);
+				if(rel_vec.length() < 0.1)
+					transform_uv_select = i;
+					break;
+			}
+			
+			transform_uv_drag = group.transform_uv.copy();
+			
+			return 1;
+			
+		}
+	}
+	
+	on_drag(uv, rel) {
+		if(transform_btn.pushed()) {
+	
+			if(transform_uv_select == -1)
+			{
+				for(i = 0; i < group.transform_uv.size(); i++)
+				{
+					transform_uv_drag[i][0] += rel.x;
+					transform_uv_drag[i][1] += rel.y;
+				}
+			}					
+			if(transform_uv_select == 0)
+			{
+				transform_uv_drag[0][0] += rel.x;
+				transform_uv_drag[0][1] += rel.y;
+				
+				transform_uv_drag[1][1] += rel.y;
+				transform_uv_drag[3][0] += rel.x;							
+			}
+			
+			if(transform_uv_select == 1)
+			{
+				transform_uv_drag[1][0] += rel.x;
+				transform_uv_drag[1][1] += rel.y;
+				
+				transform_uv_drag[0][1] += rel.y;
+				transform_uv_drag[2][0] += rel.x;							
+			}
+			
+			if(transform_uv_select == 2)
+			{
+				transform_uv_drag[2][0] += rel.x;
+				transform_uv_drag[2][1] += rel.y;
+				
+				transform_uv_drag[3][1] += rel.y;
+				transform_uv_drag[1][0] += rel.x;							
+			}
+			
+			if(transform_uv_select == 3)
+			{
+				transform_uv_drag[3][0] += rel.x;
+				transform_uv_drag[3][1] += rel.y;
+				
+				transform_uv_drag[2][1] += rel.y;
+				transform_uv_drag[0][0] += rel.x;							
+			}
+			
+			group.transform_uv = quantize_transform(transform_uv_drag);
+			
+			build_shader_flag = true;
+		}
+	}
+	
+	on_drag_end(start_uv, end_uv) {
+		if(edit_segments_btn.pushed())
+			new_segment(start_uv, end_uv);
+	}
+	
+	
+	draw(ctx, is_active) {
 		if(group.segments ?? false)
 		{
-			draw_color = is_active ? vec4f(0.0, 0.4, 0.8, 0.8) : vec4f(0.8, 0.8, 0.8, 0.6);
-			
-			for(i = 0; i < group.segments.size(); i++) {
+			if(transform_btn.pushed()) {
 				
-				seg = group.segments[i];
+				ctx.nvgBeginPath();
+				ctx.nvgStrokeColor(vec4f(1,0,0,0.6));
+				ctx.nvgStrokeWidth(3);
 				
-				if(seg.height == 1) {
-					start_pos = json_to_vec(seg.start_pos) * shader.size();
-					end_pos = json_to_vec(seg.end_pos) * shader.size();
-
-					ctx.nvgBeginPath();
+				rs = shader.render_size();
+				psw = rs.x;
+				psh = rs.y;
 				
-					ctx.nvgMoveTo(vec2f(start_pos.x, start_pos.y));
-					ctx.nvgLineTo(vec2f(end_pos.x, end_pos.y));
-					ctx.nvgStrokeWidth(10.0);
-					ctx.nvgStrokeColor(draw_color);
-					ctx.nvgStroke();
-				}
-				else {
-					ctx.nvgBeginPath();
+				ctx.nvgMoveTo(vec2f(group.transform_uv[0][0]*psw,group.transform_uv[0][1]*psh));
+				
+				for(i = 0; i < group.transform_uv.size(); i++)
+				{	
+					ctx.nvgLineTo(vec2f(group.transform_uv[i][0]*psw,group.transform_uv[i][1]*psh));
 					
-					led_count = seg.width;
-					led_height = seg.height;
-					
-					start_pos = json_to_vec(seg.start_pos) * shader.size();
-					end_pos = json_to_vec(seg.end_pos) * shader.size();
-					
-					led_diff = end_pos - start_pos;
-					perp = vec2f(led_diff.y, 0 - led_diff.x);
-					perp.normalize();
-					
-					//make vector same length as out square formed by the points
-					perp *= led_diff.length();
-					perp_step = perp / std.float(led_height-1);
-					//half perp cuz we go from the middle
-					perp /= 2.0;
-					
-					perp_start = start_pos - perp;
-					perp_end = end_pos - perp;
-					
-
-					for(j = 0; j < led_height; j++)
+					if(i == transform_uv_select)
 					{
-						ctx.nvgMoveTo(vec2f(perp_start.x,perp_start.y));
-						ctx.nvgLineTo(vec2f(perp_end.x, perp_end.y));
-						perp_start += perp_step;
-						perp_end += perp_step;
+						ctx.nvgStroke();
+						ctx.nvgBeginPath();
+						ctx.nvgStrokeColor(vec4f(1,1,0,0.6));
+						ctx.nvgStrokeWidth(5);
 					}
 					
-					ctx.nvgStrokeWidth(10.0);
-					ctx.nvgStrokeColor(draw_color);
+					ctx.nvgCircle(vec2f(group.transform_uv[i][0]*psw,group.transform_uv[i][1]*psh), 5 * (transform_uv_select + 1));
 					
-					ctx.nvgStroke();
+					if(i == transform_uv_select)
+					{
+						ctx.nvgStroke();
+						ctx.nvgBeginPath();
+						ctx.nvgStrokeColor(vec4f(1,0,0,0.6));
+						ctx.nvgStrokeWidth(3);
+					}
+					
+					ctx.nvgMoveTo(vec2f(group.transform_uv[i][0]*psw,group.transform_uv[i][1]*psh));
 				}
+				
+				ctx.nvgLineTo(vec2f(group.transform_uv[0][0]*psw,group.transform_uv[0][1]*psh));
+				ctx.nvgStroke();
+			
+			
+				uv_min = vec2f(group.transform_uv[0][0],group.transform_uv[0][1]) * vec2f(psw, psh);
+				uv_max = vec2f(group.transform_uv[2][0],group.transform_uv[2][1]) * vec2f(psw, psh);
+				uv_middle = uv_min + (uv_max - uv_min) / 2.0;
+				
+				ctx.nvgSave();
+				
+				ctx.nvgTranslate(vec2f(uv_middle[0], uv_middle[1]));
+				angle_deg = group.transform_angle;
+				ctx.nvgRotate(angle_deg * math.PI / 180.0);
+				ctx.nvgTranslate(vec2f(-uv_middle[0], -uv_middle[1]));
+				
+				ctx.nvgTranslate(vec2f(uv_min[0], uv_min[1]));
+				ctx.nvgScale(vec2f(group.transform_uv[2][0] - group.transform_uv[0][0], group.transform_uv[2][1] - group.transform_uv[0][1]));
+				
+				draw_segments(ctx, is_active);
+				
+				ctx.nvgTranslate(vec2f(0-uv_min[0], 0-uv_min[1]));
+				
+				ctx.nvgRestore();
+				
+			}
+			else
+				draw_segments(ctx, is_active);
+			
+		}
+	}
+	
+	draw_segments(ctx, is_active) {
+		draw_color = is_active ? vec4f(0.0, 0.4, 0.8, 0.8) : vec4f(0.8, 0.8, 0.8, 0.6);
+			
+		for(i = 0; i < group.segments.size(); i++) {
+			
+			seg = group.segments[i];
+			
+			if(seg.height == 1) {
+				start_pos = json_to_vec(seg.start_pos) * shader.size();
+				end_pos = json_to_vec(seg.end_pos) * shader.size();
+
+				ctx.nvgBeginPath();
+			
+				ctx.nvgMoveTo(vec2f(start_pos.x, start_pos.y));
+				ctx.nvgLineTo(vec2f(end_pos.x, end_pos.y));
+				ctx.nvgStrokeWidth(10.0);
+				ctx.nvgStrokeColor(draw_color);
+				ctx.nvgStroke();
+			}
+			else {
+				ctx.nvgBeginPath();
+				
+				led_count = seg.width;
+				led_height = seg.height;
+				
+				start_pos = json_to_vec(seg.start_pos) * shader.size();
+				end_pos = json_to_vec(seg.end_pos) * shader.size();
+				
+				led_diff = end_pos - start_pos;
+				perp = vec2f(led_diff.y, 0 - led_diff.x);
+				perp.normalize();
+				
+				//make vector same length as out square formed by the points
+				perp *= led_diff.length();
+				perp_step = perp / std.float(led_height-1);
+				//half perp cuz we go from the middle
+				perp /= 2.0;
+				
+				perp_start = start_pos - perp;
+				perp_end = end_pos - perp;
+				
+
+				for(j = 0; j < led_height; j++)
+				{
+					ctx.nvgMoveTo(vec2f(perp_start.x,perp_start.y));
+					ctx.nvgLineTo(vec2f(perp_end.x, perp_end.y));
+					perp_start += perp_step;
+					perp_end += perp_step;
+				}
+				
+				ctx.nvgStrokeWidth(10.0);
+				ctx.nvgStrokeColor(draw_color);
+				
+				ctx.nvgStroke();
 			}
 		}
 	}
@@ -505,7 +805,8 @@ class FixtureScene {
 
 		select_div = scene_area.widget().fixed_height(25).anchor_left(0).anchor_right(0);
 		select_btn = select_div.pushbutton(">").anchor_left(0).fixed_width(25);
-		scene_name = select_div.textbox(scene.name).anchor(0).anchor_right(25).anchor_left(25);
+		save_btn = select_div.button("S").anchor_left(25).fixed_width(25);
+		scene_name = select_div.textbox(scene.name).anchor(0).anchor_right(25).anchor_left(50);
 		scene_name.on_change([this, scene](v){
 			scene.name = v;
 		});
@@ -516,6 +817,26 @@ class FixtureScene {
 		
 			select_group(v);
 			select_btn.pushed(v);
+		});
+		
+		save_btn.on_click([save_btn, scene](){
+			form = [
+				[id="name",  	label="Preset Name",  	type="text",   	placeholder = scene.name],
+			];
+			
+			engine = std.global("engine");
+			res = engine.screen.modal_form(form, "Save preset", "save", "cancel");		
+			if(res.choice != "submit")
+				return;
+			
+			//std.print(res);
+			
+			if(!res.values.name)
+				return;
+			
+			save_scene = scene.copy();
+			save_scene.type = "scene";
+			fileio.write_json(preset_save_path + "scenes/" + res.values.name + ".json", save_scene);
 		});
 		
 		delete_btn.on_click([this, index](){
@@ -553,6 +874,8 @@ class FixtureScene {
 				start_channel = 0,
 				max_brightness = 1.0,
 				wrap_leds = false,
+				transform_uv = [[x=0,y=0],[x=1,y=0],[x=1,y=1],[x=0,y=1]],
+				transform_angle = 0,
 			]);
 			
 			build_groups();
@@ -590,7 +913,7 @@ class FixtureScene {
 			return;
 		for(i = 0; i < groups.size(); i++) {
 			if(groups[i] != active_group)
-				groups[i].draw_segments(ctx, false);
+				groups[i].draw(ctx, false);
 		}
 	}
 }
@@ -610,66 +933,117 @@ build_scenes() {
 	}
 }
 
-traverse_segment(led_buffer, segment) {
-	count = math.max(1, segment.width) * math.max(1, segment.height);
+traverse_segment(led_buffer, group, segment) {
 	
-	if(segment.height == 1) {
-		for(i = 0; i < count; i++) {
-			perc = i / std.float(count-1);
-			perc_inv = 1.0 - perc;
-			led_buffer.push_back(segment.start_pos.x * perc_inv + segment.end_pos.x * perc);
-			led_buffer.push_back(segment.start_pos.y * perc_inv + segment.end_pos.y * perc);
+	// Remember where this segment starts in the buffer.
+	// We need this so the transform below only affects this segment.
+	buffer_start = led_buffer.size();
+	
+	led_width = math.max(1, segment.width);
+	led_height = math.max(1, segment.height);
+	
+	count = led_width * led_height;
+	
+	led_start = vec2f(segment.start_pos.x, segment.start_pos.y);
+	led_end = vec2f(segment.end_pos.x, segment.end_pos.y);
+	
+	
+	// ------------------------------------------------------------
+	// Generate LED coordinates
+	// ------------------------------------------------------------
+	
+	if(led_height == 1) {
+		
+		// Simple 1D segment
+		
+		for(i = 0; i < led_width; i++) {
+			
+			t = 0.0;
+			if(led_width == 1)
+				t = 0.5;
+			else
+				t = i / std.float(led_width - 1);
+			
+			perc_inv = 1.0 - t;
+			
+			vcur = led_start * perc_inv + led_end * t;
+			
+			led_buffer.push_back(vcur.x);
+			led_buffer.push_back(vcur.y);
 			led_buffer.push_back(segment.rgb_type);
 			led_buffer.push_back(segment.is_rgbw);
 		}
 	}
 	else {
-	
-		led_start = vec2f(segment.start_pos.x, segment.start_pos.y);
-		led_end = vec2f(segment.end_pos.x, segment.end_pos.y);
-		led_width = segment.width;
-		led_height = segment.height;
-	
-		led_diff = led_end - led_start;
-		led_diff = vec2f(led_diff.y, 0-led_diff.x);
-		led_diff.normalize();
-		perp_full = led_diff * led_diff.length();
-		row_step = perp_full / std.float(led_height-1);
 		
-		perp_full = (0-0.5) * perp_full;
-
-		switch_lines = 0;
-
-		for (j = 0; j < led_height; j++) 
-		{
-			// Center the grid vertically:
-			row_offset = perp_full + j * row_step;
+		// --------------------------------------------------------
+		// 2D LED grid
+		// --------------------------------------------------------
+		
+		// Direction and length of the main segment
+		led_diff = led_end - led_start;
+		segment_length = led_diff.length();
+		
+		
+		// Create perpendicular vector
+		perp = vec2f(led_diff.y, 0 - led_diff.x);
+		
+		
+		// Normalize perpendicular direction
+		if(segment_length > 0.0)
+			perp.normalize();
+		
+		
+		// Make the perpendicular vector the same length
+		// as the main segment.
+		//
+		// This matches the drawing code:
+		//
+		// perp.normalize();
+		// perp *= led_diff.length();
+		//
+		perp_full = perp * segment_length;
+		
+		
+		// Center the grid around the original segment.
+		// First row starts at -0.5 * perpendicular length.
+		perp_start = perp_full * -0.5;
+		
+		
+		// Distance between rows
+		row_step = perp_full / std.float(led_height - 1);
+		
+		
+		switch_lines = false;
+		
+		
+		for(j = 0; j < led_height; j++) {
+			
+			// Offset this row perpendicular to the segment
+			row_offset = perp_start + row_step * j;
+			
 			row_start = led_start + row_offset;
-			row_end   = led_end   + row_offset;
-
-			// Instead of computing vstep and accumulating vcur,
-			// compute each point's coordinate directly:
-			if (switch_lines) 
-			{
-				// Instead of computing t in reverse order, swap the endpoints.
-				rev_start = row_end;
-				rev_end   = row_start;
-				for (i = 0; i < led_width; i++) 
-				{
-					t = i / std.float(led_width - 1);
-					vcur = (rev_start * (1.0 - t) + rev_end * t);
-					led_buffer.push_back(vcur.x);
-					led_buffer.push_back(vcur.y);
-					led_buffer.push_back(segment.rgb_type);
-					led_buffer.push_back(segment.is_rgbw);
-				}
-			} 
-			else 
-			{
-				for (i = 0; i < led_width; i++) 
-				{
-					t = i / std.float(led_width - 1);
-					vcur = (row_start * (1.0 - t) + row_end * t);
+			row_end   = led_end + row_offset;
+			
+			
+			// Serpentine LED ordering:
+			//
+			// Row 0: ---->
+			// Row 1: <----
+			// Row 2: ---->
+			// Row 3: <----
+			
+			if(switch_lines) {
+				
+				for(i = 0; i < led_width; i++) {
+					t = 0.0;
+					if(led_width == 1)
+						t = 0.5;
+					else
+						t = i / std.float(led_width - 1);
+					
+					// Reverse interpolation
+					vcur = row_end * (1.0 - t) + row_start * t;
 					
 					led_buffer.push_back(vcur.x);
 					led_buffer.push_back(vcur.y);
@@ -677,10 +1051,92 @@ traverse_segment(led_buffer, segment) {
 					led_buffer.push_back(segment.is_rgbw);
 				}
 			}
-
+			else {
+				
+				for(i = 0; i < led_width; i++) {
+					t = 0.0;
+					if(led_width == 1)
+						t = 0.5;
+					else
+						t = i / std.float(led_width - 1);
+					
+					// Normal interpolation
+					vcur = row_start * (1.0 - t) + row_end * t;
+					
+					led_buffer.push_back(vcur.x);
+					led_buffer.push_back(vcur.y);
+					led_buffer.push_back(segment.rgb_type);
+					led_buffer.push_back(segment.is_rgbw);
+				}
+			}
+			
+			
 			switch_lines = !switch_lines;
-		}		
-	}	
+		}
+	}
+	
+	
+	// ------------------------------------------------------------
+	// Apply group UV transform
+	// ------------------------------------------------------------
+	
+	u_min = group.transform_uv[0][0];
+	v_min = group.transform_uv[0][1];
+	
+	u_max = group.transform_uv[2][0];
+	v_max = group.transform_uv[2][1];
+	
+	
+	// Rotation
+	angle_deg = group.transform_angle;
+	angle_rad = angle_deg * math.PI / 180.0;
+	
+	cosA = math.cos(angle_rad);
+	sinA = math.sin(angle_rad);
+	
+	
+	// Center of the transform area
+	cx = (u_min + u_max) * 0.5;
+	cy = (v_min + v_max) * 0.5;
+	
+	
+	// IMPORTANT:
+	//
+	// Only transform LEDs generated by THIS traverse_segment call.
+	//
+	// Previously:
+	//
+	// for(i = 0; i < led_buffer.size(); i += 4)
+	//
+	// caused every previous segment to be transformed again.
+	
+	for(i = buffer_start; i < led_buffer.size(); i += 4) {
+		
+		u = led_buffer[i];
+		v = led_buffer[i + 1];
+		
+		
+		// Map normalized segment coordinates into
+		// the group's transform UV rectangle.
+		
+		u_mapped = u_min + u * (u_max - u_min);
+		v_mapped = v_min + v * (v_max - v_min);
+		
+		
+		// Rotate around the center of transform_uv
+		
+		dx = u_mapped - cx;
+		dy = v_mapped - cy;
+		
+		
+		u_rot = cx + dx * cosA - dy * sinA;
+		v_rot = cy + dx * sinA + dy * cosA;
+		
+		
+		led_buffer[i]     = u_rot;
+		led_buffer[i + 1] = v_rot;
+	}
+	
 	
 	return count;
 }
@@ -698,7 +1154,7 @@ traverse_group(led_buffer, group) {
 	
 	for(i = 0; i < group.segments.size(); i++) {
 		seg = group.segments[i];
-		led_count = traverse_segment(led_buffer, seg);	
+		led_count = traverse_segment(led_buffer, group, seg);	
 
 		if(group.channel_gap == 0 && seg.universe == -1 && seg.channel == -1 &&
 			seg.rgb_type == last_rgb_type && seg.is_rgbw == last_rgbw) {
@@ -765,6 +1221,7 @@ build_shader() {
 	led_coords_buffer.upload_data(led_buffer);
 	
 	led_shader.render_size(vec2i(total_pixel_count, 1));
+	led_shader.keep_aspect_ratio(false);
 	led_shader.input("input", shader);
 	led_shader.input("led_coords", led_coords_image);
 	led_shader.output_component_format("uint8");
@@ -819,9 +1276,11 @@ update_pre(generator, tl_pos, delta) {
 	}
 }
 
+/*
 update_post(generator) {
 	//necessary?
 }
+*/
 
 //SHADER SRC
 shader_src = R"(
@@ -841,6 +1300,11 @@ led_shader_src = R"(
 
 uniform sampler2D input;
 uniform sampler2D led_coords;
+uniform sampler2D feedback;
+
+uniform int analog_mode;
+uniform int led_radius;
+uniform float feedback_value; // 0.0 = none, 1.0 = full ghosting
 
 void main()
 {
@@ -854,7 +1318,142 @@ void main()
     int rgb_type = int(coords.z);
     int is_rgbw = int(coords.w);
 
-    fragColor = texture(input, coords.xy);
+    coords.y = 1.0 - coords.y;
+
+
+    // ============================================================
+    // LED RADIUS
+    // Average a circular area around the LED coordinate
+    // ============================================================
+
+    vec4 current_color;
+
+    if (led_radius <= 0)
+    {
+        current_color = texture(input, coords.xy);
+    }
+    else
+    {
+        ivec2 input_size = textureSize(input, 0);
+
+        vec2 pixel_size = 1.0 / vec2(input_size);
+
+        vec4 color_sum = vec4(0.0);
+        int sample_count = 0;
+
+        for (int y = -led_radius; y <= led_radius; y++)
+        {
+            for (int x = -led_radius; x <= led_radius; x++)
+            {
+                // Circular radius
+                if (x * x + y * y <= led_radius * led_radius)
+                {
+                    vec2 offset =
+                        vec2(float(x), float(y)) * pixel_size;
+
+                    color_sum += texture(
+                        input,
+                        coords.xy + offset
+                    );
+
+                    sample_count++;
+                }
+            }
+        }
+
+        current_color =
+            color_sum / float(sample_count);
+    }
+
+
+	// ============================================================
+	// FEEDBACK / LIGHT RESPONSE
+	// ============================================================
+
+	vec4 feedbackColor = texture(feedback, v_uv);
+
+	feedbackColor = max(feedbackColor - 0.0025, 0.0);
+
+	float feedback_amount = 1.0 - clamp(feedback_value, 0.0, 1.0);
+
+	// ============================================================
+	// NORMAL MODE
+	// Keep the existing behavior exactly
+	// ============================================================
+
+	if (analog_mode == 0)
+	{
+		float decay = feedback_amount * feedback_amount;
+
+		float attack = 0.85;
+		float release = 0.15 + decay * 0.80;
+
+		vec4 target = current_color;
+
+		vec4 response;
+
+		response.r = target.r > feedbackColor.r
+			? mix(feedbackColor.r, target.r, attack)
+			: mix(feedbackColor.r, target.r, release);
+
+		response.g = target.g > feedbackColor.g
+			? mix(feedbackColor.g, target.g, attack)
+			: mix(feedbackColor.g, target.g, release);
+
+		response.b = target.b > feedbackColor.b
+			? mix(feedbackColor.b, target.b, attack)
+			: mix(feedbackColor.b, target.b, release);
+
+		response.a = target.a > feedbackColor.a
+			? mix(feedbackColor.a, target.a, attack)
+			: mix(feedbackColor.a, target.a, release);
+
+		fragColor = response;
+	}
+
+	// ============================================================
+	// ANALOG MODE
+	// Simulate physical light response
+	// ============================================================
+
+	else
+	{
+		float analog = clamp(feedback_value, 0.0, 1.0);
+
+		// More analog = more thermal inertia.
+		float inertia = analog * analog;
+
+		// Brightening is relatively quick, cooling is slower.
+		float attack = mix(0.95, 0.25, inertia);
+		float release = mix(0.15, 0.02, inertia);
+
+		vec4 target = current_color;
+
+		vec4 response;
+
+		response.r = target.r > feedbackColor.r
+			? mix(feedbackColor.r, target.r, attack)
+			: mix(feedbackColor.r, target.r, release);
+
+		response.g = target.g > feedbackColor.g
+			? mix(feedbackColor.g, target.g, attack)
+			: mix(feedbackColor.g, target.g, release);
+
+		response.b = target.b > feedbackColor.b
+			? mix(feedbackColor.b, target.b, attack)
+			: mix(feedbackColor.b, target.b, release);
+
+		response.a = target.a > feedbackColor.a
+			? mix(feedbackColor.a, target.a, attack)
+			: mix(feedbackColor.a, target.a, release);
+
+		fragColor = response;
+	}
+
+
+    // ============================================================
+    // RGB ORDER
+    // ============================================================
 
     if (rgb_type == 0)
     {
@@ -864,9 +1463,14 @@ void main()
             max(fragColor.g, fragColor.b)
         );
 
-        fragColor = vec4(max_value, max_value, max_value, 0.0);
+        fragColor = vec4(
+            max_value,
+            max_value,
+            max_value,
+            0.0
+        );
     }
-	else if (rgb_type == 2) // RBG
+    else if (rgb_type == 2) // RBG
     {
         fragColor = vec4(
             fragColor.r,
@@ -914,7 +1518,17 @@ void main()
 }
 )";
 
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_input")
+		return in_ctrl;
+	
+	if(cmd == "get_default_output")
+		return out_ctrl;
+}
+
 entry(generator, area) {	
+	
+	generator.window.fixed_size(vec2f(1200,800));
 	
 	net = generator.engine.net;
 	
@@ -934,6 +1548,8 @@ entry(generator, area) {
 	led_shader.fragment_source(led_shader_src);
 	led_shader.render_size(vec2i(1, 1));
 	led_shader.pixel_readback(true);
+	led_shader.input("feedback", led_shader);
+	
 	
 	shader_view = area.scrollarea().anchor_left(200).anchor_right(200).anchor_top(20).anchor_bottom(0).fit_content().content();
 	
@@ -942,6 +1558,21 @@ entry(generator, area) {
 	
 	size_x = left_ctrls.controlint("Width", "settings").value(generator.engine.project_width.value());
 	size_y = left_ctrls.controlint("Height", "settings").value(generator.engine.project_height.value());
+	
+	led_radius_ctrl = left_ctrls.controlint("LED Radius").min(1).max(100).callback([this](v){
+		led_shader.uniform("led_radius", v);
+	});
+	led_radius_ctrl.value(1);
+	
+	led_smoothing_ctrl = left_ctrls.controlslider("LED Smoothing").callback([this](v){
+		led_shader.uniform("feedback_value", v);
+	});
+	led_smoothing_ctrl.value(0.0);
+	
+	led_analog_ctrl = left_ctrls.controlbutton("Analog Mode").push(true).callback([this](v){
+		led_shader.uniform("analog_mode", v);
+	});
+	led_analog_ctrl.value(0);
 	
 	size_cb = [size_x, size_y, shader_view](v) {
 		shader.render_size(vec2i(size_x.value(), size_y.value()));
@@ -955,9 +1586,31 @@ entry(generator, area) {
 	
 	size_cb();
 
-	add_scene = left_ctrls.button("Add Scene");
+	select_video_router = left_ctrls.combobox().items(["Select Input"]);
+	select_video_router.on_open([select_video_router](){
+		routers = get_video_routers();
+		items = ["Select Input"];
+		for(i = 0; i < routers.size(); i++) {
+			items.push_back(routers[i].name);
+		}
+		select_video_router.items(items);
+	});
 	
-	scene_area = left_ctrls.vscroll().anchor(0).anchor_top(100).content().layout(nanogui.layout_vertical()).fixed_width(200);
+	select_video_router.on_change([select_video_router, in_ctrl](index, text){
+		routers = get_video_routers();
+		index--;
+		if(index < 0 || index >= routers.size())
+			in_ctrl.clear_incoming_links();
+			in_ctrl.value(None);
+		else 
+			routers[index].output_ctrl.link_to(in_ctrl);
+			in_ctrl.value(routers[index].output_ctrl.value());
+			
+	});
+
+	add_scene = left_ctrls.button("Add Scene").fixed_height(30);
+	
+	scene_area = left_ctrls.vscroll().anchor(0).anchor_top(230).content().layout(nanogui.layout_vertical()).fixed_width(200);
 	
 	scene_control_area = right_ctrls;
 	
@@ -970,29 +1623,86 @@ entry(generator, area) {
 		build_scenes();
 	});
 	
+	left_ctrls.on_dragdrop_hover([this](payload, pos) {
+			path = fileio.relative_path_cwd(payload.path);	
+			config = fileio.read_json(path);
+			return config.type == "scene";
+		});
+		
+	left_ctrls.on_dragdrop([this, area](payload, pos) {
+			path = fileio.relative_path_cwd(payload.path);	
+			config = fileio.read_json(path);
+			if(config.type == "scene") {
+				fixture_scenes.push_back(config);
+				build_scenes();
+				build_shader_flag = true;
+			}
+			return true;
+		});
+	
+	scene_control_area.on_dragdrop_hover([this](payload, pos) {
+			path = fileio.relative_path_cwd(payload.path);	
+			config = fileio.read_json(path);
+			return config.type == "group" || config.type == "segment";
+		});
+		
+	scene_control_area.on_dragdrop([this, area](payload, pos) {
+			path = fileio.relative_path_cwd(payload.path);	
+			config = fileio.read_json(path);
+			if(config.type == "group") {
+				if(!active_scene)
+					std.print("No scene active.");
+					return;
+				active_scene.scene.groups.push_back(config);
+				active_scene.build_groups();
+				build_shader_flag = true;
+			}
+			else if(config.type == "segment") {
+				if(!active_group)
+					std.print("No group active.");
+					return;
+				active_group.group.segments.push_back(config);
+				active_group.build_segments();
+				build_shader_flag = true;
+			}
+			return true;
+		});
+	
 	shader.on_mouse_button([](pos, button, down, mods) {
 		if(button != 0)
 			return false;
 		std.print(pos);
 		if(down)
 			active_drag_start = quantize_grid(pos);
+			if(active_group) {
+				uv = vec2f(active_drag_start.x / std.float(shader.width()), active_drag_start.y / std.float(shader.height()));
+				active_group.on_drag_start(uv);
+			}
 		else
 			active_drag_end = quantize_grid(pos);
 			
-			if(active_drag_start && active_drag_end)
-				uv_start = vec2f(active_drag_start.x / std.float(shader.width()), active_drag_start.y / std.float(shader.height()));
-				uv_end = vec2f(active_drag_end.x / std.float(shader.width()), active_drag_end.y / std.float(shader.height()));
-				if(active_group)
-					active_group.new_segment(uv_start, uv_end);
+			if(active_drag_start && active_drag_end) {
+				if(active_group) {
+					uv_start = vec2f(active_drag_start.x / std.float(shader.width()), active_drag_start.y / std.float(shader.height()));
+					uv_end = vec2f(active_drag_end.x / std.float(shader.width()), active_drag_end.y / std.float(shader.height()));		
+					active_group.on_drag_end(uv_start, uv_end);
+				}
+			}
 			
 			active_drag_start = None;
 			active_drag_end = None;
 		return true;
 	});
 	
-	shader.on_mouse_motion([](pos, rel, button, mods) {
-		if(active_drag_start)
+	shader.on_mouse_drag([](pos, rel, button, mods) {
+		if(active_drag_start) {
 			active_drag_end = quantize_grid(pos);
+			if(active_group) {
+				uv = vec2f(active_drag_end.x / std.float(shader.width()), active_drag_end.y / std.float(shader.height()));
+				uv_rel = vec2f(rel.x / std.float(shader.width()), rel.y / std.float(shader.height()));
+				active_group.on_drag(uv, uv_rel);
+			}
+		}
 		return true;
 	});
 
@@ -1033,7 +1743,7 @@ entry(generator, area) {
 		}
 	
 		if(active_group) {
-			active_group.draw_segments(ctx, true);
+			active_group.draw(ctx, true);
 		}
 	
 		if(active_drag_start && active_drag_end) {
