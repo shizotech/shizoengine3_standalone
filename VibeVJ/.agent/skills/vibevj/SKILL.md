@@ -104,3 +104,10 @@ Fixture definitions are located in assets/Fixtures using a simple json scheme
 To get an overview of the exact format and possible channel definitions, look at assets/Fixtures/example.json which showcases all possibilities
 You can create new fixtures there using regular file operation tools
 You can also look up specific fixture definitions there
+
+# Asset Directories
+
+The default usable asset directory is 'assets/'
+Views are in 'assets/views'
+
+Some internally used engine assets can be found in 'engine/assets', you generally dont add these yourself.
