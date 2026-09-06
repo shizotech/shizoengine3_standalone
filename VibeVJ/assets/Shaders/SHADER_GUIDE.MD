@@ -57,7 +57,9 @@ If a shader input has the **same name** as another pass within the shader node, 
 uniform sampler2D A;  // Will bind to src/A.glsl automatically
 ```
 
-### Special Input Names
+**Exceptions**
+
+#### Special Input Names
 
 | Name | Behavior |
 |------|----------|
@@ -66,7 +68,7 @@ uniform sampler2D A;  // Will bind to src/A.glsl automatically
 | `feedback` | Binds to itself (the current shader), use this for feedback effects |
 | `RenderMaskInput` | Binds to the render mask input |
 
-Each effect shader needs exactly one primary "input" input.
+Each effect shader needs exactly one primary "input" sampler.
 
 ---
 
