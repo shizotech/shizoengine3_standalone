@@ -1,0 +1,1502 @@
+// ============================================================================
+// __init__.shio — MCP 2026-07-28 Server
+// ============================================================================
+//
+// Modern MCP architecture:
+//
+//   POST /mcp
+//       |
+//       +-- server/discover
+//       +-- tools/list
+//       +-- tools/call
+//       +-- resources/list
+//       +-- resources/read
+//       +-- prompts/list
+//       +-- prompts/get
+//       +-- ping
+//
+// There is NO:
+//
+//   - initialize/initialized handshake
+//   - Mcp-Session-Id
+//   - session storage
+//   - persistent SSE connection
+//   - GET / SSE endpoint
+//
+// Every request is independent and can be handled by any server instance.
+//
+// MCP protocol version:
+//   2026-07-28
+//
+// ============================================================================
+
+
+import webserver;
+
+#include "mcp_types.shio"
+#include "openai/openai"
+
+
+// ============================================================================
+// MCP Server
+// ============================================================================
+
+class mcpserver
+{
+	name = "";
+	port = 13338;
+	http = None;
+
+	// ------------------------------------------------------------------------
+	// MCP tools
+	// ------------------------------------------------------------------------
+
+	tools = toolset();
+
+
+	// ------------------------------------------------------------------------
+	// MCP server instructions
+	//
+	// These are global instructions describing how an MCP client/model should
+	// use this server.
+	//
+	// They are returned by server/discover.
+	// ------------------------------------------------------------------------
+
+	instructions = "";
+
+
+	// ------------------------------------------------------------------------
+	// MCP resources
+	//
+	// Resource formats:
+	//
+	// [
+	//     uri = "...",
+	//     name = "...",
+	//     description = "...",
+	//     mimeType = "...",
+	//     text = "...",
+	//     path = None,
+	//     callback = None
+	// ]
+	//
+	// Resources can therefore be:
+	//
+	//   1. static text
+	//   2. file-backed
+	//   3. dynamically generated
+	// ------------------------------------------------------------------------
+
+	resources = resource_registry();
+
+
+	// ------------------------------------------------------------------------
+	// MCP prompts
+	//
+	// [
+	//     name = "...",
+	//     description = "...",
+	//     arguments = [...],
+	//     callback = ...
+	// ]
+	// ------------------------------------------------------------------------
+
+	prompts = prompt_registry();
+
+
+	// ------------------------------------------------------------------------
+	// Cache hints
+	//
+	// MCP 2026-07-28 defines ttlMs and cacheScope for discovery/list/read
+	// results.
+	//
+	// 0 / private means:
+	//
+	//   - don't consider the result cacheable
+	//   - don't share it between authorization contexts
+	//
+	// These defaults are safest for a generic server.
+	// ------------------------------------------------------------------------
+
+	cache_ttl_ms = 0;
+	cache_scope = "private";
+
+
+	// =========================================================================
+	// Constructor
+	// =========================================================================
+
+	__init__(name, port, http_backend = webserver.http_server())
+	{
+		this.name = name;
+		this.port = port;
+		this.http = http_backend;
+
+
+		// toolset has no __init__ and None members, initialize them here.
+		this.tools.tools = [];
+		this.tools.tool_callbacks = [];
+
+
+		http.init(port);
+
+
+		// ---------------------------------------------------------------------
+		// Modern MCP Streamable HTTP endpoint
+		// ---------------------------------------------------------------------
+
+		http.route(
+			"POST",
+			"/mcp",
+			this.mcp_handler
+		);
+		
+		http.route(
+			"POST",
+			"/",
+			this.mcp_handler
+		);
+
+		// ---------------------------------------------------------------------
+		// Start server
+		// ---------------------------------------------------------------------
+
+		http.start();
+
+		std.print("MCP Server started on port " + port);
+		std.print("MCP Endpoint: http://localhost:" + port + "/mcp");
+	}
+
+
+	// =========================================================================
+	// Configuration API
+	// =========================================================================
+
+
+	// -------------------------------------------------------------------------
+	// Set server instructions
+	// -------------------------------------------------------------------------
+
+	add_instruction(text)
+	{
+		this.instructions = text;
+	}
+
+
+	// -------------------------------------------------------------------------
+	// Alias for add_instruction
+	// -------------------------------------------------------------------------
+
+	set_instructions(text)
+	{
+		this.instructions = text;
+	}
+
+
+	// -------------------------------------------------------------------------
+	// Set cache behavior
+	//
+	// Example:
+	//
+	// server.set_cache(60000, "public");
+	//
+	// Only use "public" when the returned data is genuinely identical for
+	// every caller/authorization context.
+	// -------------------------------------------------------------------------
+
+	set_cache(ttl_ms, cache_scope)
+	{
+		this.cache_ttl_ms = ttl_ms;
+		this.cache_scope = cache_scope;
+	}
+
+
+	// =========================================================================
+	// Resource registration
+	// =========================================================================
+
+
+	// -------------------------------------------------------------------------
+	// Add static resource
+	// -------------------------------------------------------------------------
+
+	add_resource(
+		uri,
+		name,
+		description,
+		mime_type,
+		text
+	)
+	{
+		this.resources.add_static_resource(
+			uri,
+			name,
+			description,
+			mime_type,
+			text
+		);
+	}
+
+
+	// -------------------------------------------------------------------------
+	// Add file-backed resource
+	//
+	// The file is read when resources/read is called.
+	//
+	// This makes skill.md files particularly convenient:
+	//
+	//   skills/nanogui/skill.md
+	//   skills/artnet/skill.md
+	//   skills/shizoscript/skill.md
+	//
+	// can be edited while the server is running.
+	// -------------------------------------------------------------------------
+
+	add_resource_file(
+		uri,
+		name,
+		description,
+		path,
+		mime_type = "text/markdown"
+	)
+	{
+		this.resources.add_resource(
+			uri,
+			name,
+			description,
+			mime_type,
+			path
+		);
+	}
+
+
+	// -------------------------------------------------------------------------
+	// Add dynamically generated resource
+	//
+	// callback(server, uri) -> text
+	// -------------------------------------------------------------------------
+
+	add_resource_callback(
+		uri,
+		name,
+		description,
+		mime_type,
+		callback
+	)
+	{
+		this.resources.add_resource_callback(
+			uri,
+			name,
+			description,
+			mime_type,
+			callback
+		);
+	}
+
+
+	// =========================================================================
+	// Prompt registration
+	// =========================================================================
+
+
+	// -------------------------------------------------------------------------
+	// Add prompt
+	//
+	// callback(server, arguments) -> prompt text
+	// -------------------------------------------------------------------------
+
+	add_prompt(
+		name,
+		description,
+		arguments,
+		callback
+	)
+	{
+		this.prompts.add_prompt(
+			name,
+			description,
+			arguments,
+			callback
+		);
+	}
+
+
+	// =========================================================================
+	// MCP server/discover
+	// =========================================================================
+	//
+	// MCP 2026-07-28 replaces the old initialize/initialized lifecycle with
+	// server/discover.
+	//
+	// This returns:
+	//
+	//   supportedVersions
+	//   capabilities
+	//   serverInfo
+	//   instructions
+	//
+	// There is no session created here.
+	//
+	// =========================================================================
+
+	handle_server_discover(req_params)
+	{
+		return [
+			supportedVersions = [
+				MCP_VERSION
+			],
+
+			capabilities = [
+				tools = [
+				],
+
+				resources = [
+				],
+
+				prompts = [
+				]
+			],
+
+			serverInfo = [
+				name = name,
+				version = "1.0.0"
+			],
+
+			instructions = instructions,
+
+			ttlMs = cache_ttl_ms,
+			cacheScope = cache_scope
+		];
+	}
+
+
+	// =========================================================================
+	// MCP tools/list
+	// =========================================================================
+
+	handle_tools_list(req_params)
+	{
+		list = [];
+
+
+		for(i = 0; i < tools.tools.size(); i++)
+		{
+			t = [
+				name =
+					tools.tools[i].function.name,
+
+				description =
+					tools.tools[i].function.description,
+
+				inputSchema =
+					tools.tools[i].function.parameters
+			];
+
+
+			if(!t.inputSchema)
+			{
+				t.inputSchema = [
+					type = "object",
+					properties = []
+				];
+			}
+
+
+			list.push_back(t);
+		}
+
+
+		return [
+			tools = list,
+
+			ttlMs = cache_ttl_ms,
+			cacheScope = cache_scope
+		];
+	}
+
+
+	// =========================================================================
+	// MCP tools/call
+	// =========================================================================
+
+	handle_tools_call(req_params, rpc_id)
+	{
+		try
+		{
+			tool_name = req_params.geti("name");
+			arguments = req_params.geti("arguments");
+
+
+			if(!tool_name)
+			{
+				return create_jsonrpc_error(
+					rpc_id,
+					JSONRPC_INVALID_REQUEST,
+					"Missing tool name."
+				);
+			}
+
+
+			if(!tools.tool_callbacks.has(tool_name))
+			{
+				return create_jsonrpc_error(
+					rpc_id,
+					JSONRPC_TOOL_NOT_FOUND,
+					"Tool doesnt exist."
+				);
+			}
+
+
+			cb = tools.tool_callbacks[tool_name];
+
+
+			return create_jsonrpc_tool_response(
+				rpc_id,
+				cb(arguments)
+			);
+		}
+		catch(e)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_INTERNAL_ERROR,
+				"Internal server error."
+			);
+		}
+	}
+
+
+	// =========================================================================
+	// MCP resources/list
+	// =========================================================================
+
+	handle_resources_list(req_params)
+	{
+		list = [];
+
+
+		for(i = 0; i < resources.resources.size(); i++)
+		{
+			r = resources.resources[i];
+
+
+			list.push_back([
+				uri = r.uri,
+				name = r.name,
+				description = r.description,
+				mimeType = r.mimeType
+			]);
+		}
+
+
+		return [
+			resources = list,
+
+			ttlMs = cache_ttl_ms,
+			cacheScope = cache_scope
+		];
+	}
+
+
+	// =========================================================================
+	// MCP resources/read
+	// =========================================================================
+
+	handle_resources_read(req_params, rpc_id)
+	{
+		uri = req_params.geti("uri");
+
+
+		if(!uri)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_INVALID_REQUEST,
+				"Missing resource URI."
+			);
+		}
+
+
+		r = this.resources.find_resource(uri);
+
+
+		if(!r)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_RESOURCE_NOT_FOUND,
+				"Resource not found: " + uri
+			);
+		}
+
+
+		// -------------------------------------------------------------
+		// Dynamic resource
+		// -------------------------------------------------------------
+
+		if(r.callback)
+		{
+			try
+			{
+				text = r.callback(this, uri);
+
+
+				return [
+					contents = [
+						[
+							uri = r.uri,
+							mimeType = r.mimeType,
+							text = text
+						]
+					],
+
+					ttlMs = cache_ttl_ms,
+					cacheScope = cache_scope
+				];
+			}
+			catch(e)
+			{
+				return create_jsonrpc_error(
+					rpc_id,
+					JSONRPC_INTERNAL_ERROR,
+					"Resource callback failed."
+				);
+			}
+		}
+
+
+		// -------------------------------------------------------------
+		// File-backed resource
+		// -------------------------------------------------------------
+
+		if(r.path)
+		{
+			try
+			{
+				text = fileio.read_string(r.path);
+
+
+				return [
+					contents = [
+						[
+							uri = r.uri,
+							mimeType = r.mimeType,
+							text = text
+						]
+					],
+
+					ttlMs = cache_ttl_ms,
+					cacheScope = cache_scope
+				];
+			}
+			catch(e)
+			{
+				return create_jsonrpc_error(
+					rpc_id,
+					JSONRPC_INTERNAL_ERROR,
+					"Failed to read resource file."
+				);
+			}
+		}
+
+
+		// -------------------------------------------------------------
+		// Static resource
+		// -------------------------------------------------------------
+
+		return [
+			contents = [
+				[
+					uri = r.uri,
+					mimeType = r.mimeType,
+					text = r.text
+				]
+			],
+
+			ttlMs = cache_ttl_ms,
+			cacheScope = cache_scope
+		];
+	}
+
+
+	// =========================================================================
+	// MCP prompts/list
+	// =========================================================================
+
+	handle_prompts_list(req_params)
+	{
+		list = [];
+
+
+		for(i = 0; i < prompts.prompts.size(); i++)
+		{
+			p = prompts.prompts[i];
+
+
+			list.push_back([
+				name = p.name,
+				description = p.description,
+				arguments = p.arguments
+			]);
+		}
+
+
+		return [
+			prompts = list,
+
+			ttlMs = cache_ttl_ms,
+			cacheScope = cache_scope
+		];
+	}
+
+
+	// =========================================================================
+	// MCP prompts/get
+	// =========================================================================
+
+	handle_prompts_get(req_params, rpc_id)
+	{
+		prompt_name = req_params.geti("name");
+		arguments = req_params.geti("arguments");
+
+
+		if(!prompt_name)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_INVALID_REQUEST,
+				"Missing prompt name."
+			);
+		}
+
+
+		p = this.prompts.find_prompt(prompt_name);
+
+
+		if(!p)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_PROMPT_NOT_FOUND,
+				"Prompt not found: " + prompt_name
+			);
+		}
+
+
+		cb = this.prompts.prompt_callbacks[prompt_name];
+
+
+		try
+		{
+			text = cb(
+				this,
+				arguments
+			);
+
+
+			return [
+				description = p.description,
+
+				messages = [
+					[
+						role = "user",
+
+						content = [
+							type = "text",
+							text = text
+						]
+					]
+				],
+
+				ttlMs = cache_ttl_ms,
+				cacheScope = cache_scope
+			];
+		}
+		catch(e)
+		{
+			return create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_INTERNAL_ERROR,
+				"Prompt callback failed."
+			);
+		}
+	}
+
+
+	// =========================================================================
+	// Validate modern MCP HTTP headers
+	// =========================================================================
+	//
+	// MCP 2026-07-28 uses HTTP headers to make requests self-describing:
+	//
+	//   MCP-Protocol-Version
+	//   Mcp-Method
+	//   Mcp-Name
+	//
+	// The body and headers must agree.
+	//
+	// =========================================================================
+
+	validate_mcp_headers(request_object, method, params)
+	{
+		// -------------------------------------------------------------
+		// Protocol version
+		// -------------------------------------------------------------
+
+		protocol_version =
+			request_object.headers.geti(
+				"MCP-Protocol-Version"
+			);
+
+
+		if(protocol_version != MCP_VERSION)
+		{
+			return [
+				ok = false,
+				error = create_jsonrpc_error(
+					-1,
+					JSONRPC_INVALID_REQUEST,
+					"Unsupported or missing MCP-Protocol-Version."
+				)
+			];
+		}
+
+
+		// -------------------------------------------------------------
+		// Method
+		// -------------------------------------------------------------
+
+		header_method =
+			request_object.headers.geti(
+				"Mcp-Method"
+			);
+
+
+		if(!header_method)
+		{
+			return [
+				ok = false,
+				error = create_jsonrpc_error(
+					-1,
+					JSONRPC_INVALID_REQUEST,
+					"Missing Mcp-Method header."
+				)
+			];
+		}
+
+
+		if(header_method != method)
+		{
+			return [
+				ok = false,
+				error = create_jsonrpc_error(
+					-1,
+					JSONRPC_INVALID_REQUEST,
+					"Mcp-Method does not match JSON-RPC method."
+				)
+			];
+		}
+
+
+		// -------------------------------------------------------------
+		// Mcp-Name
+		//
+		// For methods with a name/URI parameter, verify it.
+		// -------------------------------------------------------------
+
+		header_name =
+			request_object.headers.geti(
+				"Mcp-Name"
+			);
+
+
+		if(
+			method == TOOLS_CALL_METHOD ||
+			method == PROMPTS_GET_METHOD
+		)
+		{
+			body_name = params.geti("name");
+
+
+			if(!header_name)
+			{
+				return [
+					ok = false,
+					error = create_jsonrpc_error(
+						-1,
+						JSONRPC_INVALID_REQUEST,
+						"Missing Mcp-Name header."
+					)
+				];
+			}
+
+
+			if(header_name != body_name)
+			{
+				return [
+					ok = false,
+					error = create_jsonrpc_error(
+						-1,
+						JSONRPC_INVALID_REQUEST,
+						"Mcp-Name does not match request."
+					)
+				];
+			}
+		}
+
+
+		// -------------------------------------------------------------
+		// resources/read uses URI as the routable name.
+		// -------------------------------------------------------------
+
+		else if(method == RESOURCES_READ_METHOD)
+		{
+			body_uri = params.geti("uri");
+
+
+			if(!header_name)
+			{
+				return [
+					ok = false,
+					error = create_jsonrpc_error(
+						-1,
+						JSONRPC_INVALID_REQUEST,
+						"Missing Mcp-Name header."
+					)
+				];
+			}
+
+
+			if(header_name != body_uri)
+			{
+				return [
+					ok = false,
+					error = create_jsonrpc_error(
+						-1,
+						JSONRPC_INVALID_REQUEST,
+						"Mcp-Name does not match resource URI."
+					)
+				];
+			}
+		}
+
+
+		return [
+			ok = true,
+			error = None
+		];
+	}
+
+
+	// =========================================================================
+	// Create HTTP JSON response
+	// =========================================================================
+	//
+	// This is deliberately separate from JSON-RPC generation.
+	//
+	// JSON-RPC is the payload.
+	// HTTP is the transport.
+	// =========================================================================
+
+	send_json_response(writer, response)
+	{
+		response_text = response.compact_string();
+
+
+		if(!writer.write_header(
+			200,
+			"application/json"
+		))
+		{
+			return false;
+		}
+
+
+		if(!writer.write(response_text))
+			return false;
+
+
+		writer.end();
+
+
+		return true;
+	}
+
+
+	// =========================================================================
+	// MCP Request Handler
+	// =========================================================================
+	//
+	// Completely stateless:
+	//
+	//   HTTP request
+	//       ↓
+	//   validate headers
+	//       ↓
+	//   parse JSON-RPC
+	//       ↓
+	//   dispatch
+	//       ↓
+	//   HTTP response
+	//
+	// No session ID is involved.
+	// =========================================================================
+
+	mcp_handler(request_object, writer)
+	{
+		// ---------------------------------------------------------------------
+		// Body
+		// ---------------------------------------------------------------------
+
+		std.print(request_object);
+
+		body_str = std.string(
+			request_object.body
+		);
+
+
+		if(body_str == "")
+		{
+			error_resp = create_jsonrpc_error(
+				-1,
+				JSONRPC_PARSE_ERROR,
+				"Empty request body."
+			);
+
+
+			send_json_response(
+				writer,
+				error_resp
+			);
+
+
+			return [
+				body = ""
+			];
+		}
+
+
+		// ---------------------------------------------------------------------
+		// Parse JSON
+		// ---------------------------------------------------------------------
+
+		req = None;
+
+
+		try
+		{
+			req = std.json(body_str);
+		}
+		catch(e)
+		{
+			error_resp = create_jsonrpc_error(
+				-1,
+				JSONRPC_PARSE_ERROR,
+				"Failed to parse JSON: " +
+				std.string(e).string(0)
+			);
+
+
+			send_json_response(
+				writer,
+				error_resp
+			);
+
+
+			return [
+				body = ""
+			];
+		}
+
+
+		// ---------------------------------------------------------------------
+		// JSON-RPC fields
+		// ---------------------------------------------------------------------
+
+		method = req.geti("method");
+		rpc_id = req.geti("id");
+		params = req.geti("params");
+
+
+		if(!method)
+		{
+			error_resp = create_jsonrpc_error(
+				rpc_id,
+				JSONRPC_INVALID_REQUEST,
+				"Missing method."
+			);
+
+
+			send_json_response(
+				writer,
+				error_resp
+			);
+
+
+			return [
+				body = ""
+			];
+		}
+
+
+		// ---------------------------------------------------------------------
+		// Params default
+		// ---------------------------------------------------------------------
+
+		if(!params)
+			params = [];
+
+
+		// ---------------------------------------------------------------------
+		// Validate modern MCP HTTP envelope
+		//
+		// server/discover itself is also a modern MCP request.
+		// ---------------------------------------------------------------------
+
+		header_validation =
+			validate_mcp_headers(
+				request_object,
+				method,
+				params
+			);
+
+
+		if(!header_validation.ok)
+		{
+			send_json_response(
+				writer,
+				header_validation.error
+			);
+
+
+			return [
+				body = ""
+			];
+		}
+
+
+		// ---------------------------------------------------------------------
+		// Route
+		// ---------------------------------------------------------------------
+
+		response = None;
+
+
+		// =====================================================================
+		// server/discover
+		// =====================================================================
+
+		if(method == SERVER_DISCOVER_METHOD)
+		{
+			result =
+				handle_server_discover(
+					params
+				);
+
+
+			response =
+				create_jsonrpc_response(
+					rpc_id,
+					result
+				);
+		}
+
+
+		// =====================================================================
+		// tools/list
+		// =====================================================================
+
+		else if(method == TOOLS_LIST_METHOD)
+		{
+			result =
+				handle_tools_list(
+					params
+				);
+
+
+			response =
+				create_jsonrpc_response(
+					rpc_id,
+					result
+				);
+		}
+
+
+		// =====================================================================
+		// tools/call
+		// =====================================================================
+
+		else if(method == TOOLS_CALL_METHOD)
+		{
+			response =
+				handle_tools_call(
+					params,
+					rpc_id
+				);
+		}
+
+
+		// =====================================================================
+		// resources/list
+		// =====================================================================
+
+		else if(method == RESOURCES_LIST_METHOD)
+		{
+			result =
+				handle_resources_list(
+					params
+				);
+
+
+			response =
+				create_jsonrpc_response(
+					rpc_id,
+					result
+				);
+		}
+
+
+		// =====================================================================
+		// resources/read
+		// =====================================================================
+
+		else if(method == RESOURCES_READ_METHOD)
+		{
+			result =
+				handle_resources_read(
+					params,
+					rpc_id
+				);
+
+
+			// A handler may already have generated a JSON-RPC error.
+			//
+			// Otherwise wrap the result in a JSON-RPC response.
+
+			if(result.error)
+				response = result;
+			else
+				response =
+					create_jsonrpc_response(
+						rpc_id,
+						result
+					);
+		}
+
+
+		// =====================================================================
+		// prompts/list
+		// =====================================================================
+
+		else if(method == PROMPTS_LIST_METHOD)
+		{
+			result =
+				handle_prompts_list(
+					params
+				);
+
+
+			response =
+				create_jsonrpc_response(
+					rpc_id,
+					result
+				);
+		}
+
+
+		// =====================================================================
+		// prompts/get
+		// =====================================================================
+
+		else if(method == PROMPTS_GET_METHOD)
+		{
+			result =
+				handle_prompts_get(
+					params,
+					rpc_id
+				);
+
+
+			if(result.error)
+				response = result;
+			else
+				response =
+					create_jsonrpc_response(
+						rpc_id,
+						result
+					);
+		}
+
+
+		// =====================================================================
+		// ping
+		// =====================================================================
+
+		else if(method == PING_METHOD)
+		{
+			response =
+				create_jsonrpc_response(
+					rpc_id,
+					[
+						status = "ok"
+					]
+				);
+		}
+
+
+		// =====================================================================
+		// Unknown method
+		// =====================================================================
+
+		else
+		{
+			response =
+				create_jsonrpc_error(
+					rpc_id,
+					JSONRPC_METHOD_NOT_FOUND,
+					"Method not found: " + method
+				);
+		}
+
+
+		// ---------------------------------------------------------------------
+		// Send HTTP response
+		// ---------------------------------------------------------------------
+
+		send_json_response(
+			writer,
+			response
+		);
+
+
+		return [
+			body = ""
+		];
+	}
+}
+
+
+// ============================================================================
+// Example Server Configuration
+// ============================================================================
+
+/*
+
+server_port = 13338;
+
+server = mcpserver(
+	"ShizoScript",
+	server_port
+);
+
+
+// ============================================================================
+// Server instructions
+// ============================================================================
+
+server.add_instruction("
+You are working with the ShizoScript development environment.
+
+Follow the ShizoScript coding conventions and existing project architecture.
+
+Before modifying code:
+
+1. Inspect the relevant existing implementation.
+2. Consult relevant documentation and skills.
+3. Reuse existing APIs where possible.
+4. Make the smallest appropriate change.
+5. Verify the result after implementation.
+
+Do not invent APIs when existing ShizoScript APIs can be inspected.
+");
+
+
+// ============================================================================
+// Resources
+// ============================================================================
+
+// Core skill
+
+server.add_resource_file(
+	"shz://skills/core",
+	"core",
+	"Core ShizoScript development instructions.",
+	"skills/core/skill.md"
+);
+
+
+// Nanogui skill
+
+server.add_resource_file(
+	"shz://skills/nanogui",
+	"nanogui",
+	"Instructions for working with ShizoScript nanogui.",
+	"skills/nanogui/skill.md"
+);
+
+
+// Art-Net skill
+
+server.add_resource_file(
+	"shz://skills/artnet",
+	"artnet",
+	"Instructions for working with Art-Net.",
+	"skills/artnet/skill.md"
+);
+
+
+// OSC skill
+
+server.add_resource_file(
+	"shz://skills/osc",
+	"osc",
+	"Instructions for working with OSC.",
+	"skills/osc/skill.md"
+);
+
+
+// ============================================================================
+// Dynamic resource
+// ============================================================================
+
+server.add_resource_callback(
+	"shz://server/state",
+	"server_state",
+	"Current state of the ShizoScript MCP server.",
+	"text/plain",
+
+	[](svr, uri)
+	{
+		return "
+ShizoScript MCP Server
+
+Name: " + svr.name + "
+Port: " + svr.port + "
+Tools: " + svr.tools.tools.size() + "
+Resources: " + svr.resources.resources.size() + "
+Prompts: " + svr.prompts.prompts.size() + "
+";
+	}
+);
+
+
+// ============================================================================
+// Example tool
+// ============================================================================
+
+server.tools.add_tool(
+	"test_tool",
+
+	"Execute a test operation",
+
+	[
+		manifest = "&string(): Plan manifest",
+		state = "&string(): Initial state",
+		taskboard = "&string(): Taskboard manifest",
+		num = "&int(): number",
+	],
+
+	[](args)
+	{
+		std.print(args);
+
+		return "Ok worked!";
+	}
+);
+
+
+// ============================================================================
+// Implement feature prompt
+// ============================================================================
+
+server.add_prompt(
+	"implement_feature",
+
+	"Implement a ShizoScript feature using the standard development workflow.",
+
+	[
+		[
+			name = "goal",
+			description = "The feature that should be implemented.",
+			required = true
+		]
+	],
+
+	[](svr, args)
+	{
+		goal = args.goaltostring();
+
+
+		return "
+You are implementing a feature in ShizoScript.
+
+Follow the ShizoScript development workflow.
+
+Before implementation:
+
+- Inspect the existing code.
+- Read relevant documentation.
+- Read relevant skill resources.
+- Reuse existing APIs where possible.
+
+After implementation:
+
+- Verify the change.
+- Check for compilation/runtime errors.
+- Do not leave the task in an ambiguous state.
+
+Feature to implement:
+
+" + goal;
+	}
+);
+
+
+// ============================================================================
+// Debug prompt
+// ============================================================================
+
+server.add_prompt(
+	"debug",
+
+	"Investigate and fix a ShizoScript problem.",
+
+	[
+		[
+			name = "problem",
+			description = "Description of the problem.",
+			required = true
+		]
+	],
+
+	[](svr, args)
+	{
+		problem = args.problemtostring();
+
+
+		return "
+Debug the following ShizoScript problem.
+
+First inspect the relevant implementation and documentation.
+
+Determine the actual cause rather than guessing.
+
+Make the smallest appropriate fix.
+
+Verify the fix afterwards.
+
+Problem:
+
+" + problem;
+	}
+);
+
+
+// ============================================================================
+// Keep server running
+// ============================================================================
+
+std.sleep(-1);
+
+*/

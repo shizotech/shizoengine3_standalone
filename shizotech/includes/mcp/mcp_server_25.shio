@@ -1,0 +1,589 @@
+// ============================================================================
+// __init__.shio — Main entry point and server initialization
+// ============================================================================
+
+// Import webserver module for HTTP server
+import webserver;
+
+#include "mcp_types.shio"
+#include "openai/openai"
+
+// Protocol version for this server (overrides the shared default in mcp_types.shio)
+MCP_VERSION = "2025-11-25";
+
+class mcpserver
+{
+	name = "";
+	port = 13338;
+	http = None;
+	clients = [];
+	tools = toolset();
+	
+	// ------------------------------------------------------------------------
+	// MCP server instructions
+	//
+	// These are global instructions describing how an MCP client/model should
+	// use this server.
+	//
+	// They are returned in the initialize result.
+	// ------------------------------------------------------------------------
+	
+	instructions = "";
+	
+	
+	// ------------------------------------------------------------------------
+	// MCP resources
+	//
+	// Resource formats:
+	//
+	// [
+	//     uri = "...",
+	//     name = "...",
+	//     description = "...",
+	//     mimeType = "...",
+	//     text = "...",
+	//     path = None,
+	//     callback = None
+	// ]
+	//
+	// Resources can therefore be:
+	//
+	//   1. static text
+	//   2. file-backed
+	//   3. dynamically generated
+	// ------------------------------------------------------------------------
+	
+	resources = resource_registry();
+	
+	
+	// ------------------------------------------------------------------------
+	// MCP prompts
+	//
+	// [
+	//     name = "...",
+	//     description = "...",
+	//     arguments = [...],
+	//     callback = ...
+	// ]
+	// ------------------------------------------------------------------------
+	
+	prompts = prompt_registry();
+	
+	__init__(name, port, http_backend = webserver.http_server()) {
+		this.name = name;
+		this.port = port;
+		this.http = http_backend;
+		http.init(port);
+		
+		// Register MCP endpoint for POST requests
+		http.route("POST", "/mcp", this.mcp_handler);
+
+		// Register GET endpoint for server health check
+		http.route("GET", "/", [this](request_object, writer) {
+			if(!writer.write_header(200, "text/event-stream")) {
+				std.print("write header failed.");
+				return;
+			}
+			
+			client_id = std.random_hash(128);
+			
+			std.print(client_id);
+			
+			stream_write_cb = [this, writer, client_id](data) {
+				//data is a json with the response
+				send_sse = "event: message\ndata: " + data.compact_string() + "\n\n";
+				if(!writer.write(send_sse))
+					this.clients[client_id].stop = true;
+			};
+			
+			this.clients[client_id] = [
+				stream_writer = stream_write_cb,
+				stop = false,
+			];
+			
+			if(!writer.write("event: endpoint\ndata: /mcp?sessionid=" + client_id + "\n\n")) {
+				this.clients.erase(client_id);
+			}
+			
+			for(!this.clients[client_id].stop && writer.is_client_alive()) {
+				std.sleep(1000);
+			}
+			
+			std.print("client disconnected.");
+			
+			this.clients.erase(client_id);
+		});
+
+		// Start the server
+		http.start();
+
+		std.print("MCP Server started on port " + port);
+		std.print("MCP Endpoint: http://localhost:" + port);
+	}
+	
+	// =========================================================================
+	// Configuration API
+	// =========================================================================
+	
+	
+	// -------------------------------------------------------------------------
+	// Set server instructions
+	// -------------------------------------------------------------------------
+	
+	add_instruction(text)
+	{
+		this.instructions = text;
+	}
+	
+	
+	// -------------------------------------------------------------------------
+	// Alias for add_instruction
+	// -------------------------------------------------------------------------
+	
+	set_instructions(text)
+	{
+		this.instructions = text;
+	}
+	
+	
+	// =========================================================================
+	// Resource registration
+	// =========================================================================
+	
+	
+	// -------------------------------------------------------------------------
+	// Add static resource
+	// -------------------------------------------------------------------------
+	
+	add_resource(
+		uri,
+		name,
+		description,
+		mime_type,
+		text
+	)
+	{
+		this.resources.add_static_resource(
+			uri,
+			name,
+			description,
+			mime_type,
+			text
+		);
+	}
+	
+	
+	// -------------------------------------------------------------------------
+	// Add file-backed resource
+	//
+	// The file is read when resources/read is called.
+	//
+	// This makes skill.md files particularly convenient:
+	//
+	//   skills/nanogui/skill.md
+	//   skills/artnet/skill.md
+	//   skills/shizoscript/skill.md
+	//
+	// can be edited while the server is running.
+	// -------------------------------------------------------------------------
+	
+	add_resource_file(
+		uri,
+		name,
+		description,
+		path,
+		mime_type = "text/markdown"
+	)
+	{
+		this.resources.add_resource(
+			uri,
+			name,
+			description,
+			mime_type,
+			path
+		);
+	}
+	
+	
+	// -------------------------------------------------------------------------
+	// Add dynamically generated resource
+	//
+	// callback(server, uri) -> text
+	// -------------------------------------------------------------------------
+	
+	add_resource_callback(
+		uri,
+		name,
+		description,
+		mime_type,
+		callback
+	)
+	{
+		this.resources.add_resource_callback(
+			uri,
+			name,
+			description,
+			mime_type,
+			callback
+		);
+	}
+	
+	
+	// =========================================================================
+	// Prompt registration
+	// =========================================================================
+	
+	
+	// -------------------------------------------------------------------------
+	// Add prompt
+	//
+	// callback(server, arguments) -> prompt text
+	// -------------------------------------------------------------------------
+	
+	add_prompt(
+		name,
+		description,
+		arguments,
+		callback
+	)
+	{
+		this.prompts.add_prompt(
+			name,
+			description,
+			arguments,
+			callback
+		);
+	}
+	
+	// Initialize handler
+	handle_initialize(req_params)
+	{
+		result = [protocolVersion=MCP_VERSION, capabilities=[tools=handle_tools_list(None), resources=[], prompts=[]], serverInfo=[name=name, version="1.0.0"], instructions=instructions];
+		return result;
+	}
+
+	// Tools/List handler
+	handle_tools_list(req_params)
+	{
+		list = [];
+				
+		for(i = 0; i < tools.tools.size(); i++) {
+			t = [
+				name=tools.tools[i].function.name,
+				description=tools.tools[i].function.description,
+				inputSchema=tools.tools[i].function.parameters,
+			];
+			
+			if(!t.inputSchema)
+				t.inputSchema = [type = "object", properties = []];
+			
+			list.push_back(t);
+		}
+		
+		//std.print(list);
+		
+		return [tools=list];
+	}
+
+	// Tools/Call handler
+	handle_tools_call(req_params, rpc_id)
+	{
+		try {
+			
+			tool_name = req_params.geti("name");
+			arguments = req_params.geti("arguments");
+
+			if (!tools.tool_callbacks.has(tool_name))
+			{
+				error_resp = create_jsonrpc_error(rpc_id, JSONRPC_TOOL_NOT_FOUND, "Tool doesnt exist.");
+				return error_resp;
+			}
+			
+			cb = tools.tool_callbacks[tool_name];
+
+			return create_jsonrpc_tool_response(rpc_id, cb(this, arguments));
+		}
+		catch(e) {}
+		
+		error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INTERNAL_ERROR, "Internal server error.");
+		return error_resp;
+	}
+	
+	// Resources/List handler
+	handle_resources_list(req_params)
+	{
+		list = [];
+		
+		for(i = 0; i < resources.resources.size(); i++) {
+			r = resources.resources[i];
+			
+			list.push_back([
+				uri=r.uri,
+				name=r.name,
+				description=r.description,
+				mimeType=r.mimeType,
+			]);
+		}
+		
+		return [resources=list];
+	}
+	
+	// Resources/Read handler
+	handle_resources_read(req_params, rpc_id)
+	{
+		uri = req_params.geti("uri");
+		
+		if(!uri) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing resource URI.");
+			return error_resp;
+		}
+		
+		r = this.resources.find_resource(uri);
+		
+		if(!r) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_RESOURCE_NOT_FOUND, "Resource not found: " + uri);
+			return error_resp;
+		}
+		
+		// Dynamic resource
+		if(r.callback) {
+			try {
+				text = r.callback(this, uri);
+				
+				return [contents=[[uri=r.uri, mimeType=r.mimeType, text=text]]];
+			}
+			catch(e) {
+				error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INTERNAL_ERROR, "Resource callback failed.");
+				return error_resp;
+			}
+		}
+		
+		// File-backed resource
+		if(r.path) {
+			try {
+				text = fileio.read_string(r.path);
+				
+				return [contents=[[uri=r.uri, mimeType=r.mimeType, text=text]]];
+			}
+			catch(e) {
+				error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INTERNAL_ERROR, "Failed to read resource file.");
+				return error_resp;
+			}
+		}
+		
+		// Static resource
+		return [contents=[[uri=r.uri, mimeType=r.mimeType, text=r.text]]];
+	}
+	
+	// Prompts/List handler
+	handle_prompts_list(req_params)
+	{
+		list = [];
+		
+		for(i = 0; i < prompts.prompts.size(); i++) {
+			p = prompts.prompts[i];
+			
+			list.push_back([
+				name=p.name,
+				description=p.description,
+				arguments=p.arguments,
+			]);
+		}
+		
+		return [prompts=list];
+	}
+	
+	// Prompts/Get handler
+	handle_prompts_get(req_params, rpc_id)
+	{
+		prompt_name = req_params.geti("name");
+		arguments = req_params.geti("arguments");
+		
+		if(!prompt_name) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing prompt name.");
+			return error_resp;
+		}
+		
+		p = this.prompts.find_prompt(prompt_name);
+		
+		if(!p) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_PROMPT_NOT_FOUND, "Prompt not found: " + prompt_name);
+			return error_resp;
+		}
+		
+		cb = this.prompts.prompt_callbacks[prompt_name];
+		
+		try {
+			text = cb(this, arguments);
+			
+			return [description=p.description, messages=[[role="user", content=[type="text", text=text]]]];
+		}
+		catch(e) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INTERNAL_ERROR, "Prompt callback failed.");
+			return error_resp;
+		}
+	}
+	
+	
+	// ============================================================================
+	// MCP Request Handler - defined LAST
+	// Processes JSON-RPC messages and routes to appropriate handlers
+	// ============================================================================
+	mcp_handler(request_object, writer)
+	{
+		// Guard: reject empty or null body before calling std.json()
+		body_str = std.string(request_object.body);
+		if (body_str == "")
+		{
+			error_resp = create_jsonrpc_error(-1, JSONRPC_PARSE_ERROR, "Empty or invalid request body");
+			return error_resp.string(0);
+		}
+
+		req = None;
+
+		// Wrap JSON parse in try/catch to handle malformed input gracefully
+		try {
+			req = std.json(body_str);
+		} catch (e) {
+			error_resp = create_jsonrpc_error(-1, JSONRPC_PARSE_ERROR, "Failed to parse JSON: " + std.string(e).string(0));
+			return error_resp.string(0);
+		}
+
+		// Extract method and id
+		method = req.geti("method");
+		rpc_id = req.geti("id");
+
+		if (!method)
+		{
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+
+		// Extract params
+		params = req.geti("params");
+
+		// Extract clientid
+		clientid = request_object.query_params.sessionid;
+		
+		if(!clients.has(clientid)) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+
+		// Declare all variables at top
+		response = "";
+		result = None;
+		error_resp = None;
+
+		// Route to appropriate handler
+		if (method == INIT_METHOD)
+		{
+			result = handle_initialize(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(INIT_METHOD + "/result", result);
+		}
+		else if (method == TOOLS_LIST_METHOD)
+		{
+			result = handle_tools_list(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(TOOLS_LIST_METHOD + "/result", result);
+		}
+		else if (method == TOOLS_CALL_METHOD)
+		{
+			response = handle_tools_call(params, rpc_id);
+		}
+		else if (method == RESOURCES_LIST_METHOD)
+		{
+			result = handle_resources_list(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(RESOURCES_LIST_METHOD + "/result", result);
+		}
+		else if (method == RESOURCES_READ_METHOD)
+		{
+			result = handle_resources_read(params, rpc_id);
+			if (result.error)
+				response = result;
+			else if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(RESOURCES_READ_METHOD + "/result", result);
+		}
+		else if (method == PROMPTS_LIST_METHOD)
+		{
+			result = handle_prompts_list(params);
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(PROMPTS_LIST_METHOD + "/result", result);
+		}
+		else if (method == PROMPTS_GET_METHOD)
+		{
+			result = handle_prompts_get(params, rpc_id);
+			if (result.error)
+				response = result;
+			else if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(PROMPTS_GET_METHOD + "/result", result);
+		}
+		else if (method == PING_METHOD)
+		{
+			result = [status="ok"];
+			if (rpc_id)
+				response = create_jsonrpc_response(rpc_id, result);
+			else
+				response = create_notification(PING_METHOD + "/result", result);
+		}
+		else
+		{
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_METHOD_NOT_FOUND, "Method not found: " + method);
+			response = error_resp;
+		}
+
+		if(!clients.has(clientid)) {
+			error_resp = create_jsonrpc_error(rpc_id, JSONRPC_INVALID_REQUEST, "Missing method");
+			return error_resp;
+		}
+		
+		std.print(method, response);
+		
+		clients[clientid].stream_writer(response);
+		
+		return [
+			body = "",
+		];
+	}
+
+}
+
+// Example Server configuration
+/*
+server_port = 3001;
+server = mcpserver("Test", server_port);
+
+server.tools.add_tool(
+"test_tool",
+"Execute a plan",
+[
+	manifest = "&string(): Plan manifest",
+	state = "&string(): Initial state",
+	taskboard = "&string(): Taskboard manifest",
+	num = "&int(): number",
+	//working_directory = "&string(): The working directory for the downstream agent.", 
+],
+[](svr, args)
+{	
+	std.print(args);
+	
+	return "Ok worked!";
+});
+
+// Keep server running
+std.sleep(-1);
+*/

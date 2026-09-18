@@ -1,0 +1,689 @@
+
+// ============================================================================
+//  LayerFader  (Utility generator)
+//
+//  A clean ("übersichtlich") overview of a clipview's layer system.
+//
+//  Non-overlapping layout, built in distinct x/y bands (window 1000x820):
+//
+//    TOP BAR      (y 0..50)   : "Layers between" / "Layers below" counts
+//                                + final OUT control
+//    MIDDLE       (y 50..560):
+//        LEFT  (x 0..720)    : LAYER OUTPUT STRIP - one row per layer, each row
+//                               = that layer's OUTPUT, plus a CLIPS popup button
+//                               + per-layer special controls
+//        RIGHT (x 720..1000) : the embedded clipview (compact) - the real layer
+//                               engine whose layers are shown at left
+//    BOTTOM       (y 560..820):
+//        LEFT  (x 0..90)     : vertical MASTER slider + route combo (routed to
+//                               the top dimmer by default, any layer selectable)
+//        RIGHT (x 90..1000)  : fixed SETTINGS window (preview | clips | colour |
+//                               envelopes grid, each editable in a popup)
+//
+//  Layer roles (top row -> bottom row):
+//    row 0             : DIMMER layer - MultiplyInput, holds a WHITE SimpleColour
+//                         ("solid colour"). The SELECTED clip in this row drives
+//                         that solid colour's BRIGHTNESS. Quick-add white
+//                         SimpleColour clips ("+ COLOUR"), each with an editable
+//                         brightness envelope (popup).
+//    rows 1..between   : normal middle layers
+//    row 1+between     : COLOUR layer - a SimpleColour clip; its colour is set by
+//                         a colour picker that opens in a POPUP (not a clipview).
+//    rows 2+between..  : normal layers BELOW the colour layer
+//
+//  "Layers between" controls the middle layers; "Layers below" controls the
+//  layers below the colour layer - the two are adjusted separately.
+//
+//  NOTE: This file is #included by the asset's __init__.shio. The class is
+//  deliberately defined in its own file, NOT inside __init__.shio - defining
+//  it there (together with the clipview/generator class re-includes)
+//  re-registers those engine classes in the asset's std.module and corrupts
+//  the global class table, aborting with 'Global scope has no task block!'.
+// ============================================================================
+
+#include "engine/generators/generatoritem"
+#include "engine/generators/clipview"
+import nanogui;
+using eigen;
+
+class layerfader {
+
+	// ----- widgets -----
+	managed clips = None;
+	managed top_bar = None;
+	managed out_strip = None;
+	managed out_ctrl = None;
+	managed n_between = None;
+	managed n_below = None;
+	managed master_slider = None;
+	managed master_route = None;
+	managed settings_win = None;
+	managed set_area = None;
+	managed prev_view = None;
+	managed layer_tabs = None;
+	managed clips_vec = None;
+	managed color_vec = None;
+	managed env_vec = None;
+
+	// ----- state -----
+	generator = None;
+	layer_rows = [];
+	dimmer = [];
+	color_layer = [];
+	selected_layer = 0;
+	first_build = true;
+	simple_color_path = "assets/Shaders/Sources/Basic/SimpleColor.glsl";
+
+	__init__(area, gen) {
+		generator = gen;
+		gen.window.fixed_size([1000, 820]);
+		area.layout(None);
+
+		// TOP BAR (y 0..50): counts + final OUT
+		top_bar = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(50);
+		n_between = top_bar.controlint("Layers between", "lf_counts").anchor_left(0).anchor_top(0).fixed_width(120).min(0).max(16).value(2);
+		n_below   = top_bar.controlint("Layers below", "lf_counts").anchor_left(125).anchor_top(0).fixed_width(120).min(0).max(16).value(0);
+		out_ctrl  = top_bar.control("OUT", "lf_io").anchor_left(250).anchor_top(0).fixed_width(70);
+
+		// MIDDLE (y 50..560): [output strip | compact clipview]
+		mid = area.widget().anchor_left(0).anchor_right(0).anchor_top(50).anchor_bottom(260);
+		out_strip = mid.vscroll().anchor_left(0).anchor_right(280).anchor_top(0).anchor_bottom(0).content();
+		out_strip.layout(nanogui.layout_vertical());
+		cv_panel = mid.widget().anchor_left(720).anchor_right(0).anchor_top(0).anchor_bottom(0);
+		clips = clipview(cv_panel);
+
+		// BOTTOM (y 560..820): [master slider | settings window]
+		bottom = area.widget().anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(260);
+		slider_col = bottom.widget().anchor_left(0).anchor_right(90).anchor_top(0).anchor_bottom(0);
+		slider_col.layout(nanogui.layout_vertical());
+		master_route = slider_col.controlcombo("MASTER ->", "lf_master").items(["(top) Dimmer"]).anchor_left(0).anchor_right(0).fixed_height(25);
+		master_slider = slider_col.slider("MASTER").anchor_left(0).anchor_right(0).anchor_top(25).anchor_bottom(0);
+		master_slider.value(1.0);
+		master_slider.value_callback([this](v) {
+			if(!this.clips)
+				return;
+			route = this.master_route.value();
+			nc = this.clips.layer_controls.size();
+			if(route >= 0 && route < nc && this.clips.layer_controls[route].layer_item)
+				this.set_uniform(this.clips.layer_controls[route].layer_item, "MASTER", v);
+		});
+
+		this.build_settings_window(bottom.widget().anchor_left(90).anchor_right(0).anchor_top(0).anchor_bottom(0));
+
+		// Build the layers (default: dimmer + 2 middle + colour = 4 rows)
+		this.rebuild(2 + this.n_between.value() + this.n_below.value());
+
+		// Count-change callbacks
+		this.n_between.callback([this](v) { this.on_count_changed(); });
+		this.n_below.callback([this](v) { this.on_count_changed(); });
+
+		// Initial overview build
+		this.first_build = false;
+		this.build_output_rows();
+		this.refresh_settings();
+		this.link_all();
+
+		// Per-frame sync
+		gen.post_callback([this]() { this.update_frame(); });
+
+		// Register for the AI agent
+		gen.on_get_status([this]() { return this.dispatcher(this.generator, "get_target_status", None); });
+	}
+
+	// ========================================================================
+	//  Recursive control-finding (brightness / colour of a SimpleColor)
+	// ========================================================================
+
+	find_ctrl_rec(node, name) {
+		if(!node)
+			return None;
+		try {
+			ch = node.children();
+			for(i = 0; i < ch.size(); i++) {
+				c = ch[i];
+				if(!c)
+					continue;
+				try {
+					if(c.name() == name)
+						return c;
+				}
+				catch(e) {}
+				r = this.find_ctrl_rec(c, name);
+				if(r)
+					return r;
+			}
+		}
+		catch(e) {}
+		return None;
+	}
+
+	find_ctrl(gen, name) {
+		if(!gen || !gen.node)
+			return None;
+		return this.find_ctrl_rec(gen.node, name);
+	}
+
+	find_brightness(gen) {
+		return this.find_ctrl(gen, "brightness");
+	}
+
+	// First generator of a clip's stack.
+	clip_first(cell_item) {
+		if(!cell_item)
+			return None;
+		try {
+			items = cell_item.dispatch("get_items");
+			if(items && items.size())
+				return items[0];
+		}
+		catch(e) {}
+		return None;
+	}
+
+	// ========================================================================
+	//  Low-level helpers (all via the generator's dispatch - verified API)
+	// ========================================================================
+
+	set_uniform(item, name, value) {
+		if(!item)
+			return;
+		item.dispatch("set_uniform", [name = name, value = value, index = 0]);
+	}
+
+	link_all() {
+		if(!this.clips)
+			return;
+		try {
+			this.clips.link_shaders();
+		}
+		catch(e) {}
+	}
+
+	create_layer(row) {
+		if(this.clips.grid.get_header_left_item(row))
+			return None;
+		item = this.clips.add_generator("engine/assets/layerblend.glsl", row, -1, "lf_layer_" + row, false);
+		item.dispatch("no_delete", true);
+		item.dispatch("set_first_name", "LAYER" + (row + 1));
+		cell = this.clips.grid.get_header_left_item(row);
+		if(cell) {
+			cell.attr.row = row;
+			cell.attr.preview_btn.anchor_right(0.6, "percent").caption("LAYER" + (row + 1));
+		}
+		this.set_uniform(item, "MIX", 0.5);
+		return item;
+	}
+
+	// Clip cells (with generator) of a row.
+	row_clip_cells(row) {
+		res = [];
+		if(!this.clips)
+			return res;
+		for(c = 0; c < this.clips.grid.cols(); c++) {
+			cell = this.clips.grid.get_item_at(row, c);
+			if(cell && cell.attr.item) {
+				items = cell.attr.item.dispatch("get_items");
+				if(items && items.size())
+					res.push_back([ cell = cell, col = c, name = fileio.pure_name(items[0].path), gen = items[0] ]);
+			}
+		}
+		return res;
+	}
+
+	next_free_col(row) {
+		if(!this.clips)
+			return 0;
+		for(c = 0; c < this.clips.grid.cols(); c++)
+			if(!this.clips.grid.get_item_at(row, c))
+				return c;
+		return this.clips.grid.cols() - 1;
+	}
+
+	// Row of the colour layer given the current "between" count.
+	color_row() {
+		return 1 + (this.n_between ? this.n_between.value() : 0);
+	}
+
+	// ========================================================================
+	//  Layer specialisation
+	// ========================================================================
+
+	// Add a white SimpleColour "clip" at (row, col) with a brightness envelope.
+	add_white_colour(row, col, id) {
+		clip = this.clips.add_generator(this.simple_color_path, row, col, id, false);
+		simple = this.clip_first(clip);
+		this.set_uniform(simple, "color", vec4f(1,1,1,1));
+		this.set_uniform(simple, "brightness", 1.0);
+		bc = this.find_brightness(simple);
+		if(bc) {
+			pts = bc.envelope().points();
+			if(pts.size() == 0)
+				pts = [[0,0,0],[1,1,0]];
+			bc.envelope().points(pts);
+		}
+		return simple;
+	}
+
+	// Top (dimmer) layer: MultiplyInput + white SimpleColour solid (base).
+	setup_dimmer() {
+		item = this.clips.grid.get_header_left_item(0);
+		if(!item)
+			item = this.create_layer(0);
+		if(!item) {
+			this.dimmer = [];
+			return;
+		}
+		this.set_uniform(item, "BLEND", 5); // MultiplyInput
+		this.set_uniform(item, "MIX", 1.0);
+		this.set_uniform(item, "MASTER", 1.0);
+
+		col = this.next_free_col(0);
+		simple = this.add_white_colour(0, col, "lf_dimmer_solid");
+		this.dimmer = [ item = item, simple_item = simple ];
+	}
+
+	// COLOUR layer: a SimpleColour clip whose colour a picker drives; No-Blend.
+	setup_color_layer() {
+		r = this.color_row();
+		item = this.clips.grid.get_header_left_item(r);
+		if(!item)
+			item = this.create_layer(r);
+		if(!item) {
+			this.color_layer = [];
+			return;
+		}
+		this.set_uniform(item, "BLEND", 0); // No Blend
+		this.set_uniform(item, "MIX", 1.0);
+
+		col = this.next_free_col(r);
+		clip = this.clips.add_generator(this.simple_color_path, r, col, "lf_base_color", false);
+		simple = this.clip_first(clip);
+		this.set_uniform(simple, "color", vec4f(0,0,0,1));
+		this.set_uniform(simple, "brightness", 1.0);
+		this.color_layer = [ item = item, col = col ];
+	}
+
+	// Make the master slider routable to any layer.
+	rebuild_master_routes() {
+		if(!this.master_route || !this.clips)
+			return;
+		items = ["(top) Dimmer"];
+		for(i = 1; i < this.clips.grid.rows(); i++)
+			items.push_back("Layer " + (i + 1));
+		this.master_route.items(items);
+	}
+
+	// Free every cell-owning generator (layers + clip cells) - keeps the
+	// composition shader - then rebuild the grid for `count` total rows.
+	rebuild(count) {
+		if(!this.clips)
+			return;
+		count = math.max(2, count);
+
+		to_free = [];
+		for(i = 0; i < this.clips.items.size(); i++) {
+			it = this.clips.items[i];
+			if(it && it.extra_widgets && it.extra_widgets.cell)
+				to_free.push_back(it);
+		}
+		for(i = 0; i < to_free.size(); i++) {
+			try { to_free[i].on_close(); }
+			catch(e) {}
+		}
+		this.clips.layer_controls.clear();
+		this.clips.active_cells.clear();
+
+		// Reset to an empty grid, then create the fresh row set. (Mirrors
+		// clipview.load_state: set_size() only adds layer shaders for rows
+		// beyond the previous count, so a 0 reset is required.)
+		this.clips.set_size(0, this.clips.grid.cols());
+		this.clips.set_size(count, this.clips.grid.cols());
+
+		this.setup_dimmer();
+		this.setup_color_layer();
+		this.link_all();
+		this.rebuild_master_routes();
+	}
+
+	on_count_changed() {
+		if(this.first_build || !this.clips)
+			return;
+		this.rebuild(2 + this.n_between.value() + this.n_below.value());
+		this.build_output_rows();
+		this.refresh_settings();
+		this.link_all();
+	}
+
+	// ========================================================================
+	//  Core: the SELECTED clip drives the white solid colour's BRIGHTNESS
+	// ========================================================================
+
+	drive_dimmer() {
+		if(!this.dimmer || !this.dimmer.simple_item)
+			return;
+		if(!this.clips || this.clips.active_cells.size() == 0)
+			return;
+		active = this.clips.active_cells[0];
+		if(!active || !active.attr.item)
+			return;
+		gen = this.clip_first(active.attr.item);
+		if(!gen || gen == this.dimmer.simple_item)
+			return;
+		bc = this.find_brightness(gen);
+		if(bc)
+			this.set_uniform(this.dimmer.simple_item, "brightness", bc.value());
+	}
+
+	// Play (trigger + activate) the clip at (row,col) in its layer.
+	select_clip(row, col) {
+		if(!this.clips)
+			return;
+		cell = this.clips.grid.get_item_at(row, col);
+		if(!cell || !cell.attr.item)
+			return;
+		try {
+			cb = cell.attr.trigger_btn.callback();
+			cb(true);
+		}
+		catch(e) {}
+		if(row == 0)
+			this.drive_dimmer();
+		if(row == this.selected_layer)
+			this.refresh_settings();
+	}
+
+	// ========================================================================
+	//  Output strip (the clean overview - one output per layer, stacked)
+	// ========================================================================
+
+	rebuild_row_clips(row) {
+		if(row >= this.layer_rows.size())
+			return;
+		list = this.layer_rows[row][2];
+		if(!list)
+			return;
+		list.clear_children();
+		list.layout(nanogui.layout_vertical());
+		cells = this.row_clip_cells(row);
+		for(i = 0; i < cells.size(); i++) {
+			info = cells[i];
+			b = list.pushbutton(info.name).anchor_left(0).anchor_right(0).fixed_height(24);
+			r = row;
+			c = info.col;
+			b.on_click([this, r, c]() { this.select_clip(r, c); });
+		}
+		if(cells.size() == 0)
+			list.label("(drag a clip here)").anchor_left(0).anchor_right(0).fixed_height(24);
+	}
+
+	add_bright_popup(parent, idx, bright) {
+		btn = parent.button_popup("ENV " + idx).side("bottom");
+		pc = btn.popup().content().layout(nanogui.layout_vertical());
+		g = pc.graph("Brightness").anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(24);
+		g.points(bright.envelope().points());
+		sv = pc.button("Save").anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(24);
+		sv.on_click([bright, g]() { bright.envelope().points(g.points()); });
+	}
+
+	// Per-row "special" controls (dimmer quick-add / colour popup).
+	build_special(parent, i) {
+		// Dimmer (top): quick-add white SimpleColour + brightness envelope popups.
+		if(i == 0 && this.dimmer) {
+			parent.layout(nanogui.layout_vertical());
+			add_btn = parent.button("+ COLOUR").anchor_left(0).anchor_right(0).fixed_height(24);
+			add_btn.on_click([this]() {
+				col = this.next_free_col(0);
+				this.add_white_colour(0, col, "");
+				this.link_all();
+				this.rebuild_row_clips(0);
+				this.refresh_settings();
+			});
+			cells = this.row_clip_cells(0);
+			idx = 1;
+			for(j = 0; j < cells.size(); j++) {
+				b = this.find_brightness(cells[j].gen);
+				if(b)
+					this.add_bright_popup(parent, idx, b);
+				idx = idx + 1;
+			}
+			return;
+		}
+		// Colour layer: colour picker opens in a POPUP.
+		if(i == this.color_row() && this.color_layer) {
+			parent.layout(nanogui.layout_vertical());
+			btn = parent.button_popup("COLOR").side("bottom");
+			pcc = btn.popup().content().layout(nanogui.layout_vertical());
+			cs = pcc.color_selector().anchor_left(0).anchor_right(0).fixed_height(60);
+			cs.on_color_change([this, i](col) {
+				cells = this.row_clip_cells(i);
+				if(cells.size())
+					this.set_uniform(cells[0].gen, "color", vec4f(col.x, col.y, col.z, 1.0));
+			});
+			return;
+		}
+		// Normal layer: show its name.
+		if(this.clips && i < this.clips.layer_controls.size()) {
+			parent.layout(nanogui.layout_vertical());
+			parent.label(this.clips.layer_controls[i].name.value()).anchor_left(0).anchor_right(0);
+		}
+	}
+
+	build_output_rows() {
+		if(!this.out_strip)
+			return;
+		this.out_strip.clear_children();
+		this.layer_rows.clear();
+		if(!this.clips)
+			return;
+
+		for(i = 0; i < this.clips.layer_controls.size(); i++) {
+			controls = this.clips.layer_controls[i];
+			item = controls ? controls.layer_item : None;
+			out_val = item ? item.dispatch("get_default_output").value() : None;
+
+			row = this.out_strip.widget().layout(nanogui.layout_horizontal()).fixed_height(70).anchor_left(0).anchor_right(0);
+
+			// (a) The layer's OUTPUT (the clean overview content)
+			sv = row.shader_view().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(130).fixed_height(70);
+			if(out_val)
+				sv.shader(out_val);
+
+			// (b) CLIPS popup: button per clip (click => play) + drop to add
+			clips_btn = row.button_popup("CLIPS").side("right").fixed_width(95).anchor_top(0).anchor_bottom(0);
+			pc = clips_btn.popup().content().layout(nanogui.layout_vertical());
+			pc.dragdrop_enabled(true);
+			clips_list = pc.widget().anchor(0);
+			clips_list.layout(nanogui.layout_vertical());
+			pc.on_dragdrop_hover([](payload, pos) { return true; });
+			pc.on_dragdrop([this, i](payload, pos) {
+				path = payload.path ? fileio.relative_path_cwd(payload.path) : "";
+				if(path) {
+					col = this.next_free_col(i);
+					cell = this.clips.grid.get_item_at(i, col);
+					if(cell && cell.attr.item)
+						cell.attr.item.dispatch("add_generator", path);
+					else
+						this.clips.add_generator(path, i, col, "", false);
+					this.link_all();
+					this.rebuild_row_clips(i);
+					this.refresh_settings();
+				}
+				return true;
+			});
+
+			// (c) Per-layer special controls
+			special = row.widget().anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(0);
+			this.build_special(special, i);
+
+			// (d) Settings-window selector (small, far right)
+			sel_btn = row.pushbutton("S" + (i+1)).fixed_width(34).fixed_height(24).anchor_right(0).anchor_top(0);
+			sel_btn.on_click([this, i, sel_btn]() {
+				for(j = 0; j < this.layer_rows.size(); j++)
+					if(this.layer_rows[j][4])
+						this.layer_rows[j][4].pushed(false);
+				sel_btn.pushed(true);
+				this.selected_layer = i;
+				this.refresh_settings();
+			});
+
+			this.layer_rows.push_back([ out_view = sv, clips_btn = clips_btn, clips_list = clips_list, special = special, sel_btn = sel_btn ]);
+			this.rebuild_row_clips(i);
+		}
+	}
+
+	// ========================================================================
+	//  Fixed SETTINGS window (preview | clips | colour | envelopes)
+	// ========================================================================
+
+	build_settings_window(area) {
+		this.settings_win = area.window("SETTINGS").anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(0).movable_y(true).clamp_move(false);
+
+		prev_area = this.settings_win.window("PREVIEW").anchor_left(0).anchor_right(0.5, "percent").anchor_top(0).anchor_bottom(0).movable_y(true).clamp_move(false).resizable_right(true);
+		this.set_area = this.settings_win.window("CLIPS / COLOR / ENVELOPES").anchor_left(0.5, "percent").anchor_right(0).anchor_top(0).anchor_bottom(0).movable_y(true).clamp_move(false).resizable_left(true);
+
+		prev_view = prev_area.shader_view().anchor(0).anchor_top(25);
+		this.prev_view = prev_view;
+
+		this.layer_tabs = this.set_area.tabwidget().anchor_left(0).anchor_right(0).fixed_height(25);
+
+		set_content = this.set_area.widget().anchor_left(0).anchor_right(0).anchor_top(25).anchor_bottom(0).vscroll().anchor_left(0).anchor_right(0).anchor_top(25).anchor_bottom(0).content();
+		set_content.layout(nanogui.layout_vertical());
+
+		this.clips_vec = set_content.controlvector("Clips (click to play)", "lf_clips");
+		this.color_vec = set_content.controlvector("Colour", "lf_color").expanded(false);
+		this.env_vec = set_content.controlvector("Envelopes (grid)", "lf_env").expanded(false);
+	}
+
+	refresh_settings() {
+		if(!this.set_area || !this.clips)
+			return;
+		n = this.clips.layer_controls.size();
+		if(this.selected_layer >= n)
+			this.selected_layer = 0;
+
+		this.layer_tabs.remove_all_tabs();
+		for(i = 0; i < n; i++) {
+			t = this.layer_tabs.add_tab(this.clips.layer_controls[i].name.value());
+			if(i == this.selected_layer)
+				this.layer_tabs.set_active_tab(t);
+		}
+
+		// Clips of the selected layer (click => play)
+		this.clips_vec.content().clear_children();
+		cells = this.row_clip_cells(this.selected_layer);
+		for(i = 0; i < cells.size(); i++) {
+			info = cells[i];
+			b = this.clips_vec.pushbutton(info.name).anchor_left(0).anchor_right(0).fixed_height(24);
+			r = this.selected_layer;
+			c = info.col;
+			b.on_click([this, r, c]() { this.select_clip(r, c); });
+		}
+		if(cells.size() == 0)
+			this.clips_vec.label("(no clips in this layer)").anchor_left(0).anchor_right(0).fixed_height(24);
+
+		// Colour (colour layer) - recompute cells for the selected layer
+		this.color_vec.content().clear_children();
+		cells = this.row_clip_cells(this.selected_layer);
+		if(this.selected_layer == this.color_row() && this.color_layer) {
+			if(cells.size()) {
+				simple = cells[0].gen;
+				cs = this.color_vec.color_selector().anchor_left(0).anchor_right(0).fixed_height(40);
+				cs.on_color_change([this, simple](col) { this.set_uniform(simple, "color", vec4f(col.x, col.y, col.z, 1.0)); });
+			}
+			else
+				this.color_vec.label("(no colour clip)").anchor_left(0).anchor_right(0).fixed_height(24);
+		}
+		else
+			this.color_vec.label("(no colour on this layer)").anchor_left(0).anchor_right(0).fixed_height(24);
+
+		// Envelopes grid (one per SimpleColour clip's brightness, selected layer)
+		this.env_vec.content().clear_children();
+		for(j = 0; j < cells.size(); j++) {
+			bright = this.find_brightness(cells[j].gen);
+			if(!bright)
+				continue;
+			cell = this.env_vec.widget().anchor_left(0).anchor_right(0);
+			g = cell.graph("ENV").anchor_left(0).anchor_right(0).fixed_height(60);
+			g.points(bright.envelope().points());
+			btn = cell.button_popup("Edit").side("bottom").fixed_width(60);
+			pc = btn.popup().content().layout(nanogui.layout_vertical());
+			eg = pc.graph("Brightness curve").anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(40);
+			eg.points(bright.envelope().points());
+			sv = pc.button("Save").anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(24);
+			sv.on_click([bright, eg]() { bright.envelope().points(eg.points()); });
+		}
+	}
+
+	// ========================================================================
+	//  Per-frame sync (strip outputs + preview + dimmer brightness + OUT)
+	// ========================================================================
+
+	update_frame() {
+		if(!this.clips || !this.generator.is_active())
+			return;
+		try {
+			nc = this.clips.layer_controls.size();
+			for(i = 0; i < nc && i < this.layer_rows.size(); i++)
+				if(this.layer_rows[i][0] && this.clips.layer_controls[i].layer_item)
+					this.layer_rows[i][0].shader(this.clips.layer_controls[i].layer_item.dispatch("get_default_output").value());
+			if(this.prev_view && this.selected_layer < nc && this.clips.layer_controls[this.selected_layer].layer_item)
+				this.prev_view.shader(this.clips.layer_controls[this.selected_layer].layer_item.dispatch("get_default_output").value());
+			// Selected clip drives the white solid colour brightness (dimmer).
+			this.drive_dimmer();
+			// Keep the final OUT control in sync with the composition output.
+			if(this.out_ctrl && this.clips.out_ctrl)
+				this.out_ctrl.value(this.clips.out_ctrl.value());
+		}
+		catch(e) {}
+	}
+
+	// ========================================================================
+	//  Dispatcher / AI
+	// ========================================================================
+
+	dispatcher(generator, cmd, value) {
+		if(cmd == "active") {
+			if(value && !generator.active_btn.value())
+				return;
+		}
+		if(cmd == "get_target_status") {
+			rows = 0;
+			cols = 0;
+			if(this.clips) {
+				rows = this.clips.grid.rows();
+				cols = this.clips.grid.cols();
+			}
+			return [
+				rows = rows,
+				cols = cols,
+				explanation = "LayerFader is a clean overview of a clipview's layers: each strip row shows a layer's output; its CLIPS popup lists the layer's clips (click to play it in the layer, drag a file to add). The top row is a dimmer (MultiplyInput) with a white solid SimpleColour; the selected clip drives that solid colour's brightness, and its brightness envelopes are editable in popups (quick-add with + COLOUR). The colour layer has a colour picker in a popup. The bottom slider routes to any layer's MASTER (default the dimmer). 'Layers between'/'Layers below' adjust the middle / below layer counts separately.",
+			];
+		}
+		return this.clips ? this.clips.dispatch(cmd, value) : None;
+	}
+
+	// ========================================================================
+	//  State
+	// ========================================================================
+
+	save_state() {
+		state = [];
+		if(this.clips)
+			state = this.clips.save_state();
+		state.lf_between = this.n_between ? this.n_between.value() : 0;
+		state.lf_below = this.n_below ? this.n_below.value() : 0;
+		return state;
+	}
+
+	load_state(state) {
+		if(state && state.has("lf_between") && this.n_between)
+			this.n_between.value(state.lf_between);
+		if(state && state.has("lf_below") && this.n_below)
+			this.n_below.value(state.lf_below);
+		if(state && this.clips)
+			this.clips.load_state(state);
+		this.link_all();
+	}
+}
+
+
