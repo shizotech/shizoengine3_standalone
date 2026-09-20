@@ -42,6 +42,10 @@ void main()
 out_shader_src = R"(
 #version 330 core
 
+// Minimum alpha value that counts as a "solid" pixel.
+// Used to detect solid<->transparent transitions for edge-local feathering.
+#define EDGE_ALPHA_SOLID 0.1
+
 uniform sampler2D in1;
 uniform sampler2D in2;
 uniform sampler2D in3;
@@ -151,6 +155,12 @@ uniform int in16_blend_mode;
 // x, y, width, height of THIS output
 
 uniform vec4 current_rect;
+
+
+// Edge feather width in projection-space pixels
+// (0 = hard edges, old behavior)
+
+uniform float edge_feather;
 
 
 // Blend two colors.
@@ -355,6 +365,89 @@ vec4 blend_colors(
 }
 
 
+// Edge-local multi-tap feathering of the input content's own alpha edges
+// (transitions between solid and fully transparent pixels).
+// Solid interiors keep the untouched center tap (fully sharp, no detail loss);
+// only pixels whose 3x3 kernel straddles a solid<->transparent transition get
+// blurred, feathering both inward and outward over +/- radius.
+// Averaging is done in premultiplied space to avoid dark fringing.
+
+vec4 sample_input_smooth(
+	sampler2D input_texture,
+	vec2 uv,
+	vec2 radius
+)
+{
+	if(radius.x <= 0.0 && radius.y <= 0.0)
+		return texture(
+			input_texture,
+			clamp(uv, vec2(0.0), vec2(1.0))
+		);
+
+	// Center tap is preserved as the sharp fallback for solid interiors.
+	vec4 center = texture(
+		input_texture,
+		clamp(uv, vec2(0.0), vec2(1.0))
+	);
+
+	vec3 rgb_sum = vec3(0.0);
+	float a_sum = 0.0;
+	float w_sum = 0.0;
+
+	// Track the alpha extent of the kernel neighborhood to derive an edge metric.
+	float a_min = 1.0;
+	float a_max = 0.0;
+
+	for(int ty = -1; ty <= 1; ty++)
+	{
+		for(int tx = -1; tx <= 1; tx++)
+		{
+			float wx = 1.0;
+			float wy = 1.0;
+
+			if(tx == 0) wx = 2.0;
+			if(ty == 0) wy = 2.0;
+
+			float wt = wx * wy;
+
+			vec2 tap_uv = clamp(
+				uv + vec2(
+					float(tx) * radius.x,
+					float(ty) * radius.y
+				),
+				vec2(0.0),
+				vec2(1.0)
+			);
+
+			vec4 s = texture(input_texture, tap_uv);
+
+			rgb_sum += s.rgb * s.a * wt;
+			a_sum   += s.a * wt;
+			w_sum   += wt;
+
+			a_min = min(a_min, s.a);
+			a_max = max(a_max, s.a);
+		}
+	}
+
+	float blurred_a = a_sum / w_sum;
+
+	vec3 blurred_rgb = vec3(0.0);
+
+	if(a_sum > 0.00001)
+		blurred_rgb = rgb_sum / a_sum;
+
+	vec4 blurred = vec4(blurred_rgb, blurred_a);
+
+	// Fully solid interiors and fully transparent regions have a small alpha
+	// span (edge = 0) and stay untouched; only the transition band is blurred.
+	float span = a_max - a_min;
+	float edge = smoothstep(EDGE_ALPHA_SOLID, 1.0, span);
+
+	return mix(center, blurred, edge);
+}
+
+
 // Process one projection mapping input.
 
 vec4 apply_input(
@@ -364,17 +457,24 @@ vec4 apply_input(
 	float brightness,
 	float opacity,
 	int blend_mode,
-	vec2 world_pos
+	vec2 world_pos,
+	float feather
 )
 {
-	// Check whether this output pixel is inside
-	// the projection rectangle.
+	// Ignore inactive / degenerate input rects.
+
+	if(input_rect.z <= 0.0 || input_rect.w <= 0.0)
+		return base;
+
+	float f = max(feather, 0.0);
+
+	// Extended bounds so feathered edge pixels are still processed.
 
 	if(
-		world_pos.x >= input_rect.x &&
-		world_pos.x <= input_rect.x + input_rect.z &&
-		world_pos.y >= input_rect.y &&
-		world_pos.y <= input_rect.y + input_rect.w
+		world_pos.x >= input_rect.x - f &&
+		world_pos.x <= input_rect.x + input_rect.z + f &&
+		world_pos.y >= input_rect.y - f &&
+		world_pos.y <= input_rect.y + input_rect.w + f
 	)
 	{
 		// Convert world position into texture UV.
@@ -383,36 +483,56 @@ vec4 apply_input(
 			(world_pos - input_rect.xy) /
 			input_rect.zw;
 
-
 		// Keep the original Y orientation.
 
 		uv.y = 1.0 - uv.y;
 
+		// Soft coverage mask for the projection rectangle border.
 
-		// Sample texture.
+		float rect_cov = 1.0;
 
-		vec4 color =
-			texture(
-				input_texture,
-				uv
+		if(f > 0.0)
+		{
+			rect_cov =
+				smoothstep(-f, 0.0, world_pos.x - input_rect.x) *
+				smoothstep(-f, 0.0, (input_rect.x + input_rect.z) - world_pos.x) *
+				smoothstep(-f, 0.0, world_pos.y - input_rect.y) *
+				smoothstep(-f, 0.0, (input_rect.y + input_rect.w) - world_pos.y);
+		}
+
+		if(rect_cov > 0.0)
+		{
+			// Feather radius converted from projection pixels into UV units.
+
+			vec2 radius = vec2(0.0);
+
+			if(f > 0.0)
+				radius = f / input_rect.zw;
+
+			// Sample texture (multi-tap to soften internal content edges).
+
+			vec4 color =
+				sample_input_smooth(
+					input_texture,
+					uv,
+					radius
+				);
+
+			// Apply brightness only to RGB.
+
+			color.rgb *= brightness;
+
+			// Blend with the accumulated output,
+			// opacity modulated by the rect feather coverage.
+
+			base = blend_colors(
+				base,
+				color,
+				opacity * rect_cov,
+				blend_mode
 			);
-
-
-		// Apply brightness only to RGB.
-
-		color.rgb *= brightness;
-
-
-		// Blend with the accumulated output.
-
-		base = blend_colors(
-			base,
-			color,
-			opacity,
-			blend_mode
-		);
+		}
 	}
-
 
 	return base;
 }
@@ -444,7 +564,8 @@ void main()
 		in1_brightness,
 		in1_opacity,
 		in1_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -457,7 +578,8 @@ void main()
 		in2_brightness,
 		in2_opacity,
 		in2_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -470,7 +592,8 @@ void main()
 		in3_brightness,
 		in3_opacity,
 		in3_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -483,7 +606,8 @@ void main()
 		in4_brightness,
 		in4_opacity,
 		in4_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -496,7 +620,8 @@ void main()
 		in5_brightness,
 		in5_opacity,
 		in5_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -509,7 +634,8 @@ void main()
 		in6_brightness,
 		in6_opacity,
 		in6_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -522,7 +648,8 @@ void main()
 		in7_brightness,
 		in7_opacity,
 		in7_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -535,7 +662,8 @@ void main()
 		in8_brightness,
 		in8_opacity,
 		in8_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -548,7 +676,8 @@ void main()
 		in9_brightness,
 		in9_opacity,
 		in9_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -561,7 +690,8 @@ void main()
 		in10_brightness,
 		in10_opacity,
 		in10_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -574,7 +704,8 @@ void main()
 		in11_brightness,
 		in11_opacity,
 		in11_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -587,7 +718,8 @@ void main()
 		in12_brightness,
 		in12_opacity,
 		in12_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -600,7 +732,8 @@ void main()
 		in13_brightness,
 		in13_opacity,
 		in13_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -613,7 +746,8 @@ void main()
 		in14_brightness,
 		in14_opacity,
 		in14_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -626,7 +760,8 @@ void main()
 		in15_brightness,
 		in15_opacity,
 		in15_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -639,7 +774,8 @@ void main()
 		in16_brightness,
 		in16_opacity,
 		in16_blend_mode,
-		world_pos
+		world_pos,
+		edge_feather
 	);
 
 
@@ -1114,7 +1250,7 @@ add_input(input_name = "", input_guid = "") {
 
 	input_width = slice_area.controlint("Width", input_guid).value(engine.project_width.value());
 	input_height = slice_area.controlint("Height", input_guid).value(engine.project_height.value());
-
+	
 	add_slice_btn = slice_area.button("Add Slice").fixed_height(30);
 	add_eco_slice_btn = slice_area.button("Add Eco Slice").fixed_height(30);
 
@@ -1235,6 +1371,8 @@ add_output(output_name, output_guid = "") {
 	slice_area = new_area.widget().layout(nanogui.layout_vertical()).visible(false);
 	output_width = slice_area.controlint("Width", output_guid).value(engine.project_width.value());
 	output_height = slice_area.controlint("Height", output_guid).value(engine.project_height.value());
+	
+	edge_smooth = slice_area.controlslider("Edge Smooth", output_guid).max(4);
 
 	videorouter_vec = slice_area.controlvector("VideoRouter", output_guid).expanded(false);
 	videorouter_enable = videorouter_vec.controlbutton("Enable Router").push(1);	
@@ -1246,6 +1384,10 @@ add_output(output_name, output_guid = "") {
 		.render_size(vec2i(engine.project_width.value(),engine.project_height.value()));
 	shader_slice.fragment_source(out_shader_src);
 	shader_slice.drawing_enabled(false);
+	
+	edge_smooth.callback([shader_slice](v){
+		shader_slice.uniform("edge_feather", v);
+	});
 	
 	output_ctrl = control_outputs_area.control("OUT", output_guid).fixed_width(40);
 	
