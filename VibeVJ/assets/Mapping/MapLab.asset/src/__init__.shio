@@ -16,6 +16,8 @@ managed outputs = [];
 selected_slice = None;
 selected_output = None;
 
+active_input_mask = None;
+
 add_input_btn = None;
 input_area = None;
 control_inputs_area = None; //Where the midiiocontrols to link to live
@@ -27,7 +29,8 @@ output_area = None;
 enable_grid_btn = None;
 grid_size_ctrl = None;
 
-//TODO: Add EfficientSlice (without projection mapping support) which is just a shaderview and doesnt render the input again !
+link_shaders_lazy = false;
+
 //TODO: Slices from the same input dont need to occupy multiple input slots like it is right now ? Or is this the easiest direct solution ? Maybe for alot of instancing use a different Mapper asset alltogether?
 
 //SHADER SRC
@@ -794,6 +797,28 @@ rect_overlap(pos1, size1, pos2, size2) {
 }
 
 link_shaders() {
+	// ------------------------------------------------------------
+	// First pass:
+	// Reset the required render size for every slice.
+	//
+	// This is the resolution the slice actually needs to render at
+	// based on the outputs it is currently visible on.
+	// ------------------------------------------------------------
+	for(i = 0; i < inputs.size(); i++) {
+		for(j = 0; j < inputs[i].slices.size(); j++) {
+			slice = inputs[i].slices[j];
+
+			if(!slice.is_eco)
+				slice.required_render_size = vec2i(1, 1);
+		}
+	}
+
+
+	// ------------------------------------------------------------
+	// Second pass:
+	// Link all slices to their overlapping outputs and determine
+	// the maximum render resolution required for every slice.
+	// ------------------------------------------------------------
 	for(i = 0; i < outputs.size(); i++) {
 		out = outputs[i];
 
@@ -832,9 +857,80 @@ link_shaders() {
 					out.shader.position(),
 					out.shader.fixed_size()
 				)) {
-					
+
+					// ------------------------------------------------
+					// Calculate how many physical output pixels the
+					// slice occupies.
+					//
+					// The slice coordinates are in project/output
+					// space, while the output shader may render at a
+					// different physical resolution.
+					//
+					// Example:
+					//   output fixed size = 1920x1080
+					//   output render size = 3840x2160
+					//
+					// A 960x540 slice therefore needs 1920x1080
+					// pixels when rendered for this output.
+					// ------------------------------------------------
+					if(!slice.is_eco) {
+						output_fixed_size = out.shader.fixed_size();
+						output_render_size = out.shader.render_size();
+
+						scale_x = output_render_size.x / output_fixed_size.x;
+						scale_y = output_render_size.y / output_fixed_size.y;
+
+						slice_size = slice.shader.fixed_size();
+
+						required_width = math.ceil(
+							slice_size.x * scale_x
+						);
+
+						required_height = math.ceil(
+							slice_size.y * scale_y
+						);
+
+						// ------------------------------------------------
+						// Never request more pixels than the slice's
+						// original/native render resolution.
+						//
+						// This is particularly important when an output
+						// is rendered at a higher resolution than the
+						// source input.
+						// ------------------------------------------------
+						current_render_size = in.input_mask.output_size();
+
+						required_width = math.min(
+							required_width,
+							current_render_size.x
+						);
+
+						required_height = math.min(
+							required_height,
+							current_render_size.y
+						);
+
+						// ------------------------------------------------
+						// Keep the maximum requirement across all outputs
+						// this slice overlaps.
+						// ------------------------------------------------
+						slice.required_render_size = vec2i(
+							math.max(
+								slice.required_render_size.x,
+								required_width
+							),
+							math.max(
+								slice.required_render_size.y,
+								required_height
+							)
+						);
+					}
+
+
+					shader_slice = slice.shader;
+
 					out.inputs.push_back([
-						shader = slice.shader,
+						shader = shader_slice,
 						rect = vec4f(
 							slice.shader.x(),
 							slice.shader.y(),
@@ -860,6 +956,31 @@ link_shaders() {
 			)
 		);
 	}
+
+
+	// ------------------------------------------------------------
+	// Third pass:
+	// Apply the calculated render resolutions.
+	//
+	// Doing this after processing ALL outputs is important because
+	// the same slice can be used by multiple outputs.
+	// ------------------------------------------------------------
+	for(i = 0; i < inputs.size(); i++) {
+		for(j = 0; j < inputs[i].slices.size(); j++) {
+			slice = inputs[i].slices[j];
+			if(!slice.is_eco) {
+				//std.print("Set Rendersize: ", slice.required_render_size);
+				//Technically, we could also set the input_mask (if available)
+				//To that resolution since its kinda useless to render at full input
+				//resolution ?
+				//But in input mask we have to keep aspect ratio from the input which makes this more
+				//complicated
+				slice.shader.render_size(
+					slice.required_render_size
+				);
+			}
+		}
+	}
 }
 
 add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
@@ -880,16 +1001,16 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 	
 	ctrl_area = slice_area.widget().layout(nanogui.layout_vertical()).visible(false);
 	
-	input_mask_btn = ctrl_area.pushbutton("INPUT MASKING").fixed_height(25);
-	
 	opacity_ctrl = ctrl_area.controlslider("Opacity", slice_guid).value(1.0).fixed_height(25);
 	bright_ctrl = ctrl_area.controlslider("Brightness", slice_guid).value(1.0).fixed_height(25);
 	blendmode_ctrl = ctrl_area.controlcombo("Blendmode", slice_guid).items(["Add", "Multiply", "Normal", "Screen", "Lighten", "Darken", "Overlay", "Difference", "Subtract"]).fixed_height(25);
-		
+	
+	input_mask_btn = ctrl_area.pushbutton("Slice Input Mask").fixed_height(25);
+	
 	if(!is_eco) {
 		shader_slice = projection_area.shader().fixed_size(vec2f(current_input.width_ctrl.value(),current_input.height_ctrl.value())).render_size(vec2i(current_input.width_ctrl.value(),current_input.height_ctrl.value()));
 		shader_slice.fragment_source(shader_src);
-		shader_slice.input("input", current_input.input_ctrl.value());
+		shader_slice.input("input", current_input.input_mask);
 		shader_slice.drawing_enabled(false);
 		
 		projection_enable_btn = ctrl_area.pushbutton("Edit Grid").fixed_height(25);
@@ -971,8 +1092,10 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 	}
 	else {
 		shader_slice = projection_area.shader_view().fixed_size(vec2f(current_input.width_ctrl.value(),current_input.height_ctrl.value()));
-		shader_slice.shader(current_input.input_ctrl.value());
+		shader_slice.shader(current_input.input_mask);
 		shader_slice.drawing_enabled(false);
+		
+		input_mask_btn.visible(false); //Idk why this doesnt work, debug later there is something wrong with how shaderview is handled ?
 	}
 	
 	shader_slice.keep_aspect_ratio(false);
@@ -1003,19 +1126,23 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 	delete_btn.on_click([current_input, current_slice](){
 		std.free(current_slice.area);
 		std.free(current_slice.shader);
+		std.free(current_slice.input_mask);
 		current_input.slices.erase(current_slice);
 		link_shaders();
 	});
 	
-	input_mask_btn.on_change([input_mask_btn, current_slice, current_input, shader_slice, is_eco](v){
-		input_mask_btn.pushed(v);
+	input_mask_btn.on_change([input_mask_btn, current_slice, current_input, shader_slice](v){
 		if(v)
+			if(active_input_mask)
+				old_cb = active_input_mask.on_change();
+				old_cb(false);
+			active_input_mask = input_mask_btn;
 			if(!current_slice.input_mask)
 				current_slice.input_mask = main_area.warp_mapper().anchor_top(35).anchor_bottom(25).anchor_left(side_width).anchor_right(0.5, "percent");
 				current_slice.input_mask.rendering_enabled(true);
 				
-			current_slice.input_mask.input(current_input.input_ctrl.value());
-			if(is_eco)
+			current_slice.input_mask.input(current_input.input_mask);
+			if(current_slice.is_eco)
 				shader_slice.shader(current_slice.input_mask);
 			else
 				shader_slice.input("input", current_slice.input_mask);
@@ -1025,18 +1152,50 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 			if(current_slice.input_mask)
 				current_slice.input_mask.visible(false);
 			projection_area.parent().anchor_left(side_width);
+			active_input_mask = None;
+		input_mask_btn.pushed(v);
 		projection_area.parent().refresh_layout();
 	});
 	
 	shader_slice.on_mouse_button([shader_slice, current_input, current_slice, projection_enable_btn](pos, btn, down, mod) {
 
+		if(btn != 0)
+			return false;
+		
+		if(!down && !shader_slice.focused())
+			return false;
+		
+		if(down && mod == 2) {
+			add_slice(current_input, "", "", current_slice.is_eco);
+			
+			new_slice = current_input.slices[-1];
+			
+			new_slice.shader.x(shader_slice.x());
+			new_slice.shader.y(shader_slice.y());
+			new_slice.shader.fixed_width(shader_slice.fixed_width());
+			new_slice.shader.fixed_height(shader_slice.fixed_height());
+			new_slice.shader.size(new_slice.shader.fixed_size());
+			
+			if(!current_slice.is_eco)
+				new_slice.shader.projection_load(shader_slice.projection_save());
+			
+			if(current_slice.input_mask)
+				cb = new_slice.input_mask_btn.on_change(); //Causes input mask to be allocated...
+				cb(true);
+				cb(false);
+				new_slice.input_mask.deserialize(current_slice.input_mask.serialize());
+			
+			cb = new_slice.shader.on_mouse_button();
+			return cb(pos, btn, down, 0);
+		}
+		
 		current_input.drag_corner = 0;
 
 		//Disabled when working on an output
-		if(selected_output || btn != 0)
+		if(selected_output.btn || btn != 0)
 			return shader_slice.parent().parent().mouse_button_default(pos, btn, down, mod); //scrollarea content widget -> scrollarea
 			
-		if(selected_slice && selected_slice.shader == shader_slice && projection_enable_btn && projection_enable_btn.pushed()) {	
+		if(selected_slice.btn && selected_slice.shader == shader_slice && projection_enable_btn && projection_enable_btn.pushed()) {	
 			shader_slice.mouse_button_default(pos, btn, down, mod);
 			return true;
 		}
@@ -1055,7 +1214,7 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 
 			local_pos = pos;
 
-			border = 25;
+			border = 35;
 
 			left   = local_pos.x < border;
 			right  = local_pos.x > size.x - border;
@@ -1064,6 +1223,9 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 
 			// Current aspect ratio
 			aspect = size.x / size.y;
+
+			// Store the aspect ratio for the resize operation
+			current_input.drag_aspect = aspect;
 
 			if(left && top) {
 				// Top-left: bottom-right remains fixed
@@ -1105,13 +1267,13 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 			}
 		}
 
-		return selected_slice && selected_slice.shader == shader_slice;
+		return selected_slice.btn && selected_slice.shader == shader_slice;
 	});
 	
 	shader_slice.on_mouse_drag([shader_slice, current_input, current_slice](pos, rel, btn, mod) {
 		
 		//Disabled when working on an output
-		if(selected_output || btn != 1) //Confusing, mouse_button is the button index (0 for LMB), drag works with "mousestate" flag (1 for LMB in this case)
+		if(selected_output.btn || btn != 1) //Confusing, mouse_button is the button index (0 for LMB), drag works with "mousestate" flag (1 for LMB in this case)
 			return shader_slice.parent().parent().mouse_drag_default(pos, rel, btn, mod); //scrollarea content widget -> scrollarea
 	
 		if(!current_slice.is_eco && shader_slice.projection_enabled())
@@ -1124,23 +1286,93 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 		// Mouse position relative to the slice
 		local_pos = pos - position;
 
-		if(current_input.drag_corner == 1)
+		if(current_input.drag_corner == 1) {
+			if(mod == 1) {
+				// Shift: preserve aspect ratio
+				new_height = fixed_size.y - rel.y;
+				new_width = new_height * current_input.drag_aspect;
+
+				shader_slice.position(
+					position + vec2f(
+						fixed_size.x - new_width,
+						rel.y
+					)
+				);
+
+				shader_slice.fixed_size(
+					vec2f(new_width, new_height)
+				);
+			}
+			else {
+				shader_slice.position(shader_slice.position() + rel); 
+				shader_slice.fixed_size(shader_slice.fixed_size() - rel);
+			}
+		}
+		else if(current_input.drag_corner == 2) {
+			if(mod == 1) {
+				// Shift: preserve aspect ratio
+				new_height = fixed_size.y - rel.y;
+				new_width = new_height * current_input.drag_aspect;
+
+				shader_slice.position(
+					position + vec2f(
+						0,
+						rel.y
+					)
+				);
+
+				shader_slice.fixed_size(
+					vec2f(new_width, new_height)
+				);
+			}
+			else {
+				rel_y = vec2f(0, rel.y);
+				rel_x = vec2f(rel.x, -rel.y);
+				shader_slice.position(shader_slice.position() + rel_y); 
+				shader_slice.fixed_size(shader_slice.fixed_size() + rel_x);
+			}
+		}
+		else if(current_input.drag_corner == 3) {
+			if(mod == 1) {
+				// Shift: preserve aspect ratio
+				new_width = fixed_size.x + rel.x;
+				new_height = new_width / current_input.drag_aspect;
+
+				shader_slice.position(
+					position + vec2f(
+						rel.x,
+						0
+					)
+				);
+
+				shader_slice.fixed_size(
+					vec2f(new_width, new_height)
+				);
+			}
+			else {
+				rel_y = vec2f(rel.x, 0);
+				rel_x = vec2f(-rel.x, rel.y);
+				shader_slice.position(shader_slice.position() + rel_y); 
+				shader_slice.fixed_size(shader_slice.fixed_size() + rel_x); 
+			}
+		}
+		else if(current_input.drag_corner == 4) {
+			if(mod == 1) {
+				// Shift: preserve aspect ratio
+				new_width = fixed_size.x + rel.x;
+				new_height = new_width / current_input.drag_aspect;
+
+				shader_slice.fixed_size(
+					vec2f(new_width, new_height)
+				);
+			}
+			else {
+				shader_slice.fixed_size(shader_slice.fixed_size() + rel);
+			}
+		}
+		else {
 			shader_slice.position(shader_slice.position() + rel); 
-			shader_slice.fixed_size(shader_slice.fixed_size() - rel); //Add other corners... 
-		else(current_input.drag_corner == 2) 
-			rel_y = vec2f(0, rel.y);
-			rel_x = vec2f(rel.x, -rel.y);
-			shader_slice.position(shader_slice.position() + rel_y); 
-			shader_slice.fixed_size(shader_slice.fixed_size() + rel_x); //Add other corners... 
-		else(current_input.drag_corner == 3) 
-			rel_y = vec2f(rel.x, 0);
-			rel_x = vec2f(-rel.x, rel.y);
-			shader_slice.position(shader_slice.position() + rel_y); 
-			shader_slice.fixed_size(shader_slice.fixed_size() + rel_x); //Add other corners... 
-		else(current_input.drag_corner == 4) 
-			shader_slice.fixed_size(shader_slice.fixed_size() + rel); //Add other corners... 
-		else
-			shader_slice.position(shader_slice.position() + rel); 
+		}
 	
 		shader_slice.size(shader_slice.fixed_size());
 	
@@ -1157,7 +1389,7 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 		header_height = 28;
 		radius = 5;
 
-		selected = selected_slice && selected_slice.shader == shader_slice;
+		selected = selected_slice.btn && selected_slice.shader == shader_slice;
 
 		// Full slice border
 		ctx.nvgBeginPath();
@@ -1222,12 +1454,12 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 		
 		select_slice_btn.caption(v ? "v" : ">");
 		
-		if(selected_output && v)
+		if(selected_output.btn && v)
 			selected_output.btn.pushed(false);
 			selected_output.slice_area.visible(false);
 			selected_output = None;
 		
-		if(selected_slice && (selected_slice.btn == current_slice.btn || v))
+		if(selected_slice.btn && (selected_slice.btn == current_slice.btn || v))
 			selected_slice.btn.pushed(false);
 			selected_slice.ctrl_area.visible(false);
 			selected_slice = None;
@@ -1255,6 +1487,9 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 	
 	input_area.refresh_layout();
 	
+	//Do both because this is kinda buggy
+	if(!is_eco) //Find out why eco slices are blackscreen on first add..
+		link_shaders_lazy = true;
 	link_shaders();
 	
 	return current_input.slices[-1];
@@ -1276,15 +1511,20 @@ add_input(input_name = "", input_guid = "") {
 
 	engine = std.global("engine");
 
-	select_video_router = slice_area.combobox().items(["Select Input"]).fixed_height(25);
-
 	input_width = slice_area.controlint("Width", input_guid).value(engine.project_width.value()).fixed_height(25);
 	input_height = slice_area.controlint("Height", input_guid).value(engine.project_height.value()).fixed_height(25);
+
+	select_video_router = slice_area.combobox().items(["Select Input"]).fixed_height(25);
+
+	input_mask_btn = slice_area.pushbutton("Input Mask").fixed_height(25);
 	
 	add_slice_btn = slice_area.button("Add Slice").fixed_height(25);
 	add_eco_slice_btn = slice_area.button("Add Eco Slice").fixed_height(25);
 
 	input_ctrl = control_inputs_area.control("IN", input_guid).fixed_width(40);
+
+	input_mask = main_area.warp_mapper().anchor_top(35).anchor_bottom(25).anchor_left(side_width).anchor_right(0.5, "percent");
+	input_mask.rendering_enabled(true).visible(false);
 
 	select_video_router.on_open([select_video_router](){
 		routers = get_video_routers();
@@ -1321,6 +1561,8 @@ add_input(input_name = "", input_guid = "") {
 		height_ctrl = input_height,
 		
 		select_video_router = select_video_router,
+		
+		input_mask = input_mask,
 	]);
 	
 	current_input = inputs[-1];
@@ -1338,20 +1580,31 @@ add_input(input_name = "", input_guid = "") {
 		
 		std.free(current_input.area);
 		std.free(current_input.input_ctrl);
+		std.free(current_input.input_mask);
+		
 		inputs.erase(current_input);
 		
 		link_shaders();
 	});
 	
-	input_ctrl.callback([current_input](v){
-		for(i = 0; i < current_input.slices.size(); i++) {
-			if(current_input.slices[i].input_mask)
-				current_input.slices[i].input_mask.input(v);
-			else if(!current_input.slices[i].is_eco)
-				current_input.slices[i].shader.input("input", v);
-			else
-				current_input.slices[i].shader.shader(v);
-		}
+	input_mask_btn.on_change([input_mask_btn, input_mask](v){
+		if(v)
+			if(active_input_mask)
+				old_cb = active_input_mask.on_change();
+				old_cb(false);
+			active_input_mask = input_mask_btn;
+			input_mask.visible(true);
+			projection_area.parent().anchor_left(0.5, "percent");
+		else
+			input_mask.visible(false);
+			projection_area.parent().anchor_left(side_width);
+			active_input_mask = None;
+		input_mask_btn.pushed(v);
+		projection_area.parent().refresh_layout();
+	});
+	
+	input_ctrl.callback([input_mask](v){
+		input_mask.input(v);
 	});
 	
 	input_width.callback([current_input](v){
@@ -1661,7 +1914,7 @@ add_output(output_name, output_guid = "") {
 		header_height = 28;
 		radius = 5;
 
-		selected = selected_output && selected_output.shader == shader_slice;
+		selected = selected_output.shader == shader_slice;
 
 		// ------------------------------------------------------------
 		// Output grid
@@ -1832,13 +2085,13 @@ add_output(output_name, output_guid = "") {
 	});
 
 	btn.on_change([current_output, shader_slice](v){		
-		if(selected_slice && v)
+		if(selected_slice.btn && v)
 			selected_slice.btn.pushed(false);
 			selected_slice.shader.projection_enabled(false);
 			selected_slice.ctrl_area.visible(false);
 			selected_slice = None;
 		
-		if(selected_output)
+		if(selected_output.btn)
 			selected_output.btn.pushed(false);
 			selected_output.slice_area.visible(false);
 			selected_output = None;
@@ -1872,6 +2125,7 @@ dispatcher(generator, cmd, value) {
 			outputs[i].shader.rendering_enabled(value);
 		}
 		for(i = 0; i < inputs.size(); i++) {
+			inputs[i].input_mask.rendering_enabled(value);
 			for(j = 0; j < inputs[i].slices.size(); j++) {
 				if(!inputs[i].slices[j].is_eco)
 					inputs[i].slices[j].shader.rendering_enabled(value);
@@ -1925,6 +2179,16 @@ entry(generator, area) {
 	});
 }
 
+update_post(generator) {
+	if(link_shaders_lazy) {
+		try {
+			link_shaders();
+		}
+		catch(e) {}
+		link_shaders_lazy = false;
+	}
+}
+
 save_state() {
 	saved_inputs = [];
 	saved_outputs = [];
@@ -1958,6 +2222,7 @@ save_state() {
 			input_guid = inputs[i].input_guid,
 			selected_router = inputs[i].select_video_router.selected_text(),
 			slices = slices,
+			input_mask_state = inputs[i].input_mask.serialize(),
 		]);
 	}
 	
@@ -1992,6 +2257,10 @@ load_state(state) {
 		add_input(state.inputs[i].input_name, state.inputs[i].input_guid);
 		
 		inputs[-1].select_video_router.items([state.inputs[i].selected_router]);
+		
+		if(state.inputs[i].input_mask_state ?? false) {
+			inputs[-1].input_mask.deserialize(state.inputs[i].input_mask_state);
+		}
 		
 		for(j = 0; j < state.inputs[i].slices.size(); j++) {
 			state_slice = state.inputs[i].slices[j];

@@ -145,6 +145,33 @@ The menu/UI code lives in `src/menu/`. See `src/README.md` for details.
 
 ---
 
+## UI Controls (shizoscript nanogui)
+
+The shizoscript nanogui API provides basic primitive UI controls like buttons etc,
+But there is also a **special** class of controls, the 'widget.control*' controls.
+E.g. widget.controlbutton, widget.controlslider, widget.control etc.
+These controls are part of the global link system and can be freely routed into each other by the user.
+They also need to obey special rules, which do not apply to primitive UI controls:
+
+*** widget.control* special UI control rules ***
+
+- Each control is has a **name** and a **group**
+- The control's **full name** is its name+group combined
+- Each control's **full name** must be ***unique*** across a single modmatrix node (but can be the same in other nodes)
+- This ensure each control gets a unique **path** based on its modmatrixnode container and can be addressed by that
+
+- You do **not need** to serialize these controls, as they are saved and restored by the global modmatrix system.
+- You **do have to** make sure that when restoring dynamic controls from a saved state, that they get the exact same **full name** as they had when they were saved
+- You can use the groupname parameter to give them **unique ids** to avoid double entries
+
+Note this is only relevant when writing or editing shizoscript nanogui code/assets.
+
+When creating assets, prefer the use of widget.control* advanced controls over primitive UI controls whenever possible.
+Primitive UI controls are mainly used for static options and controls where it would make no sense to make them mappable/linkable.
+
+A modmatrixnode is an UI Widget with a unique ID that can contain multiple widget.control* elements.
+The elements of a modmatrixnode do NOT need to be direct children of the modmatrixnode, and can be part of sub-widgets within the modmatrixnode (they will recursively look upwards to find their modmatrixnode parent when created)
+
 ## Quick Links
 
 ### Navigation
