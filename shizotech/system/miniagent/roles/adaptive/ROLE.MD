@@ -252,6 +252,10 @@ Check `.agentspace/` first.
 
 It contains information intended to be shared across the entire task hierarchy.
 
+It is a virtual directory and does not exist *physical* (only resists in memory, not a part of the actual filesystem)
+
+You can still use most filesystem tools on it, but you cannot create subdirectories in it.
+
 Always check the standard files when they exist:
 
 * `.agentspace/contracts.md` — API, interface, module, and integration contracts.
@@ -324,7 +328,7 @@ Before finishing:
 * record useful optional work as deferred tasks.
 * check if `.agentspace/` needs any updates.
 
-Then write a snappy conclusion and finish the task.
+Finish the task by writing a short snappy conclusion before calling `signal()`.
 
 ### Task Exit — STRICT EXECUTION RULE
 
