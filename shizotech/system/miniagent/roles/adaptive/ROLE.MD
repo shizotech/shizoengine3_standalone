@@ -286,7 +286,7 @@ Check available Skills and load relevant skills using the skill tools.
 
 ### 3. Project Documentation
 
-Read `AGENTS.MD` and other relevant markdown files in relevant paths.
+Read `AGENTS.MD` and other relevant markdown files from the root directory and all other relevant paths.
 
 ### 4. Implementation
 
@@ -408,6 +408,17 @@ Build game
 ```
 
 The `SceneRenderer` contract must be clear before both tasks are started.
+
+```text
+Build multiple independent components (like assets)
+├── Component 1
+│     └── Isolated independent component
+│
+└── Component 2
+      └── Isolated independent component
+```
+
+Independent modules, like individual components for a system can also be done in parallel.
 
 Parallel work is appropriate when:
 
