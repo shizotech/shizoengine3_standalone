@@ -202,28 +202,50 @@ If you discover useful work that is not required for your task:
 Do not let optional work block the current task. 
 
 
-## Signals 
- 
-Tasks communicate with their parent through `signal()`. 
- 
-**STRICT REQUIREMENT: Every task run MUST end by calling `signal()`.** 
- 
-Never exit a task run without emitting a signal, regardless of whether the task: 
- 
-* completed successfully; 
-* failed; 
-* cannot continue without information from the parent; 
-* encountered an important situation that requires the parent's attention. 
- 
-Use the appropriate signal: 
- 
-* `FINISHED` — the task completed its contract successfully. 
-* `FAILED` — the task cannot complete its contract. 
-* `QUESTION` — the task requires an answer or decision from the parent before it can continue. 
-* `UPDATE` — an important event or situation requires the parent's attention before continuing. 
- 
-The signal's `report` must clearly explain the result, relevant verification, remaining work, or information required by the parent. 
- 
+## Signals
+
+`signal()` is a TASK EXIT mechanism.
+
+**Only call `signal()` when you can no longer continue working in the current run.**
+
+Do NOT call `signal()` merely because:
+* you started working;
+* you made progress;
+* you completed a small step;
+* you discovered something interesting;
+* you want to report an ordinary update;
+* you want to record a milestone.
+
+Use `milestone()` for progress and recovery checkpoints.
+
+When you call `signal()`, your current task run stops immediately.
+
+Use exactly one of:
+
+* `FINISHED` — the entire task contract is complete and verified.
+* `FAILED` — the task cannot be completed.
+* `QUESTION` — the task cannot continue until the parent provides information or makes a decision.
+
+### Signal discipline
+
+**Do not call `signal()` while you can still make useful progress.**
+
+Before calling `signal()` ask:
+
+> Can I continue working on this task right now without something from the parent?
+
+If yes, **do not call `signal()`**. Continue working.
+
+If no, call the appropriate signal:
+
+* Work is complete → `FINISHED`
+* Work cannot be completed → `FAILED`
+* Parent input or decision is required → `QUESTION`
+
+There is no signal for ordinary progress or status updates.
+
+After calling `signal()`, stop working and wait for further instructions.
+
 ### Signal rules 
  
 **Always call `signal()` before exiting the run.** 
@@ -234,15 +256,7 @@ If the task cannot complete its contract, it must explicitly report this with a 
  
 If the task needs information or a decision from the parent, it must use `QUESTION`. 
  
-If an important event requires the parent's attention before the task can continue, it must use `UPDATE`. 
- 
 Do not silently stop, return from the task, or assume that the parent will infer the task's state from the repository. 
- 
-Do not use `milestone()` as a replacement for `signal()`. 
- 
-`milestone()` records progress while the task continues running. 
- 
-`signal()` reports an event to the parent and stops the current task run. 
  
 ### Receiving signals 
  
@@ -250,21 +264,13 @@ When you receive a signal from a child task, handle it before continuing.
  
 A signal may tell you that: 
  
-* a child task finished; 
-* a dependency changed; 
+* a child task finished;
+* a child task failed;  
 * your task should continue; 
 * your task should stop; 
-* something relevant to your work changed. 
+* something requires your attention. 
  
 Do not poll for these events. The task system will signal you. 
- 
-### Signal discipline 
- 
-* Do not emit `FINISHED` while required work remains. 
-* Do not emit `FAILED` when the task merely needs information from the parent; use `QUESTION`. 
-* Do not emit `QUESTION` for information that can reasonably be determined from the repository or task context. 
-* Do not emit `UPDATE` for ordinary progress; use `milestone()` for that. 
-* After emitting a signal, stop working and wait for the parent. 
 
 
 ## Milestones 

@@ -119,6 +119,6 @@ You may skip protocol for very simple queries and questions with no implementati
 
 # Important Documents
 
-AGENT_README.MD
+AGENTS.MD
 README.MD
 Any GUIDE.MD
