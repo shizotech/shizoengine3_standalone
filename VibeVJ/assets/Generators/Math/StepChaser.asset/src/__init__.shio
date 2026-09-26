@@ -1,0 +1,435 @@
+// ============================================================================
+// StepChaser - bar-synced step sequencer / value chaser
+// ============================================================================
+// The bar (Takt) is divided into a configurable number of counts (Zaehlzeiten).
+// Each count either gets an explicit Wert (target value 0..1) or is flagged
+// HOLD, meaning the last explicitly set value is kept for that count.
+//
+// When a count is reached the target value is emitted:
+//   attack  current value -> Wert over FadeIn   (beats)
+//   hold    Wert for the remaining part of the count
+//   release Wert -> 0 over FadeOut              (beats, at the END of the count)
+// Hold counts never release, so the value is simply sustained.
+// FadeIn / FadeOut are per count and clamped to the length of the count.
+//
+// UI: a nanogui.gridview table.
+//   columns  = counts (1..16)
+//   rows     = 3 rows per BLOCK  ->  row0: Wert (+Hold)  row1: FadeOut  row2: FadeIn
+//   top header = count numbers, left header (rowspan 3) = block name
+//   left header, top -> bottom:  Name / Wert (live readout slider) / OUT / REMOVE
+//   All in-cell setting sliders use an explicit fixed_width so they fit into
+//   their column completely (no overflow out of the cell).
+// Blocks are stacked vertically on the SAME grid, so several blocks produce
+// several independent OUT outputs (one linkable controlfloat per block).
+//
+// IMPORTANT (crash safety):
+//   No widget teardown may ever happen inside a callback of a widget that is
+//   currently dispatching an event. Removing a block therefore only marks the
+//   block and hides its header immediately; the actual grid rebuild runs at the
+//   top of update(), where no widget event is on the call stack.
+// ============================================================================
+
+import nanogui;
+using eigen;
+
+max_steps = 16;   // maximum counts per bar
+max_blocks = 32;  // maximum stacked blocks
+max_fade = 8.0;   // maximum FadeIn / FadeOut in beats
+
+// Grid cell size and derived slider widths. The setting sliders are explicitly
+// sized (instead of filling the cell) so they fit completely into their column.
+cell_w = 130;
+cell_h = 34;
+hold_w = 30;              // Hold toggle button
+slider_w = cell_w - 6;    // FadeIn / FadeOut sliders
+wert_w = cell_w - 6 - hold_w;  // Wert slider (shares its row with Hold)
+
+// Default per-count values.
+default_wert = 1.0;
+default_fade_in = 0.0;
+default_fade_out = 0.0;
+default_hold = 0;
+
+// Widgets
+grid = None;
+mode = None;        // 0 = SYNC, 1 = FREE
+beats_ctrl = None;  // beats per bar
+steps_ctrl = None;  // counts per bar
+
+// Block records (ordered). Stable ids keep control group names stable.
+block_max_id = 0;
+blocks = [];
+
+// Clock
+free_time = 0.0;
+
+// Deferred grid teardown request (see IMPORTANT note above).
+pending_rebuild = false;
+
+// Unique control group for a block. Control names are unique inside a group,
+// so a block's controls read as e.g. "Wert S1@block3", "OUT@block3".
+grp(bid) {
+    return "block" + bid;
+}
+
+// Grow / shrink a block's per-count arrays to n.
+resize_block(rec, n) {
+    if(n < 1)
+        n = 1;
+    for(i = rec.wert.size(); i < n; i++) {
+        rec.wert.push_back(default_wert);
+        rec.fade_in.push_back(default_fade_in);
+        rec.fade_out.push_back(default_fade_out);
+        rec.hold.push_back(default_hold);
+    }
+    if(rec.wert.size() > n) {
+        rec.wert.resize(n);
+        rec.fade_in.resize(n);
+        rec.fade_out.resize(n);
+        rec.hold.resize(n);
+    }
+}
+
+// Build one block inside the grid. Must only be called from rebuild_grid().
+build_block(b) {
+    rec = blocks[b];
+    bid = rec.id;
+    group = grp(bid);
+    n_steps = steps_ctrl.value();
+    base = b * 3;
+
+    // Left header spans the three rows of the block.
+    left = grid.add_header_left_item(base);
+    left.rowspan(3);
+
+    name_ctrl = left.controltext("Name", group);
+    name_ctrl.value(rec.name, false, false)
+        .anchor_left(0).anchor_top(0).anchor_right(0).fixed_height(20)
+        .hide_config_menu(true);
+    name_ctrl.callback([rec](v) {
+        rec.name = v;
+    });
+
+    // Live readout: slider that outputs the current value of this block.
+    readout_ctrl = left.controlslider("Wert", group);
+    readout_ctrl.min(0).max(1).value(rec.env, false, false)
+        .anchor_left(0).anchor_top(22).anchor_right(0).fixed_height(20)
+        .hide_config_menu(true);
+
+    out_ctrl = left.controlfloat("OUT", group);
+    out_ctrl.min(0).max(1).value(rec.env, false, false)
+        .anchor_left(0).anchor_top(44).anchor_right(0).fixed_height(20)
+        .hide_config_menu(true);
+
+    // REMOVE must NOT destroy itself -> mark + hide, rebuild deferred to update().
+    del_btn = left.button("REMOVE").anchor_left(0).anchor_bottom(0).anchor_right(0).fixed_height(20);
+    del_btn.on_click([rec, left]() {
+        rec.pending_remove = 1;
+        rec.env = 0.0;
+        left.visible(false);
+        pending_rebuild = true;
+    });
+
+    rec.name_ctrl = name_ctrl;
+    rec.readout_ctrl = readout_ctrl;
+    rec.out_ctrl = out_ctrl;
+
+    // Per-count cells.
+    for(s = 0; s < n_steps; s++) {
+        // Row 0: Wert + Hold toggle.
+        wert_item = grid.add_item(base + 0, s);
+        wert_item.layout(nanogui.layout_horizontal());
+        wert_item.children_visible(true);
+
+        hold_ctrl = wert_item.controlbutton("Hold S" + (s + 1), group);
+        hold_ctrl.push(1).transparent(1).fixed_width(hold_w).hide_config_menu(true);
+        hold_ctrl.value(rec.hold[s], false, false);
+        hold_ctrl.callback([rec, s](v) {
+            rec.hold[s] = (v) ? 1 : 0;
+        });
+
+        wert_ctrl = wert_item.controlfloat("Wert S" + (s + 1), group);
+        wert_ctrl.min(0).max(1).value(rec.wert[s], false, false).hide_config_menu(true);
+        wert_ctrl.fixed_width(wert_w);
+        wert_ctrl.callback([rec, s](v) {
+            rec.wert[s] = v;
+        });
+
+        // Row 1: FadeOut.
+        fo_item = grid.add_item(base + 1, s);
+        fo_ctrl = fo_item.controlslider("FadeOut S" + (s + 1), group);
+        fo_ctrl.min(0).max(max_fade).value(rec.fade_out[s], false, false).hide_config_menu(true);
+        fo_ctrl.fixed_width(slider_w);
+        fo_ctrl.callback([rec, s](v) {
+            rec.fade_out[s] = v;
+        });
+
+        // Row 2: FadeIn.
+        fi_item = grid.add_item(base + 2, s);
+        fi_ctrl = fi_item.controlslider("FadeIn S" + (s + 1), group);
+        fi_ctrl.min(0).max(max_fade).value(rec.fade_in[s], false, false).hide_config_menu(true);
+        fi_ctrl.fixed_width(slider_w);
+        fi_ctrl.callback([rec, s](v) {
+            rec.fade_in[s] = v;
+        });
+    }
+}
+
+// Tear the table down and rebuild it from the current block list.
+// NEVER call this from inside a widget event callback.
+rebuild_grid() {
+    n_steps = steps_ctrl.value();
+    if(n_steps < 1)
+        n_steps = 1;
+    if(n_steps > max_steps)
+        n_steps = max_steps;
+
+    grid.clear_children();
+    grid.rows(blocks.size() * 3).cols(n_steps);
+
+    for(s = 0; s < n_steps; s++) {
+        top = grid.add_header_top_item(s);
+        top.label("S" + (s + 1)).anchor(0).font_size(12);
+    }
+
+    for(b = 0; b < blocks.size(); b++) {
+        resize_block(blocks[b], n_steps);
+        build_block(b);
+    }
+
+    pending_rebuild = false;
+}
+
+// Apply removals that were requested from button callbacks, then rebuild.
+// Called from update() only - no widget event is on the stack there.
+flush_pending_rebuild() {
+    if(pending_rebuild != true)
+        return;
+
+    for(b = blocks.size() - 1; b >= 0; b--) {
+        if(blocks[b].pending_remove == 1)
+            blocks.erase(b);
+    }
+
+    rebuild_grid();
+}
+
+add_block() {
+    if(blocks.size() >= max_blocks)
+        return;
+
+    block_max_id = block_max_id + 1;
+    rec = [id=block_max_id, name="Block " + block_max_id,
+        wert=[], fade_in=[], fade_out=[], hold=[],
+        pending_remove=0,
+        last_step=-1, prev_env=0.0, hold_value=0.0, env=0.0,
+        name_ctrl=None, readout_ctrl=None, out_ctrl=None];
+
+    resize_block(rec, steps_ctrl.value());
+    blocks.push_back(rec);
+    rebuild_grid();
+}
+
+entry(generator, area) {
+    area.layout(nanogui.layout_vertical());
+
+    top_row = area.widget().fixed_height(28)
+        .anchor_left(0).anchor_top(0).anchor_right(0)
+        .layout(nanogui.layout_horizontal());
+
+    // 0 = SYNC (timeline position), 1 = FREE (internal accumulator).
+    mode = top_row.controlcombo("Mode").fixed_width(80);
+    mode.items(["SYNC", "FREE"]);
+
+    beats_ctrl = top_row.controlslider("Beats per Bar").min(0.1).max(32).value(4.0).fixed_width(150);
+    steps_ctrl = top_row.controlint("Counts per Bar").min(1).max(max_steps).value(4).fixed_width(130);
+
+    add_btn = area.button("ADD BLOCK").fixed_height(26);
+    add_btn.on_click([]() {
+        add_block();
+    });
+
+    grid = area.gridview()
+        .anchor(0).anchor_top(112)
+        .header_left_width(200)
+        .header_top_height(28)
+        .cell_size(vec2f(cell_w, cell_h))
+        .rows(0).cols(0)
+        .show_grid(true);
+
+    // Changing the count subdivision rebuilds the table (values kept in records).
+    steps_ctrl.callback([](v) {
+        for(b = 0; b < blocks.size(); b++) {
+            blocks[b].last_step = -1;
+        }
+        rebuild_grid();
+    });
+
+    add_block();
+}
+
+update(generator, tl_pos, pos_delta) {
+    flush_pending_rebuild();
+
+    n_steps = steps_ctrl.value();
+    if(n_steps < 1)
+        n_steps = 1;
+    if(n_steps > max_steps)
+        n_steps = max_steps;
+
+    // Clock selection.
+    clock = 0.0;
+    if(mode.value() == 1) {
+        free_time = free_time + pos_delta;
+        clock = free_time;
+    }
+    else {
+        clock = tl_pos;
+    }
+    if(clock < 0.0)
+        clock = 0.0;
+
+    step_len = beats_ctrl.value() / std.float(n_steps);
+    if(step_len <= 0.0)
+        step_len = 1.0;
+
+    current_step = math.floor(clock / step_len);
+
+    for(b = 0; b < blocks.size(); b++) {
+        rec = blocks[b];
+        resize_block(rec, n_steps);
+
+        s = math.mod(current_step, n_steps);
+        if(s < 0)
+            s = 0;
+
+        // Count boundary crossed -> latch the target for this count.
+        if(current_step != rec.last_step) {
+            rec.prev_env = rec.env;
+            rec.last_step = current_step;
+            if(rec.hold[s] == 0)
+                rec.hold_value = rec.wert[s];
+        }
+
+        held = (rec.hold[s] != 0);
+        target = held ? rec.hold_value : rec.wert[s];
+
+        fi = rec.fade_in[s];
+        if(fi < 0.0)
+            fi = 0.0;
+        fo = rec.fade_out[s];
+        if(fo < 0.0)
+            fo = 0.0;
+        // Hold counts never release.
+        if(held)
+            fo = 0.0;
+
+        // Clamp fades to the length of the count.
+        fi_eff = math.min(fi, step_len);
+        fo_eff = math.min(fo, step_len - fi_eff);
+
+        step_start = std.float(current_step) * step_len;
+        p = clock - step_start;
+        if(p < 0.0)
+            p = 0.0;
+
+        from = rec.prev_env;
+
+        if(p < fi_eff) {
+            // Attack: from -> target.
+            rec.env = from + (target - from) * (p / fi_eff);
+        }
+        else if(p < step_len - fo_eff) {
+            // Sustain at target (or held value).
+            rec.env = target;
+        }
+        else {
+            if(fo_eff > 0.0) {
+                // Release: target -> 0 at the end of the count.
+                q = (p - (step_len - fo_eff)) / fo_eff;
+                if(q > 1.0)
+                    q = 1.0;
+                rec.env = target * (1.0 - q);
+            }
+            else {
+                rec.env = target;
+            }
+        }
+
+        if(rec.env < 0.0)
+            rec.env = 0.0;
+        if(rec.env > 1.0)
+            rec.env = 1.0;
+
+        if(rec.out_ctrl != None)
+            rec.out_ctrl.value(rec.env, false, false);
+        if(rec.readout_ctrl != None)
+            rec.readout_ctrl.value(rec.env, false, false);
+    }
+}
+
+save_state() {
+    state = [
+        mode=mode.value(),
+        beats=beats_ctrl.value(),
+        steps=steps_ctrl.value(),
+        block_max_id=block_max_id,
+        blocks=[],
+    ];
+
+    for(b = 0; b < blocks.size(); b++) {
+        rec = blocks[b];
+        blk = [id=rec.id, name=rec.name, steps=[]];
+        for(s = 0; s < rec.wert.size(); s++) {
+            blk.steps.push_back([
+                wert=rec.wert[s],
+                fade_in=rec.fade_in[s],
+                fade_out=rec.fade_out[s],
+                hold=rec.hold[s],
+            ]);
+        }
+        state.blocks.push_back(blk);
+    }
+
+    return state;
+}
+
+load_state(state) {
+    if(state.has("mode"))
+        mode.value(state.mode, false, false);
+    if(state.has("beats"))
+        beats_ctrl.value(state.beats, false, false);
+    if(state.has("steps"))
+        steps_ctrl.value(state.steps, false, false);
+    if(state.has("block_max_id"))
+        block_max_id = state.block_max_id;
+
+    n_steps = steps_ctrl.value();
+
+    blocks.clear();
+    if(state.has("blocks")) {
+        for(b = 0; b < state.blocks.size(); b++) {
+            blk = state.blocks[b];
+            rec = [id=blk.id, name=blk.name,
+                wert=[], fade_in=[], fade_out=[], hold=[],
+                pending_remove=0,
+                last_step=-1, prev_env=0.0, hold_value=0.0, env=0.0,
+                name_ctrl=None, readout_ctrl=None, out_ctrl=None];
+
+            if(blk.has("steps")) {
+                for(s = 0; s < blk.steps.size(); s++) {
+                    cell = blk.steps[s];
+                    rec.wert.push_back((cell.has("wert")) ? cell.wert : default_wert);
+                    rec.fade_in.push_back((cell.has("fade_in")) ? cell.fade_in : default_fade_in);
+                    rec.fade_out.push_back((cell.has("fade_out")) ? cell.fade_out : default_fade_out);
+                    rec.hold.push_back((cell.has("hold")) ? cell.hold : default_hold);
+                }
+            }
+
+            resize_block(rec, n_steps);
+            blocks.push_back(rec);
+        }
+    }
+
+    rebuild_grid();
+}

@@ -20,7 +20,13 @@ uniform int bar_count;
 uniform float randomness;      // 0 = gleichmäßig, 1 = zufällig
 
 //@slider min=0.0 max=1.0 value=0.5
-uniform float softness;
+uniform float smoothness_in;   // Weichheit der Vorderseite (in Bewegungsrichtung)
+
+//@slider min=0.0 max=1.0 value=0.5
+uniform float smoothness_out;  // Weichheit der Rückseite
+
+//@slider min=0.0 max=0.3 value=0.0
+uniform float tail_length;     // Länge des weichen Tails an der Rückseite
 
 //@slider min=0.0 max=1.0 value=0.0
 uniform float curvature;       // Amplitude/Beugung für Wellenlinie/Bogen
@@ -109,14 +115,43 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             deform = -c * c * curvature * 0.4;
         }
 
-        // Shift the coordinate along the axis to account for the perpendicular deform
+        // Determine the movement direction (+1 / -1) along the motion axis
+        // analytically from the same formulas that drive 'pos' above.
+        float dirSign = 1.0;
+        if (move_mode == 1) {
+            dirSign = -1.0;
+        } else if (move_mode == 2) {
+            // pingPong: rising while fract(...) < 0.5, falling otherwise
+            float f = fract(basePos + t * 0.1 + phase * 0.05);
+            dirSign = (f < 0.5) ? 1.0 : -1.0;
+        } else if (move_mode == 3) {
+            float arg = fract(t * 0.1 + phase * 0.1) * 6.28318530718;
+            dirSign = sign(cos(arg));
+        } else if (move_mode == 4) {
+            float arg = fract(t * 0.1 + phase * 0.1) * 6.28318530718;
+            dirSign = -sign(cos(arg));
+        }
+
+        // Shift the coordinate along the axis to account the perpendicular deform
         float coordWithDeform = axisCoord + deform;
 
-        // Signed distance to the infinite bar centered at 'pos'
+        // Signed offset from the bar center, projected onto the motion direction:
+        //   front > 0 -> leading half (in Bewegungsrichtung)
+        //   front < 0 -> trailing half  (hinten)
         float halfW = bar_width * 0.5;
-        float dist = abs(coordWithDeform - pos);
-        float soft = max(softness * 0.05 + 0.001, 0.001);
-        float density = 1.0 - smoothstep(halfW - soft, halfW + soft, dist);
+        float front = (coordWithDeform - pos) * dirSign;
+        float dist = abs(front);
+
+        // "In" side: soft edge scaled by smoothness_in only.
+        float inSoft  = max(smoothness_in * 0.05 + 0.001, 0.001);
+        float inDensity  = 1.0 - smoothstep(halfW - inSoft, halfW + inSoft, dist);
+
+        // "Out" side: soft edge scaled by smoothness_out and extended by tail_length.
+        float outSoft  = max(smoothness_out * 0.05 + 0.001, 0.001);
+        float outEdgeEnd = halfW + outSoft + tail_length;
+        float outDensity = 1.0 - smoothstep(halfW, outEdgeEnd, dist);
+
+        float density = (front >= 0.0) ? inDensity : outDensity;
 
         col = max(col, color * density);
     }

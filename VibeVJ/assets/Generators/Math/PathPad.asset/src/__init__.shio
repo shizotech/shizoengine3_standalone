@@ -1,0 +1,320 @@
+ // PathPad generator (Math)
+ // XYPad-style point editor: create points, and a line (or circle-like closed
+ // loop) is drawn between them. A travelling point — clockable FREE (free
+ // running) or SYNC (locked to the beat/timeline, like EnvelopeOutput) — moves
+ // along that path. Its current position lands in the X / Y output sliders
+ // (Regler) at the bottom.
+ //
+ // "Curve" (Kruemmung) shapes the connection between the points:
+ //   Curve = 0.0  -> straight LINE segments between the points
+ //   Curve > 0.0  -> smooth CURVE (Catmull-Rom; higher = rounder / more circle-like)
+ //   Curve > 1.0  -> exaggerated curvature (loops / strong bulges)
+ //
+ // Path points use the standard graph point format: [[x, y, weight], ...]
+  // with x/y in 0..1.
+  //
+  // Two output modes (toggle "Out" / RELATIVE MODE):
+  //   DIRECT    -> the X / Y sliders are written straight from the sampled path
+  //                (original behaviour, sliders are the raw output).
+  //   RELATIVE  -> the X / Y sliders are NOT edited directly anymore. They are
+  //                computed as
+  //                  out = Input + Strength * path_value
+  //                where "Input X" / "Input Y" are new base sliders and
+  //                "Strength X" / "Strength Y" set how strong the path
+  //                modulates that base. Result is clamped to 0..1.
+  import nanogui;
+
+  // Controls
+  path_graph = None; // Editable point graph (the path)
+  curve = None;      // 0 = LINE, 1 = smooth CIRCLE-like curve, >1 = exaggerated
+  speed = None;      // Beats per full loop
+  phase = None;      // Phase offset 0..1
+  mode = None;       // 0 = FREE, 1 = SYNC
+  loop_mode = None;  // 0 = closed loop, 1 = back-and-forth (ping-pong)
+  out_x = None;      // Output slider X (Regler)
+  out_y = None;      // Output slider Y (Regler)
+
+  // Relative-mode controls
+  out_mode = None;   // 0 = DIRECT, 1 = RELATIVE
+  in_x = None;       // Base "Input X" (Regler)
+  in_y = None;       // Base "Input Y" (Regler)
+  str_x = None;      // Modulation strength for X
+  str_y = None;      // Modulation strength for Y
+
+  // Cached mode so update() can flip the slider editability only on change.
+  rel_active = false;
+
+ // Free-running clock state
+ free_time = 0.0;
+
+ // Sample the path at position p (in "point units" 0..n) and return [x, y].
+ sample_path(points, p, curv, pingpong) {
+ 	n = points.size();
+ 	if(n == 0)
+ 		return [0.5, 0.5];
+ 	if(n == 1)
+ 		return points[0];
+
+ 	fn = std.float(n);
+ 	// Number of segments: n-1 for ping-pong, n for a closed loop.
+ 	segments = n - 1;
+ 	if(pingpong == 0)
+ 		segments = n;
+
+ 	// Wrap / bounce the position into the segment range.
+ 	q = p;
+ 	span = std.float(segments);
+ 	if(pingpong == 1) {
+ 		// Triangle wave over 0..segments (closed -> back -> closed).
+ 		double_span = span * 2.0;
+ 		q = math.mod(p, double_span);
+ 		if(q > span)
+ 			q = double_span - q;
+ 	}
+ 	else {
+ 		q = math.mod(p, span);
+ 	}
+
+ 	idx = math.floor(q);
+ 	if(idx >= std.float(segments))
+ 		idx = std.float(segments) - 1.0;
+ 	frac = q - idx;
+
+ 	i0 = std.int(idx);
+ 	i1 = i0 + 1;
+ 	// For a closed loop, the last segment wraps back to the first point.
+ 	if(pingpong == 0 && i1 >= n)
+ 		i1 = 0;
+
+ 	// Neighbour points for Catmull-Rom tangents (clamped for open paths).
+ 	im1 = i0 - 1;
+ 	if(im1 < 0) {
+ 		if(pingpong == 0)
+ 			im1 = n - 1;
+ 		else
+ 			im1 = 0;
+ 	}
+ 	ip1 = i1 + 1;
+ 	if(pingpong == 0) {
+ 		if(ip1 >= n)
+ 			ip1 = 0;
+ 	}
+ 	else {
+ 		if(ip1 >= n)
+ 			ip1 = n - 1;
+ 	}
+
+ 	x0 = points[i0][0];
+ 	y0 = points[i0][1];
+ 	x1 = points[i1][0];
+ 	y1 = points[i1][1];
+ 	xm1 = points[im1][0];
+ 	ym1 = points[im1][1];
+ 	xp1 = points[ip1][0];
+ 	yp1 = points[ip1][1];
+
+ 	x = 0.0;
+ 	y = 0.0;
+ 	if(curv <= 0.001) {
+ 		// Straight LINE.
+ 		x = x0 + (x1 - x0) * frac;
+ 		y = y0 + (y1 - y0) * frac;
+ 	}
+ 	else {
+ 		// CURVE: Catmull-Rom Hermite segment, curvature scales the tangents.
+ 		t0x = (xp1 - x0) * 0.5 * curv;
+ 		t0y = (yp1 - y0) * 0.5 * curv;
+ 		t1x = (x1 - xm1) * 0.5 * curv;
+ 		t1y = (y1 - ym1) * 0.5 * curv;
+
+ 		u = frac;
+ 		iu = 1.0 - u;
+
+ 		cx0 = x0;
+ 		cx1 = x0 + t0x;
+ 		cx2 = x1 - t1x;
+ 		cx3 = x1;
+ 		x = iu * (iu * (iu * cx0 + u * cx1) + u * (iu * cx2 + u * cx3))
+ 		  + u  * (iu * (iu * cx1 + u * cx2) + u * (iu * cx2 + u * cx3));
+
+ 		cy0 = y0;
+ 		cy1 = y0 + t0y;
+ 		cy2 = y1 - t1y;
+ 		cy3 = y1;
+ 		y = iu * (iu * (iu * cy0 + u * cy1) + u * (iu * cy2 + u * cy3))
+ 		  + u  * (iu * (iu * cy1 + u * cy2) + u * (iu * cy2 + u * cy3));
+ 	}
+
+ 	if(x < 0.0)
+ 		x = 0.0;
+ 	if(x > 1.0)
+ 		x = 1.0;
+ 	if(y < 0.0)
+ 		y = 0.0;
+ 	if(y > 1.0)
+ 		y = 1.0;
+
+ 	return [x, y];
+ }
+
+ entry(generator, area) {
+ 	area.layout(nanogui.layout_vertical());
+
+ 	// ---- Point editor (XYPad-style, same editing style as envelope graphs) ----
+ 	path_box = area.widget().fixed_height(200);
+ 	path_graph = path_box.graph("Path").anchor(0);
+	path_graph.editable(true);
+	path_graph.allow_new_points(true);
+	// envelope_mode(true) is what actually enables interactive point placement
+	// (click to add / drag to move points), same as the working EnvelopeOutput
+	// generator. vertex_mode/values_mode are display-only draw modes and do NOT
+	// make the graph editable, which is why points could not be set before.
+	path_graph.envelope_mode(true);
+	path_graph.loop(true);
+	path_graph.points([[0.5, 0.2, 0.0], [0.8, 0.5, 0.0], [0.5, 0.8, 0.0], [0.2, 0.5, 0.0]]);
+
+ 	// ---- Path controls ----
+ 	row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+ 	curve = row.controlslider("Curve").min(0).max(2).value(0.0).fixed_width(120);
+ 	speed = row.controlslider("Beats").min(0.5).max(16).value(2.0).fixed_width(110);
+ 	phase = row.controlslider("Phase").min(0).max(1).value(0.0).fixed_width(110);
+ 	mode = row.controlcombo("Mode").fixed_width(90);
+ 	mode.items(["FREE", "SYNC"]);
+ 	loop_mode = row.controlcombo("Path").fixed_width(110);
+ 	loop_mode.items(["LOOP", "PINGPONG"]);
+
+ 	// ---- Output mode: DIRECT writes the path straight into X/Y, RELATIVE
+	// computes X/Y from the Input sliders + strength instead. ----
+	mode_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	out_mode = mode_row.controlcombo("Out").fixed_width(110);
+	out_mode.items(["DIRECT", "RELATIVE"]);
+
+	// ---- Relative inputs (only visible in RELATIVE mode) ----
+	rel_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	in_x = rel_row.controlslider("Input X").min(0).max(1).value(0.0).fixed_width(140);
+	in_y = rel_row.controlslider("Input Y").min(0).max(1).value(0.0).fixed_width(140);
+	str_x = rel_row.controlslider("Strength X").min(-2).max(2).value(1.0).fixed_width(140);
+	str_y = rel_row.controlslider("Strength Y").min(-2).max(2).value(1.0).fixed_width(140);
+
+	// ---- Output sliders (Regler) ----
+	out_row = area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	out_x = out_row.controlslider("X").min(0).max(1).value(0.5).fixed_width(150);
+	out_y = out_row.controlslider("Y").min(0).max(1).value(0.5).fixed_width(150);
+
+	// Start in DIRECT mode: the relative input sliders are hidden until the
+	// RELATIVE mode is enabled.
+	rel_active = false;
+	in_x.visible(false);
+	in_y.visible(false);
+	str_x.visible(false);
+	str_y.visible(false);
+	out_x.enabled(true);
+	out_y.enabled(true);
+
+	out_mode.callback([in_x, in_y, str_x, str_y, out_x, out_y](v) {
+		rel = v == 1;
+		in_x.visible(rel);
+		in_y.visible(rel);
+		str_x.visible(rel);
+		str_y.visible(rel);
+		// In RELATIVE mode the X/Y sliders are computed, so they are no longer
+		// meant to be edited directly.
+		out_x.enabled(!rel);
+		out_y.enabled(!rel);
+		rel_active = rel;
+	});
+}
+
+ update(generator, tl_pos, pos_delta) {
+	// Keep the relative-mode UI state in sync even when the mode was restored
+	// from a saved state (no callback fired in that case).
+	rel = out_mode.value() == 1;
+	if(rel != rel_active) {
+		in_x.visible(rel);
+		in_y.visible(rel);
+		str_x.visible(rel);
+		str_y.visible(rel);
+		out_x.enabled(!rel);
+		out_y.enabled(!rel);
+		rel_active = rel;
+	}
+
+	// Path values (0..1). In DIRECT mode they are written to the X/Y sliders
+	// as-is; in RELATIVE mode the sliders are computed from the Input sliders
+	// plus the path value scaled by the Strength sliders.
+	px = 0.5;
+	py = 0.5;
+
+	pts = path_graph.points();
+	n = pts.size();
+	if(n == 1) {
+		px = pts[0][0];
+		py = pts[0][1];
+	}
+	else if(n >= 2) {
+		pingpong = 1;
+		if(loop_mode.value() == 0)
+			pingpong = 0;
+
+		segments = n;
+		if(pingpong == 1)
+			segments = n - 1;
+		if(segments < 1)
+			segments = 1;
+
+		// Compute the path position p (in point units) for the beat clock.
+		p = 0.0;
+		if(mode.value() == 0) {
+			// FREE: free-running, pos_delta is in beats.
+			free_time = free_time + pos_delta / speed.value();
+			p = math.mod(free_time + phase.value(), 1.0) * std.float(segments);
+		}
+		else {
+			// SYNC: locked to the timeline (tl_pos is in beats).
+			p = math.mod(tl_pos / speed.value() + phase.value(), 1.0) * std.float(segments);
+		}
+
+		res = sample_path(pts, p, curve.value(), pingpong);
+		px = res[0];
+		py = res[1];
+	}
+
+	if(rel) {
+		out_x.value(math.clamp(in_x.value() + str_x.value() * px, 0.0, 1.0));
+		out_y.value(math.clamp(in_y.value() + str_y.value() * py, 0.0, 1.0));
+	}
+	else {
+		out_x.value(px);
+		out_y.value(py);
+	}
+}
+
+ save_state() {
+	state = [mode=mode.value(), speed=speed.value(), phase=phase.value(), curve=curve.value(), pingpong=loop_mode.value(), path=path_graph.points(), out_mode=out_mode.value(), in_x=in_x.value(), in_y=in_y.value(), str_x=str_x.value(), str_y=str_y.value()];
+	return state;
+}
+
+load_state(state) {
+	if(state.has("mode"))
+		mode.value(state.mode);
+	if(state.has("speed"))
+		speed.value(state.speed);
+	if(state.has("phase"))
+		phase.value(state.phase);
+	if(state.has("curve"))
+		curve.value(state.curve);
+	if(state.has("pingpong"))
+		loop_mode.value(state.pingpong);
+	if(state.has("path"))
+		path_graph.points(state.path);
+	if(state.has("out_mode"))
+		out_mode.value(state.out_mode);
+	if(state.has("in_x"))
+		in_x.value(state.in_x);
+	if(state.has("in_y"))
+		in_y.value(state.in_y);
+	if(state.has("str_x"))
+		str_x.value(state.str_x);
+	if(state.has("str_y"))
+		str_y.value(state.str_y);
+}

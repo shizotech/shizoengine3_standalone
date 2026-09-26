@@ -1,0 +1,196 @@
+// XYPathPad generator
+// An editable X/Y pad ("bereich" field with a + and - area) on which freely
+// draggable points form a path. A travelling point walks this path at an even
+// (zeitlich gleichmaessig) speed, taking the same amount of time for every
+// segment between two points.
+//
+// The sampled path position (a bipolar -1..1 value on each axis) is combined
+// with the Input X / Input Y controls and the result is written to the
+// Output X / Output Y controls.
+//
+// Path mode:  CLOSED = path is looped (last point connects back to first)
+//             OPEN   = path has a distinct start and end point.
+// Travel mode: LOOP  = after the last point the walk restarts from the front.
+//              BOUNCE= after the last point the walk reverses back to the start.
+//
+// Graph points use the standard [[x, y, weight], ...] format with x/y in 0..1.
+// They are interpreted bipolar: value = 2 * coord - 1, so the middle of the pad
+// is 0 and the edges are -1 / +1.
+import nanogui;
+
+// Controls
+path_graph = None;
+travel = None;      // beats for one full traversal of the path
+mode = None;        // 0 = LOOP, 1 = BOUNCE
+shape = None;       // 0 = CLOSED (looped), 1 = OPEN (start+end)
+combine = None;     // 0 = ADD, 1 = SUB, 2 = MUL
+in_x = None;
+in_y = None;
+out_x = None;
+out_y = None;
+
+// Free-running clock
+walk_time = 0.0;
+
+// Clamp a value into [-1, 1].
+clamp_bipolar(v) {
+	if(v < -1.0)
+		return -1.0;
+	if(v > 1.0)
+		return 1.0;
+	return v;
+}
+
+// Combine a path value with an input value according to the combine mode.
+combine_value(pv, iv, mode_idx) {
+	if(mode_idx == 0)
+		return clamp_bipolar(pv + iv);   // ADD
+	else if(mode_idx == 1)
+		return clamp_bipolar(pv - iv);   // SUB
+	else
+		return clamp_bipolar(pv * iv);   // MUL
+}
+
+// Convert a graph coord (0..1) into a bipolar path value (-1..1).
+to_bipolar(c) {
+	return clamp_bipolar(2.0 * c - 1.0);
+}
+
+// Sample the path at an even per-segment position.
+// `seg` selects the current segment index, `frac` the 0..1 progress within it.
+// Returns the sampled [x, y] as bipolar values.
+sample_path(points, seg, frac) {
+	n = points.size();
+	if(n == 0)
+		return [0.0, 0.0];
+	if(n == 1)
+		return [to_bipolar(points[0][0]), to_bipolar(points[0][1])];
+
+	i0 = seg;
+	i1 = i0 + 1;
+	if(i1 >= n)
+		i1 = 0;
+
+	x0 = points[i0][0];
+	y0 = points[i0][1];
+	x1 = points[i1][0];
+	y1 = points[i1][1];
+
+	// Straight line between the two points.
+	x = x0 + (x1 - x0) * frac;
+	y = y0 + (y1 - y0) * frac;
+
+	return [to_bipolar(x), to_bipolar(y)];
+}
+
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
+
+	// ---- Editable XY path field (with +/- area) ----
+	path_box = area.widget().fixed_height(220);
+	path_graph = path_box.graph("X / Y Path").anchor(0);
+	path_graph.allow_new_points(true);
+	path_graph.editable(true);
+	path_graph.vertex_mode(true);
+	path_graph.grid(0.25);
+	path_graph.points([[0.25, 0.25, 0.0], [0.75, 0.25, 0.0], [0.75, 0.75, 0.0], [0.25, 0.75, 0.0]]);
+
+	// ---- Path / travel controls ----
+	row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	travel = row.controlslider("Travel").min(0.25).max(16).value(2.0).fixed_width(110);
+	mode = row.controlcombo("Mode").fixed_width(110);
+	mode.items(["LOOP", "BOUNCE"]);
+	shape = row.controlcombo("Path").fixed_width(120);
+	shape.items(["CLOSED", "OPEN"]);
+
+	// ---- Input controls (linkable) ----
+	in_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	combine = in_row.controlcombo("Combine").fixed_width(90);
+	combine.items(["ADD", "SUB", "MUL"]);
+	in_x = in_row.controlslider("Input X").min(-1).max(1).value(0.0).fixed_width(150);
+	in_y = in_row.controlslider("Input Y").min(-1).max(1).value(0.0).fixed_width(150);
+
+	// ---- Output controls ----
+	out_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	out_x = out_row.controlslider("Output X").min(-1).max(1).value(0.0).fixed_width(150);
+	out_y = out_row.controlslider("Output Y").min(-1).max(1).value(0.0).fixed_width(150);
+}
+
+update(generator, tl_pos, pos_delta) {
+	pts = path_graph.points();
+	n = pts.size();
+
+	if(n < 2) {
+		// With a single (or no) point there is no path to walk.
+		p0 = (n == 1) ? to_bipolar(pts[0][0]) : 0.0;
+		p1 = (n == 1) ? to_bipolar(pts[0][1]) : 0.0;
+		out_x.value(combine_value(p0, in_x.value(), combine.value()));
+		out_y.value(combine_value(p1, in_y.value(), combine.value()));
+		return;
+	}
+
+	// Number of segments depends on the path shape.
+	segments = (shape.value() == 0) ? n : (n - 1);
+	if(segments < 1)
+		segments = 1;
+
+	// Advance the walk clock (even time across the whole traversal).
+	travel_beats = travel.value();
+	if(travel_beats < 0.001)
+		travel_beats = 0.001;
+	walk_time = walk_time + pos_delta / travel_beats;
+
+	// Build a phase in [0,1) depending on LOOP / BOUNCE.
+	phase = 0.0;
+	if(mode.value() == 0) {
+		// LOOP: restart from the front.
+		phase = math.mod(walk_time, 1.0);
+	}
+	else {
+		// BOUNCE: triangle wave -> forward then backward.
+		cyc = math.mod(walk_time, 2.0);
+		phase = (cyc < 1.0) ? cyc : (2.0 - cyc);
+	}
+
+	// Even distribution of time across segments.
+	total = phase * std.float(segments);
+	seg = std.int(math.floor(total));
+	if(seg >= segments)
+		seg = segments - 1;
+	frac = total - std.float(seg);
+
+	res = sample_path(pts, seg, frac);
+
+	out_x.value(combine_value(res[0], in_x.value(), combine.value()));
+	out_y.value(combine_value(res[1], in_y.value(), combine.value()));
+}
+
+save_state() {
+	state = [
+		travel=travel.value(),
+		mode=mode.value(),
+		shape=shape.value(),
+		combine=combine.value(),
+		in_x=in_x.value(),
+		in_y=in_y.value(),
+		path=path_graph.points(),
+	];
+	return state;
+}
+
+load_state(state) {
+	if(state.has("travel"))
+		travel.value(state.travel);
+	if(state.has("mode"))
+		mode.value(state.mode);
+	if(state.has("shape"))
+		shape.value(state.shape);
+	if(state.has("combine"))
+		combine.value(state.combine);
+	if(state.has("in_x"))
+		in_x.value(state.in_x);
+	if(state.has("in_y"))
+		in_y.value(state.in_y);
+	if(state.has("path"))
+		path_graph.points(state.path);
+}
