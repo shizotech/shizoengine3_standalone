@@ -73,6 +73,7 @@ Make sure the script compiles and runs correctly.
 
 2. After that use `shizoscript_debugger` to catch any runtime errors and fix them.
 
+3. Alternatively, you can use the command line and the `shz <source_file>` command if shizoscript is installed on the system.
 
 ---
 
@@ -330,8 +331,15 @@ class Player
     {
         name = n;
     }
+	
+	__deinit__() {
+		//Destructor...
+	}
 }
 ```
+
+There is no inheritance in shizoscript yet.
+Classes work perfectly fine but not all common object-oriented class functionalities are implemented yet.
 
 ---
 
