@@ -69,11 +69,10 @@ Absolutely no assumptions are allowed.
 
 Make sure the script compiles and runs correctly.
 
-1. Use `shizoscript_syntax_checker` until all compile errors are resolved.
+1. Locate the shizoscript binary with `shizoscript_bin_path`.
+2. Run `path_to_shz_binary <source_file>` via command line and inspect output.
 
-2. After that use `shizoscript_debugger` to catch any runtime errors and fix them.
-
-3. Alternatively, you can use the command line and the `shz <source_file>` command if shizoscript is installed on the system.
+If you do not want to execute a script to debug it, you can also run `path_to_shz_binary --check <source_file>` to check the syntax of a script only.
 
 ---
 
@@ -195,7 +194,7 @@ b = a;
 b.name = "Bob";
 std.print(a.name); // Is now Bob
 
-c = a.copy(); //Creates an actual real copy and not a reference to the same underlying json object.
+c = a.copy(); //Creates an actual real copy of the json.
 ```
 
 ---
@@ -427,7 +426,46 @@ t.join();
 
 ---
 
-## 17. Common Mistakes
+# 17. Lambda Functions
+
+ShizoScript supports lambda (anonymous) functions with explicit capture semantics.
+
+---
+
+# 18. Indentation vs Brackets
+
+If and for statements can be scoped by brackets AND by indentation.
+
+```
+if(statement) {
+	do_stuff();
+	do_more();
+}
+```
+
+```
+if(statement)
+	do_stuff();
+	do_more(); 
+```
+
+are both perfectly valid statements.
+
+Statements like 
+
+```
+for(i = 0; i < 10; i++)
+	do_stuff();
+	if(check())
+		i--;
+		continue;
+```
+
+are NOT mistakes, the scopes can be defined by the indentation OR brackets.
+
+---
+
+## 19. Common Mistakes
 
 - NO while
 - NO {}
@@ -438,7 +476,7 @@ t.join();
 
 ---
 
-## 18. Checklist
+## 20. Checklist
 
 Before generating code:
 
@@ -451,10 +489,6 @@ Before generating code:
 
 ---
 
-# 19. Lambda Functions
-
-ShizoScript supports lambda (anonymous) functions with explicit capture semantics.
-
 ## Syntax
 
 ```
@@ -463,7 +497,7 @@ fn = [capture_list]() {
 };
 ```
 
-- Lambdas are defined using `[]() {}` syntax
+- Lambdas are defined using `[](){}` syntax
 - They can be assigned to variables or passed as arguments
 - They follow the same rules as normal functions (statements end with `;`)
 

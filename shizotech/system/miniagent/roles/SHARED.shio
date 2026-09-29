@@ -239,6 +239,248 @@ agt_add_read_tools(agt) {
 	  }
 	);
 
+	//Doesnt really work, better if the AI uses command line directly...
+	/*
+	agt.add_tool(
+		"grep",
+		"FILE OPERATION - Grep function",
+		[
+			query = "&string(): The query to search for",
+			recursive = ["true", "false"],
+			path = "string(): OPTIONAL Directory to limit search to, if not set this function operates from the current working directory",
+			extensions = "array(string): OPTIONAL Limit to specific file extensions, e.g. [\".h\", \".cpp\"]", 
+		],
+		[](agt, args)
+		{	
+			fs = agt.filesystem;
+			is_virtual_fs = false;
+			if(args.path && args.path.starts("mind://")) {
+				is_virtual_fs = true;
+				args.path = args.path.removesuffix("mind://");
+				fs = agt.filesystem_virtual;
+			}
+		
+			res = fs.grep(args.query, args.path ?? ".", false, args.recursive == "true", args.extensions ?? []);
+			res_truncated = false;
+			for(res.size() > 50) {
+				res.erase(res.size()-1);
+				res_truncated = true;
+			}	
+
+			if(res_truncated) {
+				return [
+					result = res,
+					results_truncated = true,
+				];
+			}
+			std.print(res);
+			return res;
+		}
+	);
+	*/
+
+
+}
+
+agt_add_code_read_tools(agt) {
+	
+	//Disabled, because these take too long with big models, enable again with a secondary smaller model...
+	return;
+	
+	agt.add_tool(
+	  "search_in_file",
+	  "FILE OPERATION - Extract relevant parts of a file based on a natural language instructions\nNote: use return_format: 'signatures' for a compressed class/function overview without concrete implementation details or function bodies",
+	  [
+		path = "&string(): Target file",
+
+		look_for = "string(): What to find or extract from the file",
+
+		return_format = ["exact", "context", "structured", "summary", "signatures"],
+		
+		include_line_numbers = ["true", "false"],
+	  ],
+	  [](agt, args)
+	  {
+		if(args.path.starts("/"))
+		  return "Invalid path specified. Use './path/to/file'.";
+	
+		fs = agt.filesystem;
+		is_virtual_fs = false;
+		if(args.path.starts("mind://")) {
+			is_virtual_fs = true;
+			args.path = args.path.removesuffix("mind://");
+			fs = agt.filesystem_virtual;
+		}
+	
+		managed _lock = local_file_lock(args.path);
+		
+		if(!fs.exists(args.path)) {
+		  return [
+			ok = false,
+			error = "file doesnt exist"
+		  ];
+		}
+		txt = fs.read_text(args.path);
+	
+		if(!txt) {
+		  return [
+			ok = true,
+			status = "file is empty"
+		  ];
+		}
+
+		txt = txt.replace("\r\n", "\n").replace("\r", "\n");
+
+		has_line_numbers = args.include_line_numbers != "false";
+
+		lines = txt.split("\n");
+		txt = "";
+
+		if(lines.size() > 50000)
+			std.error("File is being truncated");
+
+		for(lines.size() > 50000) {
+			lines.erase(lines.size()-1);
+		}
+		
+		if(has_line_numbers) {
+			for(i = 0; i < lines.size(); i++) {
+				txt += (i+1) + " ";
+				txt += lines[i] + "\n";
+			}
+		}
+
+		managed search_agt = agt.subagent("util/filereader", true);
+
+		prompt =
+		  "<FILE>\n" + txt + "\n</FILE>\n\n" +
+		  "<INSTRUCTION>\n" + args.look_for + "\n</INSTRUCTION>\n\n" +
+		  "<RETURN_FORMAT>\n" + args.return_format + "\n</RETURN_FORMAT>";
+		  
+		if(has_line_numbers) {
+			prompt += "\n\nInclude line numbers for any text from the file in your response.";
+		}
+		
+		if(args.return_format == "signatures") {
+			prompt += "\nReturn a signatures-only version of any functions/classes you may find and omit concrete implementation details and function bodies.\nInclude return and parameter types and other function signature data only";
+		}
+
+		if(!agt.env_shared.running_agent_count)
+			agt.env_shared.running_agent_count = 0;
+		
+		if(agt.model_config.max_running_agents > 0) {
+			first = true;
+			for(agt.env_shared.running_agent_count >= agt.model_config.max_running_agents) {
+				if(first)
+					std.print("MAX PARALLEL AGENT COUNT!");
+					first = false;
+				std.sleep(10);
+			}					
+		}
+
+		agt.env_shared.running_agent_count += 1;
+
+		res = search_agt.single_task(prompt);
+
+		agt.env_shared.running_agent_count -= 1;
+
+		return [
+		  ok = true,
+		  content = res
+		];
+	  }
+	);
+	
+	agt.add_tool(
+		"resolve_symbol",
+		"FILE OPERATION - Resolve functions/classes/variables across the entire codebase",
+		[
+			symbols = "&array(string): List of symbols to resolve",
+			source_file = "string(): OPTIONAL Which source file the search should initially start from, to make it easier to find the symbol",
+		],
+		[](agt, args)
+		{			
+			fs = agt.filesystem;
+			is_virtual_fs = false;
+			if(args.path.starts("mind://")) {
+				is_virtual_fs = true;
+				args.path = args.path.removesuffix("mind://");
+				fs = agt.filesystem_virtual;
+			}
+		
+			//Implement caching if source of symbol has not changed !
+		
+			local_files = std.global("local_files");
+
+			if(!local_files.symbol_maps)
+				local_files.symbol_maps = [];
+			
+			resolved_symbols = [];
+			
+			resolve_thread = [agt, &resolved_symbols, &local_files](symbol, source_file) {
+				managed search_agt = agt.subagent("util/symbol_resolver", true);
+				agent_prompt = "<symbol_name>" + symbol + "</symbol_name>";
+				if(source_file)
+					agent_prompt = "\n<source_file>" + source_file + "</source_file>";		
+				
+				if(!agt.env_shared.running_agent_count)
+					agt.env_shared.running_agent_count = 0;
+				
+				if(agt.model_config.max_running_agents > 0) {
+					first = true;
+					for(agt.env_shared.running_agent_count >= agt.model_config.max_running_agents) {
+						if(first)
+							std.print("MAX PARALLEL AGENT COUNT!");
+							first = false;
+						std.sleep(10);
+					}					
+				}
+
+				agt.env_shared.running_agent_count += 1;
+				
+				search_agt.single_task(agent_prompt);
+				
+				agt.env_shared.running_agent_count -= 1;				
+				
+				resolved_symbols[symbol] = [
+					definition = search_agt.env.symbol_definition,
+					path = search_agt.env.symbol_path,
+				];
+				
+				if(search_agt.env.symbol_path) {			
+					local_files.symbol_maps[symbol] = [
+						path = search_agt.env.symbol_path,
+						hash = fileio.hash(search_agt.env.symbol_path),
+						content = [
+							definition = search_agt.env.symbol_definition,
+							path = search_agt.env.symbol_path,
+						]
+					];
+				}
+			}
+			
+			rt = std.thread(resolve_thread);
+			
+			for(i = 0; i < args.symbols.size(); i++) {
+				symbol = args.symbols[i];
+				if(local_files.symbol_maps.has(symbol)) {
+					cached_symbol = &local_files.symbol_maps[symbol];
+					fh = fileio.hash(cached_symbol.path);
+					if(cached_symbol.hash == fh) {
+						resolved_symbols[symbol] = cached_symbol.content;
+						continue;
+					}
+				}
+				
+				rt.run(symbol, args.source_file);
+			}	
+		
+			rt.join();
+			
+			return resolved_symbols;
+		}
+	);
+
 	agt.add_tool(
 	  "read_source_map",
 	  "FILE OPERATION - Read a source file of any kind as a skeleton overview with all classes and functions and their locations in the text file, without concrete implementation details\nALWAYS prefer this function over reading entire source files when possible.\nDO NOT use this function on non-programming or non-structured regular text files.",
@@ -350,240 +592,6 @@ agt_add_read_tools(agt) {
 		  content = txt,
 		];
 	  }
-	);
-
-	agt.add_tool(
-	  "search_in_file",
-	  "FILE OPERATION - Extract relevant parts of a file based on a natural language instructions\nNote: use return_format: 'signatures' for a compressed class/function overview without concrete implementation details or function bodies",
-	  [
-		path = "&string(): Target file",
-
-		look_for = "string(): What to find or extract from the file",
-
-		return_format = ["exact", "context", "structured", "summary", "signatures"],
-		
-		include_line_numbers = ["true", "false"],
-	  ],
-	  [](agt, args)
-	  {
-		if(args.path.starts("/"))
-		  return "Invalid path specified. Use './path/to/file'.";
-	
-		fs = agt.filesystem;
-		is_virtual_fs = false;
-		if(args.path.starts("mind://")) {
-			is_virtual_fs = true;
-			args.path = args.path.removesuffix("mind://");
-			fs = agt.filesystem_virtual;
-		}
-	
-		managed _lock = local_file_lock(args.path);
-		
-		if(!fs.exists(args.path)) {
-		  return [
-			ok = false,
-			error = "file doesnt exist"
-		  ];
-		}
-		txt = fs.read_text(args.path);
-	
-		if(!txt) {
-		  return [
-			ok = true,
-			status = "file is empty"
-		  ];
-		}
-
-		txt = txt.replace("\r\n", "\n").replace("\r", "\n");
-
-		has_line_numbers = args.include_line_numbers != "false";
-
-		lines = txt.split("\n");
-		txt = "";
-
-		if(lines.size() > 50000)
-			std.error("File is being truncated");
-
-		for(lines.size() > 50000) {
-			lines.erase(lines.size()-1);
-		}
-		
-		if(has_line_numbers) {
-			for(i = 0; i < lines.size(); i++) {
-				txt += (i+1) + " ";
-				txt += lines[i] + "\n";
-			}
-		}
-
-		managed search_agt = agt.subagent("util/filereader", true);
-
-		prompt =
-		  "<FILE>\n" + txt + "\n</FILE>\n\n" +
-		  "<INSTRUCTION>\n" + args.look_for + "\n</INSTRUCTION>\n\n" +
-		  "<RETURN_FORMAT>\n" + args.return_format + "\n</RETURN_FORMAT>";
-		  
-		if(has_line_numbers) {
-			prompt += "\n\nInclude line numbers for any text from the file in your response.";
-		}
-		
-		if(args.return_format == "signatures") {
-			prompt += "\nReturn a signatures-only version of any functions/classes you may find and omit concrete implementation details and function bodies.\nInclude return and parameter types and other function signature data only";
-		}
-
-		if(!agt.env_shared.running_agent_count)
-			agt.env_shared.running_agent_count = 0;
-		
-		if(agt.model_config.max_running_agents > 0) {
-			first = true;
-			for(agt.env_shared.running_agent_count >= agt.model_config.max_running_agents) {
-				if(first)
-					std.print("MAX PARALLEL AGENT COUNT!");
-					first = false;
-				std.sleep(10);
-			}					
-		}
-
-		agt.env_shared.running_agent_count += 1;
-
-		res = search_agt.single_task(prompt);
-
-		agt.env_shared.running_agent_count -= 1;
-
-		return [
-		  ok = true,
-		  content = res
-		];
-	  }
-	);
-
-	agt.add_tool(
-		"grep",
-		"FILE OPERATION - Grep function",
-		[
-			query = "&string(): The query to search for",
-			recursive = ["true", "false"],
-			path = "string(): OPTIONAL Directory to limit search to, if not set this function operates from the current working directory",
-			extensions = "array(string): OPTIONAL Limit to specific file extensions, e.g. [\".h\", \".cpp\"]", 
-		],
-		[](agt, args)
-		{	
-			fs = agt.filesystem;
-			is_virtual_fs = false;
-			if(args.path && args.path.starts("mind://")) {
-				is_virtual_fs = true;
-				args.path = args.path.removesuffix("mind://");
-				fs = agt.filesystem_virtual;
-			}
-		
-			res = fs.grep(args.query, args.path ?? ".", false, args.recursive == "true", args.extensions ?? []);
-			res_truncated = false;
-			for(res.size() > 50) {
-				res.erase(res.size()-1);
-				res_truncated = true;
-			}	
-
-			if(res_truncated) {
-				return [
-					result = res,
-					results_truncated = true,
-				];
-			}
-			std.print(res);
-			return res;
-		}
-	);
-}
-
-agt_add_code_read_tools(agt) {
-	
-	agt.add_tool(
-		"resolve_symbol",
-		"Resolve functions/classes/variables across the entire codebase",
-		[
-			symbols = "&array(string): List of symbols to resolve",
-			source_file = "string(): OPTIONAL Which source file the search should initially start from, to make it easier to find the symbol",
-		],
-		[](agt, args)
-		{			
-			fs = agt.filesystem;
-			is_virtual_fs = false;
-			if(args.path.starts("mind://")) {
-				is_virtual_fs = true;
-				args.path = args.path.removesuffix("mind://");
-				fs = agt.filesystem_virtual;
-			}
-		
-			//Implement caching if source of symbol has not changed !
-		
-			local_files = std.global("local_files");
-
-			if(!local_files.symbol_maps)
-				local_files.symbol_maps = [];
-			
-			resolved_symbols = [];
-			
-			resolve_thread = [agt, &resolved_symbols, &local_files](symbol, source_file) {
-				managed search_agt = agt.subagent("util/symbol_resolver", true);
-				agent_prompt = "<symbol_name>" + symbol + "</symbol_name>";
-				if(source_file)
-					agent_prompt = "\n<source_file>" + source_file + "</source_file>";		
-				
-				if(!agt.env_shared.running_agent_count)
-					agt.env_shared.running_agent_count = 0;
-				
-				if(agt.model_config.max_running_agents > 0) {
-					first = true;
-					for(agt.env_shared.running_agent_count >= agt.model_config.max_running_agents) {
-						if(first)
-							std.print("MAX PARALLEL AGENT COUNT!");
-							first = false;
-						std.sleep(10);
-					}					
-				}
-
-				agt.env_shared.running_agent_count += 1;
-				
-				search_agt.single_task(agent_prompt);
-				
-				agt.env_shared.running_agent_count -= 1;				
-				
-				resolved_symbols[symbol] = [
-					definition = search_agt.env.symbol_definition,
-					path = search_agt.env.symbol_path,
-				];
-				
-				if(search_agt.env.symbol_path) {			
-					local_files.symbol_maps[symbol] = [
-						path = search_agt.env.symbol_path,
-						hash = fileio.hash(search_agt.env.symbol_path),
-						content = [
-							definition = search_agt.env.symbol_definition,
-							path = search_agt.env.symbol_path,
-						]
-					];
-				}
-			}
-			
-			rt = std.thread(resolve_thread);
-			
-			for(i = 0; i < args.symbols.size(); i++) {
-				symbol = args.symbols[i];
-				if(local_files.symbol_maps.has(symbol)) {
-					cached_symbol = &local_files.symbol_maps[symbol];
-					fh = fileio.hash(cached_symbol.path);
-					if(cached_symbol.hash == fh) {
-						resolved_symbols[symbol] = cached_symbol.content;
-						continue;
-					}
-				}
-				
-				rt.run(symbol, args.source_file);
-			}	
-		
-			rt.join();
-			
-			return resolved_symbols;
-		}
 	);
 }
 
@@ -1572,10 +1580,9 @@ Rules:
 			
 			fs = agt.filesystem;
 			is_virtual_fs = false;
-			if(args.source.starts("mind://")) {
+			if(args.path.starts("mind://")) {
 				is_virtual_fs = true;
-				args.source = args.source.removesuffix("mind://");
-				args.destination = args.destination.removesuffix("mind://");
+				args.path = args.path.removesuffix("mind://");
 				fs = agt.filesystem_virtual;
 			}
 			
@@ -1987,9 +1994,7 @@ agt_add_command_tools(agt)
 
 			proc = subprocess.process();
 
-			// Session outlives the tool call; never auto-terminate when the
-			// local object goes out of scope while the session stays registered.
-			proc.terminate_on_destroy(false);
+			proc.terminate_on_destroy(true);
 
 			// Enable pipes so read()/write() work on a live process.
 			proc.pipes(true, true, true);

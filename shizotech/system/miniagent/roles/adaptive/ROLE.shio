@@ -83,6 +83,163 @@ format_task_hierachy(hierarchy)
 	return result;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch tasks (see batch_spec.md)
+//
+// task_batch is a WORKLOAD MULTIPLIER: one complete, independent child task per
+// matched file. The agent supplies the workload, the harness resolves the target,
+// creates and schedules the children, and aggregates the per-item results.
+// ─────────────────────────────────────────────────────────────────────────────
+
+batch_child_prompt = R"(
+AGENT TASK
+
+Goal:
+[GOAL]
+
+Context:
+[CONTEXT]
+
+Contract:
+[CONTRACT]
+
+Constraints:
+[CONSTRAINTS]
+
+Assigned item:
+[ITEM]
+
+Task hierarchy:
+[HIERACHY]
+)";
+
+// Appended to every batch child so items stay isolated from each other.
+batch_ownership_note = R"(
+
+---
+
+BATCH OWNERSHIP: this task is a single item of a batch.
+The assigned item is the only file you own and are allowed to modify.
+Do not modify any other project file unless the batch contract or the batch constraints explicitly allow it.
+Inspect, implement, debug, test and verify the complete workload for the assigned item yourself.)";
+
+// Concurrency used when the model config does not limit running agents.
+batch_default_concurrency = 4;
+
+// Per-item report size returned to the parent (the full report stays in the task record).
+batch_report_max_chars = 1500;
+
+batch_max_parallel(agt)
+{
+	limit = batch_default_concurrency;
+
+	if(agt.model_config.max_running_agents > 0)
+		limit = agt.model_config.max_running_agents;
+
+	return math.max(1, limit);
+}
+
+// Creates the executor for one batch item.
+// IMPORTANT: must only be called from a single thread; the agent tree
+// (subagent bookkeeping) is not thread safe. Running children may be threaded.
+batch_create_child(agt, batch_goal, batch_context, batch_contract, batch_constraints, item, batch_id)
+{
+	env = agt.env;
+
+	if(!env.tasks)
+		env.tasks = [];
+
+	tasks = env.tasks;
+
+	executor = agt.subagent("adaptive");
+
+	parent_id = "";
+	if(agt.env.active_task ?? false)
+		parent_id = agt.env.active_task.id;
+
+	tasks.push_back([
+		agent = executor,
+		parent_id = parent_id,
+		batch_id = batch_id,
+		assigned_item = item,
+
+		id = "task_" + std.random_hash(6),
+		name = "batch item: " + item,
+		goal = batch_goal,
+		context = batch_context,
+		contract = batch_contract,
+		constraints = batch_constraints,
+
+		finished = false,
+		finish_reason = "",
+		milestones = [],
+		report = "",
+
+		batch_done = false,
+	]);
+
+	// JSONs are reference counted: this shares the record with env.tasks.
+	task = tasks[-1];
+
+	//Is this a cyclic reference which could cause agent to never destroy?
+	//But since subtasks are managed the agents are destroyed nonethless... ?
+	executor.env.active_task = task;
+
+	if(agt.on_action) {
+		executor.on_action = [agt](act) {
+			agt.on_action(act);
+		};
+	}
+
+	hierarchy = format_task_hierachy(
+		build_task_hierachy(executor)
+	);
+
+	executor.env.batch_prompt = batch_child_prompt.replace([
+		"[GOAL]" = batch_goal,
+		"[CONTEXT]" = batch_context,
+		"[CONTRACT]" = batch_contract,
+		"[CONSTRAINTS]" = batch_constraints + batch_ownership_note,
+		"[ITEM]" = item,
+		"[HIERACHY]" = hierarchy,
+	]);
+
+	executor.env.batch_runs = 0;
+
+	return task;
+}
+
+// Drive one batch child until it reaches a terminal state (FINISHED / FAILED / QUESTION).
+batch_run_child(agt, task)
+{
+	executor = task.agent;
+
+	res = None;
+
+	try {
+		res = executor.task(executor.env.batch_prompt);
+	}
+	catch(e) {
+		res = None;
+	}
+
+	executor.env.batch_runs++;
+
+	// Ran out of runs without ever signalling.
+	if(!task.finished) {
+	
+		task.finished = true;
+		task.finish_reason = "FAILED";
+
+		if(!task.report)
+			task.report = "The batch child crashed or returned nothing before emitting a signal.\nManual verification of this item is required.";
+
+	}
+
+	// Publish the terminal state to the scheduler.
+	task.batch_done = true;
+}
+
 add_tools(agt)
 {
 	agt.add_tool(
@@ -157,26 +314,20 @@ add_tools(agt)
 			std.print("\n\n---NEW TASK---\n");
 			
 			agt.env_shared.running_agent_count += 1;
+				
+			prompt = agent_prompt.replace([
+				"[GOAL]" = args.goal,
+				"[CONTEXT]" = args.context,
+				"[CONTRACT]" = args.contract,
+				"[CONSTRAINTS]" = args.constraints,
+				"[HIERACHY]" = hierarchy,
+			]);
 			
-			for(!task.finished) {
-				
-				//TODO: build simple task hierachy based on _parent recursively (just task names no details)
-				//To make it visible to the subagent where in the hiearchy it is
-				
-				prompt = agent_prompt.replace([
-					"[GOAL]" = args.goal,
-					"[CONTEXT]" = args.context,
-					"[CONTRACT]" = args.contract,
-					"[CONSTRAINTS]" = args.constraints,
-					"[HIERACHY]" = hierarchy,
-				]);
-				
-				try {
-					step_result = executor.task(prompt);
-				}
-				catch(e) {
-					//Todo: add fail counter
-				}
+			try {
+				step_result = executor.task(prompt);
+			}
+			catch(e) {
+
 			}
 			
 			agt.env_shared.running_agent_count -= 1;
@@ -251,28 +402,22 @@ add_tools(agt)
 				build_task_hierachy(executor)
 			);
 			
-			for(!task.finished) {
-				
-				//TODO: build simple task hierachy based on _parent recursively (just task names no details)
-				//To make it visible to the subagent where in the hiearchy it is
-				
-				prompt = continue_prompt.replace([
-					"[PREV]" = last_report,
-					"[RESPONSE]" = args.response,
-					"[MILESTONES]" = task.milestones,
-					"[GOAL]" = task.goal,
-					"[CONTEXT]" = task.context,
-					"[CONTRACT]" = task.contract,
-					"[CONSTRAINTS]" = task.constraints,
-					"[HIERACHY]" = hierarchy,
-				]);
-				
-				try {
-					step_result = executor.task(prompt);
-				}
-				catch(e) {
-					//Todo: add fail counter
-				}
+			prompt = continue_prompt.replace([
+				"[PREV]" = last_report,
+				"[RESPONSE]" = args.response,
+				"[MILESTONES]" = task.milestones,
+				"[GOAL]" = task.goal,
+				"[CONTEXT]" = task.context,
+				"[CONTRACT]" = task.contract,
+				"[CONSTRAINTS]" = task.constraints,
+				"[HIERACHY]" = hierarchy,
+			]);
+			
+			try {
+				step_result = executor.task(prompt);
+			}
+			catch(e) {
+				//Todo: add fail counter
 			}
 			
 			if(!task.report) {
@@ -364,10 +509,157 @@ add_tools(agt)
 		}
 	);
 
+	agt.add_tool(
+		"file_task_batch",
+		"**ONLY CALL THIS TOOL ONE AT A TIME, NOT IN PARALLEL!**\nCreate one independent agent task for every item matched by a path selector.\n\nThe agent provides the workload, the harness resolves 'target' with glob() semantics, snapshots the file list, creates and schedules one child task per matched file, manages concurrency internally, and aggregates the per-item results.\n\nPath selector semantics: an exact path matches that file, a directory path matches the files inside it, '*' matches everything within one directory level, '**' matches recursively across directory levels, and '?' matches a single character. Examples: 'src/', 'src/**/*.cpp', 'src/shaders/*.frag'. The selector is resolved once at batch creation into a fixed snapshot; files created, deleted or renamed afterwards do not become new batch items.\n\nThis is a WORKLOAD multiplier, not an action multiplier: every child owns the complete workload (inspect, implement, debug, test, verify) for its assigned item. Never describe a sequence of trivial actions in 'goal' and never enumerate the files in 'goal'; the harness tells each child which file it owns.\n\nA failure or question of one child does not affect the other children. The batch returns only after every matched item reached FINISHED, FAILED or QUESTION.\n\nAn empty target is not an error.",
+		[
+			target = "&string(): Path selector describing the files to process (exact path, directory, '*', '**', '?'). Resolved once into a fixed snapshot.",
+			goal = "&string(): The workload every child must complete for its assigned file. Describe the desired result, not a list of actions and not a list of files.",
+			context = "string(): OPTIONAL context shared with every child task.",
+			contract = "string(): OPTIONAL contract every child must satisfy for its assigned item.",
+			constraints = "string(): OPTIONAL restrictions applying to every child (e.g. do not modify unrelated files, preserve existing behavior).",
+		],
+		[](agt, args)
+		{
+			env = agt.env;
+
+			if(!env.tasks)
+				env.tasks = [];
+
+			tasks = env.tasks;
+			// ── Target resolution: exactly once, fixed snapshot for this batch ──
+			items = fileio.glob(args.target);
+
+			if(!items)
+				items = [];
+
+			batch_id = "batch_" + std.random_hash(6);
+
+			batch_goal = args.goal;
+			batch_context = args.context ?? "";
+			batch_contract = args.contract ?? "";
+			batch_constraints = args.constraints ?? "";
+
+			// ── Child creation (single threaded: the agent tree is not thread safe) ──
+			children = [];
+
+			for(i = 0; i < items.size(); i++) {
+				item = items[i];
+
+				task = batch_create_child(agt, batch_goal, batch_context, batch_contract, batch_constraints, item, batch_id);
+
+				children.push_back(task);
+			}
+			
+			// ── Empty target: a valid, successful batch ──
+			if(!children.size()) {
+				return [
+					batch_id = batch_id,
+					target = args.target,
+					status = "BATCH FINISHED",
+					total = 0,
+					finished = 0,
+					failed = 0,
+					questions = 0,
+					results = [],
+					note = "The target matched no files. This is not an error.",
+				];
+			}
+
+			// Batch children use their own slot counter so that the internal
+			// helper subagents of a child can still use the model_config slots.
+			max_parallel = batch_max_parallel(agt);
+
+			std.print("\n\n---NEW BATCH--- ", batch_id, " (", children.size(), " items, max parallel: ", max_parallel, ")\n");
+
+			next_item = 0;
+			batch_running = 0;
+
+			batch_pool = [];
+
+			batch_launch = [&next_item, &batch_running, &children, batch_pool, agt](max_parallel) {
+				for(*next_item < children.size()) {
+
+					if(batch_running >= max_parallel)
+						break;
+
+					batch_running++;
+					task = children[*next_item];
+					*next_item++;
+					
+					batch_thread = std.thread([agt, &task, &batch_running]() {
+						batch_run_child(agt, task);
+						batch_running--;
+					});
+					
+					batch_pool.push_back(batch_thread);
+					batch_thread.run();
+				}
+			};
+			
+			// ── Scheduling ──
+			// Keep every slot busy: as soon as a child finishes, a pending item is started.
+			batch_launch(max_parallel);
+			
+			for(next_item < children.size() || batch_running > 0) {
+				std.sleep(25);
+				batch_launch(max_parallel);
+			}
+			
+			for(i = 0; i < batch_pool.size(); i++) {
+				batch_pool[i].join();
+			}
+			
+			// ── Aggregate ──
+			total = children.size();
+			finished = 0;
+			failed = 0;
+			questions = 0;
+
+			results = [];
+
+			for(i = 0; i < children.size(); i++) {
+				task = children[i];
+
+				status = task.finish_reason;
+				if(!status)
+					status = "FAILED";
+
+				if(status == "FINISHED")
+					finished++;
+				else if(status == "QUESTION")
+					questions++;
+				else
+					failed++;
+
+				report = task.report ?? "";
+				if(report.size() > batch_report_max_chars)
+					report = report.substr(0, batch_report_max_chars) + "\n...[report truncated]...";
+
+				results.push_back([
+					item = task.assigned_item,
+					task_id = task.id,
+					status = status,
+					report = report,
+				]);
+			}
+
+			return [
+				batch_id = batch_id,
+				target = args.target,
+				status = "BATCH FINISHED",
+				total = total,
+				finished = finished,
+				failed = failed,
+				questions = questions,
+				results = results,
+			];
+		}
+	);
+
 	agt.add_read_tools();
 	agt.add_code_read_tools();
 	agt.add_write_tools();
 	agt.add_skill_tools();
 	agt.add_command_tools();
-
 }

@@ -1,41 +1,137 @@
+# TASK SELECTION
 
-# VibeVJ
+Based on the instruction, choose one of the following execution paths:
 
-You can interact with the live VibeVJ program by using the 'vibevj_*' tools.
+## DIRECT OPERATION
 
-First, determine the target by utilizing 'vibevj_get_focus' to get the currently focused item.
+If the request suggests actions within the currently running program or the currently open project, use DIRECT OPERATION.
 
-Then use vibevj_query() to interact with the generator (get & set)
+In this mode, you operate VibeVJ through the available VibeVJ tools.
 
-If no generator is focused currently, hint the user to click on an item to make it visible to you.
+- Use the VibeVJ tools to perform the requested actions.
+- Do NOT operate on the filesystem level when the requested action can be performed through the running program.
+- Do NOT directly modify source files.
+- Do NOT read files from the current directory unless absolutely necessary.
+- You may list files from the asset directory (`assets/`) to get a grip on what assets are available to the program.
+- Do NOT read or inspect asset source/content unless you actually need to understand it to complete the request.
+- Prefer using your intuition and the available tools over researching how the program works.
+- Choose the fastest reasonable path to the requested result.
+- Only investigate or inspect additional information when something does not work as expected or when the information is genuinely required.
+- Operate confidently and intuitively, like an experienced pro-user of the software rather than a researcher trying to understand the software from scratch.
 
-The whole program is build around dynamically placeable UI containers ("Views") which hold different kinds of generator assets.
-You can find both views and all asset types under "assets/".
+Examples that trigger DIRECT OPERATION:
 
-# vibevj_query()
+- When the user asks to edit settings
+- When the user asks to build a show
+- When the user asks to edit the current show
+- When the user asks to configure or operate something in the running program
+- When the user asks to change parameters or program state
+- When the user asks to perform an action that the VibeVJ tools can directly accomplish
 
-vibevj_query() takes two arguments:
+WHAT TO DO:
 
-- name
-The name of the action to execute on the generator (you need to choose a valid action as returned by 'vibevj_get_focus'.
+-> Load the `vibevj_live` skill.
+-> Do NOT do file operations, unless absolutely necessary to understand.
 
-- args
-The JSON arguments for the query
-Arguments are provided for each action returned by 'vibevj_get_focus'.
-This should be a ***VALID JSON*** object, ***NOT*** a string!
+## EDIT MODE
 
-# live_path
+If the request suggests changes to the engine source code or requires creating/modifying assets, use EDIT MODE.
 
-A 'live_path' is NOT a real filesystem path!
-Instead, 'live_path' can be used to focus on active generator instances currently within the running instance of the vibevj software.
+In this mode, follow your normal implementation routines to make the requested changes to the actual program source or assets.
 
-# each turn
+Load the shizoscript and shizoscript_nanogui skill to work on script files.
 
-Each new user message resets the current focus path and sets it to the last user focused generator again.
+Examples:
 
-# Asset format
+- When the user asks to create a new asset
+- When the user asks to edit an existing asset
+- When the user explicitly asks to change functionality of the engine
+- When the user explicitly asks to fix or modify engine source code
+- When the requested change cannot be performed through the running VibeVJ program and requires source-level changes
 
-## Basic Asset Structure
+Be careful when making changes to engine core files.
+
+Ask for confirmation before modifying engine core files.
+
+Do not modify engine source code merely because doing so would be an alternative way of accomplishing a DIRECT OPERATION request.
+
+WHAT TO DO:
+
+-> Load the `vibevj_build_debug` skill.
+-> Load the `vibevj_live` skill (required for debugging later).
+-> Implement, Debug.
+
+## MODE SELECTION
+
+Choose the execution path based on what the user is asking you to accomplish.
+
+The important distinction is:
+
+- If the user wants something done in the currently running VibeVJ program, use DIRECT OPERATION.
+- If the user wants to change how VibeVJ itself works, use EDIT MODE.
+- If the user wants to create or modify an asset, use EDIT MODE.
+- If the user wants to configure, manipulate, or operate the current program state, use DIRECT OPERATION.
+
+Do not interpret a request as EDIT MODE simply because source code could potentially be used to accomplish it.
+
+Prefer DIRECT OPERATION whenever the requested result can be achieved through the running program.
+
+## NOT SURE
+
+If you are unsure which execution path applies, assume DIRECT OPERATION.
+
+Load the `vibevj` skill and attempt to accomplish the request using the VibeVJ tools.
+
+Only use EDIT MODE when it is clear that source-level or asset-level changes are actually required.
+
+## RESTRICTED
+
+Do NOT try to escape the current programs enviromnent.
+Do NOT issue risky or dangerous console commands.
+
+Generally, try to avoid command line, unless its for debugging shizoscript.
+
+---
+
+# Program File Structure
+
+`assets/` -> The place for you.
+`engine/` -> Generally dont touch unless changes to the engine are EXPLICITLY requested.
+`src/` -> Same as engine, generally dont touch.
+
+Other directories are generally not if interest for you.
+
+## Asset Directories
+
+The default usable asset directory is `assets/`
+
+With the majority of the usable stuff in `assets/Generators` organized in categories.
+
+Some special more complex generator modules are also in `assets/Mapping`.
+
+Some internally used engine assets can be found in 'engine/assets', you generally dont add or touch these yourself.
+
+### Views
+
+Views are a special kind of generator, specifically ones that can hold other generators (used to build custom UI's and layouts within the program)
+
+Views are in `assets/Views`
+
+### Shaders
+
+Shader assets are located in `assets/Shaders`.
+There are two type of shaders:
+
+`sources` -> Any shader that takes NO input and produces visual output on its own
+
+`effects` -> Shaders that need an input to work with, anything that transforms other shaders.
+
+DO NOT confuse `sources` and `effects`!
+An `effect` CANNOT produce visuals on its own and WILL BE black without a `source` input!
+
+## Asset format
+
+### Basic Asset Structure
 
 ```
 MyAsset.asset/ <--- ASSET_ROOT
@@ -47,7 +143,7 @@ MyAsset.asset/ <--- ASSET_ROOT
         └── helper.shio
 ```
 
-## Shader Structure
+### Shader Structure
 
 ```
 MyShader.glsl/  <--- ASSET_ROOT
@@ -58,56 +154,3 @@ MyShader.glsl/  <--- ASSET_ROOT
     └── subdirectory/      # NOT rendered, only accessible via #include (OPTIONAL)
         └── helper.glsl
 ```
-
-When adding shaders to any generator:
-
-ALWAYS use the ASSET_ROOT as only valid path to add new generators.
-NEVER try to instantiate assets or shaders from raw glsl or shio files directly.
-
-The ASSET_ROOT is basically the MyAsset.extension directory.
-
----
-
-# Generator controls
-
-The '@' in a controls name is their respective group.
-
-For example
-
-uniforms@x
-uniforms@y
-uniforms@size
-
-All belong to the same group.
-
----
-
-Controls which have a '#' in their name are attribute controls.
-Attribute controls means that they belong to a parent control (the one with the same prefix but without '#')
-
-For example:
-
-node/control_1 <--- PARENT CONTROL
-node/control_1#Min <--- Attribute control
-node/control_1#Max <--- Attribute control
-node/control_1#Trigger <--- Attribute control
-
-Change attribute controls only when you want to change the attributes of their respective parent control.
-Attribute controls do not belong to the generator directly, only their parent control.
-You can get and set attribute controls just like any other regular control.
-
----
-
-# Fixtures
-
-Fixture definitions are located in assets/Fixtures using a simple json scheme
-To get an overview of the exact format and possible channel definitions, look at assets/Fixtures/example.json which showcases all possibilities
-You can create new fixtures there using regular file operation tools
-You can also look up specific fixture definitions there
-
-# Asset Directories
-
-The default usable asset directory is 'assets/'
-Views are in 'assets/views'
-
-Some internally used engine assets can be found in 'engine/assets', you generally dont add these yourself.
