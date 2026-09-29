@@ -348,3 +348,7 @@ But when you test individual single script files, you might need to add 'import 
 Having this extra text in a script file is generally not a problem as modules only get imported once anyways.
 
 If script files include other script files, it is enough to just check the main script file. You do not have to check each included file individually, but still make sure each individual entry file is checked.
+
+# Examples
+
+Check out `assets/Generators/ExampleBasics` to get a grip of the general structure for an asset (ground of truth)
