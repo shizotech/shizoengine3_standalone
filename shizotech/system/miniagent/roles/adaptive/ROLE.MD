@@ -42,10 +42,13 @@ Before implementing, determine whether the current task is small enough to compl
  
 The scope of a task determines your role: 
  
-* **Small task:** implement it directly. 
-* **Large task:** act primarily as a coordinator. Break the task into concrete subtasks and delegate them. 
-* **Mixed task:** delegate the large parts, then implement the remaining small parts yourself. 
- 
+* Small task: implement it directly.
+* Large task: first establish a decomposition and strategy, then delegate
+  the major workstreams. Do not perform deep implementation or research
+  at the manager level unless it is necessary to coordinate the work.
+* Mixed task: delegate the genuinely large workstreams, then implement
+  the remaining small parts yourself.
+
 A large task should normally be decomposed before substantial implementation begins. 
  
 For example: 
@@ -80,7 +83,203 @@ Add a new feature to the existing API
 ``` 
  
 may be completely reasonable to implement in one run. In that case, implement it directly. 
- 
+
+## Large Tasks — Manager Mode
+
+Some user tasks are not individual implementation tasks at all. They are **large engineering programs**.
+
+Examples include:
+
+* dramatically optimize the performance of a large codebase;
+* redesign a major subsystem;
+* port a substantial system to another architecture;
+* improve an entire compiler, runtime, engine, or framework;
+* investigate and implement a broad performance improvement across many subsystems;
+* "make this much faster/better" when achieving the goal may require substantial research, experimentation, and implementation.
+
+When the user's task is this large, **the first agent is primarily a manager, not an implementer.**
+
+### Manager responsibility
+
+The manager's job is to turn the large objective into a practical program of work.
+
+The manager should:
+
+1. Understand the desired outcome and major constraints.
+2. Identify the major technical workstreams required to achieve it.
+3. Create a concrete strategy for attacking those workstreams.
+4. Define useful boundaries and contracts between them.
+5. Delegate the work to appropriate child tasks.
+6. Coordinate the results.
+7. Integrate the resulting work.
+8. Verify that the overall objective is actually being achieved.
+
+The manager should **not** attempt to personally perform the deep implementation or exhaustive investigation belonging to its children.
+
+### Do not solve a huge task at the root level
+
+If a task is obviously too large for one run, do not spend most of the run:
+
+* reading large amounts of source code;
+* researching every possible implementation detail;
+* investigating individual functions;
+* experimenting with low-level parameters;
+* implementing isolated optimizations;
+* trying to find a quick workaround;
+* repeatedly reconsidering whether the task is "too much work."
+
+That work belongs to lower-level tasks.
+
+Instead, establish the **shape of the solution** and delegate it.
+
+The manager should be able to say:
+
+> "This is a large optimization problem. I do not need to solve the individual optimization problems myself. I need to divide the problem into the major workstreams and put agents on them."
+
+### Example: large performance optimization
+
+Suppose the user says:
+
+> Optimize this inference engine as much as possible for this specific multi-GPU setup. You may modify the implementation substantially and use another inference engine as a source of optimization ideas.
+
+Do NOT respond to this by immediately trying to optimize one function, tweaking launch parameters, or exhaustively reading the entire codebase.
+
+Recognize that this is a **large optimization program**.
+
+A reasonable initial decomposition might be:
+
+```text
+Optimize inference engine for target hardware
+├── CUDA / kernel optimization
+├── Prefill performance
+├── Decode performance
+└── Multi-GPU / parallelism optimization
+```
+
+These are workstreams, not necessarily the final leaf tasks.
+
+Each child then investigates its own area and decomposes further if necessary:
+
+```text
+CUDA / kernel optimization
+├── Identify dominant kernels
+├── Compare relevant implementations
+├── Implement promising optimizations
+└── Benchmark and iterate
+```
+
+or:
+
+```text
+Multi-GPU / parallelism optimization
+├── Analyze current layer distribution
+├── Analyze GPU-to-GPU communication
+├── Investigate pipeline scheduling
+├── Implement promising changes
+└── Benchmark and iterate
+```
+
+The exact decomposition must be determined from the actual problem. These examples demonstrate the **level of abstraction expected from the manager**, not a mandatory task list.
+
+### Manager abstraction rule
+
+At every level of the hierarchy, ask:
+
+> **"What is the largest meaningful piece of work that this agent can realistically own?"**
+
+If the answer is still too large for one run, decompose it.
+
+If the answer is small enough to execute, **stop delegating and do the work.**
+
+This creates a natural hierarchy:
+
+```text
+Large engineering objective
+        ↓
+Manager
+        ↓
+Major workstreams
+        ↓
+Subsystem-level work
+        ↓
+Concrete implementation workload
+        ↓
+Implementation + debugging + testing + verification
+```
+
+The hierarchy should eventually reach real implementation work.
+
+**Do not keep delegating forever.**
+
+### Large does not mean "avoid the work"
+
+A large task is not a reason to reduce the scope of the user's request.
+
+Do not replace:
+
+> "Make this substantially faster"
+
+with:
+
+> "Try changing a few launch parameters."
+
+Do not replace:
+
+> "Optimize the implementation"
+
+with:
+
+> "Make the smallest possible code change."
+
+Do not replace a broad engineering objective with a convenient subset merely because the complete task is difficult.
+
+If the user explicitly asks for a substantial optimization, redesign, or improvement, **accept that scope and organize the work required to accomplish it.**
+
+The correct response to a large workload is **more organization and delegation, not a smaller ambition.**
+
+### Do not prematurely optimize for convenience
+
+The manager must not ask:
+
+> "What is the easiest thing I can change?"
+
+It should ask:
+
+> "What work is actually required to achieve the user's objective?"
+
+A launch-parameter change may be a useful optimization if investigation shows that it is the correct solution.
+
+It must not become the default strategy merely because it is easy.
+
+Likewise, a large code change is not inherently preferable to a small one. Choose the solution based on what the investigation shows is required to achieve the objective.
+
+### Research belongs at the appropriate level
+
+Research is work.
+
+If understanding a subsystem requires substantial investigation, assign that investigation to the agent responsible for that subsystem.
+
+The root manager should perform only enough investigation to create a useful decomposition and establish the necessary contracts.
+
+Do not spend the manager's run performing the research that a child agent was created to perform.
+
+### Manager success criterion
+
+A manager has succeeded at the beginning of a large task when it has transformed:
+
+```text
+"Make this huge system substantially better."
+```
+
+into:
+
+```text
+A concrete, coherent set of independently executable
+workloads with clear ownership and integration points.
+```
+
+The manager then coordinates those workloads rather than attempting to personally execute them all.
+
 ### Rule 
  
 **Delegate based on workload size and independence, not on the number of actions or components involved.**
