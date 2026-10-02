@@ -1,0 +1,697 @@
+// ============================================================================
+// XY-Positions (Math)
+// ============================================================================
+// A list of XY positions. Every position can be selected by clicking its
+// (MIDI-controllable) button. The position values are ALWAYS shown and edited
+// inside one single persistent field ("XY OUTPUT") that is shared by every
+// position: switching the position morphs the shared X / Y sliders from the
+// currently shown value to the newly selected position over a configurable
+// transition time.
+//
+// Under every shared slider are jog buttons (+10 / +1 / -1 / -10) which step
+// the stored value of the currently selected position.
+//
+// Every position row has a settings popup (styled like the Control-Button-Matrix
+// popups) with the per-position Input X / Input Y sliders and the separate
+// Strength X / Strength Y sliders. When RELATIVE is enabled for a position the
+// final output becomes
+//      out = live_position + strength * input
+// (clamped into 0..100), otherwise out = live_position.
+//
+// Routeable controls:
+//   X@xypos / Y@xypos          shared (persistent) position sliders, 0..100
+//   OUT X / OUT Y@xypos        final computed output, normalized 0..1
+//   TRANSITION@xypos           transition duration in seconds
+//   P<id>@pos<id>              per-position selectable button (selection)
+//   INPUT X / INPUT Y@pos<id>  per-position input values (-100..100)
+//   STRENGTH X / Y@pos<id>     per-position modulation strength (-2..2)
+//   RELATIVE@pos<id>           per-position relative mode toggle
+//   Name@pos<id>               per-position name (editable in the popup)
+//
+// IMPORTANT (crash safety): deleting a position may NOT tear down widgets from
+// inside a widget event callback (the delete button lives in that row's popup).
+// Deletion therefore only marks the entry and hides the row; the actual list
+// rebuild runs deferred at the top of update(), where no widget event is on the
+// call stack. Same pattern as StepChaser.
+// ============================================================================
+
+import nanogui;
+
+// ---------------------------------------------------------------------------
+// Shared / persistent controls (created in entry)
+// ---------------------------------------------------------------------------
+managed list_content = None;   // scroll content of the position list
+managed trans_ctrl = None;     // transition duration (seconds)
+managed live_x_ctrl = None;    // shared X slider (routeable, 0..100)
+managed live_y_ctrl = None;    // shared Y slider (routeable, 0..100)
+managed out_x_ctrl = None;     // final output X (routeable, 0..1)
+managed out_y_ctrl = None;     // final output Y (routeable, 0..1)
+managed sel_lbl = None;        // selected position readout
+
+// ---------------------------------------------------------------------------
+// Data / state
+// ---------------------------------------------------------------------------
+entries = [];        // position records (source of truth, ordered)
+uis = [];            // matching widget records (parallel to entries)
+selected = 0;        // index of the selected position
+max_id = 0;          // stable id counter (control group names stay stable)
+
+// Transition state. Wall-clock based (std.millis) so the transition also runs
+// while the timeline is stopped.
+live_x = 50.0;
+live_y = 50.0;
+from_x = 50.0;
+from_y = 50.0;
+to_x = 50.0;
+to_y = 50.0;
+trans_start = 0.0;
+trans_dur = 0.5;
+trans_active = false;
+
+// Deferred list rebuild request (deletion from a popup callback).
+pending_rebuild = false;
+
+// Dirty-cache for the output / readout refresh.
+last_out_x = -1.0;
+last_out_y = -1.0;
+last_sel_txt = "";
+
+// Re-entrancy guard for programmatic pushes into the shared sliders.
+// While true, the shared X/Y slider callbacks must NOT write back into the
+// selected entry: otherwise a morph transition (or a jog / linked source)
+// that pushes an intermediate live value would store that value into the
+// currently selected position and corrupt its stored data.
+syncing = false;
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+clamp_pos(v) {
+	if(v < 0.0)
+		return 0.0;
+	if(v > 100.0)
+		return 100.0;
+	return v;
+}
+
+// Compact number formatting for readouts (one decimal, trailing zeros trimmed).
+// std.string(float) always renders 6 decimals ("50.000000"), so we build the
+// string manually from the rounded tenth: whole part + optional single decimal.
+fmt(v) {
+	scaled = math.round(std.float(v) * 10.0);
+	whole = math.floor(scaled / 10.0);
+	frac = scaled - whole * 10.0;
+	if(frac == 0.0)
+		return std.string(std.int(whole));
+	return std.string(std.int(whole)) + '.' + std.string(std.int(frac));
+}
+
+// Control group of one position entry. Unique per entry and stable across
+// rebuilds, so routes are kept when the list is rebuilt.
+grp_of(rec) {
+	return "pos" + rec.id;
+}
+
+// ---------------------------------------------------------------------------
+// Output computation
+// ---------------------------------------------------------------------------
+compute_output_x(rec) {
+	if(rec.rel)
+		return clamp_pos(live_x + rec.str_x * rec.in_x);
+	return clamp_pos(live_x);
+}
+
+compute_output_y(rec) {
+	if(rec.rel)
+		return clamp_pos(live_y + rec.str_y * rec.in_y);
+	return clamp_pos(live_y);
+}
+
+// Write the computed outputs and refresh the row readouts. Only touches the
+// widgets when the displayed value actually changed, so the per-frame call from
+// update() does not spam linked controls / MIDI devices.
+refresh_outputs() {
+	if(entries.size() == 0) {
+		if(out_x_ctrl != None && last_out_x != 0.0) {
+			last_out_x = 0.0;
+			out_x_ctrl.value(0.0);
+		}
+		if(out_y_ctrl != None && last_out_y != 0.0) {
+			last_out_y = 0.0;
+			out_y_ctrl.value(0.0);
+		}
+		if(sel_lbl != None && last_sel_txt != "-") {
+			last_sel_txt = "-";
+			sel_lbl.text("Selected: -");
+		}
+		return;
+	}
+
+	if(selected >= entries.size())
+		selected = entries.size() - 1;
+	if(selected < 0)
+		selected = 0;
+
+	rec = entries[selected];
+
+	nx = compute_output_x(rec) / 100.0;
+	ny = compute_output_y(rec) / 100.0;
+
+	if(out_x_ctrl != None && math.abs(nx - last_out_x) > 0.000001) {
+		last_out_x = nx;
+		out_x_ctrl.value(nx);
+	}
+	if(out_y_ctrl != None && math.abs(ny - last_out_y) > 0.000001) {
+		last_out_y = ny;
+		out_y_ctrl.value(ny);
+	}
+
+	txt = "Selected: " + rec.name + "   (" + fmt(rec.x) + " / " + fmt(rec.y) + ")";
+	if(sel_lbl != None && txt != last_sel_txt) {
+		last_sel_txt = txt;
+		sel_lbl.text(txt);
+	}
+
+	// Per-row readout of the stored position values.
+	for(i = 0; i < uis.size(); i++) {
+		if(i >= entries.size())
+			break;
+		u = uis[i];
+		e = entries[i];
+		if(u.lbl == None)
+			continue;
+		rx = fmt(e.x) + " / " + fmt(e.y);
+		if(u.cache == None || u.cache != rx) {
+			u.cache = rx;
+			u.lbl.text(rx);
+		}
+	}
+}
+
+// Snap the shared live values onto the stored values of the selected position
+// and stop any running transition. Pure state operation, no widget writes.
+cancel_transition() {
+	if(!trans_active)
+		return;
+	if(entries.size() == 0) {
+		trans_active = false;
+		return;
+	}
+	rec = entries[selected];
+	live_x = rec.x;
+	live_y = rec.y;
+	from_x = rec.x;
+	from_y = rec.y;
+	trans_active = false;
+}
+
+// Push both shared sliders with their current live values (routes the value
+// out but does not re-trigger our own value callback).
+// The syncing guard protects against engines that still dispatch the local
+// value callback for programmatic sets: without the guard, every morph frame
+// would write its intermediate value back into the selected entry and corrupt
+// the stored position (last edited value leaking into the selected position).
+push_live_sliders() {
+	syncing = true;
+	if(live_x_ctrl != None)
+		live_x_ctrl.value(live_x, false, true);
+	if(live_y_ctrl != None)
+		live_y_ctrl.value(live_y, false, true);
+	syncing = false;
+}
+
+// ---------------------------------------------------------------------------
+// Interaction
+// ---------------------------------------------------------------------------
+// Apply a jog step (axis 0 = X, axis 1 = Y) to the selected position.
+jog(axis, delta) {
+	if(entries.size() == 0)
+		return;
+
+	// A manual edit cancels a running transition and snaps both axes onto the
+	// stored values of the selected position.
+	cancel_transition();
+
+	rec = entries[selected];
+	if(axis == 0) {
+		rec.x = clamp_pos(std.float(rec.x) + delta);
+		live_x = rec.x;
+		from_x = rec.x;
+	}
+	else {
+		rec.y = clamp_pos(std.float(rec.y) + delta);
+		live_y = rec.y;
+		from_y = rec.y;
+	}
+
+	push_live_sliders();
+	refresh_outputs();
+}
+
+// Select one position and start the transition of the shared sliders.
+select_entry(idx) {
+	if(entries.size() == 0) {
+		selected = 0;
+		return;
+	}
+
+	if(idx < 0)
+		idx = 0;
+	if(idx >= entries.size())
+		idx = entries.size() - 1;
+
+	selected = idx;
+
+	// Sync the button widgets (visual selection state).
+	for(i = 0; i < uis.size(); i++) {
+		u = uis[i];
+		if(u.sel_btn != None)
+			u.sel_btn.value(i == idx, false, false);
+	}
+
+	rec = entries[idx];
+
+	// Start from the currently shown live value, morph to the new position.
+	from_x = live_x;
+	from_y = live_y;
+	to_x = rec.x;
+	to_y = rec.y;
+	trans_start = std.millis() / 1000.0;
+	trans_dur = trans_ctrl.value();
+
+	if(trans_dur <= 0.0001) {
+		trans_active = false;
+		live_x = to_x;
+		live_y = to_y;
+		push_live_sliders();
+	}
+	else {
+		trans_active = true;
+	}
+
+	refresh_outputs();
+}
+
+// ---------------------------------------------------------------------------
+// Row construction
+// ---------------------------------------------------------------------------
+// Build one position row (selection button + readout + settings popup).
+// Only called from rebuild_list().
+build_row(parent, idx) {
+	rec = entries[idx];
+	grp = grp_of(rec);
+
+	row = parent.widget()
+		.layout(nanogui.layout_horizontal())
+		.fixed_height(26)
+		.anchor_left(0).anchor_right(0);
+
+	// Selectable (MIDI-controllable) position button.
+	sel_btn = row.controlbutton("P" + rec.id, grp).push(true).fixed_width(120);
+	sel_btn.display_name(rec.name);
+	sel_btn.value(idx == selected, false, false);
+	sel_btn.callback([idx](v){
+		select_entry(idx);
+	});
+
+	// Stored position readout.
+	lbl = row.label(fmt(rec.x) + " / " + fmt(rec.y)).fixed_height(26);
+
+	// Settings popup (Button-Matrix style), opened with the small gear button.
+	popup = row.button_popup("⚙").side("bottom").fixed_width(28);
+	pc = popup.popup().content().layout(nanogui.layout_vertical());
+	pc.fixed_width(210);
+
+	name_box = pc.textbox().editable(true).value(rec.name)
+		.anchor_left(0).anchor_right(0);
+
+	rel_btn = pc.controlbutton("RELATIVE", grp).push(true)
+		.anchor_left(0).anchor_right(0);
+	rel_btn.value(rec.rel, false, false);
+
+	in_x_ctrl = pc.controlslider("INPUT X", grp).min(-100).max(100).value(rec.in_x)
+		.anchor_left(0).anchor_right(0);
+	in_y_ctrl = pc.controlslider("INPUT Y", grp).min(-100).max(100).value(rec.in_y)
+		.anchor_left(0).anchor_right(0);
+
+	str_x_ctrl = pc.controlslider("STRENGTH X", grp).min(-2).max(2).value(rec.str_x)
+		.anchor_left(0).anchor_right(0);
+	str_y_ctrl = pc.controlslider("STRENGTH Y", grp).min(-2).max(2).value(rec.str_y)
+		.anchor_left(0).anchor_right(0);
+
+	del_btn = pc.button("DELETE").anchor_left(0).anchor_right(0).fixed_height(24);
+
+	// Callbacks -------------------------------------------------------------
+	rel_btn.callback([rec](v){
+		rec.rel = v != 0;
+		refresh_outputs();
+	});
+
+	in_x_ctrl.callback([rec](v){
+		rec.in_x = v;
+		refresh_outputs();
+	});
+
+	in_y_ctrl.callback([rec](v){
+		rec.in_y = v;
+		refresh_outputs();
+	});
+
+	str_x_ctrl.callback([rec](v){
+		rec.str_x = v;
+		refresh_outputs();
+	});
+
+	str_y_ctrl.callback([rec](v){
+		rec.str_y = v;
+		refresh_outputs();
+	});
+
+	name_box.on_change([rec, sel_btn](v){
+		if(v) {
+			rec.name = v;
+			sel_btn.display_name(v);
+			refresh_outputs();
+		}
+	});
+
+	// Deletion must never tear widgets down while the popup dispatches the
+	// click -> mark + hide now, rebuild deferred to update().
+	del_btn.on_click([rec, row]() {
+		rec.pending_remove = 1;
+		row.visible(false);
+		pending_rebuild = true;
+	});
+
+	uis.push_back([sel_btn=sel_btn, lbl=lbl, name_box=name_box, rel_btn=rel_btn,
+		in_x_ctrl=in_x_ctrl, in_y_ctrl=in_y_ctrl,
+		str_x_ctrl=str_x_ctrl, str_y_ctrl=str_y_ctrl,
+		cache=None]);
+}
+
+// Rebuild the complete list from the current entries.
+// NEVER call this from inside a widget event callback of a row / popup widget.
+rebuild_list() {
+	if(list_content != None)
+		list_content.clear_children();
+
+	uis = [];
+
+	for(i = 0; i < entries.size(); i++)
+		build_row(list_content, i);
+
+	pending_rebuild = false;
+}
+
+// Apply the marked removals, then rebuild. Called from update() only, where no
+// widget event is on the stack.
+flush_pending_rebuild() {
+	if(pending_rebuild != true)
+		return;
+
+	for(i = entries.size() - 1; i >= 0; i--) {
+		if(entries[i].pending_remove == 1)
+			entries.erase(i);
+	}
+
+	if(selected >= entries.size())
+		selected = entries.size() - 1;
+	if(selected < 0)
+		selected = 0;
+
+	rebuild_list();
+
+	if(entries.size() > 0) {
+		rec = entries[selected];
+		live_x = rec.x;
+		live_y = rec.y;
+		from_x = rec.x;
+		from_y = rec.y;
+		trans_active = false;
+		push_live_sliders();
+		refresh_outputs();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Adding positions
+// ---------------------------------------------------------------------------
+add_position(name) {
+	id = max_id + 1;
+	max_id = id;
+
+	rec = [id=id, name=name,
+		x=50.0, y=50.0,
+		in_x=0.0, in_y=0.0,
+		str_x=1.0, str_y=1.0,
+		rel=false, pending_remove=0];
+
+	entries.push_back(rec);
+	// Do NOT auto-switch here: keep the current selection (and its transition)
+	// untouched, the new row simply shows up in the list.
+	rebuild_list();
+}
+
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
+
+	// ---- Top row: add button + transition time ----
+	top = area.widget()
+		.layout(nanogui.layout_horizontal())
+		.fixed_height(26)
+		.anchor_left(0).anchor_right(0);
+
+	add_btn = top.button("+ ADD POSITION").fixed_width(120);
+	add_btn.on_click([]() {
+		add_position("Pos " + std.string(max_id + 1));
+	});
+
+	trans_ctrl = top.controlslider("TRANSITION", "xypos").min(0).max(10).value(0.5)
+		.fixed_width(150)
+		.tooltip("Transition duration in seconds when switching the position");
+
+	// ---- Position list (scrollable) ----
+	list = area.vscroll().fixed_height(160).anchor_left(0).anchor_right(0);
+	list_content = list.content().layout(nanogui.layout_vertical());
+
+	// ---- Persistent field (shared by every position) ----
+	field = area.collapsable("XY OUTPUT").expanded(true);
+	fc = field.content().layout(nanogui.layout_vertical());
+
+	sel_lbl = fc.label("Selected: -").fixed_height(18);
+
+	// Shared X slider + jog buttons.
+	live_x_ctrl = fc.controlslider("X", "xypos").min(0).max(100).value(50.0)
+		.anchor_left(0).anchor_right(0);
+	live_x_ctrl.callback([](v){
+		if(entries.size() == 0)
+			return;
+		if(syncing == true)
+			return;
+		cancel_transition();
+		rec = entries[selected];
+		rec.x = clamp_pos(v);
+		live_x = rec.x;
+		from_x = rec.x;
+		if(live_y_ctrl != None) {
+			syncing = true;
+			live_y_ctrl.value(live_y, false, true);
+			syncing = false;
+		}
+		refresh_outputs();
+	});
+
+	jx = fc.widget()
+		.layout(nanogui.layout_horizontal())
+		.fixed_height(24)
+		.anchor_left(0).anchor_right(0);
+	jx.button("+10").fixed_width(60).on_click([](){ jog(0, 10.0); });
+	jx.button("+1").fixed_width(60).on_click([](){ jog(0, 1.0); });
+	jx.button("-1").fixed_width(60).on_click([](){ jog(0, -1.0); });
+	jx.button("-10").fixed_width(60).on_click([](){ jog(0, -10.0); });
+
+	// Shared Y slider + jog buttons.
+	live_y_ctrl = fc.controlslider("Y", "xypos").min(0).max(100).value(50.0)
+		.anchor_left(0).anchor_right(0);
+	live_y_ctrl.callback([](v){
+		if(entries.size() == 0)
+			return;
+		if(syncing == true)
+			return;
+		cancel_transition();
+		rec = entries[selected];
+		rec.y = clamp_pos(v);
+		live_y = rec.y;
+		from_y = rec.y;
+		if(live_x_ctrl != None) {
+			syncing = true;
+			live_x_ctrl.value(live_x, false, true);
+			syncing = false;
+		}
+		refresh_outputs();
+	});
+
+	jy = fc.widget()
+		.layout(nanogui.layout_horizontal())
+		.fixed_height(24)
+		.anchor_left(0).anchor_right(0);
+	jy.button("+10").fixed_width(60).on_click([](){ jog(1, 10.0); });
+	jy.button("+1").fixed_width(60).on_click([](){ jog(1, 1.0); });
+	jy.button("-1").fixed_width(60).on_click([](){ jog(1, -1.0); });
+	jy.button("-10").fixed_width(60).on_click([](){ jog(1, -10.0); });
+
+	// ---- Final (computed) routeable outputs ----
+	out_row = fc.widget()
+		.layout(nanogui.layout_horizontal())
+		.fixed_height(24)
+		.anchor_left(0).anchor_right(0);
+	out_x_ctrl = out_row.controlslider("OUT X", "xypos").min(0).max(1).value(0.5)
+		.fixed_width(170);
+	out_y_ctrl = out_row.controlslider("OUT Y", "xypos").min(0).max(1).value(0.5)
+		.fixed_width(170);
+
+	// ---- Initial content ----
+	add_position("Pos 1");
+}
+
+// ---------------------------------------------------------------------------
+// Frame update
+// ---------------------------------------------------------------------------
+update(generator, tl_pos, pos_delta) {
+	flush_pending_rebuild();
+
+	if(entries.size() == 0) {
+		refresh_outputs();
+		return;
+	}
+
+	if(selected >= entries.size())
+		selected = entries.size() - 1;
+	if(selected < 0)
+		selected = 0;
+
+	rec = entries[selected];
+
+	s = 1.0;
+	if(trans_active) {
+		if(trans_dur <= 0.0001) {
+			trans_active = false;
+			s = 1.0;
+		}
+		else {
+			el = std.millis() / 1000.0 - trans_start;
+			s = el / trans_dur;
+			if(s >= 1.0) {
+				s = 1.0;
+				trans_active = false;
+			}
+			s = math.smoothstep(0.0, 1.0, s);
+		}
+
+		// The target may have changed while transitioning (jog / slider edit on
+		// the newly selected position) -> always re-read the stored values.
+		to_x = rec.x;
+		to_y = rec.y;
+
+		live_x = from_x + (to_x - from_x) * s;
+		live_y = from_y + (to_y - from_y) * s;
+
+		push_live_sliders();
+	}
+
+	refresh_outputs();
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+save_state() {
+	state = [
+		selected = selected,
+		transition = trans_ctrl.value(),
+		max_id = max_id,
+		live_x = live_x,
+		live_y = live_y,
+		positions = [],
+	];
+
+	for(i = 0; i < entries.size(); i++) {
+		rec = entries[i];
+		state.positions.push_back([
+			id = rec.id,
+			name = rec.name,
+			x = rec.x,
+			y = rec.y,
+			in_x = rec.in_x,
+			in_y = rec.in_y,
+			str_x = rec.str_x,
+			str_y = rec.str_y,
+			rel = rec.rel,
+		]);
+	}
+
+	return state;
+}
+
+load_state(state) {
+	if(!state)
+		return;
+
+	if(state.has("transition"))
+		trans_ctrl.value(state.transition, false, false);
+	if(state.has("max_id"))
+		max_id = state.max_id;
+
+	entries = [];
+	if(state.has("positions")) {
+		for(i = 0; i < state.positions.size(); i++) {
+			p = state.positions[i];
+			id = (p.has("id")) ? p.id : (i + 1);
+
+			rec = [];
+			rec.id = id;
+			rec.name = (p.has("name")) ? p.name : ("Pos " + std.string(id));
+			rec.x = (p.has("x")) ? std.float(p.x) : 50.0;
+			rec.y = (p.has("y")) ? std.float(p.y) : 50.0;
+			rec.in_x = (p.has("in_x")) ? std.float(p.in_x) : 0.0;
+			rec.in_y = (p.has("in_y")) ? std.float(p.in_y) : 0.0;
+			rec.str_x = (p.has("str_x")) ? std.float(p.str_x) : 1.0;
+			rec.str_y = (p.has("str_y")) ? std.float(p.str_y) : 1.0;
+			rec.rel = false;
+			if(p.has("rel"))
+				rec.rel = p.rel != 0;
+			rec.pending_remove = 0;
+
+			entries.push_back(rec);
+			if(id > max_id)
+				max_id = id;
+		}
+	}
+
+	if(entries.size() == 0) {
+		add_position("Pos 1");
+		return;
+	}
+
+	sel = state.has("selected") ? state.selected : 0;
+	if(sel < 0)
+		sel = 0;
+	if(sel >= entries.size())
+		sel = entries.size() - 1;
+	selected = sel;
+
+	rebuild_list();
+
+	rec = entries[selected];
+	live_x = rec.x;
+	live_y = rec.y;
+	from_x = rec.x;
+	from_y = rec.y;
+	trans_active = false;
+
+	push_live_sliders();
+	refresh_outputs();
+}

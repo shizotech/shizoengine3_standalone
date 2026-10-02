@@ -64,15 +64,15 @@ void mainImage( out vec4 fragColor, in vec2 p )
 		float sensitivity = 0.2;
 
 		float chromaValue;
-		if(BLEND == 4) chromaValue = c2.r; // RED
-		if(BLEND == 5) chromaValue = c2.g; // GREEN
-		if(BLEND == 6) chromaValue = c2.b; // BLUE
+		if(BLEND == 6) chromaValue = c2.r; // RED
+		if(BLEND == 7) chromaValue = c2.g; // GREEN
+		if(BLEND == 8) chromaValue = c2.b; // BLUE
 
 		// Find the max of the non-chroma channels
 		float otherMax;
-		if(BLEND == 4) otherMax = max(c2.g, c2.b);
-		if(BLEND == 5) otherMax = max(c2.r, c2.b);
-		if(BLEND == 6) otherMax = max(c2.r, c2.g);
+		if(BLEND == 6) otherMax = max(c2.g, c2.b);
+		if(BLEND == 7) otherMax = max(c2.r, c2.b);
+		if(BLEND == 8) otherMax = max(c2.r, c2.g);
 
 		// Determine mask where chroma color is significantly dominant
 		float alpha = smoothstep(threshold, threshold + sensitivity, chromaValue - otherMax);
