@@ -95,6 +95,7 @@ If it was not retrieved via `shizoscript_docs`, it does NOT exist.
 The following are COMMON hallucinations and MUST NEVER appear unless explicitly verified:
 
 - print() (without namespace)
+- std.len() exists, bare len() does not
 - console.log
 - len()
 - map(), filter(), reduce()
@@ -176,7 +177,7 @@ class App
         std.print("Hello from class!");
     }
     
-    __deinit()__ {
+    __deinit__() {
         
     }
 }
@@ -411,7 +412,7 @@ math.sqrt(2);
 
 ## 15. Truthiness
 
-- `0`, `None`, `""` = false
+- `0`, `None`, `""`, `[]` = false
 - everything else = true
 
 ---
@@ -486,6 +487,20 @@ Before generating code:
 - [ ] Only `for` loops used
 - [ ] No `{}` for data
 - [ ] No invalid operators
+
+---
+
+## 21. Runtime Pitfalls
+
+- Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed.
+- `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
+- Integer division truncates (`7 / 2 == 3`).
+- Division by zero currently returns `0` (`x / 0 == 0`).
+- `math.mod(-1, 4) == -1`.
+- Mixed-type comparisons may coerce unexpectedly; keep both sides the same type.
+- `std.error(...)` logs an error message and does not throw.
+- `std.warn(...)` logs a warning message and does not throw.
+- `std.runtime_error(...)` raises a runtime error (throws).
 
 ---
 
@@ -581,7 +596,8 @@ class App
 ## Rules & Constraints
 
 - Capture list `[]` is REQUIRED (cannot be omitted)
-- No implicit captures — EVERYTHING must be explicitly listed
+- Lambda capture lists are explicit, but globals can still be read without listing them.
+- Capturing JSON/object values keeps shared references; mutating captured data mutates the original value.
 - Reference captures (`&var`) must be used with extreme caution
 - Lambdas follow normal function syntax rules:
   - Semicolons required
@@ -702,4 +718,3 @@ Note that due to shizoscript's dynamic type system it might be necessary to util
 If you did not explicitly verify it:
 
 → IT DOES NOT EXIST
-
