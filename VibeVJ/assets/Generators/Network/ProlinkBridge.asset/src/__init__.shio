@@ -1,0 +1,223 @@
+// ProlinkBridge generator
+// CDJ data (Pioneer Pro DJ Link) straight from the prolink-bridge ESP32 over USB,
+// no bridge.py, no Art-Net. Needs the native module 'prolink' (shzmodule_prolink).
+//
+// - TIMELINE BPM SYNC locks the VibeVJ timeline to the tempo master deck (like the audio analysis),
+//   BAR LOCK also puts timeline positions 0, 4, 8 ... on the downbeat.
+// - The output controls follow the tempo master deck and can be linked like any other control.
+// - LOW / MID / HIGH follow the waveform of the master deck at the playhead.
+// - SOURCE "DEMO" replays a recorded DJ set (demo/demo_set.jsonl), no hardware needed.
+//
+// Firmware, protocol and wiring: https://github.com/shizotech/prolink-bridge
+import nanogui;
+import prolink;
+
+using eigen;
+
+managed device = None;
+
+status = None;
+sync = None;
+bar_lock = None;
+source = None;
+port_text = None;
+phase_offset = None;
+pulse_ms = None;
+
+bpm = None;
+beat = None;
+bar = None;
+beat_pulse = None;
+downbeat_pulse = None;
+cue_beats = None;
+cue_ramp = None;
+drop_pulse = None;
+progress = None;
+playing = None;
+on_air = None;
+master_deck = None;
+low = None;
+mid = None;
+high = None;
+
+demo_path = "";
+open_source = -1;
+open_port = "";
+
+// Wall-clock (ms) of the last master beat / downbeat / memory cue
+last_beat_ms = -100000.0;
+last_downbeat_ms = -100000.0;
+last_drop_ms = -100000.0;
+status_text = "";
+
+dispatcher(generator, cmd, value) {
+
+}
+
+open_device() {
+	open_source = source.value();
+	open_port = port_text.value();
+
+	device.close();
+	if(open_source == 1)
+		device.replay(demo_path, 1.0, true);
+	else
+		device.open(open_port);
+}
+
+wrap_phase(p) {
+	p = p + phase_offset.value();
+	if(p >= 1.0)
+		p -= 1.0;
+	if(p < 0.0)
+		p += 1.0;
+	return p;
+}
+
+pulse(since_ms) {
+	if(since_ms >= 0 && since_ms < pulse_ms.value())
+		return 1.0;
+	return 0.0;
+}
+
+set_status(text) {
+	if(text != status_text) {
+		status_text = text;
+		status.text(text);
+	}
+}
+
+entry(generator, area) {
+	generator.window.fixed_size(vec2f(420, 560));
+
+	top_area = area.vscroll().anchor(0).anchor_bottom(0);
+	area = top_area.content().layout(nanogui.layout_vertical());
+
+	status = area.label("Not connected").fixed_height(24);
+
+	sync = area.controlbutton("TIMELINE BPM SYNC").push(1).value(1);
+	bar_lock = area.controlbutton("BAR LOCK").push(1).value(1);
+
+	bpm = area.controlfloat("BPM").max(999);
+	beat = area.controlslider("BEAT");
+	bar = area.controlslider("BAR");
+	beat_pulse = area.controlslider("BEAT PULSE");
+	downbeat_pulse = area.controlslider("DOWNBEAT PULSE");
+
+	cue_cnt = area.collapsable("Cue / Drop").content().layout(nanogui.layout_vertical());
+	cue_beats = cue_cnt.controlfloat("BEATS TO CUE").min(-1).max(256);
+	cue_ramp = cue_cnt.controlslider("CUE RAMP");
+	drop_pulse = cue_cnt.controlslider("DROP PULSE");
+
+	deck_cnt = area.collapsable("Deck").content().layout(nanogui.layout_vertical());
+	progress = deck_cnt.controlslider("PROGRESS");
+	playing = deck_cnt.controlslider("PLAYING");
+	on_air = deck_cnt.controlslider("ON AIR");
+	master_deck = deck_cnt.controlfloat("MASTER DECK").max(64);
+
+	// Bass, mids and highs of the waveform at the playhead: like an audio analysis, without an audio line
+	level_cnt = area.collapsable("Levels").content().layout(nanogui.layout_vertical());
+	low = level_cnt.controlslider("LOW");
+	mid = level_cnt.controlslider("MID");
+	high = level_cnt.controlslider("HIGH");
+
+	settings = area.collapsable("Settings").content().layout(nanogui.layout_vertical());
+	source = settings.controlcombo("SOURCE");
+	source.items(["USB", "DEMO"]);
+	port_text = settings.controltext("PORT (empty = auto)").value("");
+	phase_offset = settings.controlslider("Phase offset").min(-0.5).max(0.5).value(0.0);
+	pulse_ms = settings.controlfloat("Pulse ms").min(10).max(1000).value(100);
+
+	demo_path = generator.path + "/demo/demo_set.jsonl";
+
+	device = prolink.device();
+	open_device();
+}
+
+update(generator, tl_pos, pos_delta) {
+	if(!device)
+		return;
+
+	// Source or port changed (also after loading a project)
+	if(source.value() != open_source || port_text.value() != open_port)
+		open_device();
+
+	now = std.millis();
+
+	// Beats and memory cues of the master deck. ageMs = how long ago it happened.
+	events = device.events();
+	for(i = 0; i < events.size(); i++) {
+		e = events[i];
+		if(e.type == "beat" && e.master) {
+			last_beat_ms = now - e.ageMs;
+			if(e.bb == 1)
+				last_downbeat_ms = now - e.ageMs;
+		}
+		else if(e.type == "cue" && e.master) {
+			last_drop_ms = now - e.ageMs;
+		}
+	}
+
+	beat_pulse.value(pulse(now - last_beat_ms));
+	downbeat_pulse.value(pulse(now - last_downbeat_ms));
+	drop_pulse.value(pulse(now - last_drop_ms));
+
+	m = device.master();
+
+	if(!m) {
+		playing.value(0);
+		master_deck.value(0);
+		if(device.connected())
+			set_status("Connected, no tempo master");
+		else if(device.error())
+			set_status(device.error());
+		else
+			set_status("Connecting...");
+		return;
+	}
+
+	bpm.value(m.effectiveBpm);
+	beat.value(wrap_phase(m.beatPhase));
+	bar.value(m.barPhase);
+	cue_beats.value(m.beatsToCue);
+	cue_ramp.value(m.cueRamp);
+	playing.value(m.playing ? 1 : 0);
+	on_air.value(m.onAir ? 1 : 0);
+	master_deck.value(m.n);
+	low.value(m.low);
+	mid.value(m.mid);
+	high.value(m.high);
+
+	// Track length: CDJ-3000 position packets, else the metadata
+	length_ms = m.lengthS * 1000.0;
+	title = "Deck " + std.string(m.n);
+	track = m.track;
+	if(track) {
+		if(track.dur)
+			length_ms = track.dur * 1000.0;
+		if(track.title)
+			title = title + ": " + track.title;
+		if(track.artist)
+			title = title + " - " + track.artist;
+	}
+	set_status(title);
+
+	// Position is only known for CDJ-3000 (None otherwise)
+	if(m.positionMs) {
+		if(length_ms > 0)
+			progress.value(math.clamp(m.positionMs / length_ms, 0.0, 1.0));
+	}
+
+	// Only follow a running deck: a stopped one has no phase, the timeline then runs freely
+	if(sync.value() && m.playing && m.effectiveBpm > 0) {
+		timeline = std.global("timeline");
+		timeline.set_bpm(m.effectiveBpm);
+		if(bar_lock.value() && m.beatInBar > 0) {
+			// Phase offset is in beats, the bar has 4
+			bar_phase = math.fract(m.barPhase + phase_offset.value() / 4.0);
+			timeline.nudge_bar(bar_phase, 4, true);
+		}
+		else
+			timeline.lock_position(wrap_phase(m.beatPhase));
+	}
+}
