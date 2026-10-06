@@ -16,6 +16,7 @@ uniform vec4 play1;   // detail column at the playhead, progress 0..1, master, o
 uniform vec4 play2;
 uniform vec4 play3;
 uniform vec4 play4;
+uniform vec4 pstyle;  // style of the preview waveform per deck (x = deck 1 ...), may differ from the detail
 uniform float decks;  // 1..4
 uniform float zoom;   // detail columns across a lane (150 per second)
 
@@ -48,6 +49,7 @@ vec4 fetch(int d, ivec2 p)
 
 vec4 info(int d) { return d == 0 ? info1 : d == 1 ? info2 : d == 2 ? info3 : info4; }
 vec4 play(int d) { return d == 0 ? play1 : d == 1 ? play2 : d == 2 ? play3 : play4; }
+float preview_style(int d) { return d == 0 ? pstyle.x : d == 1 ? pstyle.y : d == 2 ? pstyle.z : pstyle.w; }
 
 vec4 detail_px(int d, int c)          { return fetch(d, ivec2(c % 4096, c / 4096)); }
 vec4 detail_mk(int d, int c, int rows) { return fetch(d, ivec2(c % 4096, rows + c / 4096)); }
@@ -106,8 +108,10 @@ vec3 draw_lane(int d, vec2 p, vec2 size, vec3 color)
 	color = mix(color, w.rgb, w.a);
 
 	// Beats (ticks at the edges, downbeats red) and cues (full line in the cue color)
-	float wide0 = col - LW * cols_per_px, wide1 = col + LW * cols_per_px;
-	for (int k = int(ceil(wide0)); k < int(ceil(wide1)) && k < int(ceil(wide0)) + 8; k++)
+	// At most 8 columns around the pixel centre (zoomed out there would be hundreds, and a window starting
+	// at the left edge would miss the markers that belong to this pixel)
+	float r = min(LW * cols_per_px, 4.0);
+	for (int k = int(ceil(col - r)); k < int(ceil(col + r)); k++)
 	{
 		if (k < 0 || k >= count)
 			continue;
@@ -143,13 +147,14 @@ vec3 draw_panel(int d, vec2 p, vec2 size, vec3 color)
 		return color;
 	}
 
-	if (inf.w < 0.5 || count <= 0)
+	float ps = preview_style(d);
+	if (ps < 0.5 || count <= 0)
 		return color * 0.8;
 
 	// Preview: bars from the bottom over the whole track
 	vec2 q = vec2(p.x / size.x, (p.y - head) / (size.y - head));
 	int c = clamp(int(q.x * float(count)), 0, count - 1);
-	vec4 w = wave(preview_px(d, c, rows), inf.w, 1.0 - q.y);
+	vec4 w = wave(preview_px(d, c, rows), ps, 1.0 - q.y);
 	vec3 wc = w.rgb;
 	if (q.x < pl.y)
 		wc *= 0.45; // already played

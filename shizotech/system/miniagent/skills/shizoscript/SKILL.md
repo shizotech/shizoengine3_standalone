@@ -285,16 +285,44 @@ ref = &x;
 *ref = 10;
 ```
 
+Function and method parameters can be passed by reference with `&` (named functions, methods and lambdas):
+
+```
+inc(&v) { v++; }
+w = 5;
+inc(w);          // w is now 6
+
+both(a, &b) { a++; b++; }   // a by value, b by reference
+```
+
 ---
 
 ## 6. Operators
 
 Standard arithmetic, logical, comparison.
 
+```
++ - * / %            // arithmetic, % = modulo (C semantics for ints: -7 % 3 == -1, fmod for floats: 7.5 % 2 == 1.5)
+& | ^ ~              // bitwise and, or, xor, not (~5 == -6)
+== != < <= > >=      // comparison
+&& || !              // logical
+a ? b : c            // ternary, right-associative: "a ? b : c ? d : e" means "a ? b : (c ? d : e)"
+a ?? b               // b if a is falsy (see Runtime Pitfalls)
+++ --
+= += -= *= /= %= &= |= ^=
+```
+
+- Compound assignments evaluate their left-hand side only once: `l[i++] += 5` increments `i` once and reads/writes the same element, `get().count += 1` calls `get()` once.
+- Compound assignments also work on index and member expressions (`l[0] %= 3`, `cfg.count += 1`).
+
 NOT AVAILABLE:
 ```
-<< >> %= &= |= ^=
+<< >> <<= >>= **
 ```
+
+Syntax errors (the script does not compile):
+- Leftover tokens after an expression: `std.print(1 + 2 3);`
+- A missing `;` between two statements: `x = 1` followed by `y = 2;` on the next line.
 
 ---
 
@@ -318,6 +346,28 @@ add(a, b)
 }
 ```
 
+- By-reference parameters: `inc(&v) { v++; }` (see References).
+- Functions are values. Script functions, builtin namespace functions and bound methods can be stored in a variable and called through it:
+
+```
+f = std.string;
+f(5);            // "5"
+
+s = "abc";
+up = s.uppercase;
+up();            // "ABC" (the bound method keeps its object)
+```
+
+- Builtin functions are NOT accepted as callbacks where a script function is expected (e.g. `list.foreach(std.print)`); wrap them in a lambda instead.
+- `noexcept` functions and methods: a runtime error inside them does not propagate, the function returns `None` and the caller continues.
+
+```
+safe() noexcept { n = None; n.foo(); return 5; }
+safe();          // None
+```
+
+- Recursion depth is limited (100000 nested calls on hosts, 512 on microcontrollers). Exceeding it raises the runtime error `maximum call depth of N exceeded (endless recursion?)`, which `try`/`catch` can handle.
+
 ---
 
 ## 9. Classes
@@ -338,8 +388,100 @@ class Player
 }
 ```
 
-There is no inheritance in shizoscript yet.
-Classes work perfectly fine but not all common object-oriented class functionalities are implemented yet.
+Methods can be called directly on temporaries: `Vec2(1, 2).str()`.
+
+### 9.1 Inheritance, virtual methods, `super`
+
+```
+class Animal
+{
+    name = "animal";
+    private secret = 42;               // only accessible from Animal and derived classes
+
+    __init__(name) { this.name = name; }
+    speak() { return "..."; }
+    describe() { return name + " says " + speak(); }   // calls the most derived speak()
+    private helper() { return secret; }
+}
+
+class Bird : Animal                    // members, methods, __init__, __deinit__ and operators are inherited
+{
+    legs = 2;                          // new member (or redefined default of an inherited one)
+
+    __init__(name) { super.__init__(name); }
+    speak() { return "Tweet, not " + super.speak(); }   // override, super calls the base implementation
+}
+```
+
+- Every method is virtual: calls are resolved by name on the actual object, so base class code calls overrides. There is NO `virtual` / `override` keyword.
+- `super.method(...)` calls the implementation of the nearest base class (`super.__init__(...)`, `super.__deinit__()`, `super.__add__(o)`, ...).
+- Base constructors / destructors are NOT called automatically, call `super.__init__(...)` yourself.
+- The base class has to be defined before the derived class.
+- `private` (members and methods): accessible from code of the class and of its base / derived classes, including other instances (`o.secret` inside a method works). Access from anywhere else is a runtime error (`member 'secret' of class 'Dog' is private`). Everything else is `public` (default, the keyword is accepted too).
+
+### 9.2 Several base classes (interfaces / mixins), abstract methods
+
+```
+class Comparable                       // an interface / mixin
+{
+    abstract key() {}                  // declared here, the final class implements it
+    __lt__(o) { return key() < o.key(); }
+}
+
+class Printable
+{
+    abstract key() {}
+    str() { return "<" + std.string(key()) + ">"; }
+}
+
+class Num : Comparable, Printable      // several bases
+{
+    v = 0;
+    __init__(v) { this.v = v; }
+    key() { return v; }
+}
+
+Num(1) < Num(2);                       // 1
+std.instanceof(Num(1), Comparable);    // true (also by name: std.instanceof(x, "Comparable"))
+Comparable();                          // runtime error: abstract method 'key' is not implemented
+```
+
+- Resolution order like Python: the first base wins (`class AB : A, B` uses `A.m()` if both define `m`), a base shared by several bases (diamond) exists once, `super.method()` calls the next class in that order.
+- `abstract name(params) {}` declares a method without implementation (the body MUST be empty). A class with unimplemented abstract methods (own or inherited) cannot be instantiated; `super` cannot call an abstract method.
+- `std.instanceof(value, Class)` is true for the class itself and all direct and indirect bases. `std.is_class(value, Class)` checks the exact class only.
+
+### 9.3 Operator overloading
+
+Classes overload operators with dunder methods:
+
+| Operator | Method | Reflected (object on the right) |
+|---|---|---|
+| `+ - * / %` | `__add__ __sub__ __mul__ __div__ __mod__` | `__radd__ __rsub__ __rmul__ __rdiv__ __rmod__` |
+| `& \| ^` | `__and__ __or__ __xor__` | `__rand__ __ror__ __rxor__` |
+| `== != < <= > >=` | `__eq__ __ne__ __lt__ __le__ __gt__ __ge__` | |
+| unary `-` | `__neg__` | |
+| `obj[key]` | `__getitem__(key)` | |
+| `obj[key] = value` | `__setitem__(key, value)` | |
+
+```
+class Vec2
+{
+    x = 0;
+    y = 0;
+    __init__(x, y) { this.x = x; this.y = y; }
+    __add__(o) { return Vec2(x + o.x, y + o.y); }
+    __rmul__(k) { return Vec2(k * x, k * y); }   // 2 * v
+    __eq__(o) { return x == o.x && y == o.y; }
+}
+
+v = Vec2(1, 2) + Vec2(3, 4);
+w = 2 * v;
+v += Vec2(1, 1);                       // compound assignments use the binary method
+```
+
+- Comparison results are normalized to `0` / `1`. `!=` falls back to the negated `__eq__`, `a > b` to `b.__lt__(a)`.
+- Without operator methods `==` compares identity and arithmetic is a runtime error naming the missing method.
+- `obj[key]` / `obj[key] = value` (also `+=` etc.): keys that name a member of the class still access that member. For any other key, and for `obj.name` when `name` is not a member, `__getitem__` is called (only if the class defines it). `this[i]` works inside the class.
 
 ---
 
@@ -367,6 +509,10 @@ std.print(complex_json.children[0].name) // -> "Child 1"
 
 NEVER use `{}` for data.
 
+Member access on non-containers:
+- Assigning through a member or index creates the JSON object: `cfg = None; cfg.window.width = 800;` creates the nested objects. This also turns a number into a JSON object (`n = 0; n["a"]["b"] = 1;`).
+- READING a member of an `int`, `float` or function is a runtime error (`type 'int' has no member 'foo'`) and leaves the variable unchanged.
+
 Checklist:
 - `{}` becomes `[]`
 - Keys do not need to be escaped with quotes ("") but they are still treated like key-strings internally and do NOT refer to local variables.
@@ -388,7 +534,11 @@ math.sqrt(2);
 
 ```
 #define MAX 100
+#include "helper"
 ```
+
+- A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.
+- A file reached through different relative paths is included only once.
 
 ---
 
@@ -397,8 +547,13 @@ math.sqrt(2);
 ```
 42
 3.14
-0xFF
+3.5f      // float with "f" suffix
+0xFF      // hex
+0b1010    // binary
+0o17      // octal
 ```
+
+- Integers are 64 bit. An integer literal that does not fit is a syntax error.
 
 ---
 
@@ -495,8 +650,9 @@ Before generating code:
 - Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed.
 - `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
 - Integer division truncates (`7 / 2 == 3`).
-- Division by zero currently returns `0` (`x / 0 == 0`).
-- `math.mod(-1, 4) == -1`.
+- Division by zero currently returns `0` (`x / 0 == 0`). Modulo by zero logs a warning and returns `0`.
+- `-1 % 4 == -1` and `math.mod(-1, 4) == -1` (sign follows the left operand, like C).
+- Endless recursion raises a runtime error once the call depth limit is reached (see Functions).
 - Mixed-type comparisons may coerce unexpectedly; keep both sides the same type.
 - `std.error(...)` logs an error message and does not throw.
 - `std.warn(...)` logs a warning message and does not throw.
@@ -504,7 +660,27 @@ Before generating code:
 
 ---
 
-## Syntax
+## 22. Error Handling
+
+```
+try {
+    n = None;
+    n.foo();
+} catch(e) {
+    std.print(e);   // plain message, e.g. "not a function!"
+}
+```
+
+- `catch` runs only when the `try` block raised a runtime error (not for earlier, non-fatal errors).
+- `catch(e)` receives the plain error message. Errors caught by a `try` are not printed as a full error report.
+- An error inside a `catch` block propagates to the next outer `try`.
+- Errors while evaluating call arguments are catchable too (`try { f(n.foo()); } catch(e) {}`).
+- `noexcept` functions turn an error into a `None` return value (see Functions).
+- `std.runtime_error("...")` raises an error; `std.error(...)` / `std.warn(...)` only log.
+
+---
+
+# Lambda Syntax
 
 ```
 fn = [capture_list]() {
@@ -650,7 +826,10 @@ Before using a lambda:
 
 ```
 shz file_name
+shz --check file_name    // syntax check only
 ```
+
+- The process exits with code `1` after an uncaught runtime error in the main script (errors caught by `try`/`catch` do not count).
 
 ---
 

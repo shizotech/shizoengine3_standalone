@@ -10,9 +10,10 @@ Network generators enable communication with external devices and systems over n
 
 | Component | Description |
 |-----------|-------------|
-| **artnet_receiver.asset** | Artnet protocol receiver |
-| **artnet_sender.asset** | Artnet protocol sender |
-| **spout_receiver.asset** | Spout2 protocol receiver |
+| **ArtnetReceiver.asset** | Artnet protocol receiver |
+| **ArtnetSender.asset** | Artnet protocol sender |
+| **SpoutReceiver.asset** | Spout2 protocol receiver |
+| **NDIReceiver.asset** | NDI video receiver |
 | **ProlinkBridge.asset** | CDJ tempo, beats, memory cues and track titles from the prolink-bridge ESP32 over USB; syncs the timeline |
 | **ProlinkDecks.asset** | Deck view of the CDJs like ShowKontrol (titles, BPM, time, preview and scrolling detail waveforms with beat grid and cues) as video output, plus per-deck controls for effects |
 
@@ -34,7 +35,7 @@ Network generators enable communication with external devices and systems over n
 - Reads Pioneer Pro DJ Link data from the [prolink-bridge](https://github.com/shizotech/prolink-bridge) ESP32-P4 directly over USB (native module `prolink`, see `shzmodule_prolink/README.md` in the source repo)
 - **TIMELINE BPM SYNC** locks the timeline to the tempo master deck, like the audio analysis does
 - Outputs of the master deck: BPM, BEAT and BAR phase, BEAT PULSE, DOWNBEAT PULSE, BEATS TO CUE, CUE RAMP (build-up over 16 beats), DROP PULSE (memory cue reached), PROGRESS, PLAYING, ON AIR, MASTER DECK
-- **SOURCE** `USB` finds the ESP32 by itself (or set **PORT**), `DEMO` replays a recorded two-deck set without hardware
+- **SOURCE** `USB` finds the ESP32 by itself (or set **PORT**), `DEMO` replays a recorded two-deck set without hardware, `NETWORK` takes the data from a relay ESP32 in the light/VJ network over ShizoNet (the listener ESP32 stays in the DJ network, see prolink-bridge `docs/relay-und-audio.md`)
 - **Phase offset** shifts BEAT and the timeline lock to compensate output latency
 - **BAR LOCK** also puts timeline positions 0, 4, 8 ... on the downbeat of the master deck
 - **LOW / MID / HIGH**: bass, mids and highs of the master deck's waveform at the playhead, usable like an audio analysis without an audio line

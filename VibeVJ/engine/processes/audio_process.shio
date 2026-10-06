@@ -11,10 +11,64 @@ managed ipc_handle_in = ipc.ipc();
 
 ipc_check_timeout = 0;
 
+// argv(2) == "external": no sound card, the parent sends the samples ("pcm" messages), e.g. the
+// microphone or line-in of a prolink-bridge ESP32 (USB or ShizoNet)
+external = false;
+if(std.argc() > 2)
+	external = std.argv(2) == "external";
+external_rate = 0;
+WAVEFORM_SIZE = 512; // the parent's texture is 512 wide
+
 ipc_handle.connect(std.argv(1), false);
 ipc_handle_in.connect(std.argv(1) + "_in", true);
 
+send_info = [](input_buffer){
+	waveform = input_buffer.as_mono_list();
+	if(waveform.size() < WAVEFORM_SIZE && waveform.size() > 0) {
+		// Shorter periods (external audio at 16/24 kHz): stretch to the texture width
+		stretched = [];
+		for(i = 0; i < WAVEFORM_SIZE; i++)
+			stretched.push_back(waveform[std.int(i * waveform.size() / WAVEFORM_SIZE)]);
+		waveform = stretched;
+	}
+	if(!ipc_handle.send([
+		type="info",
+		bpm=analyzer.bpm(),
+		phase=analyzer.phase(),
+		cum_score=analyzer.cum_score(),
+		break_detected = analyzer.break_detected(),
+		normalized_bands = fft.normalized_bands(),
+		band_ema = fft.band_ema(),
+		waveform = waveform,
+		energy = [fft.low_energy(), fft.mid_energy(), fft.high_energy()],
+	])) {
+		std.print("IPC timeout.");
+		std.exitprocess(0);
+	}
+};
+
 ipc_handle_in.on_message([](msg) {
+	
+	if(msg.type == "pcm") {
+		if(!external)
+			return;
+		// Same time resolution as a sound card at 48 kHz with 512 frames
+		if(msg.rate != external_rate) {
+			external_rate = msg.rate;
+			period = 512;
+			if(msg.rate < 44100)
+				period = 256;
+			audio.start_external(send_info, [sampleRate=msg.rate, periodSize=period]);
+		}
+		audio.feed(msg.data); // binary int16 little-endian mono
+		return;
+	}
+	
+	ipc_check_timeout = std.millis();
+	
+	// External audio: the analyzer only exists after the first samples (they bring the sample rate)
+	if(external && !external_rate)
+		return;
 	
 	analyzer.set_tempo(msg.fix_bpm);
 	analyzer.break_treshold(msg.break_treshold);
@@ -28,8 +82,6 @@ ipc_handle_in.on_message([](msg) {
 	
 	fft.low_cutoff(msg.low_cutoff);
 	fft.high_cutoff(msg.high_cutoff);
-	
-	ipc_check_timeout = std.millis();
 });
 	
 
@@ -39,25 +91,10 @@ analyzer.on_beat([](){
 	]);
 });
 
-audio.start(None, [](input_buffer){
-	if(!ipc_handle.send([
-		type="info",
-		bpm=analyzer.bpm(),
-		phase=analyzer.phase(),
-		cum_score=analyzer.cum_score(),
-		break_detected = analyzer.break_detected(),
-		normalized_bands = fft.normalized_bands(),
-		band_ema = fft.band_ema(),
-		waveform = input_buffer.as_mono_list(),
-		energy = [fft.low_energy(), fft.mid_energy(), fft.high_energy()],
-	])) {
-		std.print("IPC timeout.");
-		std.exitprocess(0);
-	}
-},
-[
-	periodSize=512,
-]);
+if(!external)
+	audio.start(None, send_info, [
+		periodSize=512,
+	]);
 
 for(1) {
 	if(ipc_check_timeout && (std.millis() - ipc_check_timeout > 1000 * 3))

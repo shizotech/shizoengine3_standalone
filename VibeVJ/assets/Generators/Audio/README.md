@@ -15,7 +15,7 @@ Audio generators analyze audio input and convert it into parameters that can dri
 ## Audio Input Analysis
 
 The `AudioInputAnalysis.asset` generator provides:
-- Audio input source selection
+- Audio input source selection (**SOURCE**): `LOCAL` = sound card, `ESP32 USB` = microphone or line-in of a prolink-bridge ESP32 on USB, `ESP32 NETWORK` = the same from a relay ESP32 over ShizoNet. For the ESP32 the analysis subprocess gets the samples instead of opening the sound card (firmware command `audio mic|line`, see prolink-bridge `docs/relay-und-audio.md`)
 - Frequency analysis (FFT)
 - Amplitude detection
 - Feature extraction for reactive visuals

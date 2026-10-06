@@ -1,6 +1,13 @@
 
+// Audio analysis (beat, BPM, FFT, energy) of the sound card input, or of the audio a prolink-bridge
+// ESP32 sends (onboard microphone or line-in, firmware command "audio mic|line"):
+//   SOURCE "ESP32 USB":     the ESP32 on USB (shares the port with the Prolink generators)
+//   SOURCE "ESP32 NETWORK": a relay ESP32 in the network over ShizoNet (the prolink module receives it)
+// The analysis runs in a subprocess (engine/processes/audio_process.shio); for the ESP32 it gets
+// the samples over ipc instead of opening the sound card.
 import subprocess;
 import ipc;
+import prolink;
 
 using eigen;
 
@@ -10,6 +17,23 @@ managed ipc_handle = None;
 managed ipc_handle_in = None;
 
 ipc_name = "shizoserver_" + std.random_hash();
+
+SOURCE_LOCAL = 0;
+SOURCE_ESP_USB = 1;
+SOURCE_ESP_NETWORK = 2;
+
+managed esp = None;      // prolink connection for SOURCE "ESP32 USB"
+audio_source = -1;       // source the subprocess was started for
+source_ctrl = None;
+esp_port = None;
+esp_status = None;
+esp_status_text = "";
+net_origin = 0;          // 1 = listener behind the relay, 2 = relay; the first one wins until it stops
+net_last_ms = 0;
+last_audio_ms = 0;
+last_audio_rate = 0;
+pcm_paused_until = 0;    // ipc queue full (analysis not reading): don't block the UI with more sends
+MAX_PCM_PER_FRAME = 12;  // older chunks after a stall are dropped (stale for beat tracking anyway)
 
 dispatcher(generator, cmd, value) {
 	
@@ -39,6 +63,8 @@ restart_audio_process() {
 				"engine.processes.audio_process",
 				ipc_name,
 			];
+			if(audio_source != SOURCE_LOCAL)
+				args.push_back("external");
 
 			audio_process = subprocess.process();
 			audio_process.terminate_on_destroy(true);
@@ -49,6 +75,98 @@ restart_audio_process() {
 		}
 		catch(e) {}
 	}	
+}
+
+set_esp_status(text) {
+	if(esp_status && text != esp_status_text) {
+		esp_status_text = text;
+		esp_status.text(text);
+	}
+}
+
+// Samples for the subprocess: binary int16 little-endian mono, as delivered by prolink
+send_pcm(rate, data) {
+	// Only while the analysis runs: during a restart nobody reads the queue, and every send would block
+	if(!ipc_handle_in || !audio_process || audio_process.exited())
+		return;
+	if(pcm_paused_until && std.millis() < pcm_paused_until)
+		return;
+	ok = ipc_handle_in.send([
+		type = "pcm",
+		rate = rate,
+		data = data,
+	]);
+	if(!ok) {
+		pcm_paused_until = std.millis() + 2000;
+		return;
+	}
+	pcm_paused_until = 0;
+	last_audio_ms = std.millis();
+	last_audio_rate = rate;
+}
+
+// Source changed (also after loading a project): restart the subprocess with or without sound card
+apply_source() {
+	audio_source = source_ctrl.value();
+	esp = None;
+	net_origin = 0;
+	last_audio_ms = 0;
+	if(audio_source == SOURCE_ESP_USB) {
+		esp = prolink.device();
+		esp.open(esp_port.value());
+	}
+	audio_process = None; // terminates the old one
+	restart_timeout = 0;
+	restart_audio_process();
+}
+
+update_esp() {
+	if(audio_source == SOURCE_LOCAL) {
+		set_esp_status("Sound card");
+		return;
+	}
+	
+	if(audio_source == SOURCE_ESP_USB && esp) {
+		chunks = esp.take_audio();
+		first = 0;
+		if(chunks.size() > MAX_PCM_PER_FRAME)
+			first = chunks.size() - MAX_PCM_PER_FRAME;
+		for(i = first; i < chunks.size(); i++)
+			send_pcm(chunks[i].rate, chunks[i].data);
+	}
+	
+	if(audio_source == SOURCE_ESP_NETWORK) {
+		// Listener and relay may both send audio: stay with the first one until it stops for a second
+		now = std.millis();
+		chunks = prolink.take_net_audio();
+		first = 0;
+		if(chunks.size() > MAX_PCM_PER_FRAME * 2)
+			first = chunks.size() - MAX_PCM_PER_FRAME * 2; // two sources possible
+		for(i = first; i < chunks.size(); i++) {
+			c = chunks[i];
+			if(c.source != net_origin) {
+				if(net_origin && now - net_last_ms < 1000)
+					continue;
+				net_origin = c.source;
+			}
+			net_last_ms = now;
+			send_pcm(c.rate, c.data);
+		}
+	}
+	
+	if(last_audio_ms && std.millis() - last_audio_ms < 1000) {
+		via = "USB";
+		if(audio_source == SOURCE_ESP_NETWORK) {
+			via = "relay";
+			if(net_origin == 1)
+				via = "listener via relay";
+		}
+		set_esp_status("ESP32 " + via + ": " + std.string(last_audio_rate / 1000) + " kHz");
+	}
+	else if(audio_source == SOURCE_ESP_USB && esp && !esp.connected())
+		set_esp_status("ESP32 not connected");
+	else
+		set_esp_status("No audio from the ESP32 (firmware: audio mic|line)");
 }
 
 shader_src = R"(
@@ -171,6 +289,10 @@ entry(generator, area) {
 
 	sync = area.controlbutton("TIMELINE BPM SYNC").push(1);
 	
+	source_ctrl = area.controlcombo("SOURCE");
+	source_ctrl.items(["LOCAL", "ESP32 USB", "ESP32 NETWORK"]);
+	esp_status = area.label("Sound card").fixed_height(20);
+	
 	out = area.control("FFT TEXTURE OUT", "output_ctrls");
 
 	bpm = area.controlfloat("BPM").max(999);
@@ -189,6 +311,7 @@ entry(generator, area) {
 	
 	low_energy_cutoff = beat_cnt.controlslider("Low Energy Cutoff").min(20).max(20000).value(250);
 	high_energy_cutoff = beat_cnt.controlslider("High Energy Cutoff").min(20).max(20000).value(4000);
+	esp_port = beat_cnt.controltext("ESP32 PORT (empty = auto)").value("");
 	
 	vars_cnt = area.collapsable("Analysis").content().layout(nanogui.layout_vertical());
 	
@@ -252,6 +375,11 @@ entry(generator, area) {
 		}
 	});
 	
+	audio_source = source_ctrl.value();
+	if(audio_source == SOURCE_ESP_USB) {
+		esp = prolink.device();
+		esp.open(esp_port.value());
+	}
 	restart_audio_process();
 	
 	ipc_handle_in.connect(ipc_name+ "_in", false);
@@ -275,6 +403,10 @@ entry(generator, area) {
 			low_cutoff = low_energy_cutoff.value(),
 			high_cutoff = high_energy_cutoff.value(),
 		]);
+		
+		if(source_ctrl.value() != audio_source)
+			apply_source();
+		update_esp();
 		
 		restart_audio_process();
 		
