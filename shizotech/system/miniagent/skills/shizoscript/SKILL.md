@@ -254,7 +254,7 @@ items = [1,2,3];
 config = [key="val"];
 ```
 
-- No types
+- No types needed (optional type annotations and compile-time checks: see Strict Mode)
 - No `null`, only `None` (also `none`)
 - `true` / `True` = `1`, `false` / `False` = `0`
 - Dynamic typing allowed
@@ -378,7 +378,7 @@ break;
 continue;
 ```
 
-NO `while` (`while(x) { }` is a syntax error with a misleading message: "parameter keywords not supported yet").
+NO `while` and NO `switch`: both are syntax errors (`'while' is not supported, use 'for (condition) { ... }'`). `new Foo()` and `null` are syntax errors too, write `Foo()` and `None`.
 
 ---
 
@@ -676,6 +676,21 @@ for(i = 0; i < 10; i++)
 
 are NOT mistakes, the scopes can be defined by the indentation OR brackets.
 
+Indentation only scopes a body that starts on a NEW line. An unbraced body that starts on the same line
+as the `if` / `else` / `for` / `try` / `catch` is exactly ONE statement (up to its `;`). Everything after it
+is the next statement and runs unconditionally:
+
+```
+if(n <= 1) return n; return 42;      // "return 42;" is NOT part of the if
+if(c) a(); b();                      // b() always runs
+if(c) a(); else b();                 // else on the same line is fine
+for(i = 0; i < 3; i++) n++; done();  // done() runs once, after the loop
+if(c) a();
+	b();                             // NOT part of the if either, the body was already complete
+```
+
+Like in C, an `else` belongs to the nearest `if`: in `if(a) if(b) x(); else y();` the `else` belongs to `if(b)`.
+
 ---
 
 ## 19. Common Mistakes
@@ -707,14 +722,14 @@ Before generating code:
 
 ## 21. Runtime Pitfalls
 
-- Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed.
+- Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed. An unbraced body on the same line as the `if`/`else`/`for` is exactly one statement: in `if(c) a(); b();` only `a()` is conditional (see Indentation vs Brackets).
 - `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
 - Integer division truncates (`7 / 2 == 3`).
 - Division by zero returns `0` (`x / 0 == 0`) and prints a runtime error report (`Division by zero!`, `Modulo by zero!` for `%`). The error is NOT fatal: the script continues and `try`/`catch` does NOT catch it.
 - `-1 % 4 == -1` and `math.mod(-1, 4) == -1` (sign follows the left operand, like C).
 - Endless recursion raises a runtime error once the call depth limit is reached (see Functions).
 - Mixed-type comparisons may coerce unexpectedly (`"5" == 5` is `1`); keep both sides the same type.
-- A method call directly on a JSON literal is a syntax error: `[1,2].size()` does not compile, assign the literal to a variable first.
+- Methods can be called directly on literals: `[1,2].size()`, `"ab".uppercase()`, `[a=1].has("a")`, `[5,6,7][1]`.
 - Variables created inside a block do not exist after it (see Variable Scope).
 - `std.error(...)` logs an error message and does not throw.
 - `std.warn(...)` logs a warning message and does not throw.
@@ -739,6 +754,175 @@ try {
 - Errors while evaluating call arguments are catchable too (`try { f(n.foo()); } catch(e) {}`).
 - `noexcept` functions turn an error into a `None` return value (see Functions).
 - `std.runtime_error("...")` raises an error; `std.error(...)` / `std.warn(...)` only log.
+
+---
+
+## 23. Strict Mode (optional type checks)
+
+Off by default. `#strict` turns on compile-time checks for the rest of the file (`#strict off` / `#strict on` switch it again from that line on). `shz --strict file` does the same for every file. Code without `#strict` compiles and runs exactly as before.
+
+Strict mode only adds compile errors, the program itself is unchanged. `shz --check file` reports them without running anything.
+
+Optional type annotations, C++ style (`type name`), allowed in every file (checked only in strict code):
+
+```
+#strict
+
+int count = 0;
+string? title = None;                 // '?' allows None
+float scale(float v, int? times = None) { return v * 2.0; }
+void log_it(string msg) { std.print(msg); }
+
+class Vec2
+{
+    float x = 0.0;
+    float y = 0.0;
+    __init__(float x, float y) { this.x = x; this.y = y; }
+    Vec2 add(Vec2 o) { return Vec2(x + o.x, y + o.y); }
+}
+
+any loose = 1;                        // 'any' / 'dynamic': not checked
+```
+
+- Types: `int`, `bool` (= int), `float`, `number` (int or float), `string`, `json`, `function`, `any` / `dynamic`, `void` (returns nothing), class and interface names, `list<T>` and `map<T>`.
+- An annotated assignment always declares a NEW variable, like `var`: `for (int i = 0; ...)` does not touch an outer `i`, and `int x = 1; int x = 2;` in the same block is a double definition.
+- Annotations do NOT convert: `float f = 1;` is an error in strict mode (the value would stay an int), write `1.0` or `std.float(x)`.
+- Without annotation a variable / member / return value gets the type of everything assigned to it. Different types (e.g. `x = 1; x = "a";`) make it `any`: not checked, dynamic code stays legal. So does passing it by reference (`f(&p)` parameter, `[&x]` capture, `r = &x`).
+
+Errors in strict code:
+- unknown member / method of a class (unless it defines `__getitem__`) or of a builtin type (`s.lenght()`, `t.rnu()` on a `std.thread`)
+- wrong argument count for functions, methods, lambdas and constructors; wrong argument types for annotated parameters
+- `private` members / methods used outside the class hierarchy, instantiating a class with unimplemented `abstract` methods
+- a method override that cannot be called like the base method (it may add optional parameters, not required ones)
+- values assigned or returned against an annotation, `return;` in a function with a return type, missing return on some path
+- comparing or calculating with a string and a number (`"1" == 1`, `"10" - 1`); `"a" + 5` (concatenation) is allowed
+- `None` in arithmetic or `<`/`>` comparisons, member access on `None` / int / float / functions, `n = None; n.x = 1;` (initialize with `[]` instead)
+- division or modulo by a literal `0`
+
+- `__deinit__` with parameters (the runtime calls it without arguments, also at the end of the script)
+
+Warnings (the code still runs; `shz --strict-errors file` makes them errors):
+- a derived `__init__` that never calls `super.__init__(...)` of a base that has one
+- a number used as a condition (`if (count)`), compare it explicitly (`if (count != 0)`); `bool` values, `T?` values and comparisons are fine
+- `__deinit__` that returns a value (it is never used)
+
+`None` checks for declared `T?`: a value declared with `?` has to be checked before it is used as a `T` (arithmetic, member access, method calls, passing it where `T` is expected). The check is recognized in `if`/`else`, early returns, loop conditions, `&&` / `||` and `? :`. Unannotated variables are not affected.
+
+```
+int length(Node? n) {
+    if (n == None) { return 0; }      // after this line n is a Node
+    return 1 + length(n.next);
+}
+int v = maybe ?? 0;                   // '??' gives a default
+```
+
+- `x != None`, `x == None` (with `else`), `!x`, `x` (truth) and `this.member` are recognized; assigning a value that may be `None` undoes the check.
+
+Interfaces (structural, like Go / TypeScript): an interface lists methods, every class that has them (public, callable with the same arguments, compatible annotated return / parameter types) can be used where the interface is expected. Classes do NOT name the interface.
+
+```
+interface Named { string name() {} }
+interface Shape : Named {              // extends Named
+    float area() {}
+    float scaled(float f) {}
+}
+
+class Square {                         // no ': Shape', having the methods is enough
+    float s = 2.0;
+    float area() { return s * s; }
+    float scaled(float f) { return area() * f; }
+    string name() { return "square"; }
+}
+
+float total(Shape a, Shape b) { return a.area() + b.area(); }
+Shape s = Square();
+```
+
+- The methods have an empty body `{}`, an interface has no members. An interface can only extend interfaces.
+- An interface is only a type: it has no value at runtime, cannot be instantiated and cannot be a base class (all compile errors, also without `#strict`). `interface` is no reserved word.
+- Strict errors: a value whose class lacks a method of the interface (the message names it), calling a method the interface does not have, an interface value stored where a class is expected (use `any` for such a cast).
+
+Element typed containers: `list<T>` (a JSON list of `T`) and `map<T>` (a JSON object whose values are `T`), nested and with `?` too (`list<list<float>>`, `list<int?>`, `map<Vec2>?`).
+
+```
+list<int> ids = [1, 2, 3];
+map<string> names = [a = "Anna", b = "Ben"];
+list<int> evens(int n) { r = []; for (int i = 0; i < n; i++) { r.push(i * 2); } return r; }
+int first = ids[0];                   // reading gives the element type
+```
+
+- Checked in strict code: the elements of a literal (`[1, "a"]` for a `list<int>`, keys in a list literal, missing keys in a map literal), `xs[i] = v`, `m.key = v`, `push` / `push_back` / `push_cyclic` / `insert`, and reads (`xs[i]`, `m.key`, `m["key"]`) have the element type. `list<int>` is not a `list<float>`.
+- A plain `json` (a function result without annotation, `[]` built step by step) can be stored in a `list<T>`: its elements are not known.
+
+Speed: in strict code, arithmetic and comparisons whose operands are typed numbers (annotated or inferred `int` / `float` locals, parameters, globals, class members `x` / `this.x` / `o.x`, and literals) and assignments of them to such variables or to members of `this` (also declarations like `int t = a * b;`) run as one fused instruction instead of one instruction and temporary variable per operand (number loops about 3-4x faster). Method calls `obj.method(...)`, `this.method(...)` and `method(...)` inside a class start the call directly, without creating a bound function variable first (number methods on class members about 2x faster). Annotate parameters (`int fib(int n)`) to get it there; an unannotated parameter is `any`. The result is always the same as without strict mode: when a value is not a number at runtime (a typed function called from dynamic code with a string), or for a zero divisor, the normal instructions run.
+
+---
+
+## 24. Kernels (typed, multi-threaded byte crunching)
+
+For bulk work on bytes (images, audio, histograms, sums) write a `kernel`: a small C-like function with fixed
+types that runs on its own VM directly on the bytes of a `std.buffer`, once for every index of a domain, on all
+cores. Full reference: `docs/kernels.md`.
+
+```
+kernel void gamma(u8* px, const u8* lut) { px[gid] = lut[px[gid]]; }
+kernel i64 total(const i32* a) reduce(+) { return a[gid]; }
+cstruct Pixel { u8 r; u8 g; u8 b; u8 a; }          // = kernel struct, packed
+kernel void gray(Pixel* p) { u8 l = u8((77 * p[gid].r + 150 * p[gid].g + 29 * p[gid].b) >> 8); p[gid].r = l; p[gid].g = l; p[gid].b = l; }
+
+px = std.buffer();
+px.resize(n);
+launch gamma(px, lut) : n;                   // or gamma.launch(n, px, lut)
+sum = total.launch(count, ints);             // reduction result
+job = gamma.launch_async(n, px, lut);        // or: launch async gamma(px, lut) : n
+job.wait();
+blur.launch([width, height], src, dst);      // 2D domain: gid_x, gid_y
+```
+
+- Kernel declarations only at the top level of a file, ABOVE the code that uses them. Entry kernels and structs
+  become variables with their name. `std.kernel_compile(source)` compiles kernel source from a string.
+- Types: `bool i8 u8 i16 u16 i32 u32 i64 u64 f32 f64`, pointers `T*` / `const T*`, kernel structs (behind
+  pointers and as local values: `Pixel q = p[gid];`), vectors `f32x4 u8x3 i32x2 ...` (fields `x y z w`, operators
+  and math builtins work componentwise, `dot cross length`), local arrays `u32 counts[16];` (zeroed),
+  `{...}` initializers. No strings, json, objects or recursion in kernels.
+- Conversions are explicit: `u8(x + 1)`, `f32(i)`, `i32(f)`. `p[i] + 1` is an `i32` (small types are read as
+  `i32`), so `p[i] = p[i] + 1;` for a `u8*` is a compile error. Only lossless widening is implicit. `i32` and
+  `u32` do not mix. Conditions must be `bool` (`if (x != 0)`, not `if (x)`).
+- C syntax: `if/else`, `for`, `while`, `break`, `continue`, `return`, `+ - * / % & | ^ ~ << >>`, `&& || !`, `?:`,
+  `+= ... >>=`, `x++` (statement only), `p[i]`, `p->f`, `p[i].f`, `*p`, `&p[i]`, `p + n`.
+- Builtins: `gid`, `gsize`, `gid_x`, `gid_y`, `gsize_x`, `gsize_y`, `min max clamp abs sqrt floor ceil round trunc
+  sin cos tan asin acos atan exp log log2 log10 pow atan2`, `atomic_add(p[i], v)`, `sizeof(T)`.
+- `kernel inline T name(...) { }` = helper (inlined), `kernel const i32 N = 4;` = constant,
+  `kernel T name(...) reduce(op) { return v; }` with op `+`, `min`, `max`, `&`, `|` or `^` = the launch returns the
+  reduction of all returned values (deterministic, also for floats). Struct results are reduced field by field
+  (`reduce(sum: +, lo: min)`) and returned as json.
+- `std.kernel_compile(source, file, unit...)` imports the structs, constants and helpers of other units
+  (e.g. `__shz_kernel_unit`).
+- Every memory access is bounds checked (`unchecked { ... }` turns it off). Errors (out of bounds, division by
+  zero, float that does not fit) stop the launch with a catchable runtime error that names the kernel, the
+  file:line and the gid.
+- Launches of kernels of the same file are checked when the script compiles (argument count, literal types),
+  both `launch k(...) : n` and `k.launch(n, ...)`. `launch ks[i](...) : n` and `launch o.k(...) : n` work too
+  (checked when they run).
+- Arguments are checked strictly: `f32` parameters need floats (`2.0`, not `2`), ints must fit the type,
+  pointers need a `std.buffer` (or a binary value; `const` pointers also take strings) or a `bitmap.bitmap`
+  (its pixels in place, 3 bytes per pixel in the order blue, green, red).
+- While a launch runs (async) its buffers are locked: a `const T*` buffer can be read but not changed, a `T*`
+  buffer can neither be read nor changed until `job.wait()`.
+- `std.buffer` methods: `size clear resize(n [, fill]) fill(byte) push(bytes...) append(buffer|string|list)
+  read(type, index) write(type, index, value)` (types `"u8"`, `"i32"`, `"f32"`, ...), `string([start, count])`
+  (byte exact; `std.string(buffer)` stops at the first zero byte).
+- Struct layout on the host: `Pixel.size()`, `Pixel.offset("g")`, `Pixel.get(buf, i, "g")`,
+  `Pixel.set(buf, i, "g", 7)`, `Pixel.read(buf, i)` (json), `Pixel.write(buf, i, [r = 1])`.
+- `std.kernel_threads(n)` limits the threads (0 = all), `k.disasm()` shows the bytecode.
+- JIT: if a C compiler is installed (`SHZ_KERNEL_CC`, else `cc` / `gcc` / `clang`, on Windows `cl` / `clang` /
+  `gcc`), the first launch of a kernel compiles it to native code in the background, later launches run that
+  (3-4x faster than the VM, same results and errors). The libraries are cached (`SHZ_KERNEL_CACHE`, else
+  `~/.cache/shizoscript/kernels`). `std.kernel_jit("auto" | "sync" | "off")` (also `SHZ_KERNEL_JIT`):
+  background compile, compile and wait, VM only. `std.kernel_jit_compiler()`, `k.jit_status()`,
+  `k.jit_source()` (the generated C). Without a compiler kernels run on the VM, or on native code compiled ahead
+  of time: `std.kernel_aot_source(kernels...)` writes it as one C file, built as a shared library
+  (`-DSHZK_AOT_SHARED`, loaded with `std.kernel_aot_load(path)`) or compiled into the interpreter / firmware.
 
 ---
 
@@ -890,7 +1074,8 @@ Before using a lambda:
 
 ```
 shz file_name
-shz --check file_name    // syntax check only
+shz --check file_name    // syntax check only (includes the strict mode checks)
+shz --strict file_name   // strict mode for every file, as if each started with #strict
 ```
 
 - The process exits with code `1` after an uncaught runtime error in the main script (errors caught by `try`/`catch` do not count).

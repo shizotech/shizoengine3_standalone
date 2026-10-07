@@ -883,3 +883,8 @@ signal(
     report = "<reason the task could not be completed>" 
 ) 
 ``` 
+
+# PLATFORM
+
+OS: {{OS}}
+DATE: {{DATE}}
