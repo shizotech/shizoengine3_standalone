@@ -1,9 +1,18 @@
 // ProlinkDecks generator
 // Deck view of the CDJs like ShowKontrol: per deck title, artist, time, BPM and the preview waveform
-// of the whole track, below them the scrolling detail waveforms with beat grid, cues and loops.
+// of the whole track, below them the scrolling detail waveforms with beat grid, cues, loops and the
+// phrases of rekordbox (Intro, Break, Buildup, Drop, Outro ... as a colored band at the bottom, if the track was
+// analysed; a rising stretch at the end of a break before a drop is detected from the waveform as Buildup).
+// Settings: DECKS (AUTO = one lane per CDJ that is there, or 1-4 fixed), LAYOUT (panels + lanes, or
+// compact lanes with the infos in each lane), PLAYHEAD (how much of the past is visible), OVERVIEW
+// (whole track as a bar in each lane), TEXT SIZE, OUTPUT (16:9, wider or a strip), ZOOM (also the zoom bar under the view and the + / - / 0 keys),
+// STYLE (CDJ: dark like ShowKontrol / the CDJ-3000; VIBEVJ: the flat look and accent colour of VibeVJ's own UI),
+// HISTORY (the played tracks as a column right of the decks; folds to a narrow tab and back with a click into it, the
+// H key, the history button in the zoom bar or HISTORY OPEN). The "History" section lists them and saves them as CSV/TXT.
 // The view is a routable video output (OUT), and every deck has controls for effects:
 // BPM, BEAT, LOW / MID / HIGH (bass, mids, highs of the waveform at the playhead), PROGRESS,
-// CUE RAMP, PLAYING, ON AIR.
+// CUE RAMP, PLAYING, ON AIR, PHRASE RAMP (0 at the start of the current phrase .. 1 at its end),
+// BUILDUP (0 .. 1 through a buildup, 0 otherwise) and DROP (1 while a drop plays).
 //
 // Uses the native module 'prolink' (shzmodule_prolink). It shares the connection with the
 // ProlinkBridge generator when both use the same SOURCE / PORT. SOURCE "NETWORK" reads a relay ESP32
@@ -22,12 +31,46 @@ status = None;
 source = None;
 port_text = None;
 deck_count = None;
+layout_ctrl = None;
+playhead_ctrl = None;
+overview_ctrl = None;
+text_size = None;
 zoom = None;
+zoom_text = None;
+zoom_buttons = [];
+output_ctrl = None;
+output_index = -1;
+mixer_present = false;  // DJM on the network: only then does On Air tell whether the channel is open
+shown_zoom = -1.0;
 smoothing = None;
+style_ctrl = None;
+history_ctrl = None;
+history_open_ctrl = None;
+
+// Colors of the current STYLE (apply_style), for the shader uniforms and the overlay
+P = [];
+accent3 = vec3f(0.298, 0.545, 0.902);  // VibeVJ accent (theme), read every few seconds
+accent_frames = 0;
+theme_widget = None;
+
+// History of played tracks (prolink module, 30 s audible = played)
+hist_items = [];      // oldest first: time, n, title, artist, bpm, key ...
+hist_count = -1;      // device.history_count() when hist_items was fetched
+hist_labels = [];     // the last tracks in the generator window
+hist_info = None;
+HIST_LABELS = 8;
+hist_open = 1.0;      // 0 = folded to the tab, 1 = open; follows HISTORY OPEN smoothly
+hist_rect = [x = 0.0, y = 0.0, w = 0.0, h = 0.0];  // history column in output pixels (clicks into the view)
+
+// Current layout, computed in update() and used by the shader uniforms and the text overlay alike
+lane_decks = [0, 1, 2, 3];  // deck index (0..3) per lane, -1 = none
+nlanes = 4;
+L = [top = 0.0, info_w = 0.0, right_w = 0.0, pbar = 0.0, scale = 1.0, compact = false, hist_w = 0.0, hist_full = 0.0];
 
 images = [];
 revs = [];
 views = [];       // player state per deck for the overlay
+marks = [];       // per deck: cues and phrases of the loaded track, its length, detail column and time at the playhead
 deck_ctrls = [];
 
 demo_path = "";
@@ -39,13 +82,51 @@ SOURCE_USB = 0;
 SOURCE_DEMO = 1;
 SOURCE_NETWORK = 2;
 
-// Layout, keep in sync with decks.glsl
-TOP = 0.38;
+LAYOUT_PANELS = 0;  // a row of deck panels on top, lanes below
+LAYOUT_LANES = 1;   // lanes only, infos in each lane
+OVERVIEW_AUTO = 0;  // on in the compact layout (the panels show the whole track otherwise)
+OVERVIEW_ON = 1;
+OVERVIEW_OFF = 2;
+STYLE_CDJ = 0;
+STYLE_VIBEVJ = 1;
+HISTORY_OFF = 0;
+HISTORY_COLUMN = 1;
+HISTORY_W = 0.20;       // history column, fraction of the output width at 1920 x 1080
+HISTORY_TAB = 0.024;    // the folded column: a narrow tab with the number of tracks
+
+// Margins, the same constants as in decks.glsl (fractions of the output height)
 GAP = 0.012;
 PAD = 0.006;
 HEAD = 0.42;
-LM = 0.045;
-RM = 0.075;
+PANELS_TOP = 0.30;      // height of the panel row
+PANELS_LEFT = 0.045;    // lane margin left in the panel layout (deck number)
+PANELS_RIGHT = 0.06;    // lane margin right in the panel layout (BPM, pitch)
+COMPACT_INFO = 0.19;    // info column of a compact lane (scaled with TEXT SIZE)
+// The widths above are for 1920 x 1080; other outputs keep the same pixel widths and give the room to the waveforms
+
+// OUTPUT sizes: name, width, height
+OUTPUTS = [
+	["1920 x 1080 (16:9)", 1920, 1080],
+	["2560 x 1080 (21:9)", 2560, 1080],
+	["3840 x 1080 (32:9)", 3840, 1080],
+	["3840 x 2160 (16:9, 4K)", 3840, 2160],
+	["1920 x 540 (strip 32:9)", 1920, 540],
+	["1920 x 360 (strip 16:3)", 1920, 360],
+];
+PREVIEW_W = 620;        // width of the view in the generator window
+ZOOM_DEFAULT = 8.0;      // RST
+ZOOM_MIN = 1.0;
+ZOOM_MAX = 60.0;
+OVERVIEW_BAR = 0.17;    // overview bar, fraction of the lane height
+
+LOOP_COLOR = vec4f(1, 0.72, 0.08, 1); // same as LOOP in decks.glsl
+
+// Icons of the zoom bar (FontAwesome codes as in nanogui/icons.h)
+ICON_ZOOM_IN = 61454;   // FA_SEARCH_PLUS 0xf00e
+ICON_ZOOM_OUT = 61456;  // FA_SEARCH_MINUS 0xf010
+ICON_FOLD = 61524;      // FA_CHEVRON_RIGHT 0xf054: fold the bar away to the right
+ICON_UNFOLD = 61523;    // FA_CHEVRON_LEFT 0xf053
+ICON_HISTORY = 61914;   // FA_HISTORY 0xf1da: fold / unfold the history column
 
 // nanovg text alignment flags
 ALIGN_LEFT_MIDDLE = 17;
@@ -136,81 +217,810 @@ draw_text(pos, text, size, face, color, align) {
 	nvgText(pos, text);
 }
 
-// Texts on top of the shader output (coordinates = output pixels)
+// A cut inside a multi-byte UTF-8 character (substr counts bytes) leaves the font decoder in a broken state:
+// the "..." after it then has no width. That is how such a cut is recognised.
+cut_ok(cut) {
+	dots = nvgTextBounds(vec2f(0, 0), "...")[0];
+	return nvgTextBounds(vec2f(0, 0), cut + "...")[0] - nvgTextBounds(vec2f(0, 0), cut)[0] > dots * 0.5;
+}
+
+// Text cut to max_w pixels with "..." at the end (font and size are set here, before measuring)
+fit_text(text, size, face, max_w) {
+	nvgFontSize(size);
+	nvgFontFace(face);
+	if(nvgTextBounds(vec2f(0, 0), text)[0] <= max_w)
+		return text;
+	// Binary search over the number of bytes that fit
+	keep = 0;
+	upper = text.length();
+	for(k = 0; k < 16 && keep < upper; k++) {
+		probe = math.floor((keep + upper + 1) * 0.5);
+		cut = text.substr(0, probe).rtrim() + "...";
+		if(nvgTextBounds(vec2f(0, 0), cut)[0] <= max_w)
+			keep = probe;
+		else
+			upper = probe - 1;
+	}
+	// Back to the start of a character (at most 3 continuation bytes in UTF-8)
+	for(k = 0; k < 3 && keep > 0 && !cut_ok(text.substr(0, keep)); k++)
+		keep = keep - 1;
+	return text.substr(0, keep).rtrim() + "...";
+}
+
+fill_rect(pos, size, color) {
+	nvgBeginPath();
+	nvgRect(pos, size);
+	nvgFillColor(color);
+	nvgFill();
+}
+
+pill_width(label, size) {
+	nvgFontSize(size);
+	nvgFontFace("sans-bold");
+	return nvgTextBounds(vec2f(0, 0), label)[0] + size * 0.9;
+}
+
+// ON AIR, MASTER and SYNC as small labels (colours of the STYLE), right-aligned at x_right; returns the width used
+draw_pills(x_right, y, pl, size) {
+	x = x_right;
+	hh = size * 1.55;
+	labels = [["ON AIR", pl.onAir && mixer_present, P.pill_on_air, P.pill_text], ["MASTER", pl.master, P.pill_master, P.pill_text],
+		["SYNC", pl.sync, P.pill_sync, P.pill_sync_text]];
+	for(i = 0; i < 3; i++) {
+		if(!labels[i][1])
+			continue;
+		wd = pill_width(labels[i][0], size);
+		x = x - wd;
+		nvgBeginPath();
+		nvgRoundedRect(vec2f(x, y - hh * 0.5), vec2f(wd, hh), hh * 0.25);
+		nvgFillColor(labels[i][2]);
+		nvgFill();
+		draw_text(vec2f(x + wd * 0.5, y), labels[i][0], size, "sans-bold", labels[i][3], ALIGN_CENTER_MIDDLE);
+		x = x - size * 0.4;
+	}
+	return x_right - x;
+}
+
+fill_tri(a, b, c3, color) {
+	nvgBeginPath();
+	nvgMoveTo(a);
+	nvgLineTo(b);
+	nvgLineTo(c3);
+	nvgClosePath();
+	nvgFillColor(color);
+	nvgFill();
+}
+
+// "#e0301e" -> vec4f
+hex_color(text, alpha) {
+	digits = "0123456789abcdef";
+	t = text.lowercase();
+	v = [0, 0, 0];
+	for(i = 0; i < 3; i++)
+		v[i] = math.max(digits.find(t.substr(1 + i * 2, 1)), 0) * 16 + math.max(digits.find(t.substr(2 + i * 2, 1)), 0);
+	return vec4f(v[0] / 255.0, v[1] / 255.0, v[2] / 255.0, alpha);
+}
+
+with_alpha(color, alpha) {
+	return vec4f(color.x, color.y, color.z, alpha);
+}
+
+// vec3f helpers for the palette
+c4(c, alpha) {
+	return vec4f(c.x, c.y, c.z, alpha);
+}
+
+mix3(a, b, t) {
+	return vec3f(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+}
+
+scale3(c, k) {
+	return vec3f(c.x * k, c.y * k, c.z * k);
+}
+
+// Colours of the STYLE: vec3f for the shader (decks.glsl), vec4f for the overlay.
+// CDJ: dark like ShowKontrol / the CDJ-3000 (3-band blue / orange / white, red playhead, orange master).
+// VIBEVJ: the flat look of VibeVJ's UI (theme.cpp): window, panel and input tones, rounded surfaces, one accent colour
+// (read from the theme, so it follows Appearance > Accent colour) for waveform, master and the beat.
+apply_style() {
+	if(style_ctrl.value() != STYLE_VIBEVJ) {
+		P = [
+			style = STYLE_CDJ,
+			bg = vec3f(0.030, 0.032, 0.040), panel = vec3f(0.075, 0.078, 0.095), lane = vec3f(0.040, 0.042, 0.052),
+			low = vec3f(0.10, 0.36, 1.00), mid = vec3f(1.00, 0.64, 0.12), high = vec3f(0.96, 0.96, 1.00),
+			playhead = vec3f(1.0, 0.16, 0.16), master = vec3f(1.0, 0.62, 0.1), on_air = vec3f(0.85, 0.15, 0.15),
+			idle = vec3f(0.22, 0.23, 0.27), loop = vec3f(1.0, 0.72, 0.08), tick = vec3f(0.78, 0.78, 0.78),
+			down = vec3f(1.0, 0.25, 0.2), radius = 0.0, stripe = 3.0,
+			text = vec4f(1, 1, 1, 1), dim = vec4f(0.6, 0.62, 0.68, 1), hot = vec4f(1, 0.62, 0.1, 1),
+			pill_on_air = vec4f(0.91, 0.26, 0.25, 1), pill_master = vec4f(1, 0.62, 0.1, 1), pill_sync = vec4f(0.25, 0.66, 1, 1),
+			pill_text = vec4f(0.04, 0.04, 0.05, 1), pill_sync_text = vec4f(0.04, 0.04, 0.05, 1),
+			beat_off = vec4f(0.22, 0.23, 0.27, 1), beat_on = vec4f(0.92, 0.92, 0.95, 1), beat_one = vec4f(1, 0.3, 0.25, 1),
+		];
+		return None;
+	}
+	// Accent of the UI theme, read every 120 frames (to_json() is not free)
+	if(accent_frames <= 0 && theme_widget) {
+		accent_frames = 120;
+		t = theme_widget.theme().to_json();
+		if(t && t.accent_color)
+			accent3 = vec3f(t.accent_color.r, t.accent_color.g, t.accent_color.b);
+	}
+	accent_frames = accent_frames - 1;
+	A = accent3;
+	T = vec3f(0.886, 0.894, 0.914);   // text_color #E2E4E9
+	chip = vec3f(0.204, 0.216, 0.243); // button #34373E
+	red = vec3f(0.92, 0.39, 0.35);    // VibeVJ's error red
+	P = [
+		style = STYLE_VIBEVJ,
+		bg = vec3f(0.125, 0.129, 0.145), panel = vec3f(0.141, 0.149, 0.169), lane = vec3f(0.086, 0.090, 0.102),
+		low = A, mid = mix3(A, T, 0.5), high = scale3(T, 0.62),
+		playhead = T, master = A, on_air = red, idle = vec3f(0.204, 0.216, 0.239), loop = vec3f(0.95, 0.72, 0.25),
+		tick = scale3(T, 0.5), down = A, radius = 3.0, stripe = 2.0,
+		text = c4(T, 0.95), dim = c4(T, 0.5), hot = c4(A, 1.0),
+		pill_on_air = c4(red, 1.0), pill_master = c4(A, 1.0), pill_sync = c4(chip, 1.0),
+		pill_text = c4(T, 1.0), pill_sync_text = c4(A, 1.0),
+		beat_off = c4(chip, 1.0), beat_on = c4(T, 1.0), beat_one = c4(A, 1.0),
+	];
+}
+
+// Palette to the shader; `lw` = line width in output pixels
+style_uniforms(lw) {
+	shader.uniform("c_bg", P.bg);
+	shader.uniform("c_panel", P.panel);
+	shader.uniform("c_lane", P.lane);
+	shader.uniform("c_low", P.low);
+	shader.uniform("c_mid", P.mid);
+	shader.uniform("c_high", P.high);
+	shader.uniform("c_playhead", P.playhead);
+	shader.uniform("c_master", P.master);
+	shader.uniform("c_on_air", P.on_air);
+	shader.uniform("c_idle", P.idle);
+	shader.uniform("c_loop", P.loop);
+	shader.uniform("c_tick", P.tick);
+	shader.uniform("c_down", P.down);
+	shader.uniform("radius", P.radius * lw);
+	shader.uniform("stripe", P.stripe);
+}
+
+// Colors of the phrase groups (CDJ: same as the web interface; VIBEVJ: tones of the UI plus the accent)
+phrase_color(group) {
+	if(P.style == STYLE_VIBEVJ) {
+		if(group == "intro" || group == "outro")
+			return vec4f(0.251, 0.267, 0.298, 1);   // hover tone #40444C
+		if(group == "verse")
+			return c4(mix3(accent3, P.panel, 0.5), 1.0);
+		if(group == "break")
+			return c4(scale3(accent3, 0.5), 1.0);
+		if(group == "buildup")
+			return vec4f(0.95, 0.70, 0.25, 1);
+		if(group == "drop")
+			return c4(accent3, 1.0);
+		return vec4f(0.204, 0.216, 0.243, 1);
+	}
+	if(group == "intro")
+		return hex_color("#5b8def", 1.0);
+	if(group == "verse")
+		return hex_color("#47b6c9", 1.0);
+	if(group == "break")
+		return hex_color("#3d63b8", 1.0);
+	if(group == "buildup")
+		return hex_color("#f2c230", 1.0);
+	if(group == "drop")
+		return hex_color("#3ecf6e", 1.0);
+	if(group == "outro")
+		return hex_color("#7d84a0", 1.0);
+	return hex_color("#888c99", 1.0);
+}
+
+// Color of the phrase name in the deck panel: in VIBEVJ the dark band tones are too faint as text on the panel,
+// so they are lifted towards the text color
+phrase_label_color(group) {
+	c = phrase_color(group);
+	if(P.style != STYLE_VIBEVJ || group == "buildup" || group == "drop")
+		return c;
+	return c4(mix3(vec3f(c.x, c.y, c.z), vec3f(0.886, 0.894, 0.914), 0.55), 1.0);
+}
+
+// Phrases as a colored band (x0, y, w x h) for the time ms_a..ms_b across the width. The name sits at the
+// left edge of the visible part, where it fits; phrases that are over (before now_ms) are dimmed.
+draw_phrase_band(phrases, x0, y, w, h, ms_a, ms_b, now_ms, lw) {
+	if(!phrases || phrases.size() == 0 || h < 2 || ms_b <= ms_a)
+		return None;
+	k = w / (ms_b - ms_a);
+	fs = h * 0.72;
+	nvgSave();
+	nvgScissor(vec2f(x0, y), vec2f(w, h));
+	for(i = 0; i < phrases.size(); i++) {
+		ph = phrases[i];
+		if(std.is_none(ph.ms) || std.is_none(ph.endMs))
+			continue;
+		if(ph.endMs <= ms_a || ph.ms >= ms_b)
+			continue;
+		xs = x0 + (ph.ms - ms_a) * k;
+		a = math.max(x0, xs);
+		b = math.min(x0 + w, x0 + (ph.endMs - ms_a) * k);
+		if(b - a < 0.5)
+			continue;
+		alpha = 0.9;
+		if(now_ms >= 0 && ph.endMs <= now_ms)
+			alpha = 0.4;
+		color = phrase_color(ph.group);
+		fill_rect(vec2f(a, y), vec2f(b - a, h), with_alpha(color, alpha));
+		// Light text on dark (and dimmed) fields, dark text otherwise
+		label = vec4f(0.04, 0.04, 0.05, 1);
+		if((0.3 * color.x + 0.59 * color.y + 0.11 * color.z) * (alpha + 0.05) < 0.42)
+			label = vec4f(0.9, 0.9, 0.93, 1);
+		fill_rect(vec2f(xs - lw * 0.5, y), vec2f(lw, h), c4(P.bg, 1.0));
+		if(fs >= 8 * lw) {
+			nvgFontSize(fs);
+			nvgFontFace("sans-bold");
+			if(nvgTextBounds(vec2f(0, 0), ph.name)[0] + 6 * lw < b - a)
+				draw_text(vec2f(a + 3 * lw, y + h * 0.53), ph.name, fs, "sans-bold", label, ALIGN_LEFT_MIDDLE);
+		}
+	}
+	nvgRestore();
+}
+
+// Phrases at the bottom of the scrolling waveform of deck d (same mapping as draw_detail_cues())
+draw_detail_phrases(d, x0, y0, ww, wh, lw) {
+	m = marks[d];
+	if(!m.wave || !m.phrases || m.phrases.size() == 0)
+		return None;
+	span = math.max(zoom.value(), 0.1) * 1000.0;
+	ms = m.col / 0.15;
+	f = playhead_ctrl.value() / 100.0;
+	h = math.round(math.max(6 * lw, math.min(wh * 0.1, 16 * lw * L.scale)));
+	draw_phrase_band(m.phrases, x0, y0 + wh - h, ww, h, ms - span * f, ms + span * (1 - f), ms, lw);
+}
+
+// Phrases along the bottom of the whole-track waveform of deck d
+draw_preview_phrases(d, x0, y0, pw, ph, lw) {
+	m = marks[d];
+	if(!m.preview || m.dur <= 0 || !m.phrases || m.phrases.size() == 0)
+		return None;
+	h = math.round(math.max(3 * lw, math.min(ph * 0.16, 14 * lw * L.scale)));
+	draw_phrase_band(m.phrases, x0, y0 + ph - h, pw, h, 0, m.dur, m.col / 0.15, lw);
+}
+
+// "Drop 12": the phrase at the playhead and the beats to the next one; "" without phrases
+phrase_text(pl) {
+	if(std.is_none(pl.phrase))
+		return "";
+	if(pl.beatsToPhrase && pl.beatsToPhrase > 0)
+		return pl.phrase + " " + std.string(pl.beatsToPhrase);
+	return pl.phrase;
+}
+
+is_loop(cue) {
+	return cue.endMs && cue.endMs > cue.ms;
+}
+
+// Flag of a cue on the top edge y of a waveform: hot cues as a box with their letter right of the line
+// (like on the CDJ), memory cues and loops as a triangle on the line. label: also the cue's comment.
+draw_cue_flag(x, y, s, cue, color, label) {
+	tx = x + s * 0.7;
+	if(cue.hot) {
+		nvgBeginPath();
+		nvgRoundedRect(vec2f(x, y), vec2f(s, s), s * 0.18);
+		nvgFillColor(color);
+		nvgFill();
+		draw_text(vec2f(x + s * 0.5, y + s * 0.54), cue.hot, s * 0.82, "sans-bold", vec4f(0.03, 0.03, 0.04, color.w), ALIGN_CENTER_MIDDLE);
+		tx = x + s * 1.3;
+	}
+	else
+		fill_tri(vec2f(x - s * 0.55, y), vec2f(x + s * 0.55, y), vec2f(x, y + s * 0.8), color);
+	if(label && cue.comment && cue.comment != "")
+		draw_text(vec2f(tx, y + s * 0.54), cue.comment, s * 0.72, "sans-bold", color, ALIGN_LEFT_MIDDLE);
+}
+
+// Cues and loops on the scrolling waveform of deck d (area x0, y0, ww x wh), same mapping as draw_detail()
+draw_detail_cues(d, x0, y0, ww, wh, lw) {
+	m = marks[d];
+	if(!m.wave || !m.cues || m.cues.size() == 0)
+		return None;
+	cols = math.max(zoom.value(), 0.1) * 150.0;
+	head = x0 + ww * playhead_ctrl.value() / 100.0;
+	s = math.max(math.min(wh * 0.08, 22 * lw), 9 * lw); // fits the headroom above the waveform (ROOM in decks.glsl)
+	nvgSave();
+	nvgScissor(vec2f(x0, y0), vec2f(ww, wh));
+	for(i = 0; i < m.cues.size(); i++) {
+		cue = m.cues[i];
+		x = head + (cue.ms * 0.15 - m.col) / cols * ww;
+		color = hex_color(cue.color, 1.0);
+		if(is_loop(cue)) {
+			color = LOOP_COLOR;
+			x2 = head + (cue.endMs * 0.15 - m.col) / cols * ww;
+			if(x2 >= x0 && x2 <= x0 + ww)
+				fill_rect(vec2f(x2 - lw, y0), vec2f(2 * lw, wh), with_alpha(color, x2 < head ? 0.45 : 0.9));
+		}
+		if(x < x0 - s * 8 || x > x0 + ww + s)
+			continue;
+		if(x < head)
+			color = with_alpha(color, 0.45); // already played, like the dimmed waveform
+		fill_rect(vec2f(x - lw, y0), vec2f(2 * lw, wh), with_alpha(color, color.w * 0.9));
+		draw_cue_flag(x, y0, s, cue, color, true);
+	}
+	// The playhead stays in front of a cue that sits right on it (as after loading a track)
+	red = c4(P.playhead, 1.0);
+	fill_rect(vec2f(head - lw, y0), vec2f(2 * lw, wh), red);
+	fill_tri(vec2f(head - 5 * lw, y0), vec2f(head + 5 * lw, y0), vec2f(head, y0 + 5 * lw), red);
+	fill_tri(vec2f(head - 5 * lw, y0 + wh), vec2f(head + 5 * lw, y0 + wh), vec2f(head, y0 + wh - 5 * lw), red);
+	nvgRestore();
+}
+
+// Cue marks on the whole-track waveform of deck d (area x0, y0, pw x ph), same mapping as draw_preview()
+draw_preview_cues(d, x0, y0, pw, ph, lw) {
+	m = marks[d];
+	if(!m.preview || m.dur <= 0 || !m.cues || m.cues.size() == 0)
+		return None;
+	s = math.max(math.min(ph * 0.2, 16 * lw), 7 * lw);
+	nvgSave();
+	nvgScissor(vec2f(x0, y0), vec2f(pw, ph));
+	for(i = 0; i < m.cues.size(); i++) {
+		cue = m.cues[i];
+		x = x0 + cue.ms / m.dur * pw;
+		color = is_loop(cue) ? LOOP_COLOR : hex_color(cue.color, 1.0);
+		fill_rect(vec2f(x - lw * 0.5, y0), vec2f(lw, ph), with_alpha(color, 0.75));
+		draw_cue_flag(x, y0, s, cue, color, false);
+	}
+	nvgRestore();
+}
+
+// Which decks get a lane: AUTO = the CDJs 1-4 that are there (in order), otherwise decks 1..n
+compute_lanes() {
+	lane_decks = [-1, -1, -1, -1];
+	n = 0;
+	mode = deck_count.value();
+	if(mode == 0) {
+		for(d = 0; d < 4; d++) {
+			pl = views[d];
+			if(pl && pl.present) {
+				lane_decks[n] = d;
+				n++;
+			}
+		}
+		if(n == 0)
+			n = 1; // waiting: one empty lane
+	}
+	else {
+		n = mode;
+		for(d = 0; d < n; d++)
+			lane_decks[d] = d;
+	}
+	nlanes = n;
+}
+
+compute_layout() {
+	compact = layout_ctrl.value() == LAYOUT_LANES;
+	scale = 0.85 + text_size.value() * 0.4;
+	overview = overview_ctrl.value();
+	bar = overview == OVERVIEW_ON || (overview == OVERVIEW_AUTO && compact);
+	L.compact = compact;
+	L.scale = scale;
+	L.pbar = bar ? OVERVIEW_BAR : 0.0;
+	// Widths are fractions of the output width, made for 1920 x 1080: wider outputs and flat strips keep
+	// these pixel widths (texts stay readable), 4K scales them up
+	rs = shader.render_size();
+	k = 1920.0 * math.max(rs.y / 1080.0, 1.0) / rs.x;
+	target = history_open_ctrl.value() ? 1.0 : 0.0;
+	hist_open = hist_open + (target - hist_open) * 0.3;
+	if(math.abs(target - hist_open) < 0.01)
+		hist_open = target;
+	L.hist_w = 0.0;
+	if(history_ctrl.value() == HISTORY_COLUMN)
+		L.hist_w = (HISTORY_TAB + (HISTORY_W - HISTORY_TAB) * hist_open) * k;
+	L.hist_full = HISTORY_W * k;
+	if(compact) {
+		L.top = 0.0;
+		L.info_w = COMPACT_INFO * scale * k;
+		L.right_w = 0.0;
+	}
+	else {
+		L.top = PANELS_TOP;
+		L.info_w = PANELS_LEFT * k;
+		L.right_w = PANELS_RIGHT * k;
+	}
+}
+
+// Four squares for the beat in the bar, the current one lit (the one red)
+draw_beats(pos, size, beat_in_bar) {
+	for(b = 0; b < 4; b++) {
+		color = P.beat_off;
+		if(beat_in_bar == b + 1) {
+			color = P.beat_on;
+			if(b == 0)
+				color = P.beat_one;
+		}
+		if(P.style == STYLE_VIBEVJ) {
+			nvgBeginPath();
+			nvgRoundedRect(vec2f(pos.x + b * size * 1.35, pos.y - size * 0.5), vec2f(size, size), size * 0.25);
+			nvgFillColor(color);
+			nvgFill();
+		}
+		else
+			fill_rect(vec2f(pos.x + b * size * 1.35, pos.y - size * 0.5), vec2f(size, size), color);
+	}
+	return size * 1.35 * 4;
+}
+
+// "CUE 16" while a memory cue is coming, orange in the last 16 beats; "" otherwise
+cue_text(pl) {
+	if(!pl.beatsToCue || pl.beatsToCue < 0 || pl.beatsToCue > 64)
+		return "";
+	return "CUE " + std.string(pl.beatsToCue);
+}
+
+remaining(pl) {
+	track = pl.track;
+	if(track && track.durationMs && !std.is_none(pl.positionMs))
+		return "-" + fmt_time(track.durationMs - pl.positionMs);
+	return "";
+}
+
+title_of(pl) {
+	track = pl.track;
+	if(!track)
+		return "no track";
+	if(track.title)
+		return track.title;
+	if(!std.is_none(track.metaExpected) && !track.metaExpected)
+		return "no metadata";
+	return "loading...";
+}
+
+// Infos in the text part of a panel (panel layout): 3 rows
+draw_panel_text(pl, d, x0, y0, pw, head, c) {
+	fs = head * 0.2 * L.scale;
+	num = head * 0.62;
+	nx = x0 + num * 0.75;
+	tx = x0 + num * 1.25;
+	draw_text(vec2f(nx, y0 + head * 0.5), std.string(d + 1), num, "sans-bold", pl && pl.master ? c.orange : c.grey, ALIGN_CENTER_MIDDLE);
+	if(!pl || !pl.present) {
+		draw_text(vec2f(tx, y0 + head * 0.5), "no player", fs, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+		return None;
+	}
+	rx = x0 + pw - fs * 0.6;
+	bpm_text = fmt1(pl.effectiveBpm);
+	draw_text(vec2f(rx, y0 + head * 0.24), bpm_text, fs * 1.35, "mono", pl.master ? c.orange : c.white, ALIGN_RIGHT_MIDDLE);
+	pills_w = draw_pills(rx - nvgTextBounds(vec2f(0, 0), bpm_text)[0] - fs * 0.5, y0 + head * 0.24, pl, fs * 0.62);
+	draw_text(vec2f(rx, y0 + head * 0.55), fmt_pitch(pl.pitch) + "%", fs * 0.85, "mono", c.grey, ALIGN_RIGHT_MIDDLE);
+	draw_text(vec2f(rx, y0 + head * 0.82), remaining(pl), fs * 0.9, "mono", c.white, ALIGN_RIGHT_MIDDLE);
+
+	text_w = rx - tx - fs * 6.5;
+	nvgSave();
+	nvgScissor(vec2f(tx, y0), vec2f(math.max(text_w, 1.0), head));
+	draw_text(vec2f(tx, y0 + head * 0.24), fit_text(title_of(pl), fs * 1.05, "sans-bold", text_w - pills_w), fs * 1.05, "sans-bold", c.white, ALIGN_LEFT_MIDDLE);
+	if(pl.track && pl.track.artist)
+		draw_text(vec2f(tx, y0 + head * 0.55), fit_text(pl.track.artist, fs * 0.85, "sans", text_w), fs * 0.85, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+	nvgRestore();
+
+	bx = tx + draw_beats(vec2f(tx, y0 + head * 0.83), fs * 0.6, pl.beatInBar) + fs * 0.6;
+	cue = cue_text(pl);
+	if(cue != "") {
+		draw_text(vec2f(bx, y0 + head * 0.83), cue, fs * 0.8, "mono", pl.beatsToCue <= 16 ? c.orange : c.grey, ALIGN_LEFT_MIDDLE);
+		bx = bx + nvgTextBounds(vec2f(0, 0), cue)[0] + fs * 0.7;
+	}
+	phrase = phrase_text(pl);
+	room = rx - fs * 5.5 - bx;
+	if(phrase != "" && room > fs * 2)
+		draw_text(vec2f(bx, y0 + head * 0.83), fit_text(phrase, fs * 0.8, "sans-bold", room), fs * 0.8, "sans-bold", phrase_label_color(pl.phraseGroup), ALIGN_LEFT_MIDDLE);
+}
+
+// Infos in the info column of a compact lane: number + BPM, title, artist, beats + pitch + time
+draw_lane_text(pl, d, x0, y0, iw, lh, h, c) {
+	fs = math.min(math.min(lh * 0.19, math.max(h, 1080) * 0.05) * L.scale, iw * 0.115); // iw already scales with TEXT SIZE
+	block = fs * 3.9;
+	if(!pl || !pl.present)
+		block = fs * 1.1; // only the number row
+	y = y0 + math.max((lh - block) * 0.5, fs * 0.2);
+	x = x0 + fs * 0.55;
+	right = x0 + iw - fs * 0.45;
+
+	nvgSave();
+	nvgScissor(vec2f(x0, y0), vec2f(iw, lh));
+	draw_text(vec2f(x, y + fs * 0.55), std.string(d + 1), fs * 1.1, "sans-bold", pl && pl.master ? c.orange : c.grey, ALIGN_LEFT_MIDDLE);
+	if(!pl || !pl.present) {
+		draw_text(vec2f(x + fs * 1.1, y + fs * 0.55), "no player", fs * 0.6, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+		nvgRestore();
+		return None;
+	}
+	bpm_text = fmt1(pl.effectiveBpm);
+	draw_text(vec2f(right, y + fs * 0.55), bpm_text, fs * 1.0, "mono", pl.master ? c.orange : c.white, ALIGN_RIGHT_MIDDLE);
+	draw_pills(right - nvgTextBounds(vec2f(0, 0), bpm_text)[0] - fs * 0.35, y + fs * 0.55, pl, fs * 0.36);
+	nvgRestore();
+
+	nvgSave();
+	nvgScissor(vec2f(x, y0), vec2f(math.max(right - x, 1.0), lh));
+	tw = right - x;
+	draw_text(vec2f(x, y + fs * 1.65), fit_text(title_of(pl), fs * 0.62, "sans-bold", tw), fs * 0.62, "sans-bold", c.white, ALIGN_LEFT_MIDDLE);
+	if(pl.track && pl.track.artist)
+		draw_text(vec2f(x, y + fs * 2.4), fit_text(pl.track.artist, fs * 0.52, "sans", tw), fs * 0.52, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+	nvgRestore();
+
+	row = y + fs * 3.35;
+	bx = x + draw_beats(vec2f(x, row), fs * 0.36, pl.beatInBar) + fs * 0.3;
+	cue = cue_text(pl);
+	if(cue != "") {
+		draw_text(vec2f(bx, row), cue, fs * 0.48, "mono", pl.beatsToCue <= 16 ? c.orange : c.grey, ALIGN_LEFT_MIDDLE);
+		bx = bx + nvgTextBounds(vec2f(0, 0), cue)[0] + fs * 0.3;
+	}
+	tail = fmt_pitch(pl.pitch) + "%  " + remaining(pl);
+	draw_text(vec2f(right, row), tail, fs * 0.48, "mono", c.grey, ALIGN_RIGHT_MIDDLE);
+	// The phrase in between, if there is room left
+	phrase = phrase_text(pl);
+	room = right - nvgTextBounds(vec2f(0, 0), tail)[0] - fs * 0.4 - bx;
+	if(phrase != "" && room > fs * 1.6)
+		draw_text(vec2f(bx, row), fit_text(phrase, fs * 0.48, "sans-bold", room), fs * 0.48, "sans-bold", phrase_label_color(pl.phraseGroup), ALIGN_LEFT_MIDDLE);
+}
+
+// Chevron at center (size s) pointing left (dir -1) or right (dir 1)
+draw_chevron(center, s, dir, color, lw) {
+	nvgBeginPath();
+	nvgMoveTo(vec2f(center.x - dir * s * 0.25, center.y - s * 0.5));
+	nvgLineTo(vec2f(center.x + dir * s * 0.25, center.y));
+	nvgLineTo(vec2f(center.x - dir * s * 0.25, center.y + s * 0.5));
+	nvgStrokeColor(color);
+	nvgStrokeWidth(lw * 2.0);
+	nvgStroke();
+}
+
+// The folded column (x0, y0, tw x ch): chevron to open it, the number of tracks and "HISTORY" running downwards
+draw_history_tab(x0, y0, tw, ch, fs, lw, c) {
+	cx = x0 + tw * 0.5;
+	y = y0 + fs * 1.3;
+	draw_chevron(vec2f(cx, y), fs * 0.7, -1, c.grey, lw);
+	y = y + fs * 1.4;
+	if(hist_items.size() > 0)
+		draw_text(vec2f(cx, y), std.string(hist_items.size()), fs * 0.75, "mono", c.orange, ALIGN_CENTER_MIDDLE);
+	nvgSave();
+	nvgTranslate(vec2f(cx, y + fs * 1.2));
+	nvgRotate(math.PI * 0.5);
+	draw_text(vec2f(0, 0), "HISTORY", fs * 0.85, "sans-bold", c.grey, ALIGN_LEFT_MIDDLE);
+	nvgRestore();
+}
+
+// History column (x0, y0, cw x ch, laid out for the open width full_w): newest track on top, time and deck on
+// the left, title and artist right of it. While it folds the content slides out to the right.
+draw_history(x0, y0, cw, ch, full_w, lw, c) {
+	fs = math.max(ch, 300) * 0.02 * L.scale;
+	nvgSave();
+	nvgScissor(vec2f(x0, y0), vec2f(cw, ch));
+	if(hist_open < 0.25) {
+		draw_history_tab(x0, y0, cw, ch, fs, lw, c);
+		nvgRestore();
+		return None;
+	}
+	pad = fs * 0.8;
+	x = x0 + pad;
+	right = x0 + full_w - pad;
+	y = y0 + pad + fs * 0.45;
+	draw_text(vec2f(x, y), "HISTORY", fs * 0.75, "sans-bold", c.grey, ALIGN_LEFT_MIDDLE);
+	draw_chevron(vec2f(right - fs * 0.2, y), fs * 0.6, 1, c.grey, lw);
+	if(hist_items.size() > 0)
+		draw_text(vec2f(right - fs * 0.9, y), std.string(hist_items.size()), fs * 0.75, "mono", c.grey, ALIGN_RIGHT_MIDDLE);
+	y = y + fs * 0.9;
+	fill_rect(vec2f(x, y), vec2f(right - x, lw), with_alpha(c.grey, 0.35));
+	y = y + fs * 0.6;
+	if(hist_items.size() == 0)
+		draw_text(vec2f(x, y + fs * 0.6), "No tracks played yet", fs * 0.8, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+	nvgFontSize(fs * 0.8);
+	nvgFontFace("mono");
+	tx = x + nvgTextBounds(vec2f(0, 0), "00:00")[0] + fs * 0.7;
+	row_h = fs * 2.5;
+	for(i = hist_items.size() - 1; i >= 0 && y + row_h <= y0 + ch; i--) {
+		e = hist_items[i];
+		newest = i == hist_items.size() - 1;
+		draw_text(vec2f(x, y + fs * 0.6), e.time, fs * 0.8, "mono", newest ? c.orange : c.grey, ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(x, y + fs * 1.6), "DECK " + std.string(e.n), fs * 0.55, "sans-bold", c.grey, ALIGN_LEFT_MIDDLE);
+		title = e.title;
+		if(std.is_none(title) || title == "")
+			title = "unknown track";
+		draw_text(vec2f(tx, y + fs * 0.6), fit_text(title, fs, "sans-bold", right - tx), fs, "sans-bold", c.white, ALIGN_LEFT_MIDDLE);
+		sub = fmt1(e.bpm) + " BPM";
+		if(!std.is_none(e.artist) && e.artist != "")
+			sub = e.artist + "  /  " + sub;
+		draw_text(vec2f(tx, y + fs * 1.6), fit_text(sub, fs * 0.78, "sans", right - tx), fs * 0.78, "sans", c.grey, ALIGN_LEFT_MIDDLE);
+		y = y + row_h;
+	}
+	nvgRestore();
+}
+
+// Fold or unfold the history column; with HISTORY OFF it switches the column on
+toggle_history() {
+	if(history_ctrl.value() != HISTORY_COLUMN) {
+		history_ctrl.value(HISTORY_COLUMN);
+		history_open_ctrl.value(true);
+		return None;
+	}
+	history_open_ctrl.value(!history_open_ctrl.value());
+}
+
+// Click into the view (widget pixels): true if it hit the history column, which then folds or unfolds
+click_history(pos) {
+	if(L.hist_w <= 0)
+		return false;
+	rs = shader.render_size();
+	ww = shader.width() * 1.0;
+	wh = shader.height() * 1.0;
+	k = math.min(ww / rs.x, wh / rs.y);
+	if(k <= 0)
+		return false;
+	x = (pos.x - (ww - rs.x * k) * 0.5) / k;
+	y = (pos.y - (wh - rs.y * k) * 0.5) / k;
+	if(x < hist_rect.x || x > hist_rect.x + hist_rect.w || y < hist_rect.y || y > hist_rect.y + hist_rect.h)
+		return false;
+	toggle_history();
+	return true;
+}
+
+// Texts on top of the shader output (coordinates = output pixels). Same geometry as main() in decks.glsl.
 draw_overlay() {
 	rs = shader.render_size();
-	w = rs.x * 1.0;
+	fw = rs.x * 1.0;   // whole output; the decks use w (without the history column)
 	h = rs.y * 1.0;
-	n = deck_count.value();
-	cols = 1;
-	if(n > 1)
-		cols = 2;
-	prows = (n + cols - 1) / cols;
-	ph = TOP * h / prows;
+	n = nlanes;
+	c = [white = P.text, grey = P.dim, orange = P.hot];
+	pad_x = PAD * fw;
+	pad_y = PAD * h;
+	gap = GAP * h;
+	lw = math.max(1.0, h / 540.0);
+	w = fw;
+	if(L.hist_w > 0) {
+		cw = L.hist_w * fw;
+		w = fw - cw - gap;
+		hist_rect = [x = fw - pad_x - cw, y = pad_y, w = cw, h = h - 2 * pad_y];
+		draw_history(hist_rect.x, hist_rect.y, cw, hist_rect.h, L.hist_full * fw, lw, c);
+	}
 
-	white = vec4f(1, 1, 1, 1);
-	grey = vec4f(0.6, 0.62, 0.68, 1);
-	orange = vec4f(1, 0.62, 0.1, 1);
+	if(L.top > 0) {
+		pw = (w - 2 * pad_x - (n - 1) * gap) / n;
+		ph = L.top * h - pad_y;
+		for(i = 0; i < n; i++) {
+			d = lane_decks[i];
+			if(d < 0)
+				continue;
+			draw_panel_text(views[d], d, pad_x + i * (pw + gap), pad_y, pw, ph * HEAD, c);
+			draw_preview_phrases(d, pad_x + i * (pw + gap), pad_y + ph * HEAD, pw, ph * (1 - HEAD), lw);
+			draw_preview_cues(d, pad_x + i * (pw + gap), pad_y + ph * HEAD, pw, ph * (1 - HEAD), lw);
+		}
+	}
 
+	y0 = pad_y;
+	if(L.top > 0)
+		y0 = L.top * h + gap;
+	lh = (h - pad_y - y0 - (n - 1) * gap) / n;
+	iw = L.info_w * fw;
 	for(i = 0; i < n; i++) {
-		col = i - (i / cols) * cols;
-		row = i / cols;
-		x0 = (col * 1.0 / cols + PAD) * w;
-		y0 = row * ph + GAP * 0.5 * h;
-		pw = (1.0 / cols - 2.0 * PAD) * w;
-		head = (ph - GAP * h) * HEAD;
-		fs = head * 0.3;
-		mid_y = y0 + head * 0.5;
-
-		pl = views[i];
-
-		// Deck number
-		draw_text(vec2f(x0 + head * 0.35, mid_y), std.string(i + 1), head * 0.55, "sans-bold", grey, ALIGN_CENTER_MIDDLE);
-
-		if(!pl || !pl.present) {
-			draw_text(vec2f(x0 + head * 0.8, mid_y), "no player", fs, "sans", grey, ALIGN_LEFT_MIDDLE);
+		ly = y0 + i * (lh + gap);
+		d = lane_decks[i];
+		if(d < 0) {
+			draw_text(vec2f(w * 0.5, ly + lh * 0.5), "Waiting for CDJs...", math.min(lh * 0.12, h * 0.03), "sans", c.grey, ALIGN_CENTER_MIDDLE);
 			continue;
 		}
+		pl = views[d];
 
-		// BPM and pitch on the right
-		bpm_color = white;
-		if(pl.master)
-			bpm_color = orange;
-		draw_text(vec2f(x0 + pw - fs * 0.4, y0 + head * 0.3), fmt1(pl.effectiveBpm), fs * 1.15, "mono", bpm_color, ALIGN_RIGHT_MIDDLE);
-		draw_text(vec2f(x0 + pw - fs * 0.4, y0 + head * 0.72), fmt_pitch(pl.pitch) + "%", fs * 0.8, "mono", grey, ALIGN_RIGHT_MIDDLE);
-
-		// Remaining time
-		track = pl.track;
-		if(track && track.durationMs && pl.positionMs)
-			draw_text(vec2f(x0 + pw - fs * 5.2, mid_y), "-" + fmt_time(track.durationMs - pl.positionMs), fs, "mono", white, ALIGN_RIGHT_MIDDLE);
-
-		// Title and artist
-		max_chars = std.int((pw - head * 0.8 - fs * 9.5) / (fs * 0.55));
-		title = "";
-		artist = "";
-		if(track) {
-			if(track.title)
-				title = track.title;
-			else
-				title = "loading...";
-			if(track.artist)
-				artist = track.artist;
+		// Cue flags on the waveforms, same areas as in main() of decks.glsl
+		wx = pad_x + iw + gap * 0.5;
+		ww = w - 2 * pad_x - L.right_w * fw - iw - gap * 0.5;
+		bar = L.pbar * lh;
+		if(bar > 0 && marks[d].preview) {
+			draw_detail_phrases(d, wx, ly, ww, lh - bar, lw);
+			draw_detail_cues(d, wx, ly, ww, lh - bar, lw);
+			draw_preview_phrases(d, wx, ly + lh - bar + lw, ww, bar - lw, lw);
+			draw_preview_cues(d, wx, ly + lh - bar + lw, ww, bar - lw, lw);
 		}
-		draw_text(vec2f(x0 + head * 0.8, y0 + head * 0.32), clip(title, max_chars), fs, "sans-bold", white, ALIGN_LEFT_MIDDLE);
-		draw_text(vec2f(x0 + head * 0.8, y0 + head * 0.72), clip(artist, max_chars), fs * 0.8, "sans", grey, ALIGN_LEFT_MIDDLE);
-	}
+		else {
+			draw_detail_phrases(d, wx, ly, ww, lh, lw);
+			draw_detail_cues(d, wx, ly, ww, lh, lw);
+		}
 
-	// Lanes: deck number left, pitch right
-	top = (TOP + GAP) * h;
-	lh = (h - top) / n;
-	for(i = 0; i < n; i++) {
-		cy = top + i * lh + (lh - GAP * 0.5 * h) * 0.5;
-		fs = math.min(lh * 0.3, h * 0.035);
-		draw_text(vec2f(LM * w * 0.5, cy), std.string(i + 1), fs * 1.3, "sans-bold", grey, ALIGN_CENTER_MIDDLE);
-		pl = views[i];
-		if(pl && pl.present)
-			draw_text(vec2f(w - RM * w * 0.5, cy), fmt_pitch(pl.pitch) + "%", fs * 0.8, "mono", grey, ALIGN_CENTER_MIDDLE);
+		if(L.compact) {
+			draw_lane_text(pl, d, pad_x, ly, iw, lh, h, c);
+			continue;
+		}
+		// Panel layout: deck number left, BPM and pitch right
+		fs = math.min(lh * 0.28, math.max(h, 1080) * 0.035) * L.scale;
+		cy = ly + lh * 0.5;
+		draw_text(vec2f(pad_x + iw * 0.5, cy), std.string(d + 1), fs * 1.3, "sans-bold", pl && pl.master ? c.orange : c.grey, ALIGN_CENTER_MIDDLE);
+		if(pl && pl.present) {
+			rx = w - pad_x - L.right_w * fw * 0.5;
+			draw_text(vec2f(rx, cy - fs * 0.45), fmt1(pl.effectiveBpm), fs * 0.8, "mono", pl.master ? c.orange : c.white, ALIGN_CENTER_MIDDLE);
+			draw_text(vec2f(rx, cy + fs * 0.45), fmt_pitch(pl.pitch) + "%", fs * 0.65, "mono", c.grey, ALIGN_CENTER_MIDDLE);
+			// ON AIR / MASTER / SYNC under each other, centred under the pitch, if the lane is high enough
+			ps = fs * 0.36;
+			py = cy + fs * 1.15;
+			if(pl.onAir && mixer_present && py + ps < ly + lh) {
+				draw_pills(rx + pill_width("ON AIR", ps) * 0.5, py, [onAir = true, master = false, sync = false], ps);
+				py = py + ps * 1.9;
+			}
+			if(pl.master && py + ps < ly + lh) {
+				draw_pills(rx + pill_width("MASTER", ps) * 0.5, py, [onAir = false, master = true, sync = false], ps);
+				py = py + ps * 1.9;
+			}
+			if(pl.sync && py + ps < ly + lh)
+				draw_pills(rx + pill_width("SYNC", ps) * 0.5, py, [onAir = false, master = false, sync = true], ps);
+		}
 	}
+}
+
+// History from the module, fetched again only when it changed
+refresh_history() {
+	count = device.history_count();
+	if(count == hist_count)
+		return None;
+	hist_count = count;
+	list = device.history();
+	if(std.is_none(list))
+		list = [];
+	hist_items = list;
+	if(hist_items.size() == 0)
+		hist_info.caption("No tracks played yet");
+	else
+		hist_info.caption(std.string(hist_items.size()) + " tracks played (newest first):");
+	for(i = 0; i < HIST_LABELS; i++) {
+		k = hist_items.size() - 1 - i;
+		text = "";
+		if(k >= 0) {
+			e = hist_items[k];
+			text = e.time + "  " + std.string(e.n) + "  ";
+			if(!std.is_none(e.artist) && e.artist != "")
+				text = text + e.artist + " - ";
+			title = e.title;
+			if(std.is_none(title) || title == "")
+				title = "unknown track";
+			text = text + title;
+		}
+		hist_labels[i].caption(text);
+		hist_labels[i].visible(k >= 0);
+	}
+}
+
+save_history(format) {
+	path = device.history_save(format);
+	if(std.is_none(path))
+		hist_info.caption("Could not write the history file");
+	else
+		hist_info.caption("Saved: " + path);
+}
+
+show_zoom() {
+	v = zoom.value();
+	shown_zoom = v;
+	text = std.string(std.int(math.round(v))) + " s";
+	if(v < 10)
+		text = fmt1(v) + " s";
+	zoom_text.caption(text);
+}
+
+// Zoom in (-1) or out (+1) one step, about a factor 1.4; also shown next to the buttons
+zoom_step(direction) {
+	v = zoom.value();
+	if(direction < 0)
+		v = v / 1.41421356;
+	else
+		v = v * 1.41421356;
+	v = math.min(math.max(v, ZOOM_MIN), ZOOM_MAX);
+	if(v < 10)
+		v = math.round(v * 10) / 10.0;
+	else
+		v = math.round(v);
+	zoom.value(v);
+	show_zoom();
+}
+
+zoom_reset() {
+	zoom.value(ZOOM_DEFAULT);
+	show_zoom();
+}
+
+// Shader output size from the OUTPUT setting; the preview in the window keeps the aspect ratio
+apply_output() {
+	output_index = output_ctrl.value();
+	o = OUTPUTS[math.min(math.max(output_index, 0), OUTPUTS.size() - 1)];
+	shader.render_size(vec2i(o[1], o[2]));
+	// Preview height follows the aspect ratio, so wide outputs do not leave empty space
+	shader.fixed_height(std.int(math.min(math.max(PREVIEW_W * o[2] / o[1], 110), 360)));
+	shader.parent().refresh_layout();
 }
 
 entry(generator, area) {
@@ -225,7 +1035,45 @@ entry(generator, area) {
 	shader.fragment_source(shader_src);
 	shader.render_size(vec2i(1920, 1080));
 
-	status = area.label("Not connected").fixed_height(24);
+	shader.keep_aspect_ratio(true);
+	// + and - zoom while the view has the focus (click into it), 0 resets
+	shader.on_keyboard_character([](ch) {
+		if(ch == "+")
+			zoom_step(-1);
+		else if(ch == "-")
+			zoom_step(1);
+		else if(ch == "0")
+			zoom_reset();
+		else if(ch == "h" || ch == "H")
+			toggle_history();
+	});
+	// A click into the history column folds or unfolds it; other clicks keep their default (focus for the keys)
+	shader.on_mouse_button([](pos, button, down, mods) {
+		if(button != 0 || !down)
+			return false;
+		return click_history(pos);
+	});
+
+	// Zoom bar under the view, like on the CDJ / rekordbox: zoom in, RST, zoom out, fold away
+	bar_row = area.widget().layout(nanogui.layout_horizontal()).fixed_height(26);
+	status = bar_row.label("Not connected").anchor_left(0).anchor_right(240);
+	hist_btn = bar_row.button("").icon(ICON_HISTORY).anchor_right(202).fixed_width(30);
+	zoom_text = bar_row.label("8 s").anchor_right(150).fixed_width(48);
+	zoom_in_btn = bar_row.button("").icon(ICON_ZOOM_IN).anchor_right(114).fixed_width(30);
+	zoom_reset_btn = bar_row.button("RST").anchor_right(70).fixed_width(42);
+	zoom_out_btn = bar_row.button("").icon(ICON_ZOOM_OUT).anchor_right(38).fixed_width(30);
+	fold_btn = bar_row.button("").icon(ICON_FOLD).anchor_right(4).fixed_width(26).transparent(true);
+	zoom_buttons = [zoom_text, zoom_in_btn, zoom_reset_btn, zoom_out_btn, hist_btn];
+	hist_btn.on_click([]() { toggle_history(); });
+	zoom_in_btn.on_click([]() { zoom_step(-1); });
+	zoom_reset_btn.on_click([]() { zoom_reset(); });
+	zoom_out_btn.on_click([]() { zoom_step(1); });
+	fold_btn.on_click([fold_btn]() {
+		show = !zoom_buttons[1].visible();
+		for(i = 0; i < zoom_buttons.size(); i++)
+			zoom_buttons[i].visible(show);
+		fold_btn.icon(show ? ICON_FOLD : ICON_UNFOLD);
+	});
 
 	ctrl_out = area.control("OUT").value(shader);
 	ctrl_out.callback([](v) {
@@ -237,9 +1085,40 @@ entry(generator, area) {
 	source = settings.controlcombo("SOURCE");
 	source.items(["USB", "DEMO", "NETWORK"]);
 	port_text = settings.controltext("PORT (empty = auto)").value("");
-	deck_count = settings.controlint("DECKS").min(1).max(4).value(4);
-	zoom = settings.controlfloat("ZOOM (seconds)").min(1).max(60).value(8);
+	// AUTO = one lane per CDJ that is there; older projects stored 1-4 here, which still means 1-4 lanes
+	deck_count = settings.controlcombo("DECKS").items(["AUTO", "1", "2", "3", "4"]);
+	layout_ctrl = settings.controlcombo("LAYOUT").items(["DECKS + LANES", "LANES ONLY (COMPACT)"]);
+	playhead_ctrl = settings.controlfloat("PLAYHEAD (% from left)").min(10).max(50).value(30);
+	overview_ctrl = settings.controlcombo("OVERVIEW IN LANES").items(["AUTO", "ON", "OFF"]);
+	text_size = settings.controlslider("TEXT SIZE").value(0.5);
+	zoom = settings.controlfloat("ZOOM (seconds)").min(ZOOM_MIN).max(ZOOM_MAX).value(ZOOM_DEFAULT);
+	output_ctrl = settings.controlcombo("OUTPUT");
+	names = [];
+	for(i = 0; i < OUTPUTS.size(); i++)
+		names.push_back(OUTPUTS[i][0]);
+	output_ctrl.items(names);
+	style_ctrl = settings.controlcombo("STYLE").items(["CDJ", "VIBEVJ"]);
+	history_ctrl = settings.controlcombo("HISTORY").items(["OFF", "RIGHT COLUMN"]);
+	history_open_ctrl = settings.controlbutton("HISTORY OPEN").push(1).value(1);
 	smoothing = settings.controlslider("Level smoothing").value(0.5);
+	theme_widget = settings;
+	apply_style();
+
+	// Played tracks: the last ones here, all of them as CSV/TXT in Documents/prolink-history
+	hist = area.collapsable("History").content().layout(nanogui.layout_vertical());
+	hist_info = hist.label("No tracks played yet");
+	hist_row = hist.widget().layout(nanogui.layout_horizontal()).fixed_height(30);
+	save_csv = hist_row.button("Save CSV").anchor_left(0).fixed_width(100);
+	save_txt = hist_row.button("Save TXT").anchor_left(104).fixed_width(100);
+	clear_btn = hist_row.button("Clear").anchor_left(208).fixed_width(80);
+	save_csv.on_click([]() { save_history("csv"); });
+	save_txt.on_click([]() { save_history("txt"); });
+	clear_btn.on_click([]() {
+		device.history_clear();
+		hist_count = -1;
+	});
+	for(i = 0; i < HIST_LABELS; i++)
+		hist_labels.push_back(hist.label("").visible(false));
 
 	for(d = 0; d < 4; d++) {
 		name = std.string(d + 1);
@@ -253,6 +1132,7 @@ entry(generator, area) {
 		images.push_back(img);
 		revs.push_back(-1);
 		views.push_back(None);
+		marks.push_back([cues = [], phrases = [], dur = 0.0, col = 0.0, wave = false, preview = false, tid = "", trev = -1]);
 
 		group = "deck" + name;
 		cnt = area.collapsable("Deck " + name).content().layout(nanogui.layout_vertical());
@@ -266,6 +1146,9 @@ entry(generator, area) {
 			cue_ramp = cnt.controlslider("CUE RAMP", group),
 			playing = cnt.controlslider("PLAYING", group),
 			on_air = cnt.controlslider("ON AIR", group),
+			phrase_ramp = cnt.controlslider("PHRASE RAMP", group),
+			buildup = cnt.controlslider("BUILDUP", group),
+			drop = cnt.controlslider("DROP", group),
 		]);
 	}
 
@@ -290,6 +1173,14 @@ update(generator, tl_pos, pos_delta) {
 
 	// Level smoothing: 0 = raw, 1 = slow
 	k = 1.0 - smoothing.value() * 0.9;
+
+	// A DJM on the network (device numbers from 33): only then is "On Air" meaningful
+	mixer_present = false;
+	for(m = 33; m <= 36; m++) {
+		mp = device.player(m);
+		if(mp && mp.present)
+			mixer_present = true;
+	}
 
 	preview_styles = [0.0, 0.0, 0.0, 0.0];
 	for(d = 0; d < 4; d++) {
@@ -329,12 +1220,42 @@ update(generator, tl_pos, pos_delta) {
 			}
 		}
 		shader.uniform("info" + uniform_name, vec4f(rows, detail_count, preview_count, style));
+		marks[d].wave = style > 0 && detail_count > 0;
+		marks[d].preview = preview_styles[d] > 0.5;
+		marks[d].dur = info ? info.durationMs : 0.0;
+		marks[d].col = 0.0;
+		// Cues: player() leaves the cue list out (it runs every frame), so fetch the whole track when it or its
+		// data change (new id or revision)
+		tid = "";
+		trev = -1;
+		if(pl && pl.track && !std.is_none(pl.track.id)) {
+			tid = pl.track.id;
+			trev = 0;
+			if(!std.is_none(pl.track.rev))
+				trev = pl.track.rev;
+		}
+		if(tid != marks[d].tid || trev != marks[d].trev) {
+			marks[d].tid = tid;
+			marks[d].trev = trev;
+			marks[d].cues = [];
+			if(tid != "") {
+				full = device.track(tid);
+				if(full && full.cues)
+					marks[d].cues = full.cues;
+			}
+		}
+		marks[d].phrases = [];
+		if(pl && pl.track && pl.track.phrases)
+			marks[d].phrases = pl.track.phrases;
 
 		ctrl = deck_ctrls[d];
 		if(!pl || !pl.present) {
 			shader.uniform("play" + uniform_name, vec4f(0, 0, 0, 0));
 			ctrl.playing.value(0);
 			ctrl.on_air.value(0);
+			ctrl.phrase_ramp.value(0);
+			ctrl.buildup.value(0);
+			ctrl.drop.value(0);
 			continue;
 		}
 
@@ -347,10 +1268,15 @@ update(generator, tl_pos, pos_delta) {
 		master = 0;
 		if(pl.master)
 			master = 1;
+		// On Air comes from the mixer. Without a mixer on the network a playing deck counts as audible
+		// (ON AIR control for effects); the view then shows no red on-air marks.
 		air = 0;
-		if(pl.onAir)
+		if(pl.onAir && mixer_present)
 			air = 1;
 		shader.uniform("play" + uniform_name, vec4f(position * 0.15, progress, master, air));
+		if(!mixer_present && pl.playing)
+			air = 1;
+		marks[d].col = position * 0.15;
 
 		ctrl.bpm.value(pl.effectiveBpm);
 		ctrl.beat.value(pl.beatPhase);
@@ -361,10 +1287,38 @@ update(generator, tl_pos, pos_delta) {
 		ctrl.cue_ramp.value(pl.cueRamp);
 		ctrl.playing.value(pl.playing ? 1 : 0);
 		ctrl.on_air.value(air);
+		ctrl.phrase_ramp.value(pl.phraseRamp ? pl.phraseRamp : 0.0);
+		buildup = 0.0;
+		drop = 0;
+		if(!std.is_none(pl.phraseGroup)) {
+			if(pl.phraseGroup == "buildup")
+				buildup = pl.phraseRamp;
+			if(pl.phraseGroup == "drop")
+				drop = 1;
+		}
+		ctrl.buildup.value(buildup);
+		ctrl.drop.value(drop);
 	}
 
 	shader.uniform("pstyle", vec4f(preview_styles[0], preview_styles[1], preview_styles[2], preview_styles[3]));
-	shader.uniform("decks", deck_count.value() * 1.0);
+	apply_style();
+	style_uniforms(math.max(1.0, shader.render_size().y / 540.0));
+	refresh_history();
+
+	if(output_ctrl.value() != output_index)
+		apply_output();
+	if(zoom.value() != shown_zoom)
+		show_zoom(); // also after MIDI or loading a project
+	compute_lanes();
+	compute_layout();
+	shader.uniform("lanes", vec4f(lane_decks[0], lane_decks[1], lane_decks[2], lane_decks[3]));
+	shader.uniform("nlanes", nlanes * 1.0);
+	shader.uniform("top", L.top);
+	shader.uniform("info_w", L.info_w);
+	shader.uniform("right_w", L.right_w);
+	shader.uniform("pbar", L.pbar);
+	shader.uniform("hist_w", L.hist_w);
+	shader.uniform("playhead", playhead_ctrl.value() / 100.0);
 	shader.uniform("zoom", zoom.value() * 150.0);
 
 	if(device.connected())

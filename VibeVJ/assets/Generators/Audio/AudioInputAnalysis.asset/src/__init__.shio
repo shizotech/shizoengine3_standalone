@@ -33,6 +33,8 @@ net_last_ms = 0;
 last_audio_ms = 0;
 last_audio_rate = 0;
 pcm_paused_until = 0;    // ipc queue full (analysis not reading): don't block the UI with more sends
+settings_sent_ms = 0;    // settings go out every SETTINGS_MS (the subprocess exits after 3 s without)
+SETTINGS_MS = 250;
 MAX_PCM_PER_FRAME = 12;  // older chunks after a stall are dropped (stale for beat tracking anyway)
 
 dispatcher(generator, cmd, value) {
@@ -127,7 +129,7 @@ update_esp() {
 	}
 	
 	if(audio_source == SOURCE_ESP_USB && esp) {
-		chunks = esp.take_audio();
+		chunks = esp.take_audio(false); // only rate and data are used, skip the per-sample float list
 		first = 0;
 		if(chunks.size() > MAX_PCM_PER_FRAME)
 			first = chunks.size() - MAX_PCM_PER_FRAME;
@@ -138,7 +140,7 @@ update_esp() {
 	if(audio_source == SOURCE_ESP_NETWORK) {
 		// Listener and relay may both send audio: stay with the first one until it stops for a second
 		now = std.millis();
-		chunks = prolink.take_net_audio();
+		chunks = prolink.take_net_audio(false);
 		first = 0;
 		if(chunks.size() > MAX_PCM_PER_FRAME * 2)
 			first = chunks.size() - MAX_PCM_PER_FRAME * 2; // two sources possible
@@ -380,9 +382,10 @@ entry(generator, area) {
 		esp = prolink.device();
 		esp.open(esp_port.value());
 	}
-	restart_audio_process();
+	// Created here (process A), the subprocess only opens it: the channel survives its restarts
+	ipc_handle_in.connect(ipc_name+ "_in", true);
 	
-	ipc_handle_in.connect(ipc_name+ "_in", false);
+	restart_audio_process();
 	
 	timeline = std.global("timeline");
 	
@@ -390,19 +393,27 @@ entry(generator, area) {
 	fft_band_smoothing, fft_attack, fft_decay, fft_release, fft_nfloor,
 	low_energy_cutoff, high_energy_cutoff](generator, tl_pos, pos_delta){	
 		
-		//Always send current settings ?
-		ipc_handle_in.send([
-			fix_bpm = fix_bpm.value(),
-			break_treshold = break_treshold.value(),
-			drop_treshold = drop_treshold.value(),
-			band_smoothing = fft_band_smoothing.value(),
-			attack = fft_attack.value(),
-			release = fft_release.value(),
-			decay = fft_decay.value(),
-			noise_floor = fft_nfloor.value(),
-			low_cutoff = low_energy_cutoff.value(),
-			high_cutoff = high_energy_cutoff.value(),
-		]);
+		// Settings a few times per second, and only while the analysis runs: nobody reads the queue during a
+		// restart, and once it is full every send blocks the UI for up to 5 s
+		now = std.millis();
+		alive = audio_process && !audio_process.exited();
+		if(alive && now - settings_sent_ms >= SETTINGS_MS && (!pcm_paused_until || now >= pcm_paused_until)) {
+			settings_sent_ms = now;
+			ok = ipc_handle_in.send([
+				fix_bpm = fix_bpm.value(),
+				break_treshold = break_treshold.value(),
+				drop_treshold = drop_treshold.value(),
+				band_smoothing = fft_band_smoothing.value(),
+				attack = fft_attack.value(),
+				release = fft_release.value(),
+				decay = fft_decay.value(),
+				noise_floor = fft_nfloor.value(),
+				low_cutoff = low_energy_cutoff.value(),
+				high_cutoff = high_energy_cutoff.value(),
+			]);
+			if(!ok)
+				pcm_paused_until = now + 2000;
+		}
 		
 		if(source_ctrl.value() != audio_source)
 			apply_source();

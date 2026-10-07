@@ -255,8 +255,32 @@ config = [key="val"];
 ```
 
 - No types
-- No `null`, only `None`
+- No `null`, only `None` (also `none`)
+- `true` / `True` = `1`, `false` / `False` = `0`
 - Dynamic typing allowed
+
+### 4.0 Variable Scope
+
+Scopes are resolved when the script is compiled, by position in the source:
+
+- Assigning to a name that already exists in an enclosing scope (defined EARLIER in the source) changes that variable. This also applies to globals inside functions, as long as the global is assigned above the function.
+- Otherwise the assignment creates a NEW variable in the current block. Every `{ }` / indentation block (`if`, `for`, function body) is its own scope: variables created inside it do NOT exist after the block (compile error `Variable 'x' does not exist`). This includes the loop variable of `for(i = 0; ...)`.
+- `var x = ...;` (or `let`) always creates a new local variable, even if an outer one with the same name exists (shadowing).
+
+```
+g = 1;
+set_g() { g = 2; }        // changes the global g (defined above)
+set_g();                  // g == 2
+
+if (1) { inner = 7; }
+std.print(inner);         // COMPILE ERROR: inner only exists inside the if block
+
+result = 0;               // declare it before the block instead
+if (1) { result = 7; }
+std.print(result);        // 7
+
+shadow() { var g = 5; return g; }   // local g, the global stays 2
+```
 
 ---
 
@@ -293,7 +317,20 @@ w = 5;
 inc(w);          // w is now 6
 
 both(a, &b) { a++; b++; }   // a by value, b by reference
+set(&v) { *v = 10; }        // assignment through a reference needs *
 ```
+
+Writing through a reference (reference variable, `&` parameter or `[&x]` lambda capture):
+
+| Statement | Changes the original? |
+|---|---|
+| `*v = 10;` / `*v += 5;` | YES |
+| `v++;` / `v--;` | YES |
+| `v = 10;` | NO (rebinds the local reference) |
+| `v += 5;` | NO |
+| `v.key = 1;` / `v.push_back(1);` (JSON, list, object) | YES (no `*` needed) |
+
+ALWAYS use `*v = ...` / `*v += ...` to assign through a reference.
 
 ---
 
@@ -330,10 +367,18 @@ Syntax errors (the script does not compile):
 
 ONLY loop keyword:
 ```
-for(...)
+for(i = 0; i < 10; i++) { }   // classic loop
+for(i < 10) { }               // condition only, replaces while
+for(1) { }                    // endless loop, leave with break
 ```
 
-NO `while`
+```
+if(a) { } else if(b) { } else { }
+break;
+continue;
+```
+
+NO `while` (`while(x) { }` is a syntax error with a misleading message: "parameter keywords not supported yet").
 
 ---
 
@@ -521,11 +566,16 @@ Checklist:
 
 ---
 
-## 11. Builtin Namespaces
+## 11. Builtin Namespaces, Modules
 
 ```
 std.print("Hello");
 math.sqrt(2);
+
+using std;          // import the symbols of a namespace
+print("Hello");
+
+import nanogui;     // load a native module
 ```
 
 ---
@@ -534,8 +584,11 @@ math.sqrt(2);
 
 ```
 #define MAX 100
-#include "helper"
+#include "helper"   // .shio is appended automatically
+def later(x);       // forward declaration of a function defined further down
 ```
+
+- `__FILE__`, `__LINE__`, `__DIR__` are replaced at compile time (as strings, also `__LINE__`).
 
 - A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.
 - A file reached through different relative paths is included only once.
@@ -551,6 +604,7 @@ math.sqrt(2);
 0xFF      // hex
 0b1010    // binary
 0o17      // octal
+1.5e3     // scientific notation (float)
 ```
 
 - Integers are 64 bit. An integer literal that does not fit is a syntax error.
@@ -560,15 +614,18 @@ math.sqrt(2);
 ## 14. Strings
 
 ```
-"a" + "b"
+"a" + "b"    // "ab"
+"a" + 5      // "a5" (numbers are converted when one side is a string)
+"""also
+multiline"""
 ```
 
 ---
 
 ## 15. Truthiness
 
-- `0`, `None`, `""`, `[]` = false
-- everything else = true
+- `0`, `0.0`, `None`, `""`, `[]`, `std.json()` (empty list / object) = false
+- everything else = true (also `"0"` and `[0]`)
 
 ---
 
@@ -624,7 +681,10 @@ are NOT mistakes, the scopes can be defined by the indentation OR brackets.
 ## 19. Common Mistakes
 
 - NO while
-- NO {}
+- NO {} for data
+- NO `struct` (only `class`)
+- NO variables used after the block that created them
+- NO `ref = value` / `ref += value` to write through a reference (parameter or capture), use `*ref = value` / `*ref += value`
 - NO new
 - NO null
 - NO function keyword
@@ -650,10 +710,12 @@ Before generating code:
 - Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed.
 - `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
 - Integer division truncates (`7 / 2 == 3`).
-- Division by zero currently returns `0` (`x / 0 == 0`). Modulo by zero logs a warning and returns `0`.
+- Division by zero returns `0` (`x / 0 == 0`) and prints a runtime error report (`Division by zero!`, `Modulo by zero!` for `%`). The error is NOT fatal: the script continues and `try`/`catch` does NOT catch it.
 - `-1 % 4 == -1` and `math.mod(-1, 4) == -1` (sign follows the left operand, like C).
 - Endless recursion raises a runtime error once the call depth limit is reached (see Functions).
-- Mixed-type comparisons may coerce unexpectedly; keep both sides the same type.
+- Mixed-type comparisons may coerce unexpectedly (`"5" == 5` is `1`); keep both sides the same type.
+- A method call directly on a JSON literal is a syntax error: `[1,2].size()` does not compile, assign the literal to a variable first.
+- Variables created inside a block do not exist after it (see Variable Scope).
 - `std.error(...)` logs an error message and does not throw.
 - `std.warn(...)` logs a warning message and does not throw.
 - `std.runtime_error(...)` raises a runtime error (throws).
@@ -717,12 +779,13 @@ fn = [local_var]() {
 local_var = "test";
 
 fn = [&local_var]() {
-    local_var = "changed";
+    *local_var = "changed";
 };
 ```
 
 - Captures a REFERENCE to `local_var`
-- Modifications affect the original variable
+- Write through the reference with `*`: `*local_var = "changed";` changes the original variable. A plain `local_var = "changed";` (or `local_var += ...`) does NOT change the original (see the table in References).
+- JSON / lists / objects do not need `*` for member changes (`list.push_back(2)`, `c[0] = "f"`).
 - Since references are also ref-counted in shizoscript, the original scoped value is kept alive as long as the lambda lives, even if it goes out of scope.
 
 ---
@@ -773,7 +836,8 @@ class App
 
 - Capture list `[]` is REQUIRED (cannot be omitted)
 - Lambda capture lists are explicit, but globals can still be read without listing them.
-- Capturing JSON/object values keeps shared references; mutating captured data mutates the original value.
+- Capture by value is a snapshot of the value at the time the lambda is created.
+- Capturing JSON/object values keeps shared references (also by value); mutating captured data mutates the original value.
 - Reference captures (`&var`) must be used with extreme caution
 - Lambdas follow normal function syntax rules:
   - Semicolons required
