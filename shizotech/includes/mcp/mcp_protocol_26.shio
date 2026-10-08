@@ -1,0 +1,154 @@
+// ============================================================================
+// mcp_protocol_26.shio — stateless MCP 2026-07-28
+//
+// Used by mcpserver (mcp_server.shio) for requests that carry
+// "MCP-Protocol-Version: 2026-07-28" or call server/discover.
+//
+//   POST /mcp   (also POST /)
+//       server/discover, tools/list, tools/call, resources/list,
+//       resources/read, prompts/list, prompts/get, ping
+//
+// There is no initialize handshake, no Mcp-Session-Id and no event stream.
+// Every request is independent and describes itself with HTTP headers:
+//
+//   MCP-Protocol-Version   must be 2026-07-28
+//   Mcp-Method             must match the JSON-RPC method
+//   Mcp-Name               tools/call, prompts/get: the name,
+//                          resources/read: the uri
+//
+// Discovery, list and read results carry the cache hints ttlMs / cacheScope
+// (mcpserver.cache_ttl_ms / cache_scope, see mcpserver.set_cache()).
+//
+// The class holds no state, everything lives in the mcpserver passed in.
+// ============================================================================
+
+class mcp_protocol_26
+{
+	name = "2026";
+
+	discover_result(server)
+	{
+		versions = [MCP_VERSION_2026];
+		for(i = 0; i < MCP_VERSIONS_2025.size(); i++)
+			versions.push_back(MCP_VERSIONS_2025[i]);
+
+		result = [
+			supportedVersions = versions,
+			capabilities = [
+				tools = [],
+				resources = [],
+				prompts = [],
+			],
+			serverInfo = [
+				name = server.name,
+				version = server.version,
+			],
+		];
+
+		if(server.instructions)
+			result.instructions = server.instructions;
+
+		return result;
+	}
+
+	add_cache_hints(server, result)
+	{
+		result.ttlMs = server.cache_ttl_ms;
+		result.cacheScope = server.cache_scope;
+		return result;
+	}
+
+	// -------------------------------------------------------------------------
+	// Methods that only exist in this protocol, everything else is shared
+	// -------------------------------------------------------------------------
+	handle_method(server, method, params, ctx)
+	{
+		if(method == SERVER_DISCOVER_METHOD)
+			return mcp_ok(add_cache_hints(server, discover_result(server)));
+
+		if(method == INIT_METHOD)
+			return mcp_fail(JSONRPC_INVALID_REQUEST, "MCP " + MCP_VERSION_2026 + " has no initialize, use " + SERVER_DISCOVER_METHOD + ".");
+
+		outcome = server.handle_method(method, params, ctx);
+
+		if(outcome.ok && (
+			method == TOOLS_LIST_METHOD ||
+			method == RESOURCES_LIST_METHOD ||
+			method == RESOURCES_READ_METHOD ||
+			method == PROMPTS_LIST_METHOD
+		))
+			add_cache_hints(server, outcome.result);
+
+		return outcome;
+	}
+
+	// -------------------------------------------------------------------------
+	// The headers have to describe the JSON-RPC body
+	// Returns None when they do, otherwise the error message.
+	// -------------------------------------------------------------------------
+	validate_headers(request_object, method, params)
+	{
+		protocol_version = request_object.headers.geti("mcp-protocol-version");
+
+		if(protocol_version != MCP_VERSION_2026)
+			return "Unsupported or missing MCP-Protocol-Version (expected " + MCP_VERSION_2026 + ").";
+
+		header_method = request_object.headers.geti("mcp-method");
+
+		if(!header_method)
+			return "Missing Mcp-Method header.";
+
+		if(header_method != method)
+			return "Mcp-Method does not match JSON-RPC method.";
+
+		header_name = request_object.headers.geti("mcp-name");
+
+		if(method == TOOLS_CALL_METHOD || method == PROMPTS_GET_METHOD)
+		{
+			if(!header_name)
+				return "Missing Mcp-Name header.";
+
+			if(header_name != params.geti("name"))
+				return "Mcp-Name does not match request.";
+		}
+		else if(method == RESOURCES_READ_METHOD)
+		{
+			if(!header_name)
+				return "Missing Mcp-Name header.";
+
+			if(header_name != params.geti("uri"))
+				return "Mcp-Name does not match resource URI.";
+		}
+
+		return None;
+	}
+
+	// -------------------------------------------------------------------------
+	// POST: validate, dispatch, answer
+	// -------------------------------------------------------------------------
+	handle_post(server, request_object, method, rpc_id, params)
+	{
+		header_error = validate_headers(request_object, method, params);
+
+		if(header_error)
+			return mcp_http_error(400, rpc_id, JSONRPC_INVALID_REQUEST, header_error);
+
+		ctx = [
+			protocol = name,
+			version = MCP_VERSION_2026,
+			client = mcp_request_client(request_object),
+			transport = "http",
+		];
+
+		response = server.dispatch(this, method, params, rpc_id, ctx);
+
+		if(!response)
+			return [status_code = 202, body = ""];
+
+		return [
+			status_code = 200,
+			headers = ["Content-Type" = "application/json"],
+			body = mcp_encode(response),
+		];
+	}
+}

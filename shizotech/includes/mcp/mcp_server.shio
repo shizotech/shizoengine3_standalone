@@ -1,0 +1,747 @@
+// ============================================================================
+// mcp_server.shio — MCP server, one entry point for every protocol version
+//
+//   #include "mcp/mcp_server"
+//
+//   server = mcpserver("My server", 13338);
+//   server.add_tool("echo", "Echo a message", [message = "&string(): Message"],
+//       [](svr, args) { return args.message; });
+//   std.sleep(-1);
+//
+// Every request is routed to the protocol it belongs to:
+//
+//   MCP-Protocol-Version: 2026-07-28 or server/discover  -> mcp_protocol_26
+//   everything else (initialize, 2024-11-05 ... 2025-11-25,
+//   Streamable HTTP and the legacy HTTP+SSE transport)    -> mcp_protocol_25
+//
+// Tools, resources, prompts and instructions are registered once and are
+// served by both protocols. See README.md for the full API.
+// ============================================================================
+
+import webserver;
+
+#include "mcp_types.shio"
+#include "mcp_protocol_25.shio"
+#include "mcp_protocol_26.shio"
+#include "openai/openai"
+
+class mcpserver
+{
+	name = "";
+	port = 13338;
+	version = "1.0.0";
+	http = None;
+
+	// true while the HTTP server is bound and serving
+	running = false;
+	// Why the server could not start ("" when it runs)
+	error = "";
+
+	// Print every request (method, tool, result) to the console
+	verbose = false;
+
+	// false: the server stays bound, but answers every request except
+	// initialize / server/discover / ping with JSONRPC_SERVER_DISABLED.
+	enabled = true;
+
+	// ------------------------------------------------------------------------
+	// Hooks
+	//
+	// tool_filter(name, args, ctx) -> None to run the tool, a string to reject
+	//   the call (the client gets a tool result with isError and the reason).
+	//
+	// on_request(entry) is called after every handled request with the same
+	//   entry that is added to history (see record()).
+	// ------------------------------------------------------------------------
+	tool_filter = None;
+	on_request = None;
+
+	// Last requests, newest last (history_size entries)
+	history = [];
+	history_size = 100;
+	request_count = 0;
+	error_count = 0;
+
+	// Clients seen recently: client name -> [protocol, version, transport, last_seen]
+	peers = [];
+
+	// Legacy HTTP+SSE streams: session id -> stream state (mcp_protocol_25)
+	clients = [];
+	// Streamable HTTP sessions: Mcp-Session-Id -> session (mcp_protocol_25)
+	sessions = [];
+	// Sessions unused for this long are dropped when new ones are opened
+	session_timeout_ms = 3600000;
+
+	// Server instructions, returned by initialize and server/discover
+	instructions = "";
+
+	// Cache hints of MCP 2026-07-28 (ttlMs / cacheScope). 0 / "private" means
+	// "do not cache" and is the safe default for a generic server.
+	cache_ttl_ms = 0;
+	cache_scope = "private";
+
+	tools = None;
+	resources = None;
+	prompts = None;
+
+	// Tools whose callback also gets the request context (add_tool with_context)
+	context_tools = [];
+
+	protocol_25 = None;
+	protocol_26 = None;
+
+	routes_added = false;
+
+	// =========================================================================
+	// Constructor
+	//
+	// http_backend: an existing webserver.http_server() (None creates one)
+	// autostart:    false only registers everything, call start() later
+	// =========================================================================
+	__init__(name, port, http_backend = None, autostart = true)
+	{
+		this.name = name;
+		this.port = port;
+
+		// Every instance gets its own registries
+		tools = toolset();
+		tools.tools = [];
+		tools.tool_callbacks = [];
+		context_tools = [];
+		resources = resource_registry();
+		prompts = prompt_registry();
+
+		history = [];
+		peers = [];
+		clients = [];
+		sessions = [];
+
+		protocol_25 = mcp_protocol_25();
+		protocol_26 = mcp_protocol_26();
+
+		http = http_backend;
+		if(!http)
+			http = webserver.http_server();
+
+		if(autostart)
+			start();
+	}
+
+	// =========================================================================
+	// Lifecycle
+	// =========================================================================
+
+	start()
+	{
+		if(running)
+			return true;
+
+		error = "";
+
+		if(!http.init(port))
+		{
+			error = "Cannot bind port " + port + ".";
+			std.error("MCP: " + error);
+			return false;
+		}
+
+		if(!routes_added)
+		{
+			routes_added = true;
+
+			// Streamable HTTP and 2026-07-28, also POST / for clients that use the
+			// base url as endpoint
+			http.route("POST", "/mcp", this.handle_post);
+			http.route("POST", "/", this.handle_post);
+
+			// Legacy HTTP+SSE event stream
+			http.route("GET", "/", this.handle_sse_stream);
+			http.route("GET", "/sse", this.handle_sse_stream);
+
+			// Streamable HTTP: no server initiated stream, end of a session
+			http.route("GET", "/mcp", [](request_object, writer) {
+				return [status_code = 405, headers = ["Allow" = "POST, DELETE"], body = "Method Not Allowed"];
+			});
+			http.route("DELETE", "/mcp", this.handle_delete);
+		}
+
+		if(!http.start())
+		{
+			error = "Cannot start the HTTP server on port " + port + ".";
+			std.error("MCP: " + error);
+			return false;
+		}
+
+		running = true;
+
+		std.print("MCP Server started on port " + port);
+		std.print("MCP Endpoint: http://localhost:" + port + "/mcp (Streamable HTTP, " + MCP_VERSION_2026 + "), http://localhost:" + port + "/sse (HTTP+SSE)");
+
+		return true;
+	}
+
+	stop()
+	{
+		if(!running)
+			return;
+
+		running = false;
+
+		// Ends the event stream loops
+		for(i = 0; i < clients.size(); i++)
+			clients[i].stop = true;
+
+		sessions = [];
+
+		http.stop();
+
+		std.print("MCP Server on port " + port + " stopped");
+	}
+
+	// =========================================================================
+	// Configuration API
+	// =========================================================================
+
+	set_instructions(text)
+	{
+		this.instructions = text;
+	}
+
+	// Alias for set_instructions
+	add_instruction(text)
+	{
+		this.instructions = text;
+	}
+
+	// server.set_cache(60000, "public");
+	// Only use "public" when the data is identical for every caller.
+	set_cache(ttl_ms, cache_scope)
+	{
+		this.cache_ttl_ms = ttl_ms;
+		this.cache_scope = cache_scope;
+	}
+
+	// =========================================================================
+	// Tools
+	//
+	// parameters: simple_json notation of the openai include, e.g.
+	//   [path = "&string(): Path of the file", count = "int(1,10): How many"]
+	//   (& = required). None for a tool without arguments.
+	// callback(server, args) -> string or json (the tool result).
+	//   with_context = true: callback(server, args, ctx), ctx describes the
+	//   request (protocol, version, client, transport), e.g. to tell clients apart.
+	//   A runtime error inside the callback becomes a tool result with isError
+	//   and the error message.
+	// =========================================================================
+
+	add_tool(tool_name, description, parameters, callback, with_context = false)
+	{
+		tools.add_tool(tool_name, description, parameters, callback);
+
+		if(with_context)
+			context_tools[tool_name] = true;
+		else if(context_tools.has(tool_name))
+			context_tools.erase(tool_name);
+	}
+
+	has_tool(tool_name)
+	{
+		return tools.tool_callbacks.has(tool_name);
+	}
+
+	remove_tool(tool_name)
+	{
+		for(i = 0; i < tools.tools.size(); i++)
+		{
+			if(tools.tools[i].function.name == tool_name)
+			{
+				tools.tools.erase(i);
+				tools.tool_callbacks.erase(tool_name);
+				if(context_tools.has(tool_name))
+					context_tools.erase(tool_name);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	clear_tools()
+	{
+		tools.tools = [];
+		tools.tool_callbacks = [];
+		context_tools = [];
+	}
+
+	// =========================================================================
+	// Resources
+	// =========================================================================
+
+	// Static text
+	add_resource(uri, name, description, mime_type, text)
+	{
+		this.resources.add_static_resource(uri, name, description, mime_type, text);
+	}
+
+	// File backed, the file is read on every resources/read, so it can be
+	// edited while the server runs
+	add_resource_file(uri, name, description, path, mime_type = "text/markdown")
+	{
+		this.resources.add_resource(uri, name, description, mime_type, path);
+	}
+
+	// callback(server, uri) -> text
+	add_resource_callback(uri, name, description, mime_type, callback)
+	{
+		this.resources.add_resource_callback(uri, name, description, mime_type, callback);
+	}
+
+	// =========================================================================
+	// Prompts
+	//
+	// arguments: [[name = "...", description = "...", required = true], ...]
+	// callback(server, arguments) -> prompt text
+	// =========================================================================
+
+	add_prompt(name, description, arguments, callback)
+	{
+		this.prompts.add_prompt(name, description, arguments, callback);
+	}
+
+	// =========================================================================
+	// Introspection
+	// =========================================================================
+
+	list_tools()
+	{
+		list = [];
+
+		for(i = 0; i < tools.tools.size(); i++)
+		{
+			t = [
+				name = tools.tools[i].function.name,
+				description = tools.tools[i].function.description,
+				inputSchema = tools.tools[i].function.parameters,
+			];
+
+			if(!t.inputSchema)
+				t.inputSchema = [type = "object", properties = []];
+
+			list.push_back(t);
+		}
+
+		return list;
+	}
+
+	// Clients seen in the last max_age_ms milliseconds, newest first
+	connected_clients(max_age_ms = 300000)
+	{
+		now = std.millis();
+		list = [];
+
+		for(i = 0; i < peers.size(); i++)
+		{
+			p = peers[i];
+			if(now - p.last_seen > max_age_ms)
+				continue;
+			list.push_back([
+				client = peers.key(i),
+				protocol = p.protocol,
+				version = p.version,
+				transport = p.transport,
+				last_seen_ms = now - p.last_seen,
+			]);
+		}
+
+		return list;
+	}
+
+	status()
+	{
+		return [
+			name = name,
+			port = port,
+			running = running,
+			enabled = enabled,
+			error = error,
+			protocols = [MCP_VERSION_2026, MCP_VERSION_2025],
+			tools = tools.tools.size(),
+			resources = resources.resources.size(),
+			prompts = prompts.prompts.size(),
+			sse_streams = clients.size(),
+			sessions = sessions.size(),
+			requests = request_count,
+			errors = error_count,
+		];
+	}
+
+	// =========================================================================
+	// Shared method handling (both protocols)
+	//
+	// Returns an outcome: mcp_ok(result) or mcp_fail(code, message).
+	// ctx: [protocol, version, client, transport] of the request.
+	// =========================================================================
+
+	handle_method(method, params, ctx)
+	{
+		if(method.starts("notifications/"))
+			return mcp_ok(None);
+
+		if(method == PING_METHOD)
+			return mcp_ok([]);
+
+		if(!enabled)
+			return mcp_fail(JSONRPC_SERVER_DISABLED, "The MCP server '" + name + "' is disabled.");
+
+		if(method == TOOLS_LIST_METHOD)
+			return mcp_ok([tools = mcp_list(list_tools())]);
+
+		if(method == TOOLS_CALL_METHOD)
+			return call_tool(params.geti("name"), params.geti("arguments"), ctx);
+
+		if(method == RESOURCES_LIST_METHOD)
+			return list_resources();
+
+		if(method == RESOURCES_READ_METHOD)
+			return read_resource(params.geti("uri"));
+
+		if(method == PROMPTS_LIST_METHOD)
+			return list_prompts();
+
+		if(method == PROMPTS_GET_METHOD)
+			return get_prompt(params.geti("name"), params.geti("arguments"));
+
+		if(method == LOGGING_SET_LEVEL_METHOD)
+			return mcp_ok([]);
+
+		return mcp_fail(JSONRPC_METHOD_NOT_FOUND, "Method not found: " + method);
+	}
+
+	call_tool(tool_name, args, ctx)
+	{
+		if(!tool_name)
+			return mcp_fail(JSONRPC_INVALID_PARAMS, "Missing tool name.");
+
+		if(!tools.tool_callbacks.has(tool_name))
+			return mcp_fail(JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
+
+		if(!args)
+			args = [];
+
+		if(tool_filter)
+		{
+			reason = None;
+			try {
+				reason = tool_filter(tool_name, args, ctx);
+			}
+			catch(e) {
+				reason = "tool filter failed: " + e;
+			}
+
+			if(reason)
+			{
+				message = "Rejected: " + reason;
+				return mcp_ok(create_tool_result(message, true), message);
+			}
+		}
+
+		cb = tools.tool_callbacks[tool_name];
+
+		try {
+			if(context_tools.has(tool_name))
+				return mcp_ok(create_tool_result(cb(this, args, ctx)));
+			return mcp_ok(create_tool_result(cb(this, args)));
+		}
+		catch(e) {
+			message = "Tool '" + tool_name + "' failed: " + e;
+			return mcp_ok(create_tool_result(message, true), message);
+		}
+	}
+
+	list_resources()
+	{
+		list = [];
+
+		for(i = 0; i < resources.resources.size(); i++)
+		{
+			r = resources.resources[i];
+
+			list.push_back([
+				uri = r.uri,
+				name = r.name,
+				description = r.description,
+				mimeType = r.mimeType,
+			]);
+		}
+
+		return mcp_ok([resources = mcp_list(list)]);
+	}
+
+	read_resource(uri)
+	{
+		if(!uri)
+			return mcp_fail(JSONRPC_INVALID_PARAMS, "Missing resource URI.");
+
+		r = resources.find_resource(uri);
+
+		if(!r)
+			return mcp_fail(JSONRPC_RESOURCE_NOT_FOUND, "Resource not found: " + uri);
+
+		text = r.text;
+
+		if(r.callback)
+		{
+			try {
+				text = r.callback(this, uri);
+			}
+			catch(e) {
+				return mcp_fail(JSONRPC_INTERNAL_ERROR, "Resource callback failed: " + e);
+			}
+		}
+		else if(r.path)
+		{
+			if(!fileio.exists(r.path))
+				return mcp_fail(JSONRPC_INTERNAL_ERROR, "Resource file not found: " + r.path);
+
+			try {
+				text = fileio.read_string(r.path);
+			}
+			catch(e) {
+				return mcp_fail(JSONRPC_INTERNAL_ERROR, "Failed to read resource file " + r.path + ": " + e);
+			}
+		}
+
+		return mcp_ok([contents = [[uri = r.uri, mimeType = r.mimeType, text = mcp_value_text(text)]]]);
+	}
+
+	list_prompts()
+	{
+		list = [];
+
+		for(i = 0; i < prompts.prompts.size(); i++)
+		{
+			p = prompts.prompts[i];
+
+			list.push_back([
+				name = p.name,
+				description = p.description,
+				arguments = mcp_list(p.arguments),
+			]);
+		}
+
+		return mcp_ok([prompts = mcp_list(list)]);
+	}
+
+	get_prompt(prompt_name, arguments)
+	{
+		if(!prompt_name)
+			return mcp_fail(JSONRPC_INVALID_PARAMS, "Missing prompt name.");
+
+		p = prompts.find_prompt(prompt_name);
+
+		if(!p)
+			return mcp_fail(JSONRPC_INVALID_PARAMS, "Prompt not found: " + prompt_name);
+
+		if(!arguments)
+			arguments = [];
+
+		for(i = 0; i < p.arguments.size(); i++)
+		{
+			a = p.arguments[i];
+			if(a.required && !arguments.geti(a.name))
+				return mcp_fail(JSONRPC_INVALID_PARAMS, "Missing required argument '" + a.name + "' of prompt " + prompt_name);
+		}
+
+		cb = prompts.prompt_callbacks[prompt_name];
+
+		try {
+			text = cb(this, arguments);
+
+			return mcp_ok([
+				description = p.description,
+				messages = [[role = "user", content = [type = "text", text = mcp_value_text(text)]]],
+			]);
+		}
+		catch(e) {
+			return mcp_fail(JSONRPC_INTERNAL_ERROR, "Prompt callback failed: " + e);
+		}
+	}
+
+	// =========================================================================
+	// Dispatch: runs a method through its protocol, records it and builds the
+	// JSON-RPC response (None for notifications, they are never answered).
+	// =========================================================================
+
+	dispatch(protocol, method, params, rpc_id, ctx)
+	{
+		started = std.millis();
+		outcome = None;
+
+		try {
+			outcome = protocol.handle_method(this, method, params, ctx);
+		}
+		catch(e) {
+			outcome = mcp_fail(JSONRPC_INTERNAL_ERROR, "Internal error in " + method + ": " + e);
+		}
+
+		if(!mcp_has_id(rpc_id))
+			return None;
+
+		record(method, params, outcome, ctx, std.millis() - started);
+
+		if(!outcome.ok)
+			return create_jsonrpc_error(rpc_id, outcome.code, outcome.message);
+
+		return create_jsonrpc_response(rpc_id, outcome.result);
+	}
+
+	// History entry:
+	//   [time, protocol, version, client, transport, method, name, ok, error, duration_ms]
+	// name is the tool / prompt name or the resource uri ("" for other methods).
+	record(method, params, outcome, ctx, duration_ms)
+	{
+		failed = outcome.ok ? outcome.failed : outcome.message;
+
+		target = "";
+		if(params.geti("name"))
+			target = std.string(params.geti("name"));
+		else if(params.geti("uri"))
+			target = std.string(params.geti("uri"));
+
+		entry = [
+			time = std.timestamp(),
+			protocol = ctx.protocol,
+			version = ctx.version,
+			client = ctx.client,
+			transport = ctx.transport,
+			method = method,
+			name = target,
+			ok = !failed,
+			error = failed,
+			duration_ms = duration_ms,
+		];
+
+		history.push_back(entry);
+		for(history.size() > history_size)
+			history.erase(0);
+
+		request_count++;
+		if(failed)
+			error_count++;
+
+		peers[ctx.client] = [
+			protocol = ctx.protocol,
+			version = ctx.version,
+			transport = ctx.transport,
+			last_seen = std.millis(),
+		];
+
+		if(verbose)
+			std.print("MCP [", ctx.protocol, "] ", ctx.client, ": ", method, target ? " " + target : "", failed ? " -> " + failed : " -> ok", " (", duration_ms, " ms)");
+
+		if(on_request)
+		{
+			try {
+				on_request(entry);
+			}
+			catch(e) {
+				std.warn("MCP: on_request failed: " + e);
+			}
+		}
+	}
+
+	// =========================================================================
+	// Sessions (Streamable HTTP)
+	// =========================================================================
+
+	open_session(ctx)
+	{
+		now = std.millis();
+
+		for(i = 0; i < sessions.size(); i++)
+		{
+			if(now - sessions[i].last_seen > session_timeout_ms)
+			{
+				sessions.erase(i);
+				i--;
+			}
+		}
+
+		session_id = std.random_hash(32);
+
+		sessions[session_id] = [
+			version = ctx.version,
+			client = ctx.client,
+			created = now,
+			last_seen = now,
+		];
+
+		return session_id;
+	}
+
+	// =========================================================================
+	// HTTP handlers
+	// =========================================================================
+
+	handle_post(request_object, writer)
+	{
+		if(!running)
+			return mcp_http_error(503, None, JSONRPC_SERVER_DISABLED, "The MCP server is stopped.");
+
+		body_str = std.string(request_object.body);
+
+		if(body_str.strip() == "")
+			return mcp_http_error(400, None, JSONRPC_PARSE_ERROR, "Empty request body.");
+
+		// std.json logs bad input and returns an empty JSON
+		req = None;
+		try {
+			req = std.json(body_str);
+		}
+		catch(e) {
+			return mcp_http_error(400, None, JSONRPC_PARSE_ERROR, "Failed to parse JSON: " + e);
+		}
+
+		if(!std.is_json(req) || req.size() == 0)
+			return mcp_http_error(400, None, JSONRPC_PARSE_ERROR, "The request body is not a JSON-RPC message.");
+
+		method = req.geti("method");
+		rpc_id = req.geti("id");
+		params = req.geti("params");
+
+		if(!params)
+			params = [];
+
+		if(!method)
+		{
+			// A response of the client (to a server request): nothing to do
+			if(req.has("result") || req.has("error"))
+				return [status_code = 202, body = ""];
+
+			return mcp_http_error(400, rpc_id, JSONRPC_INVALID_REQUEST, "Missing method.");
+		}
+
+		return protocol_for(request_object, method).handle_post(this, request_object, method, rpc_id, params);
+	}
+
+	handle_delete(request_object, writer)
+	{
+		return protocol_25.handle_delete(this, request_object);
+	}
+
+	handle_sse_stream(request_object, writer)
+	{
+		protocol_25.handle_sse_stream(this, request_object, writer);
+	}
+
+	// The version routing (see the top of this file)
+	protocol_for(request_object, method)
+	{
+		if(request_object.headers.geti("mcp-protocol-version") == MCP_VERSION_2026)
+			return protocol_26;
+
+		if(method == SERVER_DISCOVER_METHOD)
+			return protocol_26;
+
+		return protocol_25;
+	}
+}

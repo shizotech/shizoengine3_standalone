@@ -1,0 +1,509 @@
+// ============================================================================
+// mcp_bridge.shio — MCP server of a running VibeVJ (MCP tab)
+//
+// Serves the generator queries of every AIInterface (engine.ai_interfaces)
+// as MCP tools, next to the in-process Chat agent:
+//
+//   one tool per query name (get_local_controls, get_local_control,
+//   set_local_control, get_local_control_attributes, get_target_status, ...)
+//     arguments: the query arguments + live_path (which generator, empty = the
+//     one the user focused last). Built from AIInterface.list_queries() and
+//     rebuilt when generators or their queries change. A name whose arguments
+//     differ between generator types gets no tool of its own, vibevj_query
+//     reaches it.
+//
+//   vibevj_list_generators, vibevj_get_focus, vibevj_describe_generator,
+//   vibevj_query, vibevj_lock_generator, vibevj_unlock_generator,
+//   vibevj_activity
+//
+// Safety for live use:
+//   - tool calls run on the HTTP server's script threads, not in the render loop
+//   - server.enabled = false (Pause) rejects everything, allow_writes = false
+//     rejects every write query, max_calls_per_second limits the call rate
+//   - write queries go through AIInterface: the generator lock (vibevj_lock_generator)
+//     and engine.ai_activity ("AI is controlling") are shared with the Chat agent.
+//     Without a lock the last write wins.
+// ============================================================================
+
+#include "mcp/mcp_server"
+#include "aiinterface"
+
+VIBEVJ_MCP_DEFAULT_PORT = 13340;
+
+VIBEVJ_MCP_INSTRUCTIONS = R"(
+You are connected to a running VibeVJ instance (live visuals software).
+
+Everything in VibeVJ is a generator (shader, effect, source, view...). Each
+generator has a live_path and offers queries.
+
+1. Call vibevj_list_generators (or vibevj_get_focus for the generator the user
+   clicked last) to find generators and their live_path.
+2. Call vibevj_describe_generator(live_path) to see its queries and arguments.
+3. Use the query tools (get_local_controls, get_local_control,
+   set_local_control, ...) with that live_path, or vibevj_query for queries
+   without a tool of their own.
+
+This is a live performance: change only what the user asked for. Other agents
+(the in-app Chat) may control the same generators, vibevj_activity shows the
+last change. vibevj_lock_generator reserves a generator for your changes.
+)";
+
+VIBEVJ_MCP_STATIC_TOOLS = [
+	"vibevj_list_generators",
+	"vibevj_get_focus",
+	"vibevj_describe_generator",
+	"vibevj_query",
+	"vibevj_lock_generator",
+	"vibevj_unlock_generator",
+	"vibevj_activity",
+];
+
+vibevj_mcp_is_static_tool(name) {
+	for(i = 0; i < VIBEVJ_MCP_STATIC_TOOLS.size(); i++) {
+		if(VIBEVJ_MCP_STATIC_TOOLS[i] == name)
+			return true;
+	}
+	return false;
+}
+
+class VibeVJMCPBridge {
+
+	server = None;
+	port = VIBEVJ_MCP_DEFAULT_PORT;
+	error = "";
+
+	// false: every write query is rejected (read only access)
+	allow_writes = true;
+	// 0 = no limit
+	max_calls_per_second = 20;
+	call_times = [];
+
+	// Generated query tools: name -> [signature, args, description, access]
+	query_tools = [];
+	tools_revision = -1;
+
+	watching = false;
+	watcher = None;
+
+	__init__(port = VIBEVJ_MCP_DEFAULT_PORT) {
+		this.port = port;
+		call_times = [];
+		query_tools = [];
+	}
+
+	running() {
+		return server && server.running;
+	}
+
+	// =========================================================================
+	// Lifecycle
+	// =========================================================================
+
+	start(new_port = None) {
+		if(running())
+			return true;
+
+		if(new_port)
+			port = std.int(new_port);
+
+		error = "";
+		query_tools = [];
+		tools_revision = -1;
+		call_times = [];
+
+		// Register everything before the port is bound, so the first client
+		// already sees the complete tool list
+		server = mcpserver("VibeVJ", port, None, false);
+		
+		server.set_instructions(VIBEVJ_MCP_INSTRUCTIONS);
+		server.tool_filter = [this](tool_name, args, ctx) {
+			return this.filter_call(tool_name, args, ctx);
+		};
+
+		add_static_tools();
+
+		if(fileio.exists(".agent/skills/vibevj/SKILL.md"))
+			server.add_resource_file("vibevj://skills/vibevj", "vibevj skill", "How to operate VibeVJ (the skill of the in-app Chat agent).", ".agent/skills/vibevj/SKILL.md");
+
+		refresh_tools(true);
+		
+		if(!server.start()) {
+			error = server.error;
+			server.tool_filter = None;
+			server.clear_tools();
+			server = None;
+			query_tools = [];
+			return false;
+		}
+		
+		// Rebuilds the query tools when generators come and go
+		watching = true;
+		watcher = std.thread([this]() {
+			for(this.watching) {
+				try {
+					this.refresh_tools();
+				}
+				catch(e) {
+					std.warn("MCP: refreshing the tools failed: " + e);
+				}
+				std.sleep(1000);
+			}
+		});
+		watcher.run();
+
+		return true;
+	}
+
+	stop() {
+		watching = false;
+
+		if(!server)
+			return;
+
+		server.stop();
+		// The callbacks capture this bridge, drop them so nothing keeps it alive
+		server.tool_filter = None;
+		server.clear_tools();
+		server = None;
+		query_tools = [];
+	}
+
+	status() {
+		if(!server)
+			return [running = false, port = port, error = error, allow_writes = allow_writes];
+
+		s = server.status();
+		s.allow_writes = allow_writes;
+		s.query_tools = query_tools.size();
+		return s;
+	}
+
+	// =========================================================================
+	// Generators
+	// =========================================================================
+
+	interfaces() {
+		list = [];
+		registry = std.global("engine").ai_interfaces;
+		if(!registry)
+			return list;
+
+		for(i = 0; i < registry.size(); i++) {
+			iface = registry[i];
+			if(iface && iface.target)
+				list.push_back(iface);
+		}
+		return list;
+	}
+
+	live_path_of(iface) {
+		try {
+			return iface.target.get_live_path();
+		}
+		catch(e) {}
+		return "";
+	}
+
+	// The generator the user clicked last, else the item of the main view
+	// (like the Chat agent). create_view: add the main view's singleview when
+	// the project is empty (it adds a generator, so only when writes are allowed).
+	focused_interface(create_view = false) {
+		engine = std.global("engine");
+		if(engine.ai_last_interface)
+			return engine.ai_last_interface;
+		
+		view = engine.main_generator_view;
+		if(!view)
+			return None;
+		if(!view.item && create_view)
+			view.add_generator(view.area, "engine/assets/singleview.asset");
+		if(view.item)
+			return view.item.ai_interface;
+		return None;
+	}
+	
+	// live_path "" / None: the focused generator (focused_interface)
+	find_interface(live_path) {
+		if(!live_path)
+			return focused_interface();
+
+		ifaces = interfaces();
+		for(i = 0; i < ifaces.size(); i++) {
+			if(live_path_of(ifaces[i]) == live_path)
+				return ifaces[i];
+		}
+		return None;
+	}
+
+	require_interface(live_path) {
+		iface = find_interface(live_path);
+		if(iface)
+			return iface;
+		if(live_path)
+			std.runtime_error("No generator with live_path '" + live_path + "', see vibevj_list_generators.");
+		std.runtime_error("No generator is focused, pass a live_path (see vibevj_list_generators).");
+		return None;
+	}
+
+	generator_info(iface) {
+		info = iface.describe();
+		info.queries = iface.query_names();
+		return info;
+	}
+
+	caller_of(ctx) {
+		return "mcp:" + ctx.client;
+	}
+
+	// Runs a query, a failure becomes a runtime error (tool result with isError)
+	run_query(live_path, query_name, args, ctx) {
+		iface = require_interface(live_path);
+		result = iface.query(query_name, args, caller_of(ctx));
+
+		if(!result.ok) {
+			message = result.error;
+			if(result.available) {
+				message += " Available queries:";
+				for(i = 0; i < result.available.size(); i++)
+					message += (i ? ", " : " ") + result.available[i];
+			}
+			std.runtime_error(message);
+		}
+
+		return result.value;
+	}
+
+	// =========================================================================
+	// Call filter (rate limit, read only mode)
+	// =========================================================================
+
+	is_write_call(tool_name, args) {
+		if(tool_name == "vibevj_lock_generator" || tool_name == "vibevj_unlock_generator")
+			return true;
+
+		if(tool_name == "vibevj_query") {
+			query_name = std.string(args.geti("query") ?? "");
+			iface = find_interface(args.geti("live_path"));
+			if(iface && iface.queries.has(query_name))
+				return iface.queries[query_name].access == "write";
+			return aiinterface_default_access(query_name) == "write";
+		}
+
+		if(query_tools.has(tool_name))
+			return query_tools[tool_name].access == "write";
+
+		return false;
+	}
+
+	filter_call(tool_name, args, ctx) {
+		now = std.millis();
+
+		for(call_times.size() > 0 && now - call_times[0] > 1000)
+			call_times.erase(0);
+
+		if(max_calls_per_second > 0 && call_times.size() >= max_calls_per_second)
+			return "more than " + max_calls_per_second + " calls per second, slow down.";
+
+		call_times.push_back(now);
+
+		if(!allow_writes && is_write_call(tool_name, args))
+			return "VibeVJ allows only reading over MCP right now (MCP tab: 'Allow changes' is off).";
+
+		return None;
+	}
+
+	// =========================================================================
+	// Tools
+	// =========================================================================
+
+	add_static_tools() {
+		server.add_tool(
+			"vibevj_list_generators",
+			"Lists every generator of the running VibeVJ: live_path, file_path, type, queries, lock state. 'focused' is the live_path of the generator the user clicked last.",
+			None,
+			[this](svr, args) {
+				list = [];
+				ifaces = this.interfaces();
+				for(i = 0; i < ifaces.size(); i++)
+					list.push_back(this.generator_info(ifaces[i]));
+
+				focused = "";
+				focused_iface = this.focused_interface();
+				if(focused_iface)
+					focused = this.live_path_of(focused_iface);
+				return [
+					generators = list,
+					focused = focused,
+				];
+			}
+		);
+
+		server.add_tool(
+			"vibevj_get_focus",
+			"Returns the generator the user clicked last (else the main view), with its queries and their arguments.",
+			None,
+			[this](svr, args) {
+				iface = this.focused_interface(this.allow_writes);
+				if(!iface)
+					std.runtime_error("Nothing is focused and the main view is empty, see vibevj_list_generators.");
+				info = this.generator_info(iface);
+				info.queries = iface.list_queries();
+				return info;
+			}
+		);
+
+		server.add_tool(
+			"vibevj_describe_generator",
+			"Returns one generator with its queries, their arguments and access (read / write).",
+			[live_path = "&string(): Live path of the generator (vibevj_list_generators)."],
+			[this](svr, args) {
+				iface = this.require_interface(args.live_path);
+				info = this.generator_info(iface);
+				info.queries = iface.list_queries();
+				return info;
+			}
+		);
+
+		server.add_tool(
+			"vibevj_query",
+			"Runs any query of a generator (also the ones without a tool of their own). Returns the query result.",
+			[
+				live_path = "string(): Live path of the generator, empty = the generator the user clicked last.",
+				query = "&string(): Name of the query (vibevj_describe_generator lists them).",
+				args = "any(): Arguments of the query as a JSON object.",
+			],
+			[this](svr, args, ctx) {
+				return this.run_query(args.geti("live_path"), args.query, args.geti("args"), ctx);
+			},
+			true
+		);
+
+		server.add_tool(
+			"vibevj_lock_generator",
+			"Reserves a generator for your changes: write queries of other agents (e.g. the in-app Chat) are refused until you unlock it or the lock expires.",
+			[
+				live_path = "&string(): Live path of the generator.",
+				ttl_seconds = "int(0,3600): Lock duration in seconds (default 60, 0 = until unlocked).",
+			],
+			[this](svr, args, ctx) {
+				iface = this.require_interface(args.live_path);
+				ttl = args.has("ttl_seconds") ? std.int(args.ttl_seconds) : 60;
+				if(!iface.lock(this.caller_of(ctx), ttl * 1000))
+					std.runtime_error("The generator is locked by " + iface.locked_by() + ".");
+				return [locked = true, owner = this.caller_of(ctx), ttl_seconds = ttl];
+			},
+			true
+		);
+
+		server.add_tool(
+			"vibevj_unlock_generator",
+			"Releases a lock of vibevj_lock_generator.",
+			[live_path = "&string(): Live path of the generator."],
+			[this](svr, args, ctx) {
+				iface = this.require_interface(args.live_path);
+				if(!iface.unlock(this.caller_of(ctx)))
+					std.runtime_error("The generator is locked by " + iface.locked_by() + ", not by you.");
+				return [locked = false];
+			},
+			true
+		);
+
+		server.add_tool(
+			"vibevj_activity",
+			"Shows the last change any AI agent (MCP clients, the in-app Chat) made, and which generators are locked.",
+			None,
+			[this](svr, args) {
+				activity = std.global("engine").ai_activity;
+				result = [last_change = "none"];
+				if(activity && activity.time) {
+					result.last_change = [
+						caller = activity.caller,
+						query = activity.query,
+						target = activity.target,
+						seconds_ago = (std.millis() - activity.time) / 1000,
+					];
+				}
+
+				locks = [];
+				ifaces = this.interfaces();
+				for(i = 0; i < ifaces.size(); i++) {
+					owner = ifaces[i].locked_by();
+					if(owner)
+						locks.push_back([live_path = this.live_path_of(ifaces[i]), owner = owner]);
+				}
+				result.locks = locks;
+				return result;
+			}
+		);
+	}
+
+	// One MCP tool per query name, from AIInterface.list_queries() of every generator
+	refresh_tools(force = false) {
+		if(!server)
+			return;
+
+		revision = std.global("engine").ai_interfaces_revision;
+		if(!force && revision == tools_revision)
+			return;
+		tools_revision = revision;
+
+		table = [];
+		ifaces = interfaces();
+
+		for(i = 0; i < ifaces.size(); i++) {
+			queries = ifaces[i].list_queries();
+			for(k = 0; k < queries.size(); k++) {
+				q = queries[k];
+				if(vibevj_mcp_is_static_tool(q.name) || q.args.has("live_path"))
+					continue;
+
+				signature = q.args.compact_string() + "|" + q.description + "|" + q.access;
+
+				if(!table.has(q.name))
+					table[q.name] = [signature = signature, args = q.args, description = q.description, access = q.access, conflict = false];
+				else if(table[q.name].signature != signature)
+					table[q.name].conflict = true;
+			}
+		}
+
+		// Remove tools that are gone or became ambiguous
+		names = [];
+		for(i = 0; i < query_tools.size(); i++)
+			names.push_back(query_tools.key(i));
+
+		for(i = 0; i < names.size(); i++) {
+			n = names[i];
+			if(!table.has(n) || table[n].conflict) {
+				server.remove_tool(n);
+				query_tools.erase(n);
+			}
+		}
+
+		for(i = 0; i < table.size(); i++) {
+			n = table.key(i);
+			entry = table[i];
+			if(entry.conflict)
+				continue;
+			if(query_tools.has(n) && query_tools[n].signature == entry.signature)
+				continue;
+
+			spec = [live_path = "string(): Live path of the generator (vibevj_list_generators), empty = the generator the user clicked last."];
+			for(k = 0; k < entry.args.size(); k++)
+				spec[entry.args.key(k)] = entry.args[k];
+
+			description = entry.description;
+			if(description)
+				description += "\n\n";
+			description += "Generator query (" + entry.access + ").";
+
+			server.add_tool(n, description, spec, [this, n](svr, args, ctx) {
+				query_args = args.copy();
+				if(query_args.has("live_path"))
+					query_args.erase("live_path");
+				return this.run_query(args.geti("live_path"), n, query_args, ctx);
+			}, true);
+
+			query_tools[n] = entry;
+		}
+	}
+}

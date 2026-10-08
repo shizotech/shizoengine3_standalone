@@ -35,7 +35,8 @@ engine/generators/extensions/
 ├── asset/__init__.shio    # Loads a .asset directory (src/__init__.shio)
 ├── glsl/__init__.shio     # Loads a .glsl directory (src/__init__.glsl) + shader_loader.shio
 ├── png/__init__.shio      # Loads a .png image generator + image_module.shio
-└── txt/__init__.shio      # Loads a .txt text generator + text_module.shio
+├── txt/__init__.shio      # Loads a .txt text generator + text_module.shio
+└── video/__init__.shio    # Loads video files (.mp4, .mov, .mkv, ...) + video_module.shio
 ```
 
 Each `__init__.shio` **must** export a `load_extension(generator)` entry point that builds the generator's control widgets into `generator.node`. Optional exports:
@@ -59,7 +60,7 @@ Each `__init__.shio` **must** export a `load_extension(generator)` entry point t
 2. **Add the entry point** inside `src/`:
    - For a ShizoScript generator: `src/__init__.shio` exporting `load_extension(generator)`.
    - For a shader generator: `src/__init__.glsl`.
-3. **Ensure a matching loader exists** in `engine/generators/extensions/<ext>/__init__.shio`. The four supported extensions are `asset`, `glsl`, `png`, `txt`. If you introduce a brand-new extension, a corresponding loader must be added (this touches engine code — see DO NOT CHANGE).
+3. **Ensure a matching loader exists** in `engine/generators/extensions/<ext>/__init__.shio`. The supported extensions are `asset`, `glsl`, `png`, `txt` and `video` (every video container extension maps to `video`, see `generatoritem.shio`). If you introduce a brand-new extension, a corresponding loader must be added (this touches engine code — see DO NOT CHANGE).
 4. **Implement `load_extension`** to build the control widgets into `generator.node`, and optionally `save_state`/`load_state`/`dispatcher`.
 5. **Test** with `shizoscript_syntax_checker` / `shizoscript_debugger`.
 
@@ -109,7 +110,7 @@ The engine wires `on_dragdrop` / `on_dragdrop_hover` handlers on each of these v
 │   │   ├── clipview.shio        # Clip view container
 │   │   ├── clipstackview.shio   # Clip stack view container
 │   │   ├── singleview.shio      # Single generator view
-│   │   └── extensions/        # Per-extension loaders (asset, glsl, png, txt)
+│   │   └── extensions/        # Per-extension loaders (asset, glsl, png, txt, video)
 │   ├── assets/              # ⚠ DO NOT CHANGE — engine-internal glue generators
 │   │   ├── composition.glsl
 │   │   ├── layerblend.glsl
@@ -123,6 +124,41 @@ The engine wires `on_dragdrop` / `on_dragdrop_hover` handlers on each of these v
 ├── projects/                 # Project configuration and state files
 └── configs/                  # Application configuration
 ```
+
+---
+
+## Documentation: every feature gets its user wiki page
+
+Every new feature or UI change also adds or updates its page in the **user wiki** in the same PR: what it is for, how to use it
+step by step, and a current screenshot or GIF. The user wiki is plain Markdown in `wiki/` (start page `wiki/README.md`), written
+for VJs, not for developers. Setting it up for the existing features is issue #295.
+
+- Use the same words as the UI and the design glossary (`../design/wiki/Glossary.md`). Mark planned features as planned.
+- UI rules (colours, notches, sizes, labels) are in `../design/README.md`; their meaning is explained in `../design/wiki/`. A
+  change to a design rule updates both in the same PR.
+
+---
+
+## Pitfalls (learned from the first local build of the Shizo UI)
+
+Things that compile in your head but fail at run time. Check them when you cannot run the app yourself.
+
+**Shizoscript**
+- There is no `while`. Use `for(condition)` instead.
+- A JSON object has methods (`size()`, `has()`, `merge()`, …). A key with the same name must be read as `obj["size"]`, not
+  `obj.size` (that returns the method).
+- Number + string gives six decimals (`1 + ""` is `"1.000000"`). Format numbers explicitly where the text matters.
+
+**Checking scripts**
+- `shz --check` needs `_shizoengine3/` as working directory and the nanogui module that matches the script version.
+- Files without their own `import nanogui` (for example `src/menu/assetbrowser/assetbrowser.shio`) cannot be checked alone;
+  check them through `__init__.shio`.
+
+**nanogui (C++) script bindings**
+- A script function with a getter branch (`params.empty()`) must be registered with a minimum of 0 parameters, else the
+  getter is unreachable ("invalid parameter count").
+- A MIDI control has two link hit buttons: `m_link_button` (input, left) and `m_out_button` (output notch, right). Anything
+  that knows about the handle (drag start, drag cancel detection, hover, tooltips) must also know the output notch.
 
 ---
 
@@ -182,6 +218,8 @@ The elements of a modmatrixnode do NOT need to be direct children of the modmatr
 ### Reference Guides
 - [Asset Authoring Guide](assets/ASSET_GUIDE.MD)
 - [Shader Guide](assets/Shaders/SHADER_GUIDE.MD)
+- [Shizo UI design system](../design/README.md) and its [design wiki](../design/wiki/README.md)
+- User wiki: `wiki/` (being set up, #295)
 
 Always check directory specific README.md's
 

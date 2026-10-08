@@ -15,9 +15,12 @@ engine/generators/extensions/
 ├── png/
 │   ├── __init__.shio            # Loader for .png image generators
 │   └── image_module.shio
-└── txt/
-    ├── __init__.shio            # Loader for .txt text generators
-    └── text_module.shio
+├── txt/
+│   ├── __init__.shio            # Loader for .txt text generators
+│   └── text_module.shio
+└── video/
+    ├── __init__.shio            # Loader for video files (.mp4, .mov, .mkv, ...)
+    └── video_module.shio        # nanogui.video player + transport controls
 ```
 
 ## Loader Contract
@@ -42,7 +45,9 @@ Optional exports:
 `generatoritem.shio` inspects the asset path:
 
 1. If the path has an explicit file extension (`.png`, `.txt`, `.glsl`,
-   `.preset`, ...) it uses that.
+   `.preset`, ...) it uses that. Video containers (`.mp4`, `.mov`, `.m4v`,
+   `.mkv`, `.webm`, `.avi`, `.mxf`, `.mpg`, `.mpeg`, `.ts`, `.wmv`) all map to
+   the `video` loader (see `docs/video.md` in the repository root).
 2. Otherwise (a bare directory), it checks for `path/src/__init__.shio`
    (→ `asset`) or `path/src/__init__.glsl` (→ `glsl`).
 3. It then loads `engine/generators/extensions/<ext>/__init__.shio` into a

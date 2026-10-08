@@ -29,7 +29,7 @@ src/
 
 ### Menu System
 - **menu.shio** - Main menu implementation (class `main_menu`)
-- **assetbrowser/** - Asset browsing and selection UI (fixtures / artnet / shizonet / chat)
+- **assetbrowser/** - Asset browsing and selection UI (fixtures / artnet / shizonet / chat / mcp)
 - **generators/** - Generator management UI (tabbed `singleview`)
 - **timeline/** - Timeline editor UI (bottom panel, BPM/phase nudge logic)
 - **mainview/** - Main view component (empty placeholder directory)
@@ -40,7 +40,7 @@ src/
 
 The VibeVJ interface is a vertical split arrangement orchestrated by `menu.shio` (class `main_menu`), which instantiates three top-level menus: `assetbrowser`, `generators`, and `timeline`.
 
-- **Left column (fixed width):** The **AssetBrowser** (`menu/assetbrowser/assetbrowser.shio`) is the leftmost panel, hosting asset browsing / fixtures / artnet / shizonet / chat menus.
+- **Left column (fixed width):** The **AssetBrowser** (`menu/assetbrowser/assetbrowser.shio`) is the leftmost panel, hosting asset browsing / fixtures / artnet / shizonet / chat / MCP menus.
 - **Top-right:** The **GeneratorView & files** panel (`menu/generators/generators.shio`) is anchored to the right of the asset browser, at the top. It holds a tabbed `singleview` for displaying generator views, with a fixed height of `screen.height() - 350`.
 - **Bottom (right of the asset browser column):** The **Timeline** (`menu/timeline/timeline.shio`) is anchored to the bottom with a fixed height of ~350px. Dragging the timeline's top edge resizes both the generators panel above it and the timeline itself, keeping the two stacked without overlap.
 

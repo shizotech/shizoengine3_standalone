@@ -33,10 +33,47 @@ engine/
 │       └── txt/
 │           ├── __init__.shio      # Loader for .txt text generators
 │           └── text_module.shio
+├── interfaces/
+│   ├── aiinterface.shio           # AIInterface: the queries an AI agent can run on a generator
+│   ├── mcp_bridge.shio            # MCP server of the MCP tab, serves the AIInterface queries as tools
+│   └── videorouter.shio
 └── processes/                     # Subprocess code (DO NOT CHANGE)
     ├── audio_process.shio         # Audio processing subprocess
     └── monitor_process.shio       # Monitor processing subprocess
 ```
+
+## AI access: AIInterface, Chat and MCP
+
+Every generator owns an `AIInterface` (`generatoritem.ai_interface`). Generators and their
+modules register queries with `generator.register(name, args, callback, description, access)`:
+
+```
+generator.register("set_split", [size = "&float(0,1): Normalized split position"], [this](args){
+	...
+	return [ok = 1];                      // [ok = 0, error = "..."] reports a failure
+}, "Moves the split.");
+```
+
+- `args` use the typed notation of the MCP / openai includes (`&` = required, `string()`, `int(min,max)`,
+  `float()`, `enum(a,b)`, `any()`). A plain description is still accepted (becomes `&any(): ...`,
+  `any(): ...` when it starts with OPTIONAL).
+- `access` is `"read"` or `"write"`; by default names starting with `get_` / `list_` / `has_` are reads.
+- `query(name, args, caller)` returns `[ok = true, value = ...]` or `[ok = false, error = "<real message>"]`,
+  `list_queries()` / `describe()` / `on_query_changed()` describe the interface.
+- Two agents use the interfaces at the same time: the **Chat** tab (in-process miniagent, caller `"chat"`)
+  and the **MCP** tab (`engine/interfaces/mcp_bridge.shio`, caller `"mcp:<client>"`). Without locks the last
+  write wins; `lock(owner, ttl_ms)` reserves a generator for one caller. The last write of any agent is in
+  `engine.ai_activity` and shown in both tabs ("AI control").
+- All interfaces are listed in `engine.ai_interfaces`. Asset modules include the engine files into their
+  own `std.module()`, so shared state lives on the engine object, not in file globals.
+
+The MCP tab runs the server on a configurable port (default 13340, `configs/mcp_server.json`):
+`http://localhost:<port>/mcp` (Streamable HTTP) and `/sse` (HTTP+SSE). Each query name becomes a tool
+with an extra `live_path` argument, plus `vibevj_list_generators`, `vibevj_get_focus`,
+`vibevj_describe_generator`, `vibevj_query`, `vibevj_lock_generator`, `vibevj_unlock_generator` and
+`vibevj_activity`. "Pause" rejects every request, "Allow changes" off rejects every write.
+
+Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root, no GUI needed).
 
 ## Components
 

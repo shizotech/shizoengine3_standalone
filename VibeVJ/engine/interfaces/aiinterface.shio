@@ -1,71 +1,423 @@
+// ============================================================================
+// AIInterface — what an AI agent can query and change on one generator
+//
+// Every generator owns one (generatoritem.ai_interface). The Chat agent
+// (vibevj skill) and the MCP server (MCP tab) both go through it.
+//
+//   register(name, args, callback, description = "", access = None)
+//   list_queries()          -> [[name, description, args, access], ...]
+//   has_query(name)         -> bool
+//   query(name, args, caller = "")
+//                           -> [ok = true, value = ...] or [ok = false, error = "..."]
+//   query_batch(calls, caller = "")
+//   describe()              -> [version, source_file, target_type, file_path, live_path, capabilities, queries, revision, locked_by]
+//   on_query_changed(callback) -> id, off_query_changed(id)
+//   lock(owner, ttl_ms) / unlock(owner) / locked_by()
+//
+// Arguments use the typed notation of the MCP / openai includes, so a query
+// converts 1:1 into an MCP tool:
+//
+//   [path = "&string(): The path to the control element.",   // & = required
+//    count = "int(1,10): How many",
+//    value = "&any(): Value for this control."]
+//
+// A plain description ("The path to the control element.") is still accepted
+// and becomes "&any(): ..." (or "any(): ..." when it starts with OPTIONAL).
+//
+// Access: "read" queries can always run. "write" queries (default for every
+// name that does not start with get_ / list_ / has_) are refused while another
+// caller holds the lock of the generator, and are recorded in last_write and
+// engine.ai_activity (who changed what last) for the "AI is controlling"
+// indicators. Without locks the last write wins.
+//
+// Every interface adds itself to engine.ai_interfaces (id -> interface) and
+// bumps engine.ai_interfaces_revision when it is created, destroyed or its
+// queries change, so the MCP server can list all generators. Asset modules
+// include this file into their own std.module(), the shared state therefore
+// lives on the engine object and not in globals of this file.
+// ============================================================================
+
+AIINTERFACE_VERSION = 2;
+
+AIINTERFACE_ARG_TYPES = ["string", "int", "float", "array", "uarray", "enum", "any"];
+
+// Typed spec of one argument (see the top of this file)
+aiinterface_normalize_arg(spec) {
+	if(!std.is_string(spec))
+		return spec; //enum list or nested object, already typed
+
+	plain = spec;
+	if(plain.starts("&"))
+		plain = plain.substr(1);
+
+	for(i = 0; i < AIINTERFACE_ARG_TYPES.size(); i++) {
+		if(plain.starts(AIINTERFACE_ARG_TYPES[i] + "("))
+			return spec;
+	}
+
+	if(spec.uppercase().starts("OPTIONAL"))
+		return "any(): " + spec;
+
+	return "&any(): " + spec;
+}
+
+aiinterface_arg_required(spec) {
+	if(std.is_string(spec))
+		return spec.starts("&");
+	return true; //enum lists and nested objects are required (as in simple_json)
+}
+
+aiinterface_default_access(name) {
+	if(name.starts("get_") || name.starts("list_") || name.starts("has_"))
+		return "read";
+	return "write";
+}
+
+// How long a change of an AI caller counts as "AI is controlling"
+AI_ACTIVITY_DISPLAY_MS = 10000;
+
+// Text for the "AI is controlling" indicators, "" when nobody changed anything recently
+ai_activity_text(skip_caller = "") {
+	activity = std.global("engine").ai_activity;
+	if(!activity || !activity.time)
+		return "";
+	age = std.millis() - activity.time;
+	if(age > AI_ACTIVITY_DISPLAY_MS)
+		return "";
+	if(skip_caller && activity.caller.starts(skip_caller))
+		return "";
+	return activity.caller + " changed " + fileio.file_name(activity.target) + " (" + activity.query + ", " + (age / 1000) + "s ago)";
+}
 
 class AIInterface {
-	
+
 	target = None;
 	queries = [];
 	source_file = "";
-	
+
+	// Incremented by every successful write query, pollers can compare it
+	revision = 0;
+
+	// Extra capability flags (describe() adds the ones it can detect itself)
+	capabilities = [];
+
+	lock_owner = None;
+	lock_until = 0;
+
+	// Last successful write query: [caller, query, time (std.millis())]
+	last_write = [];
+
+	query_listeners = [];
+
+	// Key in engine.ai_interfaces
+	registry_id = "";
+
 	__init__(parent, parent_widget, src_file = "", get_status = None) {
 		target = parent;
 		source_file = src_file;
+		queries = [];
+		capabilities = [];
+		query_listeners = [];
+		last_write = [];
+
+		registry_id = std.random_hash(12);
+		try {
+			engine = std.global("engine");
+			engine.ai_interfaces[registry_id] = this;
+			engine.ai_interfaces_revision += 1;
+		}
+		catch(e) {}
+
 		if(parent_widget) {
 			parent_widget.on_focus([this](v){
 				if(v)
 					focus();
 			});
 		}
-		
-		if(source_file) {
-			register("get_source_file", None, [this](value) {
-				return source_file;
-			});
-		}
-		
+
+		register_builtin_queries();
+
 		if(get_status) {
 			on_get_status(get_status);
 		}
 	}
-	
+
+	__deinit__() {
+		try {
+			engine = std.global("engine");
+			if(engine.ai_interfaces.has(registry_id))
+				engine.ai_interfaces.erase(registry_id);
+			engine.ai_interfaces_revision += 1;
+		}
+		catch(e) {}
+	}
+
 	focus() {
 		std.global("engine").ai_last_interface = this;
 	}
-	
+
+	register_builtin_queries() {
+		register("get_source_file", None, [this](args) {
+			return source_file;
+		}, "Returns the source file of the generator.");
+	}
+
 	on_get_status(callback) {
-		register("get_target_status", None, [callback](v){
-			callback();
-		});
+		register("get_target_status", None, [callback](args){
+			return callback();
+		}, "Returns the status of the generator (active state and module specific status).");
 	}
-	
-	register(name, args, callback, description = "") {
-		queries[name] = [args=args, callback=callback, description=description];	
+
+	// =========================================================================
+	// Registration
+	// =========================================================================
+
+	// args:     [name = "typed spec", ...] or None / [] for no arguments
+	// callback: callback(args) -> value. Return [ok = 0, error = "..."] (or
+	//           raise a runtime error) to report a failure.
+	// access:   "read" / "write", None = from the name (get_ / list_ / has_ = read)
+	register(name, args, callback, description = "", access = None) {
+		spec = [];
+		if(std.is_json(args)) {
+			for(i = 0; i < args.size(); i++)
+				spec[args.key(i)] = aiinterface_normalize_arg(args[i]);
+		}
+
+		queries[name] = [
+			args = spec,
+			callback = callback,
+			description = description ?? "",
+			access = access ?? aiinterface_default_access(name),
+		];
+
+		notify_query_changed("registered", name);
 	}
-	
-	query(name, args) {
+
+	unregister(name) {
+		if(!queries.has(name))
+			return false;
+		queries.erase(name);
+		notify_query_changed("removed", name);
+		return true;
+	}
+
+	// Drops the queries of the loaded module (on reload), keeps the builtin ones
+	clear_queries() {
+		kept = [];
+		if(queries.has("get_source_file"))
+			kept.get_source_file = queries.get_source_file;
+		if(queries.has("get_target_status"))
+			kept.get_target_status = queries.get_target_status;
+		queries = kept;
+		notify_query_changed("cleared", "");
+	}
+
+	add_capability(flag) {
+		for(i = 0; i < capabilities.size(); i++) {
+			if(capabilities[i] == flag)
+				return;
+		}
+		capabilities.push_back(flag);
+	}
+
+	// callback(interface, change, query_name), change: "registered" | "removed" | "cleared"
+	on_query_changed(callback) {
+		id = std.random_hash(8);
+		query_listeners[id] = callback;
+		return id;
+	}
+
+	off_query_changed(id) {
+		if(query_listeners.has(id))
+			query_listeners.erase(id);
+	}
+
+	notify_query_changed(change, name) {
 		try {
-			if(queries.has(name)) {
-				cb = queries[name].callback;
-				if(std.is_string(args))
-					args = std.json(args);
-				//Hack: errors can cause return values to not be passed (investigate !!!) bug in shizoscript...
-				//try to work around it...
-				t = std.thread(cb);
-				t.run(args);
-				t.join();
-				return t.get_results(0);
+			std.global("engine").ai_interfaces_revision += 1;
+		}
+		catch(e) {}
+
+		for(i = 0; i < query_listeners.size(); i++) {
+			try {
+				query_listeners[i](this, change, name);
+			}
+			catch(e) {
+				std.warn("AIInterface: query listener failed: " + e);
 			}
 		}
-		catch(e) {
-			return [
-				ok = false,
-				error = "query internal error.",
-			];
-		}
-		
-		return [ok=false, error="query name not found."];
 	}
-	
-	clear_queries() {
-		tmp_status_query = queries["get_target_status"];
-		queries = [get_target_status=tmp_status_query];
+
+	// =========================================================================
+	// Introspection
+	// =========================================================================
+
+	has_query(name) {
+		return queries.has(name);
+	}
+
+	query_names() {
+		names = [];
+		for(i = 0; i < queries.size(); i++)
+			names.push_back(queries.key(i));
+		return names;
+	}
+
+	list_queries() {
+		list = [];
+		for(i = 0; i < queries.size(); i++) {
+			list.push_back([
+				name = queries.key(i),
+				description = queries[i].description,
+				args = queries[i].args,
+				access = queries[i].access,
+			]);
+		}
+		return list;
+	}
+
+	describe() {
+		caps = [];
+		if(queries.has("get_target_status"))
+			caps.push_back("status");
+		if(queries.has("get_source_file"))
+			caps.push_back("source_file");
+		if(queries.has("get_local_controls"))
+			caps.push_back("controls");
+		for(i = 0; i < capabilities.size(); i++)
+			caps.push_back(capabilities[i]);
+
+		info = [
+			version = AIINTERFACE_VERSION,
+			source_file = source_file,
+			target_type = std.string(target),
+			capabilities = caps,
+			queries = queries.size(),
+			revision = revision,
+			locked_by = locked_by() ?? "",
+		];
+
+		try {
+			info.file_path = target.get_relative_path();
+			info.live_path = target.get_live_path();
+		}
+		catch(e) {}
+
+		return info;
+	}
+
+	// =========================================================================
+	// Ownership
+	//
+	// A caller (e.g. "chat", "mcp:<client>") can lock the generator for its
+	// write queries. The lock expires after ttl_ms (0 = never) so a client that
+	// disappears cannot block the generator forever.
+	// =========================================================================
+
+	locked_by() {
+		if(lock_owner && lock_until && std.millis() > lock_until) {
+			lock_owner = None;
+			lock_until = 0;
+		}
+		return lock_owner;
+	}
+
+	lock(owner, ttl_ms = 60000) {
+		current = locked_by();
+		if(current && current != owner)
+			return false;
+		lock_owner = owner;
+		lock_until = ttl_ms > 0 ? std.millis() + ttl_ms : 0;
+		return true;
+	}
+
+	unlock(owner = None) {
+		current = locked_by();
+		if(!current)
+			return true;
+		if(owner && owner != current)
+			return false;
+		lock_owner = None;
+		lock_until = 0;
+		return true;
+	}
+
+	// =========================================================================
+	// Queries
+	// =========================================================================
+
+	failure(message) {
+		return [ok = false, error = message];
+	}
+
+	// args: json, JSON string or None. caller: who asks ("chat", "mcp:<client>", ...)
+	query(name, args = None, caller = "") {
+		if(!queries.has(name)) {
+			result = failure("Unknown query '" + name + "'.");
+			result.available = query_names();
+			return result;
+		}
+
+		entry = queries[name];
+
+		if(std.is_string(args)) {
+			text = args;
+			args = std.json(text);
+			if(text.strip() && !std.is_json(args))
+				return failure("Arguments of '" + name + "' are not a JSON object: " + text);
+		}
+		if(!std.is_json(args))
+			args = [];
+
+		for(i = 0; i < entry.args.size(); i++) {
+			arg_name = entry.args.key(i);
+			if(aiinterface_arg_required(entry.args[i]) && !args.has(arg_name)) {
+				result = failure("Missing argument '" + arg_name + "' of query '" + name + "'.");
+				result.args = entry.args;
+				return result;
+			}
+		}
+
+		is_write = entry.access == "write";
+
+		if(is_write) {
+			owner = locked_by();
+			if(owner && owner != caller)
+				return failure("'" + name + "' refused: the generator is locked by " + owner + ".");
+		}
+
+		value = None;
+
+		try {
+			value = entry.callback(args);
+		}
+		catch(e) {
+			return failure("Query '" + name + "' failed: " + e);
+		}
+
+		// The queries report their own errors as [ok = 0, error = "..."]
+		if(std.is_json(value) && value.has("ok") && !value.ok) {
+			message = value.error ?? value.status;
+			return failure(message ? std.string(message) : "Query '" + name + "' failed.");
+		}
+
+		if(is_write) {
+			revision++;
+			last_write = [caller = caller, query = name, time = std.millis()];
+			try {
+				std.global("engine").ai_activity = [caller = caller, query = name, target = source_file, time = last_write.time];
+			}
+			catch(e) {}
+		}
+
+		return [ok = true, value = value];
+	}
+
+	// calls: [[name = "...", args = [...]], ...] -> one result per call (stops at nothing)
+	query_batch(calls, caller = "") {
+		results = [];
+		for(i = 0; i < calls.size(); i++)
+			results.push_back(query(calls[i].name, calls[i].args, caller));
+		return results;
 	}
 }

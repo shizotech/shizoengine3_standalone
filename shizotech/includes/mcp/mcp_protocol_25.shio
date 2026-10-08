@@ -1,0 +1,214 @@
+// ============================================================================
+// mcp_protocol_25.shio — initialize based MCP (2024-11-05 ... 2025-11-25)
+//
+// Used by mcpserver (mcp_server.shio) for every request that is not a
+// 2026-07-28 request. It speaks both transports of these versions:
+//
+//   Streamable HTTP (2025-03-26 and newer)
+//     POST /mcp               JSON-RPC request -> application/json response
+//                             notification / response -> 202 Accepted
+//                             initialize answers with an Mcp-Session-Id header,
+//                             later requests that send an unknown id get 404
+//                             (the client initializes again, e.g. after a restart)
+//     DELETE /mcp             ends the session named by Mcp-Session-Id
+//
+//   HTTP+SSE (2024-11-05, "sse" transport of most clients)
+//     GET /  or  GET /sse     event stream, first event "endpoint" names the
+//                             POST url (/mcp?sessionid=...)
+//     POST /mcp?sessionid=..  -> 202 Accepted, the response goes to the stream
+//
+// The class holds no state, everything lives in the mcpserver passed in.
+// ============================================================================
+
+mcp_version_2025_supported(version)
+{
+	for(i = 0; i < MCP_VERSIONS_2025.size(); i++)
+	{
+		if(MCP_VERSIONS_2025[i] == version)
+			return true;
+	}
+	return false;
+}
+
+class mcp_protocol_25
+{
+	name = "2025";
+
+	// -------------------------------------------------------------------------
+	// initialize: version negotiation, capabilities, server info
+	// -------------------------------------------------------------------------
+	initialize_result(server, params)
+	{
+		requested = params.geti("protocolVersion");
+		version = MCP_VERSION_2025;
+		if(requested && mcp_version_2025_supported(requested))
+			version = requested;
+
+		result = [
+			protocolVersion = version,
+			capabilities = [
+				tools = [listChanged = json.bool(false)],
+				resources = [subscribe = json.bool(false), listChanged = json.bool(false)],
+				prompts = [listChanged = json.bool(false)],
+				logging = [],
+			],
+			serverInfo = [name = server.name, version = server.version],
+		];
+
+		if(server.instructions)
+			result.instructions = server.instructions;
+
+		return result;
+	}
+
+	// -------------------------------------------------------------------------
+	// Methods that only exist in this protocol, everything else is shared
+	// -------------------------------------------------------------------------
+	handle_method(server, method, params, ctx)
+	{
+		if(method == INIT_METHOD)
+		{
+			result = initialize_result(server, params);
+			ctx.version = result.protocolVersion;
+			client_info = params.geti("clientInfo");
+			if(client_info && client_info.geti("name"))
+				ctx.client = std.string(client_info.geti("name")) + (client_info.geti("version") ? " " + std.string(client_info.geti("version")) : "");
+			return mcp_ok(result);
+		}
+
+		return server.handle_method(method, params, ctx);
+	}
+
+	// -------------------------------------------------------------------------
+	// POST: legacy SSE session (query sessionid) or Streamable HTTP
+	// -------------------------------------------------------------------------
+	handle_post(server, request_object, method, rpc_id, params)
+	{
+		sse_session = request_object.query_params.geti("sessionid");
+
+		if(sse_session)
+			return handle_sse_post(server, sse_session, method, rpc_id, params);
+
+		return handle_streamable_post(server, request_object, method, rpc_id, params);
+	}
+
+	handle_sse_post(server, session_id, method, rpc_id, params)
+	{
+		if(!server.clients.has(session_id))
+			return mcp_http_error(404, rpc_id, JSONRPC_INVALID_REQUEST, "Unknown SSE session, open a new event stream.");
+
+		client = server.clients[session_id];
+
+		ctx = [protocol = name, version = client.version, client = client.client, transport = "sse"];
+		response = server.dispatch(this, method, params, rpc_id, ctx);
+
+		// initialize can change the version and the client name of the stream
+		client.version = ctx.version;
+		client.client = ctx.client;
+
+		if(response && !client.send(response))
+			client.stop = true;
+
+		return [status_code = 202, body = "Accepted"];
+	}
+
+	handle_streamable_post(server, request_object, method, rpc_id, params)
+	{
+		session_id = request_object.headers.geti("mcp-session-id");
+		header_version = request_object.headers.geti("mcp-protocol-version");
+		session = None;
+
+		if(session_id && method != INIT_METHOD)
+		{
+			if(!server.sessions.has(session_id))
+				return mcp_http_error(404, rpc_id, JSONRPC_INVALID_REQUEST, "Unknown or expired session, send initialize again.");
+			session = server.sessions[session_id];
+			session.last_seen = std.millis();
+		}
+
+		if(header_version && method != INIT_METHOD && !mcp_version_2025_supported(header_version))
+			return mcp_http_error(400, rpc_id, JSONRPC_INVALID_REQUEST, "Unsupported MCP-Protocol-Version: " + header_version);
+
+		// Without header and session the specification says to assume 2025-03-26
+		version = "2025-03-26";
+		if(header_version)
+			version = header_version;
+		else if(session)
+			version = session.version;
+
+		client = mcp_request_client(request_object);
+		if(session)
+			client = session.client;
+
+		ctx = [
+			protocol = name,
+			version = version,
+			client = client,
+			transport = "streamable-http",
+		];
+
+		response = server.dispatch(this, method, params, rpc_id, ctx);
+
+		if(!response)
+			return [status_code = 202, body = ""];
+
+		headers = ["Content-Type" = "application/json"];
+
+		if(method == INIT_METHOD && !response.has("error"))
+			headers["Mcp-Session-Id"] = server.open_session(ctx);
+
+		return [status_code = 200, headers = headers, body = mcp_encode(response)];
+	}
+
+	handle_delete(server, request_object)
+	{
+		session_id = request_object.headers.geti("mcp-session-id");
+
+		if(session_id && server.sessions.has(session_id))
+		{
+			server.sessions.erase(session_id);
+			return [status_code = 200, body = ""];
+		}
+
+		return [status_code = 404, body = "Unknown session"];
+	}
+
+	// -------------------------------------------------------------------------
+	// GET: legacy event stream, runs as long as the client stays connected
+	// -------------------------------------------------------------------------
+	handle_sse_stream(server, request_object, writer)
+	{
+		if(!server.running)
+			return;
+
+		if(!writer.write_header(200, "text/event-stream", ["Cache-Control" = "no-cache"]))
+			return;
+
+		session_id = std.random_hash(32);
+
+		server.clients[session_id] = [
+			stop = false,
+			version = "2024-11-05",
+			client = mcp_request_client(request_object),
+			connected = std.millis(),
+			// Writes one JSON-RPC message to the stream, false when the client is gone
+			send = [writer](message) {
+				return writer.write("event: message\ndata: " + mcp_encode(message) + "\n\n");
+			},
+		];
+
+		if(server.verbose)
+			std.print("MCP: SSE client connected (", session_id, ")");
+
+		if(writer.write("event: endpoint\ndata: /mcp?sessionid=" + session_id + "\n\n"))
+		{
+			for(server.running && server.clients.has(session_id) && !server.clients[session_id].stop && writer.is_client_alive())
+				std.sleep(500);
+		}
+
+		server.clients.erase(session_id);
+
+		if(server.verbose)
+			std.print("MCP: SSE client disconnected (", session_id, ")");
+	}
+}

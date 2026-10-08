@@ -1,1 +1,0 @@
-single mcp_server.shio file which automatically parses the protocol version from a request and routes it to the correct class

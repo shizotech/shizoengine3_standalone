@@ -1,9 +1,30 @@
 // ============================================================================
-// mcp_types.shio — MCP Protocol constants, types, and JSON-RPC helpers
+// mcp_types.shio — MCP protocol constants, JSON-RPC helpers and registries
+//
+// Shared by every protocol version. Scripts include "mcp/mcp_server", which
+// pulls in this file.
 // ============================================================================
 
-// MCP Protocol version
-MCP_VERSION = "2026-07-28";
+// ----------------------------------------------------------------------------
+// Protocol versions
+//
+// MCP_VERSION_2025 is the newest version of the initialize based protocol
+// (handshake, optional sessions, legacy HTTP+SSE or Streamable HTTP transport).
+// MCP_VERSION_2026 is the stateless protocol (server/discover, every request
+// carries its own MCP-Protocol-Version / Mcp-Method / Mcp-Name headers).
+// ----------------------------------------------------------------------------
+
+MCP_VERSION_2025 = "2025-11-25";
+MCP_VERSION_2026 = "2026-07-28";
+
+// Versions the initialize based protocol accepts, newest first.
+// initialize answers with the version the client asked for when it is in this
+// list, otherwise with the newest one (the client then decides whether it can
+// continue, as the specification describes).
+MCP_VERSIONS_2025 = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+// Newest version this include implements.
+MCP_VERSION = MCP_VERSION_2026;
 
 // JSON-RPC version
 JSONRPC_VERSION = "2.0";
@@ -23,6 +44,8 @@ PROMPTS_GET_METHOD = "prompts/get";
 
 PING_METHOD = "ping";
 
+LOGGING_SET_LEVEL_METHOD = "logging/setLevel";
+
 // JSON-RPC error codes
 JSONRPC_PARSE_ERROR = -32700;
 JSONRPC_INVALID_REQUEST = -32600;
@@ -33,6 +56,8 @@ JSONRPC_TOOL_NOT_FOUND = -32001;
 JSONRPC_TOOL_ERROR = -32002;
 JSONRPC_RESOURCE_NOT_FOUND = -32003;
 JSONRPC_PROMPT_NOT_FOUND = -32004;
+// The server is running but does not accept requests right now (mcpserver.enabled = false)
+JSONRPC_SERVER_DISABLED = -32005;
 
 // ============================================================================
 // Helper: parse JSON string into json object
@@ -40,6 +65,37 @@ JSONRPC_PROMPT_NOT_FOUND = -32004;
 parse_json(str)
 {
     return std.json(str);
+}
+
+// ============================================================================
+// Empty arrays
+//
+// shizoscript JSONs do not know whether an empty container is a list or an
+// object, it is always written as {}. MCP needs [] for empty lists
+// ("tools": [] on a server without tools), so list fields go through
+// mcp_list(), which puts a placeholder into an empty list, and every message
+// is written with mcp_encode(), which turns the placeholder into [].
+// ============================================================================
+MCP_EMPTY_ARRAY = "__shz_mcp_empty_array__";
+
+mcp_list(list)
+{
+    if (std.is_none(list) || list.size() == 0)
+        return MCP_EMPTY_ARRAY;
+    return list;
+}
+
+mcp_encode(message)
+{
+    return message.compact_string().replace("\"" + MCP_EMPTY_ARRAY + "\"", "[]");
+}
+
+// ============================================================================
+// Helper: true when a JSON-RPC id is present (0 and "" are valid ids)
+// ============================================================================
+mcp_has_id(id)
+{
+    return !std.is_none(id);
 }
 
 // ============================================================================
@@ -54,13 +110,34 @@ create_jsonrpc_response(id, result)
     return resp;
 }
 
+// ============================================================================
+// Helper: convert a tool return value into the text of a tool result
+// ============================================================================
+mcp_value_text(value)
+{
+    if (std.is_none(value))
+        return "";
+    if (std.is_string(value))
+        return value;
+    return std.string(value);
+}
+
+// ============================================================================
+// Helper: the result object of tools/call
+// is_error marks a failed tool execution: the model sees the message, it is
+// not a protocol error.
+// ============================================================================
+create_tool_result(value, is_error = false)
+{
+    result = [content = [[type = "text", text = mcp_value_text(value)]]];
+    if (is_error)
+        result.isError = json.bool(true);
+    return result;
+}
+
 create_jsonrpc_tool_response(id, result)
 {
-	resp = [jsonrpc=JSONRPC_VERSION, result = [content = [[type="text", text=std.string(result)]]]];
-
-    if (!std.is_none(id))
-        resp.id = id;
-    return resp;
+    return create_jsonrpc_response(id, create_tool_result(result));
 }
 
 // ============================================================================
@@ -80,6 +157,43 @@ create_jsonrpc_error(id, code, message, extra = None)
 }
 
 // ============================================================================
+// Method outcomes (internal): what a method handler returns before it becomes
+// a JSON-RPC response. failed is set for tools/call results with isError, so
+// the request log can show them as failures.
+// ============================================================================
+mcp_ok(result, failed = "")
+{
+    return [ok = true, result = result, failed = failed];
+}
+
+mcp_fail(code, message)
+{
+    return [ok = false, code = code, message = message];
+}
+
+// ============================================================================
+// Helper: HTTP answer that carries a JSON-RPC error
+// ============================================================================
+mcp_http_error(status_code, id, code, message)
+{
+    return [
+        status_code = status_code,
+        headers = ["Content-Type" = "application/json"],
+        body = mcp_encode(create_jsonrpc_error(id, code, message)),
+    ];
+}
+
+// ============================================================================
+// Helper: a readable name for the client of an HTTP request
+// ============================================================================
+mcp_request_client(request_object)
+{
+    if (request_object.user_agent)
+        return std.string(request_object.user_agent);
+    return std.string(request_object.client_ip);
+}
+
+// ============================================================================
 // Helper: create a JSON-RPC notification (no id field)
 // Parameters: method (string), params (json)
 // ============================================================================
@@ -92,13 +206,33 @@ create_notification(method, params)
 }
 
 // ============================================================================
-// Resource registry: holds MCP file-based resources (e.g. skill .md files)
-// Modeled on the toolset class style from the openai standard include
+// Resource registry: holds MCP resources (static text, file backed or
+// generated by a callback). Adding a resource with an existing uri replaces it.
 // ============================================================================
 class resource_registry
 {
 	resources = [];
-	
+
+	__init__()
+	{
+		resources = [];
+	}
+
+	set_resource(entry)
+	{
+		for(i = 0; i < resources.size(); i++)
+		{
+			if(resources[i].uri == entry.uri)
+			{
+				resources[i] = entry;
+				return;
+			}
+		}
+
+		resources.push_back(entry);
+	}
+
+	// File backed resource, the file is read on every resources/read
 	add_resource(
 		uri,
 		name,
@@ -107,46 +241,17 @@ class resource_registry
 		file_path
 	)
 	{
-		//Check if it already exists and if so, overwrite silently
-		found_resource = false;
-		for(i = 0; i < resources.size(); i++)
-		{
-			if(resources[i].uri == uri)
-			{
-				resources[i] = [
-					uri = uri,
-					name = name,
-					description = description,
-					mimeType = mimeType,
-					path = file_path,
-				];
-				found_resource = true;
-				break;
-			}
-		}
-		
-		if(!found_resource) {
-			resources.push_back([
-				uri = uri,
-				name = name,
-				description = description,
-				mimeType = mimeType,
-				path = file_path,
-			]);
-		}
+		set_resource([
+			uri = uri,
+			name = name,
+			description = description,
+			mimeType = mimeType,
+			text = None,
+			path = file_path,
+			callback = None,
+		]);
 	}
-	
-	find_resource(uri) {
-		for(i = 0; i < resources.size(); i++)
-		{
-			if(resources[i].uri == uri) {
-				return resources[i];
-			}
-		}
-		
-		return None;
-	}
-	
+
 	add_static_resource(
 		uri,
 		name,
@@ -155,39 +260,18 @@ class resource_registry
 		text
 	)
 	{
-		//Check if it already exists and if so, overwrite silently
-		found_resource = false;
-		for(i = 0; i < resources.size(); i++)
-		{
-			if(resources[i].uri == uri)
-			{
-				resources[i] = [
-					uri = uri,
-					name = name,
-					description = description,
-					mimeType = mimeType,
-					text = text,
-					path = None,
-					callback = None,
-				];
-				found_resource = true;
-				break;
-			}
-		}
-		
-		if(!found_resource) {
-			resources.push_back([
-				uri = uri,
-				name = name,
-				description = description,
-				mimeType = mimeType,
-				text = text,
-				path = None,
-				callback = None,
-			]);
-		}
+		set_resource([
+			uri = uri,
+			name = name,
+			description = description,
+			mimeType = mimeType,
+			text = text,
+			path = None,
+			callback = None,
+		]);
 	}
-	
+
+	// callback(server, uri) -> text
 	add_resource_callback(
 		uri,
 		name,
@@ -196,43 +280,43 @@ class resource_registry
 		callback
 	)
 	{
-		//Check if it already exists and if so, overwrite silently
-		found_resource = false;
+		set_resource([
+			uri = uri,
+			name = name,
+			description = description,
+			mimeType = mimeType,
+			text = None,
+			path = None,
+			callback = callback,
+		]);
+	}
+
+	find_resource(uri) {
 		for(i = 0; i < resources.size(); i++)
 		{
-			if(resources[i].uri == uri)
-			{
-				resources[i] = [
-					uri = uri,
-					name = name,
-					description = description,
-					mimeType = mimeType,
-					text = None,
-					path = None,
-					callback = callback,
-				];
-				found_resource = true;
-				break;
+			if(resources[i].uri == uri) {
+				return resources[i];
 			}
 		}
-		
-		if(!found_resource) {
-			resources.push_back([
-				uri = uri,
-				name = name,
-				description = description,
-				mimeType = mimeType,
-				text = None,
-				path = None,
-				callback = callback,
-			]);
+
+		return None;
+	}
+
+	remove_resource(uri) {
+		for(i = 0; i < resources.size(); i++)
+		{
+			if(resources[i].uri == uri) {
+				resources.erase(i);
+				return true;
+			}
 		}
+
+		return false;
 	}
 }
 
 // ============================================================================
 // Prompt registry: holds MCP prompt templates
-// Mirrors the resource_registry / toolset pattern:
 // prompts is the list of prompt entry jsons, prompt_callbacks maps name -> callback
 // ============================================================================
 class prompt_registry
@@ -242,9 +326,12 @@ class prompt_registry
 
 	__init__()
 	{
+		prompts = [];
 		prompt_callbacks = [];
 	}
 
+	// arguments: [[name = "...", description = "...", required = true], ...]
+	// callback(server, arguments) -> prompt text
 	add_prompt(
 		name,
 		description,
@@ -252,31 +339,24 @@ class prompt_registry
 		callback
 	)
 	{
-		//Check if it already exists and if so, overwrite silently
-		found_prompt = false;
+		entry = [
+			name = name,
+			description = description,
+			arguments = arguments ?? [],
+		];
+
+		prompt_callbacks[name] = callback;
+
 		for(i = 0; i < prompts.size(); i++)
 		{
 			if(prompts[i].name == name)
 			{
-				prompts[i] = [
-					name = name,
-					description = description,
-					arguments = arguments,
-				];
-				prompt_callbacks[name] = callback;
-				found_prompt = true;
-				break;
+				prompts[i] = entry;
+				return;
 			}
 		}
 
-		if(!found_prompt) {
-			prompts.push_back([
-				name = name,
-				description = description,
-				arguments = arguments,
-			]);
-			prompt_callbacks[name] = callback;
-		}
+		prompts.push_back(entry);
 	}
 
 	find_prompt(name) {
@@ -288,5 +368,18 @@ class prompt_registry
 		}
 
 		return None;
+	}
+
+	remove_prompt(name) {
+		for(i = 0; i < prompts.size(); i++)
+		{
+			if(prompts[i].name == name) {
+				prompts.erase(i);
+				prompt_callbacks.erase(name);
+				return true;
+			}
+		}
+
+		return false;
 	}
 }

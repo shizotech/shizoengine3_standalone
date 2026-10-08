@@ -1,0 +1,235 @@
+#include "engine/interfaces/mcp_bridge"
+
+// MCP tab of the sidebar: an MCP server inside the running VibeVJ, next to
+// the Chat tab (both can be used at the same time).
+// External MCP clients (Claude Desktop, Claude Code, ...) get the generator
+// queries as tools, see engine/interfaces/mcp_bridge.shio.
+
+MCP_MENU_CONFIG_PATH = "configs/mcp_server.json";
+
+// Config values from read_json: true / false arrive as json.bool objects
+mcp_config_flag(value) {
+	if(std.is_none(value))
+		return false;
+	text = std.string(value);
+	return text == "1" || text == "true";
+}
+
+class mcp_menu {
+
+	managed area = None;
+	bridge = None;
+
+	config = [];
+
+	// UI elements updated in refresh()
+	port_box = None;
+	start_btn = None;
+	pause_btn = None;
+	status_label = None;
+	endpoint_box = None;
+	clients_box = None;
+	activity_box = None;
+	log_box = None;
+
+	log_seen = 0;
+	log_lines = [];
+	last_refresh = 0;
+
+	__init__(parent) {
+		area = parent.widget().anchor(0);
+		bridge = VibeVJMCPBridge();
+		log_lines = [];
+
+		load_config();
+		build_menu();
+
+		if(config.autostart)
+			start_server();
+	}
+
+	__deinit__() {
+		//Frees the port and ends the tool watcher thread
+		bridge.stop();
+	}
+
+	load_config() {
+		config = [port = VIBEVJ_MCP_DEFAULT_PORT, autostart = 0, allow_writes = 1];
+		if(fileio.exists(MCP_MENU_CONFIG_PATH)) {
+			try {
+				config.merge(fileio.read_json(MCP_MENU_CONFIG_PATH));
+			}
+			catch(e) {
+				std.warn("MCP: cannot read " + MCP_MENU_CONFIG_PATH + ": " + e);
+			}
+		}
+		config.port = std.int(config.port);
+		config.autostart = mcp_config_flag(config.autostart) ? 1 : 0;
+		config.allow_writes = mcp_config_flag(config.allow_writes) ? 1 : 0;
+		bridge.port = config.port;
+		bridge.allow_writes = config.allow_writes;
+	}
+
+	save_config() {
+		try {
+			fileio.write_json(MCP_MENU_CONFIG_PATH, config.copy());
+		}
+		catch(e) {
+			std.warn("MCP: cannot write " + MCP_MENU_CONFIG_PATH + ": " + e);
+		}
+	}
+
+	add_row(parent, name, height = 30) {
+		div = parent.widget().fixed_height(height).layout(nanogui.layout_horizontal());
+		div.label(name).anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(75);
+		return div;
+	}
+
+	build_menu() {
+		panel = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(330).layout(nanogui.layout_vertical());
+
+		port_box = add_row(panel, "Port").intbox().value(std.int(config.port)).anchor(0).anchor_left(75);
+
+		start_btn = panel.pushbutton("Start server");
+		start_btn.tooltip("Runs an MCP server inside VibeVJ. The Chat tab keeps working.");
+		start_btn.on_change([this](v) {
+			if(v)
+				this.start_server();
+			else
+				this.stop_server();
+		});
+
+		pause_btn = panel.pushbutton("Pause (reject all requests)");
+		pause_btn.on_change([this](v) {
+			if(this.bridge.server)
+				this.bridge.server.enabled = !v;
+		});
+
+		allow_btn = panel.pushbutton("Allow changes");
+		allow_btn.tooltip("Off: MCP clients can only read, every query that changes a generator is rejected.");
+		allow_btn.pushed(config.allow_writes);
+		allow_btn.on_change([this](v) {
+			this.bridge.allow_writes = v ? 1 : 0;
+			this.config.allow_writes = v ? 1 : 0;
+			this.save_config();
+		});
+
+		autostart_btn = panel.pushbutton("Start with VibeVJ");
+		autostart_btn.pushed(config.autostart);
+		autostart_btn.on_change([this](v) {
+			this.config.autostart = v ? 1 : 0;
+			this.save_config();
+		});
+
+		status_label = panel.label("Stopped");
+
+		endpoint_box = add_row(panel, "Endpoint").textbox().editable(false).anchor(0).anchor_left(75);
+		endpoint_box.tooltip("Streamable HTTP endpoint, e.g.  claude mcp add --transport http vibevj <url>  (/sse for the SSE transport)");
+
+		panel.label("Clients");
+		clients_box = panel.textarea("").editable(false).wrap_text(true).fixed_height(50);
+
+		activity_box = add_row(panel, "AI control").textbox().editable(false).anchor(0).anchor_left(75);
+
+		panel.label("Requests");
+
+		log_box = area.textarea("").editable(false).wrap_text(true).anchor_left(0).anchor_right(0).anchor_bottom(0).anchor_top(335);
+
+		// UI updates only happen here, on the render thread (the requests run on the server threads)
+		area.on_draw([this]() {
+			now = std.millis();
+			if(now - this.last_refresh < 500)
+				return;
+			this.last_refresh = now;
+			this.refresh();
+		});
+
+		refresh();
+	}
+
+	start_server() {
+		port = std.int(port_box.value());
+
+		if(!bridge.start(port)) {
+			std.error("MCP: " + bridge.error);
+			add_log("Cannot start: " + bridge.error);
+			start_btn.pushed(false);
+			return false;
+		}
+
+		start_btn.pushed(true);
+		start_btn.caption("Stop server");
+		port_box.enabled(false);
+
+		if(pause_btn.pushed())
+			bridge.server.enabled = false;
+
+		config.port = port;
+		save_config();
+
+		log_seen = 0;
+		add_log("Started on port " + port);
+		return true;
+	}
+
+	stop_server() {
+		bridge.stop();
+		start_btn.pushed(false);
+		start_btn.caption("Start server");
+		port_box.enabled(true);
+		add_log("Stopped");
+	}
+
+	add_log(line) {
+		log_lines.push_back(line);
+		for(log_lines.size() > 200)
+			log_lines.erase(0);
+
+		text = "";
+		for(i = log_lines.size() - 1; i >= 0; i--)
+			text += log_lines[i] + "\n";
+		log_box.value(text);
+	}
+
+	refresh() {
+		activity = ai_activity_text();
+		activity_box.value(activity ? activity : "-");
+
+		if(!bridge.running()) {
+			status_label.caption("Stopped");
+			endpoint_box.value("");
+			clients_box.value("");
+			return;
+		}
+
+		s = bridge.status();
+		state = s.enabled ? "Running" : "PAUSED";
+		status_label.caption(state + " - " + s.tools + " tools, " + s.requests + " requests, " + s.errors + " errors" + (s.allow_writes ? "" : ", read only"));
+		endpoint_box.value("http://localhost:" + s.port + "/mcp");
+
+		clients = bridge.server.connected_clients();
+		text = "";
+		for(i = 0; i < clients.size(); i++)
+			text += clients[i].client + "  (" + clients[i].transport + " " + clients[i].version + ", " + (clients[i].last_seen_ms / 1000) + "s ago)\n";
+		clients_box.value(text ? text : "none");
+
+		// New requests from the server history
+		history = bridge.server.history;
+		new_count = bridge.server.request_count - log_seen;
+		if(new_count > 0) {
+			first = history.size() - new_count;
+			if(first < 0)
+				first = 0;
+			for(i = first; i < history.size(); i++) {
+				h = history[i];
+				line = h.time + "  " + h.client + "  " + h.method;
+				if(h.name)
+					line += " " + h.name;
+				line += h.ok ? "  ok" : "  FAILED: " + h.error;
+				line += " (" + h.duration_ms + " ms)";
+				add_log(line);
+			}
+			log_seen = bridge.server.request_count;
+		}
+	}
+}

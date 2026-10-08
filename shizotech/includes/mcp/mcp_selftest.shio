@@ -1,120 +1,380 @@
 // ============================================================================
-// mcp_selftest.shio — Self-test entry for the Streamable HTTP MCP server
-// Starts a server on a test port, then uses curl to exercise every endpoint.
+// mcp_selftest.shio — self test of the MCP server include
+//
+//   shz mcp_selftest.shio
+//
+// Starts servers on test ports and talks to them over HTTP with curl:
+//   - 2025 Streamable HTTP (initialize, sessions, version negotiation)
+//   - 2025 legacy HTTP+SSE (event stream + POST ?sessionid=)
+//   - 2026-07-28 stateless requests (server/discover, Mcp-* headers)
+//   - errors, empty lists, enabled / tool_filter / history hooks, stop()
+// Prints PASS / FAIL per check, exits with code 1 when a check failed.
 // ============================================================================
 
-#include "mcp_server_25"
+#include "mcp_server"
 
 import curl;
 
-// Start the test server
 server_port = 34567;
-server = mcpserver("SelfTest", server_port);
+empty_port = 34568;
 
-// One tool: echo a message (callback returns the argument)
-server.tools.add_tool(
-"echo",
-"Echo a message",
-[
-	message = "&string(): Message to echo",
-],
-[](svr, args)
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
 {
-	return std.string(args.geti("message"));
-});
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
 
-// One resource: plain text welcome file
-server.resources.add_resource(
-"file:///notes/welcome.txt",
-"Welcome",
-"Example plain text resource",
-"text/plain",
-"docs/welcome.txt"
-);
+// ----------------------------------------------------------------------------
+// Server under test
+// ----------------------------------------------------------------------------
 
-// Server instructions shown in the initialize result
+server = mcpserver("SelfTest", server_port);
+check("server starts", server.running, server.error);
+
 server.set_instructions("Test MCP server exposing tools, resources and prompts.");
 
-// One prompt: greet the user by name
-server.prompts.add_prompt(
-"welcome",
-"Greet the user by name",
-[
-	[name = "user", description = "Name of the user", required = true],
-],
-[](svr, args)
-{
-	return "Welcome, " + std.string(args.geti("user")) + "!";
+server.add_tool(
+	"echo",
+	"Echo a message",
+	[message = "&string(): Message to echo"],
+	[](svr, args) {
+		return std.string(args.geti("message"));
+	}
+);
+
+server.add_tool(
+	"fail",
+	"Always fails",
+	None,
+	[](svr, args) {
+		std.runtime_error("boom");
+		return "unreachable";
+	}
+);
+
+server.add_tool(
+	"scale",
+	"Returns a json",
+	[factor = "float(0,10): Factor"],
+	[](svr, args) {
+		return [value = 2 * std.float(args.geti("factor"))];
+	}
+);
+
+server.add_tool(
+	"whoami",
+	"Returns the client name of the request",
+	None,
+	[](svr, args, ctx) {
+		return ctx.client + " via " + ctx.transport;
+	},
+	true
+);
+
+server.add_resource_file("file:///notes/welcome.txt", "Welcome", "Example plain text resource", __DIR__ + "/docs/welcome.txt", "text/plain");
+server.add_resource("shz://static", "Static", "Static text", "text/plain", "static text");
+server.add_resource_callback("shz://state", "State", "Generated text", "text/plain", [](svr, uri) {
+	return "tools=" + svr.list_tools().size();
 });
 
-// Give the server a moment to bind the port
-std.sleep(500);
+server.add_prompt(
+	"welcome",
+	"Greet the user by name",
+	[[name = "user", description = "Name of the user", required = true]],
+	[](svr, args) {
+		return "Welcome, " + std.string(args.geti("user")) + "!";
+	}
+);
 
-base_url = "http://localhost:" + std.string(server_port) + "/mcp";
+hook_calls = [count = 0];
+server.on_request = [hook_calls](entry) {
+	hook_calls.count += 1;
+};
 
-// One curl client for all requests
+// A second server without anything registered: its lists must be [] not {}
+empty_server = mcpserver("Empty", empty_port);
+check("second server starts next to the first", empty_server.running, empty_server.error);
+
+std.sleep(300);
+
+base_url = "http://localhost:" + server_port + "/mcp";
+empty_url = "http://localhost:" + empty_port + "/mcp";
+
 c = curl.curl();
 
-// Standard headers for MCP JSON-RPC requests
-headers = [
-	"Accept" = "application/json",
+h25 = [
+	"Accept" = "application/json, text/event-stream",
 	"Content-Type" = "application/json",
 ];
 
-// Send a POST JSON-RPC request and print the http_code + body
-post_and_print(label, json_string)
+headers_26(method, name = "")
 {
-	resp = c.post(base_url, json_string, headers, 5000);
-	std.print(label);
-	std.print(resp.http_code);
-	std.print(resp.body);
+	h = [
+		"Content-Type" = "application/json",
+		"MCP-Protocol-Version" = "2026-07-28",
+		"Mcp-Method" = method,
+	];
+	if(name)
+		h["Mcp-Name"] = name;
+	return h;
 }
 
-// 1) initialize — expect 200 + protocolVersion 2025-03-26 + correct capabilities
-post_and_print("[1] initialize",
-	"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}");
+post(url, body, headers)
+{
+	return c.post(url, body, headers, 5000);
+}
 
-// 2) notifications/initialized — expect 202, empty body
-post_and_print("[2] notifications/initialized",
-	"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+parsed(resp)
+{
+	if(!resp.body)
+		return [];
+	return std.json(resp.body);
+}
 
-// 3) tools/list — expect 200 + tools array with the tool
-post_and_print("[3] tools/list",
-	"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}");
+rpc(id, method, params_json = "{}")
+{
+	return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":\"" + method + "\",\"params\":" + params_json + "}";
+}
 
-// 4) tools/call — expect 200 + content
-post_and_print("[4] tools/call",
-	"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}");
+// ============================================================================
+// 2025: Streamable HTTP
+// ============================================================================
 
-// 5) prompts/list — expect 200 + prompts
-post_and_print("[5] prompts/list",
-	"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"prompts/list\",\"params\":{}}");
+r = post(base_url, rpc(1, "initialize", "{\"protocolVersion\":\"2025-06-18\",\"clientInfo\":{\"name\":\"selftest\",\"version\":\"1\"},\"capabilities\":{}}"), h25);
+j = parsed(r);
+check("2025 initialize: 200", r.http_code == 200, r.http_code);
+check("2025 initialize: negotiates the requested version", j.result.protocolVersion == "2025-06-18", r.body);
+check("2025 initialize: tools capability is an object, not the tool list", j.result.capabilities.tools.has("listChanged") && !j.result.capabilities.tools.has("tools"), r.body);
+check("2025 initialize: instructions", j.result.instructions == "Test MCP server exposing tools, resources and prompts.", r.body);
+check("2025 initialize: opens a session", server.sessions.size() == 1, server.sessions.size());
 
-// 6) prompts/get — expect 200 + messages wrapped
-post_and_print("[6] prompts/get",
-	"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"prompts/get\",\"params\":{\"name\":\"welcome\",\"arguments\":{\"user\":\"Alice\"}}}");
+r = post(base_url, rpc(2, "initialize", "{\"protocolVersion\":\"1999-01-01\"}"), h25);
+check("2025 initialize: unknown version answers with the newest", parsed(r).result.protocolVersion == MCP_VERSION_2025, r.body);
 
-// 7) resources/list — expect 200
-post_and_print("[7] resources/list",
-	"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/list\",\"params\":{}}");
+r = post(base_url, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", h25);
+check("2025 notification: 202 without body", r.http_code == 202 && !r.body, r.http_code);
 
-// 8) resources/read — expect 200 + contents text
-post_and_print("[8] resources/read",
-	"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\",\"params\":{\"uri\":\"file:///notes/welcome.txt\"}}");
+r = post(base_url, rpc(3, "tools/list"), h25);
+j = parsed(r);
+check("2025 tools/list", j.result.tools.size() == 4 && j.result.tools[0].name == "echo", r.body);
+check("2025 tools/list: input schema", j.result.tools[0].inputSchema.required[0] == "message", r.body);
+check("2025 tools/list: float parameters are JSON schema numbers", r.body.find("\"type\":\"number\"") >= 0, r.body);
 
-// 9) ping — expect 200 + empty result object {}
-post_and_print("[9] ping",
-	"{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\",\"params\":{}}");
+r = post(base_url, rpc(4, "tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}"), h25);
+j = parsed(r);
+check("2025 tools/call", j.result.content[0].text == "hi" && !j.result.has("isError"), r.body);
 
-// 10) unknown method — expect 200 + error -32601 METHOD_NOT_FOUND
-post_and_print("[10] unknown method",
-	"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"does/not/exist\",\"params\":{}}");
+h_agent = h25.copy();
+h_agent["User-Agent"] = "selftest-agent";
+r = post(base_url, rpc(41, "tools/call", "{\"name\":\"whoami\"}"), h_agent);
+check("tools/call with_context: ctx reaches the callback", parsed(r).result.content[0].text == "selftest-agent via streamable-http", r.body);
 
-// 11) malformed body — expect 400 + -32700 PARSE_ERROR
-post_and_print("[11] malformed body",
-	"not json");
+r = post(base_url, rpc(5, "tools/call", "{\"name\":\"fail\",\"arguments\":{}}"), h25);
+j = parsed(r);
+check("2025 tools/call: a failing tool is a tool result with isError and the real message", j.result.isError && j.result.content[0].text.find("boom") >= 0, r.body);
 
-// Allow the last response to be flushed before exiting
-std.sleep(500);
+r = post(base_url, rpc(6, "tools/call", "{\"name\":\"nope\"}"), h25);
+check("2025 tools/call: unknown tool -32602", parsed(r).error.code == JSONRPC_INVALID_PARAMS, r.body);
 
-std.print("SELFTEST DONE");
+r = post(base_url, rpc(7, "tools/call", "{\"name\":\"scale\",\"arguments\":{\"factor\":1.5}}"), h25);
+check("2025 tools/call: json result", parsed(r).result.content[0].text.find("3") >= 0, r.body);
+
+r = post(base_url, rpc(8, "prompts/list"), h25);
+check("2025 prompts/list", parsed(r).result.prompts[0].name == "welcome", r.body);
+
+r = post(base_url, rpc(9, "prompts/get", "{\"name\":\"welcome\",\"arguments\":{\"user\":\"Alice\"}}"), h25);
+check("2025 prompts/get", parsed(r).result.messages[0].content.text == "Welcome, Alice!", r.body);
+
+r = post(base_url, rpc(10, "prompts/get", "{\"name\":\"welcome\",\"arguments\":{}}"), h25);
+check("2025 prompts/get: missing required argument -32602", parsed(r).error.code == JSONRPC_INVALID_PARAMS, r.body);
+
+r = post(base_url, rpc(11, "resources/list"), h25);
+check("2025 resources/list", parsed(r).result.resources.size() == 3, r.body);
+
+r = post(base_url, rpc(12, "resources/read", "{\"uri\":\"file:///notes/welcome.txt\"}"), h25);
+check("2025 resources/read: file", parsed(r).result.contents[0].text.find("Welcome") >= 0, r.body);
+
+r = post(base_url, rpc(13, "resources/read", "{\"uri\":\"shz://static\"}"), h25);
+check("2025 resources/read: static", parsed(r).result.contents[0].text == "static text", r.body);
+
+r = post(base_url, rpc(14, "resources/read", "{\"uri\":\"shz://state\"}"), h25);
+check("2025 resources/read: callback", parsed(r).result.contents[0].text == "tools=4", r.body);
+
+r = post(base_url, rpc(15, "resources/read", "{\"uri\":\"shz://missing\"}"), h25);
+check("2025 resources/read: unknown uri -32003", parsed(r).error.code == JSONRPC_RESOURCE_NOT_FOUND, r.body);
+
+r = post(base_url, rpc(16, "ping"), h25);
+check("2025 ping: empty result object", r.body.find("\"result\":{}") >= 0, r.body);
+
+r = post(base_url, rpc(17, "does/not/exist"), h25);
+check("2025 unknown method -32601", parsed(r).error.code == JSONRPC_METHOD_NOT_FOUND, r.body);
+
+r = post(base_url, "not json", h25);
+check("malformed body: 400 + -32700", r.http_code == 400 && parsed(r).error.code == JSONRPC_PARSE_ERROR, r.http_code + " " + r.body);
+
+r = post(base_url, rpc(0, "ping"), h25);
+check("id 0 is a request, not a notification", r.http_code == 200 && r.body.find("\"id\":0") >= 0, r.body);
+
+h_unknown = h25.copy();
+h_unknown["Mcp-Session-Id"] = "does-not-exist";
+r = post(base_url, rpc(18, "tools/list"), h_unknown);
+check("2025 unknown Mcp-Session-Id: 404", r.http_code == 404, r.http_code);
+
+session_id = server.sessions.key(0);
+h_session = h25.copy();
+h_session["Mcp-Session-Id"] = session_id;
+h_session["MCP-Protocol-Version"] = "2025-06-18";
+r = post(base_url, rpc(19, "tools/list"), h_session);
+check("2025 known Mcp-Session-Id: 200", r.http_code == 200 && parsed(r).result.tools.size() == 4, r.http_code);
+
+h_bad_version = h25.copy();
+h_bad_version["MCP-Protocol-Version"] = "1999-01-01";
+r = post(base_url, rpc(20, "tools/list"), h_bad_version);
+check("2025 unsupported MCP-Protocol-Version header: 400", r.http_code == 400, r.http_code);
+
+r = c.get(base_url, [], 3000);
+check("2025 GET /mcp: 405", r.http_code == 405, r.http_code);
+
+r = c.delete(base_url, h_session, 3000);
+check("2025 DELETE /mcp ends the session", r.http_code == 200 && !server.sessions.has(session_id), r.http_code);
+
+r = post(base_url, rpc(21, "tools/list"), h_session);
+check("2025 ended session: 404", r.http_code == 404, r.http_code);
+
+// ============================================================================
+// 2026-07-28: stateless
+// ============================================================================
+
+r = post(base_url, rpc(30, "server/discover"), headers_26("server/discover"));
+j = parsed(r);
+check("2026 server/discover", r.http_code == 200 && j.result.supportedVersions[0] == MCP_VERSION_2026, r.body);
+check("2026 server/discover: lists the 2025 versions too", j.result.supportedVersions.size() == 1 + MCP_VERSIONS_2025.size(), r.body);
+check("2026 server/discover: cache hints", j.result.has("ttlMs") && j.result.cacheScope == "private", r.body);
+
+r = post(base_url, rpc(31, "tools/list"), headers_26("tools/list"));
+j = parsed(r);
+check("2026 tools/list", j.result.tools.size() == 4 && j.result.has("ttlMs"), r.body);
+
+r = post(base_url, rpc(32, "tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"hi26\"}}"), headers_26("tools/call", "echo"));
+check("2026 tools/call", parsed(r).result.content[0].text == "hi26", r.body);
+
+r = post(base_url, rpc(33, "tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"x\"}}"), headers_26("tools/call"));
+check("2026 tools/call without Mcp-Name: 400", r.http_code == 400, r.http_code);
+
+r = post(base_url, rpc(34, "tools/list"), headers_26("prompts/list"));
+check("2026 Mcp-Method mismatch: 400", r.http_code == 400, r.http_code);
+
+r = post(base_url, rpc(35, "resources/read", "{\"uri\":\"shz://static\"}"), headers_26("resources/read", "shz://static"));
+check("2026 resources/read", parsed(r).result.contents[0].text == "static text", r.body);
+
+r = post(base_url, rpc(36, "prompts/get", "{\"name\":\"welcome\",\"arguments\":{\"user\":\"Bob\"}}"), headers_26("prompts/get", "welcome"));
+check("2026 prompts/get", parsed(r).result.messages[0].content.text == "Welcome, Bob!", r.body);
+
+r = post(base_url, rpc(37, "initialize", "{}"), headers_26("initialize"));
+check("2026 has no initialize", parsed(r).error.code == JSONRPC_INVALID_REQUEST, r.body);
+
+// ============================================================================
+// Empty lists are [] (both protocols)
+// ============================================================================
+
+r = post(empty_url, rpc(40, "tools/list"), h25);
+check("empty tools/list is []", r.body.find("\"tools\":[]") >= 0, r.body);
+r = post(empty_url, rpc(41, "prompts/list"), headers_26("prompts/list"));
+check("empty prompts/list is [] (2026)", r.body.find("\"prompts\":[]") >= 0, r.body);
+r = post(empty_url, rpc(42, "resources/list"), h25);
+check("empty resources/list is []", r.body.find("\"resources\":[]") >= 0, r.body);
+
+// ============================================================================
+// 2025: legacy HTTP+SSE
+// ============================================================================
+
+sse = [code = 0, body = ""];
+sse_thread = std.thread([sse, server_port]() {
+	sc = curl.curl();
+	sr = sc.get("http://localhost:" + server_port + "/sse", [], 8000);
+	sse.code = sr.http_code;
+	sse.body = sr.body;
+});
+sse_thread.run();
+
+for(i = 0; i < 40 && server.clients.size() == 0; i++)
+	std.sleep(50);
+
+check("SSE stream registers a client", server.clients.size() == 1, server.clients.size());
+
+sse_id = server.clients.key(0);
+sse_url = base_url + "?sessionid=" + sse_id;
+
+r = post(sse_url, rpc(50, "initialize", "{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"sse-client\",\"version\":\"2\"}}"), h25);
+check("SSE initialize: 202", r.http_code == 202, r.http_code);
+
+r = post(sse_url, rpc(51, "tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"via-sse\"}}"), h25);
+check("SSE tools/call: 202", r.http_code == 202, r.http_code);
+
+r = post(base_url + "?sessionid=nope", rpc(52, "ping"), h25);
+check("SSE unknown sessionid: 404", r.http_code == 404, r.http_code);
+
+std.sleep(200);
+server.clients[sse_id].stop = true;
+sse_thread.join();
+
+check("SSE stream: endpoint event", sse.body.find("event: endpoint\ndata: /mcp?sessionid=" + sse_id) >= 0, sse.body);
+check("SSE stream: initialize response", sse.body.find("\"protocolVersion\":\"2024-11-05\"") >= 0, sse.body);
+check("SSE stream: tool result", sse.body.find("via-sse") >= 0, sse.body);
+check("SSE stream: client name from initialize", server.peers.has("sse-client 2"), server.peers);
+
+// ============================================================================
+// Hooks
+// ============================================================================
+
+server.enabled = false;
+r = post(base_url, rpc(60, "tools/list"), h25);
+check("disabled: tools/list rejected", parsed(r).error.code == JSONRPC_SERVER_DISABLED, r.body);
+r = post(base_url, rpc(61, "ping"), h25);
+check("disabled: ping still answers", r.body.find("\"result\":{}") >= 0, r.body);
+server.enabled = true;
+
+server.tool_filter = [](tool_name, args, ctx) {
+	if(tool_name == "echo")
+		return "echo is locked";
+	return None;
+};
+r = post(base_url, rpc(62, "tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}"), h25);
+j = parsed(r);
+check("tool_filter rejects a call", j.result.isError && j.result.content[0].text.find("echo is locked") >= 0, r.body);
+server.tool_filter = None;
+
+check("history records requests", server.history.size() > 0 && server.history[-1].method == "tools/call" && !server.history[-1].ok, server.history[-1]);
+check("history keeps the real error", server.history[-1].error.find("echo is locked") >= 0, server.history[-1]);
+check("on_request is called", hook_calls.count == server.request_count, hook_calls.count + " / " + server.request_count);
+check("error_count counts failures", server.error_count > 0, server.error_count);
+check("connected_clients", server.connected_clients().size() > 0, server.connected_clients());
+
+// ============================================================================
+// stop()
+// ============================================================================
+
+empty_server.stop();
+check("stop(): not running", !empty_server.running);
+r = post(empty_url, rpc(70, "ping"), h25);
+check("stop(): no answer anymore", r.http_code != 200, r);
+
+server.stop();
+
+std.print("");
+std.print("MCP SELFTEST: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);
