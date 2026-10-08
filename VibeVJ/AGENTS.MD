@@ -21,8 +21,8 @@ The base generator class lives in:
 
 This class is a **universal wrapper** for any generator. When instantiated it:
 - Creates a nanoGUI `window` + a `matrixnode` for the generator's UI.
-- Provides the **ACT** button (`active_btn`) that gates whether the generator runs.
-- Provides **Save (S)** and **Reload (R)** buttons, a close (`X`) button, a **big-view (`|_|`)** toggle and a **collapse (`_`)** toggle.
+- Provides the **power** button (`active_btn`, MIDI control ID `ACT`) that gates whether the generator runs.
+- Provides the **⋯ menu** (*Copy settings*, *Paste settings*, *Save preset…*, *Reload module*, *Hide header (E)*), the **link** button (*Always draw links*) and **maximize**, **collapse** and **close**.
 - Handles **state save/load** (`save_state` / `load_state`) including window position, size, big/collapse state, and per-generator data.
 - Detects the asset's **file extension**, then loads the matching **extension-specific loader** from `engine/generators/extensions/<ext>/__init__.shio` and calls its `load_extension(generator)` entry point.
 
@@ -52,7 +52,7 @@ Each `__init__.shio` **must** export a `load_extension(generator)` entry point t
    - With an explicit file extension (`.png`, `.txt`, `.glsl`, `.preset`, etc.) it uses that.
    - Without a file extension, it checks `path/src/__init__.shio` (=> `asset`) or `path/src/__init__.glsl` (=> `glsl`).
 3. **Loader lookup** — the class loads `engine/generators/extensions/<ext>/__init__.shio` into a `std.module()` and calls `load_extension(this)`, which populates the generator's UI and behavior.
-4. **Window wrapping** — `generatoritem.shio` wraps the generator in a movable/resizable nanoGUI window with the ACT/save/reload/big-view/collapse controls and full state save/load.
+4. **Window wrapping** — `generatoritem.shio` wraps the generator in a movable/resizable nanoGUI window with the header controls (power, ⋯ menu, maximize/collapse/close) and full state save/load.
 
 ### How to add a new generator
 
@@ -131,7 +131,8 @@ The engine wires `on_dragdrop` / `on_dragdrop_hover` handlers on each of these v
 
 Every new feature or UI change also adds or updates its page in the **user wiki** in the same PR: what it is for, how to use it
 step by step, and a current screenshot or GIF. The user wiki is plain Markdown in `wiki/` (start page `wiki/README.md`), written
-for VJs, not for developers. Setting it up for the existing features is issue #295.
+for VJs, not for developers. The pages for the existing features came with #295; a page still waiting for its picture
+has a line `> Screenshot to add: …`.
 
 - Use the same words as the UI and the design glossary (`../design/wiki/Glossary.md`). Mark planned features as planned.
 - UI rules (colours, notches, sizes, labels) are in `../design/README.md`; their meaning is explained in `../design/wiki/`. A
@@ -219,7 +220,7 @@ The elements of a modmatrixnode do NOT need to be direct children of the modmatr
 - [Asset Authoring Guide](assets/ASSET_GUIDE.MD)
 - [Shader Guide](assets/Shaders/SHADER_GUIDE.MD)
 - [Shizo UI design system](../design/README.md) and its [design wiki](../design/wiki/README.md)
-- User wiki: `wiki/` (being set up, #295)
+- [User wiki](wiki/README.md)
 
 Always check directory specific README.md's
 

@@ -4,8 +4,8 @@ The `engine/` directory contains the core engine implementation for the VJ appli
 
 Core principle: **everything is a generator.** The base generator wrapper
 (`engine/generators/generatoritem.shio`) creates a nanoGUI window/node,
-handles the ACT button, save/reload buttons, big-view/collapse and state
-save/load. The actual generator behavior comes from a "loader" selected by
+handles the window header (power button, ⋯ menu with save preset and reload,
+maximize / collapse / close) and state save/load. The actual generator behavior comes from a "loader" selected by
 the asset file extension. Loaders live in `engine/generators/extensions/`.
 
 ```
@@ -17,7 +17,7 @@ engine/
 │   ├── layerblend.glsl/          # Layer blending shader (src/__init__.glsl)
 │   └── shaderstack.asset/        # Shader stack configuration (src/__init__.shio)
 ├── generators/                    # The "views" — containers that hold one or more generators
-│   ├── generatoritem.shio         # Universal generator wrapper class (window, ACT, save/reload, big-view/collapse, state save/load)
+│   ├── generatoritem.shio         # Universal generator wrapper class (window, header: power, ⋯ menu, maximize/collapse/close, state save/load)
 │   ├── generatorview.shio         # Generator view (holds multiple generators)
 │   ├── clipview.shio             # Clip view
 │   ├── clipstackview.shio        # Clip stack view
@@ -78,8 +78,8 @@ Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root
 ## Components
 
 - **`generators/generatoritem.shio`** — the universal generator wrapper. It wraps any
-  generator asset in a nanoGUI window, wires up the ACT button, save/reload,
-  big-view/collapse and state save/load, then auto-detects the asset extension:
+  generator asset in a nanoGUI window, wires up the header (power,
+  ⋯ menu, maximize/collapse/close) and state save/load, then auto-detects the asset extension:
   - No file extension → looks for `path/src/__init__.shio` (=> `asset`) or `path/src/__init__.glsl` (=> `glsl`).
   - It then loads the matching extension loader from `engine/generators/extensions/<ext>/__init__.shio`.
 - **`generators/` views** — `generatorview.shio`, `clipview.shio`, `clipstackview.shio`

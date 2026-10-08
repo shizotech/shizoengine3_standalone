@@ -5,7 +5,7 @@ one or more generators, plus the **universal generator wrapper**.
 
 ```
 engine/generators/
-├── generatoritem.shio        # Universal generator wrapper class (window, ACT, save/reload, big-view/collapse, state save/load)
+├── generatoritem.shio        # Universal generator wrapper class (window, header: power, ⋯ menu, maximize/collapse/close, state save/load)
 ├── generatorview.shio        # Generator view (holds a group of generators)
 ├── clipview.shio            # Clip view container
 ├── clipstackview.shio       # Clip stack view container
@@ -18,9 +18,10 @@ engine/generators/
 - **`generatoritem.shio`** — the base `generator` class. It is a **universal
   wrapper** for any generator asset. On init it:
   - Creates a nanoGUI `window` + a `matrixnode` for the generator's UI.
-  - Wires up the **ACT** button, **Save (S)** / **Reload (R)** buttons, the
-    **big-view (`|_|`)** and **collapse (`_`)** toggles and the **close (X)**
-    button.
+  - Wires up the header: the **power** button (the MIDI control `ACT`), the
+    **⋯ menu** (*Copy settings*, *Paste settings*, *Save preset…*, *Reload module*,
+    *Hide header (E)*), the **link** button (*Always draw links*) and
+    **maximize** / **collapse** / **close**.
   - Handles **state save/load** (`save_state` / `load_state`) for window
     position, size, big/collapse state and per-generator data.
   - Auto-detects the asset's file extension (no extension → checks for
