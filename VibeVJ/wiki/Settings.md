@@ -43,10 +43,12 @@ starts with; you can change each shader later.
 ### Cable view and off-screen link hints
 
 *Cable view* turns the whole screen into the cable view: every notch is shown in full and every link whose two ends
-are visible is drawn as a cable. Turn it off to keep the screen calm while you play.
+are visible is drawn as a cable. Turn it off to keep the screen calm while you play. The link button in the timeline bar,
+next to the show mode lock, is the same switch.
 
 - A generator with *Always draw links* on (the link icon in its header) draws its own cables also when *Cable view* is
-  off. See [Generators](Generators.md).
+  off. See [Generators](Generators.md). The link button in the timeline bar counts these local cable views in a small
+  bubble and, when you rest the mouse on it, splits to offer a broken link that ends them all ([Linking](Linking.md#seeing-your-links)).
 - *Off-screen link hints* work only while *Cable view* is on. The badge counts the links of that control whose other end
   is not visible right now: in another tab, scrolled away or covered by a window. It is not the number of all links.
 - In show mode there is no cable view and no badges.

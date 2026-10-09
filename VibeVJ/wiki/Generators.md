@@ -3,7 +3,7 @@
 A generator is the building block of VibeVJ. This page explains what a generator is, how you add one, what the buttons in
 its window header do, and how you keep its settings as a preset.
 
-![A generator window: power, title, link, ⋯ menu, maximize, collapse, close](media/generator-window.png)
+![A generator window: power, title, link, ⋯ menu, maximize, collapse, close (older picture: the chevron is missing and link sits on the right)](media/generator-window.png)
 
 ## What a generator is
 
@@ -37,16 +37,17 @@ after the question "Overwrite view?".
 
 ## The window header
 
-The header runs along the top of the window. From left to right:
+The header runs along the top of the window. From left to right (on the right in the Windows order: minimize, maximize, close):
 
 | Button | Tooltip | What it does |
 |---|---|---|
+| Chevron | *Collapse* / *Expand* | Shrinks the window to its header and opens it again at its old size. It points down while the window is open and right while it is collapsed. The same switch as the minimize button. |
 | Power icon | *Generator active* | Switches the generator on and off. The icon is green while it runs. When it is off, the generator stops and its name is dimmed. It is a control: you can link it or map it to MIDI. |
-| Name | | The name of the asset |
 | Link icon | *Always draw links* | Draws the cables of this generator all the time and shows its notches in full, even when *Cable view* is off. Saved with the project. |
+| Name | | The name of the asset |
 | ⋯ | *More* | Opens the menu with the less used actions (below). |
-| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, *Collapse* and *Close* are hidden. |
-| Collapse | *Collapse* | Shrinks the window to its header. Press it again to open it. |
+| Minimize | *Collapse* / *Expand* | Shrinks the window to its header. Press it again to open it. The same switch as the chevron, saved with the project. |
+| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron, *Minimize* and *Close* are hidden. |
 | × | *Close* | Closes the generator. |
 
 > Screenshot to add: the header from left to right, with each button labelled.

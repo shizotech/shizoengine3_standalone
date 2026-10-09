@@ -12,7 +12,9 @@ From left to right:
 | Control | What it does |
 |---|---|
 | Sidebar icon | Shows or hides the sidebar. |
-| Chevron | Collapses the timeline to its bar. Drag the bar up to open it again. |
+| Chevron | Collapses the timeline to its bar. Click it again (or drag the bar up) to open it at its last height. |
+| Link | *Cable view* on or off: every link on screen as a cable. The same switch as in *Project* › *Settings*. Green while on, greyed out in show mode. While it is off, a small violet bubble on its top right corner counts the generators with their own link icon on (local cable views). Rest the mouse on the button for a moment and it splits: a broken link slides in on its right half, a click on it ends them all. See [Linking](Linking.md#seeing-your-links). |
+| Lock | Show mode. See below. |
 | *Play* | Runs the timeline. Green while playing. Click again to pause. |
 | *Stop* | Stops and goes back to the start (Bar 1.1.00). |
 | *Follow* | Tooltip *Follow the playhead*. It can be switched on and linked, but has no effect yet. *(Planned.)* |
@@ -22,7 +24,6 @@ From left to right:
 | *Bar* | The position as bar.beat.tick. |
 | *View* | *Timeline* / *Loops* / *Patch*. |
 | *Snap windows* | Keeps the view area above the timeline the right size. On by default. |
-| Lock | Show mode. See below. |
 
 *Play*, *Stop*, *Follow*, *BPM*, *Beat*, *Bar*, *View* and *Snap windows* have notches, so you can link them or map them to
 MIDI. See [Linking](Linking.md).
@@ -66,11 +67,12 @@ the views. With it off, the views only get smaller when the timeline would cover
 
 ## Show mode
 
-![The transport bar in show mode: lock icon and Show badge](media/transport-show.png)
+![The transport bar in show mode: the lock closed and green](media/transport-show.png)
 
 Show mode locks the app for performing, so nothing gets linked, moved or closed by accident, by mouse or by touch.
 
-1. Click the lock (tooltip *Show mode: lock notches and editing*). It closes and a small *Show* badge appears.
+1. Click the lock at the left of the bar, next to the chevron (tooltip *Show mode: lock notches and editing*). It closes
+   and turns green.
 2. Play your show.
 3. To leave, press the lock, hold it for at least 400 ms, then let go. A short click does nothing, so a stray touch does
    not unlock it.

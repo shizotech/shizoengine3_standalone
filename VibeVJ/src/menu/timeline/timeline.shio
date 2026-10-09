@@ -12,12 +12,16 @@ class timeline
 	managed bpm_ctrl = None;
 	managed snap_btn = None;
 	managed show_btn = None;
-	managed show_badge = None;
+	managed cable_btn = None;
+	managed collapse_btn = None;
+	managed menu = None;
+	managed screen = None;
 	managed timeline_generators = None;
 	
 	nudge_factor = 1.0;
 	tap_times = []; //std.millis() of the recent taps on Tap
 	show_press = 0; //std.millis() of the press on the show mode button
+	expanded_top = 0.0; //top edge of the timeline before the last collapse, 0 = never collapsed
 
 	// Persistent state — keep these between calls
 	phase_integral = 0.0;
@@ -32,6 +36,8 @@ class timeline
 	__init__(engine, main_menu) {
 
 		engine.timeline = this;
+		menu = main_menu;
+		screen = engine.screen;
 
 		engine_global = std.global("timeline");
 		engine_global.set(this);
@@ -60,22 +66,8 @@ class timeline
 			this.window.fixed_height(engine.screen.height() - pos.y);
 		});
 		
-		window.on_move([this, engine, main_menu](pos, old_pos) {
-
-			this.window.refresh_layout();
-			
-			if(pos.y < 50.0 || pos.y > engine.screen.height())
-				this.window.position(old_pos);
-				this.window.fixed_height(engine.screen.height() - old_pos.y);
-				return;
-			
-			generators_window = main_menu.generators_menu.window;
-			
-			if(pos.y < generators_window.y() + generators_window.height() || this.snap_btn.value())
-				generators_window.fixed_height(pos.y);
-				generators_window.refresh_layout();
-		
-			this.window.fixed_height(engine.screen.height() - pos.y);
+		window.on_move([this](pos, old_pos) {
+			this.place(pos.y);
 		});
 		
 		timeline_node = window.matrixnode("timeline").anchor(0);
@@ -84,22 +76,79 @@ class timeline
 		
 		button_panel = window.button_panel().matrixnode("timeline_header").anchor(0).layout(nanogui.layout_horizontal());
 		
+		//The four view tools (sidebar, collapse, cable view, show mode) sit 4 px apart (a zero-width gap adds one more
+		//layout spacing of 2 px); the rest of the bar keeps 2 px, so narrow screens lose nothing more
+		view_gap = [button_panel]() {
+			button_panel.widget().fixed_width(0);
+		};
 		sidebar_btn = button_panel.button("").icon(nanogui.icon("bars")).tooltip("Show / hide the sidebar");
 		sidebar_btn.on_click([main_menu](){
 			main_menu.toggle_sidebar();
 		});
 		
-		collapse_btn = button_panel.button("").icon(nanogui.icon("chevron_down")).tooltip("Collapse the timeline (drag the bar up to open it)");
-		collapse_btn.on_click([this, window, engine, main_menu](){
-			window.y(engine.screen.height() - 35);
-			window.fixed_height(35);
-			
-			generators_window = main_menu.generators_menu.window;
-			
-			if(this.snap_btn.value())
-				generators_window.fixed_height(window.y());
-				generators_window.refresh_layout();
+		view_gap();
+		collapse_btn = button_panel.button("").icon(nanogui.icon("chevron_up")).tooltip("Open or collapse the timeline");
+		collapse_btn.on_click([this](){
+			this.toggle_collapse();
 		});
+
+		view_gap();
+		//Cable view, the same switch as Project > Settings > Cable view (saved with the project): every link on screen as a
+		//cable. Next to the lock, as the opposite mode: wiring vs. performing. Locked while in show mode, which has no cables.
+		//Local cable views (the link icon in a generator header, Always draw links): a small accent bubble on the top
+		//right corner counts them. Hovering the button for a moment while there are any splits it: the broken link slides
+		//in on its right half and ends them all. The button keeps its width; the global cable view stays as it is
+		show_links = main_menu.asset_menu.show_links;
+		cable_btn = button_panel.pushbutton("").icon(nanogui.icon("link")).fixed_width(44).tooltip("Cable view: show every link");
+		cable_btn.pushed(show_links.value() != 0);
+		cable_btn.on_change([show_links](pushed){
+			show_links.value(pushed ? 1 : 0);
+		});
+		main_menu.asset_menu.on_cable_view = [this](v){
+			this.cable_btn.pushed(v != 0);
+		};
+		cable_btn.split_icon(nanogui.icon("unlink")).split_enabled(false).on_split_click([](){
+			nanogui.always_draw_links_off();
+		});
+		//Kept current every frame: generators switch their link icon, get closed or loaded at any time
+		//The bubble only while the global cable view is off: with it on every cable shows anyway
+		cable_btn.on_draw([cable_btn](){
+			n = nanogui.show_mode() ? 0 : std.int(nanogui.local_cable_views());
+			count = n > 0 ? std.string(n) : "";
+			badge = cable_btn.pushed() ? "" : count;
+			if(cable_btn.badge() != badge)
+				cable_btn.badge(badge);
+			tip = "End all local cable views (" + count + ")";
+			if(cable_btn.split_tooltip() == tip)
+				return;
+			cable_btn.split_enabled(n > 0);
+			cable_btn.split_tooltip(tip);
+		});
+		
+		view_gap();
+		//Show mode (#285): a click locks notches and editing for performing; leaving needs a hold, so a stray touch
+		//during the show does not unlock it. It sits at the start of the bar: the bar does not wrap, and on narrow
+		//screens (1280 px, or 1920 px at 150 % scaling) everything after the view switch is cut off.
+		//A toggle button so it is green ("on", like Play) while the show runs, which marks show mode; its own handler
+		//below decides when it toggles, the button's default click never runs
+		show_btn = button_panel.pushbutton("").icon(nanogui.icon("unlock")).fixed_width(44).tooltip("Show mode: lock notches and editing");
+		show_btn.on_mouse_button([this](pos, btn, down, mods) {
+			if(btn != 0)
+				return true;
+			if(down) {
+				this.show_press = std.millis();
+				return true;
+			}
+			if(!nanogui.show_mode())
+				this.set_show_mode(true);
+			else if(std.millis() - this.show_press >= 400)
+				this.set_show_mode(false);
+			return true;
+		});
+
+		//A hairline between the view tools (sidebar, collapse, cable view, show mode) and the transport
+		transport_gap = button_panel.widget().fixed_width(13);
+		transport_gap.widget_solid().anchor_left(6).fixed_width(1).anchor_top(2).anchor_bottom(2).background_color(vec4f(1.0, 1.0, 1.0, 0.12));
 		
 		//IDs stay in capitals (MIDI mappings, links, projects), the captions are plain words
 		play_btn = button_panel.controlbutton("PLAY").caption("Play").push(true).fixed_width(44);
@@ -164,25 +213,7 @@ class timeline
 		
 		snap_btn = button_panel.controlbutton("SNAP WINDOWS").caption("Snap windows").push(1).value(1);
 		snap_btn.get_button().tooltip("The view area above follows the timeline when you move or collapse it");
-		
-		//Show mode (#285): a click locks notches and editing for performing; leaving needs a hold, so a stray touch
-		//during the show does not unlock it
-		show_btn = button_panel.button("").icon(nanogui.icon("unlock")).fixed_width(44).tooltip("Show mode: lock notches and editing");
-		show_badge = button_panel.label("Show").font_size(13).visible(false);
-		show_btn.on_mouse_button([this](pos, btn, down, mods) {
-			if(btn != 0)
-				return true;
-			if(down) {
-				this.show_press = std.millis();
-				return true;
-			}
-			if(!nanogui.show_mode())
-				this.set_show_mode(true);
-			else if(std.millis() - this.show_press >= 400)
-				this.set_show_mode(false);
-			return true;
-		});
-		
+
 		engine.save_hooks["timeline_generators"] = [timeline_generators](){		
 			return timeline_generators.save_state();
 		};
@@ -193,6 +224,40 @@ class timeline
 	}
 
 
+	//Puts the top edge of the timeline at y, clamped so 120 px of views stay above and the bar stays visible.
+	//The views follow when they are snapped or would overlap the timeline. Returns the clamped y.
+	place(y) {
+		h = screen.height();
+		y = math.clamp(y, 120.0, h - 35.0);
+		window.y(y);
+		window.fixed_height(h - y);
+		window.refresh_layout();
+		
+		views = menu.generators_menu.window;
+		if(snap_btn.value() || y < views.y() + views.height()) {
+			views.fixed_height(y - views.y());
+			views.refresh_layout();
+		}
+		
+		collapse_btn.icon(nanogui.icon(y >= h - 35.0 ? "chevron_up" : "chevron_down"));
+		return y;
+	}
+	
+	collapsed() {
+		return window.y() >= screen.height() - 35.0;
+	}
+	
+	//The chevron: collapse to the bar, a second click opens the timeline again at its last height
+	toggle_collapse() {
+		h = screen.height();
+		if(!collapsed()) {
+			expanded_top = window.y();
+			place(h);
+			return;
+		}
+		place(expanded_top > 0.0 ? expanded_top : h * 0.6);
+	}
+
 	set_bpm(bpm) {
 		bpm_ctrl.value(bpm);
 	}
@@ -200,9 +265,10 @@ class timeline
 	set_show_mode(enabled) {
 		nanogui.show_mode(enabled);
 		show_btn.icon(nanogui.icon(enabled ? "lock" : "unlock"));
+		show_btn.pushed(enabled);
 		show_btn.tooltip(enabled ? "Hold to leave show mode" : "Show mode: lock notches and editing");
-		show_badge.visible(enabled);
-		window.refresh_layout();
+		cable_btn.enabled(!enabled);
+		cable_btn.tooltip(enabled ? "Cable view: not in show mode" : "Cable view: show every link");
 	}
 
 	phase_distance(desired, actual)

@@ -14,7 +14,8 @@ Every linkable row has two small tabs, the notches.
 | Left (input) | Something can come in. Violet when a link arrives. | Opens the options | Starts a link |
 | Right (output) | Something goes out. Filled with its cable colour. | Opens the options | Starts a link |
 
-Cables run the same way: they leave the right notch of the sender and end at the left notch of the receiver.
+Cables run the same way: they leave the right notch of the sender and end at the left notch of the receiver. If the receiver
+sits further left than the sender, the cable hangs in a loop below both and still comes into the receiver from the left.
 
 On very small buttons (the Clipview transport buttons) a click on the right notch presses the button. Use the left notch for
 the options there; dragging from the right notch still links.
@@ -47,7 +48,11 @@ Made for touch screens, works with the mouse too.
 2. Drag. On the right half of the row the link starts from the output, on the left half from the input.
 
 If you move before 400 ms, the row changes its value as usual. If the press had already changed the value, the value goes
-back when the link starts. Hold and drag works on value fields and buttons, not on *In* / *Out* ports.
+back when the link starts. Hold and drag works on value fields and buttons, not on *In* / *Out* ports and not on a slider's
+thumb (the violet bar): holding the thumb still before you move it just picks it up.
+
+An *Out* port carries its dot on the right, where its cables leave; an *In* port on the left. Like every notch, a port's cap
+is only a thin edge until the port is linked or the mouse is over it. An *Out* port takes no links, its generator writes it.
 
 ## Remove a link
 
@@ -57,7 +62,7 @@ back when the link starts. Hold and drag works on value fields and buttons, not 
 
 ## The link list
 
-Click a notch to open the options of a control.
+Click a notch to open the options of a control. They close when you click anywhere outside them, or the notch again.
 
 | Tab | What is there |
 |---|---|
@@ -97,9 +102,10 @@ A greyed-out control has no grip dots on its notches and takes no links.
 
 | Setting | Where | What it does |
 |---|---|---|
-| *Cable view* | Sidebar › *Project* › *Settings* | The cable view: draws every link whose two ends are on screen, with all notches in full. Saved with the project. |
+| *Cable view* | Link button in the timeline bar, or Sidebar › *Project* › *Settings* (one switch) | The cable view: draws every link whose two ends are on screen, with all notches in full. Saved with the project. |
 | *Off-screen link hints* | Sidebar › *Project* › *Settings* | While *Cable view* is on: a small violet badge with a number on a control whose link partner is not on screen (other tab, scrolled away, covered). |
-| *Always draw links* | Link icon in a generator's header | Draws the links of this one generator even when *Cable view* is off. |
+| *Always draw links* | Link icon in a generator's header | Draws the links of this one generator even when *Cable view* is off: a local cable view. The small violet bubble on the link button in the timeline bar counts them. |
+| *End all local cable views* | Rest the mouse on the link button in the timeline bar, then click the broken link that slides in on its right half | Switches *Always draw links* off in every generator at once, also in every Patchview. *Cable view* stays as it is. Only there while at least one is on. |
 
 While you drag a link, the cable view is on for the moment.
 

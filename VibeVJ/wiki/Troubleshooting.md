@@ -31,7 +31,7 @@ While you drag, only controls that can take the link get a violet outline. If yo
 |---|---|---|
 | The target is a **pure output** | It has only a right notch (for example *Beat* of Audio Input Analysis, the deck values of Prolink Decks). | Link the other way: from the pure output into the control it should drive. |
 | The target is **disabled** | It is greyed out, its notches have no grip dot. | A disabled control takes no links. Pick another target. |
-| **Show mode** is on | The *Show* badge is in the timeline bar. | Leave show mode (see below). |
+| **Show mode** is on | The lock in the timeline bar is green. | Leave show mode (see below). |
 | Start and target are the **same control** | — | A control cannot link to itself. |
 
 A link into a pure output that was saved in an older project is dropped when the project loads.
@@ -41,7 +41,7 @@ A link into a pure output that was saved in an older project is dropped when the
 Show mode is on. It locks notches, links, moving and closing windows, dropping assets, *Paste settings* and *Reload module*.
 Values, clips and MIDI keep working.
 
-1. Find the lock in the timeline bar, next to the *Show* badge.
+1. Find the green lock at the left of the timeline bar.
 2. Press and **hold** it for about half a second, then let go. A short click does not leave show mode, on purpose.
 
 ## The tempo keeps changing by itself

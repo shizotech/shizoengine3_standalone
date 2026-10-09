@@ -90,7 +90,7 @@ Every generator lives in its own window. The window header and its buttons are o
 The timeline sits at the bottom. It starts as a single bar.
 
 1. Drag the bar up to open the timeline.
-2. Click the chevron button (tooltip *Collapse the timeline*) to close it to a bar again.
+2. Click the chevron button (tooltip *Open or collapse the timeline*) to close it to a bar, and again to open it at its last height.
 
 With *Snap windows* on, the views above get smaller or bigger as you move the bar, so nothing is covered.
 
@@ -98,12 +98,13 @@ With *Snap windows* on, the views above get smaller or bigger as you move the ba
 |---|---|
 | ☰ | Shows or hides the sidebar |
 | Chevron | Closes the timeline to a bar |
+| Link | *Cable view* on or off. The small violet bubble counts the local cable views; rest the mouse on it and the broken link on its right half ends them all. See [Linking](Linking.md#seeing-your-links). |
+| Lock | Show mode. See [Timeline](Timeline.md). |
 | Play, Stop, Follow | Transport. Stop also goes back to the start. |
 | *BPM*, *Tap* | Tempo, and tap tempo |
 | *Beat*, *Bar* | Where the playhead is |
 | *View* | *Timeline*, or *Loops* / *Patch*: a free area for generator windows. Windows there snap to a grid. |
 | *Snap windows* | Keeps the views and the timeline stacked |
-| Lock | Show mode. See [Timeline](Timeline.md). |
 
 Today *Loops* and *Patch* show the same area.
 

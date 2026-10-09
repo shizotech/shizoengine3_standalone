@@ -23,6 +23,7 @@ or a mapping editor, Page Up / Page Down change that editor's grid instead.
 |---|---|
 | Click on a slider | The value jumps to that point. |
 | Drag on a slider | Sets the value as you move. |
+| Drag the thumb (the violet bar in the slider) | Picks it up where it is, the value does not jump. It gets wider when the mouse is on it. Works at 0 % and 100 % too, next to the notches. |
 | Shift + drag on a slider | Fine control: the value does not jump, and it moves ten times slower than the mouse. You can also press Shift during a drag. |
 | Double click on a slider | Opens a box to type the value. Enter sets it, Esc keeps the old one. |
 | Click on a number field | Type a new value, then Enter. |
@@ -98,6 +99,8 @@ When a file opens as text (for example a shader):
 - **Lost a cable?** Turn on *Cable view* in *Project* › *Settings* to see every link on screen. With *Off-screen link
   hints* a badge counts the links that end somewhere you can't see.
 - **One generator's wiring only:** click the link icon in its header (*Always draw links*).
+- **Too many cables after patching?** The small violet bubble on the link button in the timeline bar says how many generators
+  still draw their own cables. Rest the mouse on the button and click the broken link that slides in: all of them stop at once.
 - **Touch screen:** use hold and drag to link, and use the Clipview's *Live* toggle so clips can't be dragged away.
 
 ## See also

@@ -340,7 +340,7 @@ Standard arithmetic, logical, comparison.
 
 ```
 + - * / %            // arithmetic, % = modulo (C semantics for ints: -7 % 3 == -1, fmod for floats: 7.5 % 2 == 1.5)
-& | ^ ~              // bitwise and, or, xor, not (~5 == -6)
+& | ^ ~              // bitwise and, or, xor, not (~5 == -6) - binds TIGHTER than * and +, see 6.1
 == != < <= > >=      // comparison
 && || !              // logical
 a ? b : c            // ternary, right-associative: "a ? b : c ? d : e" means "a ? b : (c ? d : e)"
@@ -352,14 +352,55 @@ a ?? b               // b if a is falsy (see Runtime Pitfalls)
 - Compound assignments evaluate their left-hand side only once: `l[i++] += 5` increments `i` once and reads/writes the same element, `get().count += 1` calls `get()` once.
 - Compound assignments also work on index and member expressions (`l[0] %= 3`, `cfg.count += 1`).
 
+### 6.1 Precedence (lowest to highest)
+
+This is the table the compiler actually uses. It is NOT the C order: the bitwise
+operators `& | ^` bind **tighter** than `* / %` and `+ -`, and all three share one level.
+
+| Level | Operators | Notes |
+|---|---|---|
+| 1 (lowest) | `? :` | ternary, right-associative |
+| 2 | `??` | |
+| 3 | `\|\|` | |
+| 4 | `&&` | |
+| 5 | `==` `!=` | |
+| 6 | `<` `>` `<=` `>=` | |
+| 7 | `+` `-` | |
+| 8 | `*` `/` `%` | |
+| 9 | `&` `\|` `^` | all three on the SAME level, left to right |
+| 10 | unary `! ~ & * + -` | prefix, binds tighter than any binary operator |
+| 11 | `++` `--` | postfix |
+
+Member access / indexing (`a.b`, `a[i]`) and calls are handled before all operators, so
+`-a.b` is `-(a.b)`.
+
+Consequences to remember (a=3, b=5, c=2, d=7):
+
+```
+a & b | c ^ d     // 4  -> ((a & b) | c) ^ d   (C/JS/Python would give 5)
+c * a & 1         // 2  -> c * (a & 1)         (C would give 0)
+1 + c & 255       // 3  -> 1 + (c & 255)
+a & b == 1        // 1  -> (a & b) == 1        (bitwise binds tighter than ==)
+```
+
+Use parentheses when porting bit masks, colour packing or DMX/Art-Net byte maths from
+C/JS/Python — the results differ silently otherwise.
+
 NOT AVAILABLE:
 ```
 << >> <<= >>= **
+:=
 ```
+
+`:=` is not an assignment operator (it is rejected with a clear syntax error). Inside a list
+literal, `[key: value]` uses `:` as the key separator (see JSON Objects).
 
 Syntax errors (the script does not compile):
 - Leftover tokens after an expression: `std.print(1 + 2 3);`
 - A missing `;` between two statements: `x = 1` followed by `y = 2;` on the next line.
+- A member access that ends with a dangling `.`: `x.;`
+- `else if` without a `(...)` condition: `if(0){} else if std.print("b");`
+- A malformed exponent: `x = 1e;`
 
 ---
 
@@ -537,7 +578,9 @@ JSON Notation is much simpler in shizoscript.
 ```
 list = [1,2,3];
 map = [key="value"];
+map2 = [key: "value"];   // ':' works as key separator too, in every element
 complex_json = [name="Root", children=[[name="Child 1", age=24], [name="Child 2", age=22], [name="Child 3", age=20]]];
+mixed = [1 ? 2 : 3, key: 4];   // a ternary inside an element is a value, not a key
 
 //Access via
 
@@ -561,6 +604,7 @@ Member access on non-containers:
 Checklist:
 - `{}` becomes `[]`
 - Keys do not need to be escaped with quotes ("") but they are still treated like key-strings internally and do NOT refer to local variables.
+- A key separator can be `=` or `:` in any element: `[a: 1, b = 2]` is the same map. A `:` that closes a ternary `?` is never a key separator, so `[1 ? 2 : 3, 4]` is a list of two values.
 - Shizoscript JSONS do not differentiate between objects and lists syntactically. 
 - However, when converted to a string (or constructed from a string) it produces and accepts the official JSON syntax to keep compatibility.
 
@@ -588,7 +632,7 @@ import nanogui;     // load a native module
 def later(x);       // forward declaration of a function defined further down
 ```
 
-- `__FILE__`, `__LINE__`, `__DIR__` are replaced at compile time (as strings, also `__LINE__`).
+- `__FILE__` and `__DIR__` are replaced at compile time (as strings), `__LINE__` is replaced by an **integer** literal (`x = __LINE__ + 1;` gives a number, `std.type(x)` is `int`).
 
 - A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.
 - A file reached through different relative paths is included only once.
@@ -619,6 +663,16 @@ def later(x);       // forward declaration of a function defined further down
 """also
 multiline"""
 ```
+
+- Raw strings are byte-exact: `R"(a	b)"` has length 3. Only tabs used for **code
+  indentation** are expanded; tabs inside string literals (raw, normal and multiline) and
+  inside `R"delim( ... )delim"` content are kept verbatim. A raw string drops only the single
+  line break directly after `R"delim(`.
+- Escapes in normal strings: `\n \r \t \b \f \v \a \\ \" \'` and `\xHH` (1-2 hex digits).
+- `\uHHHH` needs exactly 4 hex digits, otherwise it is a syntax error. A surrogate must be
+  written as a full pair (`"\uD83D\uDE00"` -> the 4-byte UTF-8 encoding of U+1F600); a lone
+  surrogate (`"\uD83D"`) is a syntax error. Multiline strings keep their backslashes
+  verbatim (they are never unescaped).
 
 ---
 

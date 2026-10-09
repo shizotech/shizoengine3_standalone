@@ -22,7 +22,7 @@ The base generator class lives in:
 This class is a **universal wrapper** for any generator. When instantiated it:
 - Creates a nanoGUI `window` + a `matrixnode` for the generator's UI.
 - Provides the **power** button (`active_btn`, MIDI control ID `ACT`) that gates whether the generator runs.
-- Provides the **⋯ menu** (*Copy settings*, *Paste settings*, *Save preset…*, *Reload module*, *Hide header (E)*), the **link** button (*Always draw links*) and **maximize**, **collapse** and **close**.
+- Provides the **⋯ menu** (*Copy settings*, *Paste settings*, *Save preset…*, *Reload module*, *Hide header (E)*), the **collapse chevron** (top left), the **link** button (*Always draw links*) next to power, and on the right **minimize** (collapse), **maximize** and **close** in the Windows order.
 - Handles **state save/load** (`save_state` / `load_state`) including window position, size, big/collapse state, and per-generator data.
 - Detects the asset's **file extension**, then loads the matching **extension-specific loader** from `engine/generators/extensions/<ext>/__init__.shio` and calls its `load_extension(generator)` entry point.
 
@@ -52,7 +52,7 @@ Each `__init__.shio` **must** export a `load_extension(generator)` entry point t
    - With an explicit file extension (`.png`, `.txt`, `.glsl`, `.preset`, etc.) it uses that.
    - Without a file extension, it checks `path/src/__init__.shio` (=> `asset`) or `path/src/__init__.glsl` (=> `glsl`).
 3. **Loader lookup** — the class loads `engine/generators/extensions/<ext>/__init__.shio` into a `std.module()` and calls `load_extension(this)`, which populates the generator's UI and behavior.
-4. **Window wrapping** — `generatoritem.shio` wraps the generator in a movable/resizable nanoGUI window with the header controls (power, ⋯ menu, maximize/collapse/close) and full state save/load.
+4. **Window wrapping** — `generatoritem.shio` wraps the generator in a movable/resizable nanoGUI window with the header controls (chevron, power, link, ⋯ menu, minimize/maximize/close) and full state save/load.
 
 ### How to add a new generator
 
