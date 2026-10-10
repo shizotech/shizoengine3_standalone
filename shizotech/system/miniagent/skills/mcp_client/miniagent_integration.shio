@@ -1,0 +1,135 @@
+// ============================================================================
+// miniagent_integration.shio — the real miniagent loads the mcp_client skill
+//
+//   shz miniagent_integration.shio
+//
+// No LLM endpoint is contacted: this only checks that the skill is discoverable
+// through find_skill()/list_skills(), that load_skill() registers the mcp_*
+// tools in the agent toolset, and that a connection made by one skill call is
+// usable by the next (the shared registry).
+// ============================================================================
+
+#include "../../miniagent"
+#include "mcp/mcp_server"
+
+server_port = 34773;
+
+server = mcpserver("MiniagentTarget", server_port);
+if(!server.running)
+{
+	std.print("FAIL server starts -> ", server.error);
+	std.exitprocess(1);
+}
+
+server.add_tool("echo", "Echo a message", [message = "&string(): Message"],
+	[](svr, args) { return "echo:" + std.string(args.geti("message")); });
+
+std.sleep(300);
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
+
+cfg = ModelConfig();
+cfg.url = "http://localhost:1/v1";	// never contacted by this test
+cfg.name = "none";
+cfg.token = "none";
+
+agt = miniagent(cfg, "adaptive");
+
+check("agent created", agt.llm_api != None);
+
+skills = agt.list_skills();
+
+found = false;
+summary = "";
+for(i = 0; i < skills.size(); i++)
+{
+	entry = skills[i];
+	name = std.is_json(entry) ? std.string(entry.geti("name")) : std.string(entry);
+	if(name == "mcp_client")
+	{
+		found = true;
+		if(std.is_json(entry))
+			summary = std.string(entry.geti("summary"));
+	}
+}
+
+check("the skill is listed", found, skills);
+check("the skill summary is reported", summary.contains("MCP"), summary);
+
+md = agt.load_skill("mcp_client");
+
+check("load_skill returns the skill text", md.size() > 100, md.size());
+check("the skill text lists its tools", md.contains("mcp_connect") && md.contains("# Skill Tools"), md.substr(md.size() - 400));
+
+check("mcp_connect is a real agent tool", agt.llm_api.tools.tool_callbacks.has("mcp_connect"), []);
+check("mcp_expose_tools is a real agent tool", agt.llm_api.tools.tool_callbacks.has("mcp_expose_tools"), []);
+check("the tool schema reached the api body", agt.llm_api.tools.find_tool("mcp_connect").parameters.properties.name.type == "string", agt.llm_api.tools.find_tool("mcp_connect"));
+
+// Drive the tools through the toolset, like the agent loop does.
+call(name, args)
+{
+	res = None;
+	try {
+		res = agt.llm_api.tools.tool_callbacks[name](args);
+	}
+	catch(e) {
+		return [ok = false, error = std.string(e)];
+	}
+	return res;
+}
+
+r = call("mcp_connect", [name = "mini", url = "http://localhost:" + server_port + "/mcp"]);
+check("the agent connects to an MCP server", r.ok, r);
+check("the agent sees the remote tool", r.tools.size() == 1, r.tools);
+
+r = call("mcp_call_tool", [name = "mini", tool = "echo", arguments = [message = "through the agent"]]);
+check("the agent calls the remote tool", r.ok && r.result == "echo:through the agent", r);
+
+r = call("mcp_expose_tools", [name = "mini", tools = ["echo"]]);
+check("the agent exposes the remote tool", r.ok, r);
+check("the exposed tool is in the agent toolset", agt.llm_api.tools.tool_callbacks.has("mcp_mini_echo"), []);
+
+r = call("mcp_mini_echo", [message = "direct"]);
+check("the agent calls the exposed tool directly", r.ok && r.result == "echo:direct", r);
+
+r = call("mcp_servers", []);
+check("the connection survives between tool calls", r.ok && r.servers.size() == 1, r);
+
+r = call("mcp_disconnect", [name = "mini"]);
+check("the agent disconnects", r.ok, r);
+
+// A second agent shares the registry (same process).
+agt2 = miniagent(cfg, "adaptive");
+agt2.load_skill("mcp_client");
+
+r2 = agt2.llm_api.tools.tool_callbacks["mcp_connect"]([name = "shared", url = "http://localhost:" + server_port + "/mcp"]);
+check("a second agent can connect", r2.ok, r2);
+
+r = agt.llm_api.tools.tool_callbacks["mcp_servers"]([]);
+check("connections are visible across the agent tree", r.ok && r.servers.size() == 1, r);
+
+agt2.llm_api.tools.tool_callbacks["mcp_disconnect"]([name = "shared"]);
+
+server.stop();
+
+std.print("");
+std.print("MCP MINIAGENT INTEGRATION: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);

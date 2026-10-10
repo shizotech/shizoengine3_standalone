@@ -14,6 +14,25 @@ the timeline area. You design most of the screen yourself, by dropping views int
 | Generator windows | Inside the views | One window per generator, with its controls |
 | Timeline | Bottom | Tempo, play position, transport and show mode |
 
+## The program window
+
+VibeVJ runs without the frame of Windows or Linux, so it brings its own:
+
+- **The buttons** sit at the top right, on the tab bar. From left to right the window gets bigger: *Minimize*,
+  *Maximize*, *Full screen*, and *Close* in the corner.
+- **Maximize** fills the screen but leaves the taskbar free, and turns into *Restore* while the window is maximized.
+- **Full screen** (Windows and Linux): the window fills the whole monitor and covers the taskbar or panel,
+  which is what you want for a show or on a small screen. The button or **F11** switch it on, and again lead back to
+  where the window was before (maximized or its own size). *Maximize* also leads out of it.
+  - VibeVJ starts this way. On Windows you also get there by dragging a tab bar to the top of the screen, and out of it
+    by dragging a tab bar away from the top.
+  - On Linux the window manager does the full screen, so its own keys or menu for it work too, and the buttons follow.
+  - On a Wayland desktop VibeVJ runs through XWayland, and the full screen works the same way.
+- **Close** saves the project first, like *Exit*; in show mode it does nothing, so a stray click does not end the show.
+- **Move:** drag an empty part of a tab bar (the views or the sidebar). A plain click on it changes nothing.
+- **Resize:** drag the outer edge or a corner of the window (a band of 5 px; the cursor changes there). Not while it is
+  maximized or in the full screen.
+
 ## Sidebar
 
 The sidebar has five tabs.

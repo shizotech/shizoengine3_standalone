@@ -3,6 +3,11 @@
 Serve tools, resources and prompts of a shizoscript program to MCP clients
 (Claude Desktop, Claude Code, IDE agents, ...) over HTTP.
 
+> This include is the **server**. To *use* an MCP server from a shizoscript
+> program (or from the miniagent), see the client library and skill in
+> `system/miniagent/skills/mcp_client/` (`mcp_client.shio`, `mcpclient(...)`),
+> which speaks 2026-07-28, Streamable HTTP, HTTP+SSE and stdio.
+
 ```
 #include "mcp/mcp_server"
 

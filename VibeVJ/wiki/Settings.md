@@ -64,24 +64,34 @@ so they stay the same for every project. They take effect at once.
 |---|---|
 | *Accent colour* | The colour picker sets your highlight colour, used for links and selection. Violet at the start. |
 | *Reset accent colour* | Sets the accent colour back to violet. |
-| *Calm notches* | Where notches are calm: *Everywhere* (the standard) or *Clipview only*. |
+| *Calm notches* | Where free notches show their grey edge: *Everywhere* (the standard) or *Clipview only*. |
+| *Linked notches* | *Open* (the standard): a linked notch is open. *Edge only*: it stays a thin coloured edge until you hover the row. |
 
 ### Calm notches
 
-Calm notches are thin edges at rest. They open to full notches when you move the mouse over a row, while you drag a link,
-and in the cable view.
+Free notches are thin grey edges at rest in every view. A notch opens in full while the mouse is over its row, while you
+drag a link from it, and while it is linked (unless *Linked notches* is *Edge only*). The cable view does not open them.
 
 | Choice | What you see |
 |---|---|
-| *Everywhere* | Calm notches in every view. |
-| *Clipview only* | The Clipview stays calm, all other views show full notches. |
+| *Everywhere* | Free notches show a grey edge in every view. |
+| *Clipview only* | Free notches show a grey edge only in the Clipview; elsewhere they appear when you hover the row. |
 
 To change it:
 
 1. Open *Settings* › *Appearance*.
 2. Pick *Everywhere* or *Clipview only* under *Calm notches*.
 
-The cable view always shows every notch in full, whatever you pick.
+The cable view draws the cables, it does not open the notches.
+
+### Linked notches
+
+| Choice | What you see |
+|---|---|
+| *Open* | A linked notch is open at full width, so you see at once which rows are linked. |
+| *Edge only* | A linked notch is a thin coloured edge, quieter with many links. Hover the row to open it. |
+
+Show mode always shows linked notches as thin coloured edges, whatever you pick.
 
 ## View scaling with Page Up and Page Down
 

@@ -144,6 +144,14 @@ The agent does not manually manage batch parallelism or create individual `task_
 
 When one child finishes, the harness may start another pending child.
 
+## Invocation constraint
+
+`task_batch` must be called **once per turn**, and never in parallel with itself or with other tool calls.
+
+The tool already runs its children concurrently, so a second concurrent batch call multiplies the agent count and oversubscribes the scheduler.
+
+The call blocks until every matched item has reached a terminal state and then returns the aggregate result.
+
 ## Isolation
 
 A batch child normally owns only its assigned item.

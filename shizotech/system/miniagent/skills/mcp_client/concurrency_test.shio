@@ -1,0 +1,181 @@
+// ============================================================================
+// concurrency_test.shio — parallel MCP usage
+//
+//   shz concurrency_test.shio
+//
+// The agent loop runs tool callbacks on their own threads, so several agents
+// can call mcp_* tools at the same time. This starts the builtin server and
+// hammers it from parallel threads over every transport, checking that no
+// answer is lost, mixed up or corrupted.
+//
+// Prints PASS / FAIL per check, exits with code 1 on a failure.
+// ============================================================================
+
+#include "mcp_client.shio"
+#include "mcp/mcp_server"
+
+port = 34774;
+
+server = mcpserver("ConcurrencyTarget", port);
+if(!server.running)
+{
+	std.print("FAIL server starts -> ", server.error);
+	std.exitprocess(1);
+}
+
+server.add_tool("echo", "Echo a message", [message = "&string(): Message"],
+	[](svr, args) { return std.string(args.geti("message")); });
+
+server.add_tool("slow", "Sleeps a little", [ms = "int(0,500): Milliseconds"],
+	[](svr, args) {
+		std.sleep(std.int(args.geti("ms")));
+		return "slept " + std.string(args.geti("ms"));
+	});
+
+std.sleep(300);
+
+base_url = "http://localhost:" + port + "/mcp";
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Many threads, one shared connection
+// ----------------------------------------------------------------------------
+
+shared = mcp_client_connect("shared", base_url);
+check("shared connection", shared.connected, shared.error);
+
+rounds = 12;
+threads = [];
+
+ok_count = [n = 0, bad = []];
+
+worker = [shared, &ok_count](index)
+{
+	for(r = 0; r < 4; r++)
+	{
+		expect = "w" + index + "-" + r;
+		res = shared.call_tool("echo", [message = expect]);
+
+		if(res.ok && res.text == expect)
+			ok_count.n++;
+		else
+			ok_count.bad.push_back([want = expect, got = res]);
+	}
+};
+
+for(i = 0; i < rounds; i++)
+{
+	t = std.thread([worker, i]() { worker(i); });
+	threads.push_back(t);
+	t.run();
+}
+
+for(i = 0; i < threads.size(); i++)
+	threads[i].join();
+
+check("every parallel call answered correctly", ok_count.n == rounds * 4 && ok_count.bad.size() == 0, [ok = ok_count.n, bad = ok_count.bad]);
+
+// ----------------------------------------------------------------------------
+// Parallel calls on a stdio connection (one pipe, many requests)
+// ----------------------------------------------------------------------------
+
+exe = std.local_executable();
+pipe = mcp_client_connect("pipe", "", [], [exe, __DIR__ + "/stdio_test_server.shio"], "", "stdio");
+
+check("stdio connection", pipe.connected, pipe.error);
+
+pipe_ok = [n = 0, bad = []];
+
+pipe_worker = [pipe, &pipe_ok](index)
+{
+	for(r = 0; r < 3; r++)
+	{
+		res = pipe.call_tool("shout", [message = "p" + index + "-" + r]);
+		if(res.ok && res.text == ("P" + index + "-" + r).uppercase())
+			pipe_ok.n++;
+		else
+			pipe_ok.bad.push_back(res);
+	}
+};
+
+threads = [];
+for(i = 0; i < 6; i++)
+{
+	t = std.thread([pipe_worker, i]() { pipe_worker(i); });
+	threads.push_back(t);
+	t.run();
+}
+for(i = 0; i < threads.size(); i++)
+	threads[i].join();
+
+check("stdio answers stay matched under parallel load", pipe_ok.n == 18 && pipe_ok.bad.size() == 0, [ok = pipe_ok.n, bad = pipe_ok.bad]);
+
+// ----------------------------------------------------------------------------
+// Parallel connect / disconnect on the registry
+// ----------------------------------------------------------------------------
+
+race = [ok = 0, bad = []];
+
+race_worker = [base_url, &race](index)
+{
+	c = mcp_client_connect("race", base_url);
+	if(c.connected)
+	{
+		r = c.call_tool("echo", [message = "race" + index]);
+		if(r.ok && r.text == "race" + index)
+			race.ok++;
+		else
+			race.bad.push_back(r);
+	}
+	else
+		race.bad.push_back(c.error);
+};
+
+threads = [];
+for(i = 0; i < 8; i++)
+{
+	t = std.thread([race_worker, i]() { race_worker(i); });
+	threads.push_back(t);
+	t.run();
+}
+for(i = 0; i < threads.size(); i++)
+	threads[i].join();
+
+check("parallel connects to the same name share one client", race.ok == 8 && race.bad.size() == 0, race);
+race_entries = 0;
+all = mcp_client_list();
+for(i = 0; i < all.size(); i++)
+	if(all[i].name == "race")
+		race_entries++;
+
+check("the registry holds exactly one entry for that name", race_entries == 1, all);
+
+check("disconnect", mcp_client_disconnect("race"));
+check("disconnect stdio", mcp_client_disconnect("pipe"));
+check("disconnect shared", mcp_client_disconnect("shared"));
+check("registry empty", mcp_client_list().size() == 0, mcp_client_list());
+
+server.stop();
+
+std.print("");
+std.print("MCP CONCURRENCY TEST: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);

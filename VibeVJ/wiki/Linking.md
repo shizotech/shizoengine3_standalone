@@ -22,11 +22,15 @@ the options there; dragging from the right notch still links.
 
 ### Calm notches
 
-So the screen stays quiet, notches rest as thin edges: grey while free, coloured while linked. Hover a row and its notches
-open in full. In the sidebar, *Project* › *Settings* › *Appearance* › *Calm notches* chooses where this applies:
+So the screen stays quiet, free notches rest as thin grey edges. A linked notch is open; hover a row and all its notches
+open in full. In the sidebar, *Project* › *Settings* › *Appearance*:
 
-- *Everywhere* (default)
-- *Clipview only*: only the Clipview is calm; the other views show full notches.
+- *Linked notches* → *Edge only* keeps linked notches as thin coloured edges too, until you hover the row.
+- *Calm notches* chooses where the grey edges of free notches are drawn:
+
+  - *Everywhere* (default)
+  - *Clipview only*: outside the Clipview a free notch shows nothing until you hover its row; a slider then marks the
+    end of its travel with a short grey line. Linked notches show everywhere.
 
 ## Make a link
 
@@ -109,6 +113,10 @@ A greyed-out control has no grip dots on its notches and takes no links.
 
 While you drag a link, the cable view is on for the moment.
 
+To see the links of one row without the cable view, rest the mouse on its linked notch for a moment: the left notch shows
+the cables coming in, the right notch the cables going out, and the control at the other end lights up. A small number on
+the corner counts partners that are not on screen. Not in show mode.
+
 ## Show mode
 
 ![Show mode: free notches hidden, linked ones a coloured edge, no cables](media/show-mode.png)
@@ -118,6 +126,8 @@ While [show mode](Timeline.md#show-mode) is on, linking is locked:
 - Notches take no clicks and no drags. A click on the notch area reaches the control itself.
 - Hold and drag is off.
 - Free notches are hidden. Linked ones stay as a coloured edge, so you know why a value moves.
+- The rows keep less room for the notches, so the sliders get a bit longer. A short grey line marks where a slider's
+  travel ends.
 - No hover opening, no cables, no off-screen badges.
 
 Values, buttons and clips keep working.

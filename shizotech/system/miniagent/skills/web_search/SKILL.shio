@@ -1,0 +1,232 @@
+
+// ============================================================================
+// web_search skill — web search + URL fetch for the agent
+//
+// Entry point: add_tools(agt)
+//
+// Tools:
+//   web_search  - search the web, returns title / url / snippet results
+//   web_fetch   - read one url as markdown (jina reader, local fallback)
+//   web_status  - which providers work right now, and the config
+//
+// The library lives in web_client.shio and is plain shizoscript: scripts can
+// #include it and call web_search() / web_fetch() directly.
+// ============================================================================
+
+#include "web_client.shio"
+
+// Max characters of one tool result handed to the agent.
+web_skill_max_text = 20000;
+
+web_skill_cut(text, max_chars = 0)
+{
+	s = std.string(text);
+	limit = max_chars > 0 ? max_chars : web_skill_max_text;
+	if(s.size() <= limit)
+		return s;
+	return s.substr(0, limit) + "\n...[output truncated]...";
+}
+
+// The result list, compact: the agent needs title, url, snippet.
+web_skill_results(list, max_chars)
+{
+	out = [];
+	for(i = 0; i < list.size(); i++)
+	{
+		r = list[i];
+		out.push_back([
+			rank = i + 1,
+			title = r.title,
+			url = r.url,
+			snippet = web_skill_cut(r.snippet, max_chars),
+			site = r.display,
+		]);
+	}
+	return out;
+}
+
+add_tools(agt)
+{
+	// ------------------------------------------------------------------------
+	// search
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"web_search",
+		"Search the web. Returns ranked results with title, url and snippet.\n\nUse web_fetch on a result url to read the full page. DuckDuckGo is the primary provider and rate limits aggressively; the tool falls back to Bing RSS automatically and reports which provider answered.",
+		[
+			query = "&string(): The search query. Normal search operators work (site:example.com, -term, \"exact phrase\").",
+			max_results = "int(1,10): OPTIONAL Number of results to return (default 5, max 10)",
+			time_range = "enum(any,day,week,month,year): OPTIONAL Restrict results to a recent time range (default 'any')",
+			include_domains = "string(): OPTIONAL Comma separated domains to restrict results to, e.g. 'github.com,docs.python.org'",
+			exclude_domains = "string(): OPTIONAL Comma separated domains to keep out of the results",
+			region = "string(): OPTIONAL Search region code, e.g. 'us-en', 'de-de', 'wt-wt' (worldwide)",
+			page = "int(1,10): OPTIONAL Result page, for paging past the first answers (default 1)",
+			provider = "string(): OPTIONAL Force one provider: 'duckduckgo', 'bing' or 'marginalia' (default: try them in order)",
+			min_relevance = "int(0,100): OPTIONAL Percentage of results that must mention a query word before a provider is accepted (default 40; 0 accepts whatever the engine returns)",
+		],
+		[](agt, args)
+		{
+			opts = [
+				max_results = std.int(args.geti("max_results")),
+				time_range = std.string(args.geti("time_range")),
+				include_domains = std.string(args.geti("include_domains")),
+				exclude_domains = std.string(args.geti("exclude_domains")),
+				region = std.string(args.geti("region")),
+				page = std.int(args.geti("page")),
+				provider = std.string(args.geti("provider")),
+				min_relevance = std.int(args.geti("min_relevance")),
+			];
+
+			if(opts.max_results < 1)
+				opts.max_results = 5;
+			if(opts.max_results > 10)
+				opts.max_results = 10;
+
+			r = web_search(std.string(args.geti("query")), opts);
+
+			if(!r.ok)
+			{
+				return [
+					ok = false,
+					error = r.error,
+					query = r.geti("query"),
+					attempted = r.geti("attempted"),
+					hint = "The search engines rate limit and answer an anti-bot challenge page. Wait a minute and retry, narrow the query, or set provider = 'bing' (Bing RSS is not rate limited).",
+				];
+			}
+
+			res = [
+				ok = true,
+				query = r.query,
+				provider = r.provider,
+				relevance = r.relevance,
+				results = web_skill_results(r.results, 400),
+				note = "Call web_fetch with one of these urls to read the page.",
+			];
+
+			if(r.has("warning"))
+				res.warning = r.warning;
+
+			return res;
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// fetch
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"web_fetch",
+		"Fetch one URL and return its content as readable text.\n\nDefault format is markdown, fetched through the Jina reader (renders javascript, strips navigation). If the reader is unreachable the page is fetched directly and converted locally. Use format='html' for the raw source (APIs, pages you must parse yourself).",
+		[
+			url = "&string(): The http(s) URL to fetch",
+			format = "enum(markdown,text,html): OPTIONAL Output format (default 'markdown'; 'text' is plain, 'html' is the raw source)",
+			max_chars = "int(500,60000): OPTIONAL Maximum characters of content to return (default 20000)",
+			timeout = "int(1000,120000): OPTIONAL Request timeout in milliseconds (default 20000)",
+		],
+		[](agt, args)
+		{
+			max_chars = std.int(args.geti("max_chars"));
+			if(max_chars < 500)
+				max_chars = 20000;
+			if(max_chars > 60000)
+				max_chars = 60000;
+
+			timeout = std.int(args.geti("timeout"));
+
+			r = web_fetch(
+				std.string(args.geti("url")),
+				max_chars,
+				std.string(args.geti("format")),
+				timeout
+			);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, url = std.string(args.geti("url")), http_code = r.geti("http_code")];
+
+			res = [
+				ok = true,
+				url = r.url,
+				title = r.title,
+				format = r.format,
+				provider = r.provider,
+				http_code = r.http_code,
+				content_type = r.content_type,
+				content = r.content,
+			];
+
+			if(r.truncated)
+			{
+				res.truncated = 1;
+				res.total_chars = r.total;
+				res.note = "Content cut at " + std.string(max_chars) + " of " + std.string(r.total) + " characters. Raise max_chars to see more.";
+			}
+
+			if(r.warnings.size())
+				res.warnings = r.warnings;
+
+			return res;
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// status / diagnostics
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"web_status",
+		"Report which web providers are reachable right now and how the skill is configured.\nUse this when web_search or web_fetch keeps failing: it says whether you are rate limited, blocked by an anti-bot challenge, or offline.",
+		[
+			check_search = "int(0,1): OPTIONAL Also run a live search probe (default 1)",
+			check_fetch = "int(0,1): OPTIONAL Also run a live fetch probe (default 1)",
+		],
+		[](agt, args)
+		{
+			cfg = web_load_config();
+
+			info = [
+				ok = true,
+				curl = "",
+				providers = web_search_order,
+				jina_base = web_jina_base(),
+				jina_api_key = web_jina_key().size() ? "configured" : "not set (s.jina.ai search disabled)",
+				config_path = std.config_path("miniagent", "websearch"),
+				throttle_ms = web_min_interval,
+			];
+
+			try { info.curl = curl.curl().version(); } catch(e) { info.curl = "unavailable"; }
+
+			online = web_http("GET", "https://example.com", "", None, 15000);
+			info.internet = online.ok;
+			if(!online.ok)
+			{
+				info.error = "no internet: " + online.error;
+				return info;
+			}
+
+			if(args.geti("check_fetch") != "0")
+			{
+				j = web_jina_fetch("https://example.com", 20000, "markdown");
+				info.jina_reader = j.ok ? "reachable" : "unreachable: " + j.error;
+
+				d = web_http("GET", "https://example.com", "", None, 15000);
+				info.direct_fetch = d.ok ? "reachable (HTTP " + d.http_code + ")" : "unreachable: " + d.error;
+			}
+
+			if(args.geti("check_search") != "0")
+			{
+				probe = [];
+				for(i = 0; i < web_search_order.size(); i++)
+				{
+					name = std.string(web_search_order[i]);
+					s = web_search_provider(name, "shizoscript", [], 1);
+					probe.push_back([provider = name, ok = s.ok, results = s.ok ? s.results.size() : 0, error = s.geti("error")]);
+				}
+				info.search = probe;
+			}
+
+			return info;
+		}
+	);
+}

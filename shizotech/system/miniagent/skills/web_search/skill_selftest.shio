@@ -1,0 +1,257 @@
+
+// ============================================================================
+// skill_selftest.shio — self test of the web_search skill layer
+//
+//   shz skill_selftest.shio
+//
+// Loads SKILL.shio the way the miniagent does (std.module + add_tools(agt))
+// with a stub agent that mimics the miniagent API, then drives web_search,
+// web_fetch and web_status. No LLM endpoint is involved.
+// ============================================================================
+
+class stub_agent
+{
+	added_tools = [];
+	env = [];
+	calls = [];
+
+	add_tool(name, description, params, callback)
+	{
+		calls[name] = [description = description, params = params, callback = callback];
+		added_tools[name] = [description = description];
+	}
+}
+
+call_tool(agt, tool_name, args)
+{
+	if(!agt.calls.has(tool_name))
+	{
+		std.print("FAIL tool registered: ", tool_name);
+		return [];
+	}
+
+	res = None;
+	try {
+		res = agt.calls[tool_name].callback(agt, args);
+	}
+	catch(e) {
+		std.print("FAIL tool call ", tool_name, " -> ", e);
+		return [ok = false, error = std.string(e)];
+	}
+
+	return res;
+}
+
+managed agt = stub_agent();
+
+skill = std.module();
+skill.load_file(__DIR__ + "/SKILL.shio");
+
+if(!skill.has("add_tools"))
+{
+	std.print("FAIL SKILL.shio exposes add_tools");
+	std.exitprocess(1);
+}
+
+skill.call("add_tools", agt);
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
+
+// ----------------------------------------------------------------------------
+// registration
+// ----------------------------------------------------------------------------
+
+expected = ["web_search", "web_fetch", "web_status"];
+
+for(i = 0; i < expected.size(); i++)
+	check("registers " + expected[i], agt.calls.has(expected[i]));
+
+check("every tool has a description", agt.added_tools.size() == expected.size(), agt.added_tools.size());
+
+for(i = 0; i < expected.size(); i++)
+{
+	name = expected[i];
+	if(!agt.calls.has(name))
+		continue;
+	c = agt.calls[name];
+	check(name + " has a description", c.description.size() > 20, c.description);
+	check(name + " has params", std.is_json(c.params) && c.params.size() > 0, c.params);
+}
+
+check("web_search requires query", agt.calls.web_search.params.has("query") && agt.calls.web_search.params.query.find("&string()") == 0, agt.calls.web_search.params);
+check("web_fetch requires url", agt.calls.web_fetch.params.has("url") && agt.calls.web_fetch.params.url.find("&string()") == 0, agt.calls.web_fetch.params);
+check("web_search format is not on search", !agt.calls.web_search.params.has("format"));
+check("web_fetch has format", agt.calls.web_fetch.params.has("format"), agt.calls.web_fetch.params);
+
+// ----------------------------------------------------------------------------
+// web_fetch
+// ----------------------------------------------------------------------------
+
+f = call_tool(agt, "web_fetch", [url = "https://example.com"]);
+check("web_fetch example.com", f.ok, f);
+check("web_fetch returns content", f.content.size() > 20, f.content);
+check("web_fetch reports a provider", f.provider == "jina" || f.provider == "direct", f.provider);
+check("web_fetch reports http_code", f.http_code == 200, f.http_code);
+
+md = call_tool(agt, "web_fetch", [url = "https://en.wikipedia.org/wiki/DuckDuckGo", max_chars = 3000]);
+check("web_fetch markdown article", md.ok && md.content.size() > 500, md.content.size());
+check("web_fetch title", md.title.contains("DuckDuckGo"), md.title);
+
+raw = call_tool(agt, "web_fetch", [url = "https://example.com", format = "html"]);
+check("web_fetch html format", raw.ok && raw.content.contains("<html"), raw.content.substr(0, 60));
+check("web_fetch html provider", raw.provider == "direct", raw.provider);
+
+txt = call_tool(agt, "web_fetch", [url = "https://example.com", format = "text"]);
+check("web_fetch text format", txt.ok && txt.content.contains("domain"), txt.content.substr(0, 100));
+
+cut = call_tool(agt, "web_fetch", [url = "https://en.wikipedia.org/wiki/DuckDuckGo", max_chars = 500]);
+check("web_fetch truncates with a note", cut.ok && cut.truncated == 1 && cut.total_chars > 500 && cut.note.size() > 0, [c = cut.content.size(), total = cut.geti("total_chars")]);
+check("web_fetch respects max_chars", cut.content.size() <= 500, cut.content.size());
+
+bad = call_tool(agt, "web_fetch", [url = "ftp://example.com"]);
+check("web_fetch rejects non http", !bad.ok && bad.error.size() > 0, bad);
+
+empty = call_tool(agt, "web_fetch", [url = ""]);
+check("web_fetch rejects empty url", !empty.ok, empty);
+
+dead = call_tool(agt, "web_fetch", [url = "http://no-such-host.invalid/x"]);
+check("web_fetch dead host is ok=false", !dead.ok && dead.error.size() > 0, dead);
+
+notfound = call_tool(agt, "web_fetch", [url = "https://example.com/nope-404", format = "html"]);
+check("web_fetch 404 is ok=false", !notfound.ok && notfound.http_code == 404, notfound);
+
+bare = call_tool(agt, "web_fetch", [url = "example.com", format = "html"]);
+check("web_fetch adds a missing scheme", bare.ok, bare);
+
+jsonurl = call_tool(agt, "web_fetch", [url = "https://httpbin.org/json", format = "html"]);
+check("web_fetch passes non html through", !jsonurl.ok || jsonurl.content.contains("{"), jsonurl.content.substr(0, 80));
+
+// ----------------------------------------------------------------------------
+// web_search
+// ----------------------------------------------------------------------------
+
+s = call_tool(agt, "web_search", [query = "shizoscript programming language"]);
+check("web_search answers", s.ok, s);
+
+if(s.ok)
+{
+	check("web_search returns results", s.results.size() >= 3, s.results.size());
+	check("web_search names the provider", s.provider.size() > 0, s.provider);
+	check("web_search echoes the query", s.query.contains("shizoscript"), s.query);
+
+	r0 = s.results[0];
+	check("result has rank", r0.rank == 1, r0.rank);
+	check("result has title", r0.title.size() > 3, r0.title);
+	check("result has url", r0.url.find("http") == 0, r0.url);
+	check("result url is not a proxy", !r0.url.contains("uddg=") && !r0.url.contains("/ck/a"), r0.url);
+	check("result has site", r0.site.size() > 2, r0.site);
+	check("result snippet is short", r0.snippet.size() <= 410, r0.snippet.size());
+
+	uniq = [];
+	for(i = 0; i < s.results.size(); i++)
+		uniq[s.results[i].url] = 1;
+	check("results are unique", uniq.size() == s.results.size(), [n = s.results.size(), u = uniq.size()]);
+}
+
+one = call_tool(agt, "web_search", [query = "shizoscript", max_results = 1]);
+check("web_search respects max_results", one.ok && one.results.size() <= 1, one.results.size());
+
+ten = call_tool(agt, "web_search", [query = "shizoscript", max_results = 99]);
+check("max_results is clamped to 10", ten.ok && ten.results.size() <= 10, ten.results.size());
+
+qe = call_tool(agt, "web_search", [query = "   "]);
+check("empty query is ok=false", !qe.ok && qe.error.size() > 0, qe);
+
+site = call_tool(agt, "web_search", [query = "shizoscript", include_domains = "github.com"]);
+if(site.ok && !site.geti("warning").size())
+{
+	only = true;
+	for(i = 0; i < site.results.size(); i++)
+		if(!site.results[i].url.contains("github.com")) only = false;
+	check("include_domains restricts results", site.results.size() > 0 && only, site.results);
+}
+else
+	check("include_domains: guard rejects off-topic answers", site.geti("warning").size() > 0 || !site.ok, site);
+
+exc = call_tool(agt, "web_search", [query = "shizoscript", exclude_domains = "github.com"]);
+if(exc.ok && !exc.geti("warning").size())
+{
+	none = true;
+	for(i = 0; i < exc.results.size(); i++)
+		if(exc.results[i].url.contains("github.com")) none = false;
+	check("exclude_domains drops results", exc.results.size() > 0 && none, exc.results);
+}
+else
+	check("exclude_domains: guard rejects off-topic answers", exc.geti("warning").size() > 0 || !exc.ok, exc);
+
+prov = call_tool(agt, "web_search", [query = "shizoscript", provider = "bing"]);
+check("provider=bing works", prov.ok && prov.results.size() > 0, prov);
+
+unknown = call_tool(agt, "web_search", [query = "shizoscript", provider = "nosuchprovider"]);
+check("an unknown provider is ok=false with a hint", !unknown.ok && unknown.hint.size() > 0, unknown);
+
+timed = call_tool(agt, "web_search", [query = "shizoscript", time_range = "month"]);
+	check("time_range is accepted", timed.ok, timed);
+
+	check("search reports relevance", s.has("relevance"), s);
+
+	// bing answers niche queries with generic localized junk; the skill must
+	// label that instead of presenting it as a normal answer
+	niche = call_tool(agt, "web_search", [query = "shizoscript", provider = "bing", min_relevance = 100]);
+	check("low relevance is labelled",
+		!niche.ok || niche.relevance < 100 || niche.geti("warning").size() > 0,
+		[rel = niche.geti("relevance"), w = niche.geti("warning")]);
+
+	any_ok = call_tool(agt, "web_search", [query = "shizoscript", provider = "bing", min_relevance = 0]);
+	check("min_relevance=0 accepts any answer", any_ok.ok && any_ok.results.size() > 0, any_ok);
+
+paged1 = call_tool(agt, "web_search", [query = "shizoscript", max_results = 5]);
+paged2 = call_tool(agt, "web_search", [query = "shizoscript", max_results = 5, page = 2]);
+check("page 2 answers", paged2.ok, paged2);
+if(paged1.ok && paged2.ok && paged1.results.size() && paged2.results.size())
+{
+	overlap = 0;
+	for(i = 0; i < paged1.results.size(); i++)
+		for(k = 0; k < paged2.results.size(); k++)
+			if(paged1.results[i].url == paged2.results[k].url) overlap++;
+	check("page 2 is not page 1", overlap < paged1.results.size(), overlap);
+}
+
+// ----------------------------------------------------------------------------
+// web_status
+// ----------------------------------------------------------------------------
+
+st = call_tool(agt, "web_status", []);
+check("web_status answers", st.ok, st);
+check("web_status reports curl", st.curl.contains("libcurl"), st.curl);
+check("web_status reports internet", st.internet == 1, st.internet);
+check("web_status reports jina", st.jina_reader.contains("reachable"), st.jina_reader);
+check("web_status reports direct fetch", st.direct_fetch.contains("reachable"), st.direct_fetch);
+check("web_status probes search", std.is_list(st.search) && st.search.size() >= 2, st.search);
+check("web_status reports the config path", st.config_path.contains("websearch"), st.config_path);
+check("web_status reports the key state", st.jina_api_key.contains("not set") || st.jina_api_key.contains("configured"), st.jina_api_key);
+
+light = call_tool(agt, "web_status", [check_search = "0", check_fetch = "0"]);
+check("web_status can skip the probes", light.ok && !light.has("search"), light);
+
+std.print("");
+std.print("WEB SKILL SELFTEST: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);

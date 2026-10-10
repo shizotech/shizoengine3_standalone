@@ -1,0 +1,1462 @@
+// ============================================================================
+// mcp_client.shio — MCP client library (the client side of includes/mcp)
+//
+//   #include "mcp_client.shio"
+//
+//   c = mcpclient("files", "http://localhost:13338/mcp");
+//   if(c.connected) {
+//       std.print(c.server_info);
+//       r = c.call_tool("echo", [message = "hi"]);
+//   }
+//   c.close();
+//
+// The builtin include (includes/mcp) is the *server*; this is the *client*.
+// It speaks every protocol the server include implements, and the transports
+// real world MCP servers use:
+//
+//   transport   handshake                                   requests
+//   ----------- ------------------------------------------- ----------------
+//   "2026"      server/discover (no session)                POST, every
+//                                                             request carries
+//                                                             MCP-Protocol-Version
+//                                                             Mcp-Method / Mcp-Name
+//   "http"      initialize                                  POST /mcp (Streamable
+//                  (2024-11-05 ... 2025-11-25)              HTTP, no session id)
+//   "sse"       GET /sse event stream (endpoint event)      POST /mcp?sessionid=
+//                                                             responses arrive on
+//                                                             the stream
+//   "stdio"     initialize over the process pipes           one JSON per line on
+//                  (newline delimited JSON-RPC)             stdin, answers on
+//                                                             stdout
+//
+// connect() picks the transport: "auto" tries 2026, then Streamable HTTP, then
+// the SSE event stream. A url starting with http:// or https:// is HTTP, a
+// command list is stdio.
+//
+// Every method returns [ok = ..., result = ..., error = ...]; a JSON-RPC error
+// is a normal result with ok = false and error = [code, message], it never
+// throws.
+// ============================================================================
+
+import curl;
+import subprocess;
+
+// Protocol versions (prefixed so they never clash with the mcp include)
+MCP_CLIENT_PROTOCOL_2026 = "2026-07-28";
+MCP_CLIENT_PROTOCOL_2025 = "2025-11-25";
+MCP_CLIENT_PROTOCOL_2024 = "2024-11-05";
+
+// Versions the initialize based protocol accepts, newest first.
+MCP_CLIENT_VERSIONS_2025 = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+// How long a single request may take.
+MCP_CLIENT_REQUEST_TIMEOUT_MS = 20000;
+// How long an SSE event stream stays open (the transfer is re-opened on demand).
+MCP_CLIENT_SSE_TIMEOUT_MS = 300000;
+// How long a stdio server may take to answer one request.
+MCP_CLIENT_STDIO_TIMEOUT_MS = 30000;
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+// Accept a json, a json string, or None.
+mcp_client_json(value)
+{
+	if(std.is_none(value))
+		return [];
+
+	if(std.is_json(value))
+		return value;
+
+	if(std.is_string(value))
+	{
+		parsed = None;
+		try {
+			parsed = std.json(value);
+		}
+		catch(e) {
+			parsed = None;
+		}
+		if(std.is_json(parsed))
+			return parsed;
+	}
+
+	return [];
+}
+
+// The JSON-RPC message inside an HTTP body: Streamable HTTP servers may answer
+// with a plain json, with an SSE framed body ("event: message\ndata: {...}")
+// or with a stream of events. Returns the last data payload, or the body.
+mcp_client_body_json(body)
+{
+	if(!body)
+		return "";
+
+	if(body.find("data:") < 0)
+		return body;
+
+	last = "";
+	lines = body.split("\n");
+	for(i = 0; i < lines.size(); i++)
+	{
+		line = lines[i].strip();
+		if(line.starts("data:"))
+			last = line.removeprefix("data:").ltrim();
+	}
+
+	if(last)
+		return last;
+
+	return body;
+}
+
+// Parse an HTTP body into a json (None when it is not json).
+mcp_client_parse(body)
+{
+	payload = mcp_client_body_json(body);
+	if(!payload)
+		return None;
+
+	parsed = None;
+	try {
+		parsed = std.json(payload);
+	}
+	catch(e) {
+		parsed = None;
+	}
+
+	if(!std.is_json(parsed) || parsed.size() == 0)
+		return None;
+
+	return parsed;
+}
+
+mcp_client_ok(result)
+{
+	return [ok = true, result = result, error = None];
+}
+
+mcp_client_err(message, code = 0, data = None)
+{
+	err = [message = message];
+	if(code)
+		err.code = code;
+	if(data)
+		err.data = data;
+	return [ok = false, result = None, error = err];
+}
+
+// Flatten the content blocks of a tools/call result into text.
+// Images and audio are reported as placeholders (the agent gets them through
+// inject_visual_prompt when it asks for one).
+mcp_client_content_text(result)
+{
+	text = "";
+
+	if(!std.is_json(result))
+		return std.string(result);
+
+	if(!result.has("content"))
+		return std.string(result);
+
+	content = result.content;
+
+	if(!std.is_json(content))
+		return std.string(content);
+
+	for(i = 0; i < content.size(); i++)
+	{
+		part = content[i];
+
+		if(!std.is_json(part))
+		{
+			text += std.string(part) + "\n";
+			continue;
+		}
+
+		kind = std.string(part.geti("type"));
+
+		if(kind == "text")
+			text += std.string(part.geti("text")) + "\n";
+		else if(kind == "image" || kind == "audio")
+		{
+			data = part.geti("data");
+			size = std.is_string(data) ? data.size() : 0;
+			text += "[" + kind + " " + std.string(part.geti("mimeType")) + " " + size + " bytes base64]\n";
+		}
+		else if(kind == "resource")
+		{
+			inner = part.geti("resource");
+			if(std.is_json(inner))
+				text += std.string(inner.geti("text")) + "\n";
+			else
+				text += part.compact_string() + "\n";
+		}
+		else
+			text += part.compact_string() + "\n";
+	}
+
+	if(result.has("structuredContent"))
+		text += "structuredContent: " + result.structuredContent.compact_string() + "\n";
+
+	return text.strip();
+}
+
+// The image/audio blocks of a tools/call result: [[type, mimeType, data], ...]
+mcp_client_content_images(result)
+{
+	images = [];
+
+	if(!std.is_json(result) || !result.has("content"))
+		return images;
+
+	content = result.content;
+
+	if(!std.is_json(content))
+		return images;
+
+	for(i = 0; i < content.size(); i++)
+	{
+		part = content[i];
+
+		if(!std.is_json(part))
+			continue;
+
+		kind = std.string(part.geti("type"));
+
+		if(kind != "image" && kind != "audio")
+			continue;
+
+		data = part.geti("data");
+		if(!std.is_string(data))
+			continue;
+
+		images.push_back([type = kind, mimeType = std.string(part.geti("mimeType")), data = data]);
+	}
+
+	return images;
+}
+
+// ============================================================================
+// MCP inputSchema -> the simple_json parameter notation of the openai include
+//
+// Lets a remote MCP tool become an ordinary agent tool.
+// ============================================================================
+
+mcp_schema_params(schema)
+{
+	params = [];
+
+	if(!std.is_json(schema) || !schema.has("properties"))
+		return params;
+
+	required = schema.geti("required");
+
+	for(i = 0; i < schema.properties.size(); i++)
+	{
+		key = schema.properties.key(i);
+		prop = schema.properties[key];
+
+		is_required = std.is_json(required) && required.has_value(key);
+
+		prefix = is_required ? "&" : "";
+
+		desc = std.string(prop.geti("description"));
+
+		kind = std.string(prop.geti("type"));
+
+		if(prop.has("enum"))
+		{
+			values = [];
+			for(j = 0; j < prop.enum.size(); j++)
+				values.push_back(std.string(prop.enum[j]));
+			params[key] = prefix + "enum(" + values.combine_string(",") + "): " + desc;
+			continue;
+		}
+
+		if(kind == "string")
+		{
+			min_len = prop.has("minLength") ? std.string(prop.minLength) : "";
+			max_len = prop.has("maxLength") ? std.string(prop.maxLength) : "";
+			params[key] = prefix + "string(" + min_len + (max_len ? "," + max_len : "") + "): " + desc;
+			continue;
+		}
+
+		if(kind == "integer")
+		{
+			min_v = prop.has("minimum") ? std.string(prop.minimum) : "";
+			max_v = prop.has("maximum") ? std.string(prop.maximum) : "";
+			params[key] = prefix + "int(" + min_v + (max_v ? "," + max_v : "") + "): " + desc;
+			continue;
+		}
+
+		if(kind == "number")
+		{
+			min_v = prop.has("minimum") ? std.string(prop.minimum) : "";
+			max_v = prop.has("maximum") ? std.string(prop.maximum) : "";
+			params[key] = prefix + "float(" + min_v + (max_v ? "," + max_v : "") + "): " + desc;
+			continue;
+		}
+
+		if(kind == "array")
+		{
+			item_type = std.string(prop.geti("items").geti("type"));
+			if(!item_type)
+				item_type = "string";
+			params[key] = prefix + "array(" + item_type + "): " + desc;
+			continue;
+		}
+
+		if(kind == "object")
+		{
+			// nested object: the notation of the openai include nests jsons
+			params[key] = mcp_schema_params(prop);
+			continue;
+		}
+
+		params[key] = prefix + "any(): " + desc;
+	}
+
+	return params;
+}
+
+// ----------------------------------------------------------------------------
+// The client
+// ----------------------------------------------------------------------------
+
+class mcp_client
+{
+	name = "";
+
+	// HTTP
+	url = "";			// endpoint of the server, e.g. http://host:port/mcp
+	headers = [];		// extra request headers (Authorization, ...)
+
+	// stdio
+	argv = [];			// command + arguments of the server process
+	cwd = "";
+
+	transport = "";		// "2026" | "http" | "sse" | "stdio" ("" until connected)
+	connected = false;
+	// true while mcp_client_connect() runs the handshake of this client
+	connecting = false;
+	error = "";
+
+	// What the server told us
+	protocol_version = "";
+	server_info = [];
+	capabilities = [];
+	instructions = "";
+
+	// Cached lists
+	tools = [];
+	resources = [];
+	prompts = [];
+
+	request_id = 0;
+	notifications = 0;
+
+	timeout_ms = MCP_CLIENT_REQUEST_TIMEOUT_MS;
+	stdio_timeout_ms = MCP_CLIENT_STDIO_TIMEOUT_MS;
+	sse_timeout_ms = MCP_CLIENT_SSE_TIMEOUT_MS;
+	verbose = false;
+
+	// agent tool name -> remote tool name (set by the skill when it exposes tools)
+	exposed = [];
+
+	managed http = None;
+	managed stream = None;
+	managed proc = None;
+
+	sse_endpoint = "";	// path the stream sent for POSTs (/mcp?sessionid=...)
+	sse_post_url = "";
+	sse_buffer = "";
+	sse_open = false;
+
+	__init__(name, url = "", headers = [], argv = [], cwd = "")
+	{
+		this.name = name;
+		this.url = url;
+		this.cwd = cwd;
+
+		// Every instance gets its own containers.
+		this.headers = mcp_client_json(headers).copy();
+		this.argv = [];
+		tools = [];
+		resources = [];
+		prompts = [];
+		exposed = [];
+		server_info = [];
+		capabilities = [];
+
+		for(i = 0; i < argv.size(); i++)
+			this.argv.push_back(std.string(argv[i]));
+
+		request_id = 0;
+		notifications = 0;
+
+		http = curl.curl();
+	}
+
+	__deinit__()
+	{
+		close();
+	}
+
+	log(txt)
+	{
+		if(verbose)
+			std.print("MCP client [", name, "] ", txt);
+	}
+
+	// ========================================================================
+	// Connection
+	// ========================================================================
+
+	// transport: "auto" (default) | "2026" | "http" | "sse" | "stdio"
+	connect(transport = "auto")
+	{
+		if(connected)
+			return true;
+
+		error = "";
+
+		if(argv.size() && transport != "http" && transport != "sse" && transport != "2026")
+			return connect_stdio();
+
+		if(!url)
+		{
+			error = "No url and no command given.";
+			return false;
+		}
+
+		if(transport == "auto")
+		{
+			if(connect_2026())
+				return true;
+			if(connect_http())
+				return true;
+			if(connect_sse())
+				return true;
+
+			// Keep the reason of the last attempt, it is the most specific one.
+			if(!error)
+				error = "The server answered nothing useful on " + url + ".";
+
+			return false;
+		}
+
+		if(transport == "2026")
+			return connect_2026();
+		if(transport == "http")
+			return connect_http();
+		if(transport == "sse")
+			return connect_sse();
+
+		error = "Unknown transport: " + transport;
+		return false;
+	}
+
+	// 2026-07-28: stateless, no handshake
+	connect_2026()
+	{
+		transport = "2026";
+		protocol_version = MCP_CLIENT_PROTOCOL_2026;
+
+		res = rpc("server/discover", []);
+
+		if(!res.ok)
+		{
+			transport = "";
+			error = res.ok ? "" : std.string(res.error.message);
+			return false;
+		}
+
+		apply_initialize_result(res.result);
+		connected = true;
+
+		log("connected (2026 stateless) to " + url);
+		refresh();
+
+		return true;
+	}
+
+	// 2025 Streamable HTTP without a session id.
+	//
+	// The curl module does not expose response headers, so an Mcp-Session-Id
+	// handed out by the server cannot be read back. Servers that require the
+	// session id answer 404 to the ping below, connect() then falls back to
+	// the SSE transport, which receives its session id inside the stream.
+	connect_http()
+	{
+		transport = "http";
+		protocol_version = MCP_CLIENT_PROTOCOL_2025;
+
+		res = rpc("initialize", initialize_params());
+
+		if(!res.ok)
+		{
+			transport = "";
+			error = std.string(res.error.message);
+			return false;
+		}
+
+		apply_initialize_result(res.result);
+
+		probe = rpc("ping", []);
+		if(!probe.ok && std.string(probe.error.message).contains("session"))
+		{
+			transport = "";
+			error = "The server requires an Mcp-Session-Id, which this client cannot read from HTTP headers: " + std.string(probe.error.message);
+			return false;
+		}
+
+		notify("notifications/initialized", []);
+
+		connected = true;
+
+		log("connected (streamable http) to " + url);
+		refresh();
+
+		return true;
+	}
+
+	// Legacy HTTP+SSE: the stream sends "event: endpoint" with the POST url.
+	connect_sse()
+	{
+		transport = "sse";
+		protocol_version = MCP_CLIENT_PROTOCOL_2024;
+
+		if(!open_sse())
+		{
+			transport = "";
+			return false;
+		}
+
+		res = rpc("initialize", initialize_params());
+
+		if(!res.ok)
+		{
+			close_stream();
+			transport = "";
+			error = std.string(res.error.message);
+			return false;
+		}
+
+		apply_initialize_result(res.result);
+		notify("notifications/initialized", []);
+
+		connected = true;
+
+		log("connected (http+sse) to " + url);
+		refresh();
+
+		return true;
+	}
+
+	connect_stdio()
+	{
+		transport = "stdio";
+		protocol_version = MCP_CLIENT_PROTOCOL_2025;
+
+		proc = subprocess.process();
+		proc.terminate_on_destroy(true);
+		proc.pipes(true, true, true);
+
+		started = false;
+		try {
+			proc.start(argv, cwd, false);
+			started = proc.status().started;
+		}
+		catch(e) {
+			error = "Cannot start the server process: " + e;
+			return false;
+		}
+
+		if(!started)
+		{
+			error = "Cannot start the server process: " + std.string(argv);
+			return false;
+		}
+
+		res = rpc("initialize", initialize_params());
+
+		if(!res.ok)
+		{
+			error = std.string(res.error.message);
+			close();
+			return false;
+		}
+
+		apply_initialize_result(res.result);
+		notify("notifications/initialized", []);
+
+		connected = true;
+
+		log("connected (stdio) pid " + proc.pid());
+		refresh();
+
+		return true;
+	}
+
+	initialize_params()
+	{
+		return [
+			protocolVersion = MCP_CLIENT_PROTOCOL_2025,
+			clientInfo = [name = "miniagent-mcp-client", version = "1.0.0"],
+			capabilities = [
+				roots = [listChanged = json.bool(true)],
+				sampling = [],
+				elicitation = [],
+			],
+		];
+	}
+
+	apply_initialize_result(result)
+	{
+		if(!std.is_json(result))
+			return;
+
+		if(result.has("protocolVersion"))
+			protocol_version = std.string(result.protocolVersion);
+
+		if(result.has("serverInfo"))
+			server_info = result.serverInfo;
+
+		if(result.has("capabilities"))
+			capabilities = result.capabilities;
+
+		if(result.has("instructions"))
+			instructions = std.string(result.instructions);
+
+		if(result.has("supportedVersions"))
+			protocol_version = std.string(result.supportedVersions[0]);
+	}
+
+	close()
+	{
+		if(transport == "http" && connected)
+		{
+			// Streamable HTTP: end the session politely (best effort).
+			http.request("DELETE", url, "", request_headers([]), 5000, false);
+		}
+
+		close_stream();
+
+		if(proc)
+		{
+			try {
+				proc.close_stdin();
+				proc.terminate();
+			}
+			catch(e) {}
+
+			std.free(proc);
+			proc = None;
+		}
+
+		// The curl handle stays alive: the client can connect() again.
+		connected = false;
+		connecting = false;
+		transport = "";
+	}
+
+	close_stream()
+	{
+		if(stream)
+		{
+			try {
+				stream.stop_stream();
+			}
+			catch(e) {}
+
+			std.free(stream);
+			stream = None;
+		}
+
+		sse_open = false;
+		sse_endpoint = "";
+		sse_post_url = "";
+		sse_buffer = "";
+	}
+
+	// ========================================================================
+	// Transport plumbing
+	// ========================================================================
+
+	// Headers of one request. method / tool name drive the 2026 headers.
+	request_headers(headers_2026)
+	{
+		h = [
+			"Content-Type" = "application/json",
+			"Accept" = "application/json, text/event-stream",
+		];
+
+		for(i = 0; i < headers.size(); i++)
+			h[headers.key(i)] = std.string(headers[headers.key(i)]);
+
+		if(transport == "2026")
+		{
+			h["MCP-Protocol-Version"] = MCP_CLIENT_PROTOCOL_2026;
+
+			if(std.is_json(headers_2026))
+			{
+				if(headers_2026.has("method"))
+					h["Mcp-Method"] = std.string(headers_2026.method);
+				if(headers_2026.has("name"))
+					h["Mcp-Name"] = std.string(headers_2026.name);
+			}
+		}
+		else if(transport == "http")
+		{
+			h["MCP-Protocol-Version"] = protocol_version ? protocol_version : MCP_CLIENT_PROTOCOL_2025;
+		}
+
+		return h;
+	}
+
+	// One JSON-RPC request. Returns [ok, result, error].
+	rpc(method, params, name_header = "")
+	{
+		if(transport == "")
+			return mcp_client_err("Not connected." + (error ? " " + error : ""));
+
+		request_id++;
+
+		req = [
+			jsonrpc = "2.0",
+			id = request_id,
+			method = method,
+		];
+
+		req.params = mcp_client_json(params);
+
+		body = req.compact_string();
+
+		if(transport == "stdio")
+			return stdio_request(body, request_id);
+
+		if(transport == "sse")
+			return sse_request(body, request_id);
+
+		h26 = [];
+		h26.method = method;
+		if(name_header)
+			h26.name = name_header;
+
+		resp = None;
+
+		try {
+			resp = http.post(url, body, request_headers(h26), timeout_ms);
+		}
+		catch(e) {
+			return mcp_client_err("Request failed: " + e);
+		}
+
+		if(!std.is_json(resp))
+			return mcp_client_err("The request returned nothing.");
+
+		if(!resp.ok)
+			return mcp_client_err(std.string(resp.geti("error")) ? std.string(resp.geti("error")) : "HTTP request failed.", resp.geti("code"));
+
+		code = resp.geti("http_code");
+
+		if(code == 404)
+			return mcp_client_err("Unknown session (404) from " + url + ".", 404);
+
+		if(code >= 400)
+			return mcp_client_err("HTTP " + code + " from " + url + ": " + std.string(resp.geti("body")), code);
+
+		parsed = mcp_client_parse(resp.geti("body"));
+
+		if(!parsed)
+			return mcp_client_err("The answer of " + url + " is not a JSON-RPC message: " + std.string(resp.geti("body")).substr(0, 400));
+
+		if(parsed.has("error"))
+			return mcp_client_err(std.string(parsed.error.geti("message")), parsed.error.geti("code"), parsed.error.geti("data"));
+
+		return mcp_client_ok(parsed.geti("result"));
+	}
+
+	// A notification (no id, no answer expected).
+	notify(method, params)
+	{
+		notif = [jsonrpc = "2.0", method = method];
+		notif.params = mcp_client_json(params);
+
+		body = notif.compact_string();
+		notifications++;
+
+		if(transport == "stdio")
+			return write_stdio_line(body);
+
+		if(transport == "sse")
+		{
+			resp = http.post(sse_post_url, body, request_headers([]), timeout_ms);
+			return std.is_json(resp) && resp.ok;
+		}
+
+		h26 = [];
+		h26.method = method;
+
+		resp = http.post(url, body, request_headers(h26), timeout_ms);
+
+		return std.is_json(resp) && resp.ok;
+	}
+
+	// ----------------------------------------------------------------------------
+	// stdio
+	// ----------------------------------------------------------------------------
+
+	write_stdio_line(line)
+	{
+		if(!proc)
+			return false;
+
+		written = 0;
+
+		try {
+			written = proc.write(line + "\n");
+		}
+		catch(e) {
+			log("stdio write failed: " + e);
+			return false;
+		}
+
+		return written > 0;
+	}
+
+	stdio_request(body, id)
+	{
+		if(!proc)
+			return mcp_client_err("The stdio server process is not running.");
+
+		if(!proc.running())
+			return mcp_client_err("The stdio server process exited (returncode " + std.string(proc.returncode()) + ").");
+
+		// One request, one answer: the pipes are a single shared channel, so a
+		// concurrent request from another thread must not slip in between.
+		managed io_lock = std.critical_section_named("mcp_client_stdio_" + name);
+
+		if(!write_stdio_line(body))
+			return mcp_client_err("Cannot write to the stdin of the stdio server.");
+
+		deadline = std.millis() + stdio_timeout_ms;
+
+		for(std.millis() < deadline)
+		{
+			line = "";
+
+			try {
+				line = proc.read_line("stdout", 1000);
+			}
+			catch(e) {
+				return mcp_client_err("Cannot read from the stdio server: " + e);
+			}
+
+			if(!line)
+			{
+				if(!proc.running())
+					return mcp_client_err("The stdio server exited while answering (returncode " + std.string(proc.returncode()) + ").");
+				continue;
+			}
+
+			parsed = mcp_client_parse(line);
+
+			if(!parsed)
+				continue;	// log noise on stdout, the spec says to ignore it
+
+			if(parsed.has("method") && !parsed.has("result") && !parsed.has("error"))
+			{
+				// A server request (ping, sampling, roots/list, ...): answer it.
+				answer_server_request(parsed);
+				continue;
+			}
+
+			if(parsed.has("id") && std.string(parsed.geti("id")) != std.string(id))
+				continue;
+
+			if(parsed.has("error"))
+				return mcp_client_err(std.string(parsed.error.geti("message")), parsed.error.geti("code"), parsed.error.geti("data"));
+
+			return mcp_client_ok(parsed.geti("result"));
+		}
+
+		return mcp_client_err("The stdio server did not answer within " + stdio_timeout_ms + " ms.");
+	}
+
+	// Servers may send requests of their own. Answer the ones that are safe to
+	// answer so the server does not block.
+	answer_server_request(req)
+	{
+		method = std.string(req.geti("method"));
+		id = req.geti("id");
+
+		if(std.is_none(id))
+			return;
+
+		result = [];
+
+		if(method == "ping")
+			result = [];
+		else if(method == "roots/list")
+			result = [roots = []];
+		else
+		{
+			reply = [
+				jsonrpc = "2.0",
+				id = id,
+				error = [code = -32601, message = "Method not supported by the miniagent MCP client: " + method],
+			];
+			write_stdio_line(reply.compact_string());
+			return;
+		}
+
+		reply = [jsonrpc = "2.0", id = id, result = result];
+		write_stdio_line(reply.compact_string());
+	}
+
+	// ----------------------------------------------------------------------------
+	// HTTP+SSE
+	// ----------------------------------------------------------------------------
+
+	open_sse()
+	{
+		sse_url = url;
+
+		// /mcp -> /sse (the legacy stream of the same server)
+		if(sse_url.ends("/mcp"))
+			sse_url = sse_url.removesuffix("/mcp") + "/sse";
+		else if(!sse_url.ends("/sse"))
+			sse_url = sse_url + "/sse";
+
+		stream = curl.curl();
+
+		h = [
+			"Accept" = "text/event-stream",
+			"Cache-Control" = "no-cache",
+		];
+
+		for(i = 0; i < headers.size(); i++)
+			h[headers.key(i)] = std.string(headers[headers.key(i)]);
+
+		try {
+			stream.start_stream("GET", sse_url, None, h, sse_timeout_ms);
+		}
+		catch(e) {
+			error = "Cannot open the SSE stream " + sse_url + ": " + e;
+			close_stream();
+			return false;
+		}
+
+		// The first event names the endpoint that receives the POSTs.
+		deadline = std.millis() + math.max(5000, timeout_ms);
+
+		for(std.millis() < deadline)
+		{
+			chunk = None;
+
+			try {
+				chunk = stream.poll_stream();
+			}
+			catch(e) {
+				chunk = None;
+			}
+
+			if(std.is_none(chunk))
+			{
+				if(!sse_buffer.empty())
+					break;
+				error = "The SSE stream " + sse_url + " sent nothing.";
+				close_stream();
+				return false;
+			}
+
+			sse_buffer += std.string(chunk);
+
+			if(sse_buffer.find("endpoint") >= 0 && sse_buffer.find("\n\n") >= 0)
+			{
+				end = sse_buffer.find("\n\n");
+				event = sse_buffer.substr(0, end);
+				sse_buffer = sse_buffer.substr(end + 2);
+
+				sse_endpoint = sse_event_data(event);
+
+				if(sse_endpoint)
+				{
+					sse_post_url = absolute_endpoint(sse_endpoint);
+					sse_open = true;
+					log("SSE endpoint " + sse_post_url);
+					return true;
+				}
+			}
+		}
+
+		error = "The SSE stream " + sse_url + " sent no endpoint event.";
+		close_stream();
+		return false;
+	}
+
+	// The data payload of one SSE event block.
+	sse_event_data(event)
+	{
+		data = "";
+		lines = event.split("\n");
+		for(i = 0; i < lines.size(); i++)
+		{
+			line = lines[i].strip();
+			if(line.starts("data:"))
+				data += line.removeprefix("data:").ltrim();
+		}
+		return data;
+	}
+
+	// The stream sends a path ("/mcp?sessionid=..."), build the full url.
+	absolute_endpoint(endpoint)
+	{
+		if(endpoint.starts("http://") || endpoint.starts("https://"))
+			return endpoint;
+
+		base = url;
+		idx = base.find("://");
+		if(idx < 0)
+			return endpoint;
+
+		rest = base.substr(idx + 3);
+		slash = rest.find("/");
+		origin = slash < 0 ? base : base.substr(0, idx + 3 + slash);
+
+		if(endpoint.starts("/"))
+			return origin + endpoint;
+
+		return origin + "/" + endpoint;
+	}
+
+	sse_request(body, id)
+	{
+		// The stream is one shared channel and the answers are matched by id out
+		// of one buffer, so requests of this client are serialised.
+		managed io_lock = std.critical_section_named("mcp_client_sse_" + name);
+
+		res = sse_post(body, id);
+
+		// The event stream is a curl transfer with a timeout: when it ended,
+		// open a new one and send the request again (the server hands out a new
+		// session id with the endpoint event).
+		if(!res.ok && std.string(res.error.message).contains("stream ended"))
+		{
+			log("SSE stream expired, reopening");
+
+			close_stream();
+
+			if(!open_sse())
+				return mcp_client_err(error ? error : "Cannot reopen the SSE stream.");
+
+			return sse_post(body, id);
+		}
+
+		return res;
+	}
+
+	sse_post(body, id)
+	{
+		if(!sse_open)
+		{
+			if(!open_sse())
+				return mcp_client_err(error ? error : "The SSE stream is not open.");
+		}
+
+		resp = None;
+
+		try {
+			resp = http.post(sse_post_url, body, request_headers([]), timeout_ms);
+		}
+		catch(e) {
+			return mcp_client_err("SSE request failed: " + e);
+		}
+
+		if(!std.is_json(resp) || !resp.ok)
+			return mcp_client_err("The server rejected the POST to " + sse_post_url + ": " + (std.is_json(resp) ? std.string(resp.geti("body")) : "no answer"));
+
+		code = resp.geti("http_code");
+
+		if(code >= 400)
+			return mcp_client_err("HTTP " + code + " from " + sse_post_url + ": " + std.string(resp.geti("body")), code);
+
+		// The answer arrives on the stream.
+		deadline = std.millis() + timeout_ms * 3;
+
+		for(std.millis() < deadline)
+		{
+			// Complete events already in the buffer
+			for(sse_buffer.find("\n\n") >= 0)
+			{
+				end = sse_buffer.find("\n\n");
+				event = sse_buffer.substr(0, end);
+				sse_buffer = sse_buffer.substr(end + 2);
+
+				data = sse_event_data(event);
+				if(!data)
+					continue;
+
+				parsed = mcp_client_parse(data);
+				if(!parsed)
+					continue;
+
+				if(parsed.has("method") && !parsed.has("result") && !parsed.has("error"))
+					continue;
+
+				if(parsed.has("id") && std.string(parsed.geti("id")) != std.string(id))
+					continue;
+
+				if(parsed.has("error"))
+					return mcp_client_err(std.string(parsed.error.geti("message")), parsed.error.geti("code"), parsed.error.geti("data"));
+
+				return mcp_client_ok(parsed.geti("result"));
+			}
+
+			chunk = None;
+
+			try {
+				chunk = stream.poll_stream();
+			}
+			catch(e) {
+				chunk = None;
+			}
+
+			if(std.is_none(chunk))
+			{
+				sse_open = false;
+				return mcp_client_err("The SSE stream ended before the answer arrived.");
+			}
+
+			sse_buffer += std.string(chunk);
+		}
+
+		return mcp_client_err("No answer on the SSE stream within " + (timeout_ms * 3) + " ms.");
+	}
+
+	// ========================================================================
+	// MCP methods
+	// ========================================================================
+
+	ping()
+	{
+		return rpc("ping", []);
+	}
+
+	discover()
+	{
+		return rpc("server/discover", []);
+	}
+
+	// Re-read tools, resources and prompts.
+	refresh()
+	{
+		tools = [];
+		resources = [];
+		prompts = [];
+
+		if(!connected)
+			return false;
+
+		res = rpc("tools/list", []);
+		if(res.ok && res.result.has("tools"))
+			tools = res.result.tools;
+
+		res = rpc("resources/list", []);
+		if(res.ok && res.result.has("resources"))
+			resources = res.result.resources;
+
+		res = rpc("prompts/list", []);
+		if(res.ok && res.result.has("prompts"))
+			prompts = res.result.prompts;
+
+		return true;
+	}
+
+	list_tools()
+	{
+		res = rpc("tools/list", []);
+		if(!res.ok)
+			return res;
+
+		tools = res.result.geti("tools");
+		return res;
+	}
+
+	// args: json or json string
+	call_tool(tool_name, args = [])
+	{
+		params = [name = tool_name, arguments = mcp_client_json(args)];
+
+		res = rpc("tools/call", params, tool_name);
+
+		if(!res.ok)
+			return res;
+
+		text = mcp_client_content_text(res.result);
+
+		failed = res.result.has("isError") && std.string(res.result.isError) != "0";
+
+		if(failed)
+			return mcp_client_err(text, -32002, res.result);
+
+		return [ok = true, result = res.result, text = text, error = None];
+	}
+
+	list_resources()
+	{
+		res = rpc("resources/list", []);
+		if(res.ok)
+			resources = res.result.geti("resources");
+		return res;
+	}
+
+	read_resource(uri)
+	{
+		res = rpc("resources/read", [uri = uri], uri);
+
+		if(!res.ok)
+			return res;
+
+		text = "";
+		contents = res.result.geti("contents");
+		for(i = 0; i < contents.size(); i++)
+			text += std.string(contents[i].geti("text")) + "\n";
+
+		return [ok = true, result = res.result, text = text.strip(), error = None];
+	}
+
+	list_prompts()
+	{
+		res = rpc("prompts/list", []);
+		if(res.ok)
+			prompts = res.result.geti("prompts");
+		return res;
+	}
+
+	get_prompt(prompt_name, args = [])
+	{
+		res = rpc("prompts/get", [name = prompt_name, arguments = mcp_client_json(args)], prompt_name);
+
+		if(!res.ok)
+			return res;
+
+		text = "";
+		messages = res.result.geti("messages");
+		for(i = 0; i < messages.size(); i++)
+			text += std.string(messages[i].geti("role")) + ": " + std.string(messages[i].geti("content").geti("text")) + "\n";
+
+		return [ok = true, result = res.result, text = text.strip(), error = None];
+	}
+
+	// Compact view of the server for the agent.
+	status()
+	{
+		return [
+			name = name,
+			transport = transport,
+			connected = connected,
+			error = error,
+			url = url,
+			command = argv,
+			protocol_version = protocol_version,
+			server_info = server_info,
+			instructions = instructions,
+			tools = tools.size(),
+			resources = resources.size(),
+			prompts = prompts.size(),
+			requests = request_id,
+			notifications = notifications,
+			exposed_tools = exposed.size(),
+		];
+	}
+}
+
+mcpclient(name, url = "", headers = [], argv = [], cwd = "")
+{
+	return mcp_client(name, url, headers, argv, cwd);
+}
+
+// ============================================================================
+// Shared registry
+//
+// Connections live in a global store so they survive single tool calls and are
+// shared by the whole agent tree (same pattern as the command sessions).
+// ============================================================================
+
+mcp_client_store()
+{
+	store = std.global("mcp_clients");
+
+	if(!store.clients)
+		store.clients = [];
+
+	return store;
+}
+
+// The agent loop runs tool callbacks on their own threads, so the registry is
+// accessed concurrently. A named critical section is shared by every script
+// location that uses the same name, which is exactly what the registry needs.
+mcp_client_lock()
+{
+	return std.critical_section_named("mcp_clients");
+}
+
+// Reserve a name in the registry and return the new (not yet connected) client,
+// or the existing client of that name. The lock is held only for the registry
+// access, never during a handshake.
+//
+// Returns [client, owner]: owner is true when the caller has to run connect().
+// A reserved client that is still connecting is returned with owner = false;
+// mcp_client_wait() blocks until that handshake is done.
+mcp_client_reserve(name, url, headers, argv, cwd)
+{
+	managed lock = mcp_client_lock();
+
+	store = mcp_client_store();
+
+	if(store.clients.has(name))
+	{
+		old = store.clients[name];
+
+		if(old.connected || old.connecting)
+			return [client = old, owner = false];
+
+		old.close();
+		store.clients.erase(name);
+	}
+
+	client = mcp_client(name, url, headers, argv, cwd);
+
+	// Reserve the name before connecting, so a second agent that asks for the
+	// same server during the handshake reuses this client.
+	client.connecting = true;
+	store.clients[name] = client;
+
+	return [client = client, owner = true];
+}
+
+// Block until a client reserved by another thread finished its handshake.
+mcp_client_wait(client, timeout_ms = 0)
+{
+	if(!(client ?? false))
+		return false;
+
+	if(timeout_ms <= 0)
+		timeout_ms = MCP_CLIENT_REQUEST_TIMEOUT_MS * 4;
+
+	deadline = std.millis() + timeout_ms;
+
+	for(client.connecting && std.millis() < deadline)
+		std.sleep(10);
+
+	return client.connected;
+}
+
+mcp_client_release(name, client)
+{
+	managed lock = mcp_client_lock();
+
+	store = mcp_client_store();
+
+	if(store.clients.has(name) && store.clients[name] == client)
+		store.clients.erase(name);
+}
+
+mcp_client_connect(name, url = "", headers = [], argv = [], cwd = "", transport = "auto")
+{
+	res = mcp_client_reserve(name, url, headers, argv, cwd);
+
+	client = res.client;
+
+	if(!res.owner)
+	{
+		// Another thread is connecting this server right now: wait for it.
+		mcp_client_wait(client);
+		return client;
+	}
+
+	ok = false;
+
+	try {
+		ok = client.connect(transport);
+	}
+	catch(e) {
+		client.error = "The connection attempt failed: " + e;
+		client.connecting = false;
+		client.close();
+		mcp_client_release(name, client);
+		return client;
+	}
+
+	client.connecting = false;
+
+	if(!ok)
+	{
+		client.close();
+		mcp_client_release(name, client);
+	}
+
+	return client;	// connected == false -> .error says why
+}
+
+mcp_client_get(name)
+{
+	managed lock = mcp_client_lock();
+
+	store = mcp_client_store();
+
+	if(!store.clients.has(name))
+		return None;
+
+	client = store.clients[name];
+
+	if(client.connecting)
+	{
+		// Release the lock before waiting (the connecting thread needs it).
+		lock.release();
+		mcp_client_wait(client);
+	}
+
+	return client;
+}
+
+mcp_client_disconnect(name)
+{
+	managed lock = mcp_client_lock();
+
+	store = mcp_client_store();
+
+	if(!store.clients.has(name))
+		return false;
+
+	client = store.clients[name];
+	store.clients.erase(name);
+
+	lock.release();
+
+	// Close outside the lock: terminating a process may take a moment.
+	client.close();
+
+	return true;
+}
+
+mcp_client_list()
+{
+	managed lock = mcp_client_lock();
+
+	store = mcp_client_store();
+
+	list = [];
+
+	for(i = 0; i < store.clients.size(); i++)
+	{
+		key = store.clients.key(i);
+		list.push_back(store.clients[key].status());
+	}
+
+	return list;
+}

@@ -1,0 +1,268 @@
+// ============================================================================
+// skill_selftest.shio — self test of the MCP client skill layer
+//
+//   shz skill_selftest.shio
+//
+// Loads SKILL.shio the way the miniagent does (std.module + add_tools(agt))
+// with a stub agent that mimics the miniagent API, then drives the mcp_* tools
+// against the builtin MCP server: connect, list, call, expose, read, prompt,
+// disconnect. No LLM endpoint is involved.
+// ============================================================================
+
+#include "mcp_client.shio"
+#include "mcp/mcp_server"
+
+server_port = 34772;
+
+server = mcpserver("SkillTarget", server_port);
+if(!server.running)
+{
+	std.print("FAIL server starts -> ", server.error);
+	std.exitprocess(1);
+}
+
+server.add_tool(
+	"echo",
+	"Echo a message",
+	[message = "&string(): Message to echo", times = "int(1,5): Repeat count"],
+	[](svr, args) {
+		out = "";
+		times = std.int(args.geti("times"));
+		if(times < 1)
+			times = 1;
+		for(i = 0; i < times; i++)
+			out += std.string(args.geti("message")) + " ";
+		return out.strip();
+	}
+);
+
+server.add_tool("secret", "Refused tool", None, [](svr, args) { return "nope"; });
+server.tool_filter = [](name, args, ctx) {
+	if(name == "secret")
+		return "not for you";
+	return None;
+};
+
+server.add_resource("shz://static", "Static", "Static text", "text/plain", "static text");
+server.add_prompt("welcome", "Greet the user by name",
+	[[name = "user", description = "Name of the user", required = true]],
+	[](svr, args) { return "Welcome, " + std.string(args.geti("user")) + "!"; });
+
+std.sleep(300);
+
+// ----------------------------------------------------------------------------
+// Stub agent: the parts of the miniagent API the skill uses
+// ----------------------------------------------------------------------------
+
+class stub_agent
+{
+	added_tools = [];
+	env = [];
+	calls = [];
+	visual = [];
+
+	add_tool(name, description, params, callback)
+	{
+		calls[name] = [description = description, params = params, callback = callback];
+		added_tools[name] = [description = description];
+	}
+
+	inject_visual_prompt(raw, type = "png", prompt = "")
+	{
+		visual.push_back([size = std.string(raw).size(), type = type, prompt = prompt]);
+		return "The user will provide you with the requested image.";
+	}
+}
+
+// Call one skill tool like the miniagent would: callback(agt, args)
+call_tool(agt, tool_name, args)
+{
+	if(!agt.calls.has(tool_name))
+	{
+		std.print("FAIL tool registered: ", tool_name);
+		return [];
+	}
+
+	res = None;
+	try {
+		res = agt.calls[tool_name].callback(agt, args);
+	}
+	catch(e) {
+		std.print("FAIL tool call ", tool_name, " -> ", e);
+		return [ok = false, error = std.string(e)];
+	}
+
+	return res;
+}
+
+// ----------------------------------------------------------------------------
+// Load the skill
+// ----------------------------------------------------------------------------
+
+managed agt = stub_agent();
+
+skill = std.module();
+skill.load_file(__DIR__ + "/SKILL.shio");
+
+if(!skill.has("add_tools"))
+{
+	std.print("FAIL SKILL.shio exposes add_tools");
+	std.exitprocess(1);
+}
+
+skill.call("add_tools", agt);
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
+
+expected = [
+	"mcp_connect", "mcp_servers", "mcp_server_info", "mcp_disconnect",
+	"mcp_list_tools", "mcp_list_resources", "mcp_list_prompts",
+	"mcp_call_tool", "mcp_read_resource", "mcp_get_prompt",
+	"mcp_expose_tools", "mcp_refresh",
+];
+
+for(i = 0; i < expected.size(); i++)
+	check("registers " + expected[i], agt.calls.has(expected[i]));
+
+check("every tool has a description", agt.added_tools.size() == expected.size(), agt.added_tools.size());
+
+// ----------------------------------------------------------------------------
+// Drive the tools
+// ----------------------------------------------------------------------------
+
+base_url = "http://localhost:" + server_port + "/mcp";
+
+r = call_tool(agt, "mcp_servers", []);
+check("no server connected yet", r.ok && r.servers.size() == 0, r);
+
+r = call_tool(agt, "mcp_connect", [name = "target", url = base_url]);
+check("mcp_connect connects", r.ok, r);
+check("mcp_connect reports the transport", r.server.transport == "2026", r.server);
+check("mcp_connect lists the tools", r.tools.size() == 2, r.tools);
+check("mcp_connect lists resources", r.resources.size() == 1, r.resources);
+check("mcp_connect lists prompts", r.prompts.size() == 1, r.prompts);
+
+r = call_tool(agt, "mcp_connect", [name = "target", url = base_url]);
+check("reconnecting a name reuses the connection", r.ok, r);
+
+r = call_tool(agt, "mcp_connect", [name = "dead", url = "http://localhost:39998/mcp"]);
+check("a dead server reports ok=false with a reason", !r.ok && r.error.size() > 0, r);
+
+r = call_tool(agt, "mcp_connect", [name = "nothing"]);
+check("url or command is required", !r.ok, r);
+
+r = call_tool(agt, "mcp_servers", []);
+check("mcp_servers lists the connection", r.ok && r.servers.size() == 1, r);
+
+r = call_tool(agt, "mcp_server_info", [name = "target", with_schema = "1"]);
+check("mcp_server_info with schema", r.ok && r.tools[0].has("input_schema"), r);
+
+r = call_tool(agt, "mcp_server_info", [name = "nope"]);
+check("unknown connection name", !r.ok, r);
+
+r = call_tool(agt, "mcp_list_tools", [name = "target", with_schema = "1"]);
+check("mcp_list_tools with schema", r.ok && r.tools[0].input_schema.properties.message.type == "string", r);
+
+r = call_tool(agt, "mcp_call_tool", [name = "target", tool = "echo", arguments = [message = "skill", times = 3]]);
+check("mcp_call_tool calls the remote tool", r.ok && r.result == "skill skill skill", r);
+
+r = call_tool(agt, "mcp_call_tool", [name = "target", tool = "echo", arguments = "{\"message\":\"from string\"}"]);
+check("mcp_call_tool accepts a json string", r.ok && r.result == "from string", r);
+
+r = call_tool(agt, "mcp_call_tool", [name = "target", tool = "secret", arguments = []]);
+check("a tool_filter rejection is ok=false with the reason", !r.ok && r.error.contains("not for you"), r);
+
+r = call_tool(agt, "mcp_call_tool", [name = "target", tool = "ghost", arguments = []]);
+check("an unknown remote tool is ok=false", !r.ok, r);
+
+r = call_tool(agt, "mcp_read_resource", [name = "target", uri = "shz://static"]);
+check("mcp_read_resource", r.ok && r.content == "static text", r);
+
+r = call_tool(agt, "mcp_get_prompt", [name = "target", prompt = "welcome", arguments = [user = "Skill"]]);
+check("mcp_get_prompt", r.ok && r.prompt.contains("Welcome, Skill!"), r);
+
+r = call_tool(agt, "mcp_list_resources", [name = "target"]);
+check("mcp_list_resources", r.ok && r.resources.size() == 1, r);
+
+r = call_tool(agt, "mcp_list_prompts", [name = "target"]);
+check("mcp_list_prompts", r.ok && r.prompts.size() == 1, r);
+
+r = call_tool(agt, "mcp_refresh", [name = "target"]);
+check("mcp_refresh", r.ok && r.tools.size() == 2, r);
+
+// ----------------------------------------------------------------------------
+// Expose remote tools as agent tools
+// ----------------------------------------------------------------------------
+
+r = call_tool(agt, "mcp_expose_tools", [name = "target", tools = ["echo", "ghost"]]);
+check("mcp_expose_tools exposes the known tool", r.ok && r.exposed.size() == 1, r);
+check("mcp_expose_tools reports the unknown one", r.failed.size() == 1, r);
+check("the exposed agent tool exists", agt.calls.has("mcp_target_echo"), []);
+target_client = mcp_client_get("target");
+
+check("exposure is recorded on the client", target_client.exposed.echo == "mcp_target_echo", target_client.exposed);
+
+r = call_tool(agt, "mcp_target_echo", [message = "direct", times = 2]);
+check("the exposed tool is callable", r.ok && r.result == "direct direct", r);
+
+r = call_tool(agt, "mcp_expose_tools", [name = "target", tools = ["*"]]);
+check("['*'] exposes every tool", r.ok && r.exposed.size() == 2, r);
+check("all tools are now agent tools", agt.calls.has("mcp_target_secret"), []);
+
+r = call_tool(agt, "mcp_target_echo", [message = "again"]);
+check("the exposed tool works with optional args omitted", r.ok && r.result == "again", r);
+
+r = call_tool(agt, "mcp_expose_tools", [name = "target", tools = ["echo"]]);
+check("exposing twice is not an error", r.ok && r.exposed[0].status == "already exposed", r);
+
+// ----------------------------------------------------------------------------
+// stdio through the skill
+// ----------------------------------------------------------------------------
+
+exe = std.local_executable();
+
+r = call_tool(agt, "mcp_connect", [name = "pipe", command = [exe, __DIR__ + "/stdio_test_server.shio"], transport = "stdio"]);
+check("stdio server connects through the skill", r.ok, r);
+check("stdio tools arrive", r.tools.size() == 3, r.tools);
+
+r = call_tool(agt, "mcp_call_tool", [name = "pipe", tool = "shout", arguments = [message = "loud"]]);
+check("stdio tool call through the skill", r.ok && r.result == "LOUD", r);
+
+r = call_tool(agt, "mcp_call_tool", [name = "pipe", tool = "picture", arguments = [], with_image = "1"]);
+check("with_image hands the image to the agent", agt.visual.size() == 1 && agt.visual[0].type == "png", [r = r, visual = agt.visual]);
+
+r = call_tool(agt, "mcp_disconnect", [name = "pipe"]);
+check("mcp_disconnect closes the stdio server", r.ok, r);
+
+r = call_tool(agt, "mcp_disconnect", [name = "pipe"]);
+check("disconnecting twice is ok=false", !r.ok, r);
+
+r = call_tool(agt, "mcp_disconnect", [name = "target"]);
+check("mcp_disconnect closes the http connection", r.ok, r);
+
+r = call_tool(agt, "mcp_servers", []);
+check("registry is empty again", r.ok && r.servers.size() == 0, r);
+
+server.stop();
+
+std.print("");
+std.print("MCP SKILL SELFTEST: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);

@@ -1,0 +1,197 @@
+// ============================================================================
+// stdio_test_server.shio — a minimal MCP server on stdin/stdout
+//
+// Used by mcp_client_selftest.shio to test the stdio transport of the client.
+// Newline delimited JSON-RPC: one request per line on stdin, one answer per
+// line on stdout. Speaks the initialize based protocol (2025 family).
+//
+//   shz stdio_test_server.shio
+// ============================================================================
+
+import tempfile;
+
+SERVER_NAME = "StdioTest";
+VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+tools = [
+	[
+		name = "shout",
+		description = "Shout a message",
+		inputSchema = [
+			type = "object",
+			properties = [message = [type = "string", description = "Message to shout"]],
+			required = ["message"],
+		],
+	],
+	[
+		name = "boom",
+		description = "Always fails",
+		inputSchema = [type = "object", properties = []],
+	],
+	[
+		name = "picture",
+		description = "Returns an image content block",
+		inputSchema = [type = "object", properties = []],
+	],
+];
+
+resources = [[uri = "stdio://hello", name = "Hello", description = "A resource", mimeType = "text/plain"]];
+prompts = [[name = "greet", description = "Greet somebody", arguments = [[name = "who", description = "Who", required = true]]]];
+
+send(message)
+{
+	std.cout(message.compact_string() + "\n");
+}
+
+answer(id, result)
+{
+	send([jsonrpc = "2.0", id = id, result = result]);
+}
+
+fail(id, code, message)
+{
+	send([jsonrpc = "2.0", id = id, error = [code = code, message = message]]);
+}
+
+handle(req)
+{
+	method = std.string(req.geti("method"));
+	id = req.geti("id");
+	params = req.geti("params");
+
+	if(!params)
+		params = [];
+
+	if(method == "initialize")
+	{
+		requested = std.string(params.geti("protocolVersion"));
+		version = VERSIONS[0];
+		for(i = 0; i < VERSIONS.size(); i++)
+			if(VERSIONS[i] == requested)
+				version = requested;
+
+		answer(id, [
+			protocolVersion = version,
+			capabilities = [tools = [listChanged = json.bool(false)], resources = [], prompts = []],
+			serverInfo = [name = SERVER_NAME, version = "1.0.0"],
+			instructions = "Answer like a server on a pipe.",
+		]);
+		return;
+	}
+
+	if(method.starts("notifications/"))
+		return;
+
+	if(method == "ping")
+	{
+		answer(id, []);
+		return;
+	}
+
+	if(method == "tools/list")
+	{
+		answer(id, [tools = tools]);
+		return;
+	}
+
+	if(method == "tools/call")
+	{
+		name = std.string(params.geti("name"));
+
+		if(name == "shout")
+		{
+			msg = std.string(params.geti("arguments").geti("message"));
+			answer(id, [content = [[type = "text", text = msg.uppercase()]]]);
+			return;
+		}
+
+		if(name == "boom")
+		{
+			answer(id, [content = [[type = "text", text = "kaboom"]], isError = json.bool(true)]);
+			return;
+		}
+
+		if(name == "picture")
+		{
+			// A server writes content blocks directly, this is how image results arrive.
+			answer(id, [content = [
+				[type = "text", text = "a 1x1 png"],
+				[type = "image", mimeType = "image/png", data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="],
+			]]);
+			return;
+		}
+
+		fail(id, -32602, "Unknown tool: " + name);
+		return;
+	}
+
+	if(method == "resources/list")
+	{
+		answer(id, [resources = resources]);
+		return;
+	}
+
+	if(method == "resources/read")
+	{
+		if(std.string(params.geti("uri")) == "stdio://hello")
+		{
+			answer(id, [contents = [[uri = "stdio://hello", mimeType = "text/plain", text = "hello from stdio"]]]);
+			return;
+		}
+		fail(id, -32003, "Unknown resource");
+		return;
+	}
+
+	if(method == "prompts/list")
+	{
+		answer(id, [prompts = prompts]);
+		return;
+	}
+
+	if(method == "prompts/get")
+	{
+		if(std.string(params.geti("name")) == "greet")
+		{
+			who = std.string(params.geti("arguments").geti("who"));
+			answer(id, [description = "Greet somebody", messages = [[role = "user", content = [type = "text", text = "Hello " + who + " from stdio."]]]]);
+			return;
+		}
+		fail(id, -32004, "Unknown prompt");
+		return;
+	}
+
+	// A server request of the client (has a method and an id): answer it.
+	if(!std.is_none(id))
+		fail(id, -32601, "Method not found: " + method);
+}
+
+for(1)
+{
+	line = std.input();
+
+	if(line == None)
+		break;
+
+	line = std.string(line).strip();
+
+	if(!line)
+		continue;
+
+	// stdout is the protocol channel: never write anything that is not JSON.
+	if(!line.starts("{"))
+		continue;
+
+	req = None;
+	try {
+		req = std.json(line);
+	}
+	catch(e) {
+		fail(None, -32700, "Parse error");
+		continue;
+	}
+
+	if(!std.is_json(req) || req.size() == 0)
+		continue;
+
+	handle(req);
+}

@@ -1,0 +1,1701 @@
+
+// ============================================================================
+// web_client.shio — web search + URL fetch library
+//
+// Built on the shizoscript builtin web APIs:
+//   curl.curl()  -> get/post/request, returns [ok, http_code, body, content_type]
+//   std.web_get() -> body only, throws on failure
+//
+// The stdlib has NO url encoder, NO html entity decoder and NO html parser, and
+// std.string.regex_* rejects input over 16384 characters (issue #102), so every
+// text extraction here is a hand written find/substr scanner.
+//
+// Everything is a plain function: call web_search() / web_fetch() from a script.
+// ============================================================================
+
+import curl;
+
+// shizoscript resolves a call by source position, so every function that is
+// used by something defined above it needs a forward declaration.
+def web_clean_text(s);
+def web_html_to_text(html);
+def web_inline_text(html);
+def web_decode_entities(s);
+def web_absolute_url(base, url);
+def root_dir(base, u);
+def web_scheme(url);
+def web_host(url);
+def web_http(method, url, body, headers, timeout);
+def web_jina_fetch(url, timeout, mode);
+def web_parse_jina(text);
+def web_truncate(text, max_chars);
+def web_fetch(url, max_chars, mode, timeout);
+def web_jina_key();
+def web_url_encode(s);
+def web_url_decode(s);
+def web_utf8(cp);
+def web_tables();
+def web_throttle(group);
+def web_group_for(url);
+def web_config_value(key, fallback);
+def web_ddg_unwrap(href);
+def web_bing_unwrap(url);
+def web_b64_decode(s);
+def web_parse_rss(xml);
+def web_parse_bing(html);
+def web_parse_ddg_lite(html);
+def web_parse_ddg_html(html);
+def web_is_http(url);
+def web_trim(list, max);
+def web_query_tokens(query);
+def web_relevance(results, tokens);
+def web_clean_url(url);
+def web_host(url);
+def web_attr_value(s, i);
+def web_attr(html, tag_start, key);
+def web_search_provider(name, query, opts, page);
+
+// ----------------------------------------------------------------------------
+// configuration
+// ----------------------------------------------------------------------------
+
+// A browser UA works for the search engines; it gets a Cloudflare challenge
+// from r.jina.ai, so the reader uses its own token.
+web_ua_browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+web_ua_agent = "miniagent-web/1.0 (shizoscript agent; +https://shizoscript.org)";
+
+web_default_timeout = 20000;
+web_max_results = 10;
+
+// Minimum milliseconds between two requests to the same host group.
+// DuckDuckGo answers an "anomaly" challenge page when hammered.
+web_min_interval = [
+	duckduckgo = 1500,
+	bing = 1500,
+	marginalia = 1500,
+	jina = 400,
+	generic = 150,
+];
+
+// Search providers in order. Marginalia answers a bot challenge for most data
+// centre ips, so it is opt in via the "provider" option.
+web_search_order = ["duckduckgo_lite", "bing"];
+
+web_config = None;
+
+web_load_config()
+{
+	if(web_config)
+		return web_config;
+
+	cfg = std.load_config("miniagent", "websearch");
+	if(!std.is_json(cfg))
+		cfg = [];
+
+	web_config = cfg;
+	return web_config;
+}
+
+// Config lives in std.config_path("miniagent", "websearch"):
+//   jina_api_key    optional key, unlocks s.jina.ai search and paid jina features
+//   jina_base       default https://r.jina.ai/
+//   search_providers override the provider order, e.g. ["bing","duckduckgo_lite"]
+web_config_value(key, fallback)
+{
+	cfg = web_load_config();
+	if(std.is_json(cfg) && cfg.has(key))
+	{
+		v = cfg.geti(key);
+		if(std.is_string(v) && v.size())
+			return v;
+	}
+	return fallback;
+}
+
+// ----------------------------------------------------------------------------
+// byte / hex tables (built once, lazily)
+// ----------------------------------------------------------------------------
+
+web_bytetab = "";
+web_hextab = "";
+
+web_tables()
+{
+	if(web_bytetab.size())
+		return 1;
+
+	vals = [];
+	for(i = 0; i < 256; i++)
+		vals.push_back(i);
+
+	b = std.buffer();
+	b.append(vals);
+	web_bytetab = b.string();
+
+	// std.int("A") is 0, so the ascii code of a char comes from find().
+	hx = [];
+	digits = "0123456789ABCDEF";
+	for(v = 0; v < 256; v++)
+	{
+		hx.push_back(web_bytetab.find(digits.substr(v / 16, 1)));
+		hx.push_back(web_bytetab.find(digits.substr(v % 16, 1)));
+	}
+
+	hb = std.buffer();
+	hb.append(hx);
+	web_hextab = hb.string();
+
+	return 1;
+}
+
+web_hexval(ch)
+{
+	p = "0123456789abcdefABCDEF".find(ch);
+	if(p < 0)
+		return -1;
+	if(p < 16)
+		return p;
+	return p - 6;
+}
+
+// ----------------------------------------------------------------------------
+// url encoding
+// ----------------------------------------------------------------------------
+
+web_url_encode(s)
+{
+	web_tables();
+
+	src = std.buffer();
+	src.append(std.string(s));
+
+	out = "";
+	for(k = 0; k < src.size(); k++)
+	{
+		v = src.read("u8", k);
+		if((v >= 65 && v <= 90) || (v >= 97 && v <= 122) || (v >= 48 && v <= 57)
+			|| v == 45 || v == 46 || v == 95 || v == 126)
+			out += src.string(k, 1);
+		else if(v == 32)
+			out += "+";
+		else
+			out += "%" + web_hextab.substr(v * 2, 2);
+	}
+
+	return out;
+}
+
+web_url_decode(s)
+{
+	web_tables();
+
+	src = std.string(s);
+	out = std.buffer();
+
+	k = 0;
+	n = src.size();
+	for(k < n)
+	{
+		ch = src.substr(k, 1);
+
+		if(ch == "%" && k + 2 < n)
+		{
+			a = web_hexval(src.substr(k + 1, 1));
+			b = web_hexval(src.substr(k + 2, 1));
+			if(a >= 0 && b >= 0)
+			{
+				out.append([a * 16 + b]);
+				k += 3;
+				continue;
+			}
+		}
+
+		if(ch == "+")
+		{
+			out.append([32]);
+			k++;
+			continue;
+		}
+
+		out.append(ch);
+		k++;
+	}
+
+	return out.string();
+}
+
+// codepoint -> utf8 bytes (no << >> in shizoscript, so division tables)
+web_utf8(cp)
+{
+	b = std.buffer();
+
+	if(cp < 128)
+		b.append([cp]);
+	else if(cp < 2048)
+		b.append([192 + cp / 64, 128 + cp % 64]);
+	else if(cp < 65536)
+		b.append([224 + cp / 4096, 128 + (cp / 64) % 64, 128 + cp % 64]);
+	else
+		b.append([240 + cp / 262144, 128 + (cp / 4096) % 64, 128 + (cp / 64) % 64, 128 + cp % 64]);
+
+	return b.string();
+}
+
+// ----------------------------------------------------------------------------
+// html entities
+// ----------------------------------------------------------------------------
+
+web_entities = [
+	"amp" = "&", "lt" = "<", "gt" = ">", "quot" = "\"", "apos" = "'",
+	"nbsp" = " ", "ensp" = " ", "emsp" = " ", "thinsp" = " ", "shy" = "",
+	"ndash" = "–", "mdash" = "—", "hellip" = "…", "middot" = "·",
+	"lsquo" = "'", "rsquo" = "'", "ldquo" = "\"", "rdquo" = "\"",
+	"sbquo" = "‚", "bdquo" = "„", "prime" = "′", "Prime" = "″",
+	"copy" = "©", "reg" = "®", "trade" = "™", "deg" = "°", "plusmn" = "±",
+	"times" = "×", "divide" = "÷", "frac12" = "½", "frac14" = "¼", "frac34" = "¾",
+	"bull" = "•", "dagger" = "†", "Dagger" = "‡", "para" = "¶", "sect" = "§",
+	"larr" = "←", "rarr" = "→", "uarr" = "↑", "darr" = "↓", "harr" = "↔",
+	"crarr" = "↵", "check" = "✓",
+	"eacute" = "é", "egrave" = "è", "ecirc" = "ê", "aacute" = "á", "agrave" = "à",
+	"acirc" = "â", "iuml" = "ï", "euml" = "ë", "auml" = "ä", "ouml" = "ö",
+	"uuml" = "ü", "yuml" = "ÿ", "ccedil" = "ç", "ntilde" = "ñ", "szlig" = "ß",
+	"micro" = "µ", "cent" = "¢", "pound" = "£", "curren" = "¤", "yen" = "¥",
+	"euro" = "€", "infin" = "∞", "minus" = "−", "ne" = "≠", "le" = "≤", "ge" = "≥",
+	"alpha" = "α", "beta" = "β", "gamma" = "γ", "delta" = "δ", "pi" = "π",
+	"sigma" = "σ", "omega" = "ω", "mu" = "μ", "lambda" = "λ", "theta" = "θ",
+];
+
+web_decode_entities(s)
+{
+	src = std.string(s);
+	out = "";
+
+	i = 0;
+	n = src.size();
+	for(i < n)
+	{
+		amp = src.find("&", i);
+		if(amp < 0)
+		{
+			out += src.substr(i, n - i);
+			break;
+		}
+
+		if(amp > i)
+			out += src.substr(i, amp - i);
+
+		sc = src.find(";", amp + 1);
+		if(sc < 0 || sc - amp > 12)
+		{
+			out += "&";
+			i = amp + 1;
+			continue;
+		}
+
+		body = src.substr(amp + 1, sc - amp - 1);
+		text = "";
+
+		if(body.size() && body.substr(0, 1) == "#")
+		{
+			hex = body.size() > 1 && (body.substr(1, 1) == "x" || body.substr(1, 1) == "X");
+			digits = hex ? body.substr(2, body.size() - 2) : body.substr(1, body.size() - 1);
+			cp = 0;
+			valid = digits.size() > 0;
+			for(d = 0; d < digits.size(); d++)
+			{
+				v = web_hexval(digits.substr(d, 1));
+				if(v < 0) { valid = false; break; }
+				cp = cp * (hex ? 16 : 10) + v;
+			}
+			if(valid && cp > 0 && cp < 1114112)
+				text = web_utf8(cp);
+			else
+				text = src.substr(amp, sc - amp + 1);
+		}
+		else if(web_entities.has(body))
+			text = web_entities.geti(body);
+		else
+			text = src.substr(amp, sc - amp + 1);
+
+		out += text;
+		i = sc + 1;
+	}
+
+	return out;
+}
+
+// ----------------------------------------------------------------------------
+// html -> text scanner
+// ----------------------------------------------------------------------------
+
+web_block_tags = [
+	"p" = 1, "div" = 1, "section" = 1, "article" = 1, "aside" = 1, "main" = 1,
+	"header" = 1, "footer" = 1, "nav" = 1, "form" = 1, "fieldset" = 1,
+	"ul" = 1, "ol" = 1, "table" = 1, "thead" = 1, "tbody" = 1, "tfoot" = 1,
+	"tr" = 1, "pre" = 1, "blockquote" = 1, "figure" = 1, "figcaption" = 1,
+	"details" = 1, "summary" = 1, "address" = 1, "dl" = 1, "dt" = 1, "dd" = 1,
+	"caption" = 1, "colgroup" = 1, "body" = 1, "html" = 1, "center" = 1,
+	"h1" = 2, "h2" = 2, "h3" = 2, "h4" = 2, "h5" = 2, "h6" = 2,
+	"td" = 3, "th" = 3,
+];
+
+web_drop_tags = ["script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "head", "title", "meta", "link", "applet"];
+
+// Position of the real '>' of the tag starting at lt (quotes may contain '>').
+web_tag_end(html, lt)
+{
+	gt = lt + 1;
+	n = html.size();
+
+	for(1)
+	{
+		gt = html.find(">", gt);
+		if(gt < 0)
+			return -1;
+
+		seg = html.substr(lt, gt - lt);
+		if(seg.count("\"") % 2 == 0 && seg.count("'") % 2 == 0)
+			return gt;
+
+		gt++;
+	}
+
+	return -1;
+}
+
+web_tag_name(inner)
+{
+	name = inner;
+	if(name.find("/") == 0)
+		name = name.substr(1, name.size() - 1);
+
+	sp = name.find_first_of(" \t\n\r\f/");
+	if(sp >= 0)
+		name = name.substr(0, sp);
+
+	return name;
+}
+
+// Strip tags, drop scripts/styles, keep block structure as newlines.
+web_html_to_text(html)
+{
+	src = std.string(html);
+	out = std.buffer();
+
+	i = 0;
+	n = src.size();
+
+	for(i < n)
+	{
+		lt = src.find("<", i);
+		if(lt < 0)
+		{
+			out.append(src.substr(i, n - i));
+			break;
+		}
+
+		if(lt > i)
+			out.append(src.substr(i, lt - i));
+
+		// comment
+		if(src.find("<!--", lt) == lt)
+		{
+			e = src.find("-->", lt + 4);
+			i = e < 0 ? n : e + 3;
+			continue;
+		}
+
+		// doctype / cdata / processing instruction
+		if(src.find("<!", lt) == lt || src.find("<?", lt) == lt)
+		{
+			e = src.find(">", lt);
+			i = e < 0 ? n : e + 1;
+			continue;
+		}
+
+		gt = web_tag_end(src, lt);
+		if(gt < 0)
+		{
+			i = n;
+			break;
+		}
+
+		inner = src.substr(lt + 1, gt - lt - 1);
+		name = web_tag_name(inner.lowercase());
+
+		if(web_drop_tags.has_value(name))
+		{
+			e = src.find("</" + name, gt);
+			i = e < 0 ? n : e + 3 + name.size();
+			continue;
+		}
+
+		if(name == "li")
+		{
+			if(inner.find("/") != 0)
+				out.append("\n- ");
+			i = gt + 1;
+			continue;
+		}
+
+		if(name == "br")
+		{
+			out.append("\n");
+			i = gt + 1;
+			continue;
+		}
+
+		if(name == "hr")
+		{
+			out.append("\n---\n");
+			i = gt + 1;
+			continue;
+		}
+
+		if(web_block_tags.has(name))
+		{
+			out.append("\n");
+			i = gt + 1;
+			continue;
+		}
+
+		i = gt + 1;
+	}
+
+	return web_clean_text(out.string());
+}
+
+// Collapse whitespace, drop empty lines, decode entities.
+web_clean_text(s)
+{
+	src = web_decode_entities(std.string(s));
+	src = src.replace("\r\n", "\n").replace("\r", "\n");
+
+	lines = src.split("\n");
+	out = "";
+
+	for(i = 0; i < lines.size(); i++)
+	{
+		l = lines[i].compress_whitespace().strip();
+		if(!l.size())
+			continue;
+		if(out.size())
+			out += "\n";
+		out += l;
+	}
+
+	return out;
+}
+
+// One line of text from an html fragment (titles, snippets).
+web_inline_text(html)
+{
+	return web_html_to_text(std.string(html)).replace("\n", " ").compress_whitespace().strip();
+}
+
+// ----------------------------------------------------------------------------
+// attribute / link helpers
+// ----------------------------------------------------------------------------
+
+// Value of an attribute whose '=' was found at i ("x", 'x' or bare).
+web_attr_value(s, i)
+{
+	src = std.string(s);
+	n = src.size();
+
+	for(i < n)
+	{
+		c = src.substr(i, 1);
+		if(c != " " && c != "\t" && c != "\n" && c != "\r" && c != "=")
+			break;
+		i++;
+	}
+
+	if(i >= n)
+		return "";
+
+	q = src.substr(i, 1);
+	if(q == "\"" || q == "'")
+	{
+		e = src.find(q, i + 1);
+		if(e < 0)
+			return "";
+		return src.substr(i + 1, e - i - 1);
+	}
+
+	e = src.find_first_of(" >\t\n\r", i);
+	if(e < 0)
+		return src.substr(i, n - i);
+	return src.substr(i, e - i);
+}
+
+web_attr(html, tag_start, key)
+{
+	eq = html.find(key, tag_start);
+	if(eq < 0)
+		return "";
+	return web_decode_entities(web_attr_value(html, eq + key.size()));
+}
+
+// Text between the '>' after anchor and the next end tag.
+web_inner(html, anchor, endtag)
+{
+	gt = html.find(">", anchor);
+	if(gt < 0)
+		return "";
+	e = html.find(endtag, gt + 1);
+	if(e < 0)
+		return "";
+	if(e <= gt)
+		return "";
+	return html.substr(gt + 1, e - gt - 1);
+}
+
+web_absolute_url(base, url)
+{
+	u = std.string(url).strip();
+	if(!u.size())
+		return "";
+
+	if(u.find("http://") == 0 || u.find("https://") == 0 || u.find("mailto:") == 0 || u.find("data:") == 0)
+		return u;
+
+	if(u.find("//") == 0)
+		return web_scheme(base) + ":" + u;
+
+	b = std.string(base);
+	sp = b.find("://");
+	if(sp < 0)
+		return u;
+
+	host_end = b.find("/", sp + 3);
+	if(host_end < 0)
+		return root_dir(b, u);
+
+	root = b.substr(0, host_end);
+	if(u.find("/") == 0)
+		return root + u;
+
+	return root_dir(b, u);
+}
+
+// base url -> directory part (everything up to the last '/' of the path)
+root_dir(base, u)
+{
+	b = std.string(base);
+
+	q = b.find_first_of("?#");
+	path = q >= 0 ? b.substr(0, q) : b;
+
+	sp = path.find("://");
+	host_end = sp < 0 ? 0 : path.find("/", sp + 3);
+	if(host_end < 0)
+		return path + "/" + u;
+
+	last = path.rfind("/");
+	if(last <= host_end)
+		return path + "/" + u;
+
+	return path.substr(0, last) + "/" + u;
+}
+
+web_scheme(url)
+{
+	u = std.string(url);
+	p = u.find("://");
+	if(p < 0)
+		return "https";
+	return u.substr(0, p);
+}
+
+web_host(url)
+{
+	u = std.string(url);
+	p = u.find("://");
+	if(p >= 0)
+		u = u.substr(p + 3, u.size() - p - 3);
+	e = u.find_first_of("/?#");
+	if(e >= 0)
+		u = u.substr(0, e);
+	at = u.find("@");
+	if(at >= 0)
+		u = u.substr(at + 1, u.size() - at - 1);
+	col = u.find(":");
+	if(col >= 0)
+		u = u.substr(0, col);
+	return u.lowercase();
+}
+
+web_is_http(url)
+{
+	u = std.string(url).lowercase();
+	return u.find("http://") == 0 || u.find("https://") == 0;
+}
+
+// https://host/path?a=b -> drop the query noise a reader never needs
+web_clean_url(url)
+{
+	u = std.string(url);
+	f = u.find("#");
+	if(f >= 0)
+		u = u.substr(0, f);
+	return u;
+}
+
+// ----------------------------------------------------------------------------
+// http transport
+// ----------------------------------------------------------------------------
+
+web_last_call = [];
+
+// Reserve a slot for a host group and sleep until it is due.
+web_throttle(group)
+{
+	min_ms = 0;
+	if(web_min_interval.has(group))
+		min_ms = web_min_interval.geti(group);
+
+	if(min_ms <= 0)
+		return 0;
+
+	managed cs = std.critical_section("web_skill_throttle");
+
+	now = std.millis();
+	last = 0;
+	if(web_last_call.has(group))
+		last = web_last_call.geti(group);
+
+	due = last + min_ms;
+	web_last_call[group] = due;
+
+	if(due <= now)
+		return 0;
+
+	cs.release();
+	std.sleep(due - now);
+	return due - now;
+}
+
+web_group_for(url)
+{
+	h = web_host(url);
+	if(h.contains("duckduckgo")) return "duckduckgo";
+	if(h.contains("bing")) return "bing";
+	if(h.contains("marginalia")) return "marginalia";
+	if(h.contains("jina")) return "jina";
+	return "generic";
+}
+
+// One HTTP request. Returns [ok, http_code, body, content_type, error, ms].
+web_http(method, url, body = "", headers = None, timeout = 0)
+{
+	m = std.string(method).uppercase();
+	u = std.string(url);
+	ms = timeout > 0 ? timeout : web_default_timeout;
+
+	hdrs = [];
+	if(std.is_json(headers))
+		hdrs = headers.copy();
+
+	if(!hdrs.has("User-Agent") && !hdrs.has("user-agent"))
+		hdrs["User-Agent"] = web_ua_browser;
+
+	web_throttle(web_group_for(u));
+
+	c = curl.curl();
+
+	res = None;
+	try
+	{
+		if(m == "GET")
+			res = c.get(u, hdrs, ms);
+		else if(m == "POST")
+			res = c.post(u, std.string(body), hdrs, ms);
+		else
+			res = c.request(m, u, std.string(body), hdrs, ms, false);
+	}
+	catch(e)
+	{
+		return [ok = false, http_code = 0, body = "", content_type = "", error = "request failed: " + std.string(e)];
+	}
+
+	if(!std.is_json(res))
+		return [ok = false, http_code = 0, body = "", content_type = "", error = "request failed: no response"];
+
+	if(!res.geti("ok"))
+	{
+		reason = std.string(res.geti("error"));
+		if(!reason.size())
+			reason = c.last_error();
+		return [ok = false, http_code = 0, body = "", content_type = "", error = reason.size() ? reason : "transport error"];
+	}
+
+	code = std.int(res.geti("http_code"));
+	ct = std.string(res.geti("content_type"));
+	text = std.string(res.geti("body"));
+
+	return [ok = code >= 200 && code < 400, http_code = code, body = text, content_type = ct, error = code >= 400 ? "HTTP " + code : ""];
+}
+
+// ----------------------------------------------------------------------------
+// jina reader
+// ----------------------------------------------------------------------------
+
+web_jina_base()
+{
+	return web_config_value("jina_base", "https://r.jina.ai/");
+}
+
+web_jina_key()
+{
+	return web_config_value("jina_api_key", "");
+}
+
+// GET https://r.jina.ai/<url> -> markdown. No API key required.
+// A browser User-Agent gets a Cloudflare challenge, so send our own token.
+web_jina_fetch(url, timeout = 0, mode = "markdown")
+{
+	u = std.string(url);
+	if(u.find("://") < 0)
+		u = "https://" + u;
+
+	target = web_jina_base() + u;
+
+	hdrs = ["User-Agent" = web_ua_agent];
+
+	respond = mode == "text" ? "text" : "markdown";
+	hdrs["x-respond-with"] = respond;
+
+	secs = timeout > 0 ? timeout / 1000 : web_default_timeout / 1000;
+	if(secs > 0)
+		hdrs["x-timeout"] = std.string(secs);
+
+	key = web_jina_key();
+	if(key.size())
+		hdrs["Authorization"] = "Bearer " + key;
+
+	r = web_http("GET", target, "", hdrs, timeout > 0 ? timeout : 30000);
+
+	if(!r.ok && !r.http_code)
+		return [ok = false, error = r.error, provider = "jina"];
+
+	text = r.body;
+
+	// jina reports its own failures as json
+	if(r.http_code >= 400 || text.find("{\"data\":null") == 0)
+	{
+		msg = "";
+		try { j = std.json(text); msg = std.string(j.geti("message")); } catch(e) { msg = ""; }
+		if(!msg.size())
+			msg = "jina returned HTTP " + r.http_code;
+		return [ok = false, error = msg, http_code = r.http_code, provider = "jina"];
+	}
+
+	return [ok = true, text = text, provider = "jina", http_code = r.http_code, content_type = r.content_type];
+}
+
+// Split the jina envelope into fields + content.
+web_parse_jina(text)
+{
+	src = std.string(text);
+
+	title = "";
+	source = "";
+	published = "";
+	warnings = [];
+	content = "";
+
+	marker = "Markdown Content:";
+	mi = src.find(marker);
+
+	head = mi < 0 ? src : src.substr(0, mi);
+	if(mi >= 0)
+	{
+		content = src.substr(mi + marker.size(), src.size() - mi - marker.size());
+		content = content.replace("\r\n", "\n");
+		for(1)
+		{
+			if(content.size() && (content.substr(0, 1) == "\n" || content.substr(0, 1) == " "))
+				content = content.substr(1, content.size() - 1);
+			else
+				break;
+		}
+	}
+	else
+		content = src;
+
+	lines = head.split("\n");
+	for(i = 0; i < lines.size(); i++)
+	{
+		l = lines[i].strip();
+		if(!l.size())
+			continue;
+		if(l.find("Title:") == 0)
+			title = l.substr(6, l.size() - 6).strip();
+		else if(l.find("URL Source:") == 0)
+			source = l.substr(11, l.size() - 11).strip();
+		else if(l.find("Published Time:") == 0)
+			published = l.substr(15, l.size() - 15).strip();
+		else if(l.find("Warning:") == 0)
+			warnings.push_back(l);
+	}
+
+	return [title = title, source = source, published = published, warnings = warnings, content = content];
+}
+
+// ----------------------------------------------------------------------------
+// fetch: markdown via jina, plain text locally, raw html on request
+// ----------------------------------------------------------------------------
+
+web_truncate(text, max_chars)
+{
+	s = std.string(text);
+	if(max_chars <= 0 || s.size() <= max_chars)
+		return [text = s, truncated = 0, total = s.size()];
+
+	cut = s.substr(0, max_chars);
+	nl = cut.rfind("\n");
+	if(nl > max_chars / 2)
+		cut = cut.substr(0, nl);
+
+	return [text = cut, truncated = 1, total = s.size()];
+}
+
+// url -> [ok, url, title, content, content_type, http_code, provider, truncated, total, warnings, error]
+web_fetch(url, max_chars = 20000, mode = "markdown", timeout = 0)
+{
+	u = std.string(url).strip();
+	if(!u.size())
+		return [ok = false, error = "no url given"];
+	if(u.find("://") < 0)
+		u = "https://" + u;
+	if(!web_is_http(u))
+		return [ok = false, error = "only http:// and https:// urls are supported"];
+
+	mode = std.string(mode).lowercase();
+	warnings = [];
+
+	if(mode == "html" || mode == "raw")
+	{
+		r = web_http("GET", u, "", None, timeout);
+		if(!r.ok)
+			return [ok = false, error = r.error, http_code = r.http_code, url = u];
+		cut = web_truncate(r.body, max_chars);
+		return [
+			ok = true, url = u, title = "", content = cut.text, content_type = r.content_type,
+			http_code = r.http_code, provider = "direct", format = "html",
+			truncated = cut.truncated, total = cut.total, warnings = warnings,
+		];
+	}
+
+	// markdown / text: jina first, local scanner as the fallback
+	if(mode == "markdown" || mode == "text" || mode == "auto")
+	{
+		j = web_jina_fetch(u, timeout, mode == "text" ? "text" : "markdown");
+
+		if(j.ok)
+		{
+			p = web_parse_jina(j.text);
+			for(w = 0; w < j.warnings.size(); w++)
+				warnings.push_back(j.warnings[w]);
+
+			cut = web_truncate(p.content, max_chars);
+			return [
+				ok = true, url = p.source.size() ? p.source : u, title = p.title,
+				content = cut.text, content_type = "text/markdown",
+				http_code = j.http_code, provider = "jina", format = mode == "text" ? "text" : "markdown",
+				published = p.published, warnings = p.warnings,
+				truncated = cut.truncated, total = cut.total,
+			];
+		}
+
+		warnings.push_back("jina reader unavailable (" + j.error + "), fell back to a local fetch");
+	}
+
+	r = web_http("GET", u, "", None, timeout);
+	if(!r.ok)
+		return [ok = false, error = r.error, http_code = r.http_code, url = u, warnings = warnings];
+
+	ct = r.content_type;
+	title = "";
+	content = "";
+
+	if(ct.contains("html") || r.body.find("<html") >= 0 || r.body.find("<!DOCTYPE") >= 0 || r.body.find("<!doctype") >= 0)
+	{
+		tp = web_attr(r.body, r.body.find("<title"), "</title>");
+		title = web_inline_text(tp);
+		content = web_html_to_text(r.body);
+	}
+	else if(ct.contains("json"))
+	{
+		content = r.body;
+	}
+	else
+	{
+		content = web_clean_text(r.body);
+	}
+
+	cut = web_truncate(content, max_chars);
+	return [
+		ok = true, url = u, title = title, content = cut.text, content_type = ct,
+		http_code = r.http_code, provider = "direct", format = "text",
+		truncated = cut.truncated, total = cut.total, warnings = warnings,
+	];
+}
+
+// ----------------------------------------------------------------------------
+// search providers
+// ----------------------------------------------------------------------------
+
+// //duckduckgo.com/l/?uddg=<encoded>&rut=<hash> -> the real url
+web_ddg_unwrap(href)
+{
+	h = web_decode_entities(std.string(href));
+	if(!h.size())
+		return "";
+
+	p = h.find("uddg=");
+	if(p >= 0)
+	{
+		v = h.substr(p + 5, h.size() - p - 5);
+		e = v.find("&");
+		if(e >= 0)
+			v = v.substr(0, e);
+		return web_url_decode(v);
+	}
+
+	return web_absolute_url("https://duckduckgo.com", h);
+}
+
+web_parse_ddg_lite(html)
+{
+	src = std.string(html);
+	results = [];
+	seen = [];
+
+	pos = 0;
+	for(1)
+	{
+		li = src.find("result-link", pos);
+		if(li < 0)
+			break;
+
+		a = src.rfind("<a ", li);
+		href = "";
+		if(a >= 0 && a < li)
+		{
+			hp = src.find("href", a);
+			if(hp >= 0 && hp < li)
+				href = web_attr_value(src, hp + 4);
+		}
+
+		title = web_inline_text(web_inner(src, li, "</a>"));
+
+		sn = src.find("result-snippet", li);
+		snippet = "";
+		next = li;
+		if(sn >= 0)
+		{
+			snippet = web_inline_text(web_inner(src, sn, "</td>"));
+			next = sn;
+		}
+
+		display = "";
+		lt = src.find("link-text", next);
+		if(lt >= 0)
+		{
+			display = web_inline_text(web_inner(src, lt, "</span>"));
+			pos = lt + 9;
+		}
+		else
+			pos = li + 11;
+
+		url = web_clean_url(web_ddg_unwrap(href));
+
+		if(url.size() && title.size() && !seen.has(url))
+		{
+			seen[url] = 1;
+			results.push_back([title = title, url = url, snippet = snippet, display = display]);
+		}
+
+		if(results.size() >= 40)
+			break;
+	}
+
+	return results;
+}
+
+// base64 with padding, tolerant of url-safe alphabets
+web_b64_decode(s)
+{
+	src = std.string(s).replace("-", "+").replace("_", "/");
+	padded = src;
+	for(1)
+	{
+		if(padded.size() % 4 == 0)
+			break;
+		padded += "=";
+	}
+
+	out = None;
+	try { out = std.base64_decode(padded); } catch(e) { out = None; }
+	if(out == None)
+		return "";
+	return std.string(out);
+}
+
+// Bing wraps every result url: /ck/a?...&u=a1<base64 of the real url>&...
+web_bing_unwrap(url)
+{
+	u = std.string(url);
+
+	if(!u.contains("/ck/a"))
+		return web_clean_url(u);
+
+	p = u.find("u=a1");
+	if(p < 0)
+		p = u.find("&u=");
+	if(p < 0)
+		return web_clean_url(u);
+
+	v = u.substr(p, u.size() - p);
+	e = v.find("&");
+	if(e >= 0)
+		v = v.substr(0, e);
+
+	if(v.find("u=a1") == 0)
+		v = v.substr(4, v.size() - 4);
+	else
+	{
+		eq = v.find("=");
+		v = eq < 0 ? "" : v.substr(eq + 1, v.size() - eq - 1);
+	}
+
+	decoded = web_b64_decode(v);
+	if(web_is_http(decoded))
+		return web_clean_url(decoded);
+
+	return web_clean_url(u);
+}
+
+// Generic RSS 2.0 / Atom feed -> search results.
+// Handles <item>/<entry>, title, link (text or href), description/summary/content, pubDate.
+web_parse_rss(xml)
+{
+	src = std.string(xml);
+	results = [];
+	seen = [];
+
+	item_open = src.find("<item");
+	entry_open = src.find("<entry");
+
+	tag = "item";
+	if(item_open < 0 && entry_open >= 0)
+		tag = "entry";
+
+	pos = 0;
+	for(1)
+	{
+		open = src.find("<" + tag, pos);
+		if(open < 0)
+			break;
+		close = src.find("</" + tag + ">", open);
+		if(close < 0)
+			break;
+
+		block = src.substr(open, close - open);
+
+		title = "";
+		tp = block.find("<title");
+		if(tp >= 0)
+			title = web_inline_text(web_inner(block, tp, "</title>"));
+
+		url = "";
+		lp = block.find("<link");
+		if(lp >= 0)
+		{
+			// RSS 2.0: <link>text</link>   Atom: <link href="..." />
+			gt = block.find(">", lp);
+			closing = block.find("</link>", gt + 1);
+			if(closing > gt)
+				url = web_inline_text(block.substr(gt + 1, closing - gt - 1));
+			else
+			{
+				hp = block.find("href", lp);
+				if(hp >= 0 && hp < gt + 1)
+					url = web_attr_value(block, hp + 4);
+			}
+		}
+
+		snippet = "";
+		fields = ["<description", "<summary", "<content"];
+		for(f = 0; f < fields.size(); f++)
+		{
+			sp = block.find(fields[f]);
+			if(sp < 0)
+				continue;
+			name = fields[f].substr(1, fields[f].size() - 1);
+			raw = web_inner(block, sp, "</" + name + ">");
+			// feeds often wrap the text in CDATA
+			c1 = raw.find("<![CDATA[");
+			if(c1 == 0)
+			{
+				c2 = raw.find("]]>");
+				if(c2 > 9)
+					raw = raw.substr(9, c2 - 9);
+			}
+			snippet = web_inline_text(raw);
+			if(snippet.size())
+				break;
+		}
+
+		date = "";
+		dp = block.find("<pubDate");
+		if(dp < 0)
+			dp = block.find("<updated");
+		if(dp < 0)
+			dp = block.find("<published");
+		if(dp >= 0)
+		{
+			name = dp == block.find("<pubDate") ? "pubDate" : (dp == block.find("<updated") ? "updated" : "published");
+			date = web_inline_text(web_inner(block, dp, "</" + name + ">"));
+		}
+
+		url = web_bing_unwrap(web_decode_entities(url));
+		pos = close + 3;
+
+		if(url.size() && title.size() && web_is_http(url) && !seen.has(url))
+		{
+			seen[url] = 1;
+			results.push_back([title = title, url = url, snippet = snippet, display = web_host(url), date = date]);
+		}
+
+		if(results.size() >= 40)
+			break;
+	}
+
+	return results;
+}
+
+web_parse_bing(html)
+{
+	src = std.string(html);
+	results = [];
+	seen = [];
+
+	pos = 0;
+	for(1)
+	{
+		algo = src.find("b_algo", pos);
+		if(algo < 0)
+			break;
+
+		h2 = src.find("<h2", algo);
+		if(h2 < 0) { pos = algo + 6; continue; }
+
+		a = src.find("<a", h2);
+		if(a < 0) { pos = h2 + 3; continue; }
+
+		hp = src.find("href", a);
+		href = hp >= 0 ? web_attr_value(src, hp + 4) : "";
+		title = web_inline_text(web_inner(src, a, "</a>"));
+
+		p = src.find("<p", h2);
+		snippet = p >= 0 ? web_inline_text(web_inner(src, p, "</p>")) : "";
+
+		cite = src.find("<cite", h2);
+		display = cite >= 0 ? web_inline_text(web_inner(src, cite, "</cite>")) : "";
+
+		url = web_bing_unwrap(web_decode_entities(href));
+		pos = (p > algo ? p : h2) + 2;
+
+		if(url.size() && title.size() && !seen.has(url) && web_is_http(url))
+		{
+			seen[url] = 1;
+			results.push_back([title = title, url = url, snippet = snippet, display = display]);
+		}
+
+		if(results.size() >= 40)
+			break;
+	}
+
+	return results;
+}
+
+web_parse_marginalia(html)
+{
+	src = std.string(html);
+	results = [];
+	seen = [];
+
+	pos = 0;
+	for(1)
+	{
+		h2 = src.find("<h2", pos);
+		if(h2 < 0)
+			break;
+
+		a = src.find("<a", h2);
+		if(a < 0) { pos = h2 + 3; continue; }
+
+		hp = src.find("href", a);
+		href = hp >= 0 ? web_attr_value(src, hp + 4) : "";
+		title = web_inline_text(web_inner(src, a, "</a>"));
+
+		url = web_clean_url(web_decode_entities(href));
+		if(!url.size() || !title.size() || !web_is_http(url)) { pos = h2 + 3; continue; }
+		if(seen.has(url)) { pos = h2 + 3; continue; }
+
+		// the block around the title carries the description
+		start = h2 > 2000 ? h2 - 2000 : 0;
+		blk = src.substr(start, src.size() - start);
+		p = blk.find("</h2>");
+		snippet = "";
+		if(p >= 0)
+		{
+			tail = blk.substr(p + 5, blk.size() - p - 5);
+			limit = tail.size() > 1200 ? 1200 : tail.size();
+			snippet = web_inline_text(tail.substr(0, limit));
+		}
+
+		seen[url] = 1;
+		results.push_back([title = title, url = url, snippet = snippet, display = web_host(url)]);
+		pos = h2 + 3;
+
+		if(results.size() >= 40)
+			break;
+	}
+
+	return results;
+}
+
+// DuckDuckGo html.html endpoint (result__a / result__snippet)
+web_parse_ddg_html(html)
+{
+	src = std.string(html);
+	results = [];
+	seen = [];
+
+	pos = 0;
+	for(1)
+	{
+		ra = src.find("result__a", pos);
+		if(ra < 0)
+			break;
+
+		a = src.rfind("<a", ra);
+		href = "";
+		if(a >= 0)
+		{
+			hp = src.find("href", a);
+			if(hp >= 0 && hp < ra)
+				href = web_attr_value(src, hp + 4);
+		}
+
+		title = web_inline_text(web_inner(src, ra, "</a>"));
+
+		sn = src.find("result__snippet", ra);
+		snippet = sn >= 0 ? web_inline_text(web_inner(src, sn, "</a>")) : "";
+		if(snippet.size() < 1)
+			snippet = sn >= 0 ? web_inline_text(web_inner(src, sn, "</td>")) : "";
+
+		url = web_clean_url(web_ddg_unwrap(href));
+		pos = (sn > ra ? sn : ra) + 12;
+
+		if(url.size() && title.size() && !seen.has(url))
+		{
+			seen[url] = 1;
+			results.push_back([title = title, url = url, snippet = snippet, display = web_host(url)]);
+		}
+
+		if(results.size() >= 40)
+			break;
+	}
+
+	return results;
+}
+
+// s.jina.ai needs an API key; returns [] when there is none.
+web_parse_jina_search(text)
+{
+	src = std.string(text);
+	results = [];
+
+	j = None;
+	try { j = std.json(src); } catch(e) { return results; }
+	if(!std.is_json(j))
+		return results;
+
+	data = j.geti("data");
+	if(!std.is_json(data))
+		return results;
+
+	list = data.geti("response");
+	if(!std.is_list(list))
+		list = data;
+	if(!std.is_list(list))
+		return results;
+
+	for(i = 0; i < list.size(); i++)
+	{
+		e = list[i];
+		if(!std.is_json(e))
+			continue;
+		url = web_clean_url(std.string(e.geti("url")));
+		title = std.string(e.geti("title"));
+		snippet = std.string(e.geti("description"));
+		if(!url.size() || !title.size())
+			continue;
+		results.push_back([title = title, url = url, snippet = snippet, display = web_host(url)]);
+	}
+
+	return results;
+}
+
+// ----------------------------------------------------------------------------
+// search
+// ----------------------------------------------------------------------------
+
+web_search_query(query, opts)
+{
+	q = std.string(query).strip();
+	if(!q.size())
+		return "";
+
+	inc = std.string(opts.geti("include_domains"));
+	exc = std.string(opts.geti("exclude_domains"));
+
+	if(inc.size())
+	{
+		domains = inc.split(",");
+		for(i = 0; i < domains.size(); i++)
+			q += " site:" + domains[i].strip();
+	}
+	if(exc.size())
+	{
+		domains = exc.split(",");
+		for(i = 0; i < domains.size(); i++)
+			q += " -site:" + domains[i].strip();
+	}
+
+	return q;
+}
+
+web_search_duckduckgo(query, opts, page)
+{
+	body = "q=" + web_url_encode(query);
+
+	tr = std.string(opts.geti("time_range"));
+	if(tr == "day" || tr == "d") body += "&df=d";
+	else if(tr == "week" || tr == "w") body += "&df=w";
+	else if(tr == "month" || tr == "m") body += "&df=m";
+	else if(tr == "year" || tr == "y") body += "&df=y";
+
+	region = std.string(opts.geti("region"));
+	if(region.size())
+		body += "&kl=" + web_url_encode(region);
+
+	if(page > 1)
+	{
+		off = (page - 1) * 10;
+		body += "&s=" + off + "&dc=" + (off + 1) + "&v=l";
+	}
+
+	hdrs = ["User-Agent" = web_ua_browser, "Content-Type" = "application/x-www-form-urlencoded", "Accept" = "text/html"];
+
+	r = web_http("POST", "https://lite.duckduckgo.com/lite/", body, hdrs, web_default_timeout);
+	if(r.ok && r.http_code == 200)
+	{
+		list = web_parse_ddg_lite(r.body);
+		if(list.size())
+			return [ok = true, provider = "duckduckgo_lite", results = list];
+	}
+
+	// GET fallback (works for the first request, then DDG answers a challenge)
+	g = web_http("GET", "https://lite.duckduckgo.com/lite/?q=" + web_url_encode(query), ["User-Agent" = web_ua_browser], web_default_timeout);
+	if(g.ok && g.http_code == 200)
+	{
+		list = web_parse_ddg_lite(g.body);
+		if(list.size())
+			return [ok = true, provider = "duckduckgo_lite", results = list];
+	}
+
+	h = web_http("POST", "https://html.duckduckgo.com/html/", body, hdrs, web_default_timeout);
+	if(h.ok && h.http_code == 200)
+	{
+		list = web_parse_ddg_html(h.body);
+		if(list.size())
+			return [ok = true, provider = "duckduckgo_html", results = list];
+	}
+
+	challenged = r.http_code == 202 || g.http_code == 202;
+	return [ok = false, provider = "duckduckgo", error = challenged
+		? "DuckDuckGo answered its anti-bot challenge page (rate limited)"
+		: "no results parsed (HTTP " + r.http_code + (r.error.size() ? ", " + r.error : "") + ")"];
+}
+
+web_search_bing(query, opts, page)
+{
+	hdrs = ["User-Agent" = web_ua_browser, "Accept-Language" = "en-US,en;q=0.9"];
+
+	q = web_url_encode(query);
+	base = "https://www.bing.com/search?q=" + q;
+
+	tr = std.string(opts.geti("time_range"));
+	fresh = "";
+	if(tr == "day" || tr == "d") fresh = "&freshness=24";
+	else if(tr == "week" || tr == "w") fresh = "&freshness=168";
+	else if(tr == "month" || tr == "m") fresh = "&freshness=720";
+
+	off = page > 1 ? (page - 1) * 10 : 0;
+
+	// RSS: stable markup and the real target urls
+	rss = base + "&format=rss&count=30" + fresh + (off ? "&first=" + (off + 1) : "");
+	r = web_http("GET", rss, "", hdrs, web_default_timeout);
+	if(r.ok && r.http_code == 200)
+	{
+		list = web_parse_rss(r.body);
+		if(list.size())
+			return [ok = true, provider = "bing_rss", results = list];
+	}
+
+	// HTML page
+	page_url = base + "&setlang=en&count=30" + (off ? "&first=" + (off + 1) : "");
+	h = web_http("GET", page_url, "", hdrs, web_default_timeout);
+	if(!h.ok)
+		return [ok = false, provider = "bing", error = "HTTP " + h.http_code + (h.error.size() ? ", " + h.error : "")];
+
+	list = web_parse_bing(h.body);
+	if(!list.size())
+		return [ok = false, provider = "bing", error = "no results parsed (the page markup changed)"];
+
+	return [ok = true, provider = "bing", results = list];
+}
+
+web_search_marginalia(query, opts, page)
+{
+	url = "https://search.marginalia.nu/search?query=" + web_url_encode(query);
+	if(page > 1)
+		url += "&page=" + page;
+
+	r = web_http("GET", url, "", ["User-Agent" = web_ua_browser], web_default_timeout);
+	if(!r.ok)
+		return [ok = false, provider = "marginalia", error = "HTTP " + r.http_code + (r.error.size() ? ", " + r.error : "")];
+
+	list = web_parse_marginalia(r.body);
+	if(!list.size())
+		return [ok = false, provider = "marginalia", error = "no results parsed"];
+
+	return [ok = true, provider = "marginalia", results = list];
+}
+
+web_search_jina(query, opts, page)
+{
+	key = web_jina_key();
+	if(!key.size())
+		return [ok = false, provider = "jina", error = "no jina api key configured"];
+
+	url = "https://s.jina.ai/" + web_url_encode(query);
+
+	r = web_http("GET", url, "", ["User-Agent" = web_ua_agent, "Authorization" = "Bearer " + key, "Accept" = "application/json"], web_default_timeout);
+	if(!r.ok)
+		return [ok = false, provider = "jina", error = "HTTP " + r.http_code + (r.error.size() ? ", " + r.error : "")];
+
+	list = web_parse_jina_search(r.body);
+	if(!list.size())
+		return [ok = false, provider = "jina", error = "no results parsed"];
+
+	return [ok = true, provider = "jina", results = list];
+}
+
+web_search_provider(name, query, opts, page)
+{
+	if(name == "duckduckgo" || name == "duckduckgo_lite" || name == "lite")
+		return web_search_duckduckgo(query, opts, page);
+	if(name == "bing")
+		return web_search_bing(query, opts, page);
+	if(name == "marginalia")
+		return web_search_marginalia(query, opts, page);
+	if(name == "jina")
+		return web_search_jina(query, opts, page);
+	if(name == "duckduckgo_html")
+	{
+		r = web_http("POST", "https://html.duckduckgo.com/html/", "q=" + web_url_encode(query),
+			["User-Agent" = web_ua_browser, "Content-Type" = "application/x-www-form-urlencoded"], web_default_timeout);
+		if(!r.ok)
+			return [ok = false, provider = name, error = "HTTP " + r.http_code];
+		list = web_parse_ddg_html(r.body);
+		if(!list.size())
+			return [ok = false, provider = name, error = "no results parsed"];
+		return [ok = true, provider = name, results = list];
+	}
+	return [ok = false, provider = name, error = "unknown search provider"];
+}
+
+// Keep at most max entries of a result list.
+web_trim(list, max)
+{
+	if(!std.is_list(list) || list.size() <= max)
+		return list;
+
+	out = [];
+	for(k = 0; k < max; k++)
+		out.push_back(list[k]);
+	return out;
+}
+
+// Significant lowercase words of a query, search operators removed.
+web_query_tokens(query)
+{
+	src = std.string(query).lowercase();
+
+	words = src.split_words();
+	tokens = [];
+	seen = [];
+
+	for(i = 0; i < words.size(); i++)
+	{
+		w = words[i];
+
+		// -term is an exclusion: it says what must NOT match
+		if(w.find("-") == 0)
+			continue;
+
+		// site:domain / intitle:word -> keep the value, drop the operator
+		colon = w.find(":");
+		if(colon >= 0)
+			w = w.substr(colon + 1, w.size() - colon - 1);
+
+		w = w.removechars("\"'`+-()[]{}~*?,&=|\\/");
+		if(w.size() < 3)
+			continue;
+		if(web_stopwords.has(w))
+			continue;
+		if(seen.has(w))
+			continue;
+
+		seen[w] = 1;
+		tokens.push_back(w);
+	}
+
+	return tokens;
+}
+
+web_stopwords = [
+	"the" = 1, "and" = 1, "for" = 1, "with" = 1, "from" = 1, "this" = 1, "that" = 1,
+	"what" = 1, "when" = 1, "where" = 1, "which" = 1, "about" = 1, "into" = 1,
+	"your" = 1, "thee" = 1, "how" = 1, "why" = 1, "can" = 1, "does" = 1, "are" = 1,
+	"was" = 1, "were" = 1, "has" = 1, "have" = 1, "not" = 1, "but" = 1, "all" = 1,
+	"its" = 1, "out" = 1, "get" = 1, "got" = 1, "use" = 1, "using" = 1, "used" = 1,
+	"make" = 1, "made" = 1, "like" = 1, "just" = 1, "very" = 1, "most" = 1,
+	"more" = 1, "than" = 1, "then" = 1, "them" = 1, "they" = 1, "their" = 1,
+	"there" = 1, "here" = 1, "over" = 1, "under" = 1, "after" = 1, "before" = 1,
+	"between" = 1, "should" = 1, "would" = 1, "could" = 1, "because" = 1,
+];
+
+// How many results mention a query word in title, url or snippet.
+// Bing RSS answers niche queries with localized generic junk; this catches it.
+web_relevance(results, tokens)
+{
+	if(!results.size())
+		return 0;
+	if(!tokens.size())
+		return 100;
+
+	hits = 0;
+	for(i = 0; i < results.size(); i++)
+	{
+		r = results[i];
+		hay = (r.title + " " + r.url + " " + r.snippet).lowercase();
+		for(k = 0; k < tokens.size(); k++)
+		{
+			if(hay.find(tokens[k]) >= 0)
+			{
+				hits++;
+				break;
+			}
+		}
+	}
+
+	return hits * 100 / results.size();
+}
+
+// query -> [ok, results, provider, attempted, error]
+web_search(query, opts = None)
+{
+	o = std.is_json(opts) ? opts : [];
+
+	q = web_search_query(query, o);
+	if(!q.size())
+		return [ok = false, error = "empty query"];
+
+	page = std.int(o.geti("page"));
+	if(page < 1)
+		page = 1;
+
+	max = std.int(o.geti("max_results"));
+	if(max < 1)
+		max = web_max_results;
+
+	order = web_search_order;
+	only = std.string(o.geti("provider"));
+	if(only.size())
+		order = [only];
+	else if(std.is_json(web_config) && web_config.has("search_providers") && std.is_list(web_config.geti("search_providers")))
+		order = web_config.geti("search_providers");
+
+	tokens = web_query_tokens(q);
+	min_score = 40;
+	if(o.has("min_relevance"))
+	{
+		v = std.int(o.geti("min_relevance"));
+		if(v >= 0)
+			min_score = v > 100 ? 100 : v;
+	}
+
+	attempted = [];
+	best = None;
+	best_score = -1;
+
+	for(i = 0; i < order.size(); i++)
+	{
+		name = std.string(order[i]);
+		r = web_search_provider(name, q, o, page);
+
+		if(!r.ok)
+		{
+			attempted.push_back([provider = name, error = r.error]);
+			continue;
+		}
+
+		score = web_relevance(r.results, tokens);
+
+		if(score >= min_score)
+			return [ok = true, query = q, provider = r.provider, results = web_trim(r.results, max), relevance = score, attempted = attempted];
+
+		attempted.push_back([provider = r.provider, error = "answered, but only " + score + "% of the results match the query"]);
+
+		if(score > best_score)
+		{
+			best_score = score;
+			best = r;
+		}
+	}
+
+	// nothing was relevant: hand back the least bad answer, clearly labelled
+	if(best != None && best.results.size())
+	{
+		return [
+			ok = true,
+			query = q,
+			provider = best.provider,
+			results = web_trim(best.results, max),
+			relevance = best_score,
+			warning = "These results look off topic for the query (" + best_score + "% match). Every provider was rate limited, blocked by an anti-bot challenge, or answered generically. Retry later, rephrase the query, or web_fetch a page you already know.",
+			attempted = attempted,
+		];
+	}
+
+	return [ok = false, query = q, results = [], attempted = attempted, relevance = 0,
+		error = "every search provider failed (rate limited, blocked by an anti-bot challenge, or the markup changed)"];
+}

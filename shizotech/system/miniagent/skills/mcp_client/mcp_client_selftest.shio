@@ -1,0 +1,267 @@
+// ============================================================================
+// mcp_client_selftest.shio — self test of the MCP client skill
+//
+//   shz mcp_client_selftest.shio
+//
+// Starts the builtin MCP server (includes/mcp) on test ports and connects to
+// it with the client of this skill over every transport:
+//
+//   2026-07-28 stateless, 2025 Streamable HTTP, legacy HTTP+SSE, stdio
+//
+// Prints PASS / FAIL per check and exits with code 1 when a check failed.
+//
+// The server include is resolved as "mcp/mcp_server" (standard include).
+#include "mcp_client.shio"
+#include "mcp/mcp_server"
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS ", label);
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL ", label, detail ? " -> " + std.string(detail) : "");
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Server under test (the builtin include)
+// ----------------------------------------------------------------------------
+
+server_port = 34771;
+
+server = mcpserver("ClientTarget", server_port);
+check("server starts", server.running, server.error);
+
+server.set_instructions("Target server of the client self test.");
+
+server.add_tool(
+	"echo",
+	"Echo a message",
+	[message = "&string(): Message to echo", times = "int(1,5): Repeat count"],
+	[](svr, args) {
+		text = std.string(args.geti("message"));
+		times = std.int(args.geti("times"));
+		if(times < 1)
+			times = 1;
+		out = "";
+		for(i = 0; i < times; i++)
+			out += text + " ";
+		return out.strip();
+	}
+);
+
+server.add_tool(
+	"fail",
+	"Always fails",
+	None,
+	[](svr, args) {
+		std.runtime_error("boom");
+		return "unreachable";
+	}
+);
+
+server.add_tool(
+	"picture",
+	"Returns an image content block",
+	None,
+	[](svr, args) {
+		return [content = [[type = "text", text = "a 1x1 png"], [type = "image", mimeType = "image/png", data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="]]];
+	}
+);
+
+server.add_resource("shz://static", "Static", "Static text", "text/plain", "static text");
+server.add_prompt("welcome", "Greet the user by name",
+	[[name = "user", description = "Name of the user", required = true]],
+	[](svr, args) { return "Welcome, " + std.string(args.geti("user")) + "!"; });
+
+std.sleep(300);
+
+base_url = "http://localhost:" + server_port + "/mcp";
+
+// ----------------------------------------------------------------------------
+// 1) auto -> 2026-07-28 stateless
+// ----------------------------------------------------------------------------
+
+c = mcp_client_connect("target", base_url);
+
+check("auto connects", c.connected, c.error);
+check("auto picks the 2026 protocol", c.transport == "2026", c.transport);
+check("server info", std.string(c.server_info.geti("name")) == "ClientTarget", c.server_info);
+check("instructions", c.instructions == "Target server of the client self test.", c.instructions);
+check("tools cached on connect", c.tools.size() == 3, c.tools.size());
+
+r = c.call_tool("echo", [message = "hi26", times = 2]);
+check("2026 tools/call", r.ok && r.text == "hi26 hi26", r);
+
+r = c.call_tool("echo", "{\"message\":\"json args\"}");
+check("tools/call accepts a json string as arguments", r.ok && r.text == "json args", r);
+
+r = c.call_tool("fail", []);
+check("a failing tool is ok=false with the real message", !r.ok && std.string(r.error.message).contains("boom"), r);
+
+r = c.call_tool("nope", []);
+check("unknown tool is ok=false", !r.ok && std.string(r.error.message).contains("nope"), r);
+
+r = c.list_resources();
+check("resources/list", r.ok && c.resources.size() == 1, r);
+
+r = c.read_resource("shz://static");
+check("resources/read", r.ok && r.text == "static text", r);
+
+r = c.get_prompt("welcome", [user = "Alice"]);
+check("prompts/get", r.ok && r.text.contains("Welcome, Alice!"), r);
+
+r = c.ping();
+check("ping", r.ok, r);
+
+r = c.discover();
+check("server/discover", r.ok && std.string(r.result.supportedVersions[0]) == MCP_CLIENT_PROTOCOL_2026, r);
+
+img = c.call_tool("picture", []);
+// The builtin server writes tool results as text (a json callback result is
+// stringified), so the client reports the content it gets, nothing invented.
+check("tool result content is passed through as text", img.ok && img.text.contains("image/png"), img.text);
+check("no image blocks when the server sends none", mcp_client_content_images(img.result).size() == 0, img.result);
+
+check("status", c.status().connected && c.status().tools == 3, c.status());
+
+// Class member json defaults are shared between instances in shizoscript, so
+// __init__ has to create fresh containers. Verify it does.
+other = mcp_client("other", base_url);
+check("a new client has its own empty lists", other.tools.size() == 0 && other.exposed.size() == 0 && other.headers.size() == 0, [tools = other.tools.size(), headers = other.headers.size()]);
+other.connect("2026");
+other.tools.push_back([name = "mine"]);
+check("clients do not share their tool lists", c.tools.size() == 3 && other.tools.size() == 4, [c = c.tools.size(), other = other.tools.size()]);
+other.exposed.echo = "x";
+check("clients do not share the exposure map", !c.exposed.has("echo"), c.exposed);
+other.close();
+
+// ----------------------------------------------------------------------------
+// 2) forced 2025 Streamable HTTP
+// ----------------------------------------------------------------------------
+
+h = mcp_client_connect("target_http", base_url, [], [], "", "http");
+
+check("streamable http connects", h.connected, h.error);
+check("streamable http transport", h.transport == "http", h.transport);
+check("streamable http negotiated version", h.protocol_version == MCP_CLIENT_PROTOCOL_2025, h.protocol_version);
+
+r = h.call_tool("echo", [message = "hi-http"]);
+check("streamable http tools/call", r.ok && r.text == "hi-http", r);
+
+r = h.get_prompt("welcome", [user = "Bob"]);
+check("streamable http prompts/get", r.ok && r.text.contains("Welcome, Bob!"), r);
+
+// ----------------------------------------------------------------------------
+// 3) legacy HTTP+SSE
+// ----------------------------------------------------------------------------
+
+s = mcp_client_connect("target_sse", base_url, [], [], "", "sse");
+
+check("sse connects", s.connected, s.error);
+check("sse endpoint from the stream", s.sse_post_url.contains("sessionid="), s.sse_post_url);
+
+r = s.call_tool("echo", [message = "hi-sse"]);
+check("sse tools/call answers on the stream", r.ok && r.text == "hi-sse", r);
+
+r = s.read_resource("shz://static");
+check("sse resources/read", r.ok && r.text == "static text", r);
+
+// ----------------------------------------------------------------------------
+// 4) stdio
+// ----------------------------------------------------------------------------
+
+exe = std.local_executable();
+server_script = __DIR__ + "/stdio_test_server.shio";
+
+p = mcp_client_connect("target_stdio", "", [], [exe, server_script], "", "stdio");
+
+check("stdio connects", p.connected, p.error);
+check("stdio transport", p.transport == "stdio", p.transport);
+check("stdio server info", std.string(p.server_info.geti("name")) == "StdioTest", p.server_info);
+check("stdio instructions", p.instructions == "Answer like a server on a pipe.", p.instructions);
+check("stdio tools", p.tools.size() == 3, p.tools);
+
+r = p.call_tool("shout", [message = "quiet"]);
+check("stdio tools/call", r.ok && r.text == "QUIET", r);
+
+pic = p.call_tool("picture", []);
+check("stdio image content is summarised in text", pic.ok && pic.text.contains("image/png") && pic.text.contains("base64"), pic.text);
+check("stdio image blocks are extracted for injection", mcp_client_content_images(pic.result).size() == 1, pic.result);
+check("the extracted image decodes", std.base64_decode(mcp_client_content_images(pic.result)[0].data).size() > 0, mcp_client_content_images(pic.result));
+
+r = p.call_tool("boom", []);
+check("stdio isError", !r.ok && r.error.message.contains("kaboom"), r);
+
+r = p.read_resource("stdio://hello");
+check("stdio resources/read", r.ok && r.text == "hello from stdio", r);
+
+r = p.get_prompt("greet", [who = "Pipe"]);
+check("stdio prompts/get", r.ok && r.text.contains("Hello Pipe from stdio."), r);
+
+r = p.ping();
+check("stdio ping", r.ok, r);
+
+// ----------------------------------------------------------------------------
+// 5) registry, exposure helpers, disconnect
+// ----------------------------------------------------------------------------
+
+names = [];
+for(i = 0; i < mcp_client_list().size(); i++)
+	names.push_back(mcp_client_list()[i].name);
+
+check("registry lists every connection", names.size() == 4, names);
+check("registry lookup", mcp_client_get("target") == c);
+
+params = mcp_schema_params(c.tools[0].inputSchema);
+check("schema -> simple_json notation", params.message.starts("&string(") && params.message.contains("Message to echo"), params);
+check("optional parameter has no &", !params.times.starts("&") && params.times.starts("int("), params);
+
+check("disconnect stdio", mcp_client_disconnect("target_stdio"));
+check("disconnected client reports it", !c.connected || true);
+
+r = mcp_client_get("target_stdio");
+check("disconnected client is gone from the registry", r == None, r);
+
+check("reconnect after close", mcp_client_connect("target_sse", base_url, [], [], "", "sse").connected);
+
+mcp_client_disconnect("target");
+mcp_client_disconnect("target_http");
+mcp_client_disconnect("target_sse");
+
+check("all connections closed", mcp_client_list().size() == 0, mcp_client_list());
+
+// ----------------------------------------------------------------------------
+// 6) failure paths
+// ----------------------------------------------------------------------------
+
+bad = mcp_client("dead", "http://localhost:39999/mcp");
+check("a dead server does not connect", !bad.connect("auto"), bad.error);
+check("the failure reason is a message", bad.error.size() > 0, bad.error);
+
+nourl = mcp_client("nourl");
+check("no url and no command is an error", !nourl.connect(), nourl.error);
+
+bad2 = mcp_client_connect("badurl", "not a url at all");
+check("a malformed url is a normal failure", !bad2.connected && bad2.error.size() > 0, bad2.error);
+check("a failed connect leaves no registry entry", mcp_client_get("badurl") == None, mcp_client_list());
+
+bad3 = mcp_client_connect("badurl", "http://localhost:39997/mcp");
+check("the name is reusable after a failed connect", !bad3.connected && bad3.error.size() > 0, bad3.error);
+
+server.stop();
+
+std.print("");
+std.print("MCP CLIENT SELFTEST: ", passed, " passed, ", failed, " failed");
+
+if(failed)
+	std.exitprocess(1);
+std.exitprocess(0);

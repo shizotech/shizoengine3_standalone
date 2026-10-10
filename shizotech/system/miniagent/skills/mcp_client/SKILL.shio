@@ -1,0 +1,507 @@
+
+#include "mcp_client.shio"
+
+// ============================================================================
+// MCP client skill — connect the agent to MCP servers
+//
+// The builtin include "mcp/mcp_server" is the server side. This skill is the
+// client side: it connects to an MCP server (http, streamable http, sse or
+// stdio), reads its tools / resources / prompts and can expose the remote
+// tools as real agent tools.
+// ============================================================================
+
+// Max characters of one tool/resource result returned to the agent.
+mcp_skill_max_text = 20000;
+
+mcp_skill_cut(text)
+{
+	if(text.size() <= mcp_skill_max_text)
+		return text;
+
+	return text.substr(0, mcp_skill_max_text) + "\n...[output truncated]...";
+}
+
+// A short, stable agent tool name for a remote tool of a server.
+// Server and remote names may contain anything, so only [A-Za-z0-9_] survives.
+mcp_skill_clean_name(part)
+{
+	out = "";
+	for(i = 0; i < part.size(); i++)
+	{
+		c = part.substr(i, 1);
+		if(c.removechars("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_").empty())
+			out += c;
+		else
+			out += "_";
+	}
+	return out;
+}
+
+mcp_skill_tool_name(server, remote_name)
+{
+	return "mcp_" + mcp_skill_clean_name(server) + "_" + mcp_skill_clean_name(remote_name);
+}
+
+// True when the agent already has a tool with that name (added_tools is reset
+// on every skill load, so the real toolset of the llm api is authoritative).
+mcp_skill_has_tool(agt, tool_name)
+{
+	if(agt.added_tools.has(tool_name))
+		return true;
+
+	if(agt.llm_api ?? false)
+	{
+		tools = agt.llm_api.tools;
+		if((tools ?? false) && (tools.tool_callbacks ?? false) && tools.tool_callbacks.has(tool_name))
+			return true;
+	}
+
+	return false;
+}
+
+// The tool list of a connection, compact (schemas only on request).
+mcp_skill_tool_overview(client, with_schema)
+{
+	list = [];
+
+	for(i = 0; i < client.tools.size(); i++)
+	{
+		t = client.tools[i];
+
+		entry = [
+			name = std.string(t.geti("name")),
+			description = std.string(t.geti("description")),
+		];
+
+		if(with_schema)
+			entry.input_schema = t.geti("inputSchema");
+
+		list.push_back(entry);
+	}
+
+	return list;
+}
+
+add_tools(agt)
+{
+	// ------------------------------------------------------------------------
+	// Connection handling
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"mcp_connect",
+		"Connect to an MCP server.\n\nHTTP servers: pass 'url' (for example 'http://localhost:13338/mcp').\nProcess servers: pass 'command', a list with the program and its arguments (for example ['npx','-y','@modelcontextprotocol/server-everything']), the transport is stdio with newline delimited JSON-RPC.\n\nThe transport is chosen automatically: 2026-07-28 (stateless), then 2025 Streamable HTTP, then the legacy HTTP+SSE stream. Set 'transport' to force one of '2026', 'http', 'sse', 'stdio'.\n\nAfter connecting, the server's tools, resources and prompts are read once. Use mcp_expose_tools to turn remote tools into real tools you can call directly.",
+		[
+			name = "&string(): Local name of this connection, used by every other mcp tool",
+			url = "string(): OPTIONAL MCP endpoint of an HTTP server, e.g. 'http://localhost:13338/mcp'",
+			command = "array(string): OPTIONAL Command of a stdio server: [program, arg1, arg2, ...]",
+			headers = "any(): OPTIONAL extra request headers as json, e.g. [Authorization = \"Bearer xyz\"]",
+			cwd = "string(): OPTIONAL working directory of a stdio server process",
+			transport = "enum(auto,2026,http,sse,stdio): OPTIONAL force a transport (default 'auto')",
+		],
+		[](agt, args)
+		{
+			url = std.string(args.geti("url"));
+			command = args.geti("command");
+			argv = [];
+
+			if(std.is_list(command))
+			{
+				for(i = 0; i < command.size(); i++)
+					argv.push_back(std.string(command[i]));
+			}
+			else if(std.is_string(command) && command)
+				argv = command.split(" ");
+
+			if(!url && !argv.size())
+				return [ok = false, error = "Provide either 'url' (HTTP server) or 'command' (stdio server)."];
+
+			headers = mcp_client_json(args.geti("headers"));
+			transport = std.string(args.geti("transport"));
+			if(!transport)
+				transport = "auto";
+
+			client = mcp_client_connect(std.string(args.geti("name")), url, headers, argv, std.string(args.geti("cwd")), transport);
+
+			if(!client.connected)
+			{
+				return [
+					ok = false,
+					error = "Cannot connect: " + client.error,
+					tried = transport == "auto" ? "2026, streamable http, sse" : transport,
+				];
+			}
+
+			return [
+				ok = true,
+				status = "Connected.",
+				server = client.status(),
+				instructions = client.instructions,
+				tools = mcp_skill_tool_overview(client, false),
+				resources = client.resources,
+				prompts = client.prompts,
+				next = "Call mcp_expose_tools to use the remote tools directly, or mcp_call_tool to call one of them.",
+			];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_servers",
+		"List every MCP connection of this agent with its state (transport, protocol version, server info, counts of tools / resources / prompts).",
+		None,
+		[](agt, args)
+		{
+			list = mcp_client_list();
+
+			if(!list.size())
+				return [ok = true, servers = [], note = "No MCP server connected. Use mcp_connect."];
+
+			return [ok = true, servers = list];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_server_info",
+		"Details of one MCP connection: server info, protocol, capabilities, instructions and the full tool/resource/prompt lists.",
+		[
+			name = "&string(): Name of the connection",
+			with_schema = "int(0,1): OPTIONAL include the JSON schema of every tool",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			if(!client.connected)
+				return [ok = false, error = "The connection is closed: " + client.error];
+
+			return [
+				ok = true,
+				status = client.status(),
+				server_info = client.server_info,
+				capabilities = client.capabilities,
+				instructions = client.instructions,
+				tools = mcp_skill_tool_overview(client, args.geti("with_schema") == "1"),
+				resources = client.resources,
+				prompts = client.prompts,
+			];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_disconnect",
+		"Close an MCP connection (a stdio server process is terminated).",
+		[
+			name = "&string(): Name of the connection",
+		],
+		[](agt, args)
+		{
+			if(!mcp_client_disconnect(std.string(args.geti("name"))))
+				return [ok = false, error = "No MCP connection with that name."];
+
+			return [ok = true, status = "Disconnected."];
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// Discovery
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"mcp_list_tools",
+		"List the tools of an MCP server (name, description, and with with_schema=1 the JSON input schema).",
+		[
+			name = "&string(): Name of the connection",
+			with_schema = "int(0,1): OPTIONAL include the JSON input schema of every tool",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.list_tools();
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message)];
+
+			return [ok = true, tools = mcp_skill_tool_overview(client, args.geti("with_schema") == "1")];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_list_resources",
+		"List the resources of an MCP server (uri, name, description, mimeType). Read one with mcp_read_resource.",
+		[
+			name = "&string(): Name of the connection",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.list_resources();
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message)];
+
+			return [ok = true, resources = client.resources];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_list_prompts",
+		"List the prompt templates of an MCP server (name, description, arguments). Get one with mcp_get_prompt.",
+		[
+			name = "&string(): Name of the connection",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.list_prompts();
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message)];
+
+			return [ok = true, prompts = client.prompts];
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// Work
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"mcp_call_tool",
+		"Call one tool of an MCP server and return its text result.\n\n'arguments' is a json object (or a json string) that matches the input schema of the tool; see mcp_list_tools with with_schema=1.",
+		[
+			name = "&string(): Name of the connection",
+			tool = "&string(): Name of the remote tool",
+			arguments = "any(): OPTIONAL Tool arguments as json object (default: none)",
+			with_image = "int(0,1): OPTIONAL 1 to show image/audio results to yourself (this ends the current run, the agent continues with the image)",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.call_tool(std.string(args.geti("tool")), args.geti("arguments"));
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message), code = res.error.geti("code")];
+
+			images = mcp_client_content_images(res.result);
+
+			if(images.size() && args.geti("with_image") == "1")
+			{
+				img = images[0];
+
+				ext = std.string(img.mimeType).removeprefix("image/");
+				if(!ext)
+					ext = "png";
+
+				return agt.inject_visual_prompt(std.base64_decode(img.data), ext, "Image result of the MCP tool '" + std.string(args.geti("tool")) + "' from server '" + std.string(args.geti("name")) + "'.");
+			}
+
+			return [ok = true, result = mcp_skill_cut(res.text), images = images.size()];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_read_resource",
+		"Read one resource of an MCP server by uri (see mcp_list_resources).",
+		[
+			name = "&string(): Name of the connection",
+			uri = "&string(): The resource uri, e.g. 'file:///notes/welcome.txt'",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.read_resource(std.string(args.geti("uri")));
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message)];
+
+			return [ok = true, content = mcp_skill_cut(res.text)];
+		}
+	);
+
+	agt.add_tool(
+		"mcp_get_prompt",
+		"Render one prompt template of an MCP server (see mcp_list_prompts for the argument names).",
+		[
+			name = "&string(): Name of the connection",
+			prompt = "&string(): Name of the prompt",
+			arguments = "any(): OPTIONAL Prompt arguments as json object",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			res = client.get_prompt(std.string(args.geti("prompt")), args.geti("arguments"));
+
+			if(!res.ok)
+				return [ok = false, error = std.string(res.error.message)];
+
+			return [ok = true, prompt = mcp_skill_cut(res.text)];
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// Dynamic tool exposure
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"mcp_expose_tools",
+		"Expose tools of an MCP server as real agent tools you can call directly (they appear as 'mcp_<server>_<tool>').\n\nCall this after mcp_connect with the tools you need. Pass tools = ['*'] to expose every tool of the server.\n\nExposed tools are registered in your own toolset, so you can call them like any other tool in the same run.",
+		[
+			name = "&string(): Name of the connection",
+			tools = "&array(string): Remote tool names to expose, ['*'] for all of them",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			server = std.string(args.geti("name"));
+			wanted = args.geti("tools");
+
+			if(!std.is_list(wanted))
+				wanted = [std.string(wanted)];
+
+			all = wanted.has_value("*");
+
+			by_name = [];
+			for(i = 0; i < client.tools.size(); i++)
+				by_name[std.string(client.tools[i].geti("name"))] = client.tools[i];
+
+			exposed = [];
+			failed = [];
+
+			for(i = 0; i < wanted.size(); i++)
+			{
+				remote = std.string(wanted[i]);
+
+				if(remote == "*")
+					continue;
+
+				if(!by_name.has(remote))
+					failed.push_back([tool = remote, error = "The server has no tool with that name."]);
+			}
+
+			names = [];
+
+			if(all)
+			{
+				for(i = 0; i < by_name.size(); i++)
+					names.push_back(by_name.key(i));
+			}
+			else
+			{
+				for(i = 0; i < wanted.size(); i++)
+				{
+					remote = std.string(wanted[i]);
+					if(remote != "*" && by_name.has(remote))
+						names.push_back(remote);
+				}
+			}
+
+			for(i = 0; i < names.size(); i++)
+			{
+				remote = names[i];
+				tool = by_name[remote];
+
+				tool_name = mcp_skill_tool_name(server, remote);
+
+				if(client.exposed.has(remote) || mcp_skill_has_tool(agt, tool_name))
+				{
+					exposed.push_back([tool = remote, agent_tool = tool_name, status = "already exposed"]);
+					client.exposed[remote] = tool_name;
+					continue;
+				}
+
+				agt.add_tool(
+					tool_name,
+					"MCP tool of the server '" + server + "': " + std.string(tool.geti("description")),
+					mcp_schema_params(tool.geti("inputSchema")),
+					[client, remote](agt, p)
+					{
+						res = client.call_tool(remote, p);
+
+						if(!res.ok)
+							return [ok = false, error = std.string(res.error.message), code = res.error.geti("code")];
+
+						blocks = res.result.geti("content");
+
+						return [ok = true, result = mcp_skill_cut(res.text), images = std.is_json(blocks) ? blocks.size() : 0];
+					}
+				);
+
+				client.exposed[remote] = tool_name;
+
+				exposed.push_back([tool = remote, agent_tool = tool_name, status = "exposed"]);
+			}
+
+			result = [
+				ok = exposed.size() > 0,
+				exposed = exposed,
+				note = "Call them directly, they are now part of your tools.",
+			];
+
+			if(failed.size())
+			{
+				result.failed = failed;
+				result.available_tools = mcp_skill_tool_overview(client, false);
+			}
+
+			return result;
+		}
+	);
+
+	agt.add_tool(
+		"mcp_refresh",
+		"Re-read the tools, resources and prompts of an MCP server (a server may add them while it runs).",
+		[
+			name = "&string(): Name of the connection",
+		],
+		[](agt, args)
+		{
+			client = mcp_client_get(std.string(args.geti("name")));
+
+			if(!client)
+				return [ok = false, error = "No MCP connection with that name."];
+
+			if(!client.connected)
+				return [ok = false, error = "The connection is closed: " + client.error];
+
+			client.refresh();
+
+			return [
+				ok = true,
+				tools = mcp_skill_tool_overview(client, false),
+				resources = client.resources,
+				prompts = client.prompts,
+			];
+		}
+	);
+}
