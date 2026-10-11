@@ -120,38 +120,139 @@ server.tools.add_tool(
 	}
 );
 
+// ---------------------------------------------------------------------------
+// Issue #234: the syntax checker and the debugger used to run
+//     std.system("shz --check " + args.path + " > " + tmp.path())
+// which had two problems:
+//   1. Every diagnostic (syntax errors, runtime errors) goes to STDERR, and
+//      the shell redirect only captured STDOUT. A broken file therefore
+//      produced an EMPTY tool result that looked like a successful check.
+//   2. args.path comes from the MCP client and was pasted into the shell
+//      command unquoted, so a path containing ';' or '$(...)' ran arbitrary
+//      commands.
+// The helpers below capture stdout AND stderr (std.system capture mode
+// merges them), quote the path for the platform, refuse paths that contain
+// shell metacharacters, and report the exit code back to the client.
+// ---------------------------------------------------------------------------
+
+//Quote a path for the shell of the current platform.
+shz_quote_path(path)
+{
+	p = std.string(path);
+	plat = std.string(std.os_platform());
+	windows = plat.contains("windows");
+	if (windows)
+		return "\"" + p + "\"";
+	return "'" + p + "'";
+}
+
+//Validate a client supplied path. Returns "" when it is safe to run,
+//otherwise the reason it was refused.
+shz_check_path_arg(path)
+{
+	if (!path)
+		return "Missing 'path' argument.";
+	p = std.string(path);
+	if (p.size() == 0)
+		return "The 'path' argument is empty.";
+	bad = [ ";", "&", "|", "$", "`", "<", ">", "(", ")", "\n", "\r", "\"", "'", "\\" ];
+	for (i = 0; i < bad.size(); i++)
+	{
+		found = p.contains(bad[i]);
+		if (found)
+			return "The path contains the shell metacharacter '" + bad[i] + "'. Refusing to run it.";
+	}
+	return "";
+}
+
+//Run the shizoscript executable (the one this server runs in, not whatever
+//happens to be on PATH) with the given arguments.
+//Returns [ exit_code, output ] where output is stdout AND stderr merged.
+//The exit code travels in a marker line appended after a newline: on Windows
+//the command runs inside a generated .bat, so the echo is its own batch line
+//and %ERRORLEVEL% expands at execution time; on POSIX the capture wrapper
+//keeps the whole command in one shell, so $? is the exit code of the run.
+shz_run_shz(arguments)
+{
+	command = shz_quote_path(std.local_executable()) + " " + arguments;
+	plat = std.string(std.os_platform());
+	windows = plat.contains("windows");
+	if (windows)
+		command = command + "\necho [shz_exit:%ERRORLEVEL%]";
+	if (windows == false)
+		command = command + "\necho \"[shz_exit:$?]\"";
+
+	out = std.system(command, 1, 0);
+
+	text = std.string(out);
+	code = -1;
+	marker = "[shz_exit:";
+	idx = text.rfind(marker);
+	if (idx >= 0)
+	{
+		tail = text.substr(idx + marker.size());
+		end = tail.find("]");
+		digits = tail;
+		if (end >= 0)
+			digits = tail.substr(0, end);
+		code = std.int(digits);
+		text = text.substr(0, idx);
+	}
+	result = std.string(text);
+	return [ exit_code = code, output = result.trim() ];
+}
+
+//Format a tool result: the captured output plus the exit code, and a
+//non-empty placeholder when there was no output at all (an empty result is
+//exactly what made a broken file look fine).
+shz_format_run(r, empty_text)
+{
+	text = r.output;
+	if (text.size() == 0)
+		text = empty_text;
+	return text + "\nExit code: " + std.string(r.exit_code);
+}
+
 server.tools.add_tool(
 	"shizoscript_syntax_checker",
-	"Check the syntax of a script file, without running it",
+	"Check the syntax of a script file, without running it. Returns the compiler output (stdout and stderr) and the exit code; exit code 0 means the file compiles.",
 	[
 		path = "&string(): Path of the script file to check",
 	],
 	[](svr, args)
 	{
-		managed tmp = tempfile.tempfile();
-		
-		std.system("shz --check " + args.path + " > " + tmp.path());
-		
-		return tmp.read();
+		reject = shz_check_path_arg(args.path);
+		if (reject)
+			return "Error: " + reject;
+
+		r = shz_run_shz("--check " + shz_quote_path(args.path));
+
+		return shz_format_run(r, "Syntax check passed: no output.");
 	}
 );
 
 server.tools.add_tool(
 	"shizoscript_debugger",
-	"Debug a script file by running it",
+	"Debug a script file by running it. Returns the program output (stdout and stderr) and the exit code.",
 	[
 		path = "&string(): Path of the script file to check",
 		run_duration = "&int(1,60): Duration that the script should run for this test",
 	],
 	[](svr, args)
 	{
-		captured_out = "";
-		
-		managed tmp = tempfile.tempfile();
-		
-		std.system("shz --testrun " + args.run_duration + " " + args.path + " > " + tmp.path());
-	
-		return tmp.read();
+		reject = shz_check_path_arg(args.path);
+		if (reject)
+			return "Error: " + reject;
+
+		duration = std.int(args.run_duration);
+		if (duration < 1)
+			duration = 1;
+		if (duration > 60)
+			duration = 60;
+
+		r = shz_run_shz("--testrun " + std.string(duration) + " " + shz_quote_path(args.path));
+
+		return shz_format_run(r, "(no output)");
 	}
 );
 
