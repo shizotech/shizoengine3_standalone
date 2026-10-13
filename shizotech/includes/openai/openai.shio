@@ -16,8 +16,6 @@ class openai_stream
 	stream_raw = "";
 	repetition_check = 0;
 	
-	last_usage = None;
-	
 	__init__(
 		api_url, 
 		auth_token = "none"
@@ -27,23 +25,7 @@ class openai_stream
 	}
 	
 	__deinit__() {
-		if(stream_curl)
-			std.free(stream_curl);
 		
-		try {
-			if(last_usage ?? false) {
-				token_usage_global = std.global("_global_token_usage");
-				
-				if(!token_usage_global["usage"].prompt_tokens) token_usage_global["usage"].prompt_tokens = 0;
-				if(!token_usage_global["usage"].completion_tokens) token_usage_global["usage"].completion_tokens = 0;
-				if(!token_usage_global["usage"].total_tokens) token_usage_global["usage"].total_tokens = 0;
-				
-				token_usage_global["usage"].prompt_tokens += last_usage.prompt_tokens;
-				token_usage_global["usage"].completion_tokens += last_usage.completion_tokens;
-				token_usage_global["usage"].total_tokens += last_usage.total_tokens;
-			}
-		}
-		catch(e) {}
 	}
 	
 	get_models() {
@@ -79,29 +61,11 @@ class openai_stream
 		return None;
 	}
 	
-	start(sub_url, body, method = "POST")
+	start(sub_url, body, method = "POST", reset_stop = true)
 	{
-		_stop_stream = false;
+		if(reset_stop)
+			_stop_stream = false;
 		
-		try {
-			if(last_usage ?? false) {
-				token_usage_global = std.global("_global_token_usage");
-				
-				if(!token_usage_global["usage"].prompt_tokens) token_usage_global["usage"].prompt_tokens = 0;
-				if(!token_usage_global["usage"].completion_tokens) token_usage_global["usage"].completion_tokens = 0;
-				if(!token_usage_global["usage"].total_tokens) token_usage_global["usage"].total_tokens = 0;
-				
-				token_usage_global["usage"].prompt_tokens += last_usage.prompt_tokens;
-				token_usage_global["usage"].completion_tokens += last_usage.completion_tokens;
-				token_usage_global["usage"].total_tokens += last_usage.total_tokens;
-				
-				last_usage = None;
-			}
-		}
-		catch(e) {}
-		
-		//_body = *body;
-	
 		headers = [
 		  "Content-Type" = "application/json",
 		  "Authorization" = "Bearer " + auth_token,
@@ -126,136 +90,150 @@ class openai_stream
 	
 	poll()
 	{
-		if(!stream_curl)
-			std.error("No stream!");
-			return None;
-		
-		if(_stop_stream)
-			//std.error("Stream stopped!");
-			return None;
-		
-		raw_chunk = "";
-		
 		for(1) {
+		
+			if(!stream_curl)
+				std.error("No stream!");
+				return None;
+			
 			if(_stop_stream)
 				//std.error("Stream stopped!");
 				return None;
 			
-			temp_chunk = stream_curl.poll_stream();
-			if(!temp_chunk) {
-				if(_chunked_stream.empty()) //Still process rest of buffer...
+			raw_chunk = "";
+			
+			for(1) {
+				if(_stop_stream)
+					//std.error("Stream stopped!");
 					return None;
-				break;
+				
+				temp_chunk = stream_curl.poll_stream();
+				if(std.is_none(temp_chunk)) {
+					break;
+				}
+				
+				_chunked_stream += std.string(temp_chunk);
+				//Check for SSE event end \n
+				if(_chunked_stream.contains("\n"))
+					break;
 			}
 			
-			_chunked_stream += std.string(temp_chunk);
-			//Check for SSE event end \n
-			if(_chunked_stream.contains("\n"))
-				break;
-		}
-		
-		if(_stop_stream)
-			//std.error("Stream stopped!");
-			return None;
-		
-		endline_index = _chunked_stream.find("\n");
-		if(endline_index >= 0) {
-			raw_chunk = _chunked_stream.substr(0, endline_index);
-			_chunked_stream = _chunked_stream.substr(endline_index).ltrim();
-		}
-		else {
-			raw_chunk = _chunked_stream;
-			_chunked_stream = "";
-		}
-
-		if(raw_chunk.empty())
-			//std.error("Cannot get raw chunk.");
-			std.error("Response was empty!");
-			return None;
-
-		stream_raw += raw_chunk;
-		
-		_last_raw = raw_chunk;
-		
-		raw_chunk = raw_chunk.removeprefix("data: ");
-		
-		if(raw_chunk.starts("[DONE]"))
-			return None;
-		
-		chunk = std.json(raw_chunk, true);
-
-		//Llama cpp sometimes does weird things (like sending " : ")
-		if(!chunk)
-			continue;
-		
-		if(chunk.error ?? false)
-		{
-			std.error("Chunk error (2): ", chunk.error.message);
-			return None;
-		}
-		
-		check_reasoning = false;
-		check_content = false;
-		
-		if(chunk.choices ?? false)
-		{		
-			if(std.is_json(chunk.choices) && chunk.choices.size() >= 1)
-			{
-				if(chunk.choices[0].delta.reasoning_content)
-					stream_reasoning += chunk.choices[0].delta.reasoning_content;
-					check_reasoning = true;
-				if(chunk.choices[0].delta.reasoning) // ??? idk when they changed that
-					stream_reasoning += chunk.choices[0].delta.reasoning;
-					check_reasoning = true;
-				if(chunk.choices[0].delta.content)
-					stream_content += chunk.choices[0].delta.content;
-					check_content = true;
-				if(chunk.choices[0].text)
-					stream_text += chunk.choices[0].text;
+			if(_stop_stream)
+				//std.error("Stream stopped!");
+				return None;
+			
+			endline_index = _chunked_stream.find("\n");
+			if(endline_index >= 0) {
+				raw_chunk = _chunked_stream.substr(0, endline_index);
+				_chunked_stream = _chunked_stream.substr(endline_index).ltrim();
 			}
 			else {
-				std.error("Chunk error (3): ", chunk.error.message);
-				return None;
+				raw_chunk = _chunked_stream;
+				_chunked_stream = "";
 			}
-		}
 
-		last_usage = chunk.usage;
+			if(raw_chunk.empty())
+				return None;
 
-		length_per_step = 10;
-		
-		max_repeat = repetition_check == 0 ? 500 : 50; 
-		
-		if(check_reasoning) {
-			if(loop_detect(
-				stream_reasoning, 
-				repetition_check * length_per_step, 
-				(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
-			) {
-				std.error("Endless repetition check triggered.");
-				stop();
+			stream_raw += raw_chunk;
+			
+			_last_raw = raw_chunk;
+			
+			raw_chunk = raw_chunk.removeprefix("data: ");
+			
+			if(raw_chunk.starts("[DONE]"))
+				return None;
+			
+			chunk = std.json(raw_chunk, true);
+
+			//Llama cpp sometimes does weird things (like sending " : ")
+			if(!chunk)
+				continue;
+			
+			if(chunk.error ?? false)
+			{
+				std.error("Chunk error (2): ", chunk.error.message);
 				return None;
 			}
-		}
-		
-		if(check_content) {
-			if(loop_detect(
-				stream_content, 
-				repetition_check * length_per_step, 
-				(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
-			) {
-				std.error("Endless repetition check triggered.");
-				stop();
-				return None;
+			
+			try {
+				token_usage_global = std.global("_global_token_usage");
+				
+				last_usage = chunk.usage;
+				
+				if(!token_usage_global["usage"].prompt_tokens) token_usage_global["usage"].prompt_tokens = 0;
+				if(!token_usage_global["usage"].completion_tokens) token_usage_global["usage"].completion_tokens = 0;
+				if(!token_usage_global["usage"].total_tokens) token_usage_global["usage"].total_tokens = 0;
+				
+				token_usage_global["usage"].prompt_tokens += last_usage.prompt_tokens;
+				token_usage_global["usage"].completion_tokens += last_usage.completion_tokens;
+				token_usage_global["usage"].total_tokens += last_usage.total_tokens;
 			}
+			catch(e) {}
+			
+			check_reasoning = false;
+			check_content = false;
+			
+			if(chunk.choices ?? false)
+			{		
+				if(std.is_json(chunk.choices) && chunk.choices.size() >= 1)
+				{
+					if(chunk.choices[0].delta.reasoning_content)
+						stream_reasoning += chunk.choices[0].delta.reasoning_content;
+						check_reasoning = true;
+					if(chunk.choices[0].delta.reasoning) // ??? idk when they changed that
+						stream_reasoning += chunk.choices[0].delta.reasoning;
+						check_reasoning = true;
+					if(chunk.choices[0].delta.content)
+						stream_content += chunk.choices[0].delta.content;
+						check_content = true;
+					if(chunk.choices[0].text)
+						stream_text += chunk.choices[0].text;
+				}
+				else {
+					std.error("Chunk error (3): ", chunk.error.message);
+					return None;
+				}
+			}
+			else
+				continue;
+
+			length_per_step = 10;
+			
+			max_repeat = repetition_check == 0 ? 500 : 50; 
+			
+			if(check_reasoning) {
+				if(loop_detect(
+					stream_reasoning, 
+					repetition_check * length_per_step, 
+					(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
+				) {
+					std.error("Endless repetition check triggered.");
+					stop();
+					return None;
+				}
+			}
+			
+			if(check_content) {
+				if(loop_detect(
+					stream_content, 
+					repetition_check * length_per_step, 
+					(repetition_check+1) * length_per_step, max_repeat) >= max_repeat
+				) {
+					std.error("Endless repetition check triggered.");
+					stop();
+					return None;
+				}
+			}
+			
+			if(check_reasoning || check_content)
+				repetition_check++;
+			
+			if(repetition_check >= 10)
+				repetition_check = 0;
+			
+			return chunk;
 		}
-		
-		if(check_reasoning || check_content)
-			repetition_check++;
-		
-		if(repetition_check >= 10)
-			repetition_check = 0;
-		
-		return chunk;
 	}
 	
 	answer()
@@ -346,8 +324,6 @@ class openai_api
 	on_text = None;
 	on_tool = None;
 	
-	pre_answer = "";
-	
 	__init__(
 		api_url, 
 		model = None,
@@ -433,10 +409,8 @@ class openai_api
 		add_image_raw(fileio.read_file(path), ext);
 	}
 	
-	ask(prompt)
+	ask(prompt, pre_answer = "")
 	{
-		_force_stop = false;
-		
 		prompt = prompt.rstrip_lines();
 		
 		if(body.messages && body.messages[-1].role == "user") {
@@ -492,11 +466,8 @@ class openai_api
 			std.error("Prompt too long.");
 			return None;
 		
-		has_preanswer = false;
-		
 		if(pre_answer)
 		{
-			has_preanswer = true;
 			body.add_generation_prompt = json.bool(false);
 			body.continue_final_message = json.bool(true);
 			body.messages.push_back(
@@ -505,53 +476,73 @@ class openai_api
 		}
 		else
 		{
-			has_preanswer = false;
 			body.add_generation_prompt = json.bool(true);
 			body.continue_final_message = json.bool(false);
 		}
 		
-		pre_answer = "";
+		completion_finished = false;
+		completion_tries = 0;
+		full_answer = "";
 		
-		stream.start("/v1/chat/completions", body);
+		for(!completion_finished) {
+			
+			if(completion_tries) {
+				std.sleep(1000);
+				std.print("Retry #" + completion_tries);
+			}
+			
+			stream.start("/v1/chat/completions", body, "POST", completion_tries == 0);
+			
+			completion_tries++;
+			
+			for (chunk = stream.poll()) {
+				
+				delta = chunk.choices[0].delta;
+				finish_reason = chunk.choices[0].finish_reason;
+				
+				if(delta.reasoning_content && std.is_function(on_reason))
+					on_reason(delta.reasoning_content);
+				else if(delta.reasoning && std.is_function(on_reason))
+					on_reason(delta.reasoning);
+				if(delta.content && std.is_function(on_text))
+					on_text(delta.content);
+				
+				if(stream._stop_stream)
+					break;
+				
+				if(finish_reason == "stop" || finish_reason == "length" || finish_reason == "tool_calls" || finish_reason == "content_filter")
+					completion_finished = true;
+					break;
+			}
+			
+			answer_content = stream.answer();
+			
+			if(body.messages[-1].role == "assistant") {
+				body.messages[-1].content += answer_content.content;
+			}
+			else {
+				body.messages.push_back(
+						["role" = "assistant", "content" = answer_content.content]
+					);
+			}
+			
+			if(answer_content.reasoning)
+				body.messages[-1].reasoning_content = answer_content.reasoning;
 		
-		for (chunk = stream.poll()) {
+			body.add_generation_prompt = json.bool(false);
+			body.continue_final_message = json.bool(true);
 			
-			if(!chunk.choices)
-				break;
+			full_answer += answer_content.content;
 			
-			delta = &chunk.choices[0].delta;
-			if(delta.reasoning_content && std.is_function(on_reason))
-				on_reason(delta.reasoning_content);
-			else if(delta.reasoning && std.is_function(on_reason))
-				on_reason(delta.reasoning);
-			if(delta.content && std.is_function(on_text))
-				on_text(delta.content);
-			
-			if(_force_stop)
-				break;
+			if(stream._stop_stream)
+				return full_answer;
 		}
 		
-		answer_content = stream.answer();
-		
-		if(has_preanswer) {
-			body.messages[-1].content += answer_content.content;
-		}
-		else {
-			body.messages.push_back(
-					["role" = "assistant", "content" = answer_content.content]
-				);
-		}
-		
-		if(answer_content.reasoning)
-			body.messages[-1].reasoning_content = answer_content.reasoning;
-		
-		return answer_content.content;
+		return full_answer;
 	}
 
-	task(prompt, _toolset = None)
+	task(prompt, _toolset = None, pre_answer = "")
 	{	
-		_force_stop = false;
-		
 		if(std.is_string(prompt))
 			prompt = prompt.rstrip_lines();
 	
@@ -623,251 +614,237 @@ class openai_api
 		}
 		else
 		{
-			has_preanswer = false;
 			body.add_generation_prompt = json.bool(true);
 			body.continue_final_message = json.bool(false);
 		}
+		
+		completion_finished = false;
+		completion_tries = 0;
+		full_answer = "";
+		
+		for(!completion_finished) {
 			
-		pre_answer = "";
-		
-		parallel_tool_calls = std.json();
-		
-		streamed_response = "";
-		
-		stream_errors = 0;
-		
-		stream.start("/v1/chat/completions", body);
-		
-		for (chunk = stream.poll()) {
-		
-			if(!chunk)
-				std.error("streaming error!");
-				stream_errors++;
-				if(stream_errors == 10)
-					break;
-				continue;
-		
-			stream_errors = 0;
-		
-			if(!chunk.choices)
-				break;
-		
-			delta = None;
-		
-			//Sometimes weird things happen...
-			try {
-				delta = &chunk.choices[0].delta;
-			}
-			catch(e) {
-				std.error("Catched streaming error.\n");
-				std.error(stream._last_raw);
-				//std.input();
-				continue;
+			if(completion_tries) {
+				std.sleep(1000);
+				std.print("Retry #" + completion_tries);
 			}
 			
-			finish_reason = chunk.choices[0].finish_reason ?? "";
-			streamed_response += delta.content ?? "";
+			stream.start("/v1/chat/completions", body, "POST", completion_tries == 0);
 			
-			if(delta.reasoning_content && std.is_function(on_reason))
-				on_reason(delta.reasoning_content);
-			else if(delta.reasoning && std.is_function(on_reason))
-				on_reason(delta.reasoning);
-			if(delta.content && std.is_function(on_text))
-				on_text(delta.content);
-					
-			if(delta.tool_calls)
-			{	
-				if(parallel_tool_calls.size() < delta.tool_calls.size())
-				{
-					parallel_tool_calls.push_back([
-						calls = None
-					]);
-				}
-
-				for(i = 0; i < delta.tool_calls.size(); i++)
-				{
-					tool_call = &delta.tool_calls[i];
-					
-					if(!tool_call.function)
-						continue;
-					
-					calls = &parallel_tool_calls[i].calls;
-					
-					if(tool_call.index >= calls.size())
+			completion_tries++;
+			
+			parallel_tool_calls = std.json();
+			
+			streamed_response = "";
+			streamed_reasoning = "";
+			
+			for (chunk = stream.poll()) {
+			
+				delta = chunk.choices[0].delta;
+				finish_reason = chunk.choices[0].finish_reason ?? "";
+				streamed_response += delta.content ?? "";
+				if(delta.reasoning_content ?? false)
+					streamed_reasoning += delta.reasoning_content ?? "";
+				else
+					streamed_reasoning += delta.reasoning ?? "";
+				
+				if(delta.reasoning_content && std.is_function(on_reason))
+					on_reason(delta.reasoning_content);
+				else if(delta.reasoning && std.is_function(on_reason))
+					on_reason(delta.reasoning);
+				if(delta.content && std.is_function(on_text))
+					on_text(delta.content);
+						
+				if(delta.tool_calls)
+				{	
+					if(parallel_tool_calls.size() < delta.tool_calls.size())
 					{
-						calls.push_back([
-							name="", 
-							arguments="",
+						parallel_tool_calls.push_back([
+							calls = None
 						]);
 					}
-					
-					last_call = &calls[calls.size()-1];
-					
-					if(delta.tool_calls[i].id ?? false)
-						last_call.id = tool_call.id;
-					
-					last_call.name += tool_call.function.name ?? "";
-					last_call.arguments += tool_call.function.arguments ?? "";
-				}
-				
-				if(!finish_reason)
-					continue;
-			}
-			
-			if(parallel_tool_calls.size() || finish_reason == "tool_calls")
-			{
-				assistant_tool_calls = [];
-				tool_results = [];
-				
-				for(i = 0; i < parallel_tool_calls.size(); i++)
-				{	
-					tool_wait = [];
 
-					for(j = 0; j < parallel_tool_calls[i].calls.size(); j++)
+					for(i = 0; i < delta.tool_calls.size(); i++)
 					{
-						tool_name = parallel_tool_calls[i].calls[j].name;
-						tool_arguments = std.json(parallel_tool_calls[i].calls[j].arguments);
-						tool_callid = parallel_tool_calls[i].calls[j].id;
+						tool_call = &delta.tool_calls[i];
 						
-						tool_def_arguments = this.ts.find_tool(tool_name);
-						
-						if(!tool_name)
+						if(!tool_call.function)
 							continue;
 						
-						//Call tools, restart stream.
-						if(std.is_function(on_tool))
-							on_tool(tool_name, tool_arguments);
+						calls = &parallel_tool_calls[i].calls;
+						
+						if(tool_call.index >= calls.size())
+						{
+							calls.push_back([
+								name="", 
+								arguments="",
+							]);
+						}
+						
+						last_call = &calls[calls.size()-1];
+						
+						if(delta.tool_calls[i].id ?? false)
+							last_call.id = tool_call.id;
+						
+						last_call.name += tool_call.function.name ?? "";
+						last_call.arguments += tool_call.function.arguments ?? "";
+					}
 					
-						tool_results.push_back([
-							result = "",
-							id = tool_callid,
-						]);
-						
-						assistant_tool_calls.push_back([
-							id = std.string(tool_callid),
-							type = "function",
-							function = [
-								name = std.string(tool_name),
-								arguments = std.string(tool_arguments),
-							]
-						]);
-						
-						tool_result_index = tool_results.size() - 1;
-						
-						tool_thread_fn = [this, &tool_results, tool_name, tool_arguments, tool_result_index]() {
-							
-							tool_result = None;
-						
-							try {
-								if(this.ts.tool_callbacks.has(tool_name)) {
-									tool_result = this.ts.tool_callbacks[tool_name](tool_arguments);
-								}
-								else
-								{
-									tool_result = [
-										error = "The tool you tried to call does not exist.",
-										available_tools = this.ts.tools,
-									];
-								}
-							}
-							catch(e) {
-								//std.error("Tool error: ", e);
-								if(this.ts.tool_callbacks.has(tool_name))
-									tool_result = "The tool encountered an unexpected error.\nMaybe check your arguments and try again.\nTool definition:\n" + this.ts.find_tool(tool_name);
-								else
-								{
-									tool_result = [
-										error = "The tool you tried to call does not exist.",
-										available_tools = this.ts.tools,
-									];
-								}
-							}
-							
-							if(!tool_result)
-								tool_result = "";
-						
-							tool_results[tool_result_index].result = std.string(tool_result);
-						};
-						
-						tool_thread = std.thread(tool_thread_fn);
-						tool_wait.push_back(tool_thread);	
-						tool_thread.run();
-					}
-				
-					for(j = 0; j < tool_wait.size(); j++) {
-						tool_wait[j].join();
-					}
+					if(!finish_reason)
+						continue;
 				}
 				
-				if(has_preanswer) {
-					body.messages[-1].content += streamed_response;
-				}
-				else {
-					body.messages.push_back(
-						["role" = "assistant", "content" = streamed_response]
-					);
-				}
-				
-				if(assistant_tool_calls) {					
-					body.messages[-1].tool_calls = assistant_tool_calls;
-				}
-				
-				for(i = 0; i < tool_results.size(); i++)
+				if(parallel_tool_calls.size() || finish_reason == "tool_calls")
 				{
-					body.messages.push_back(
-						[role = "tool", tool_call_id = tool_results[i].id, content = tool_results[i].result]
-					);
-				}
-				
-				parallel_tool_calls = std.json();	
-				streamed_response = "";
-				
-				//If any toolcall set a custom pre_answer.. handle that here
-				if(pre_answer)
-				{
-					has_preanswer = true;
-					body.add_generation_prompt = json.bool(false);
-					body.continue_final_message = json.bool(true);
-					body.messages.push_back(
-							["role" = "assistant", "content" = pre_answer]
+					assistant_tool_calls = [];
+					tool_results = [];
+					
+					for(i = 0; i < parallel_tool_calls.size(); i++)
+					{	
+						tool_wait = [];
+
+						for(j = 0; j < parallel_tool_calls[i].calls.size(); j++)
+						{
+							tool_name = parallel_tool_calls[i].calls[j].name;
+							tool_arguments = std.json(parallel_tool_calls[i].calls[j].arguments);
+							tool_callid = parallel_tool_calls[i].calls[j].id;
+							
+							tool_def_arguments = this.ts.find_tool(tool_name);
+							
+							if(!tool_name)
+								continue;
+							
+							//Call tools, restart stream.
+							if(std.is_function(on_tool))
+								on_tool(tool_name, tool_arguments);
+						
+							tool_results.push_back([
+								result = "",
+								id = tool_callid,
+							]);
+							
+							assistant_tool_calls.push_back([
+								id = std.string(tool_callid),
+								type = "function",
+								function = [
+									name = std.string(tool_name),
+									arguments = std.string(tool_arguments),
+								]
+							]);
+							
+							tool_result_index = tool_results.size() - 1;
+							
+							tool_thread_fn = [this, &tool_results, tool_name, tool_arguments, tool_result_index]() {
+								
+								tool_result = None;
+							
+								try {
+									if(this.ts.tool_callbacks.has(tool_name)) {
+										tool_result = this.ts.tool_callbacks[tool_name](tool_arguments);
+									}
+									else
+									{
+										tool_result = [
+											error = "The tool you tried to call does not exist.",
+											available_tools = this.ts.tools,
+										];
+									}
+								}
+								catch(e) {
+									//std.error("Tool error: ", e);
+									if(this.ts.tool_callbacks.has(tool_name))
+										tool_result = "The tool encountered an unexpected error.\nMaybe check your arguments and try again.\nTool definition:\n" + this.ts.find_tool(tool_name);
+									else
+									{
+										tool_result = [
+											error = "The tool you tried to call does not exist.",
+											available_tools = this.ts.tools,
+										];
+									}
+								}
+								
+								if(!tool_result)
+									tool_result = "";
+							
+								tool_results[tool_result_index].result = std.string(tool_result);
+							};
+							
+							tool_thread = std.thread(tool_thread_fn);
+							tool_wait.push_back(tool_thread);	
+							tool_thread.run();
+						}
+					
+						for(j = 0; j < tool_wait.size(); j++) {
+							tool_wait[j].join();
+						}
+					}
+					
+					if(has_preanswer) {
+						body.messages[-1].content += streamed_response;
+						body.messages[-1].reasoning_content += streamed_reasoning;
+					}
+					else {
+						body.messages.push_back(
+							["role" = "assistant", "content" = streamed_response, "reasoning_content" = streamed_reasoning]
 						);
-				}
-				else
-				{
+					}
+					
 					has_preanswer = false;
+					
+					if(assistant_tool_calls) {					
+						body.messages[-1].tool_calls = assistant_tool_calls;
+					}
+					
+					for(i = 0; i < tool_results.size(); i++)
+					{
+						body.messages.push_back(
+							[role = "tool", tool_call_id = tool_results[i].id, content = tool_results[i].result]
+						);
+					}
+					
+					parallel_tool_calls = std.json();	
+					streamed_response = "";
+					streamed_reasoning = "";
+					
 					body.add_generation_prompt = json.bool(true);
 					body.continue_final_message = json.bool(false);
+					
+					if(stream._stop_stream)
+						break;
+					
+					stream.start("/v1/chat/completions", body, "POST", false);
+					
+					continue;
 				}
-				
-				if(_force_stop)
+			
+				if(stream._stop_stream)
 					break;
 				
-				pre_answer = "";
-				
-				stream.start("/v1/chat/completions", body);
-				
-				continue;
+				if(finish_reason == "stop" || finish_reason == "length" || finish_reason == "content_filter")
+					completion_finished = true;
+					break;
 			}
-		
-			if(_force_stop)
-				break;
-		}
 
-		if(has_preanswer) {
-			body.messages[-1].content += streamed_response;
-		}
-		else(streamed_response) {
-			body.messages.push_back(
-				["role" = "assistant", "content" = streamed_response]
-			);
-		}
-		
-		answer_content = stream.answer();
+			if(body.messages[-1].role == "assistant") {
+				body.messages[-1].content += streamed_response;
+				body.messages[-1].content += streamed_reasoning;
+			}
+			else {
+				body.messages.push_back(
+						["role" = "assistant", "content" = streamed_response, "reasoning_content" = streamed_reasoning]
+					);
+			}
+				
+			body.add_generation_prompt = json.bool(false);
+			body.continue_final_message = json.bool(true);
 			
-		if(answer_content.reasoning)
-			body.messages[-1].reasoning_content = answer_content.reasoning;
+			full_answer += streamed_response;
+			
+			if(stream._stop_stream)
+				return full_answer;
+		}
 		
-		return answer_content.content;		
+		return full_answer;		
 	}
 
 	get_json(prompt, schema)
@@ -1032,12 +1009,9 @@ class openai_api
 			stream.start("/props", _body, "GET");
 			token_count_info = stream.poll();
 			res = stream.answer();
-			
+			if(!token_count_info)
+				token_count_info = std.json(res.raw);
 			llama_n_ctx = token_count_info.default_generation_settings.n_ctx;
-			
-			if(!llama_n_ctx)
-				std.print("non vLLM or llama endpoint without /tokenize or /props ... using default 128k.");
-				llama_n_ctx = 128000;
 			
 			//Not vllm, use alternative approach and fixed context size for now
 			_body.stream = json.bool(true);
@@ -1049,6 +1023,10 @@ class openai_api
 			}
 			stream.stop();
 			res = stream.answer();
+			
+			if(!llama_n_ctx)
+				std.print("non vLLM or llama endpoint without /tokenize or /props ... using default 128k.");
+				llama_n_ctx = 128000;
 			
 			return [
 				tokens = token_count_info.usage.prompt_tokens,
@@ -1142,11 +1120,9 @@ class openai_api
 	}
 	
 	stop() {
-		_force_stop = true;
 		stream.stop();
 	}
 	
 	streamed_response = "";
-	_force_stop = false;
 }
 

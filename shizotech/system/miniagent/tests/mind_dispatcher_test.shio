@@ -1,0 +1,391 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Mind dispatcher tests (headless — no LLM endpoint required)
+//
+//  Run:  shz tests/mind_dispatcher_test.shio
+//
+//  Covers the dispatcher contract that makes the Receptionist non-blocking:
+//  event classification, one serialized run per Mind, stop signalling,
+//  post-run bookkeeping, the end-to-end loop against a host without a model
+//  endpoint (which must block truthfully, never spin, never fake a run), the
+//  notification consumer (consumed events are printed, never silently dropped,
+//  and the durable completion notification is discharged once) and direct
+//  delivery of a message into a live Mind agent via miniagent.send_prompt.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+#include "../runtime/mind_dispatcher"
+
+tests_passed = 0;
+tests_failed = 0;
+failures = [];
+
+check(name, cond, detail = "") {
+	if(cond) {
+		tests_passed++;
+		std.cout("  [ok]   ", name, "\n");
+		return;
+	}
+	tests_failed++;
+	failures.push_back(name + (detail ? " :: " + detail : ""));
+	std.cout("  [FAIL] ", name, " ", detail, "\n");
+}
+
+section(title) {
+	std.cout("\n== ", title, " ==\n");
+}
+
+// Mark every pending event of a Mind as processed (simulates delivery).
+drain(mind_id) {
+	pending = mind_pending_events(mind_id);
+	for(i = 0; i < pending.size(); i++)
+		mind_mark_event(pending[i].id, MIND_DELIVERY_PROCESSED, "test");
+	return pending.size();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.cout("\nMind dispatcher tests\n");
+
+test_root = ".agent/mind_test_disp_" + std.random_hash(6) + "/";
+
+mind_set_root(test_root);
+
+cfg = ModelConfig();
+
+section("Event classification: what starts a run, what does not");
+
+check("mind.created starts a run", mind_event_triggers_run("mind.created") == true);
+check("mind.message_received starts a run", mind_event_triggers_run("mind.message_received") == true);
+check("mind.recovered starts a run", mind_event_triggers_run("mind.recovered") == true);
+check("mind.progress never starts a run", mind_event_triggers_run("mind.progress") == false);
+check("mind.run_finished never starts a run", mind_event_triggers_run("mind.run_finished") == false);
+check("mind.started never starts a run (no self-triggering loop)", mind_event_triggers_run("mind.started") == false);
+check("mind.completed never starts a run", mind_event_triggers_run("mind.completed") == false);
+check("mind.stop_requested is a stop, not a run", mind_event_is_stop_request("mind.stop_requested") == true);
+check("mind.stop_requested does not start a run", mind_event_triggers_run("mind.stop_requested") == false);
+check("mind.blocked is informational", mind_event_is_informational("mind.blocked") == true);
+check("a stop request is not informational", mind_event_is_informational("mind.stop_requested") == false);
+
+section("Bounded invocation context (plan §7)");
+
+spawn = mind_spawn("Water the plants when the soil sensor reads below 30 percent", "user is on holiday", [request_id = "disp_1"]);
+id = spawn.mind_id;
+
+mind_update(id, [goal = "Water the plants when the soil sensor reads below 30 percent", execution_shape = "recurring", plan = [next_step = "find the sensor taskroute"]]);
+msg = mind_message(id, "only water the balcony plants", [kind = "instruction"]);
+
+evs = mind_events(id);
+created = evs[0];
+
+prompt = mind_run_prompt(created, id, "run_test_1");
+
+check("prompt names the mind", prompt.contains(id));
+check("prompt names the run", prompt.contains("run_test_1"));
+check("prompt carries the durable goal state", prompt.contains("goal_state") && prompt.contains("Water the plants"));
+check("prompt carries the triggering event", prompt.contains("triggering_event") && prompt.contains("mind.created"));
+check("prompt is bounded (no full transcript)", prompt.size() < 20000, "size=" + std.string(prompt.size()));
+
+section("Dispatcher step: informational events are consumed, triggers are not");
+
+steps_before = mind_dispatcher_state().steps;
+mind_dispatcher_step(None);
+
+progress_seen = false;
+pending_after = mind_pending_events(id);
+for(i = 0; i < pending_after.size(); i++)
+	if(pending_after[i].type == "mind.progress")
+		progress_seen = true;
+
+check("informational events are not left pending forever", !progress_seen);
+check("trigger events stay queued for a run", mind_event(created.id).delivery.status == MIND_DELIVERY_PENDING);
+check("the step did not create a run", mind_get(id).counters.runs == 0);
+check("the step advanced the dispatcher", mind_dispatcher_state().steps > steps_before);
+
+section("Launch guard: no model endpoint must block, not spin and not fake work");
+
+launch = mind_dispatcher_launch(None, created);
+
+check("launch refused without an endpoint", launch.ok == false && launch.error == "no_model_endpoint");
+check("no run record was created", mind_get(id).counters.runs == 0);
+check("the Mind is blocked with a truthful reason", mind_get(id).state == MIND_STATE_BLOCKED);
+check("the blocker names the missing capability", std.string(mind_get(id).state_reason).contains("model endpoint"));
+check("the event stays queued for redelivery", mind_event(created.id).delivery.status == MIND_DELIVERY_PENDING);
+
+section("Post-run bookkeeping: a Mind is never left running with no next event");
+
+id2 = mind_spawn("Summarize the changelog of last week", "", [request_id = "disp_2"]).mind_id;
+
+mind_set_state(id2, MIND_STATE_ACTIVE, "interpreting");
+run2 = mind_run_start(id2, "", [trigger = "mind.created"]);
+mind_run_end(run2.run_id, MIND_RUN_FINISHED, "bounded step done");
+
+post2 = mind_dispatcher_post_run(id2);
+check("a queued next event keeps the Mind active", mind_get(id2).state == MIND_STATE_ACTIVE && post2.status == "queued_next_event");
+
+drain(id2);
+
+post = mind_dispatcher_post_run(id2);
+check("active mind with no next event becomes waiting", mind_get(id2).state == MIND_STATE_WAITING, std.string(post));
+check("it records what it waits for", std.string(mind_get(id2).waiting_for).contains("next runtime event"));
+
+id3 = mind_spawn("Rename the release branch", "", [request_id = "disp_3"]).mind_id;
+mind_set_state(id3, MIND_STATE_ACTIVE, "interpreting");
+mind_report(id3, "completed", "renamed", "git branch -a shows release/2.0", true);
+mind_dispatcher_post_run(id3);
+check("a completed Mind is not touched by bookkeeping", mind_get(id3).state == MIND_STATE_COMPLETED);
+
+id4 = mind_spawn("Watch the build server", "", [request_id = "disp_4"]).mind_id;
+mind_set_state(id4, MIND_STATE_ACTIVE, "watching");
+mind_stop(id4, "user asked");
+mind_dispatcher_post_run(id4);
+check("a stop_requested Mind ends as stopped, never completed", mind_get(id4).state == MIND_STATE_STOPPED);
+check("the stop is not reported as completion", mind_get(id4).outcome.status == MIND_STATE_STOPPED);
+
+id5 = mind_spawn("Track the sensor", "", [request_id = "disp_5"]).mind_id;
+mind_set_state(id5, MIND_STATE_ACTIVE, "working");
+mind_set_state(id5, MIND_STATE_WAITING, "waiting for worker result", [waiting_for = "worker_7 result"]);
+mind_dispatcher_post_run(id5);
+check("an explicit wait_for is preserved", mind_get(id5).state == MIND_STATE_WAITING && mind_get(id5).waiting_for == "worker_7 result");
+
+section("Stop signalling: no active run means the stop is confirmed immediately");
+
+id6 = mind_spawn("Index the archive", "", [request_id = "disp_6"]).mind_id;
+mind_set_state(id6, MIND_STATE_ACTIVE, "indexing");
+mind_stop(id6, "user cancelled");
+handled = mind_dispatcher_handle_stop(id6);
+check("stop handled", handled.ok == true);
+check("stop confirmed because no run is active", mind_get(id6).state == MIND_STATE_STOPPED);
+check("the dispatcher tracks no running mind", mind_dispatcher_mind_running(id6) == false);
+check("the dispatcher has no active runs", mind_dispatcher_active_count() == 0);
+
+section("End-to-end loop against a host without a model endpoint");
+
+managed host = miniagent(cfg, "receptionist");
+
+started = mind_ensure_dispatcher(host);
+check("dispatcher starts", started.ok == true && started.status == "started");
+started2 = mind_ensure_dispatcher(host);
+check("dispatcher start is idempotent", started2.status == "already_running");
+
+id7 = mind_spawn("Send the weekly report to the team channel", "", [request_id = "disp_7"]).mind_id;
+
+// The loop must reach the new Mind. Poll with a bound: a dispatcher step costs
+// time per event (persist + notification), a fixed sleep is flaky.
+waited = 0;
+for(mind_get(id7).state != MIND_STATE_BLOCKED && waited < 10000) {
+	std.sleep(100);
+	waited += 100;
+}
+
+st = mind_dispatcher_status();
+check("dispatcher loop is alive", st.running == true);
+check("dispatcher performed steps", st.steps > 0, std.string(st.steps));
+check("no run was executed (no endpoint)", mind_get(id7).counters.runs == 0);
+check("the Mind ended up blocked, not silently idle", mind_get(id7).state == MIND_STATE_BLOCKED,
+	"state=" + std.string(mind_get(id7).state) + " waited_ms=" + std.string(waited));
+check("the dispatcher reports no active runs", st.active_runs == 0);
+check("the loop printed the events it consumed", st.events_printed > 0, std.string(st.events_printed));
+
+mind_dispatcher_stop();
+std.sleep(300);
+
+check("dispatcher stops on request", mind_dispatcher_status().running == false);
+
+dstate = std.global(MIND_DISPATCHER_GLOBAL);
+dstate.running = false;
+
+section("Notification consumer: consumed events are printed, never silently dropped");
+
+mind_dispatcher_set_notify_level(MIND_NOTIFY_LEVEL_ALL);
+
+id8 = mind_spawn("Rotate the API signing key", "notify me when it is done",
+	[request_id = "disp_8", notification_condition = "notify the user when the key rotation finishes"]).mind_id;
+
+mind_update(id8, [goal = "Rotate the API signing key", plan = [next_step = "check the vault"]]);
+mind_report(id8, "completed", "key rotated, verified with a signature check", "vault audit log line 42", true);
+
+// The consumer runs inside a dispatcher step: that is what consumes events.
+mind_dispatcher_step(None);
+
+log = mind_dispatcher_notify_log(200);
+
+seen_progress = false;
+seen_completed = false;
+completed_delivered = false;
+for(i = 0; i < log.size(); i++) {
+	e = log[i];
+	if(e.mind_id != id8)
+		continue;
+	if(e.type == "mind.progress")
+		seen_progress = true;
+	if(e.type == "mind.completed") {
+		seen_completed = true;
+		completed_delivered = e.notification_delivered;
+	}
+}
+
+check("the progress event was notified, not dropped", seen_progress);
+check("the terminal event was notified", seen_completed);
+check("the notification log records the event id", log.size() > 0 && (log[log.size() - 1].event_id ?? "").starts("evt_"));
+check("the completed event is a notify-class event", mind_notify_class("mind.completed") == "notify");
+check("a routine event is info-class", mind_notify_class("mind.run_finished") == "info");
+
+section("Notification consumer: at-least-once delivery prints each event once");
+
+evs8 = mind_events(id8, 50);
+target8 = None;
+for(i = 0; i < evs8.size(); i++)
+	if(evs8[i].type == "mind.created")
+		target8 = evs8[i];
+
+check("the created event is available", target8 ? true : false);
+
+first8 = mind_dispatcher_notify(target8);
+before = mind_dispatcher_notify_log(500).size();
+second8 = mind_dispatcher_notify(target8);
+after = mind_dispatcher_notify_log(500).size();
+
+check("a first notification prints", first8.status == "printed", std.string(first8));
+check("a second notification for one event is a no-op", second8.status == "already_notified", std.string(second8));
+check("it did not add a second line", before == after, std.string(before) + " -> " + std.string(after));
+
+section("Notification consumer: level filtering");
+
+mind_dispatcher_set_notify_level(MIND_NOTIFY_LEVEL_NOTIFY);
+check("level is settable", mind_dispatcher_notify_level() == MIND_NOTIFY_LEVEL_NOTIFY);
+check("an unknown level is rejected", mind_dispatcher_set_notify_level("loud").ok == false);
+
+id9 = mind_spawn("Track the freezer temperature", "", [request_id = "disp_9"]).mind_id;
+mind_update(id9, [goal = "Track the freezer temperature"]);   // mind.progress: info class
+mind_set_state(id9, MIND_STATE_BLOCKED, "the sensor is offline");  // mind.blocked: notify class
+
+mind_dispatcher_step(None);
+log9 = mind_dispatcher_notify_log(500);
+progress9 = false;
+blocked9 = false;
+for(i = 0; i < log9.size(); i++) {
+	e = log9[i];
+	if(e.mind_id != id9)
+		continue;
+	if(e.type == "mind.progress")
+		progress9 = true;
+	if(e.type == "mind.blocked")
+		blocked9 = true;
+}
+
+check("level notify filters routine events", !progress9);
+check("level notify keeps user-relevant events", blocked9);
+
+mind_dispatcher_set_notify_level(MIND_NOTIFY_LEVEL_OFF);
+off = mind_dispatcher_notify(mind_events(id9)[0]);
+check("level off prints nothing", off.status == "disabled", std.string(off));
+mind_dispatcher_set_notify_level(MIND_NOTIFY_LEVEL_ALL);
+
+section("Durable completion notification is discharged by the terminal event");
+
+id10 = mind_spawn("Book the meeting room for Friday", "",
+	[request_id = "disp_10", notification_condition = "notify the user when the room is booked"]).mind_id;
+check("the notification is undelivered before the terminal event", mind_get(id10).notification.delivered == false);
+
+rep10 = mind_report(id10, "completed", "room booked", "calendar entry FR-42", true);
+ev10 = mind_event(rep10.event_id);
+
+n10 = mind_dispatcher_notify(ev10);
+check("the terminal event delivered the notification", n10.ok == true && n10.notification_delivered == true, std.string(n10));
+check("the durable record says delivered", mind_get(id10).notification.delivered == true);
+
+n10b = mind_dispatcher_notify(ev10);
+check("a redelivered terminal event notifies once", n10b.status == "already_notified", std.string(n10b));
+
+section("Direct delivery: a message reaches the live Mind agent through send_prompt");
+
+id11 = mind_spawn("Deploy the staging build", "", [request_id = "disp_11"]).mind_id;
+mind_set_state(id11, MIND_STATE_ACTIVE, "deploying");
+
+msg11 = mind_message(id11, "stop the staging deploy, the release moved to Thursday", [kind = "instruction"]);
+
+// No Mind agent is running: the message must stay queued for the dispatcher.
+no_live = mind_dispatcher_inject(id11, msg11.message_id, msg11.event_id);
+check("without a live agent nothing is injected", no_live.ok == false && no_live.status == "no_live_agent");
+check("the message stays queued", mind_message_state(msg11.message_id).status == MIND_MESSAGE_QUEUED);
+check("no run was created by a failed injection", mind_get(id11).counters.runs == 0);
+
+// Register a live Mind agent for this Mind: a stand-in for the dispatcher's
+// subagent, recording every prompt it is given.
+seen_prompts = [];
+fake_agent = [
+	send_prompt = [](p) {
+		seen_prompts.push_back(p);
+		return [ok = true, reports = [[report = "acknowledged: the deploy is stopped"]]];
+	},
+	stop = []() { return true; },
+];
+
+dstate = std.global(MIND_DISPATCHER_GLOBAL);
+dstate.active[id11] = [mind_id = id11, run_id = "run_pre_existing", agent = fake_agent, done = false, thread = None];
+
+check("the live agent is found", mind_dispatcher_agent(id11) ? true : false);
+
+t_inj = std.millis();
+inj = mind_dispatcher_inject(id11, msg11.message_id, msg11.event_id);
+inj_elapsed = std.millis() - t_inj;
+
+check("the message is injected into the live agent", inj.ok == true && inj.status == "injected_live_agent", std.string(inj));
+check("the injection returns promptly (never waits for the Mind)", inj_elapsed < 2000, "elapsed_ms=" + std.string(inj_elapsed));
+check("the injection is recorded as a run of the Mind", mind_get(id11).counters.runs == 1);
+check("the message is marked delivered", mind_message_state(msg11.message_id).status == MIND_MESSAGE_DELIVERED ||
+	mind_message_state(msg11.message_id).status == MIND_MESSAGE_PROCESSED);
+check("the injected run blocks a second run for the same Mind", mind_dispatcher_mind_running(id11) == true);
+
+runs11 = mind_runs(id11, 10);
+trigger11 = "";
+for(i = 0; i < runs11.size(); i++)
+	if(runs11[i].id == inj.run_id)
+		trigger11 = runs11[i].trigger;
+check("the run records the injection trigger", trigger11 == "message_injected", "trigger=" + trigger11);
+
+// The injection executes in its own thread: wait for its bookkeeping.
+waited2 = 0;
+for(mind_message_state(msg11.message_id).status != MIND_MESSAGE_PROCESSED && waited2 < 10000) {
+	std.sleep(100);
+	waited2 += 100;
+}
+
+check("the live agent received the prompt", seen_prompts.size() == 1, "n=" + std.string(seen_prompts.size()));
+check("the prompt carries the message body", seen_prompts.size() && std.string(seen_prompts[0]).contains("release moved to Thursday"));
+check("the prompt names the Mind and the message", seen_prompts.size() && std.string(seen_prompts[0]).contains(id11) &&
+	std.string(seen_prompts[0]).contains(msg11.message_id));
+check("the prompt points at the authoritative record", seen_prompts.size() && std.string(seen_prompts[0]).contains("get_goal_state"));
+check("the message ends up processed", mind_message_state(msg11.message_id).status == MIND_MESSAGE_PROCESSED,
+	"status=" + std.string(mind_message_state(msg11.message_id).status) + " waited_ms=" + std.string(waited2));
+check("the message left the mailbox", !mind_mailbox_has(mind_get(id11), msg11.message_id));
+check("the message_received event was spent, so no duplicate run", mind_event(msg11.event_id).delivery.status == MIND_DELIVERY_PROCESSED);
+check("the injected run ended", mind_run(inj.run_id).status == MIND_RUN_FINISHED, std.string(mind_run(inj.run_id)));
+check("the dispatcher counted the injection", mind_dispatcher_status().messages_injected == 1, std.string(mind_dispatcher_status()));
+
+dstate.active.erase(id11);
+
+section("Direct delivery: mind_dispatcher_deliver reports the path honestly");
+
+id12 = mind_spawn("Reindex the search index", "", [request_id = "disp_12"]).mind_id;
+msg12 = mind_message(id12, "reindex only the last month", [kind = "instruction"]);
+del12 = mind_dispatcher_deliver(id12, msg12.message_id, msg12.event_id);
+check("no live agent means queued_for_dispatch", del12.ok == true && del12.status == "queued_for_dispatch", std.string(del12));
+check("the reason names the missing live agent", std.string(del12.reason) == "no_live_agent");
+check("deliver did not create a run", mind_get(id12).counters.runs == 0);
+
+std.cout("\n----------------------------------------\n");
+std.cout("passed: ", tests_passed, "  failed: ", tests_failed, "\n");
+
+if(tests_failed) {
+	std.cout("failures:\n");
+	for(i = 0; i < failures.size(); i++)
+		std.cout("  - ", failures[i], "\n");
+}
+
+std.cout("----------------------------------------\n");
+
+fileio.remove(test_root.removesuffix("/"));
+
+std.exitprocess(tests_failed ? 1 : 0);

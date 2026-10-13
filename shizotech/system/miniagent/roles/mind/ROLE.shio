@@ -1,0 +1,476 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Role: Mind  (plan §5)
+//
+//  Durable owner of one goal. Every invocation is one bounded LLM run driven by
+//  a runtime event; the tools below are the only way this role touches
+//  authoritative state, and every one of them persists through the runtime.
+//
+//  Least privilege (§8): read-only inspection, skills, command execution and the
+//  goal-state tools. No write/edit tools and no task tools: concrete
+//  implementation work is delegated to Workers (plan Phase 5).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../../miniagent"
+#include "../../runtime/mind_runtime"
+
+MIND_TASKROUTE_DIR = "taskroutes/";
+
+mind_role_id(agt) {
+	id = agt.env.mind_id ?? "";
+	return std.string(id);
+}
+
+mind_role_run_id(agt) {
+	id = agt.env.run_id ?? "";
+	return std.string(id);
+}
+
+mind_no_mind() {
+	return [
+		ok = false,
+		error = "no_mind_bound",
+		explanation = "This agent instance is not bound to a Mind record, so it cannot read or write goal state. It must be launched by the mind dispatcher.",
+	];
+}
+
+// Collect only the fields the caller actually provided.
+mind_role_patch(args) {
+	patch = [];
+
+	if(args.has("goal") && std.string(args.goal).strip())
+		patch.goal = std.string(args.goal);
+
+	if(args.has("success_criteria") && std.is_json(args.success_criteria))
+		patch.success_criteria = args.success_criteria;
+
+	if(args.has("execution_shape") && std.string(args.execution_shape).strip())
+		patch.execution_shape = std.string(args.execution_shape).strip().lowercase();
+
+	if(args.has("plan_strategy") || args.has("plan_next_step")) {
+		plan = [];
+		if(args.has("plan_strategy"))
+			plan.strategy = std.string(args.plan_strategy);
+		if(args.has("plan_next_step"))
+			plan.next_step = std.string(args.plan_next_step);
+		patch.plan = plan;
+	}
+
+	if(args.has("blockers") && std.is_json(args.blockers))
+		patch.blockers = args.blockers;
+
+	if(args.has("waiting_for"))
+		patch.waiting_for = std.string(args.waiting_for);
+
+	return patch;
+}
+
+add_tools(agt)
+{
+	// ── Goal state ───────────────────────────────────────────────────────────
+
+	agt.add_tool(
+		"get_goal_state",
+		"Read the durable goal record of this Mind: goal, success criteria, plan, taskroutes, decisions, blockers, counters, plus the recent lifecycle events and runs.\nThe state store is authoritative; this transcript is not.",
+		[
+			events = "int(0,50): OPTIONAL number of recent events to include (default 20)",
+			runs = "int(0,20): OPTIONAL number of recent runs to include (default 10)",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+			return mind_detail(id);
+		}
+	);
+
+	agt.add_tool(
+		"set_goal_state",
+		"Persist your interpretation of the goal: the goal statement, the success criteria, the execution shape (one_shot | recurring | iterative) and the plan (strategy + the single next bounded step).\nOnly pass the fields you are changing. This is the record future runs of this Mind will read, so write down what you decided and what you will do next.",
+		[
+			summary = "&string(): One line describing what this update means for the goal.",
+			goal = "string(): OPTIONAL the goal statement as you have interpreted it.",
+			success_criteria = "array(string): OPTIONAL list of conditions that must hold for the goal to count as done.",
+			execution_shape = "string(): OPTIONAL one of: one_shot, recurring, iterative.",
+			plan_strategy = "string(): OPTIONAL the current strategy.",
+			plan_next_step = "string(): OPTIONAL the single next bounded step.",
+			blockers = "array(string): OPTIONAL current known blockers (empty list clears them).",
+			waiting_for = "string(): OPTIONAL what you are waiting for, if anything.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			patch = mind_role_patch(args);
+
+			if(!patch.size())
+				return [
+					ok = false,
+					status = "rejected",
+					error = "No state was provided. Pass at least one of: goal, success_criteria, execution_shape, plan_strategy, plan_next_step, blockers, waiting_for.",
+				];
+
+			return mind_update(id, patch, [
+				summary = args.summary,
+				source = "mind",
+				run_id = mind_role_run_id(agt),
+			]);
+		}
+	);
+
+	agt.add_tool(
+		"record_decision",
+		"Append one durable note to the goal record: a decision you made, an assumption you are relying on, or an approval you got from the user.\nLater runs and other agents read these, so record the reasoning that a future run could not reconstruct.",
+		[
+			text = "&string(): The decision, assumption or approval, in one or two sentences.",
+			kind = "string(): OPTIONAL 'decision' (default), 'assumption' or 'approval'.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			kind = std.string(args.kind ?? "decision").strip().lowercase();
+
+			field = "decisions";
+			if(kind == "assumption")
+				field = "assumptions";
+			else if(kind == "approval")
+				field = "approvals";
+			else if(kind != "decision")
+				return [ok = false, status = "rejected", error = "kind must be decision, assumption or approval", given = kind];
+
+			return mind_append_list(id, field, [
+				text = std.string(args.text),
+				kind = kind,
+				run_id = mind_role_run_id(agt),
+				timestamp = mind_now_str(),
+			], [summary = field + " recorded", source = "mind", run_id = mind_role_run_id(agt)]);
+		}
+	);
+
+	// ── Taskroutes ───────────────────────────────────────────────────────────
+
+	agt.add_tool(
+		"list_taskroutes",
+		"List the available taskroutes (documented reusable procedures under 'taskroutes/').\nReturns each route's path, title and applicability snippet. You are responsible for choosing the route; the Receptionist never searches for one.",
+		[
+			query = "string(): OPTIONAL filter term to narrow the list.",
+		],
+		[](agt, args)
+		{
+			files = fileio.glob(MIND_TASKROUTE_DIR + "*.md");
+			if(!std.is_json(files))
+				files = [];
+
+			routes = [];
+			query = std.string(args.query ?? "").strip().lowercase();
+
+			for(i = 0; i < files.size(); i++) {
+				path = std.string(files[i]);
+
+				name = fileio.pure_name(path);
+				if(name == "README" || name.starts("_"))
+					continue;
+
+				txt = fileio.read_string(path);
+				if(!std.is_string(txt))
+					txt = "";
+
+				title = "";
+				lines = txt.split("\n", -1, true);
+				for(j = 0; j < lines.size(); j++) {
+					if(lines[j].starts("#")) {
+						title = lines[j].removeprefix("#").strip();
+						break;
+					}
+				}
+
+				applicability = txt.extract("## When it applies", "##");
+				if(!std.is_string(applicability))
+					applicability = "";
+
+				snippet = mind_clip_lines(applicability.strip(), 300);
+				if(!snippet)
+					snippet = mind_clip_lines(txt, 300);
+
+				if(query) {
+					hay = (path + " " + title + " " + snippet).lowercase();
+					if(!hay.contains(query))
+						continue;
+				}
+
+				routes.push_back([
+					path = path,
+					title = title,
+					applicability = snippet,
+				]);
+			}
+
+			return [
+				ok = true,
+				count = routes.size(),
+				directory = MIND_TASKROUTE_DIR,
+				routes = routes,
+				note = routes.size() ? "Read a route with read_taskroute before following it, then register_taskroute." : "No taskroutes exist in this directory (the format specification is taskroutes/README.md). Do not fabricate a route: report a truthful blocker or failure naming what is missing.",
+			];
+		}
+	);
+
+	agt.add_tool(
+		"read_taskroute",
+		"Read one taskroute file in full, including its preconditions, permitted tools, verification requirements and escalation behaviour.",
+		[
+			path = "&string(): Path of the taskroute, e.g. 'taskroutes/fix_repository_issue.md'.",
+		],
+		[](agt, args)
+		{
+			path = std.string(args.path ?? "");
+
+			if(!path.starts(MIND_TASKROUTE_DIR))
+				return [
+					ok = false,
+					error = "Only files under '" + MIND_TASKROUTE_DIR + "' are taskroutes.",
+				];
+
+			if(!fileio.exists(path))
+				return [ok = false, error = "taskroute not found", path = path];
+
+			return [
+				ok = true,
+				path = path,
+				content = fileio.read_string(path),
+			];
+		}
+	);
+
+	agt.add_tool(
+		"register_taskroute",
+		"Record which taskroute you are following, with its version, in the durable goal state. Do this before executing the route so a later run can see the choice and detect that the route changed underneath you.",
+		[
+			id = "&string(): Identifier of the route (usually its file name without extension).",
+			path = "&string(): Path of the route file.",
+			version = "string(): OPTIONAL route version, use the file hash if the route declares none.",
+			reason = "string(): OPTIONAL why this route applies to the goal.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			version = std.string(args.version ?? "");
+			if(!version && fileio.exists(std.string(args.path)))
+				version = "sha:" + fileio.hash(std.string(args.path));
+
+			return mind_append_list(id, "taskroutes", [
+				id = std.string(args.id),
+				path = std.string(args.path),
+				version = version,
+				reason = std.string(args.reason ?? ""),
+				registered_at = mind_now_str(),
+				run_id = mind_role_run_id(agt),
+			], [summary = "taskroute registered: " + std.string(args.id), source = "mind", run_id = mind_role_run_id(agt)]);
+		}
+	);
+
+	agt.add_tool(
+		"register_notification",
+		"Register the durable completion-notification condition for this goal, when the user asked to be told when it is done.\nRegistration is part of the goal record, so a goal that finishes quickly cannot race past it. This call does not keep the run open.",
+		[
+			condition = "&string(): What to notify about, e.g. 'notify the user when the goal reaches completed, failed, blocked or stopped'.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+			return mind_notify_register(id, args.condition);
+		}
+	);
+
+	// ── Continuation and termination ─────────────────────────────────────────
+
+	agt.add_tool(
+		"wait_for",
+		"End this run while waiting for a defined future event (a user reply, a worker result, a timer, an external message).\nRecord what you are waiting for. Never sleep, poll or busy-wait inside a run: the runtime invokes you again when that event arrives.",
+		[
+			what = "&string(): The event you are waiting for, specific enough that the runtime can match it.",
+			reason = "string(): OPTIONAL why the goal cannot progress before that event.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			what = std.string(args.what ?? "").strip();
+			if(!what)
+				return [ok = false, error = "'what' must name the event you are waiting for."];
+
+			res = mind_set_state(id, MIND_STATE_WAITING, what, [
+				summary = "waiting for: " + mind_clip_lines(what, 160),
+				waiting_for = what,
+				reason = std.string(args.reason ?? ""),
+			], [source = "mind", run_id = mind_role_run_id(agt)]);
+
+			agt.stop();
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"complete_goal",
+		"Report the goal as completed. Accepted ONLY when the success criteria are met and you can state the verification evidence; the runtime refuses an unverified completion.\nIf the goal is in state 'stop_requested' this is refused: a stop is never a completion.",
+		[
+			report = "&string(): What was achieved and what is still open (empty means nothing).",
+			evidence = "&string(): The verification evidence: commands run, outputs observed, checks that prove each success criterion.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			res = mind_report(id, "completed", args.report, args.evidence, true, [
+				source = "mind",
+				run_id = mind_role_run_id(agt),
+			]);
+
+			agt.stop();
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"fail_goal",
+		"Report the goal as failed: no viable path remains under the allowed constraints, an unrecoverable error occurred, or the goal was terminated by a stop request before completion.\nState truthfully what was attempted and what is missing. Do not fabricate execution.",
+		[
+			report = "&string(): What was attempted, what happened, and the current state of the work.",
+			reason = "&string(): Why no viable path remains (missing capability, permission, data, or an unrecoverable error).",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			report = std.string(args.report ?? "");
+			reason = std.string(args.reason ?? "");
+
+			res = mind_report(id, "failed", report + (reason ? "\nReason: " + reason : ""), reason, false, [
+				source = "mind",
+				run_id = mind_role_run_id(agt),
+			]);
+
+			agt.stop();
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"block_goal",
+		"Report the goal as blocked: progress needs user input, a permission, a missing input, or an external condition that is not satisfied.\nA blocker is not a failure and not a completion. The goal stays addressable and is re-invoked when the condition changes.",
+		[
+			report = "&string(): What is blocked and what has been done so far.",
+			needs = "&string(): Exactly what is required to continue (a decision, a permission, a file, a credential, an external state).",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			needs = std.string(args.needs ?? "");
+
+			res = mind_report(id, "blocked", args.report, "", false, [
+				needs = needs,
+				blockers = needs ? [needs] : [],
+				source = "mind",
+				run_id = mind_role_run_id(agt),
+			]);
+
+			agt.stop();
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"ask_user",
+		"Ask the user for information or a decision that is genuinely required to continue, and end this run.\nThe goal becomes blocked with your question recorded. Ask only for what you truly need; do not use this as a general check-in.",
+		[
+			question = "&string(): The single question that unblocks the goal.",
+			options = "array(string): OPTIONAL list of answers you can act on.",
+			why = "string(): OPTIONAL why you cannot proceed without it.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			question = std.string(args.question ?? "");
+			options = std.is_json(args.options) ? args.options : [];
+
+			needs = question + (options.size() ? " (options: " + std.string(options) + ")" : "");
+
+			res = mind_report(id, "blocked", "Question for the user: " + question, "", false, [
+				needs = needs,
+				blockers = [needs],
+				source = "mind",
+				run_id = mind_role_run_id(agt),
+			]);
+
+			agt.stop();
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"end_run",
+		"End this LLM run after a bounded step, keeping the goal active.\nUse this when the goal continues and the next step will be taken by a later invocation (triggered by the next event). This is not a completion: state stays active and the report is only a progress note.",
+		[
+			summary = "&string(): What was done in this run and what the next invocation should do.",
+			next_event = "string(): OPTIONAL the event you expect to trigger the next run.",
+		],
+		[](agt, args)
+		{
+			id = mind_role_id(agt);
+			if(!id)
+				return mind_no_mind();
+
+			summary = std.string(args.summary ?? "");
+			next = std.string(args.next_event ?? "");
+
+			mind_update(id, [
+				waiting_for: next,
+			], [summary = "run ended: " + mind_clip_lines(summary, 160), source = "mind", run_id = mind_role_run_id(agt)]);
+
+			agt.stop();
+
+			return [
+				ok = true,
+				mind_id = id,
+				status = "run_ended",
+				state = mind_get(id).state,
+				summary = summary,
+				note = "The goal stays open. This run is over; the runtime will invoke the next run on the next event.",
+			];
+		}
+	);
+
+	// ── Investigation tools (least privilege: read, skills, commands) ────────
+
+	agt.add_read_tools();
+	agt.add_skill_tools();
+	agt.add_command_tools();
+}

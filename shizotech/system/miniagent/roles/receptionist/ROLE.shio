@@ -1,0 +1,129 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Role: Receptionist  (plan §4)
+//
+//  A thin, non-blocking router. Exactly the five coordination tools of §4.1
+//  exist on this role. Deliberately NOT registered: file, write, command, skill,
+//  search, taskroute, Worker or task-execution tools. The Receptionist cannot
+//  investigate, plan or execute, because it has no tools to do it with —
+//  the boundary is enforced by the runtime, not by prompt wording (§8).
+//
+//  Every tool call only writes durable runtime state and returns immediately.
+//  Mind invocations happen in the dispatcher thread (runtime/mind_dispatcher).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../../miniagent"
+#include "../../runtime/mind_dispatcher"
+
+add_tools(agt)
+{
+	agt.add_tool(
+		"get_overview",
+		"Inspect the current system state: all Minds and their lifecycle states.\nRead-only. Use it to identify the owner of existing work or to disambiguate a reference.\nThis call never wakes, invokes or runs a Mind, and it does not start anything.\nDo not call it repeatedly to watch progress: completion and failure arrive later as system events.",
+		None,
+		[](agt, args)
+		{
+			return mind_overview();
+		}
+	);
+
+	agt.add_tool(
+		"get_last_actions",
+		"Retrieve the compressed list of recent actions, newest first.\nUse it ONLY to resolve references such as 'do that again' or 'the one from before' when the current context does not already identify the action.\nIt identifies the action and its target Mind; it is not a historical search and it contains no implementation logs.",
+		[
+			limit = "int(1,100): OPTIONAL number of recent actions to return (default 20)",
+		],
+		[](agt, args)
+		{
+			limit = (args.limit ?? false) ? args.limit : 20;
+			return mind_last_actions(limit);
+		}
+	);
+
+	agt.add_tool(
+		"spawn_mind",
+		"Create a Mind for a new substantive goal.\nForward the user's intent as given: do NOT pre-validate feasibility, do NOT research the task, do NOT inspect the repository first. The Mind investigates, plans, executes and reports.\nReturns promptly with a stable Mind ID and the confirmed creation state. The goal is NOT executed by this call and you must not wait for it.",
+		[
+			goal = "&string(): The user's goal, stated as the user intended it. Include the outcome the user wants, not a solution.",
+			context = "&string(): Relevant conversational context: what was said before, constraints the user mentioned, channel, and any notification requirement. Empty string if none.",
+			title = "string(): OPTIONAL short label for the goal (a few words).",
+			request_id = "string(): OPTIONAL stable id of the user request. Used to deduplicate: re-sending the same request id returns the existing Mind instead of creating a second one.",
+			idempotency_key = "string(): OPTIONAL explicit deduplication key (used instead of request_id).",
+			notification_condition = "string(): OPTIONAL set this when the user asked to be notified: describe what to notify about (e.g. 'notify the user when the goal reaches a terminal outcome'). Registered durably with the goal, it does not keep this call open.",
+		],
+		[](agt, args)
+		{
+			res = mind_spawn(args.goal, args.context ?? "", [
+				title = args.title ?? "",
+				request_id = args.request_id ?? "",
+				idempotency_key = args.idempotency_key ?? "",
+				notification_condition = args.notification_condition ?? "",
+				source = "receptionist",
+			]);
+
+			// Schedule delivery of the created event. Never executes the goal here.
+			if(res.ok)
+				mind_ensure_dispatcher(agt);
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"stop_mind",
+		"Request that a Mind stops working on its goal.\nReturns 'stop_requested' when only the request was accepted. 'stopped' is confirmed later by the runtime, once termination is established. Never report a confirmed stop from this call alone.\nIdempotent: calling it again for the same Mind is harmless.",
+		[
+			mind_id = "&string(): The Mind to stop, taken from the current context or from get_overview.",
+			reason = "string(): OPTIONAL short reason, forwarded to the Mind's record.",
+		],
+		[](agt, args)
+		{
+			res = mind_stop(args.mind_id, args.reason ?? "", [source = "receptionist"]);
+
+			// Let the dispatcher signal the runner and confirm termination later.
+			if(res.ok)
+				mind_ensure_dispatcher(agt);
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"send_message",
+		"Forward a follow-up instruction, clarification or answer to an existing Mind.\nEnqueues into the Mind's mailbox and returns promptly with a message id and the queue state. It does NOT run the target Mind and is NOT proof that the message was processed.\nIf the Mind is currently running, the message is also handed directly to that Mind agent (delivery: injected_live_agent) so it can react inside the run it is in; otherwise the dispatcher invokes the Mind for it (delivery: queued_for_dispatch).\nUse this for follow-ups to existing work instead of spawning a new Mind.",
+		[
+			mind_id = "&string(): The target Mind, taken from the current context or from get_overview.",
+			message = "&string(): The instruction or answer to forward, phrased for the Mind that owns the goal.",
+			kind = ["instruction", "info", "answer"],
+			idempotency_key = "string(): OPTIONAL deduplication key so a repeated send does not enqueue the same instruction twice.",
+		],
+		[](agt, args)
+		{
+			res = mind_message(args.mind_id, args.message, [
+				source = "receptionist",
+				kind = args.kind ?? "instruction",
+				idempotency_key = args.idempotency_key ?? "",
+			]);
+
+			if(res.ok) {
+				// Schedule delivery of the message_received event.
+				mind_ensure_dispatcher(agt);
+
+				// A Mind agent that is live right now receives the message
+				// directly through miniagent.send_prompt. Asynchronous: this
+				// call never waits for the Mind (plan §4.3).
+				del = mind_dispatcher_deliver(res.mind_id, res.message_id, res.event_id);
+
+				res.delivery = del.status;
+				res.delivery_note = del.note;
+
+				if(del.status == "injected_live_agent")
+					res.note += " The Mind agent is running: the message was handed to it directly (send_prompt). Still not proof that it acted on it.";
+				else
+					res.note += " No live Mind agent: the dispatcher will invoke the Mind for this message.";
+			}
+
+			return res;
+		}
+	);
+}

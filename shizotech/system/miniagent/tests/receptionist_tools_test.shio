@@ -1,0 +1,316 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Receptionist tool-surface tests (headless — no LLM endpoint required)
+//
+//  Run:  shz tests/receptionist_tools_test.shio
+//
+//  Exercises the five coordination tools through the real tool callbacks of a
+//  miniagent built from roles/receptionist, and asserts the Phase 2 exit
+//  criterion structurally: the Receptionist has no tool with which it could
+//  research, execute or wait, and every tool returns without running a Mind.
+//
+//  The dispatcher registry is pre-armed as "already running" so the tools'
+//  mind_ensure_dispatcher() call is a no-op: no thread, no LLM run, no network.
+//  Dispatcher behaviour itself is covered by tests/mind_dispatcher_test.shio.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+#include "../runtime/mind_dispatcher"
+
+tests_passed = 0;
+tests_failed = 0;
+failures = [];
+
+check(name, cond, detail = "") {
+	if(cond) {
+		tests_passed++;
+		std.cout("  [ok]   ", name, "\n");
+		return;
+	}
+	tests_failed++;
+	failures.push_back(name + (detail ? " :: " + detail : ""));
+	std.cout("  [FAIL] ", name, " ", detail, "\n");
+}
+
+section(title) {
+	std.cout("\n== ", title, " ==\n");
+}
+
+tool_names(agt) {
+	names = [];
+	tools = agt.llm_api.tools.tools;
+	for(i = 0; i < tools.size(); i++)
+		names.push_back(tools[i].function.name);
+	return names;
+}
+
+has_tool(names, name) {
+	for(i = 0; i < names.size(); i++)
+		if(names[i] == name)
+			return true;
+	return false;
+}
+
+call(agt, name, args) {
+	if(!agt.llm_api.tools.tool_callbacks.has(name))
+		return [ok = false, error = "tool_not_registered", tool = name];
+	return agt.llm_api.tools.tool_callbacks[name](args);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.cout("\nReceptionist tool-surface tests\n");
+
+test_root = ".agent/mind_test_recv_" + std.random_hash(6) + "/";
+
+mind_set_root(test_root);
+
+// Pre-arm the dispatcher so the tools' scheduling call is a no-op offline.
+dstate = std.global(MIND_DISPATCHER_GLOBAL);
+dstate.running = true;
+dstate.active = [];
+
+cfg = ModelConfig();
+
+managed recv = miniagent(cfg, "receptionist");
+
+section("Tool surface: coordination only (§4.1, §8)");
+
+names = tool_names(recv);
+
+check("get_overview registered", has_tool(names, "get_overview"));
+check("get_last_actions registered", has_tool(names, "get_last_actions"));
+check("spawn_mind registered", has_tool(names, "spawn_mind"));
+check("stop_mind registered", has_tool(names, "stop_mind"));
+check("send_message registered", has_tool(names, "send_message"));
+
+forbidden = [
+	"write_file", "append_text", "replace_string", "mkdir", "move", "copy", "rename", "remove",
+	"read_file", "list_dir", "file_info", "file_line_count",
+	"command_start", "command_read", "command_input", "command_kill", "command_wait", "command_list_sessions",
+	"list_skills", "read_skill",
+	"start_task", "continue_task", "file_task_batch", "signal", "milestone",
+	"read_source_map", "resolve_symbol", "search_in_file", "grep",
+	"spawn_worker", "start_worker", "execute_plan", "execute_task", "delegate_task",
+];
+
+leaks = "";
+for(i = 0; i < forbidden.size(); i++)
+	if(has_tool(names, forbidden[i]))
+		leaks += forbidden[i] + " ";
+
+check("no file, command, skill, worker or task tool is exposed", leaks.empty(), "leaked: " + leaks);
+check("tool count is exactly the 5 coordination tools + sleep", names.size() == 6, std.string(names));
+
+section("spawn_mind: routes, never executes, never waits");
+
+t0 = std.millis();
+spawn = call(recv, "spawn_mind", [
+	goal = "Compile the firmware for the esp32 board and flash it",
+	context = "user is in the workshop channel",
+	request_id = "recv_req_1",
+	notification_condition = "notify the user when the flash succeeds or fails",
+]);
+elapsed = std.millis() - t0;
+
+check("spawn_mind accepted", spawn.ok == true, std.string(spawn));
+check("spawn_mind returns a mind id", (spawn.mind_id ?? "").starts("mind_"));
+check("spawn_mind reports creation, not completion", spawn.status == "created" && spawn.state == MIND_STATE_STARTING);
+check("spawn_mind returns promptly", elapsed < 2000, "elapsed_ms=" + std.string(elapsed));
+
+mind_id = spawn.mind_id;
+mind = mind_get(mind_id);
+
+check("no LLM run was executed by spawn_mind", mind.counters.runs == 0);
+check("the created event is queued, not processed", mind_pending_events(mind_id).size() == 1);
+check("notification condition is durable on the goal",
+	mind.notification.wanted == true && std.string(mind.notification.condition).contains("flash"));
+check("the user request is stored verbatim", std.string(mind.request.text).starts("Compile the firmware"));
+check("the conversational context is stored", std.string(mind.request.context).contains("workshop"));
+check("the goal starts uninterpreted (the Mind interprets it)", mind.execution_shape == "unknown" && mind.success_criteria.size() == 0);
+
+dupe = call(recv, "spawn_mind", [goal = "Compile the firmware for the esp32 board and flash it", context = "", request_id = "recv_req_1"]);
+check("duplicate request id does not create a second Mind", dupe.deduplicated == true && dupe.mind_id == mind_id);
+
+empty = call(recv, "spawn_mind", [goal = "   ", context = ""]);
+check("empty goal rejected", empty.ok == false && empty.status == "rejected");
+
+weird = call(recv, "spawn_mind", [goal = "Make me a coffee", context = "no coffee machine is known to exist", request_id = "recv_req_coffee"]);
+check("an apparently impossible request is still delegated", weird.ok == true && weird.status == "created");
+check("the receptionist did not judge feasibility", mind_get(weird.mind_id).state == MIND_STATE_STARTING);
+
+section("get_overview: read-only, does not wake a Mind");
+
+before = mind_stats();
+ov = call(recv, "get_overview", []);
+after = mind_stats();
+
+check("overview ok", ov.ok == true);
+check("overview lists the Minds", ov.total_minds >= 2);
+check("overview exposes the lifecycle state", ov.minds[0].state == MIND_STATE_STARTING);
+check("overview did not start a run", before.running_runs == after.running_runs && mind_get(mind_id).counters.runs == 0);
+check("overview did not consume the queued event", before.pending_events == after.pending_events);
+check("overview did not mutate the store sequence", before.seq == after.seq);
+check("overview declares that it does not wake Minds", std.string(ov.note).contains("does not wake"));
+
+section("send_message: enqueues, never runs the target");
+
+t0 = std.millis();
+msg = call(recv, "send_message", [mind_id = mind_id, message = "use the esp32-s3 target, not the plain esp32", kind = "instruction"]);
+elapsed = std.millis() - t0;
+
+check("send_message ok", msg.ok == true, std.string(msg));
+check("send_message returns a message id", (msg.message_id ?? "").starts("msg_"));
+check("send_message reports queued only", msg.status == MIND_MESSAGE_QUEUED);
+check("send_message returns promptly", elapsed < 2000, "elapsed_ms=" + std.string(elapsed));
+check("the result refuses to imply processing", std.string(msg.note).contains("not proof"));
+
+record = mind_message_state(msg.message_id);
+check("message is queued, not processed", record.status == MIND_MESSAGE_QUEUED && record.processed_ms == 0);
+check("message sits in the Mind mailbox", mind_get(mind_id).mailbox.size() == 1);
+check("queueing did not run the Mind", mind_get(mind_id).counters.runs == 0);
+check("queueing emitted a message_received event", mind_pending_events(mind_id).size() == 2);
+
+call(recv, "send_message", [mind_id = mind_id, message = "use the esp32-s3 target", kind = "instruction", idempotency_key = "recv_msg_1"]);
+dupe_msg = call(recv, "send_message", [mind_id = mind_id, message = "use the esp32-s3 target", kind = "instruction", idempotency_key = "recv_msg_1"]);
+check("duplicate idempotency key is deduplicated", dupe_msg.deduplicated == true);
+
+missing = call(recv, "send_message", [mind_id = "mind_does_not_exist", message = "hello?"]);
+check("unknown mind id is reported, not guessed", missing.ok == false && missing.status == "not_found");
+
+section("send_message with a live Mind agent: delivered through miniagent.send_prompt");
+
+seen_tool_prompts = [];
+fake_live = [
+	send_prompt = [](p) {
+		seen_tool_prompts.push_back(p);
+		return [ok = true, reports = [[report = "acknowledged: switching target"]]];
+	},
+	stop = []() { return true; },
+];
+
+dstate.active[mind_id] = [
+	mind_id = mind_id,
+	run_id = "run_fake_live",
+	agent = fake_live,
+	done = false,
+	thread = None,
+];
+
+t0 = std.millis();
+live_msg = call(recv, "send_message", [mind_id = mind_id, message = "the esp32-s3 target has 8MB flash, use it"]);
+live_elapsed = std.millis() - t0;
+
+check("send_message reports the live-agent delivery", live_msg.delivery == "injected_live_agent", std.string(live_msg));
+check("send_message still only reports queued", live_msg.status == MIND_MESSAGE_QUEUED);
+check("send_message returns promptly with a live Mind", live_elapsed < 2000, "elapsed_ms=" + std.string(live_elapsed));
+check("the note states the direct delivery", std.string(live_msg.note).contains("send_prompt"));
+
+waited_live = 0;
+for(mind_message_state(live_msg.message_id).status != MIND_MESSAGE_PROCESSED && waited_live < 10000) {
+	std.sleep(100);
+	waited_live += 100;
+}
+
+check("the live Mind agent received the instruction", seen_tool_prompts.size() == 1, "n=" + std.string(seen_tool_prompts.size()));
+check("the injected prompt carries the instruction", seen_tool_prompts.size() && std.string(seen_tool_prompts[0]).contains("8MB flash"));
+check("the injected prompt names the Mind", seen_tool_prompts.size() && std.string(seen_tool_prompts[0]).contains(mind_id));
+check("the message is processed by the live agent", mind_message_state(live_msg.message_id).status == MIND_MESSAGE_PROCESSED,
+	"status=" + std.string(mind_message_state(live_msg.message_id).status) + " waited_ms=" + std.string(waited_live));
+check("the direct delivery created exactly one run", mind_get(mind_id).counters.runs == 1, std.string(mind_get(mind_id).counters.runs));
+
+dstate.active.erase(mind_id);
+
+section("stop_mind: a request is never a confirmation");
+
+t0 = std.millis();
+stop = call(recv, "stop_mind", [mind_id = mind_id, reason = "user cancelled the flash"]);
+elapsed = std.millis() - t0;
+
+check("stop_mind ok", stop.ok == true, std.string(stop));
+check("stop_mind reports stop_requested", stop.status == MIND_STATE_STOP_REQUESTED);
+check("stop_mind does not claim confirmation", stop.confirmed == false);
+check("stop_mind returns promptly", elapsed < 2000, "elapsed_ms=" + std.string(elapsed));
+
+stop_again = call(recv, "stop_mind", [mind_id = mind_id, reason = "user cancelled the flash"]);
+check("stop_mind is idempotent", stop_again.ok == true && stop_again.status == MIND_STATE_STOP_REQUESTED);
+
+check("the Mind cannot be completed after a stop", mind_report(mind_id, "completed", "done", "evidence", true).ok == false);
+
+confirm = mind_confirm_stopped(mind_id, "runner terminated (simulated in test)");
+check("runtime can confirm stopped", confirm.ok == true && confirm.state == MIND_STATE_STOPPED);
+
+stopped_view = call(recv, "get_overview", []);
+state = "";
+for(i = 0; i < stopped_view.minds.size(); i++)
+	if(stopped_view.minds[i].id == mind_id)
+		state = stopped_view.minds[i].state;
+check("overview shows the confirmed stop", state == MIND_STATE_STOPPED);
+
+after_stop = call(recv, "send_message", [mind_id = mind_id, message = "and now also do X"]);
+check("a stopped Mind is not addressable by message", after_stop.ok == false && after_stop.status == "mind_terminal");
+
+missing_stop = call(recv, "stop_mind", [mind_id = "mind_nope"]);
+check("stop of an unknown Mind is reported", missing_stop.ok == false && missing_stop.status == "not_found");
+
+section("get_last_actions: resolves references to previous actions");
+
+t0 = std.millis();
+acts = call(recv, "get_last_actions", [limit = 40]);
+elapsed = std.millis() - t0;
+
+check("get_last_actions ok", acts.ok == true);
+check("get_last_actions returns promptly", elapsed < 2000, "elapsed_ms=" + std.string(elapsed));
+check("the spawn is in the history", std.string(acts).contains("spawn_mind"));
+check("the message is in the history", std.string(acts).contains("send_message"));
+check("the stop is in the history", std.string(acts).contains("stop_mind"));
+check("entries identify the target Mind", acts.actions[0].mind_id == mind_id);
+check("entries carry no implementation log", !acts.actions[0].has("content") && !acts.actions[0].has("logs"));
+
+limited = call(recv, "get_last_actions", [limit = 2]);
+check("limit is honoured", limited.count <= 2, std.string(limited.count));
+
+section("The spawn target exists: the Mind role loads with its state tools");
+
+managed mnd = miniagent(cfg, "mind");
+mnames = tool_names(mnd);
+
+check("mind role: get_goal_state", has_tool(mnames, "get_goal_state"));
+check("mind role: set_goal_state", has_tool(mnames, "set_goal_state"));
+check("mind role: record_decision", has_tool(mnames, "record_decision"));
+check("mind role: complete_goal", has_tool(mnames, "complete_goal"));
+check("mind role: fail_goal", has_tool(mnames, "fail_goal"));
+check("mind role: block_goal", has_tool(mnames, "block_goal"));
+check("mind role: ask_user", has_tool(mnames, "ask_user"));
+check("mind role: wait_for", has_tool(mnames, "wait_for"));
+check("mind role: end_run", has_tool(mnames, "end_run"));
+check("mind role: list_taskroutes", has_tool(mnames, "list_taskroutes"));
+check("mind role: read_taskroute", has_tool(mnames, "read_taskroute"));
+check("mind role: register_taskroute", has_tool(mnames, "register_taskroute"));
+check("mind role: register_notification", has_tool(mnames, "register_notification"));
+
+mind_forbidden = ["write_file", "replace_string", "append_text", "remove", "mkdir", "move", "copy",
+	"rename", "start_task", "file_task_batch", "signal", "milestone", "spawn_mind", "stop_mind"];
+mind_leaks = "";
+for(i = 0; i < mind_forbidden.size(); i++)
+	if(has_tool(mnames, mind_forbidden[i]))
+		mind_leaks += mind_forbidden[i] + " ";
+check("mind role has no write or routing tools in this phase", mind_leaks.empty(), "leaked: " + mind_leaks);
+
+check("mind role can inspect (read tools)", has_tool(mnames, "read_file") && has_tool(mnames, "list_dir"));
+check("mind role can run commands (taskroute execution)", has_tool(mnames, "command_start"));
+
+std.cout("\n----------------------------------------\n");
+std.cout("passed: ", tests_passed, "  failed: ", tests_failed, "\n");
+
+if(tests_failed) {
+	std.cout("failures:\n");
+	for(i = 0; i < failures.size(); i++)
+		std.cout("  - ", failures[i], "\n");
+}
+
+std.cout("----------------------------------------\n");
+
+fileio.remove(test_root.removesuffix("/"));
+
+std.exitprocess(tests_failed ? 1 : 0);
