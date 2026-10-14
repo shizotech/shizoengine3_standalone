@@ -13,7 +13,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 uv = fragCoord.xy / iResolution.xy;
 
-    vec4 input = texture2D(iChannel0, uv);
+    vec4 input = texture(iChannel0, uv);
     vec3 color = input.rgb;
 
     if (invert_selective == 0)

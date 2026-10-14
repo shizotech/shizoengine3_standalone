@@ -10,7 +10,7 @@ uniform float blend;
 // automatically bound to src/A.glsl due to auto-binding.
 // ============================================================
 
-uniform sampler2D in;      // Default input
+uniform sampler2D input;      // Default input
 uniform sampler2D A;       // Auto-bound to src/A.glsl
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
@@ -19,7 +19,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     
     // Sample both passes
     vec4 passA = texture(A, uv);
-    vec4 input = texture(in, uv);
+    vec4 input = texture(input, uv);
     
     // Blend between them
     fragColor = mix(input, passA, blend);

@@ -14,6 +14,7 @@ src/
 ├── README.md                 # This file
 └── menu/                     # Menu system code
     ├── menu.shio             # Main menu implementation (class main_menu)
+    ├── toolwindow.shio       # Floating window over the program (class toolwindow): the settings window
     ├── assetbrowser/         # Asset browser component
     ├── generators/           # Generator UI components (tabbed singleview)
     ├── timeline/             # Timeline UI component (bottom panel)
@@ -29,6 +30,7 @@ src/
 
 ### Menu System
 - **menu.shio** - Main menu implementation (class `main_menu`)
+- **toolwindow.shio** - A floating window with pages listed at its side (class `toolwindow`). The settings window is one; it is built in `assetbrowser/assetbrowser.shio` and opened from the top bar
 - **assetbrowser/** - Asset browsing and selection UI (fixtures / artnet / shizonet / chat / mcp)
 - **generators/** - Generator management UI (tabbed `singleview`)
 - **timeline/** - Timeline editor UI (bottom panel, BPM/phase nudge logic)

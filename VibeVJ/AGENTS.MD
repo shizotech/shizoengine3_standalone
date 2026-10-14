@@ -75,7 +75,7 @@ The second core idea of VibeVJ is that **users design their own UI**. Instead of
 - `generatorview.shio` — holds a free-floating group of generator windows in a scroll area (drag/drop handlers at `area.content().on_dragdrop_hover` ~lines 23-25 and `on_dragdrop` ~lines 27-33, which calls `add_generator`).
 - `clipview.shio` — the clip/timeline view (drag/drop handlers `on_dragdrop_hover` ~lines 101-103, `on_cell_drop` line 105, and `begin_dragdrop` for dragging clips and stacking effects at line 866).
 - `clipstackview.shio` — the clip stack view, which can itself be dragged into the clipview to stack effects onto sources (`on_dragdrop_hover` ~lines 25-27, `on_dragdrop` ~lines 29-38; see the TODO at line 4).
-- `singleview.shio` — a single-generator view with its own `on_dragdrop_hover` (~lines 20-22) and `on_dragdrop` (~lines 24-30) handlers.
+- `singleview.shio` — one area of the layout of a view tab. It holds one generator or view and has a header, a menu and the picker of an empty area. Its drop handlers are in `take_drops`: a drop on an edge splits the area (`split`), in the middle it adds a tab (`add_as_tab`), and a view dragged by its header or tab moves in (`drop_view`). The view tabs themselves are in `src/menu/generators/generators.shio`.
 
 The engine wires `on_dragdrop` / `on_dragdrop_hover` handlers on each of these views so they can be nested and composed by the user. See `engine/generators/README.md` for the view-container overview and `assets/Views/README.md` for the user-facing view assets.
 
@@ -135,6 +135,11 @@ for VJs, not for developers. The pages for the existing features came with #295;
 has a line `> Screenshot to add: …`.
 
 - Use the same words as the UI and the design glossary (`../design/wiki/Glossary.md`). Mark planned features as planned.
+- Link to the place that says more: `[Moving a view](The-Screen.md#moving-a-view)`. The Help window of the program shows
+  the same pages, with these links (rules in `wiki/README.md`, *Writing a page*).
+- A new control gets a tooltip. Words of `wiki/glossary.json` are written as `[[area]]` or `[[area|areas]]` in it, and a
+  line `[[wiki:Page#heading]]` at its end leads into the wiki (also with F1 on the control). A new word gets its entry in
+  `glossary.json`, with the `page` that explains it.
 - UI rules (colours, notches, sizes, labels) are in `../design/README.md`; their meaning is explained in `../design/wiki/`. A
   change to a design rule updates both in the same PR.
 

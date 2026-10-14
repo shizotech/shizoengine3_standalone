@@ -33,6 +33,13 @@ MyShader.glsl/
 3. **Subdirectories**: Files in `src/subdir/` are **NOT rendered**, only accessible via `#include`
 4. **Single File Fallback**: A single `.glsl` file (without directory structure) can also be used
 5. **Rich Controls**: Each shader should have uniform controls so every aspect of the shader can be modified, be really expressive on controls for the shader
+6. **Strict GLSL 330 core**: shaders run on NVIDIA, AMD/Intel (Mesa) and macOS. Only NVIDIA accepts sloppy code, so write strict code:
+   - use `texture()`, never `texture2D()` / `textureCube()` / `gl_FragColor` (removed from the core profile);
+   - never name anything `in`, `out` or another keyword, and do not redefine built-ins such as `noise2()`;
+   - no implicit conversions: `vec3(p)` with a `vec2 p` does not compile (`vec3(p, 0.0)`, `p.xyx`), and assigning a `vec2` to a `float` is an error;
+   - no `\` line continuations.
+
+   Check: `python3 compile_scripts/check_glsl.py` (needs `glslangValidator`, it also runs in CI).
 
 ---
 

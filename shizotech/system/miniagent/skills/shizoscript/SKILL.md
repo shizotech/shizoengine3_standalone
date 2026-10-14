@@ -779,7 +779,8 @@ Before generating code:
 - Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed. An unbraced body on the same line as the `if`/`else`/`for` is exactly one statement: in `if(c) a(); b();` only `a()` is conditional (see Indentation vs Brackets).
 - `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
 - Integer division truncates (`7 / 2 == 3`).
-- Division by zero returns `0` (`x / 0 == 0`) and prints a runtime error report (`Division by zero!`, `Modulo by zero!` for `%`). The error is NOT fatal: the script continues and `try`/`catch` does NOT catch it.
+- Division by zero returns `0` (`x / 0 == 0`, also `x % 0`) and prints a one-line warning, once for each place in the code (`file.shio:12:8: Runtime Warning: Division by zero, the result is 0 (shown once for this place)`). It is NOT an error: the script continues, the exit code stays 0 and `try`/`catch` does NOT catch it. Check the divisor yourself if 0 is possible. In `#strict` code a literal `0` divisor is a compile error.
+- Variables of a namespace (`math.PI`, ...) are shared by every script and module: `math.PI = 3`, `math.PI += 1` and `math.PI++` are compile errors. Copy the value into a variable of your own (`p = math.PI;`). Members of an object held by a namespace variable can still be changed.
 - `-1 % 4 == -1` and `math.mod(-1, 4) == -1` (sign follows the left operand, like C).
 - Endless recursion raises a runtime error once the call depth limit is reached (see Functions).
 - Mixed-type comparisons may coerce unexpectedly (`"5" == 5` is `1`); keep both sides the same type.

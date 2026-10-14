@@ -25,10 +25,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 texel = 1.0 / iResolution.xy;
 
     // Sample surrounding pixels for edge detection
-    float top = dot(texture2D(iChannel0, uv + vec2(0.0, texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float bottom = dot(texture2D(iChannel0, uv + vec2(0.0, -texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float left = dot(texture2D(iChannel0, uv + vec2(-texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float right = dot(texture2D(iChannel0, uv + vec2(texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float top = dot(texture(iChannel0, uv + vec2(0.0, texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float bottom = dot(texture(iChannel0, uv + vec2(0.0, -texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float left = dot(texture(iChannel0, uv + vec2(-texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float right = dot(texture(iChannel0, uv + vec2(texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
 
     // Sobel-like edge detection
     float edge_x = right - left;
@@ -41,10 +41,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         for (float y = -3.0; y <= 3.0; y += 1.0) {
             vec2 offset = vec2(x, y) * texel;
             float sample_edge = length(vec2(
-                dot(texture2D(iChannel0, uv + vec2(texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722)) -
-                dot(texture2D(iChannel0, uv + vec2(-texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722)),
-                dot(texture2D(iChannel0, uv + vec2(0.0, texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722)) -
-                dot(texture2D(iChannel0, uv + vec2(0.0, -texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722))
+                dot(texture(iChannel0, uv + vec2(texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722)) -
+                dot(texture(iChannel0, uv + vec2(-texel.x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722)),
+                dot(texture(iChannel0, uv + vec2(0.0, texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722)) -
+                dot(texture(iChannel0, uv + vec2(0.0, -texel.y)).rgb, vec3(0.2126, 0.7152, 0.0722))
             ));
 
             if (sample_edge > edge_threshold) {
@@ -55,7 +55,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     glow /= 49.0;
 
     // Combine original with edges and glow
-    vec4 input = texture2D(iChannel0, uv);
+    vec4 input = texture(iChannel0, uv);
     vec3 color = input.rgb;
 
     // Apply edge color

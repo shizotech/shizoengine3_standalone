@@ -26,7 +26,7 @@ vec4 Cell(int index){
 void mainImage( out vec4 fragColor, in vec2 fragCoord )
 {
     vec2 uv = fragCoord.xy / iResolution.xy;
-    vec4 noise = texture(iChannel2, fragCoord.xy / iChannelResolution[2].xy + fract(vec2(42,56)*iTime));
+    vec4 noise = texture(iChannel2, fragCoord.xy / vec2(textureSize(iChannel2, 0)) + fract(vec2(42,56)*iTime));
     vec4 normalizedVolume = Cell(13)*0.2 + 0.75;
     vec4 integratedVolume = Cell(19);
     vec4 fader = Cell(22)*8.;

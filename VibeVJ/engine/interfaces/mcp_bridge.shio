@@ -14,7 +14,7 @@
 //
 //   vibevj_list_generators, vibevj_get_focus, vibevj_describe_generator,
 //   vibevj_query, vibevj_lock_generator, vibevj_unlock_generator,
-//   vibevj_activity
+//   vibevj_activity, vibevj_list_links
 //
 // Safety for live use:
 //   - tool calls run on the HTTP server's script threads, not in the render loop
@@ -27,6 +27,9 @@
 
 #include "mcp/mcp_server"
 #include "aiinterface"
+
+// nanogui.all_links / nanogui.cable_place for vibevj_list_links
+import nanogui;
 
 VIBEVJ_MCP_DEFAULT_PORT = 13340;
 
@@ -46,6 +49,8 @@ generator has a live_path and offers queries.
 This is a live performance: change only what the user asked for. Other agents
 (the in-app Chat) may control the same generators, vibevj_activity shows the
 last change. vibevj_lock_generator reserves a generator for your changes.
+
+vibevj_list_links lists the links between controls (what drives what).
 )";
 
 VIBEVJ_MCP_STATIC_TOOLS = [
@@ -56,6 +61,8 @@ VIBEVJ_MCP_STATIC_TOOLS = [
 	"vibevj_lock_generator",
 	"vibevj_unlock_generator",
 	"vibevj_activity",
+	"vibevj_describe_layout",
+	"vibevj_list_links",
 ];
 
 vibevj_mcp_is_static_tool(name) {
@@ -65,6 +72,33 @@ vibevj_mcp_is_static_tool(name) {
 	}
 	return false;
 }
+
+// The value of a control as 0..1 (the position in its range), None when it has no range (text, vector, ...)
+vibevj_mcp_normalized(ctrl) {
+	try {
+		kind = std.vtype(ctrl);
+		value = ctrl.value();
+		if(kind == "nanogui.midicontrolbutton")
+			return value ? 1.0 : 0.0;
+		if(kind == "nanogui.midicontrolslider" || kind == "nanogui.midicontrolfloat" || kind == "nanogui.midicontrolint") {
+			low = std.float(ctrl.min());
+			high = std.float(ctrl.max());
+			if(high == low)
+				return 0.0;
+			return math.clamp((std.float(value) - low) / (high - low), 0.0, 1.0);
+		}
+		if(kind == "nanogui.midicontrolcombo") {
+			count = ctrl.items().size();
+			if(count < 2)
+				return 0.0;
+			return math.clamp(std.float(value) / std.float(count - 1), 0.0, 1.0);
+		}
+	}
+	catch(e) {}
+	return None;
+}
+
+VIBEVJ_MCP_LINK_TYPES = ["Absolute", "Normalized", "Inverted"];
 
 class VibeVJMCPBridge {
 
@@ -274,6 +308,89 @@ class VibeVJMCPBridge {
 	}
 
 	// =========================================================================
+	// Links (vibevj_list_links, the Links view shows the same)
+	// =========================================================================
+
+	// One end of a link: where it is (nanogui.cable_place) and its value
+	link_end(ctrl, path) {
+		place = [];
+		try {
+			found_place = nanogui.cable_place(ctrl);
+			if(found_place)
+				place = found_place;
+		}
+		catch(e) {}
+
+		value = None;
+		try {
+			value = ctrl.value();
+		}
+		catch(e) {}
+		// Objects (a texture of a plain control) do not go into JSON: their type instead
+		kind = std.vtype(value);
+		if(kind != "none" && kind != "int" && kind != "float" && kind != "string" && kind != "json")
+			value = kind;
+
+		end = [
+			live_path = path,
+			area = place.area ?? "",
+			generator = place.generator ?? "",
+			control = place.control ?? ctrl.name(),
+			place = place.place ?? "",
+			value = value,
+		];
+		normalized = vibevj_mcp_normalized(ctrl);
+		if(!std.is_none(normalized))
+			end.normalized = normalized;
+		return end;
+	}
+
+	// Every link, sorted by the area, generator and control of the sender. filter: only links whose area,
+	// generator or control names (of either end) contain it, case-insensitive
+	list_links(filter = None) {
+		needle = filter ? std.string(filter).lowercase() : "";
+		found = nanogui.all_links();
+		sorted = [];
+
+		for(i = 0; i < found.size(); i++) {
+			link = found[i];
+			sender = link_end(link["from"], link.from_path);
+			receiver = link_end(link["to"], link.to_path);
+
+			if(needle) {
+				names = sender.place + " " + sender.area + " " + sender.generator + " " + sender.control;
+				names += " " + receiver.place + " " + receiver.area + " " + receiver.generator + " " + receiver.control;
+				if(!names.lowercase().contains(needle))
+					continue;
+			}
+
+			kind = std.int(link.type_index);
+			if(kind < 0 || kind > 2)
+				kind = 0;
+
+			// A keyed list sorts by its keys; "\n" sorts before every letter, the index keeps the keys apart
+			sort_key = sender.area + "\n" + sender.generator + "\n" + sender.control + "\n" + std.string(i);
+			sorted[sort_key] = [
+				from = sender,
+				to = receiver,
+				type = VIBEVJ_MCP_LINK_TYPES[kind],
+				type_id = link["type"],
+			];
+		}
+		sorted.sort();
+
+		links = [];
+		for(i = 0; i < sorted.size(); i++)
+			links.push_back(sorted[i]);
+
+		return [
+			links = links,
+			count = links.size(),
+			total = found.size(),
+		];
+	}
+
+	// =========================================================================
 	// Call filter (rate limit, read only mode)
 	// =========================================================================
 
@@ -433,6 +550,27 @@ class VibeVJMCPBridge {
 				}
 				result.locks = locks;
 				return result;
+			}
+		);
+
+		server.add_tool(
+			"vibevj_describe_layout",
+			"Describes the layout of every view tab: splits, Tabviews, empty areas and the view in each area (its asset in 'assets', by uid), the view tab in front, the maximized area and the next undo / redo step. Read only.",
+			None,
+			[this](svr, args) {
+				menu = std.global("engine").menu;
+				if(!menu || !menu.generators_menu)
+					std.runtime_error("The views are not set up yet.");
+				return menu.generators_menu.layout_overview();
+			}
+		);
+
+		server.add_tool(
+			"vibevj_list_links",
+			"Lists every link between controls: sender and receiver with their live paths, the view/area and generator they are in, the control names, the link type and the current values. Use it to explain what drives what.",
+			[filter = "string(): Only links whose area, generator or control names (of either end) contain this text, case-insensitive."],
+			[this](svr, args) {
+				return this.list_links(args.geti("filter"));
 			}
 		);
 	}

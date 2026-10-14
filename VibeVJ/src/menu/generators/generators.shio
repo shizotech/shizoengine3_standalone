@@ -3,15 +3,54 @@ using eigen;
 
 #include "engine/generators/singleview"
 
+//The top bar (#345) is the header of the views tab bar:
+//  [sidebar] [≡ menu] | [undo] [redo] | [tab] [tab] [+]  … free space …  [window buttons]
+//Its free space moves the window (the program runs without the OS frame), tabs and buttons do not.
+//Views are not chosen here: an empty area offers them (singleview), a filled one has them in its header menu.
+//Every view tab ("workspace") holds one singleview. The first one keeps the node name "generator_view", so older
+//projects and their MIDI mappings load unchanged.
+
 class generators
 {
 	managed window = None;
-	managed views = [];
-	
 	managed subviews = None;
-	
+	managed workspaces = []; //one per view tab: [tab=, node=, view=, main=]; the order on screen is the tab bar's
+	                         //A tab in a window of its own (multi window) also has window= (its screen), holder= and note=
+
+	eng = None;
+	sidebar_btn = None;
+
+	//Undo / redo (#350). The layout is the first thing in it: every step keeps the layout before and after
+	managed undo_history = None;
+	recording = false;    //a layout step is running: steps inside it belong to it
+	graves = [];          //uid -> [path=, guid=, state=, node=]: views a step took away, kept to make them again
+	parking = None;       //holds the views while a layout is rebuilt
+	undo_btn = None;
+	redo_btn = None;
+	back_btn = None;      //back to where the last jump of the cable view started (#381)
+	cable_history = [];   //[ctrl, place] of every jump of the cable view, the last one at the end
+	badges_time = 0;      //when the badges of the tabs were last set, ms (refresh_cable_badges)
+	tab_menu_btn = None; //carries the menu of a view tab to the cursor
+
+	bar_height = 48; //toolbar height (design/tokens.json size.toolbar, engine/style.json toolbar_height)
+	btn_size = 36;
+	btn_top = 6;
+	btn_step = 38;
+	tab_height = 30; //the tabs are lower than the bar and sit in its middle
+
+	//The shortcuts of the layout work on one area (#349): the one the mouse is in, or the one F6 went to
+	active_area = "";
+	marked_area = ""; //F6 went there: it shows a line at its top edge until the mouse enters an area again
+
 	__init__(engine, main_menu) {
-		
+
+		eng = engine;
+
+		style = fileio.read_json(STYLE_FILE);
+		if(style && style.toolbar_height)
+			bar_height = style.toolbar_height;
+		btn_top = std.int((bar_height - btn_size) / 2);
+
 		window = engine.screen.window("");
 		window.anchor_top(0)
 			.anchor_left(main_menu.asset_menu.window.fixed_width())
@@ -20,7 +59,7 @@ class generators
 			.movable(false)
 			.margin(0)
 			.resizable_bottom(true);
-			
+
 		//The bottom edge of the views and the top edge of the timeline are one edge: while they touch (or are
 		//snapped) the timeline follows it both ways, so pulling the edge up no longer leaves a black gap,
 		//and pushing it down stops at the timeline bar instead of shoving the timeline off the screen
@@ -28,106 +67,1529 @@ class generators
 			tl = main_menu.timeline_menu;
 			top = this.window.y();
 			timeline_top = tl.window.y();
-			
+
 			if(tl.snap_btn.value() || top + old_size.y >= timeline_top - 1.0 || top + new_size.y > timeline_top)
 				tl.place(top + new_size.y);
 		});
-		
+
 		subviews = window.tabwidget();
 		subviews.anchor(0).anchor_bottom(5);
 		subviews.closeable(true).movable(true);
-		
-		//Cannot drag tabs around because of this somehow
-		subviews.on_mouse_button([this, engine, subviews](pos, btn, down, mods)
-		{		
-			if(!subviews.mouse_button_default(pos, btn, down, mods) && down && pos.y < subviews.header_height())
-				engine.screen.begin_drag();		
+		subviews.header_height(bar_height);
+		subviews.tab_height(tab_height);
+		//A press takes a tab, the release brings it to the front: in between it can be dragged down into an area of
+		//the tab in front. A drag over another tab brings that one to the front after a moment
+		subviews.select_on_release(true).spring_tabs(true);
+		//The badges of the cable view on the tabs, kept current while the bar draws (#381)
+		subviews.on_draw([this](){
+			this.refresh_cable_badges();
 		});
-		
-		add_frame_buttons(engine);
-		
-		generator_view_tab = subviews.add_permanent_tab("Views");
-		
-		generatorview_node = generator_view_tab.matrixnode("generator_view").anchor(0);
-		
-		views.generatorview = singleview(generatorview_node);
-		engine.main_generator_view = views.generatorview;
-		
-		engine.save_hooks["generators"] = [this](){		
-			states = [];		
-			for(i = 0; i < this.views.size(); i++) {
-				states[views.key(i)] = this.views[i].save_state();
+
+		//A press on free bar space moves the window; tabs, "+" and the scroll controls handle their own press.
+		//A handled press must return true: otherwise it falls through to the window, which takes the focus back
+		//and moves on top of a dialog the press just opened (rename, delete tab)
+		subviews.on_mouse_button([this, engine, subviews](pos, btn, down, mods)
+		{
+			//A right click on a view tab opens its menu
+			if(btn == 1 && pos.y < subviews.header_height()) {
+				if(!down) {
+					index = subviews.tab_under(pos);
+					if(index >= 0)
+						this.open_tab_menu(index, pos);
+				}
+				return true;
 			}
-			return states;
+			if(subviews.mouse_button_default(pos, btn, down, mods))
+				return true;
+			if(down && pos.y < subviews.header_height())
+				engine.screen.begin_drag();
+			return false;
+		});
+
+		//Dragging a view tab along the bar reorders it, dragging it down out of the bar moves its view into an area:
+		//onto an edge as a split, into the middle as a tab (singleview.start_drag, #347)
+		subviews.on_mouse_drag([this, subviews](pos, rel, btn, mods){
+			index = subviews.pressed_tab();
+			if(index < 0 || pos.y < subviews.header_height() + 6)
+				return subviews.mouse_drag_default(pos, rel, btn, mods);
+
+			ws = this.find_workspace(subviews.tab_at(index));
+			subviews.pressed_tab(-1);
+			if(ws)
+				ws.view.start_drag(subviews);
+			return true;
+		});
+
+		subviews.add_button(true);
+		subviews.on_add([this](){
+			if(nanogui.show_mode())
+				return; //show mode (#285): the layout is locked while performing
+			this.layout_step("Add tab", [this](){
+				this.add_workspace(this.free_tab_name(), "", true, false);
+			});
+		});
+
+		subviews.on_double_click([this](index){
+			this.layout_step("Rename tab", [this, index](){
+				this.rename_tab(index);
+			});
+		});
+
+		subviews.on_close([this](index){
+			this.layout_step("Delete tab", [this, index](){
+				this.close_tab(index);
+			});
+		});
+
+		left = add_left_buttons(engine, main_menu);
+		right = add_frame_buttons(engine);
+		right = add_project_info(engine, main_menu, right + 8);
+		subviews.header_insets(left, right + 8);
+
+		main = add_workspace("Views", "", false, true);
+		engine.main_generator_view = main.view;
+
+		//An area that closes or gets another view hands its old view over (singleview.to_tab): nothing is deleted
+		engine.env.view_to_tab = [this](gen, name){
+			this.view_to_tab(gen, name);
 		};
-		
-		engine.load_hooks["generators"] = [this](states){					
-			for(i = 0; i < this.views.size(); i++) {
-				view_name = views.key(i);
-				if(states.has(view_name)) {
-					views[i].load_state(states[view_name]);
+
+		//The view of a tab was dragged into an area of another tab (singleview.moved_out): the tab goes with it.
+		//The last view tab stays
+		engine.env.view_moved_out = [this](uid){
+			for(i = 0; i < this.workspaces.size(); i++) {
+				ws = this.workspaces[i];
+				if(ws.view.uid == uid) {
+					if(!ws.view.item && this.ordered_workspaces().size() > 1)
+						this.remove_workspace(ws);
+					return;
 				}
 			}
 		};
+
+		//The mouse entered an area (singleview): the shortcuts work on that one now
+		engine.env.area_entered = [this](uid){
+			this.active_area = uid;
+			this.mark_area("");
+		};
+
+		//F1 opens the wiki on the page of the part of the screen the mouse is in
+		window.on_mouse_enter([engine](pos, enter){
+			if(enter)
+				engine.env.help_region = "The-Screen";
+		});
+		main_menu.asset_menu.window.on_mouse_enter([engine](pos, enter){
+			if(enter)
+				engine.env.help_region = "Generators";
+		});
+
+		//An area was split: what it held is in a new area, and the shortcuts follow it there
+		engine.env.area_replaced = [this](old_uid, new_uid){
+			if(this.active_area == old_uid)
+				this.active_area = new_uid;
+			if(this.marked_area == old_uid)
+				this.mark_area(new_uid);
+		};
+
+		//The areas of the view tab in front, for "Swap with" in the menu of an area (singleview)
+		engine.env.layout_areas = [this](){
+			return this.areas();
+		};
+
+		//A click on a card of the cable view (#381): the area of the other end comes to the front, with its view tab
+		//and the tabs of the Tabviews on the way; the control is scrolled to and flashes afterwards (nanogui)
+		nanogui.on_cable_jump([this](ctrl, ids, from){
+			if(ids && ids.size() > 0)
+				this.reveal_area(ids[0]);
+			//A step forward: the way back goes to where it started
+			if(!std.is_none(from) && from)
+				this.remember_jump(from);
+		});
+		//"End all local cable views" of the timeline also ends the cable view of every area
+		engine.env.cable_areas_off = [this](){
+			for(i = 0; i < this.workspaces.size(); i++)
+				this.workspaces[i].view.cables_off_tree();
+		};
+
+		//Every key comes here before the focused widget gets it
+		engine.screen.on_keyboard([this, engine](key, scancode, action, mods){
+			//The letter of the key in the keyboard layout in use: the key codes are positions on a US keyboard, where
+			//a German Z is a Y. Empty for a key without a letter
+			letter = action == 1 ? engine.screen.key_name(key, scancode) : "";
+			if(action == 1 && this.shortcut(key, mods, letter))
+				return true;
+			handled = engine.screen.keyboard_default(key, scancode, action, mods);
+			//Undo / redo, when nothing that has the focus used the key itself (a code editor, a mapping editor)
+			if(!handled && action == 1 && this.history_key(letter, mods))
+				return true;
+			return handled;
+		});
+
+		//Undo / redo (#350)
+		undo_history = history();
+		undo_history.on_change = [this](){
+			this.refresh_history_buttons();
+		};
+		//Links made, removed or changed by the user are steps too (#387); not while a step of the layout runs or a
+		//project loads
+		link_steps_attach(undo_history, engine.ctx, [this, engine](){
+			return this.recording || engine.load_in_progress;
+		});
+		refresh_history_buttons();
+		engine.env.layout_step = [this](name, action){
+			this.layout_step(name, action);
+		};
+		engine.env.bury_views = [this](area){
+			this.bury_views(area);
+		};
+
+		//The setting for the heads of the areas changed (Settings, Appearance)
+		engine.env.refresh_areas = [this](){
+			for(i = 0; i < this.workspaces.size(); i++)
+				this.workspaces[i].view.refresh_tree();
+		};
+
+		engine.save_hooks["generators"] = [this](){
+			return this.save_state();
+		};
+
+		engine.load_hooks["generators"] = [this](states){
+			this.load_state(states);
+		};
+	}
+
+	//View tabs
+
+	add_workspace(name, guid = "", switch_to = true, main = false) {
+		tab = subviews.add_tab(name, switch_to);
+		//The first tab keeps the node name of the former permanent "Views" tab, so control paths stay the same
+		node = main ? tab.matrixnode("generator_view").anchor(0) : tab.matrixnode("", guid).anchor(0);
+		view = singleview(node);
+		//The root of the layout of the screen: only areas below it are split (singleview.can_split)
+		view.workspace = true;
+		view.refresh_chrome();
+
+		ws = [tab=tab, node=node, view=view, main=main];
+		workspaces.push_back(ws);
+		return ws;
+	}
+
+	//A view that left its area gets a tab of its own, with its state, links and MIDI mappings (#347).
+	//The tab does not come to the front: the user is arranging the tab in front
+	view_to_tab(gen, name) {
+		ws = add_workspace(name, "", false, false);
+		ws.view.attach(gen);
+		return ws;
+	}
+
+	// =========================================================================
+	// Undo / redo of the layout (#350)
+	// =========================================================================
+	//A step keeps the layout before and after it as data (describe_all). Undo and redo rebuild the layout of that data
+	//(restore_layout): the splits and Tabviews are made again, the views in them are alive and move into place, so
+	//their state, links and MIDI mappings stay. Only a view that a step deleted is loaded again, from what was kept
+	//of it (graves).
+
+	//Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z. letter: the letter on the key that was pressed
+	history_key(letter, mods) {
+		if(nanogui.show_mode() || !undo_history)
+			return false;
+		if(mods == 2 && letter == "z") {
+			undo_history.undo();
+			return true;
+		}
+		if((mods == 2 && letter == "y") || (mods == 3 && letter == "z")) {
+			undo_history.redo();
+			return true;
+		}
+		return false;
+	}
+
+	refresh_history_buttons() {
+		if(!undo_btn || !redo_btn || !undo_history)
+			return;
+		undo_name = undo_history.undo_name();
+		redo_name = undo_history.redo_name();
+		undo_btn.enabled(undo_name != "");
+		undo_btn.tooltip((undo_name != "" ? "Undo: " + undo_name + " (Ctrl+Z)" : "Undo the last change of the [[layout]] or of a [[link]] (Ctrl+Z)") + "\n[[wiki:The-Screen#undo-and-redo]]");
+		redo_btn.enabled(redo_name != "");
+		redo_btn.tooltip((redo_name != "" ? "Redo: " + redo_name + " (Ctrl+Y)" : "Redo the change you took back (Ctrl+Y)") + "\n[[wiki:The-Screen#undo-and-redo]]");
+	}
+
+	//Runs a user action on the layout as one step. Nothing is recorded when the layout is the same afterwards
+	//(a question that was answered with no, an action that does not apply)
+	layout_step(name, action) {
+		if(!undo_history || undo_history.busy || recording) {
+			action();
+			return;
+		}
+
+		recording = true;
+		before = describe_all();
+		try {
+			action();
+		}
+		catch(e) {}
+		after = describe_all();
+		recording = false;
+
+		if(before.compact_string() == after.compact_string())
+			return;
+		undo_history.push(name,
+			[this, before](){ this.restore_layout(before); },
+			[this, after](){ this.restore_layout(after); });
+	}
+
+	//The layout of every view tab as data
+	describe_all() {
+		list = [];
+		ordered = ordered_workspaces();
+		for(i = 0; i < ordered.size(); i++) {
+			ws = ordered[i];
+			list.push_back([guid = ws.node.guid(), name = subviews.tab_name(ws.tab), root = ws.view.describe()]);
+		}
+		//The tab in front belongs to the layout: undoing "Add tab" goes back to the tab that showed before
+		front = front_workspace();
+		return [view_tabs = list, front = front ? front.node.guid() : ""];
+	}
+
+	//describe_all with the asset of every view by its uid, the maximized area and the next undo / redo step: for the
+	//MCP tool vibevj_describe_layout, which the Linux smoke test checks the layout with (#385)
+	layout_overview() {
+		//A step of the layout is still running: it waits for frames while views are freed, and this call comes from
+		//the thread of the MCP server in between. The layout is half built then (a split without its module), and a
+		//key pressed now is not a step of its own: the caller asks again
+		if(recording || (undo_history && undo_history.busy))
+			return [busy = 1];
+
+		try {
+			assets = [];
+			for(i = 0; i < workspaces.size(); i++) {
+				leaves = [];
+				workspaces[i].view.collect_leaves(leaves);
+				for(k = 0; k < leaves.size(); k++) {
+					gen = leaves[k].item;
+					if(gen)
+						assets[gen.uid] = gen.get_relative_path();
+				}
+			}
+			//The tiles of the pickers of the empty areas in the view tab in front, where they are on the screen
+			picker = [];
+			shown = areas();
+			for(i = 0; i < shown.size(); i++) {
+				tiles = shown[i].picker_tiles();
+				for(k = 0; k < tiles.size(); k++)
+					picker.push_back(tiles[k]);
+			}
+			maximized = eng.env.maximized_view;
+			maximized_uid = "";
+			if(maximized && maximized.item)
+				maximized_uid = maximized.item.uid;
+			return [
+				busy = 0,
+				layout = describe_all(),
+				assets = assets,
+				maximized = maximized_uid,
+				picker = picker,
+				undo = undo_history ? undo_history.undo_name() : "",
+				redo = undo_history ? undo_history.redo_name() : "",
+			];
+		}
+		catch(e) {
+			//A view that is freed right now (a load, a view closed outside a step)
+			return [busy = 1, error = std.string(e)];
+		}
+	}
+
+	//Keeps what is needed to make a generator again: a step is about to delete it
+	bury(gen) {
+		try {
+			graves[gen.uid] = [
+				path = gen.get_relative_path(),
+				guid = gen.guid,
+				state = gen.save_state(),
+				node = gen.node.serialize_json(true),
+			];
+		}
+		catch(e) {}
+	}
+
+	//The same for everything in an area
+	bury_views(area) {
+		leaves = [];
+		area.collect_leaves(leaves);
+		for(i = 0; i < leaves.size(); i++)
+			bury(leaves[i].item);
+	}
+
+	//Rebuilds the layout of a description
+	restore_layout(desc) {
+		maximized = eng.env.maximized_view;
+		if(maximized)
+			maximized.restore_maximized();
+
+		if(!parking)
+			parking = window.widget().fixed_size(vec2f(8, 8)).visible(false);
+
+		//1. Every view that is alive leaves its area and waits
+		pool = [];
+		for(i = 0; i < workspaces.size(); i++) {
+			leaves = [];
+			workspaces[i].view.collect_leaves(leaves);
+			for(k = 0; k < leaves.size(); k++) {
+				gen = leaves[k].detach();
+				gen.window.move_to(parking);
+				pool[gen.uid] = gen;
+			}
+		}
+
+		//2. What is left in the tabs is layout: it goes
+		for(i = 0; i < workspaces.size(); i++) {
+			root = workspaces[i].view;
+			if(root.item) {
+				old = root.detach();
+				old.release();
+			}
+		}
+		for(!garbage_cleared()) {
+			std.sleep(0);
+		}
+
+		//3. The view tabs of the description, each with its layout
+		kept = [];
+		for(t = 0; t < desc.view_tabs.size(); t++) {
+			d = desc.view_tabs[t];
+			ws = None;
+			for(i = 0; i < workspaces.size(); i++) {
+				if(workspaces[i].node.guid() == d.guid)
+					ws = workspaces[i];
+			}
+			if(!ws)
+				ws = add_workspace(d.name, d.guid, false, false);
+			subviews.tab_name(ws.tab, d.name);
+			kept.push_back(ws);
+			build_layout(ws.view, d.root, pool);
+		}
+
+		//A view tab the description does not have is gone again (it is empty now)
+		for(i = workspaces.size() - 1; i >= 0; i--) {
+			ws = workspaces[i];
+			found = false;
+			for(k = 0; k < kept.size(); k++) {
+				if(kept[k] == ws)
+					found = true;
+			}
+			if(!found && !ws.main)
+				remove_workspace(ws);
+		}
+
+		//4. A view that is alive but not in the description was added by a step that is being undone. It is kept
+		//as data, so the redo can make it again
+		//One that a step dragged out of a Patchview goes back there as a window
+		for(i = 0; i < pool.size(); i++) {
+			gen = pool[i];
+			if(gen && !return_home(gen)) {
+				bury(gen);
+				gen.release();
+			}
+		}
+
+		for(i = 0; i < workspaces.size(); i++) {
+			if(desc.front != "" && workspaces[i].node.guid() == desc.front)
+				subviews.set_active_tab(workspaces[i].tab);
+		}
+
+		active_area = "";
+		marked_area = "";
+		for(i = 0; i < workspaces.size(); i++)
+			workspaces[i].view.refresh_tree();
+	}
+
+	//A generator that "Move generators" (#348) took out of a Patchview goes back into it. false: it has no such home,
+	//or the Patchview is gone
+	return_home(gen) {
+		homes = eng.env.generator_homes;
+		views = eng.env.patch_views;
+		if(!homes || !views || !homes.has(gen.uid))
+			return false;
+		home = homes[gen.uid];
+		for(v = 0; v < views.size(); v++) {
+			if(views[v].uid == home.view) {
+				views[v].take_back(gen, home);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//The generator with that uid, taken alive out of the Patchview it is in (the redo of "Move generators")
+	take_from_patch(uid) {
+		views = eng.env.patch_views;
+		if(!views)
+			return None;
+		for(v = 0; v < views.size(); v++) {
+			view = views[v];
+			for(i = 0; i < view.items.size(); i++) {
+				gen = view.items[i];
+				if(gen && gen.uid == uid)
+					return view.forget(gen.guid);
+			}
+		}
+		return None;
+	}
+
+	//One area of a description: a view that is alive moves in, a split or a Tabview is made and its areas follow
+	build_layout(area, d, pool) {
+		if(!d || d.kind == "empty")
+			return;
+
+		if(d.kind == "leaf") {
+			gen = None;
+			if(pool.has(d.uid)) {
+				gen = pool[d.uid];
+				pool.erase(d.uid);
+				area.attach(gen);
+			}
+			else if(graves.has(d.uid)) {
+				//It was deleted since: made again from what was kept, under the name the steps know it by
+				grave = graves[d.uid];
+				gen = area.add_generator(area.area, grave.path, grave.guid);
+				if(gen) {
+					gen.uid = d.uid;
+					try {
+						gen.load_state(grave.state);
+						gen.node.deserialize_json(grave.node, true);
+					}
+					catch(e) {}
+				}
+			}
+			else {
+				//It is a window in a Patchview again (an undo put it back): it moves into the area once more
+				gen = take_from_patch(d.uid);
+				if(gen)
+					area.attach(gen);
+			}
+			if(gen && d.hide >= 0) {
+				area.auto_hide = d.hide;
+				area.refresh_chrome();
+			}
+			return;
+		}
+
+		gen = area.add_generator(area.area, d.path, d.guid);
+		if(!gen)
+			return;
+
+		if(d.kind == "split") {
+			gen.module.call("ensure_views", d.views.size());
+			gen.module.call("set_sizes", d.sizes);
+			for(i = 0; i < d.views.size(); i++)
+				build_layout(gen.module.call("get_view", i), d.views[i], pool);
+			//The areas the split made after it was adopted belong to this area too
+			area.adopt();
+		}
+		else if(d.kind == "tabs") {
+			gen.module.call("clear_tabs");
+			for(i = 0; i < d.tabs.size(); i++) {
+				view = gen.module.call("add_new_tab", -1, d.tabs[i].name, d.tabs[i].guid);
+				build_layout(view, d.tabs[i].view, pool);
+			}
+			gen.module.call("select_tab", d.selected);
+		}
+	}
+
+	// Shortcuts (#349). They are named in the tooltips of the buttons and in wiki/Shortcuts-and-Tips.md
+
+	//true: the key was a shortcut and is used up. mods: 0 none, 1 Shift, 2 Ctrl, 3 Ctrl+Shift. letter: the letter on
+	//the key in the keyboard layout in use ("" for a key without one)
+	//from_ws: the key came from the window of that view tab (multi window): the keys of the areas work on its areas
+	shortcut(key, mods, letter = "", from_ws = None) {
+		//Alt+Left: back to where the last jump of the cable view started
+		if(key == 263 && mods == 4)
+			return cable_back();
+		//Esc closes a tool window (Settings, Help): the one that has the focus, else the one in front (#376: right
+		//after F1 or the ? button the window does not have the focus yet)
+		if(key == 256 && eng.env.toolwindows) {
+			tools = eng.env.toolwindows;
+			for(i = 0; i < tools.size(); i++) {
+				if(tools[i].visible() && tools[i].window.focused()) {
+					tools[i].hide();
+					return true;
+				}
+			}
+			front = toolwindow_in_front(eng);
+			if(front) {
+				front.hide();
+				return true;
+			}
+		}
+
+		//F11 from anywhere in the program. In a view window it is that window: on a second monitor or a projector
+		//its views fill the monitor. A view window has the frame of the system, which goes while it fills the monitor
+		if(key == 300 && from_ws && from_ws.window.fill_monitor_available()) {
+			toggle_window_fill(from_ws);
+			return true;
+		}
+		if(key == 300 && !from_ws && eng.screen.fill_monitor_available()) {
+			eng.screen.fill_monitor(!eng.screen.fill_monitor());
+			return true;
+		}
+
+		//F1: the wiki, on the page for the part of the screen the mouse is in (#357, #358)
+		if(key == 290 && mods == 0 && eng.env.open_help) {
+			eng.env.open_help(eng.env.help_region ?? "");
+			//The wiki opens in the main window: from a view window that one comes to the front
+			if(from_ws)
+				eng.screen.focus_window();
+			return true;
+		}
+
+		//The rest belongs to the views: only while they have the focus, so not in a dialog, the sidebar or the timeline
+		views_window = from_ws ? from_ws.holder : window;
+		if(!views_window.focused())
+			return false;
+
+		//Ctrl+0 shows everything, Ctrl+1 is 100 %: the Patchview the mouse was over last (also on the keypad)
+		if(mods == 2 && (key == 48 || key == 49 || key == 320 || key == 321)) {
+			if(patch_zoom(key == 48 || key == 320 ? "all" : "100"))
+				return true;
+		}
+		ctrl = mods == 2 || mods == 3;
+		back = mods == 1 || mods == 3;
+
+		if(key == 258 && ctrl && !from_ws) { //Ctrl+Tab, Ctrl+Shift+Tab
+			switch_tab(back ? -1 : 1);
+			return true;
+		}
+
+		//The others are for the areas of a view tab, a code tab keeps its keys
+		ws = from_ws ? from_ws : current_workspace();
+		if(!ws)
+			return false;
+
+		if(key == 295 && (mods == 0 || mods == 1)) { //F6, Shift+F6
+			focus_area(back ? -1 : 1, ws);
+			return true;
+		}
+
+		//The keys of #347: E, D, W by the letter on the key, and Space (32)
+		if(!ctrl || (letter != "e" && letter != "d" && letter != "w" && key != 32))
+			return false;
+
+		//Closing only works on the area itself: after it is gone the next Ctrl+W must not close another one
+		area = find_active_area(letter != "w", ws);
+		if(!area)
+			return true;
+		if(letter == "e") //Ctrl+E, Ctrl+Shift+E
+			area.split_empty(back ? "bottom" : "right");
+		else if(mods != 2)
+			return true;
+		else if(letter == "d") //Ctrl+D
+			area.duplicate();
+		else if(key == 32) //Ctrl+Space
+			area.toggle_maximize();
+		else //Ctrl+W
+			area.close_by_key();
+
+		//The widget that had the focus can be gone with the area: the views keep the focus for the next key
+		views_window.focus(true);
+		return true;
+	}
+
+	//A zoom key for the canvas the mouse was over last; false when there is none (the key stays free)
+	patch_zoom(act) {
+		env = std.global("engine").env;
+		views = env.patch_views;
+		uid = env.hovered_patch_uid;
+		if(!views || !uid)
+			return false;
+		for(i = 0; i < views.size(); i++) {
+			v = views[i];
+			if(v.uid == uid && v.zoom_chip) {
+				if(!v.area.visible_recursive())
+					return false;
+				v.zoom_action(act);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//The areas of the view tab in front (or of ws) that show something, in reading order
+	areas(ws = None) {
+		list = [];
+		if(!ws)
+			ws = current_workspace();
+		if(ws)
+			ws.view.collect_areas(list);
+		return list;
+	}
+
+	// =========================================================================
+	// Cable view: the way back, the badges of the tabs (#381)
+	// =========================================================================
+
+	//A jump of the cable view started at ctrl: it is the way back. At most 20 steps
+	remember_jump(ctrl) {
+		place = nanogui.cable_place(ctrl);
+		cable_history.push_back([ctrl = ctrl, place = place.place + " · " + place.control]);
+		if(cable_history.size() > 20)
+			cable_history.erase(0);
+		refresh_back_button();
+	}
+
+	//Back to where the last jump started; the jump back is no new step
+	cable_back() {
+		for(cable_history.size() > 0) {
+			last = cable_history[cable_history.size() - 1];
+			cable_history.erase(cable_history.size() - 1);
+			//A control that is gone (its generator was closed) is skipped
+			try {
+				nanogui.jump_to_control(last.ctrl);
+				refresh_back_button();
+				return true;
+			}
+			catch(e) {}
+		}
+		refresh_back_button();
+		return false;
+	}
+
+	refresh_back_button() {
+		if(!back_btn)
+			return;
+		has = cable_history.size() > 0;
+		back_btn.enabled(has);
+		back_btn.tooltip(has
+			? "Back to " + cable_history[cable_history.size() - 1].place + " (Alt+Left)\n[[wiki:Linking#seeing-your-links]]"
+			: "Back: no jump of the [[cable view]] yet (Alt+Left)\n[[wiki:Linking#seeing-your-links]]");
+	}
+
+	//The tabs that hold the hidden end of a cable on screen get a badge with the number of such links, lit while a card
+	//under the mouse or the signal path leads there: the view tabs of the top bar and the tabs of every Tabview.
+	//A few times a second (from the drawing of the tab bar)
+	refresh_cable_badges() {
+		now = std.millis();
+		if(now - badges_time < 200)
+			return;
+		badges_time = now;
+
+		targets = [];
+		list = nanogui.cable_targets();
+		for(i = 0; i < list.size(); i++)
+			targets[list[i].id] = list[i];
+
+		front = front_workspace();
+		for(i = 0; i < workspaces.size(); i++) {
+			ws = workspaces[i];
+			//The tab of a view window leads to views that are on the screen in their window: no badge
+			t = (ws != front && !ws.window && targets.has(ws.view.uid)) ? targets[ws.view.uid] : None;
+			subviews.tab_badge(ws.tab, t && t.count > 0 ? std.string(t.count) : "", t && t.hot ? true : false);
+			ws.view.cable_badges(targets);
+		}
+	}
+
+	//The area with that uid in any view tab: its view tab comes to the front, then the area shows itself
+	reveal_area(uid) {
+		//The tab bar also holds code tabs: its own index
+		for(i = 0; i < subviews.tab_count(); i++) {
+			ws = find_workspace(subviews.tab_at(i));
+			area = ws ? ws.view.find_area(uid) : None;
+			if(!area)
+				continue;
+			if(ws.window)
+				ws.window.focus_window();
+			else if(current_workspace() != ws)
+				subviews.tab(i);
+			area.reveal();
+			return;
+		}
+	}
+
+	//or_first: the first area when the mouse has not been in one of this tab yet. ws: the view tab (the one in front)
+	find_active_area(or_first = true, ws = None) {
+		list = areas(ws);
+		for(i = 0; i < list.size(); i++) {
+			if(list[i].uid == active_area)
+				return list[i];
+		}
+		return (or_first && list.size() > 0) ? list[0] : None;
+	}
+
+	//The area the keyboard went to gets a line at its top edge; "" takes the line away. ws: the view tab it is in
+	mark_area(uid, ws = None) {
+		if(marked_area == uid)
+			return;
+		marked_area = uid;
+
+		for(i = 0; i < workspaces.size(); i++)
+			workspaces[i].view.clear_marks();
+		if(uid == "")
+			return;
+
+		list = areas(ws);
+		for(i = 0; i < list.size(); i++) {
+			if(list[i].uid == uid)
+				list[i].set_marked(true);
+		}
+	}
+
+	//F6: the next area of the view tab in front (or of ws) becomes the one the shortcuts work on
+	focus_area(step, ws = None) {
+		list = areas(ws);
+		count = list.size();
+		if(count == 0)
+			return;
+
+		index = -1;
+		for(i = 0; i < count; i++) {
+			if(list[i].uid == active_area)
+				index = i;
+		}
+		index = index < 0 ? 0 : index + step;
+		if(index >= count)
+			index = 0;
+		if(index < 0)
+			index = count - 1;
+
+		active_area = list[index].uid;
+		mark_area(active_area, ws);
+	}
+
+	//Ctrl+Tab: the next tab of the top bar comes to the front
+	switch_tab(step) {
+		count = subviews.tab_count();
+		if(count < 2)
+			return;
+		index = subviews.tab() + step;
+		if(index >= count)
+			index = 0;
+		if(index < 0)
+			index = count - 1;
+		subviews.tab(index);
+	}
+
+	//"View 2", "View 3", …: the first name that no tab has yet (tabs get closed, so counting them gave a name twice)
+	free_tab_name() {
+		for(n = workspaces.size() + 1; n < 1000; n++) {
+			name = "View " + std.string(n);
+			taken = false;
+			for(i = 0; i < subviews.tab_count(); i++) {
+				if(subviews.tab_name(i) == name)
+					taken = true;
+			}
+			if(!taken)
+				return name;
+		}
+		return "View";
+	}
+
+	find_workspace(tab) {
+		if(!tab)
+			return None;
+		for(i = 0; i < workspaces.size(); i++) {
+			if(workspaces[i].tab == tab)
+				return workspaces[i];
+		}
+		return None;
+	}
+
+	//The view tabs in the order of the tab bar (the bar also holds code tabs from the asset browser)
+	ordered_workspaces() {
+		ordered = [];
+		for(i = 0; i < subviews.tab_count(); i++) {
+			ws = find_workspace(subviews.tab_at(i));
+			if(ws)
+				ordered.push_back(ws);
+		}
+		return ordered;
+	}
+
+	//The view tab in front whose views are in the main window. None for a code tab, and for a tab whose views are in a
+	//window of their own (its tab only leads there)
+	current_workspace() {
+		ws = front_workspace();
+		return (ws && !ws.window) ? ws : None;
+	}
+
+	//The view tab in front of the tab bar, also when its views are in a window of their own
+	front_workspace() {
+		return find_workspace(subviews.content());
+	}
+
+	//The menu of a view tab (right click): rename, save its layout as a preset (#349), delete
+	open_tab_menu(index, pos) {
+		ws = find_workspace(subviews.tab_at(index));
+		if(!ws || nanogui.show_mode())
+			return;
+
+		if(!tab_menu_btn) {
+			tab_menu_btn = window.button_popup("").side("auto").transparent(true)
+				.anchor_left(0).anchor_top(0).fixed_width(1).fixed_height(1).overlay(true);
+			tab_menu_btn.on_screen(true).autoclose(true);
+			tab_menu_btn.popup().content().layout(nanogui.layout_vertical());
+			tab_menu_btn.popup().content().fixed_width(230);
+		}
+		if(tab_menu_btn.pushed())
+			return;
+
+		menu = tab_menu_btn.popup().content();
+		menu.clear_children();
+		popup_btn = tab_menu_btn;
+		add_item = [menu, popup_btn](caption, icon, action) {
+			item = menu.button(caption).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+			if(icon)
+				item.icon(nanogui.icon(icon));
+			item.on_click([popup_btn, action](){
+				popup_btn.close();
+				action();
+			});
+			return item;
+		};
+
+		add_item("Rename…", "pen", [this, index](){
+			this.layout_step("Rename tab", [this, index](){ this.rename_tab(index); });
+		});
+		//What the tab holds as a preset of its view: a layout is a preset of the split at its top, and every empty
+		//area offers it again
+		if(ws.view.item)
+			add_item("Save layout as preset…", "save", [ws](){ ws.view.save_preset(); });
+		//Multi window: the views of the tab in a window of their own, e.g. on a second monitor
+		if(ws.window) {
+			add_item("Show its window", "external_link_alt", [ws](){ ws.window.focus_window(); });
+			add_item("Back into the tab", "window_restore", [this, ws](){ this.back_from_window(ws); });
+		}
+		else
+			add_item("Open in own window", "external_link_alt", [this, ws](){ this.open_in_window(ws); });
+		if(ordered_workspaces().size() > 1)
+			add_item("Delete tab…", "trash", [this, index](){
+				this.layout_step("Delete tab", [this, index](){ this.close_tab(index); });
+			});
+
+		tab_menu_btn.anchor_left(pos.x - 2).anchor_top(pos.y + 6);
+		tab_menu_btn.pushed(true);
+	}
+
+	rename_tab(index) {
+		ws = find_workspace(subviews.tab_at(index));
+		if(!ws || nanogui.show_mode())
+			return;
+
+		form = [
+			[id="name",  	label="Tab name",  	type="text", placeholder = subviews.tab_name(index)],
+		];
+
+		res = eng.screen.modal_form(form, "Rename tab", "OK", "Cancel");
+		if(res.choice != "submit" || !res.values.name)
+			return;
+
+		subviews.tab_name(index, res.values.name);
+		if(ws.window)
+			ws.window.window_title(window_caption(ws));
+	}
+
+	close_tab(index) {
+		tab = subviews.tab_at(index);
+		ws = find_workspace(tab);
+
+		//Code tabs opened from the asset browser close right away
+		if(!ws) {
+			subviews.remove_tab(index);
+			return;
+		}
+
+		if(nanogui.show_mode())
+			return; //show mode (#285): no deleting while performing
+
+		//The last view tab stays: the program always has a place to drop views into
+		if(ordered_workspaces().size() <= 1)
+			return;
+
+		if(ws.view.item) {
+			accept = eng.screen.modal_yes_no("Delete the tab \"" + subviews.tab_name(index) + "\" and the views in it?", "Delete tab?");
+			if(accept != "yes")
+				return;
+		}
+
+		//Undo makes the views of the tab again from what is kept here
+		bury_views(ws.view);
+		remove_workspace(ws);
+	}
+
+	remove_workspace(ws) {
+		back_from_window(ws);
+		for(i = 0; i < workspaces.size(); i++) {
+			if(workspaces[i] == ws) {
+				workspaces.erase(i);
+				break;
+			}
+		}
+
+		if(ws.view.item)
+			ws.view.item.release();
+		subviews.remove_tab(ws.tab);
+
+		//The main view (MCP bridge, new project) moves on to the first view tab that is left
+		if(ws.main) {
+			ordered = ordered_workspaces();
+			if(ordered.size() > 0) {
+				ordered[0].main = true;
+				eng.main_generator_view = ordered[0].view;
+			}
+		}
+	}
+
+	// =========================================================================
+	// Multi window: a view tab in a window of its own
+	// =========================================================================
+	//The views of a view tab move into another OS window (screen.child_screen), e.g. on a second monitor. They keep
+	//running as they are, with their state, links and MIDI mappings: the window draws with the OpenGL context of the
+	//program. The tab stays in the bar and leads there; closing the window brings the views back into it.
+
+	//rect: [x=, y=, w=, h=] where the window was (a saved project), None: a new window. false when the system cannot
+	//open one
+	open_in_window(ws, rect = None) {
+		if(ws.window) {
+			ws.window.focus_window();
+			return true;
+		}
+
+		width = rect && rect.w ? std.int(rect.w) : 1280;
+		height = rect && rect.h ? std.int(rect.h) : 800;
+		scr = eng.screen.child_screen(window_caption(ws), width, height);
+		if(!scr) {
+			std.error("Cannot open a window of its own for the view tab \"" + subviews.tab_name(ws.tab) + "\" on this system");
+			return false;
+		}
+		if(rect)
+			scr.window_position(vec2f(rect.x, rect.y));
+
+		holder = scr.window("");
+		holder.anchor(0).movable(false).margin(0);
+
+		ws.window = scr;
+		ws.holder = holder;
+		ws.node.move_to(holder);
+		ws.node.anchor(0);
+
+		//The tab shows where its views are, until they come back
+		if(!ws.note)
+			ws.note = make_window_note(ws);
+		ws.note.visible(true);
+
+		//The close button of the window frame brings the views back. false: the window is closed here, not by the
+		//system
+		scr.should_close([this, ws](){
+			this.back_from_window(ws);
+			return false;
+		});
+
+		//The keys of the views work in the window as in the main window, on its areas
+		scr.on_keyboard([this, ws, scr](key, scancode, action, mods){
+			letter = action == 1 ? scr.key_name(key, scancode) : "";
+			if(action == 1 && this.shortcut(key, mods, letter, ws))
+				return true;
+			handled = scr.keyboard_default(key, scancode, action, mods);
+			if(!handled && action == 1 && this.history_key(letter, mods))
+				return true;
+			return handled;
+		});
+
+		//The links of the tooltips into the wiki, which opens in the main window
+		scr.on_tooltip_link([this](target){
+			follow = this.eng.screen.on_tooltip_link();
+			if(!follow)
+				return;
+			this.eng.screen.focus_window();
+			follow(target);
+		});
+
+		//The window manager of X11 leaves the full screen of F11 later: the frame comes back once it has
+		scr.on_maximize([this, ws](maximized){
+			if(ws.window && !ws.window.fill_monitor())
+				this.finish_leaving_fill(ws);
+		});
+
+		holder.on_mouse_enter([this](pos, enter){
+			if(enter)
+				this.eng.env.help_region = "The-Screen";
+		});
+
+		active_area = "";
+		mark_area("");
+		ws.view.refresh_tree();
+		scr.focus_window();
+
+		//It filled its monitor when the project was saved (F11): on the monitor it was placed on above
+		if(rect && rect.fill && scr.fill_monitor_available())
+			toggle_window_fill(ws);
+		return true;
+	}
+
+	//F11 in a view window: its views fill the monitor the window is on (a second monitor, a projector), without the
+	//frame of the system. F11 again brings the frame back, at the place and size from before
+	toggle_window_fill(ws) {
+		scr = ws.window;
+		if(!scr)
+			return;
+		if(!scr.fill_monitor() && !ws.leaving_fill) {
+			ws.rect_before_fill = window_rect(ws);
+			scr.decorated(0);
+			scr.fill_monitor(true);
+			return;
+		}
+		ws.leaving_fill = true;
+		scr.fill_monitor(false);
+		//Windows leaves it right away, the window manager of X11 later (on_maximize in open_in_window)
+		if(!scr.fill_monitor())
+			finish_leaving_fill(ws);
+	}
+
+	finish_leaving_fill(ws) {
+		if(!ws.leaving_fill || !ws.window)
+			return;
+		ws.leaving_fill = false;
+		scr = ws.window;
+		scr.decorated(1);
+		r = ws.rect_before_fill;
+		ws.rect_before_fill = None;
+		if(r) {
+			scr.screen_size(vec2f(r.w, r.h));
+			scr.window_position(vec2f(r.x, r.y));
+		}
+	}
+
+	//The views of a tab in a window of its own come back into the tab, the window closes
+	back_from_window(ws) {
+		if(!ws || !ws.window)
+			return;
+		scr = ws.window;
+		ws.node.move_to(ws.tab);
+		ws.node.anchor(0);
+		if(ws.note)
+			ws.note.visible(false);
+		ws.window = None;
+		ws.holder = None;
+		ws.rect_before_fill = None;
+		ws.leaving_fill = false;
+		scr.close_window();
+
+		active_area = "";
+		mark_area("");
+		ws.view.refresh_tree();
+	}
+
+	//Where the window of a view tab is, for the project: [x=, y=, w=, h=], None when its views are in the main window.
+	//While it fills its monitor (F11): the place and size from before, and fill = 1
+	window_rect(ws) {
+		if(!ws.window)
+			return None;
+		if(ws.rect_before_fill && ws.window.fill_monitor()) {
+			r = ws.rect_before_fill;
+			return [x = r.x, y = r.y, w = r.w, h = r.h, fill = 1];
+		}
+		pos = ws.window.window_position();
+		size = ws.window.screen_size();
+		return [x = pos.x, y = pos.y, w = size.x, h = size.y];
+	}
+
+	window_caption(ws) {
+		return subviews.tab_name(ws.tab) + " - VibeVJ";
+	}
+
+	//What the tab of a view window shows instead of its views
+	make_window_note(ws) {
+		note = ws.tab.widget().anchor(0);
+		box = note.widget().anchor_left(32).anchor_top(32).fixed_width(420).layout(nanogui.layout_vertical());
+		box.label("The views of this tab are in a window of their own.").fixed_height(28);
+		show_btn = box.button("Show the window").icon(nanogui.icon("external_link_alt")).alignment("left").fixed_height(30)
+			.tooltip("Brings the window of this tab to the front.\n[[wiki:The-Screen#view-windows]]");
+		show_btn.on_click([ws](){
+			if(ws.window)
+				ws.window.focus_window();
+		});
+		box.label("").fixed_height(6);
+		back_btn = box.button("Back into the tab").icon(nanogui.icon("window_restore")).alignment("left").fixed_height(30)
+			.tooltip("Closes the window: its views come back into this tab, as they are.\n[[wiki:The-Screen#view-windows]]");
+		back_btn.on_click([this, ws](){
+			this.back_from_window(ws);
+		});
+		return note;
+	}
+
+	//No view that was released is waiting to be freed, in the main window or a view window
+	garbage_cleared() {
+		if(!eng.screen.garbage_cleared())
+			return false;
+		for(i = 0; i < workspaces.size(); i++) {
+			if(workspaces[i].window && !workspaces[i].window.garbage_cleared())
+				return false;
+		}
+		return true;
+	}
+
+	//Left end of the bar: sidebar, menu, settings, help, undo / redo. Returns the room they take
+
+	add_left_buttons(engine, main_menu) {
+		x = 6;
+
+		//At the edge it moves: a chevron like the collapse button of the timeline, pointing where the sidebar goes
+		sidebar_btn = window.button("").icon(nanogui.icon(main_menu.sidebar_visible ? "chevron_left" : "chevron_right")).tooltip("Show / hide the [[sidebar]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
+		sidebar_btn.on_click([this, main_menu](){
+			this.show_sidebar(main_menu, !main_menu.sidebar_visible);
+		});
+		x += btn_step;
+
+		menu_btn = window.button_popup("").icon(nanogui.icon("bars")).side("bottom").tooltip("Menu: open and save the [[project]], settings, help\n[[wiki:The-Screen#top-bar]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
+		menu = menu_btn.popup().content().layout(nanogui.layout_vertical());
+		menu.fixed_width(260);
+		//Built each time it opens: the list of recent projects is then always the current one (#315, #360)
+		menu_btn.on_change([this, menu, menu_btn, engine, main_menu](pushed){
+			if(pushed)
+				this.add_app_menu(menu, menu_btn, engine, main_menu);
+		});
+		x += btn_step;
+
+		//The settings window (#356), next to the menu
+		settings_btn = window.button("").icon(nanogui.icon("cog")).tooltip("Settings\n[[wiki:Settings]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
+		settings_btn.on_click([main_menu](){
+			main_menu.asset_menu.settings.toggle();
+		});
+		x += btn_step;
+
+		//The wiki in its window (#357), like F1. It opens where it was left; a second click closes it
+		help_btn = window.button("").icon(nanogui.icon("question")).tooltip("Help: the wiki of VibeVJ in a window. F1 opens it at the part that explains what the mouse is on.\n[[wiki:The-Screen#the-help-window]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
+		help_btn.on_click([main_menu](){
+			if(!main_menu.help)
+				return;
+			if(main_menu.help.tool.visible())
+				main_menu.help.tool.hide();
+			else
+				main_menu.help.open("");
+		});
+		x += btn_step + 8;
+
+		//Undo / redo (#350). They follow the history (refresh_history_buttons)
+		undo_btn = window.button("").icon(nanogui.icon("undo_alt")).tooltip("Undo the last change of the [[layout]] or of a [[link]] (Ctrl+Z)\n[[wiki:The-Screen#undo-and-redo]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true).enabled(false);
+		undo_btn.on_click([this](){
+			if(!nanogui.show_mode())
+				this.undo_history.undo();
+		});
+		x += btn_step;
+		redo_btn = window.button("").icon(nanogui.icon("redo_alt")).tooltip("Redo the change you took back (Ctrl+Y)\n[[wiki:The-Screen#undo-and-redo]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true).enabled(false);
+		redo_btn.on_click([this](){
+			if(!nanogui.show_mode())
+				this.undo_history.redo();
+		});
+		x += btn_step + 8;
+
+		//Back to where the last jump of the cable view started (a click on a card, #381)
+		back_btn = window.button("").icon(nanogui.icon("arrow_left")).tooltip("Back: no jump of the [[cable view]] yet (Alt+Left)")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true).enabled(false);
+		back_btn.on_click([this](){
+			this.cable_back();
+		});
+		x += btn_step + 8;
+
+		return x;
+	}
+
+	//Right end of the bar, left of the window buttons: the name of the project (#360), which had its place in the
+	//Project tab of the sidebar. Returns the room taken from the right edge
+	add_project_info(engine, main_menu, right) {
+		name_width = 220;
+		project_name = window.label("<New Project>").font_size(15).alignment("right").text_color(vec4f(0.608, 0.608, 0.627, 1.0))
+			.anchor_top(0).anchor_right(right + 6).fixed_width(name_width).fixed_height(bar_height).overlay(true);
+		project_name.tooltip("The name of the [[project]]. Save and Save as… are in the menu");
+		//It lies on free bar space: a press on it moves the window like the bar around it
+		project_name.on_mouse_button([engine](pos, btn, down, mods){
+			if(down && btn == 0)
+				engine.screen.begin_drag();
+			return false;
+		});
+		//The engine and the project actions write the name here (project_env.label)
+		std.global("project").label = project_name;
+
+		return right + 6 + name_width;
+	}
+
+	//Shows or hides the sidebar. The chevron of its button points where the sidebar goes with a click
+	show_sidebar(main_menu, visible) {
+		if(main_menu.sidebar_visible != visible)
+			main_menu.toggle_sidebar();
+		if(sidebar_btn)
+			sidebar_btn.icon(nanogui.icon(main_menu.sidebar_visible ? "chevron_left" : "chevron_right"));
+	}
+
+	//The project actions, where they are expected in other programs. They were buttons in the Project tab of the
+	//sidebar until #360; the functions are still made in assetbrowser.shio (project_actions)
+	add_app_menu(menu, menu_btn, engine, main_menu) {
+		menu.clear_children();
+		project = main_menu.asset_menu.project_actions;
+
+		add_item = [menu, menu_btn](caption, icon, action) {
+			item = menu.button(caption).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+			if(icon)
+				item.icon(nanogui.icon(icon));
+			item.on_click([menu_btn, action](){
+				menu_btn.close();
+				action();
+			});
+			return item;
+		};
+
+		run_project = [project](key) {
+			if(!project || !project[key])
+				return;
+			action = project[key];
+			action();
+		};
+
+		add_item("New project", "file", [run_project](){ run_project("new"); });
+		add_item("Open…", "folder", [run_project](){ run_project("load"); });
+
+		//The recent projects, newest first (#315), at most eight
+		entries = [];
+		try {
+			project_dirs = fileio.dirs("projects", false);
+			for(i = 0; i < project_dirs.size(); i++) {
+				info = fileio.file_info("projects/" + project_dirs[i]);
+				entries[project_dirs[i]] = [time = info.last_write_time ?? 0];
+			}
+		}
+		catch(e) {
+			std.error("Cannot read the project list");
+		}
+		entries.sort_by("time", true); //sort_by only sorts keyed entries
+		for(i = 0; i < entries.size() && i < 8; i++) {
+			project_name = entries.key(i);
+			recent_item = add_item("    " + project_name, "", [engine, project_name](){
+				if(engine.env.load_project)
+					engine.env.load_project(project_name);
+			});
+			recent_item.tooltip("Open the project " + project_name);
+		}
+
+		//The templates in ./templates (#425), next to the recent projects. One opens as a new project without a name:
+		//Save asks for a name, the template stays as it is
+		templates = [];
+		try {
+			if(fileio.is_directory("templates"))
+				templates = fileio.dirs("templates", false);
+		}
+		catch(e) {
+			std.error("Cannot read the template list");
+		}
+		if(templates.size() > 0) {
+			add_item("New from template", "clone", [](){}).enabled(false).tooltip("Templates: a [[project]] to start from. Save asks for a name, the template stays as it is.\n[[wiki:Getting-Started#templates]]");
+			for(i = 0; i < templates.size(); i++) {
+				template_name = templates[i];
+				template_item = add_item("    " + template_name, "", [engine, template_name](){
+					if(engine.env.load_template)
+						engine.env.load_template(template_name);
+				});
+				template_item.tooltip("A new project from the template " + template_name + ". Save asks for a name");
+			}
+		}
+
+		add_item("Save", "save", [run_project](){ run_project("save"); });
+		add_item("Save as…", "", [run_project](){ run_project("save_as"); });
+
+		undo_name = undo_history ? undo_history.undo_name() : "";
+		undo_item = add_item(undo_name != "" ? "Undo: " + undo_name : "Undo", "undo_alt", [this](){
+			if(!nanogui.show_mode())
+				this.undo_history.undo();
+		});
+		undo_item.enabled(undo_name != "").tooltip("Undo the last change of the layout or of a link (Ctrl+Z)");
+		redo_name = undo_history ? undo_history.redo_name() : "";
+		redo_item = add_item(redo_name != "" ? "Redo: " + redo_name : "Redo", "redo_alt", [this](){
+			if(!nanogui.show_mode())
+				this.undo_history.redo();
+		});
+		redo_item.enabled(redo_name != "").tooltip("Redo the change you took back (Ctrl+Y)");
+
+		add_item("Settings…", "cog", [main_menu](){
+			main_menu.asset_menu.settings.show();
+		});
+
+		help_item = add_item("Help…", "question", [main_menu](){
+			if(main_menu.help)
+				main_menu.help.open("");
+		});
+		help_item.tooltip("Open the wiki in a window of the program (F1)");
+
+		add_item("Exit", "sign_out_alt", [run_project](){
+			if(nanogui.show_mode())
+				return; //show mode (#285): a stray click must not end the show
+			run_project("exit");
+		});
+	}
+
+	//Save / load: every view tab with its name; "generatorview" keeps the main view for older versions
+
+	save_state() {
+		//A maximized area only changed the split ratios: the layout is saved as it is without it
+		maximized = eng.env.maximized_view;
+		if(maximized)
+			maximized.restore_maximized();
+
+		states = [];
+		ordered = ordered_workspaces();
+		list = [];
+		selected = 0;
+		current = front_workspace();
+
+		for(i = 0; i < ordered.size(); i++) {
+			ws = ordered[i];
+			view_state = ws.view.save_state();
+			if(ws.main)
+				states["generatorview"] = view_state;
+			if(ws == current)
+				selected = i;
+			list.push_back([
+				name = subviews.tab_name(ws.tab),
+				guid = ws.main ? "" : ws.node.guid(),
+				main = ws.main,
+				view = view_state,
+				window = window_rect(ws), //None: in the main window
+			]);
+		}
+
+		states.workspaces = list;
+		states.selected = selected;
+		return states;
+	}
+
+	load_state(states) {
+		//Another project: its history starts empty
+		if(undo_history)
+			undo_history.clear();
+		graves = [];
+		eng.env.generator_homes = [];
+
+		//Every view window closes, its views come back into their tab first (they are released with it below)
+		for(i = 0; i < workspaces.size(); i++)
+			back_from_window(workspaces[i]);
+
+		//The main tab stays, the others are rebuilt. workspaces is managed: assigning a new list would destroy
+		//the main tab as well, so the others are erased one by one
+		main = None;
+		for(i = workspaces.size() - 1; i >= 0; i--) {
+			ws = workspaces[i];
+			if(ws.main) {
+				main = ws;
+				continue;
+			}
+			if(ws.view.item)
+				ws.view.item.release();
+			subviews.remove_tab(ws.tab);
+			workspaces.erase(i);
+		}
+		ws = None;
+
+		for(!eng.screen.garbage_cleared()) {
+			std.sleep(0);
+		}
+
+		if(!states) {
+			main.view.load_state(None);
+			subviews.tab_name(main.tab, "Views");
+			return;
+		}
+
+		//Projects from before the view tabs only have "generatorview"
+		if(!states.workspaces) {
+			main.view.load_state(states.generatorview);
+			return;
+		}
+
+		in_windows = [];
+		for(i = 0; i < states.workspaces.size(); i++) {
+			entry = states.workspaces[i];
+			if(entry.main) {
+				subviews.tab_name(main.tab, entry.name ?? "Views");
+				main.view.load_state(entry.view);
+				if(entry.window)
+					in_windows.push_back([ws = main, rect = entry.window]);
+				continue;
+			}
+			ws = add_workspace(entry.name ?? "View", entry.guid ?? "", false, false);
+			try {
+				ws.view.load_state(entry.view);
+			}
+			catch(e) {
+				std.error("Cannot load view tab " + (entry.name ?? ""));
+			}
+			if(entry.window)
+				in_windows.push_back([ws = ws, rect = entry.window]);
+		}
+
+		//The view tabs that were in windows of their own open there again, where they were
+		for(i = 0; i < in_windows.size(); i++)
+			open_in_window(in_windows[i].ws, in_windows[i].rect);
+
+		ordered = ordered_workspaces();
+		selected = states.selected ?? 0;
+		if(selected >= 0 && selected < ordered.size())
+			subviews.set_active_tab(ordered[selected].tab);
 	}
 
 	//The program runs without the OS frame (screen.decorated(0)): its window buttons sit at the top right, on the tab bar.
 	//From left to right the window gets bigger: minimize (taskbar), maximize (work area), full screen (whole monitor),
 	//and close stays in the corner as in Windows. The tab bar moves the window, the edges of the screen resize it
-	//(screen.resize_border in __init__)
+	//(screen.resize_border in __init__). Returns the room they take from the right end
 	add_frame_buttons(engine) {
 		screen = engine.screen;
-		h = subviews.header_height();
-		btn_h = h - 6;
 		//Full screen: Windows and Linux with X11, which includes XWayland on a Wayland desktop (the Linux build has no native
 		//Wayland GLFW; with one there would be none so far); without it the other buttons close the gap
 		has_full = screen.fill_monitor_available();
-		step = has_full ? 30 : 0;
+		step = has_full ? btn_step : 0;
 		//overlay: the tab bar fills the window and moves on top of its siblings once it gets the focus (any click into
 		//the views), so without it the buttons end up under it
-		
-		close_btn = window.button("").icon(nanogui.icon("times")).tooltip("Close VibeVJ (saves the project)").danger("hover")
-			.anchor_top(3).anchor_right(4).fixed_width(28).fixed_height(btn_h).overlay(true);
+
+		close_btn = window.button("").icon(nanogui.icon("times")).tooltip("Save the [[project]] and close VibeVJ").danger("hover")
+			.anchor_top(btn_top).anchor_right(4).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
 		close_btn.on_click([engine](){
 			if(nanogui.show_mode())
 				return; //show mode (#285): a stray click must not end the show
-			engine.save_project();
-			std.exitprocess(0);
+			//Like Exit in the menu: a named project is saved, an unnamed one is asked about first (#314). Before,
+			//this button saved nothing for an unnamed project and quit without a question
+			if(engine.confirm_quit())
+				std.exitprocess(0);
 		});
-		
+
 		//Full screen: the window fills the whole monitor, over the taskbar, for a show or a small screen. VibeVJ starts
 		//this way (__init__). The button or F11 lead there and back to where the window was; Maximize leads out. On Windows
 		//dragging the tab bar to the top of the screen leads there too and dragging it away leads out
 		full_btn = None;
 		if(has_full) {
-			full_btn = window.button("").icon(nanogui.icon("expand")).tooltip("Full screen: also covers the taskbar (F11)")
-				.anchor_top(3).anchor_right(4 + 30).fixed_width(28).fixed_height(btn_h).overlay(true);
+			full_btn = window.button("").icon(nanogui.icon("expand")).tooltip("Full screen: also covers the taskbar (F11)\n[[wiki:The-Screen#the-program-window]]")
+				.anchor_top(btn_top).anchor_right(4 + btn_step).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
 			full_btn.on_click([screen](){
 				screen.fill_monitor(!screen.fill_monitor());
 			});
-			//F11 from anywhere in the program: the screen sees every key before the focused widget does
-			screen.on_keyboard([screen](key, scancode, action, mods){
-				if(key == 300 && action == 1) { //F11 pressed
-					screen.fill_monitor(!screen.fill_monitor());
-					return true;
-				}
-				return screen.keyboard_default(key, scancode, action, mods);
-			});
+			//F11 leads there too, from anywhere in the program (shortcut())
 		}
-		
+
 		//Maximized fills the work area, the taskbar stays free
 		max_btn = window.button("").icon(nanogui.icon("window_maximize")).tooltip("Maximize")
-			.anchor_top(3).anchor_right(4 + 30 + step).fixed_width(28).fixed_height(btn_h).overlay(true);
+			.anchor_top(btn_top).anchor_right(4 + btn_step + step).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
 		max_btn.on_click([screen](){
 			screen.maximized(!screen.maximized());
 		});
-		
+
 		min_btn = window.button("").icon(nanogui.icon("window_minimize")).tooltip("Minimize")
-			.anchor_top(3).anchor_right(4 + 60 + step).fixed_width(28).fixed_height(btn_h).overlay(true);
+			.anchor_top(btn_top).anchor_right(4 + btn_step * 2 + step).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
 		min_btn.on_click([screen](){
 			screen.iconify();
 		});
-		
+
 		//The icons follow the window, also when it changes another way (window manager, Windows snap, the tab bar)
 		update_frame_buttons = [screen, max_btn, full_btn](maximized){
 			max_btn.icon(nanogui.icon(maximized ? "window_restore" : "window_maximize"));
@@ -140,12 +1602,13 @@ class generators
 		};
 		screen.on_maximize(update_frame_buttons);
 		update_frame_buttons(screen.maximized());
+
+		return 4 + btn_step * 3 + step;
 	}
 
 	add_testbench(name) {
-		new_tab = subviews.add_tab(name, true);
-		generatorview_node = new_tab.matrixnode("testbench_"+std.random_hash()).anchor(0);
-		return singleview(generatorview_node);
+		ws = add_workspace(name, "", true, false);
+		return ws.view;
 	}
-	
+
 }

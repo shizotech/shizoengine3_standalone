@@ -48,7 +48,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         spiral_uv = mix(spiral_uv, extra_uv, blend * 0.3);
     }
 
-    fragColor = texture2D(iChannel0, spiral_uv);
+    fragColor = texture(iChannel0, spiral_uv);
 
     if (fragColor.a == 0.0)
     {

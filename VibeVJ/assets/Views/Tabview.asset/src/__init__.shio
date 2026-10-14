@@ -5,6 +5,13 @@ managed tabs = None;
 
 managed all_tabs = [];
 
+//The area that holds this Tabview (singleview.adopt): the areas of the tabs belong to it
+holder = None;
+
+//A tab dragged out of the strip moves its view to another area (#347): the tab pressed, and how far the mouse went
+drag_state = [tab = -1, distance = 0];
+
+
 ai_docs = R"(
 The tab view can hold multiple tabs.
 )";
@@ -26,8 +33,9 @@ add_new_tab(index = -1, name = None, guid = "") {
 	
 	new_tab = index >= 0 ? tabs.insert_tab(index, name ?? "New tab") : tabs.add_tab(name ?? "New tab");
 	new_node = new_tab.matrixnode("", guid).anchor(0);
-	new_view = singleview(new_node);
+	new_view = singleview(new_node, true); //the tab strip is the head of the area
 	new_view.area.anchor(0);
+	new_view.owner = holder;
 	
 	all_tabs.push_back([
 		tab = new_tab,
@@ -41,12 +49,113 @@ add_new_tab(index = -1, name = None, guid = "") {
 	return new_view;
 }
 
+//Closes a tab without deleting what it shows: the view moves into a tab of its own in the top bar, with its state,
+//links and MIDI mappings (#347). The last tab stays, empty
+close_tab(index) {
+	if(index < 0 || index >= all_tabs.size())
+		return;
+
+	view = all_tabs[index].view;
+	if(view.item) {
+		gen = view.detach();
+		if(!view.to_tab(gen)) {
+			view.attach(gen);
+			return;
+		}
+	}
+
+	if(all_tabs.size() <= 1)
+		return;
+
+	tabs.remove_tab(all_tabs[index].tab);
+	all_tabs.erase(index);
+}
+
+//The view of a tab was dragged to another area (singleview.moved_out): its tab goes. The last tab stays, empty
+remove_tab_of(uid) {
+	for(i = 0; i < all_tabs.size(); i++) {
+		if(all_tabs[i].view.uid == uid) {
+			if(all_tabs.size() > 1) {
+				tabs.remove_tab(all_tabs[i].tab);
+				all_tabs.erase(i);
+			}
+			return;
+		}
+	}
+}
+
+//A user action on the tabs is one step of the history (generators.shio, #350)
+layout_step(name, action) {
+	env = std.global("engine").env;
+	if(env.layout_step)
+		env.layout_step(name, action);
+	else
+		action();
+}
+
+//For the menu of the tab strip (the menu of the area that holds this Tabview)
+close_other_tabs() {
+	keep = tabs.tab();
+	for(i = all_tabs.size() - 1; i >= 0; i--) {
+		if(i != keep)
+			close_tab(i);
+	}
+}
+
+close_all_tabs() {
+	for(i = all_tabs.size() - 1; i >= 0; i--)
+		close_tab(i);
+}
+
+tab_count() {
+	return all_tabs.size();
+}
+
 entry(generator, parent) {
 	
 	tabs = parent.tabwidget();
 	tabs.movable(false); //Re-edit the code to work with this, have to dynamically resolve the correct tab widget from all_tabs
 	tabs.closeable(true);
-	
+	//Like the view tabs of the top bar: a press takes a tab, the release brings it to the front, and a drag over a
+	//tab brings that one to the front after a moment
+	tabs.select_on_release(true).spring_tabs(true);
+
+	//Dragging a tab moves its view: onto the edge of an area as a split, into the middle as a tab (singleview.start_drag).
+	//A handled press returns true, or it would fall through to the window (see generators.shio)
+	tabs.on_mouse_button([tabs](pos, btn, down, mods){
+		count = all_tabs.size();
+		handled = tabs.mouse_button_default(pos, btn, down, mods);
+		if(btn == 0 && down) {
+			drag_state.distance = 0;
+			//Not the "+" and not the cross of a tab that closed: the tabs are still the same
+			drag_state.tab = (handled && all_tabs.size() == count && pos.y < tabs.header_height()) ? tabs.pressed_tab() : -1;
+		}
+		return handled ? true : false;
+	});
+	tabs.on_mouse_drag([tabs](pos, rel, btn, mods){
+		if(drag_state.tab < 0)
+			return tabs.mouse_drag_default(pos, rel, btn, mods);
+		drag_state.distance += math.abs(rel.x) + math.abs(rel.y);
+		if(drag_state.distance >= 8) {
+			index = drag_state.tab;
+			drag_state.tab = -1;
+			if(index < all_tabs.size())
+				all_tabs[index].view.start_drag(tabs);
+		}
+		return true;
+	});
+
+	//"+" after the last tab, like the view tabs of the top bar
+	tabs.add_button(true);
+	tabs.on_add([tabs](){
+		if(nanogui.show_mode())
+			return; //show mode (#285): the layout is locked while performing
+		layout_step("Add tab", [tabs](){
+			add_new_tab(-1);
+			tabs.tab(tabs.tab_count() - 1);
+		});
+	});
+
 	add_new_tab(-1);
 	
 	tabs.on_double_click([generator](index) {
@@ -67,13 +176,12 @@ entry(generator, parent) {
 	
 	tabs.on_close([tabs](index){
 		if(nanogui.show_mode())
-			return; //show mode (#285): no deleting while performing
+			return; //show mode (#285): the layout is locked while performing
 		
-		accept = tabs.screen().modal_yes_no("Are you sure you want to remove this tab?", "Delete tab " + tabs.tab_name(index) + "?");
-		if(accept == "yes") {
-			tabs.remove_tab(all_tabs[index].tab);
-			all_tabs.erase(index);
-		}
+		//Closing never deletes (#347): the view of the tab moves into a tab of its own in the top bar
+		layout_step("Close tab", [index](){
+			close_tab(index);
+		});
 		/*
 		real_index = -1;
 		for(i = 0; i < all_tabs.size(); i++) {
@@ -165,11 +273,13 @@ entry(generator, parent) {
 	});
 	
 	tabs.on_dragdrop([this, tabs](payload, pos) {
-		view = add_new_tab(-1, fileio.pure_name(payload.path));
-		path = fileio.relative_path_cwd(payload.path);	
-		view.add_generator(view.area, path);
+		layout_step("Add view", [payload](){
+			view = add_new_tab(-1, fileio.pure_name(payload.path));
+			path = fileio.relative_path_cwd(payload.path);
+			view.add_generator(view.area, path);
+		});
 		//Handle payload.paths for multi-file later...
-		
+
 		return true;
 	});
 
@@ -183,8 +293,112 @@ find_view(tab) {
 		if(tabs.tab_at(i) == tab)
 			return all_tabs[i];
 	}
-	
+
 	return None;
+}
+
+//For the layout code of a singleview (add_as_tab): module.get() only returns functions, not tabs / all_tabs
+
+set_holder(view) {
+	holder = view;
+}
+
+//The area that holds this Tabview puts its buttons over the right end of the tab strip (variant C of #347,
+//singleview): the tabs end before them. In the units of this window, which the area may show scaled
+strip_room(room) {
+	tabs.header_insets(0, room);
+}
+
+//The height of the tab strip, for the buttons of the area
+strip_height() {
+	return tabs.header_height();
+}
+
+//The area of a tab
+get_view(index) {
+	if(index < 0 || index >= all_tabs.size())
+		return None;
+	return all_tabs[index].view;
+}
+
+set_tab_name(index, name) {
+	if(index >= 0 && index < all_tabs.size())
+		tabs.tab_name(all_tabs[index].tab, name);
+}
+
+//For undo (singleview.describe, generators.shio, #350): name and node of a tab, the tab in front, and a Tabview
+//without tabs to build its tabs again
+tab_info(index) {
+	if(index < 0 || index >= all_tabs.size())
+		return None;
+	return [name = tabs.tab_name(all_tabs[index].tab), guid = all_tabs[index].node.guid()];
+}
+
+selected_tab() {
+	return tabs.tab();
+}
+
+clear_tabs() {
+	tabs.remove_all_tabs();
+	all_tabs = [];
+}
+
+//The area of the tab in front: the shortcuts of the layout work on it (singleview.collect_areas)
+front_view() {
+	return get_view(tabs.tab());
+}
+
+//Closes the tab of that area like its cross does (Ctrl+W)
+close_tab_of(uid) {
+	for(i = 0; i < all_tabs.size(); i++) {
+		if(all_tabs[i].view.uid == uid) {
+			close_tab(i);
+			return;
+		}
+	}
+}
+
+//The area of a tab holds something else now (singleview.name_tab): its tab is named after it. only_new: only while
+//the tab still has the name of a new tab
+set_tab_name_of(uid, name, only_new = false) {
+	for(i = 0; i < all_tabs.size(); i++) {
+		if(all_tabs[i].view.uid == uid) {
+			if(!only_new || tabs.tab_name(all_tabs[i].tab) == "New tab")
+				tabs.tab_name(all_tabs[i].tab, name);
+			return;
+		}
+	}
+}
+
+//The badge of the cable view on a tab (singleview.cable_badges): links lead into it; hot: lit
+tab_badge(index, text, hot) {
+	if(index >= 0 && index < all_tabs.size())
+		tabs.tab_badge(all_tabs[index].tab, text, hot);
+}
+
+//The tab of that area comes to the front (a card of the cable view leads to it, singleview.reveal)
+select_tab_of(uid) {
+	for(i = 0; i < all_tabs.size(); i++) {
+		if(all_tabs[i].view.uid != uid)
+			continue;
+		for(k = 0; k < tabs.tab_count(); k++) {
+			if(tabs.tab_at(k) == all_tabs[i].tab) {
+				tabs.tab(k);
+				return;
+			}
+		}
+	}
+}
+
+//index -1: the last tab
+select_tab(index) {
+	tabs.tab(index < 0 ? tabs.tab_count() - 1 : index);
+}
+
+//Called by the generator before this module goes (generator.free_module_content, #361): the managed globals of a
+//module are not always released with it, and everything they hold then stays alive
+on_free() {
+	all_tabs = [];
 }
 
 save_state() {
@@ -214,13 +428,18 @@ load_state(state) {
 		std.sleep(0);
 	}
 	
-	for(i = 0; i < state.tabs.size(); i++) {
-		new_view = add_new_tab(-1, state.tabs[i].name, state.tabs[i].guid);
+	//An older preset holds one tab, [guid=, name=, view=], not a list of tabs: it loaded as a Tabview without tabs
+	tab_states = state.has("tabs") ? state.tabs : [];
+	if(!state.has("tabs") && state.has("view"))
+		tab_states = [state];
+
+	for(i = 0; i < tab_states.size(); i++) {
+		new_view = add_new_tab(-1, tab_states[i].name, tab_states[i].guid);
 		try {
-			new_view.load_state(state.tabs[i].view);
+			new_view.load_state(tab_states[i].view);
 		}
 		catch(e) {}
 	}
-	
-	tabs.tab(state.selected);
+
+	tabs.tab(state.has("selected") ? state.selected : 0);
 }

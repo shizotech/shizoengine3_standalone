@@ -26,7 +26,7 @@ uniform vec2 center;
 //   - @slidervec2: two sliders for precise control
 // ============================================================
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
@@ -49,7 +49,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     col *= ring * intensity;
     
     // Add subtle input blend
-    vec4 inputColor = texture(in, fragCoord.xy / iResolution.xy);
+    vec4 inputColor = texture(input, fragCoord.xy / iResolution.xy);
     col = mix(col, inputColor.rgb, 0.2);
     
     fragColor = vec4(col, 1.0);

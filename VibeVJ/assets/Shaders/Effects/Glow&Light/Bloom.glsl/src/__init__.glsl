@@ -18,7 +18,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 texel_size = bloom_radius / iResolution.xy;
 
     // Sample input
-    vec4 input_color = texture2D(iChannel0, uv);
+    vec4 input_color = texture(iChannel0, uv);
 
     // Extract bright areas
     float brightness = dot(input_color.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -33,7 +33,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         for (float y = -3.0; y <= 3.0; y += 1.0)
         {
             vec2 offset = vec2(x, y) * texel_size;
-            vec4 sampled = texture2D(iChannel0, uv + offset);
+            vec4 sampled = texture(iChannel0, uv + offset);
             float sample_brightness = dot(sampled.rgb, vec3(0.2126, 0.7152, 0.0722));
 
             if (sample_brightness > bloom_threshold)

@@ -21,12 +21,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 texel_size = neon_radius / iResolution.xy;
 
     // Sample input
-    vec4 input = texture2D(iChannel0, uv);
+    vec4 input = texture(iChannel0, uv);
     float brightness = dot(input.rgb, vec3(0.2126, 0.7152, 0.0722));
 
     // Detect edges using simple difference
-    float edge_x = abs(input.r - texture2D(iChannel0, uv + vec2(texel_size.x, 0.0)).r);
-    float edge_y = abs(input.g - texture2D(iChannel0, uv + vec2(0.0, texel_size.y)).g);
+    float edge_x = abs(input.r - texture(iChannel0, uv + vec2(texel_size.x, 0.0)).r);
+    float edge_y = abs(input.g - texture(iChannel0, uv + vec2(0.0, texel_size.y)).g);
     float edge = max(edge_x, edge_y);
 
     // Neon glow effect
@@ -34,7 +34,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     for (float x = -2.0; x <= 2.0; x += 1.0) {
         for (float y = -2.0; y <= 2.0; y += 1.0) {
             vec2 offset = vec2(x, y) * texel_size;
-            vec4 sampled = texture2D(iChannel0, uv + offset);
+            vec4 sampled = texture(iChannel0, uv + offset);
             float sample_bright = dot(sampled.rgb, vec3(0.2126, 0.7152, 0.0722));
 
             if (sample_bright > neon_threshold) {

@@ -37,6 +37,8 @@ engine/
 │   ├── aiinterface.shio           # AIInterface: the queries an AI agent can run on a generator
 │   ├── mcp_bridge.shio            # MCP server of the MCP tab, serves the AIInterface queries as tools
 │   └── videorouter.shio
+├── migrate/
+│   └── migrate.shio               # Format of projects and presets on disk, steps from older formats (#386)
 └── processes/                     # Subprocess code (DO NOT CHANGE)
     ├── audio_process.shio         # Audio processing subprocess
     └── monitor_process.shio       # Monitor processing subprocess
@@ -70,10 +72,14 @@ generator.register("set_split", [size = "&float(0,1): Normalized split position"
 The MCP tab runs the server on a configurable port (default 13340, `configs/mcp_server.json`):
 `http://localhost:<port>/mcp` (Streamable HTTP) and `/sse` (HTTP+SSE). Each query name becomes a tool
 with an extra `live_path` argument, plus `vibevj_list_generators`, `vibevj_get_focus`,
-`vibevj_describe_generator`, `vibevj_query`, `vibevj_lock_generator`, `vibevj_unlock_generator` and
-`vibevj_activity`. "Pause" rejects every request, "Allow changes" off rejects every write.
+`vibevj_describe_generator`, `vibevj_query`, `vibevj_lock_generator`, `vibevj_unlock_generator`,
+`vibevj_activity`, `vibevj_describe_layout` (the areas of every view tab as data, read only; `busy` while a step of
+the layout runs) and `vibevj_list_links` (every link between controls with both ends, their place from
+`nanogui.cable_place`, the type and the values; optional `filter`). "Pause" rejects every request, "Allow changes"
+off rejects every write.
 
-Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root, no GUI needed).
+Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root, no GUI needed), and the Linux smoke test
+`_testing/linux_app/smoke.py`, which drives the running app and checks it through this server (#385).
 
 ## Components
 
@@ -87,6 +93,12 @@ Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root
 - **`generators/extensions/`** — each subfolder (`asset`, `glsl`, `png`, `txt`) contains an
   `__init__.shio` exporting a `load_extension(generator)` entry point (plus optional
   `save_state` / `load_state` / `dispatcher`).
+- **`migrate/`** — `PROJECT_FORMAT`, the format of projects and presets. A project folder has `project.json`
+  (`format`), a preset has `format` at its top level; without it the format is 1. On load, `migrate_project_file()` /
+  `migrate_preset()` bring older JSON to the current format before anything reads it, so `load_state` of the views and
+  generators only knows the current one. A newer format is not loaded. The first save over an older project keeps its
+  old files in `projects/<name>/.backup_v<format>/`. To change the format: raise `PROJECT_FORMAT` and add a step
+  (`migrate_<n>_to_<n+1>`), tested in `_testing/project_migration.shio`.
 - **`assets/`** — engine-internal generator assets used as glue between engine parts.
 - **`processes/`** — code for functions that must run in a subprocess.
 

@@ -76,6 +76,11 @@ vec2 GradientB(vec2 uv, vec2 d, vec4 selector, int level, sampler2D bufB, sample
     return vec2( dot(dX, selector), dot(dY, selector) );
 }
 
+// 1 inside the unit square, 0 outside (the Shadertoy original calls it with one argument)
+float unit_square(vec2 uv){
+    return (uv.x > 0. && uv.x < 1. && uv.y > 0. && uv.y < 1. ) ? 1. : 0.;
+}
+
 float unit_square(vec2 uv, vec2 aspect){
     uv = 0.5 + (uv - 0.5)/aspect.yx;
     return (uv.x > 0. && uv.x < 1. && uv.y > 0. && uv.y < 1. ) ? 1. : 0.;

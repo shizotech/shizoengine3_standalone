@@ -12,7 +12,7 @@ uniform float radius;
 // blended with the main pass (__init__.glsl).
 // ============================================================
 
-uniform sampler2D in;
+uniform sampler2D input;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
@@ -40,7 +40,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     );
     
     // Blend with input
-    vec4 inputColor = texture(in, uv);
+    vec4 inputColor = texture(input, uv);
     col = mix(inputColor.rgb, col, 0.8);
     
     fragColor = vec4(col, 1.0);

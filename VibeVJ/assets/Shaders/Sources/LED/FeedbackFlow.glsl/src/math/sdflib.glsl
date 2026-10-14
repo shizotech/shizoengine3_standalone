@@ -7,7 +7,7 @@
 // --- hash / value-noise ---
 float ff_hash(vec2 p)
 {
-    vec3 p3 = fract(vec3(p) * vec3(0.1031, 0.1030, 0.0973));
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
     p3 += dot(p3, p3.yzx + vec3(34.0, 96.0, 124.0));
     return fract((p3.x + p3.y) * p3.z);
 }

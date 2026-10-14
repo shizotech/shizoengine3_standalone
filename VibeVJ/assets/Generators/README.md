@@ -8,39 +8,34 @@ Generators are the core processing units of the VJ application. They can generat
 
 ## Categories
 
-| Category | Description | Files |
-|----------|-------------|-------|
-| **Math** | Math-based waveform/LFO generators | SineGenerator.asset, TriangleWave.asset, LFOSynth.asset, SawtoothWave.asset, SquareWave.asset, NoiseGenerator.asset, LFOClock.asset |
-| **Audio** | Audio analysis and reactive generators | AudioInputAnalysis.asset |
-| **Network** | Network input/output generators | artnet_receiver.asset, artnet_sender.asset, spout_receiver.asset |
-| **Output** | Output configuration generators | LEDMapping.asset |
-| **Utility** | Utility and helper generators | test.asset, textbox.asset, value_text.asset |
+| Category | Description | Assets |
+|----------|-------------|--------|
+| **Math** | Waveforms, LFOs, clocks and step sequencers | SineGenerator, TriangleWave, SawtoothWave, SquareWave, NoiseGenerator, LFOSynth, LFOClock, StepChaser, PathPad |
+| **Audio** | Audio analysis that drives everything else | AudioInputAnalysis |
+| **Network** | Art-Net in and out, video in (NDI, Spout), CDJs over Pro DJ Link | ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks |
+| **Utility** | Pads, button fields, envelopes and small helpers | XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld, Control-Button-Matrix, EnvelopeOutput, StepChaser, control4, quantize, textbox, value_text, Chat, broken |
+| **output** | Masks for an output | RGBMask (`legacy/` holds VideoToRGB, no longer in the asset list) |
+| **ExampleBasics** | Code examples for asset authors | custom_drawing_ui_controls |
+
+`Utility/broken.asset` fails on purpose: it shows what the error report of a broken asset looks like (the Linux smoke
+test, `_testing/linux_app/smoke.py`, leaves it out).
 
 ## Directory Structure
 
 ```
 Generators/
-├── Math/             # Math-based waveform/LFO generators
-│   ├── SineGenerator.asset
-│   ├── TriangleWave.asset
-│   ├── LFOSynth.asset
-│   ├── SawtoothWave.asset
-│   ├── SquareWave.asset
-│   ├── NoiseGenerator.asset
-│   └── LFOClock.asset
-├── Audio/            # Audio generators
-│   └── AudioInputAnalysis.asset
-├── Network/          # Network generators
-│   ├── artnet_receiver.asset
-│   ├── artnet_sender.asset
-│   └── spout_receiver.asset
-├── Output/           # Output generators
-│   └── LEDMapping.asset
-└── Utility/          # Utility generators
-    ├── test.asset
-    ├── textbox.asset
-    └── value_text.asset
+├── Math/            SineGenerator, TriangleWave, SawtoothWave, SquareWave, NoiseGenerator,
+│                    LFOSynth, LFOClock, StepChaser, PathPad
+├── Audio/           AudioInputAnalysis
+├── Network/         ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks
+├── Utility/         XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld,
+│                    Control-Button-Matrix, EnvelopeOutput, StepChaser, control4, quantize,
+│                    textbox, value_text, Chat, broken
+├── output/          RGBMask, legacy/VideoToRGB
+└── ExampleBasics/   custom_drawing_ui_controls
 ```
+
+Every name above is a folder `<Name>.asset` with its entry point in `src/__init__.shio`.
 
 ## Generator Types
 
@@ -59,11 +54,12 @@ Process audio input and generate reactive visual output based on audio analysis.
 
 ### Network Generators
 Handle network-based input/output:
-- **Artnet**: DMX512 over Ethernet protocol support
-- **Spout**: SPOUT2 video sharing protocol support
+- **ArtnetReceiver / ArtnetSender**: DMX512 over Ethernet (Art-Net) in and out
+- **NDIReceiver / SpoutReceiver**: video from other programs (NDI on every system, Spout on Windows)
+- **ProlinkBridge / ProlinkDecks**: CDJ data (Pioneer Pro DJ Link) from the prolink-bridge ESP32, and a deck view of it
 
 ### Output Generators
-Configure and manage visual output destinations.
+- **RGBMask**: shapes that mask an output. The LED mapping lives in `assets/Mapping/` (LEDMapper, MapLab).
 
 ### Utility Generators
 Provide helper functionality and debugging tools.
@@ -80,5 +76,4 @@ Provide helper functionality and debugging tools.
 - [Assets Overview](../README.md)
 - [Audio Generators](Audio/README.md)
 - [Network Generators](Network/README.md)
-- [Output Generators](Output/README.md)
 - [Utility Generators](Utility/README.md)

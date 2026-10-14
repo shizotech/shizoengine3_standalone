@@ -32,7 +32,7 @@ vec4 NC1=vec4(1.0,158.0,114.0,271.0);
 
 vec4 hash4( vec4 n ) { return fract(sin(n)*753.5453123); }
 vec2 hash2( vec2 n ) { return fract(sin(n)*753.5453123); }
-float noise2( vec2 x )
+float bnoise2( vec2 x )
 {
     vec2 p = floor(x);
     vec2 f = fract(x);
@@ -43,7 +43,7 @@ float noise2( vec2 x )
     return mix(s1.x,s1.y,f.y);
 }
 
-float noise3( vec3 x )
+float bnoise3( vec3 x )
 {
     vec3 p = floor(x);
     vec3 f = fract(x);
@@ -60,20 +60,20 @@ vec4 booble(vec2 te,vec2 pos,float numCells)
 
     vec2 te1=te+(pos-vec2(0.5,0.5))*0.4/numCells;
     vec2 te2=-te1;
-    float zb1=max(pow(noise2(te2*1000.11*d),10.0),0.01);
-    float zb2=noise2(te1*1000.11*d);
-    float zb3=noise2(te1*200.11*d);
-    float zb4=noise2(te1*200.11*d+vec2(20.0));
+    float zb1=max(pow(bnoise2(te2*1000.11*d),10.0),0.01);
+    float zb2=bnoise2(te1*1000.11*d);
+    float zb3=bnoise2(te1*200.11*d);
+    float zb4=bnoise2(te1*200.11*d+vec2(20.0));
     
     vec4 colorb=vec4(1.0);
-    colorb.xyz=colorb.xyz*(0.7+noise2(te1*1000.11*d)*0.3);
+    colorb.xyz=colorb.xyz*(0.7+bnoise2(te1*1000.11*d)*0.3);
     
     zb2=max(pow(zb2,20.1),0.01);
     colorb.xyz=colorb.xyz*(zb2*1.9);
     
-    vec4 color=vec4(noise2(te2*10.8),noise2(te2*9.5+vec2(15.0,15.0)),noise2(te2*11.2+vec2(12.0,12.0)),1.0);
-    color=mix(color,vec4(1.0),noise2(te2*20.5+vec2(200.0,200.0)));
-    color.xyz=color.xyz*(0.7+noise2(te2*1000.11*d)*0.3);
+    vec4 color=vec4(bnoise2(te2*10.8),bnoise2(te2*9.5+vec2(15.0,15.0)),bnoise2(te2*11.2+vec2(12.0,12.0)),1.0);
+    color=mix(color,vec4(1.0),bnoise2(te2*20.5+vec2(200.0,200.0)));
+    color.xyz=color.xyz*(0.7+bnoise2(te2*1000.11*d)*0.3);
     color.xyz=color.xyz*(0.2+zb1*1.9);
     
     float r1=max(min((0.033-min(0.04,d))*100.0/sqrt(numCells),1.0),-1.6);

@@ -29,7 +29,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float warp = sin(dist * 10.0 - time * 3.0) * (1.0 - zoom) * 0.02;
     zoomed_uv += normalize(delta + 0.001) * warp;
 
-    fragColor = texture2D(iChannel0, zoomed_uv);
+    fragColor = texture(iChannel0, zoomed_uv);
 
     if (fragColor.a == 0.0)
     {

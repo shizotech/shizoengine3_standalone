@@ -3,13 +3,15 @@
 A generator is the building block of VibeVJ. This page explains what a generator is, how you add one, what the buttons in
 its window header do, and how you keep its settings as a preset.
 
-![A generator window: power, title, link, ⋯ menu, maximize, collapse, close (older picture: the chevron is missing and link sits on the right)](media/generator-window.png)
+![A generator window. In its header: collapse, link, power, the title, the ⋯ menu, minimize, maximize, close](media/generator-window.png)
 
 ## What a generator is
 
 Every effect, source, input, output and utility in VibeVJ is a generator: a shader, an LFO, the audio analysis, an Art-Net
 sender, a text box. Even the views (Clipview, Patchview, Tabview) are generators. Each one runs in its own window with its
 own controls, and every control can be linked to any other control (see [Linking](Linking.md)).
+
+What comes with VibeVJ is listed on [Assets](Assets.md).
 
 These files open as a generator:
 
@@ -28,12 +30,15 @@ These files open as a generator:
 2. Find the asset. Type part of its name into *Filter* to find it faster.
 3. Drag it into a view:
    - into a **Patchview** or the timeline area: the window opens where you drop it;
-   - into an **empty part** (the *Views* tab, a tab, half of a split): it fills the part;
+   - into an **empty area** (a new view tab, a tab of a Tabview, half of a split): it fills the area;
+   - onto a **filled area**: an edge splits the area, the middle adds the generator as a tab. Nothing is replaced. See
+     [The screen](The-Screen.md#dropping-an-asset);
    - onto the **tab bar of a Tabview**: you get a new tab with it;
-   - into a **Clipview**: it becomes a clip (see [Clipview](Clipview.md)).
+   - into a **Clipview**: it becomes a clip (see [Clipview](Clipview.md#make-a-clip));
+   - onto a **CueList**: it becomes a cue (see [CueList](CueList.md#add-cues)).
 
-To remove a generator, click × in its header. In a part that already holds something, dropping a new asset replaces it
-after the question "Overwrite view?".
+To remove a generator, click × in its header. A generator that fills an area has no window header: use *Delete view…*
+in the menu of the area (⋯ in the header of the area, or a right click).
 
 ## The window header
 
@@ -42,12 +47,12 @@ The header runs along the top of the window. From left to right (on the right in
 | Button | Tooltip | What it does |
 |---|---|---|
 | Chevron | *Collapse* / *Expand* | Shrinks the window to its header and opens it again at its old size. It points down while the window is open and right while it is collapsed. The same switch as the minimize button. |
+| Link icon | *Always draw links* | Draws the cables of this generator all the time, even when *Cable view* is off: a local cable view. On at the start in a Patchview. Saved with the project. See [Seeing your links](Linking.md#seeing-your-links). |
 | Power icon | *Generator active* | Switches the generator on and off. The icon is green while it runs. When it is off, the generator stops and its name is dimmed. It is a control: you can link it or map it to MIDI. |
-| Link icon | *Always draw links* | Draws the cables of this generator all the time and shows its notches in full, even when *Cable view* is off. Saved with the project. |
 | Name | | The name of the asset |
 | ⋯ | *More* | Opens the menu with the less used actions (below). |
 | Minimize | *Collapse* / *Expand* | Shrinks the window to its header. Press it again to open it. The same switch as the chevron, saved with the project. |
-| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron, *Minimize* and *Close* are hidden. |
+| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron, *Minimize* and *Close* are hidden, and the zoom of the Patchview is set back and held. |
 | × | *Close* | Closes the generator. |
 
 > Screenshot to add: the header from left to right, with each button labelled.
@@ -56,30 +61,77 @@ The header runs along the top of the window. From left to right (on the right in
 
 | Item | What it does |
 |---|---|
-| *Copy settings* | Copies the settings of this generator. |
+| *Copy settings* | Copies the settings of this generator: what a [preset](#presets) holds. The copy stays inside VibeVJ, it is not on the clipboard of your system. |
 | *Paste settings* | Puts the copied settings into this generator. Works only between generators of the same asset; otherwise nothing happens. |
 | *Save preset…* | Saves the settings as a preset file (see [Presets](#presets)). |
-| *Reload module* | Loads the generator's code again and keeps its settings. Useful after you changed the asset's files. |
+| *Reload module* | Loads the code of the generator again and keeps its settings and all its links. Useful after you changed the files of the asset. |
 | *Hide header (E)* | Hides the header. Press E to show it again. |
+| *Fit to content* | Makes the window as big as its controls need, within the view it is in. See [Window size](#window-size). |
+
+### Window size
+
+- In a Patchview a new window is as big as its controls need. *Fit to content* in the ⋯ menu does the same later, for
+  example after you added channels or steps.
+- A window with its header is at least 256 px wide, so the buttons of the header never cover the name. Hide the header
+  (E) to make it smaller, down to a single control.
+- A collapsed window is only its header. Its size cannot be dragged until you open it again.
 
 ### Hide and show the header with E
 
 1. Click into the generator window.
 2. Press E. The header disappears, or comes back if it was hidden.
 
-This also works where a generator has no header at first: in the *Views* tab, in a tab of a Tabview and in a split. Press E
+This also works where a generator has no header at first: where it fills an area of a view tab, a tab of a Tabview or half of a split. Press E
 there to reach the power button, the ⋯ menu and the other buttons.
+
+## Select and move generators
+
+In a Patchview (and in the *Patch* area of the timeline) you can select generators and take them to another view.
+
+**Select**
+
+- Click the header of a generator: it is selected and shows a violet outline. A click on one that is selected
+  already keeps the whole selection.
+- Ctrl + click or Shift + click a header: adds the generator, or takes it out of the selection again.
+- Drag on the empty canvas: a frame appears, and everything it touches is selected. The outlines show while you drag,
+  so you see what the frame takes before you let go. With Shift or Ctrl the frame adds to the selection.
+- Click the empty canvas: nothing is selected.
+
+**Move**
+
+1. Hold Alt and drag one of the selected generators. A small label at the mouse says what you drag: the name of the
+   generator, or "2 generators". Alt + drag on a generator that is not selected takes that one alone.
+2. Drop it:
+   - in the same Patchview: the generators move to that place;
+   - on another Patchview: the generators move there and keep their arrangement;
+   - on an area: the generator becomes the view of that area. On an edge it splits the area, in the middle it is added
+     as a tab. More than one generator: the first goes where you drop it, the others become tabs.
+3. Hold Ctrl when you let go to drop copies. The originals stay where they are.
+
+- A generator that moves keeps its controls, links and MIDI mappings. Nothing is reloaded.
+- A copy has the settings of its original, but no links to other generators.
+- Alt is the key of [*Settings* › *Appearance* › *Move areas with*](Settings.md#move-areas-with).
+- Ctrl + Z takes the move back: see [Undo and redo](The-Screen.md#undo-and-redo).
+- Not yet: dropping generators into a Clipview cell or a CueList.
+- Not in show mode.
 
 ## Presets
 
 A preset is a file with the settings of one generator. It is stored inside the asset, so it shows up next to it in the
 *Assets* tab.
 
+A preset holds the values of all controls, their names, ranges, envelopes and MIDI mappings, the links inside the
+generator, the power button and *Always draw links*. It does not hold the place and size of the window, and not the
+links to other generators.
+
 To save a preset:
 
 1. Click ⋯ › *Save preset…*.
 2. Type a *Preset name*.
 3. Click *Save*. The file `<preset name>.preset` is written to the `presets` folder inside the asset.
+
+A generator or view that fills an area has no ⋯ menu in sight: use *Save as preset…* in
+[the menu of the area](The-Screen.md#the-menu-of-an-area).
 
 To use a preset:
 
@@ -88,7 +140,8 @@ To use a preset:
 3. The generator opens with the saved settings, where you dropped it. The position and size of the window are not part of
    the preset.
 
-Many assets come with presets already, for example the Tabview and some shaders.
+Many assets come with presets already, for example the Tabview and some shaders. The presets of the views are
+offered in every [empty area](The-Screen.md#an-empty-area).
 
 To copy settings from one window to another without a file, use *Copy settings* and *Paste settings* instead.
 
@@ -96,12 +149,18 @@ To copy settings from one window to another without a file, use *Copy settings* 
 
 In show mode (the lock in the timeline bar) you can still use the power button and all values. These do nothing until you
 leave show mode: *Close*, *Paste settings* and *Reload module*. Windows cannot be moved or resized. See
-[Timeline](Timeline.md).
+[Show mode](Timeline.md#show-mode).
+
+## What is saved
+
+With the [project](Getting-Started.md#what-is-saved-with-a-project), for every generator window: where it is and how
+big, whether it is maximized or collapsed, the power button, and everything a preset holds.
 
 ## See also
 
+- [Assets](Assets.md)
 - [Linking](Linking.md)
 - [The screen](The-Screen.md)
 - [Clipview](Clipview.md)
 - [Shortcuts and tips](Shortcuts-and-Tips.md)
-- [Glossary](../../design/wiki/Glossary.md) (design wiki)
+- [Troubleshooting](Troubleshooting.md)

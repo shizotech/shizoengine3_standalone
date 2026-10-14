@@ -27,7 +27,7 @@ uniform sampler2D feedback;
 float fhash(vec2 p)
 {
     vec2 h = p * vec2(127.1, 311.7);
-    return fract(sin(dot(h, vec2(12.9898, 78.233)) * 43758.5453123);
+    return fract(sin(dot(h, vec2(12.9898, 78.233))) * 43758.5453123);
 }
 
 float vnoise(vec2 p)

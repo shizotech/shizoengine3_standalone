@@ -92,7 +92,7 @@ vec3 march(vec3 from, vec3 dir)
         vec3 n=normal(p);
         vec2 e=vec2(0.,.05);
         col=.1+max(0.,dot(-dir,n))*colid;
-        col*=.5+step(.7,hash12(id+floor(iTime*5.)));\
+        col*=.5+step(.7,hash12(id+floor(iTime*5.)));
     } 
     else
     {

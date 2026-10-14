@@ -1,0 +1,171 @@
+
+#include "miniagent"
+
+class Megamind {
+	
+	running = true;
+	
+	managed receptionist = None;
+	managed worker_threads = [];
+	
+	tasks = [];
+	tasks_scheduled = [];
+	//TODO: keep only a fixed number, not inifinite entries, also add timestamps everyhwere
+	tasks_finished = [];
+	tasks_failed = [];
+	
+	__init__(cfg) {
+		receptionist = miniagent(cfg, "megamind/receptionist");
+		receptionist.set_reasoning_effort("low");
+		receptionist.env.mind = this;
+		
+		max_workers = cfg.max_running_agents;
+		
+		if(max_workers <= 0)
+			max_workers = 4;
+		
+		std.print("Starting " + max_workers + " workers.");
+		
+		for(i = 0; i < max_workers; i++) {
+			t = std.thread(this.worker_thread);
+			t.run();
+			worker_threads.push_back(t);
+		}
+	}
+	
+	__deinit__() {
+		running = false;
+		for(i = 0; i < worker_threads.size(); i++) {
+			worker_threads[i].join();
+		}
+	}
+	
+	run(prompt) {		
+		_grd = std.critical_section();
+		receptionist.clear_chat();
+		return receptionist.task(prompt);
+	}
+	
+	//Used in receptionist's tools
+	get_overview() {
+		//TODO: truncate fields automatically + also show last finished / failed tasks maybe
+		return [
+			tasks = tasks,
+			tasks_scheduled = tasks_scheduled,
+			tasks_failed = tasks_failed,
+			tasks_finished = tasks_finished,
+		];
+	}
+	
+	add_task(goal) {
+		taskid = std.random_hash();
+		tasks_scheduled.push_back([task=goal, taskid=taskid, state="PLANNED"]);
+		return taskid;
+	}
+	
+	stop_task(taskid) {
+		//Wasnt processed by the scheduler yet, save to kill
+		//This operation is atomic, however in the future might want to put a named critical_section here if shizoscript changes
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				tasks_scheduled.erase(i);
+				return;
+		}
+	}
+	
+	update_task(taskid, message, stop_agent=false) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				if(!tasks_scheduled[i].user_updates)
+					tasks_scheduled[i].user_updates = [];
+				tasks_scheduled[i].user_updates.push_back(message);
+				return;
+		}
+	}
+	
+	worker_thread() {
+		
+		managed cfg = ModelConfig();
+		cfg.copy_from(receptionist.model_config);
+		
+		managed worker = miniagent(cfg, "adaptive");
+		
+		for(this.running) {
+			for(tasks_scheduled.size()) {
+				task = tasks_scheduled[0];
+				tasks_scheduled.erase(0);
+				tasks.push_back(task);
+				task.state = "RESEARCH";
+				
+				try {
+					worker.clear_chat();
+					worker.env.clear();
+					worker.set_reasoning_effort("medium");
+					
+					task.worker = worker;	
+					
+					worker.task("# Instruction\nI will give you a task description and you will research what is needed to complete the task.\nYou should not start the task, just gather context and required files and code lines and emit a report via signal().\n\n# Task Description\n" + task.task);
+					
+					research = worker.env.signal_report;
+					
+					prompt = "# Goal\n" + task.task;
+					
+					if(research)
+						prompt += "\n\n# Research\n" + research;
+					if(task.user_updates) {
+						prompt += "\n\n# Updates\n";
+						for(i = 0; i < task.user_updates.size(); i++) {
+							prompt += task.user_updates[i] + "\n\n";
+						}
+					}
+
+					task.state = "IMPLEMENT";
+
+					worker.set_reasoning_effort("high");
+					worker.task(prompt);
+					
+					task.state = worker.env.signal_event;
+					task.report = worker.env.signal_report;
+					
+					for(i = 0; i < tasks.size(); i++) {
+						if(tasks[i].taskid == task.taskid)
+							tasks.erase(i);
+							break;
+					}
+	
+					//on_action -> telegram api ?
+					
+					if(task.state == "FAILED") {
+						tasks_failed.push_back(task);
+						if(tasks_failed.size() > 5)
+							tasks_failed.erase(0);
+					}
+					else {
+						tasks_finished.push_back(task);
+						if(tasks_finished.size() > 5)
+							tasks_finished.erase(0);
+					}
+					//TODO: FINISHED, QUESTION
+				}
+				catch(e) {
+					std.print(e);
+					task.state = "CRASHED";
+					for(i = 0; i < tasks.size(); i++) {
+						if(tasks[i].taskid == task.taskid)
+							tasks.erase(i);
+							break;
+					}
+					tasks_failed.push_back(task);
+					if(tasks_failed.size() > 5)
+						tasks_failed.erase(0);
+				}
+			}
+			
+			std.sleep(100);
+		}
+	}
+	
+	on_action(cb) {
+		receptionist.on_action = cb;
+	}
+}

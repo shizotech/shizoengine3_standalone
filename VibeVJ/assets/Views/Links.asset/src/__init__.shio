@@ -1,0 +1,563 @@
+import nanogui;
+using nanogui;
+using eigen;
+
+//Every link of the project in one list (#381): one row per link with the sender, the receiver, the link type and the
+//live value of the sender. A click on one end goes there (nanogui.jump_to_control), the mouse over a row lights both
+//ends (nanogui.highlight_controls). The list is built again only when the links change: every LINKS_CHECK_MS the view
+//compares a signature of all links (nanogui.all_links) with the last one; in between it only reads the values.
+//The rows hold no controls, only their paths: a click looks the link up again (find_link), so a control that goes
+//is not kept alive by this view.
+
+ai_docs = R"(
+The links view lists every link between controls of the project, one row per link: the sender (the control whose
+value travels) with the area and generator it is in, the receiver, the link type (Absolute = the raw value,
+Normalized = the 0..1 position in the range, Inverted = 1 minus that) and the live value of the sender as a bar.
+The rows are grouped by the area and generator of the sender. A filter (words, type, "On screen") narrows the list.
+The status lists the links the view shows right now (after its filter), with the live paths of both ends.
+)";
+
+LINKS_VALUE_MS = 250;    //how often the bars read the values of the senders
+LINKS_CHECK_MS = 500;    //how often the links are compared with the list
+LINKS_BAR_HEIGHT = 34;   //the filter row
+LINKS_COUNT_HEIGHT = 20; //the number of links below it
+LINKS_HEAD_HEIGHT = 26;  //the place of the senders above their rows
+LINKS_ROW_HEIGHT = 40;
+LINKS_TYPE_WIDTH = 92;
+LINKS_DELETE_WIDTH = 28;
+LINKS_TOOLS_WIDTH = 4 + LINKS_DELETE_WIDTH + 4 + LINKS_TYPE_WIDTH + 8;
+LINKS_TYPES_WIDTH = 320; //the type filter (segmented, "Normalized" must fit)
+LINKS_SCREEN_WIDTH = 96; //"On screen"
+
+//The colours of singleview.shio (AREA_TEXT_2, AREA_TEXT_3, AREA_TILE_COLOR, AREA_TILE_HOT_COLOR), which this view
+//does not include
+LINKS_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+LINKS_TEXT_3 = vec4f(0.369, 0.369, 0.388, 1.0);
+LINKS_ROW_COLOR = vec4f(0.110, 0.110, 0.120, 1.0);
+LINKS_ROW_HOT_COLOR = vec4f(0.160, 0.160, 0.175, 1.0);
+LINKS_TRACK_COLOR = vec4f(1.0, 1.0, 1.0, 0.07); //line
+
+//By type_index of nanogui.all_links: the captions of the options and the colours of the cables (design/tokens.json:
+//accent, link_normalized, link_inverted)
+LINK_TYPE_NAMES = ["Absolute", "Normalized", "Inverted"];
+LINK_TYPE_COLORS = [
+	vec4f(0.616, 0.522, 1.0, 1.0),
+	vec4f(1.0, 0.522, 0.898, 1.0),
+	vec4f(0.522, 0.745, 1.0, 1.0),
+];
+
+LINKS_EMPTY_TEXT = "No links yet.";
+LINKS_EMPTY_HINT = "Drag from the right notch of a control onto another control.";
+
+managed links_root = None;
+filter_box = None;
+type_select = None;
+on_screen_btn = None;
+count_label = None;
+rows_content = None;
+empty_label = None;
+empty_hint = None;
+
+all_rows = [];       //every link as collect_links made it, sorted
+shown_rows = [];     //the rows on screen: [from_path=, sender=, state=[norm=, width=]]
+filter_text = "";
+type_filter = 0;     //0 all, else type_index + 1
+on_screen_only = false;
+last_signature = "";
+needs_collect = true; //the links are read again
+needs_render = true;  //the rows are built again (the filter changed)
+last_value_poll = 0;
+last_link_check = 0;
+hovered_key = "";     //the row the mouse is over, its ends glow
+
+dispatcher(generator, cmd, value) {
+	return None;
+}
+
+//The place of a control (nanogui.cable_place): [area=, generator=, control=, area_id=, place=]
+place_of(ctrl) {
+	try {
+		found_place = nanogui.cable_place(ctrl);
+		if(found_place)
+			return found_place;
+	}
+	catch(e) {}
+	return [area = "", generator = "", control = ctrl.name(), area_id = "", place = ""];
+}
+
+//The links of nanogui.all_links as rows, sorted by the area of the sender, then its generator and its control
+collect_links(found) {
+	sorted = [];
+	for(i = 0; i < found.size(); i++) {
+		link = found[i];
+		from_place = place_of(link["from"]);
+		to_place = place_of(link["to"]);
+		kind = std.int(link.type_index);
+		if(kind < 0 || kind > 2)
+			kind = 0;
+
+		row = [
+			from_path = link.from_path,
+			to_path = link.to_path,
+			type_index = kind,
+			from_area = from_place.area,
+			from_place = from_place.place,
+			from_control = from_place.control,
+			to_place = to_place.place,
+			to_control = to_place.control,
+		];
+		//What the filter looks through
+		haystack = from_place.place + " " + from_place.area + " " + from_place.generator + " " + from_place.control;
+		haystack += " " + to_place.place + " " + to_place.area + " " + to_place.generator + " " + to_place.control;
+		row.haystack = haystack.lowercase();
+
+		//A keyed list sorts by its keys (case-insensitive); "\n" sorts before every letter, so a shorter name comes
+		//first. The index keeps the keys apart
+		sort_key = from_place.area + "\n" + from_place.generator + "\n" + from_place.control;
+		sort_key += "\n" + to_place.place + "\n" + to_place.control + "\n" + std.string(i);
+		sorted[sort_key] = row;
+	}
+	sorted.sort();
+
+	result = [];
+	for(i = 0; i < sorted.size(); i++)
+		result.push_back(sorted[i]);
+	return result;
+}
+
+//The words of the filter, lower case
+filter_words() {
+	words = [];
+	parts = filter_text.lowercase().split(" ");
+	for(i = 0; i < parts.size(); i++) {
+		if(parts[i])
+			words.push_back(parts[i]);
+	}
+	return words;
+}
+
+//A row passes when it has the type of the filter and every word is in its places or control names
+row_matches(row, words) {
+	if(type_filter > 0 && row.type_index != type_filter - 1)
+		return false;
+	for(i = 0; i < words.size(); i++) {
+		if(!row.haystack.contains(words[i]))
+			return false;
+	}
+	return true;
+}
+
+//The heading of a group: the place of its senders
+group_of(row) {
+	if(row.from_place)
+		return row.from_place;
+	if(row.from_area)
+		return row.from_area;
+	return "Outside the views";
+}
+
+//The link of these two paths as nanogui.all_links has it now, or None when it is gone
+find_link(from_path, to_path) {
+	found = nanogui.all_links();
+	for(i = 0; i < found.size(); i++) {
+		if(found[i].from_path == from_path && found[i].to_path == to_path)
+			return found[i];
+	}
+	return None;
+}
+
+highlight(controls) {
+	try {
+		nanogui.highlight_controls(controls);
+	}
+	catch(e) {}
+}
+
+clear_highlight() {
+	if(!hovered_key)
+		return;
+	hovered_key = "";
+	highlight([]);
+}
+
+//The value of a control as 0..1 for the bar, -1 when it has no range (text, vector, a plain control)
+normalized_of(ctrl) {
+	try {
+		kind = std.vtype(ctrl);
+		value = ctrl.value();
+		if(kind == "nanogui.midicontrolbutton")
+			return value ? 1.0 : 0.0;
+		if(kind == "nanogui.midicontrolslider" || kind == "nanogui.midicontrolfloat" || kind == "nanogui.midicontrolint") {
+			low = std.float(ctrl.min());
+			high = std.float(ctrl.max());
+			if(high == low)
+				return 0.0;
+			return math.clamp((std.float(value) - low) / (high - low), 0.0, 1.0);
+		}
+		if(kind == "nanogui.midicontrolcombo") {
+			count = ctrl.items().size();
+			if(count < 2)
+				return 0.0;
+			return math.clamp(std.float(value) / std.float(count - 1), 0.0, 1.0);
+		}
+	}
+	catch(e) {}
+	return -1.0;
+}
+
+//One row: the sender with the bar of its value, an arrow, the receiver with its place, the type and the delete button
+add_row(row, locked) {
+	from_path = row.from_path;
+	to_path = row.to_path;
+	kind = row.type_index;
+	key = from_path + ">" + to_path;
+	color = LINK_TYPE_COLORS[kind];
+	state = [norm = -1.0, width = 0];
+
+	line = rows_content.widget().fixed_height(LINKS_ROW_HEIGHT);
+	//The background is a child of its own: the callback of the row changes it without holding the row
+	back = line.widget_solid().background_color(LINKS_ROW_COLOR).anchor(0);
+	body = line.widget().anchor(0).anchor_right(LINKS_TOOLS_WIDTH);
+
+	//The sender, and its value as a thin bar in the colour of the link type
+	sender = body.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).anchor_right(0.5, "percent");
+	sender.label(row.from_control).font_size(14).anchor_left(10).anchor_right(30).anchor_top(4).fixed_height(18);
+	sender.button("").icon(nanogui.icon("arrow_right")).transparent(true).text_color(color)
+		.anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(28);
+	sender.on_draw([this, state, color](){
+		if(state.norm < 0)
+			return;
+		track = state.width - 40;
+		if(track <= 0)
+			return;
+		nvgBeginPath();
+		nvgRect(vec2f(10, 28), vec2f(track, 3));
+		nvgFillColor(LINKS_TRACK_COLOR);
+		nvgFill();
+		nvgBeginPath();
+		nvgRect(vec2f(10, 28), vec2f(track * state.norm, 3));
+		nvgFillColor(color);
+		nvgFill();
+	});
+	sender_hit = sender.button("").transparent(true).anchor(0);
+	sender_hit.tooltip("Go to the sender\n" + (row.from_place ? row.from_place + " / " : "") + row.from_control);
+	sender_hit.on_click([this, from_path, to_path](){
+		found_link = find_link(from_path, to_path);
+		if(found_link)
+			nanogui.jump_to_control(found_link["from"], found_link["to"]); //Back (Alt+Left) leads to the other end
+	});
+
+	//The receiver and where it is
+	receiver = body.widget().anchor_left(0.5, "percent").anchor_top(0).anchor_bottom(0).anchor_right(0);
+	receiver.label(row.to_control).font_size(14).anchor_left(6).anchor_right(6).anchor_top(4).fixed_height(18);
+	receiver.label(row.to_place).font_size(12).text_color(LINKS_TEXT_2).anchor_left(6).anchor_right(6).anchor_top(21).fixed_height(15);
+	receiver_hit = receiver.button("").transparent(true).anchor(0);
+	receiver_hit.tooltip("Go to the receiver\n" + (row.to_place ? row.to_place + " / " : "") + row.to_control);
+	receiver_hit.on_click([this, from_path, to_path](){
+		found_link = find_link(from_path, to_path);
+		if(found_link)
+			nanogui.jump_to_control(found_link["to"], found_link["from"]); //Back (Alt+Left) leads to the other end
+	});
+
+	//The type: a click takes the next one (Absolute, Normalized, Inverted)
+	type_btn = line.button(LINK_TYPE_NAMES[kind]).font_size(13).text_color(color)
+		.anchor_right(4 + LINKS_DELETE_WIDTH + 4).anchor_top(6).anchor_bottom(6).fixed_width(LINKS_TYPE_WIDTH);
+	type_btn.tooltip("The [[link]] type. A click takes the next one: Absolute, Normalized, Inverted\n[[wiki:Linking#link-types]]");
+	type_btn.enabled(!locked);
+	type_btn.on_click([this, from_path, to_path, kind](){
+		if(nanogui.show_mode())
+			return; //show mode (#285): links are locked while performing
+		found_link = find_link(from_path, to_path);
+		if(found_link) {
+			nanogui.record_link_changes(true); //a step of undo / redo (#387)
+			try {
+				found_link["from"].link_to(found_link["to"], kind >= 2 ? 0 : kind + 1);
+			}
+			catch(e) {}
+			nanogui.record_link_changes(false);
+		}
+		needs_collect = true;
+	});
+
+	unlink_btn = line.button("").icon(nanogui.icon("times")).transparent(true)
+		.anchor_right(4).anchor_top(6).anchor_bottom(6).fixed_width(LINKS_DELETE_WIDTH);
+	unlink_btn.tooltip("Remove this [[link]]");
+	unlink_btn.enabled(!locked);
+	unlink_btn.on_click([this, from_path, to_path](){
+		if(nanogui.show_mode())
+			return; //show mode (#285): links are locked while performing
+		found_link = find_link(from_path, to_path);
+		if(found_link) {
+			nanogui.record_link_changes(true); //a step of undo / redo (#387)
+			try {
+				found_link["from"].unlink_from(found_link["to"]);
+			}
+			catch(e) {}
+			nanogui.record_link_changes(false);
+		}
+		needs_collect = true;
+	});
+
+	//The mouse over the row lights both ends, wherever they are
+	line.on_mouse_enter([this, back, key, from_path, to_path](pos, enter){
+		back.background_color(enter ? LINKS_ROW_HOT_COLOR : LINKS_ROW_COLOR);
+		if(enter) {
+			hovered_key = key;
+			found_link = find_link(from_path, to_path);
+			if(found_link)
+				highlight([found_link["from"], found_link["to"]]);
+		}
+		else if(hovered_key == key) {
+			hovered_key = "";
+			highlight([]);
+		}
+	});
+
+	shown_rows.push_back([from_path = from_path, sender = sender, state = state]);
+}
+
+//Builds the rows of all_rows that pass the filter. Never from a callback of a row: the button that was clicked would
+//go while it runs (the callbacks set needs_collect, update builds)
+render_rows() {
+	clear_highlight();
+	rows_content.clear_children();
+	shown_rows = [];
+
+	locked = nanogui.show_mode() ? true : false;
+	words = filter_words();
+	group = None;
+
+	for(i = 0; i < all_rows.size(); i++) {
+		row = all_rows[i];
+		if(!row_matches(row, words))
+			continue;
+
+		row_group = group_of(row);
+		if(row_group != group) {
+			group = row_group;
+			head = rows_content.widget().fixed_height(LINKS_HEAD_HEIGHT);
+			head.label(group).font_size(13).text_color(LINKS_TEXT_2).anchor_left(10).anchor_right(10).anchor_top(8).fixed_height(16);
+		}
+
+		add_row(row, locked);
+	}
+
+	total = all_rows.size();
+	shown = shown_rows.size();
+	if(total == 0)
+		count_label.caption("");
+	else if(shown == total)
+		count_label.caption(std.string(total) + (total == 1 ? " link" : " links"));
+	else
+		count_label.caption(std.string(shown) + " of " + std.string(total) + (total == 1 ? " link" : " links"));
+
+	if(total == 0) {
+		empty_label.caption(on_screen_only ? "No link has both ends on screen." : LINKS_EMPTY_TEXT);
+		empty_hint.caption(on_screen_only ? "" : LINKS_EMPTY_HINT);
+	}
+	else {
+		empty_label.caption("No link matches the filter.");
+		empty_hint.caption("");
+	}
+	empty_label.visible(shown == 0);
+	empty_hint.visible(shown == 0);
+}
+
+//The bars: the value of every sender on screen, read once per sender
+read_values(found) {
+	if(shown_rows.size() == 0)
+		return;
+
+	values = [];
+	for(i = 0; i < shown_rows.size(); i++)
+		values[shown_rows[i].from_path] = -2.0;
+
+	for(i = 0; i < found.size(); i++) {
+		path = found[i].from_path;
+		if(values.has(path) && values[path] < -1.5)
+			values[path] = normalized_of(found[i]["from"]);
+	}
+
+	for(i = 0; i < shown_rows.size(); i++) {
+		shown = shown_rows[i];
+		shown.state.norm = values[shown.from_path];
+		shown.state.width = shown.sender.width();
+	}
+}
+
+poll(now_ms) {
+	//A view in a tab at the back has nothing to show; it catches up when it comes to the front
+	if(!links_root.visible_recursive()) {
+		//A click on a row that leads into another tab hides this view under the mouse: the row gets no leave, its
+		//ends would glow until the mouse is back here
+		clear_highlight();
+		return;
+	}
+
+	found = nanogui.all_links(on_screen_only);
+
+	if(needs_collect || now_ms - last_link_check >= LINKS_CHECK_MS) {
+		last_link_check = now_ms;
+
+		//Show mode locks the buttons of the rows, so it is part of the signature
+		signature = (nanogui.show_mode() ? "show:" : "edit:") + std.string(found.size());
+		for(i = 0; i < found.size(); i++)
+			signature += "|" + found[i].from_path + ">" + found[i].to_path + ":" + std.string(found[i].type_index);
+
+		if(needs_collect || signature != last_signature) {
+			last_signature = signature;
+			needs_collect = false;
+			all_rows = collect_links(found);
+			needs_render = true;
+		}
+	}
+
+	if(needs_render) {
+		needs_render = false;
+		render_rows();
+	}
+
+	read_values(found);
+}
+
+entry(generator, parent) {
+
+	generator.window.fixed_size([620, 420]);
+
+	parent.layout(None);
+
+	links_root = parent.widget().anchor(0);
+
+	//The filter: words, the type and "On screen"
+	bar = links_root.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(LINKS_BAR_HEIGHT);
+
+	filter_box = bar.textbox().placeholder("Filter: place, generator or control").alignment("left")
+		.anchor_left(6).anchor_right(6 + LINKS_TYPES_WIDTH + 6 + LINKS_SCREEN_WIDTH + 6).anchor_top(4).anchor_bottom(4);
+	filter_box.tooltip("Shows only the [[link|links]] whose place, generator or control contains these words\n[[wiki:Linking#the-links-view]]");
+	filter_box.on_edit([this](text){
+		filter_text = text;
+		needs_render = true;
+	});
+	filter_box.on_change([this](text){
+		filter_text = text;
+		needs_render = true;
+	});
+
+	type_select = bar.combobox().items(["All", "Absolute", "Normalized", "Inverted"]).segmented(true)
+		.anchor_right(6 + LINKS_SCREEN_WIDTH + 6).anchor_top(4).anchor_bottom(4).fixed_width(LINKS_TYPES_WIDTH);
+	type_select.selected(0);
+	type_select.tooltip("Shows only the [[link|links]] of one type\n[[wiki:Linking#link-types]]");
+	type_select.on_change([this](index, caption){
+		type_filter = std.int(index);
+		needs_render = true;
+	});
+
+	on_screen_btn = bar.pushbutton("On screen").anchor_right(6).anchor_top(4).anchor_bottom(4).fixed_width(LINKS_SCREEN_WIDTH);
+	on_screen_btn.tooltip("Shows only the [[link|links]] whose two ends are on screen now\n[[wiki:Linking#the-links-view]]");
+	on_screen_btn.on_change([this](v){
+		on_screen_only = v ? true : false;
+		needs_collect = true;
+	});
+
+	count_label = links_root.label("").font_size(13).text_color(LINKS_TEXT_3)
+		.anchor_left(10).anchor_right(10).anchor_top(LINKS_BAR_HEIGHT).fixed_height(LINKS_COUNT_HEIGHT);
+
+	scroll = links_root.vscroll().anchor(0).anchor_top(LINKS_BAR_HEIGHT + LINKS_COUNT_HEIGHT);
+	rows_content = scroll.content().layout(nanogui.layout_vertical());
+
+	//No links, or none that pass the filter: a calm text instead of the list
+	empty_label = links_root.label(LINKS_EMPTY_TEXT).font_size(15).text_color(LINKS_TEXT_2).alignment("center")
+		.anchor_left(16).anchor_right(16).anchor_top(LINKS_BAR_HEIGHT + 60).fixed_height(22);
+	empty_hint = links_root.label(LINKS_EMPTY_HINT).font_size(13).text_color(LINKS_TEXT_3).alignment("center")
+		.anchor_left(16).anchor_right(16).anchor_top(LINKS_BAR_HEIGHT + 84).fixed_height(18);
+	empty_label.visible(false);
+	empty_hint.visible(false);
+
+	//For the AI agent: the links the view shows, with the live paths of both ends
+	generator.on_get_status([this](){
+		words = filter_words();
+		status_links = [];
+		for(i = 0; i < all_rows.size(); i++) {
+			row = all_rows[i];
+			if(!row_matches(row, words))
+				continue;
+			status_links.push_back([
+				from_place = row.from_place,
+				from_control = row.from_control,
+				from_path = row.from_path,
+				to_place = row.to_place,
+				to_control = row.to_control,
+				to_path = row.to_path,
+				type = LINK_TYPE_NAMES[row.type_index],
+			]);
+		}
+		return [
+			links = status_links,
+			filter = filter_text,
+			type_filter = type_filter > 0 ? LINK_TYPE_NAMES[type_filter - 1] : "All",
+			on_screen_only = on_screen_only,
+		];
+	});
+}
+
+//Runs every frame (generator pre-callback): reads the values a few times per second and checks the links twice a
+//second. An error would drop the callback for good, so it is caught
+update(generator, tl_pos, pos_delta) {
+	if(!links_root)
+		return;
+
+	now_ms = std.millis();
+	if(!needs_collect && !needs_render && now_ms - last_value_poll < LINKS_VALUE_MS)
+		return;
+	last_value_poll = now_ms;
+
+	try {
+		poll(now_ms);
+	}
+	catch(e) {
+		std.warn("Links view: " + e);
+	}
+}
+
+//Called by the generator before this module goes (generator.free_module_content, #361): the managed globals of a
+//module are not always released with it, and everything they hold then stays alive
+on_free() {
+	clear_highlight();
+	all_rows = [];
+	shown_rows = [];
+	filter_box = None;
+	type_select = None;
+	on_screen_btn = None;
+	count_label = None;
+	rows_content = None;
+	empty_label = None;
+	empty_hint = None;
+	links_root = None;
+}
+
+save_state() {
+	return [
+		filter_text = filter_text,
+		type_filter = type_filter,
+		on_screen_only = on_screen_only,
+	];
+}
+
+load_state(state) {
+	if(!state)
+		return;
+
+	if(state.has("filter_text")) {
+		filter_text = state["filter_text"] ?? "";
+		filter_box.value(filter_text);
+	}
+	if(state.has("type_filter")) {
+		type_filter = std.int(state["type_filter"] ?? 0);
+		type_select.selected(type_filter);
+	}
+	if(state.has("on_screen_only")) {
+		on_screen_only = state["on_screen_only"] ? true : false;
+		on_screen_btn.pushed(on_screen_only);
+	}
+	needs_collect = true;
+}

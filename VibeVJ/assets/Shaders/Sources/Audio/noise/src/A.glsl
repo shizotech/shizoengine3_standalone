@@ -26,7 +26,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
     vec2 uv = fragCoord.xy * pixelSize;
     vec2 uv_aspect = 0.5 + (uv - 0.5)*aspect.yx;
     
-    vec4 noise = (texture(iChannel2, fragCoord.xy / iChannelResolution[2].xy + fract(vec2(42,56)*iTime))-0.5)*2.;
+    vec4 noise = (texture(iChannel2, fragCoord.xy / vec2(textureSize(iChannel2, 0)) + fract(vec2(42,56)*iTime))-0.5)*2.;
     
     vec2 mouseV = mouseDelta(iResolution, iMouse, iChannel3);
     vec4 volume = vol(0, iChannel3);

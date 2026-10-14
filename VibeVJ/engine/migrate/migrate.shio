@@ -1,0 +1,113 @@
+//Format of projects and presets on disk, and the steps that bring an older one to the current format (#386).
+//
+//- A project folder has project.json: [format = <int>, saved_with = "VibeVJ"]. A project without it was saved
+//  before #386 and is format 1. A preset has the same two keys at its top level.
+//- Loading runs the steps from the format on disk to PROJECT_FORMAT on the JSON before anything else reads it, so
+//  the readers (load_state of the views and generators) only know the current format.
+//- A project or preset of a newer format than this VibeVJ knows is not loaded: it would be loaded half, and the next
+//  save would write it back in the old format.
+//- The first save of a project that was migrated keeps its old files once in projects/<name>/.backup_v<format>/.
+//
+//To change the format: raise PROJECT_FORMAT, add a step migrate_<n>_to_<n+1>(file, data) and call it from
+//migrate_step() below. A step changes the JSON in place.
+
+PROJECT_FORMAT = 2;
+
+//The files of a project that are migrated (projects/<name>/<file>.json). The load hooks add theirs
+//(generators, timeline_generators, ...); these are the ones the engine reads itself.
+PROJECT_FILES = ["controls", "fixture_setup"];
+
+//Format of the project in this folder
+project_format(dir) {
+	if(!fileio.exists(dir + "/project.json"))
+		return 1;
+	try {
+		info = fileio.read_json(dir + "/project.json");
+		if(info.has("format"))
+			return std.int(info.format);
+	}
+	catch(e) {}
+	return 1;
+}
+
+write_project_format(dir) {
+	fileio.write_json(dir + "/project.json", [format = PROJECT_FORMAT, saved_with = "VibeVJ"]);
+}
+
+//Keeps the files of a project of an older format once, before they are overwritten with the current format
+backup_project_files(dir, format) {
+	backup = dir + "/.backup_v" + format;
+	if(fileio.exists(backup))
+		return;
+	fileio.mkdir(backup);
+	files = fileio.files(dir, false);
+	for(i = 0; i < files.size(); i++) {
+		name = fileio.file_name(files[i]);
+		if(name.ends(".json"))
+			fileio.write_string(backup + "/" + name, fileio.read_string(dir + "/" + name));
+	}
+}
+
+// =========================================================================
+// 1 -> 2: splits with any number of areas (#382)
+// =========================================================================
+
+//HorizontalSplit / VerticalSplit had view1 / view2 and the share of the first area as split2_anchor; since #382
+//they have a list of areas (views) and their shares (sizes)
+migrate_splits(node) {
+	if(node.has("path") && node.has("data") && std.type(node.data) == "json") {
+		path = std.string(node.path).replace("\\", "/");
+		if((path.ends("/HorizontalSplit.asset") || path.ends("/VerticalSplit.asset")) && !node.data.has("views") &&
+			(node.data.has("view1") || node.data.has("view2"))) {
+			old = node.data;
+			share = old.has("split2_anchor") ? std.float(old.split2_anchor) : 0.5;
+			node.data = [
+				views = [old.has("view1") ? old.view1 : [], old.has("view2") ? old.view2 : []],
+				sizes = [share, 1.0 - share],
+			];
+		}
+	}
+	for(i = 0; i < node.size(); i++) {
+		child = node[i];
+		if(std.type(child) == "json")
+			migrate_splits(child);
+	}
+}
+
+migrate_1_to_2(file, data) {
+	if(std.type(data) == "json")
+		migrate_splits(data);
+}
+
+migrate_step(from, file, data) {
+	if(from == 1)
+		migrate_1_to_2(file, data);
+}
+
+// =========================================================================
+// Entry points (the steps above come first: a function is known only after its definition)
+// =========================================================================
+
+//One file of a project ("generators", "controls", ...) from format `from` to PROJECT_FORMAT. Returns the data.
+migrate_project_file(file, data, from) {
+	for(f = from; f < PROJECT_FORMAT; f++)
+		migrate_step(f, file, data);
+	return data;
+}
+
+//A preset of the asset at asset_path. Returns false if it is of a newer format than this VibeVJ knows.
+migrate_preset(preset, asset_path) {
+	from = preset.has("format") ? std.int(preset.format) : 1;
+	if(from > PROJECT_FORMAT)
+		return false;
+	//The state of a preset has no path of its own: it is the state of the asset the preset belongs to
+	if(from < PROJECT_FORMAT && preset.has("state") && std.type(preset.state) == "json" && preset.state.has("data")) {
+		item = [path = asset_path, data = preset.state.data];
+		for(f = from; f < PROJECT_FORMAT; f++)
+			migrate_step(f, "preset", item);
+		preset.state.data = item.data;
+	}
+	preset.format = PROJECT_FORMAT;
+	return true;
+}
+

@@ -55,10 +55,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     );
 
     // Sample input
-    vec4 kaleido_input = texture2D(iChannel0, kaleido_uv);
+    vec4 kaleido_input = texture(iChannel0, kaleido_uv);
 
     // Sample original for mix
-    vec4 original = texture2D(iChannel0, uv);
+    vec4 original = texture(iChannel0, uv);
 
     // Mix kaleidoscope with original input
     vec3 color = mix(original.rgb, kaleido_input.rgb, input_mix);

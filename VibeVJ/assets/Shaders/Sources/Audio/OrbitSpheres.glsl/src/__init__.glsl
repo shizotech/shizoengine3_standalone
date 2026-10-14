@@ -124,7 +124,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         float ndl = clamp(dot(normalize(p - eye), lightDir), 0.0, 1.0);
         vec3 shaded = glow_color * (0.35 + 0.65 * ndl);
         // specular highlight offset toward upper-left
-        float spec = clamp(dot(-normalize(d + vec2(-r_px * 0.35, -r_px * 0.4)), normalize(lightDir.xy), 0.0, 1.0);
+        float spec = clamp(dot(-normalize(d + vec2(-r_px * 0.35, -r_px * 0.4)), normalize(lightDir.xy)), 0.0, 1.0);
         spec = pow(spec, 24.0);
         shaded += vec3(1.0) * spec * 0.7;
 

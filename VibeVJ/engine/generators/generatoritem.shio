@@ -1,9 +1,14 @@
 
 #include "engine/interfaces/aiinterface"
+#include "engine/migrate/migrate"
 
 import nanogui;
 
 using eigen;
+
+//The narrowest a generator window gets while it shows its header: chevron, link and power (90 px), a short title, and
+//the more menu, minimize, maximize and close on the right (121 px). On the grid of a canvas (8 × 32)
+HEADER_MIN_WIDTH = 256;
 
 class generator {
 	
@@ -19,6 +24,7 @@ class generator {
 	
 	path = "";
 	guid = "";
+	uid = ""; //tells generators apart while the program runs, also two with the same guid (a copy). Undo names a view by it
 	
 	//These are two individual states, is_active is enforced by the engine
 	is_active_internal = true; 
@@ -44,7 +50,19 @@ class generator {
 		preset = None;
 		
 		if(fileio.file_ext(path).lowercase() == "preset") {
+			preset_path = path;
 			preset = fileio.read_json(path);
+			
+			//Parent asset = the folder that contains presets/ (#323).
+			//Searching for dots broke on preset names with a dot ("v1.2.preset" resolved to
+			//the presets folder itself, so the asset never loaded).
+			path = fileio.file_dir(fileio.file_dir(path));
+
+			//#386: an older preset is brought to the current format, a newer one is not loaded
+			if(!migrate_preset(preset, path)) {
+				std.error("Preset " + preset_path + " was saved by a newer VibeVJ (format " + preset.format + "), it is not loaded.");
+				preset = [state = []];
+			}
 			
 			preset.state.erase("x");
 			preset.state.erase("y");
@@ -52,16 +70,12 @@ class generator {
 			preset.state.erase("h");
 			preset.state.erase("fw");
 			preset.state.erase("fh");
-			
-			//Parent asset = the folder that contains presets/ (#323).
-			//Searching for dots broke on preset names with a dot ("v1.2.preset" resolved to
-			//the presets folder itself, so the asset never loaded).
-			path = fileio.file_dir(fileio.file_dir(path));
 			//std.print("PRESET: " + path);
 		}
 		
 		this.path = path;
-		
+		uid = std.random_hash();
+
 		engine = std.global("engine");
 				
 		file_ext = fileio.file_ext(path).lowercase();
@@ -90,11 +104,17 @@ class generator {
 			.fixed_size(vec2f(400,300))
 			.movable(true)
 			.resizable(true);
+		//The cards of the cable view name the generator a cable leads into (#381)
+		window.cable_name(fileio.pure_name(path));
 			
+		//A window keeps room for its header: power, link, title and the buttons on the right. Without the header
+		//(E) it can be as small as a single control
+		window.min_size(vec2f(HEADER_MIN_WIDTH, -1));
 		window.on_keyboard([window](key,scancode,action,mods){
 			if(key == 69 && action == 1) //'E' key
 			{
 				window.header_enabled(!window.header_enabled());
+				window.min_size(vec2f(window.header_enabled() ? HEADER_MIN_WIDTH : -1, -1));
 				return true;
 			}
 			window.keyboard_default(key,scancode,action,mods);
@@ -133,7 +153,7 @@ class generator {
 			.anchor_bottom(0)
 			.anchor_right(btn_margin * 3 + 6)
 			.fixed_width(25)
-			.tooltip("More");
+			.tooltip("More: copy and paste settings, save a [[preset]], reload\n[[wiki:Generators#the--menu]]");
 		more_menu = more_btn.popup().content().layout(nanogui.layout_vertical());
 		more_menu.fixed_width(200);
 		
@@ -173,7 +193,7 @@ class generator {
 			.anchor_top(0)
 			.anchor_bottom(0)
 			.fixed_width(25)
-			.tooltip("Always draw links");
+			.tooltip("Always draw [[link|links]]: the cables of this [[generator]] show also while the [[cable view]] is off");
 		links_btn.pushed(node.always_draw_links_own());
 		links_btn.on_change([this](pushed){
 			this.node.always_draw_links(pushed);
@@ -190,7 +210,7 @@ class generator {
 		active_btn.no_load_callbacks(true);
 		//Power (Shizo UI window header): an icon that turns green while the generator runs, the button itself stays grey.
 		//It keeps its link handle (MIDI-mappable) and its ID "ACT", so mappings and projects keep working
-		active_btn.get_button().caption("").icon(nanogui.icon("power_off")).latched_style("icon").tooltip("Generator active");
+		active_btn.get_button().caption("").icon(nanogui.icon("power_off")).latched_style("icon").tooltip("Generator active: the [[power button]]. Off stops the [[generator]].");
 		active_btn.fixed_width(40);
 		
 		save_preset_btn = more_menu.button("Save preset…").icon(nanogui.icon("save")).anchor_left(0).anchor_right(0).fixed_height(28);
@@ -204,13 +224,7 @@ class generator {
 			if(res.choice != "submit")
 				return;
 			
-			preset_json = [
-				state = this.save_state(false),
-				node = this.node.serialize_json(),
-				button_node = this.button_panel.serialize_json(),
-			];
-			
-			fileio.write_string(this.path + "/presets/" + res.values.name + ".preset", preset_json.compact_string());
+			this.save_preset(res.values.name);
 		});
 			
 		reload_btn = more_menu.button("Reload module").icon(nanogui.icon("sync")).anchor_left(0).anchor_right(0).fixed_height(28);
@@ -220,6 +234,23 @@ class generator {
 		hide_header_btn.on_click([window, more_btn](){
 			more_btn.close();
 			window.header_enabled(false);
+			window.min_size(vec2f(-1, -1));
+		});
+
+		//As big as the content needs: the height follows it, the width too (within the view it is in)
+		fit_btn = more_menu.button("Fit to content").icon(nanogui.icon("compress_arrows_alt")).anchor_left(0).anchor_right(0).fixed_height(28)
+			.tooltip("The window takes the size its controls need\n[[wiki:Generators#window-size]]");
+		fit_btn.on_click([this, window, more_btn](){
+			more_btn.close();
+			if(this.is_collapsed)
+				this.set_collapsed(false);
+			p = window.parent();
+			limit = None;
+			if(p) {
+				ps = p.size();
+				limit = vec2f(math.max(320, ps.x - window.x()), math.max(240, ps.y - window.y()));
+			}
+			window.fit_to_content(limit, true, None, this.node);
 		});
 			
 		/*edit_btn = left_top_panel.button("E")
@@ -232,7 +263,7 @@ class generator {
 		name_lbl.font_size(16); //title style (design/tokens.json font.title)
 		
 		//Windows order on the right: minimize, maximize, close
-		big_view_btn = button_panel.pushbutton("").icon(nanogui.icon("window_maximize")).tooltip("Maximize")
+		big_view_btn = button_panel.pushbutton("").icon(nanogui.icon("window_maximize")).tooltip("Maximize: the window fills its [[view]]\n[[wiki:Generators#the-window-header]]")
 			.anchor_top(0)
 			.anchor_bottom(0)
 			.anchor_right(btn_margin)
@@ -330,6 +361,7 @@ class generator {
 				screen = this.node.screen();
 				old_state = this.save_state();
 				old_node_state = this.node.serialize_json(true); //Serialize all links (even global ones)
+				this.free_module_content();
 				std.free(this.module);
 				this.node.clear_children();
 				
@@ -530,6 +562,20 @@ class generator {
 	__deinit__() {
 		//std.print("---GENERATOR DEINIT---");
 		//std.error(path);
+		free_module_content();
+	}
+
+	//The module frees what its managed globals hold, in on_free(). Freeing the module should do that, but for a
+	//module whose load_state() was called (a view loaded from a project) the globals are not released with it:
+	//the views and generators in it stayed alive without a window (#361). A module that holds other generators
+	//or views in managed globals needs an on_free() that sets them to None
+	free_module_content() {
+		if(!module || !module.has("on_free"))
+			return;
+		try {
+			module.call("on_free");
+		}
+		catch(e) {}
 	}
 	
 	release() {
@@ -599,6 +645,22 @@ class generator {
 		engine.generators_post_callbacks.push_back(this);
 	}
 	
+	//Writes what the generator is set to as <asset>/presets/<name>.preset. An area calls it too (singleview,
+	//"Save as preset…"): there the header of the window, with "Save preset…", is hidden
+	save_preset(name) {
+		preset_json = [
+			format = PROJECT_FORMAT, //#386
+			saved_with = "VibeVJ",
+			state = save_state(false),
+			node = node.serialize_json(),
+			button_node = button_panel.serialize_json(),
+		];
+
+		if(!fileio.exists(path + "/presets"))
+			fileio.mkdir(path + "/presets");
+		fileio.write_string(path + "/presets/" + name + ".preset", preset_json.compact_string());
+	}
+
 	save_state(save_window_state=true) {
 		state = [];
 		
@@ -629,6 +691,9 @@ class generator {
 		try {
 			if(module.has("save_state"))
 				state.data = module.call("save_state");
+			//A view that is a canvas keeps its zoom and pan (Patchview)
+			if(save_window_state && module.has("save_view"))
+				state.view = module.call("save_view");
 		}
 		catch(e) {
 			
@@ -648,6 +713,8 @@ class generator {
 		try {
 			if(module.has("load_state"))
 				module.call("load_state", state.data);
+			if(state.has("view") && module.has("load_view"))
+				module.call("load_view", state.view);
 		}
 		catch(e) {}
 		
@@ -663,6 +730,9 @@ class generator {
 		
 		if(state.has("is_collapsed") && state.is_collapsed && state.collapse_state.has("w")) {
 			_collapse_state = state.collapse_state;
+			if(!_collapse_state.has("resizable"))
+				_collapse_state.resizable = window.resizable();
+			window.resizable(false);
 			show_collapsed(true);
 		}
 		
@@ -680,18 +750,27 @@ class generator {
 			return;
 		
 		if(collapsed) {
+			//Collapsed is the header: a window without one (E) gets it back, or it would be 0 px high
+			if(!window.header_enabled()) {
+				window.header_enabled(true);
+				window.min_size(vec2f(HEADER_MIN_WIDTH, -1));
+			}
 			_collapse_state = [
 				w = window.width(),
 				h = window.height(),
 				fw = window.fixed_width(),
 				fh = window.fixed_height(),
+				resizable = window.resizable(),
 			];
 			window.size(vec2f(_collapse_state.w, window.header_height()));
 			window.fixed_size(vec2f(_collapse_state.w, window.header_height()));
+			//Pulling an edge of a collapsed window would make it tall while it still counts as collapsed
+			window.resizable(false);
 		}
 		else {
 			window.fixed_size(vec2f(_collapse_state.fw, _collapse_state.fh));
 			window.size(vec2f(_collapse_state.w, _collapse_state.h));
+			window.resizable(_collapse_state.has("resizable") ? _collapse_state.resizable : true);
 			window.refresh_size();
 			window.refresh_layout();
 		}

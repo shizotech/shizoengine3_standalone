@@ -36,9 +36,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 sampled_uv = uv + vec2(tracking + warp, 0.0);
 
     // Color channels with offset for color bleed
-    float r = texture2D(iChannel0, sampled_uv + vec2(vhs_color_bleed * 0.01, 0.0)).r;
-    float g = texture2D(iChannel0, sampled_uv).g;
-    float b = texture2D(iChannel0, sampled_uv - vec2(vhs_color_bleed * 0.01, 0.0)).b;
+    float r = texture(iChannel0, sampled_uv + vec2(vhs_color_bleed * 0.01, 0.0)).r;
+    float g = texture(iChannel0, sampled_uv).g;
+    float b = texture(iChannel0, sampled_uv - vec2(vhs_color_bleed * 0.01, 0.0)).b;
 
     vec3 color = vec3(r, g, b);
 

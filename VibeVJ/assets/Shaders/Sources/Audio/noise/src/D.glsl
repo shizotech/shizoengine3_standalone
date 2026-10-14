@@ -272,7 +272,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
     bool beat = (v0.w-v0_prev.w)*2. > 4./frames_since_last_beat;
     beat = beat && (frames_since_last_beat > 15.);
 
-    vec4 noise = texture(iChannel0, fragCoord.xy / iChannelResolution[0].xy + fract(vec2(42,56)*iTime));
+    vec4 noise = texture(iChannel0, fragCoord.xy / vec2(textureSize(iChannel0, 0)) + fract(vec2(42,56)*iTime));
 
     if(beat)
     {

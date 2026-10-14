@@ -50,8 +50,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
     // Grid lines: compute distance to the nearest cell edge in uv space.
     float cell = 1.0 / cells;
-    float dx = min(f, 1.0 - f) * cell;
-    float dy = min(f, 1.0 - f) * cell;
+    float dx = min(f.x, 1.0 - f.x) * cell;
+    float dy = min(f.y, 1.0 - f.y) * cell;
     float line_dist = min(dx, dy);
 
     // Line mask with a glow falloff.

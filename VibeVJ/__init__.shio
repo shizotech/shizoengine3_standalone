@@ -1,5 +1,6 @@
 
 #include "src/defs"
+#include "engine/migrate/migrate"
 #include "src/menu/menu"
 
 import nanogui;
@@ -69,10 +70,17 @@ class shizoengine
 
 		style = fileio.read_json(STYLE_FILE);
 		screen.theme().from_json(style);
+		//Interface size (Appearance): on top of the system scale, before anything is laid out
+		if(style.has("ui_scale"))
+			screen.ui_scale(style.ui_scale);
 		//Calm notches (Shizo UI): "everywhere" (default) or "clipview", set in Appearance
 		nanogui.calm_notches(style.has("calm_notches") ? style.calm_notches : "everywhere");
 		//Linked notches (Shizo UI): "open" (default) or "edge", set in Appearance
 		nanogui.linked_notches(style.has("linked_notches") ? style.linked_notches : "open");
+		//Area headers (#347): "always" (default) or "auto_hide", set in Appearance
+		env.area_headers_auto_hide = (style.has("area_headers") && style.area_headers == "auto_hide") ? 1 : 0;
+		//Move areas with (#347): "alt" (default), "ctrl+alt" or "none", set in Appearance
+		nanogui.grab_modifier(style.has("grab_modifier") ? style.grab_modifier : "alt");
 		
 		menu = main_menu(this);
 		
@@ -197,6 +205,12 @@ class shizoengine
 
 		fileio.write_string("engine/last_project.dat", project_env.name);
 
+		//#386: a project folder of an older format keeps its files once before they are written in the current one
+		project_dir = "projects/" + project_env.name;
+		old_format = project_format(project_dir);
+		if(old_format < PROJECT_FORMAT && fileio.exists(project_dir + "/generators.json"))
+			backup_project_files(project_dir, old_format);
+
 		if(fixtures)
 			tmp_fixtures = fixtures.copy();
 			tmp_fixtures.remove_all_keys("device");
@@ -214,11 +228,11 @@ class shizoengine
 		}
 		
 		fileio.write_json("projects/" + project_env.name + "/controls.json", nanogui.serialize_controls());
+		write_project_format(project_dir);
 		
 		/*
 		fileio.write_json("projects/" + project_env.name + "/ui_settings.json", [
 			filebrowser_scale = this.scale_widget.scale(),
-			double_screen = double_screen.pushed(),
 		]);
 		*/
 		
@@ -268,7 +282,9 @@ class shizoengine
 		return project_env.name ? true : false;
 	}
 	
-	load_project(name) {
+	//folder: where the project is read from. "templates" (#425) loads a template as a new project without a name:
+	//Save asks for one, so the template itself is never overwritten
+	load_project(name, folder = "projects") {
 		if(save_in_progress || load_in_progress)
 			return false;
 		
@@ -278,8 +294,11 @@ class shizoengine
 		if(!name)
 			return false;
 		
-		if(!fileio.is_directory("projects/" + name)) {
-			std.error("Project not found: " + name);
+		is_template = folder != "projects";
+		project_dir = folder + "/" + name;
+		
+		if(!fileio.is_directory(project_dir)) {
+			std.error((is_template ? "Template" : "Project") + " not found: " + name);
 			//nanogui has no plain "OK" box: modal_yes_no is the only cross-platform, user-dismissible
 			//message dialog (status_overlay cannot be closed by the user, std.messagebox is Windows only)
 			try {
@@ -289,17 +308,30 @@ class shizoengine
 			return false;
 		}
 		
-		std.print("Loading: " + name);
+		//#386: a project of a newer VibeVJ is not loaded half; an older one is brought to the current format on load
+		format = project_format(project_dir);
+		if(format > PROJECT_FORMAT) {
+			std.error("Project " + name + " has format " + format + ", this VibeVJ reads up to " + PROJECT_FORMAT);
+			try {
+				screen.modal_yes_no("Project " + name + " was saved by a newer VibeVJ (format " + format + "). Update VibeVJ to open it.", "Load project");
+			}
+			catch(e) {}
+			return false;
+		}
+
+		std.print("Loading: " + name + (format < PROJECT_FORMAT ? " (format " + format + ", migrated to " + PROJECT_FORMAT + ")" : ""));
 		
 		tmp_fps = ctx.fps();
 		ctx.fps(-1);
 		
 		project_env = std.global("project");
 		
-		project_env.name = name;
-		project_env.label.text(project_env.name);		
+		//A template comes in without a name: the start up keeps opening the last real project
+		project_env.name = is_template ? None : name;
+		project_env.label.text(is_template ? "<New Project>" : name);
 		
-		fileio.write_string("engine/last_project.dat", name);
+		if(!is_template)
+			fileio.write_string("engine/last_project.dat", name);
 		
 		screen.status_overlay("Loading...");
 		
@@ -308,17 +340,17 @@ class shizoengine
 		load_timer = std.millis();
 		
 		try {
-			if(fileio.exists("projects/" + project_env.name + "/" + "fixture_setup.json"))
-				fixtures = fileio.read_json("projects/" + project_env.name + "/" + "fixture_setup.json");
+			if(fileio.exists(project_dir + "/fixture_setup.json"))
+				fixtures = migrate_project_file("fixture_setup", fileio.read_json(project_dir + "/fixture_setup.json"), format);
 			
 			managed load_threads = [];
 			
 			for(i = 0; i < load_hooks.size(); i++) {
 				hook = load_hooks[i];
 				hook_name = load_hooks.key(i);
-				thread = std.thread([this, project_env, hook, hook_name]() {
+				thread = std.thread([this, project_dir, hook, hook_name, format]() {
 					try {
-						hook_data = fileio.read_json("projects/" + project_env.name + "/" + hook_name + ".json");
+						hook_data = migrate_project_file(hook_name, fileio.read_json(project_dir + "/" + hook_name + ".json"), format);
 						hook(hook_data);
 					}
 					catch(e) {
@@ -334,16 +366,12 @@ class shizoengine
 				load_threads[i].join();
 			}
 			
-			nanogui.deserialize_controls(fileio.read_json("projects/" + project_env.name + "/controls.json"));
+			nanogui.deserialize_controls(migrate_project_file("controls", fileio.read_json(project_dir + "/controls.json"), format));
 			
 			/*
-			ui_settings = fileio.read_json("projects/" + project_env.name + "/ui_settings.json");
+			ui_settings = fileio.read_json(project_dir + "/ui_settings.json");
 			if(ui_settings.filebrowser_scale)
 				this.scale_widget.scale(ui_settings.filebrowser_scale);
-			if(ui_settings.double_screen)
-				cb = double_screen.on_change();
-				cb(true);
-				double_screen.pushed(true);
 			*/
 		}
 		catch(e) {}

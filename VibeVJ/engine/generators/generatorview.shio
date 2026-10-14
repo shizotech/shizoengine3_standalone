@@ -1,12 +1,39 @@
 
 #include "generatoritem"
 
+//Selecting and dragging generators (#348):
+//- A click on the header of a generator selects it, Ctrl or Shift + click adds one or takes it away again, a frame
+//  dragged on the empty canvas selects what it touches, a click on the empty canvas selects nothing. Selected
+//  generators show an accent outline.
+//- Alt + drag on a generator (the grab modifier, nanogui.grab_modifier) drags it out, with the others that are
+//  selected: into another view of this kind they move as they are (controls, links and MIDI mappings stay), an area
+//  takes them as views (singleview). Ctrl held at the drop leaves copies.
+//A Patchview is a canvas (make_canvas): a dot grid that windows snap to, a zoom chip in its corner (Ctrl+0 shows
+//everything, Ctrl+1 is 100 %), panning that stops a little past the edges, and new generators that come in as big as
+//their content and on a free spot
+CANVAS_GRID = 32;
+CANVAS_GAP = 16;          //the room a new generator keeps from the others
+DEFAULT_WINDOW_W = 400;   //generatoritem's size before the asset sets its own
+DEFAULT_WINDOW_H = 300;
+MARQUEE_COLOR = vec4f(0.616, 0.522, 1.0, 0.10);      //the inside of the frame
+MARQUEE_EDGE_COLOR = vec4f(0.616, 0.522, 1.0, 0.85); //its edge, 1 px
+
 class generatorview
 {
 	managed area = None;
 	managed items = [];
+
+	uid = "";          //tells the views apart
+	listed = false;    //in engine.env.patch_views (enlist)
+	selection = [];    //guids of the selected generators
+	managed marquee = None; //the frame while it is dragged on the canvas
+	marquee_from = None;
+	marquee_to = None;
+	marquee_base = []; //what stays selected under a frame pulled with Shift or Ctrl
 	
 	grid_size = 0.0;
+	managed zoom_chip = None; //only on a canvas
+	shown_zoom = -1;
 	
 	//New nodes draw their link cables without the link overview (set by the Patchview). A node loaded from a saved
 	//state keeps its saved value, so a node switched off by hand stays off.
@@ -29,14 +56,275 @@ class generatorview
 		});
 		
 		area.content().on_dragdrop([this, area](payload, pos) {
-			path = fileio.relative_path_cwd(payload.path);	
-			this.add_generator(area,path,pos);
+			//Generators dragged out of a view like this one (#348): they move here, Ctrl leaves copies
+			if(payload.generators)
+				return this.drop_generators(pos);
+
+			path = fileio.relative_path_cwd(payload.path);
+			item = this.add_generator(area,path,pos);
+			if(item)
+				this.settle_new(item);
 			//Handle payload.paths for multi-file later...
-			
+
 			return true;
 		});
-		
+
 		info_label = area.content().label("Drop assets or views here").font_size(15);
+
+		uid = std.random_hash();
+
+		//The empty canvas: a click selects nothing, a drag pulls a frame that selects what it touches
+		content = area.content();
+		content.on_mouse_button([this, content](pos, btn, down, mods){
+			//The release of a frame ends it, wherever the mouse is by then (also over a generator)
+			if(btn == 0 && !down && !std.is_none(this.marquee_from)) {
+				this.end_marquee();
+				return true;
+			}
+			if(content.mouse_button_default(pos, btn, down, mods))
+				return true;
+			if(btn != 0 || !down)
+				return false;
+			//A frame whose release never came is over
+			if(!std.is_none(this.marquee_from))
+				this.end_marquee();
+			//With Shift or Ctrl the frame adds to what is selected, without them it starts anew
+			adding = mods == 1 || mods == 2;
+			if(!adding)
+				this.select_none();
+			this.marquee_base = adding ? this.selection.copy() : [];
+			this.marquee_from = pos;
+			this.marquee_to = pos;
+			return true; //the drag belongs to the canvas now
+		});
+		content.on_mouse_drag([this, content](pos, rel, btn, mods){
+			if(std.is_none(this.marquee_from))
+				return content.mouse_drag_default(pos, rel, btn, mods);
+			this.marquee_to = pos;
+			this.show_marquee();
+			return true;
+		});
+	}
+
+	// =========================================================================
+	// Selection
+	// =========================================================================
+
+	is_selected(guid) {
+		for(i = 0; i < selection.size(); i++) {
+			if(selection[i] == guid)
+				return true;
+		}
+		return false;
+	}
+
+	//The outline of a generator follows the selection, and so does the focus of the cable view (Settings, Links, "Only
+	//the selection", #381)
+	mark(guid, on) {
+		if(items.has(guid) && items[guid].window) {
+			items[guid].window.marked(on);
+			items[guid].window.cable_focus(on ? true : false);
+		}
+	}
+
+	select(guid) {
+		if(is_selected(guid))
+			return;
+		selection.push_back(guid);
+		mark(guid, true);
+	}
+
+	deselect(guid) {
+		for(i = 0; i < selection.size(); i++) {
+			if(selection[i] == guid) {
+				selection.erase(i);
+				break;
+			}
+		}
+		mark(guid, false);
+	}
+
+	select_none() {
+		for(i = 0; i < selection.size(); i++)
+			mark(selection[i], false);
+		selection = [];
+	}
+
+	//A click on the header of a generator. mods: 1 Shift, 2 Ctrl
+	click_select(guid, mods) {
+		if(mods == 1 || mods == 2) {
+			if(is_selected(guid))
+				deselect(guid);
+			else
+				select(guid);
+			return;
+		}
+		if(is_selected(guid))
+			return; //a selected one is clicked to drag the selection, not to shrink it
+		select_none();
+		select(guid);
+	}
+
+	//The frame follows the mouse, and what it touches shows its outline at once: the selection is what the frame
+	//selects when it is let go
+	show_marquee() {
+		if(std.is_none(marquee_from))
+			return;
+		x = math.min(marquee_from.x, marquee_to.x);
+		y = math.min(marquee_from.y, marquee_to.y);
+		w = math.abs(marquee_to.x - marquee_from.x);
+		h = math.abs(marquee_to.y - marquee_from.y);
+		if(!marquee && w < 4 && h < 4)
+			return; //a click, not a frame yet
+		if(!marquee) {
+			//Over the generators, also over one that gets the focus while the frame is pulled
+			marquee = area.content().widget_solid().background_color(MARQUEE_COLOR).overlay(true);
+			marquee.widget_solid().background_color(MARQUEE_EDGE_COLOR).anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(1);
+			marquee.widget_solid().background_color(MARQUEE_EDGE_COLOR).anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(1);
+			marquee.widget_solid().background_color(MARQUEE_EDGE_COLOR).anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(1);
+			marquee.widget_solid().background_color(MARQUEE_EDGE_COLOR).anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(1);
+		}
+		marquee.position(vec2f(x, y));
+		marquee.fixed_size(vec2f(w, h));
+		marquee.size(vec2f(w, h));
+		marquee.refresh_layout(); //its edges follow the new size
+		select_in_marquee(x, y, x + w, y + h);
+	}
+
+	//Selected: what was selected before a frame pulled with Shift or Ctrl, and every generator the frame touches
+	select_in_marquee(x0, y0, x1, y1) {
+		for(i = 0; i < items.size(); i++) {
+			item = items[i];
+			if(!item || !item.window)
+				continue;
+			p = item.window.position();
+			s = item.window.size();
+			touched = p.x < x1 && p.x + s.x > x0 && p.y < y1 && p.y + s.y > y0;
+			kept = false;
+			for(k = 0; k < marquee_base.size(); k++) {
+				if(marquee_base[k] == item.guid)
+					kept = true;
+			}
+			if(touched || kept)
+				select(item.guid);
+			else if(is_selected(item.guid))
+				deselect(item.guid);
+		}
+	}
+
+	//The frame is let go: what it touches stays selected
+	end_marquee() {
+		if(std.is_none(marquee_from))
+			return;
+		marquee_from = None;
+		marquee_to = None;
+		marquee = None;
+		marquee_base = [];
+	}
+
+	// =========================================================================
+	// Dragging generators to another view
+	// =========================================================================
+
+	//Alt + drag on a generator: it leaves with the others that are selected
+	start_drag(item) {
+		if(nanogui.show_mode())
+			return;
+		if(!is_selected(item.guid)) {
+			select_none();
+			select(item.guid);
+		}
+
+		guids = [];
+		for(i = 0; i < selection.size(); i++)
+			guids.push_back(selection[i]);
+
+		std.global("engine").env.dragged_generators = [view = this, guids = guids, grabbed = item.guid];
+		label = guids.size() == 1 ? fileio.pure_name(item.get_relative_path()) : std.string(guids.size()) + " generators";
+		item.window.begin_dragdrop([type = "generators", generators = 1, ghost = label, ghost_copy = "+ Copy " + label]);
+	}
+
+	//A generator leaves this view alive: it is no longer listed here, and no longer closes into this view
+	forget(guid) {
+		if(!items.has(guid))
+			return None;
+		gen = items[guid];
+		deselect(guid);
+		items.erase(guid);
+		gen.on_close = None;
+		return gen;
+	}
+
+	//The dragged generators are dropped on this view, at pos of its canvas. They keep their arrangement: the one
+	//that was grabbed lands at pos, the others around it as they were
+	drop_generators(pos) {
+		env = std.global("engine").env;
+		drag = env.dragged_generators;
+		env.dragged_generators = None;
+		if(!drag || nanogui.show_mode())
+			return false;
+
+		source = drag.view;
+		copy = area.screen().modifier_ctrl();
+		origin = source.items.has(drag.grabbed) ? source.items[drag.grabbed].window.position() : None;
+
+		moved = [];
+		for(i = 0; i < drag.guids.size(); i++) {
+			guid = drag.guids[i];
+			if(!source.items.has(guid))
+				continue;
+			gen = source.items[guid];
+			at = gen.window.position();
+			if(std.is_none(origin))
+				origin = at;
+			target = vec2f(pos.x + at.x - origin.x, pos.y + at.y - origin.y);
+
+			if(copy) {
+				made = copy_generator(gen, target);
+				if(made)
+					moved.push_back(made.guid);
+			}
+			else if(source.uid == uid) {
+				gen.window.position(target);
+				clamp_item(gen);
+				moved.push_back(guid);
+			}
+			else {
+				source.forget(guid);
+				gen.window.move_to(area);
+				gen.window.position(target);
+				adopt_generator(gen);
+				clamp_item(gen);
+				moved.push_back(gen.guid);
+			}
+		}
+
+		//What arrived is the selection here
+		if(source.uid != uid)
+			source.select_none();
+		select_none();
+		for(i = 0; i < moved.size(); i++)
+			select(moved[i]);
+		return true;
+	}
+
+	//A copy of a generator at pos: a new one of the same asset with the state and the controls of the original, as a
+	//clip copied with Ctrl in the Clipview. Links to other generators are not copied
+	copy_generator(gen, pos) {
+		state = gen.save_state();
+		node_state = gen.node.serialize_json(false);
+		made = add_generator(area, gen.get_relative_path(), pos);
+		if(!made)
+			return None;
+		try {
+			state.erase("x");
+			state.erase("y");
+			state.erase("guid");
+			made.load_state(state);
+			made.node.deserialize_json(node_state, true);
+		}
+		catch(e) {}
+		return made;
 	}
 
 	dispatch(cmd, value) {
@@ -57,26 +345,101 @@ class generatorview
 	
 			item = generator(parent, path, pos, guid);
 			item_guid = item.guid;
-			
+
 			if(!item || !item_guid) {
 				if(item)
 					std.free(item);
 				return None;
 			}
-			
-			this.items[item_guid] = item;
-			
+
 			if(this.default_always_draw_links && item.node)
 				item.node.always_draw_links(true);
-			
+
+			adopt_generator(item);
+			//A position from a drop, a copy, the AI or a saved project can lie off the canvas, where nothing reaches it
+			clamp_item(item);
+
+			return item;
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//Undo finds this view again by its uid (generators.shio): the views of this kind that are alive
+	enlist() {
+		if(listed)
+			return;
+		eng = std.global("engine");
+		if(!eng || !eng.env)
+			return;
+		if(!eng.env.patch_views)
+			eng.env.patch_views = [];
+		eng.env.patch_views.push_back(this);
+		listed = true;
+	}
+
+	__deinit__() {
+		eng = std.global("engine");
+		if(!listed || !eng || !eng.env || !eng.env.patch_views)
+			return;
+		views = eng.env.patch_views;
+		for(i = 0; i < views.size(); i++) {
+			if(views[i].uid == uid) {
+				views.erase(i);
+				break;
+			}
+		}
+	}
+
+	//A generator that left this view for an area comes back as a window, where and as big as it was (the undo of
+	//"Move generators"). home: what singleview.drop_generators kept of it
+	take_back(gen, home) {
+		window = gen.window;
+		window.move_to(area);
+		window.clear_anchors();
+		window.header_enabled(true);
+		window.resizable(true);
+		window.movable(true);
+		window.contour(true);
+		window.margin(home.margin);
+		window.position(vec2f(home.x, home.y));
+		window.fixed_size(vec2f(home.w, home.h));
+		window.size(vec2f(home.w, home.h));
+		adopt_generator(gen);
+	}
+
+	//A generator belongs to this view from now on: one that was just made here, or one that was dragged in alive
+	adopt_generator(item) {
+			enlist();
+			item_guid = item.guid;
+			this.items[item_guid] = item;
+
+			if(info_label)
+				info_label = None; //Remove info label
+
 			item.on_close = [this, item_guid]() {
 				if(this.items.has(item_guid)) {
 					item = this.items[item_guid];
+					this.deselect(item_guid);
 					this.items.erase(item_guid);
 					std.free(item);
 				}
 			};
-			
+
+			//A click on its header selects it (Ctrl / Shift + click adds or takes away), Alt + drag takes it out
+			window = item.window;
+			window.on_mouse_button([this, window, item_guid](pos, btn, down, mods){
+				handled = window.mouse_button_default(pos, btn, down, mods);
+				if(btn == 0 && down && pos.y >= 0 && pos.y < window.header_height())
+					this.click_select(item_guid, mods);
+				return handled;
+			});
+			window.on_grab([this, item](pos){
+				this.start_drag(item);
+			});
+
+			//Snap to the grid: to the nearest point, not down and to the left
 			adjust_item = [this, item]() {
 				
 				gs = this.grid_size;
@@ -85,18 +448,22 @@ class generatorview
 					return;
 				
 				pos = item.window.position();
-				pos.x = std.int(pos.x / gs);
-				pos.y = std.int(pos.y / gs);
+				pos.x = std.int(pos.x / gs + 0.5);
+				pos.y = std.int(pos.y / gs + 0.5);
 				item.window.position(pos * gs);
 				
+				//A collapsed window is only its header: its height is not on the grid
+				if(item.is_collapsed)
+					return;
+				
 				size = item.window.size();
-				size.x = std.int(size.x / gs);
-				size.y = std.int(size.y / gs);
+				size.x = math.max(1, std.int(size.x / gs + 0.5));
+				size.y = math.max(1, std.int(size.y / gs + 0.5));
 				item.window.size(size * gs);
 				
 				size = item.window.fixed_size();
-				size.x = std.int(size.x / gs);
-				size.y = std.int(size.y / gs);
+				size.x = math.max(1, std.int(size.x / gs + 0.5));
+				size.y = math.max(1, std.int(size.y / gs + 0.5));
 				item.window.fixed_size(size * gs);
 			};
 			
@@ -106,13 +473,258 @@ class generatorview
 			item.window.on_resize([adjust_item](p1,p2){
 				adjust_item();
 			});
-			//std.print("GUID: " + item_guid);
-			
-			return item;
+	}
+
+	// =========================================================================
+	// Canvas: grid, zoom, placement (a Patchview)
+	// =========================================================================
+
+	set_grid(size) {
+		grid_size = size;
+		area.dot_grid(size);
+	}
+
+	make_canvas(parent) {
+		enlist();
+		set_grid(CANVAS_GRID);
+		area.bounded_pan(true);
+
+		//The zoom in the corner: what it is, and the way home
+		zoom_chip = parent.button_popup("100 %").side("top")
+			.anchor_right(12).anchor_bottom(12).fixed_width(64).fixed_height(24)
+			.tooltip("Zoom of this view. Ctrl + 0 shows everything, Ctrl + 1 goes to 100 %, the mouse wheel zooms at the cursor\n[[wiki:The-Screen#zoom-and-the-grid-of-a-patchview]]");
+		zoom_chip.on_screen(true).autoclose(true); //not clipped by the view, closes on a click elsewhere
+		menu = zoom_chip.popup().content().layout(nanogui.layout_vertical());
+		menu.fixed_width(230);
+		entries = [
+			[label = "Show everything", key = "Ctrl+0", icon = "expand", act = "all"],
+			[label = "Show the selection", key = "", icon = "object_group", act = "selection"],
+			[label = "100 %", key = "Ctrl+1", icon = "search", act = "100"],
+			[label = "Zoom in", key = "Wheel", icon = "search_plus", act = "in"],
+			[label = "Zoom out", key = "Wheel", icon = "search_minus", act = "out"],
+		];
+		for(i = 0; i < entries.size(); i++) {
+			e = entries[i];
+			b = menu.button(e.label).icon(nanogui.icon(e.icon)).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+			if(e.key)
+				b.tooltip(e.key);
+			act = e.act;
+			b.on_click([this, act](){
+				this.zoom_chip.close();
+				this.zoom_action(act);
+			});
 		}
-		catch(e) {
-			return None;
-		}	
+		//The caption follows the zoom (wheel, keys, menu, a project that loads): told by the canvas, not looked up
+		//on every frame
+		area.on_zoom([this](scale){
+			this.refresh_zoom_chip();
+		});
+		refresh_zoom_chip();
+
+		//The keys (generators.shio) zoom the canvas the mouse was over last
+		content = area.content();
+		content.on_mouse_motion([this, content](pos, rel, btn, mods){
+			std.global("engine").env.hovered_patch_uid = this.uid;
+			return content.mouse_motion_default(pos, rel, btn, mods);
+		});
+	}
+
+	refresh_zoom_chip() {
+		if(!zoom_chip)
+			return;
+		pct = std.int(area.scale() * 100.0 + 0.5);
+		if(pct == shown_zoom)
+			return;
+		shown_zoom = pct;
+		zoom_chip.caption(std.string(pct) + " %");
+	}
+
+	zoom_action(act) {
+		if(act == "all")
+			show_items(false);
+		else if(act == "selection")
+			show_items(true);
+		else if(act == "100")
+			area.zoom_at(1.0);
+		else if(act == "in")
+			area.zoom_at(area.scale() * 1.25);
+		else if(act == "out")
+			area.zoom_at(area.scale() / 1.25);
+	}
+
+	//The generators (or the selected ones) fill the view, at most at 100 %
+	show_items(only_selection) {
+		x0 = 0; y0 = 0; x1 = 0; y1 = 0;
+		n = 0;
+		for(i = 0; i < items.size(); i++) {
+			item = items[i];
+			if(!item || !item.window)
+				continue;
+			if(only_selection && !is_selected(item.guid))
+				continue;
+			p = item.window.position();
+			s = item.window.size();
+			if(n == 0) {
+				x0 = p.x; y0 = p.y; x1 = p.x + s.x; y1 = p.y + s.y;
+			}
+			else {
+				x0 = math.min(x0, p.x); y0 = math.min(y0, p.y);
+				x1 = math.max(x1, p.x + s.x); y1 = math.max(y1, p.y + s.y);
+			}
+			n++;
+		}
+		if(n == 0) {
+			if(only_selection)
+				return show_items(false);
+			area.scale(1.0);
+			area.pan(vec2f(0, 0));
+			return;
+		}
+		vs = area.size();
+		w = x1 - x0 + CANVAS_GRID * 2;
+		h = y1 - y0 + CANVAS_GRID * 2;
+		z = math.min(1.0, math.min(vs.x / w, vs.y / h));
+		z = math.max(z, area.min_scale());
+		area.scale(z);
+		area.pan(vec2f((vs.x - (x1 - x0) * z) / 2.0 - x0 * z, (vs.y - (y1 - y0) * z) / 2.0 - y0 * z));
+	}
+
+	//Zoom and pan go with the project (generatoritem: save_view / load_view of the module)
+	save_view() {
+		pan = area.pan();
+		return [zoom = area.scale(), x = pan.x, y = pan.y];
+	}
+
+	load_view(v) {
+		if(!v || !v.has("zoom"))
+			return;
+		area.scale(v.zoom);
+		area.pan(vec2f(v.x, v.y));
+	}
+
+	//A position on the canvas: left and top of a window at 0 or more, the window inside the canvas
+	clamp_item(item) {
+		if(!item || !item.window)
+			return;
+		w = item.window;
+		p = w.position();
+		s = w.size();
+		cs = area.content().size();
+		x = math.max(0, math.min(p.x, cs.x - s.x));
+		y = math.max(0, math.min(p.y, cs.y - s.y));
+		if(x != p.x || y != p.y)
+			w.position(vec2f(x, y));
+	}
+
+	//A new generator dropped from the sidebar or added by the AI, on a canvas: as big as its content (the asset kept
+	//the default size) or as the asset says, but never bigger than the view; then on the nearest free spot
+	settle_new(item) {
+		if(!zoom_chip || !item || !item.window)
+			return;
+		window = item.window;
+		vs = area.size();
+		z = math.max(area.scale(), 0.01);
+		limit = vec2f(math.max(320, vs.x / z - CANVAS_GRID * 2), math.max(240, vs.y / z - CANVAS_GRID * 2));
+		fs = window.fixed_size();
+		if(std.int(fs.x) == DEFAULT_WINDOW_W && std.int(fs.y) == DEFAULT_WINDOW_H) {
+			window.fit_to_content(limit, false, [this, item](size){
+				this.place_free(item);
+			}, item.node);
+			return;
+		}
+		if(fs.x > limit.x || fs.y > limit.y) {
+			fit = vec2f(math.min(fs.x, limit.x), math.min(fs.y, limit.y));
+			window.fixed_size(fit);
+			window.size(fit);
+		}
+		place_free(item);
+	}
+
+	//The part of the canvas that is on screen, in canvas coordinates: [x0, y0, x1, y1]
+	visible_rect() {
+		z = math.max(area.scale(), 0.01);
+		pan = area.pan();
+		vs = area.size();
+		return [x0 = -pan.x / z, y0 = -pan.y / z, x1 = (vs.x - pan.x) / z, y1 = (vs.y - pan.y) / z];
+	}
+
+	//A new window that would hang out of the view (dropped near its edge) moves in, as far as it fits
+	pull_into_view(item) {
+		w = item.window;
+		p = w.position();
+		s = w.size();
+		r = visible_rect();
+		m = CANVAS_GAP;
+		x = math.max(r.x0 + m, math.min(p.x, r.x1 - s.x - m));
+		y = math.max(r.y0 + m, math.min(p.y, r.y1 - s.y - m));
+		if(x != p.x || y != p.y)
+			w.position(vec2f(x, y));
+	}
+
+	//Does a window of size s at x, y come closer than CANVAS_GAP to another generator?
+	overlaps(item, x, y, s) {
+		g = CANVAS_GAP;
+		for(i = 0; i < items.size(); i++) {
+			o = items[i];
+			if(!o || !o.window || o.guid == item.guid)
+				continue;
+			op = o.window.position();
+			os = o.window.size();
+			if(x < op.x + os.x + g && x + s.x + g > op.x && y < op.y + os.y + g && y + s.y + g > op.y)
+				return true;
+		}
+		return false;
+	}
+
+	//The nearest free spot on the grid around where it was dropped (rings outwards); it stays if nothing is free
+	place_free(item) {
+		if(!item || !item.window)
+			return;
+		pull_into_view(item);
+		w = item.window;
+		p = w.position();
+		s = w.size();
+		cs = area.content().size();
+		if(!overlaps(item, p.x, p.y, s)) {
+			clamp_item(item);
+			return;
+		}
+		step = grid_size > 0 ? grid_size : CANVAS_GRID;
+		//First a spot that is on screen, else anywhere on the canvas
+		v = visible_rect();
+		bounds = [
+			[x0 = v.x0, y0 = v.y0, x1 = v.x1, y1 = v.y1],
+			[x0 = 0, y0 = 0, x1 = cs.x, y1 = cs.y],
+		];
+		for(b = 0; b < bounds.size(); b++) {
+			bx = bounds[b];
+			for(r = 1; r <= 32; r++) {
+				found = false;
+				best_x = 0; best_y = 0; best_d = 0;
+				for(dx = -r; dx <= r; dx++) {
+					//Only the ring: its left and right column whole, the other columns at its top and bottom
+					edge = math.abs(dx) == r;
+					for(dy = -r; dy <= r; dy += edge ? 1 : 2 * r) {
+						x = p.x + dx * step;
+						y = p.y + dy * step;
+						if(x < bx.x0 || y < bx.y0 || x + s.x > bx.x1 || y + s.y > bx.y1)
+							continue;
+						if(overlaps(item, x, y, s))
+							continue;
+						d = dx * dx + dy * dy;
+						if(!found || d < best_d) {
+							found = true;
+							best_x = x; best_y = y; best_d = d;
+						}
+					}
+				}
+				if(found) {
+					w.position(vec2f(best_x, best_y));
+					return;
+				}
+			}
+		}
+		clamp_item(item);
 	}
 
 	save_state() {
@@ -141,7 +753,8 @@ class generatorview
 		}
 		
 		this.items.clear();
-		
+		selection = [];
+
 		// Very special function, this avoids reloading same project GUID's while the current objects may not be destroyed yet
 		for(!area.screen().garbage_cleared()) {
 			std.sleep(0);

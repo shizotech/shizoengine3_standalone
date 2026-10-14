@@ -1,42 +1,205 @@
 
 #include "generatoritem"
 
+//One area of the layout. It holds one generator or view (#346, #347, #349):
+//- an empty area asks "What goes here?" and offers the views, their presets and takes a drop,
+//- a drop on the edge of a filled area splits it: the old content moves into one half, the new view goes into the other,
+//- a drop in the middle adds the new view as a tab (the content becomes the first tab of a new Tabview),
+//- its head (24 px) names it and splits, maximizes and closes it. The head is always there and the content starts
+//  below it, so nothing is covered and nothing moves; its buttons only show while the mouse is in the area.
+//  "Auto-hide header" gives the room back: the head then only comes while the mouse is at the top edge, over the
+//  content. The same actions are in the menu of a right click.
+//Frames: an area only has a hairline at its right and bottom edge, towards its neighbours. Everything that is just layout (the window of a split, its panes, the
+//window of the view in the area) has no contour and no margin, so a nested layout does not stack frames and gaps.
+//Moving: the head of an area, or a tab of a Tabview, is dragged onto another area and dropped on an edge (split) or
+//in the middle (tab). Such a drag always lands on the area under the cursor, also over a view that takes drops.
+//Nothing is overwritten, and moved content is not reloaded: its window moves (widget.move_to), so its controls,
+//links and MIDI mappings stay the same. Closing an area does not delete its view either, the view moves into a tab
+//of its own in the top bar; only "Delete view…" destroys it.
+//Keys (#347, #349, generators.shio): Ctrl+E splits right, Ctrl+Shift+E down, Ctrl+D duplicates, Ctrl+Space maximizes,
+//Ctrl+W closes the area the
+//mouse is in. F6 goes to the next area without the mouse; a line at its top edge marks it.
+
+SPLIT_SIDE_BY_SIDE = "assets/Views/HorizontalSplit.asset";
+SPLIT_ONE_ABOVE = "assets/Views/VerticalSplit.asset";
+TABS_VIEW = "assets/Views/Tabview.asset";
+VIEWS_DIR = "assets/Views";
+
+AREA_HEAD_HEIGHT = 24;
+AREA_NARROW = 220;     //px: below it the head keeps only its menu and close, split and maximize are in the menu
+AREA_TINY = 120;       //px: below it the head shows no icon and no name either
+AREA_PADDING = 6;   //room around the content of an area (a generator); layout views (split, Tabview) get none
+AREA_LINE_COLOR = vec4f(1.0, 1.0, 1.0, 0.07); //the hairline at the right and bottom edge of an area (border_light)
+STRIP_WIDTH = 124;   //the buttons over the tab strip of a Tabview (variant C)
+AREA_HOT_HEIGHT = 14; //the top edge that shows the head; more than the edge band a window keeps for itself
+AREA_HEAD_COLOR = vec4f(0.098, 0.098, 0.106, 1.0);   //surface_2
+AREA_TILE_COLOR = vec4f(0.110, 0.110, 0.120, 1.0);
+AREA_TILE_HOT_COLOR = vec4f(0.160, 0.160, 0.175, 1.0);
+AREA_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+AREA_TEXT_3 = vec4f(0.369, 0.369, 0.388, 1.0);
+AREA_MARK_COLOR = vec4f(0.616, 0.522, 1.0, 1.0);     //accent
+
+//The views in assets/Views: [path=, name=, icon=, order=, toolbar=, description=], sorted by "order" of their view.json.
+//"toolbar": false keeps a view out of the picker of an empty area (the split views: an area is split with its head)
+view_assets() {
+	result = [];
+	dirs = fileio.dirs(VIEWS_DIR, false);
+	for(i = 0; i < dirs.size(); i++) {
+		dir_name = dirs[i];
+		if(!dir_name.ends(".asset"))
+			continue;
+
+		path = VIEWS_DIR + "/" + dir_name;
+		meta = [];
+		try {
+			if(fileio.exists(path + "/view.json"))
+				meta = fileio.read_json(path + "/view.json");
+		}
+		catch(e) {
+			std.warn("Cannot read " + path + "/view.json");
+		}
+
+		entry = [
+			path = path,
+			name = meta.name ?? fileio.pure_name(dir_name),
+			icon = meta.icon ?? "square",
+			order = meta.order ?? 100,
+			//Not "?? true": that also replaces a false from view.json
+			toolbar = meta.has("toolbar") ? (meta.toolbar ? true : false) : true,
+			description = meta.description ?? "",
+		];
+
+		//Sorted by order; equal orders keep the folder order
+		pos = result.size();
+		for(j = 0; j < result.size(); j++) {
+			if(entry.order < result[j].order) {
+				pos = j;
+				break;
+			}
+		}
+		result.insert(pos, entry);
+	}
+	return result;
+}
+
+//Breaks text into lines of at most max_chars at its spaces (labels do not wrap)
+wrap_words(text, max_chars) {
+	lines = [];
+	words = text.split(" ");
+	line = "";
+	for(i = 0; i < words.size(); i++) {
+		candidate = line ? line + " " + words[i] : words[i];
+		if(line && std.len(candidate) > max_chars) {
+			lines.push_back(line);
+			line = words[i];
+		}
+		else
+			line = candidate;
+	}
+	if(line)
+		lines.push_back(line);
+	return lines;
+}
+
+view_icon(name) {
+	try {
+		return nanogui.icon(name);
+	}
+	catch(e) {
+		return nanogui.icon("square");
+	}
+}
+
 class singleview
 {
 	managed area = None;
-	managed item = None;
-	managed info_label = None;
-	
-	__init__(parent)
-	{		
-		//option_bar = parent.widget_solid();
-		//option_bar.anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(30);
-		
-		area = parent.scrollarea().anchor(0).fit_mode(true).zoom_on_scroll(false);
+	//Not managed: content that moves to another area must live on, and assigning a managed member destroys the old
+	//value. The area still frees what it holds when it goes (__deinit__)
+	item = None;
+
+	managed picker = None;    //"What goes here?", only while the area is empty
+	picker_targets = [];      //[name=, button=] the tiles of the picker, for picker_tiles()
+	managed head = None;      //the head of the area
+	managed hot = None;       //the top edge that shows the head of a filled area
+	managed context_btn = None; //carries the menu of a right click to the cursor
+
+	container = None;
+	head_name = None;
+	head_icon = None;
+	head_max = None;
+	head_more = None;
+	head_close = None;
+
+	uid = "";        //tells areas apart (objects of different modules are not compared)
+	drag_distance = 0; //how far the mouse moved since the press on the head, -1 once the drag started
+	owner = None;    //the area whose split or Tabview holds this one, None for the area of a view tab
+	slot = 0;        //which area of the owner's view this is (split: 0 = left / top, 1 = right / bottom)
+	in_tab = false;  //a tab of a Tabview: the tab strip is its head
+	workspace = false; //the area of a view tab of the top bar: the root of the layout of the screen (generators.shio)
+	last_added = None; //the area the last split of this one made, for what is dropped after it (drop_generators)
+	//The head only comes at the top edge, over the content, instead of staying with the content below it.
+	//None: as the setting says (Settings, Appearance, "Area headers"), 1 / 0: this area differs
+	auto_hide = None;
+	hovered = false; //the mouse is in the area: the head shows its buttons
+	marked = false;  //the keyboard went to this area (F6): a line at its top edge shows it
+	managed mark_line = None;
+	managed strip = None; //the buttons over the tab strip of a Tabview in this area
+	strip_close = None;
+	strip_more = None;
+	strip_max = None;
+	strip_split_down = None;
+	strip_split_right = None;
+	placed_top = -1; //head room the area was last laid out with (anchors are only set on a change)
+	placed_name_room = 130; //room right of the name in the head, for its buttons
+	narrow = 0; //0: the full head, 1: narrow (menu and close), 2: tiny (no icon and name either), see AREA_NARROW
+	managed line_right = None;
+	managed line_bottom = None;
+	head_split_right = None;
+	head_split_down = None;
+	maximized = None; //while maximized: the split ratios to go back to
+	//Cable view of this area (midilink_renderer, #381): it shows the cables of everything in it, also the areas in it
+	//(the tabs of a Tabview). Every area is a cable area: a cable to a control in another area ends in a card
+	cables = false;
+	head_cables = None;
+	cables_lit = false; //the colour of the button is set for this state
+
+	__init__(parent, in_tab = false)
+	{
+		this.in_tab = in_tab;
+		uid = std.random_hash();
+
+		//The area, its head and the picker share one frame, and the frame is the only thing the parent gets.
+		//A widget with exactly one visible child takes the preferred size of that child, with more it keeps its own
+		//size: a head next to the area made the split views resize in a loop that never settled
+		container = parent.widget().anchor(0);
+		container.fixed_size(vec2f(16999,16999));
+
+		area = container.scrollarea().anchor(0).fit_mode(true).zoom_on_scroll(false);
 		area.anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(0);
-		
+
 		area.fixed_size(vec2f(16999,16999));
-		
-		area.on_dragdrop_hover([this](payload, pos) {
-			return true;
+		area.cable_scope(false, "", uid);
+
+		take_drops(area);
+
+		container.on_context_menu([this](pos) {
+			this.open_context_menu(pos);
 		});
-		
-		area.on_dragdrop([this, area](payload, pos) {
-		
-			if(this.item) {
-				accept = area.screen().modal_yes_no("Are you sure you want to overwrite the contents of this view?\nThis will erase the current view.", "Overwrite view?");
-				if(accept != "yes")
-					return;
-			}
-		
-			path = fileio.relative_path_cwd(payload.path);	
-			this.add_generator(area, path);
-			//Handle payload.paths for multi-file later...
-			
-			return true;
+
+		//Alt + drag anywhere in the area moves its view, like a drag by the head (#347). The key is a setting
+		//(Settings, Appearance, "Move areas with"): some window managers keep Alt + drag for themselves
+		container.on_grab([this](pos) {
+			this.start_drag(this.container);
 		});
-		
-		info_label = area.label("Drop assets or views here").font_size(15);
+
+		build_head(container);
+		refresh_chrome();
+	}
+
+	__deinit__() {
+		set_cables(false);
+		if(item)
+			std.free(item);
 	}
 
 	dispatch(cmd, value) {
@@ -45,58 +208,1719 @@ class singleview
 		return item.dispatch(cmd, value);
 	}
 
-	add_generator(parent, path, guid = "") {	
-	
+	//The screen shows where a drop lands and sends the zone with the payload
+	take_drops(widget) {
+		widget.dropzones(true, "Drop here", false);
+
+		widget.on_dragdrop_hover([this](payload, pos) {
+			this.refresh_zones();
+			return true;
+		});
+
+		widget.on_dragdrop([this](payload, pos) {
+			zone = payload.zone ?? "center";
+
+			//A piece of the layout, dragged by its head or its tab: the view moves here. A view dragged from the
+			//asset browser has layout too (it addresses the area, #362), but brings a path like any asset
+			if(payload.layout && !payload.path) {
+				this.step("Move view", [this, zone](){
+					this.drop_view(zone);
+				});
+				return true;
+			}
+
+			//Generators dragged out of a Patchview (#348): they become views here
+			if(payload.generators) {
+				this.step("Move generators", [this, zone](){
+					this.drop_generators(zone);
+				});
+				return true;
+			}
+
+			//Handle payload.paths for multi-file later...
+			if(!payload.path)
+				return false;
+
+			path = fileio.relative_path_cwd(payload.path);
+			this.step("Add view", [this, path, zone](){
+				this.drop_path(path, zone);
+			});
+			return true;
+		});
+	}
+
+	//Puts the asset at path into this area; zone is where it was dropped (center, left, right, top, bottom)
+	drop_path(path, zone = "center") {
+		if(!item)
+			return add_generator(area, path);
+		if(zone == "center" || !can_split())
+			return add_as_tab(path);
+		return split(path, zone);
+	}
+
+	//Splits belong to the layout of the screen: the areas below a view tab of the top bar. A view that sits as a
+	//window in a Patchview is a node of the patch: its areas hold one view each (or tabs) and are not split further
+	can_split() {
+		view = this;
+		for(view.owner)
+			view = view.owner;
+		return view.workspace ? true : false;
+	}
+
+	//An edge only splits a filled area that can be split; everywhere else the whole area is one zone
+	refresh_zones() {
+		area.dropzones(true, item ? "Add as tab" : "Drop here", (item && can_split()) ? true : false);
+	}
+
+	// =========================================================================
+	// What the area holds
+	// =========================================================================
+
+	is_split() {
+		return item && item.module && item.module.has("set_ratio");
+	}
+
+	is_tabs() {
+		return item && item.module && item.module.has("add_new_tab");
+	}
+
+	//Name and icon for the head: from view.json for a view, the file name for anything else
+	item_meta() {
+		if(!item)
+			return [name = "Empty", icon = ""];
+
+		path = item.get_relative_path().replace("\\", "/");
+		views = view_assets();
+		for(i = 0; i < views.size(); i++) {
+			if(path == views[i].path || path.starts(views[i].path + "/"))
+				return [name = views[i].name, icon = views[i].icon];
+		}
+		return [name = fileio.pure_name(path), icon = ""];
+	}
+
+	//The window of the view in the area is not a window to the user: no contour, no selection on its edge. A view
+	//that is layout fills the area, anything else gets a little room
+	frame_item() {
+		item.window.contour(false);
+		item.window.margin((is_split() || is_tabs()) ? 0 : AREA_PADDING);
+	}
+
+	//The areas of the view in this one belong to it: they close into it and maximize through it
+	adopt() {
+		if(!item || !item.module)
+			return;
+
+		if(item.module.has("get_view")) {
+			for(i = 0; i < 256; i++) {
+				view = item.module.call("get_view", i);
+				if(!view)
+					break;
+				view.owner = this;
+				view.slot = i;
+				view.refresh_chrome();
+			}
+		}
+		if(item.module.has("set_holder"))
+			item.module.call("set_holder", this);
+		//The tabs of a Tabview end before the buttons this area puts over its strip
+		if(item.module.has("strip_room"))
+			item.module.call("strip_room", in_tab ? 0 : STRIP_WIDTH + 6);
+	}
+
+	//Takes the item out of this area without destroying it; it moves to another area (attach)
+	detach() {
+		old = item;
+		item = None;
+		refresh_chrome();
+		return old;
+	}
+
+	//Moves a generator that lives in another area into this one
+	attach(gen) {
+		gen.window.move_to(area);
+		gen.window.anchor(0);
+		gen.window.header_enabled(false);
+		gen.window.resizable(false);
+		gen.window.movable(false);
+
+		item = gen;
+		frame_item();
+		adopt();
+		refresh_chrome();
+		name_tab(true);
+		return gen;
+	}
+
+	//Edge of a filled area: a split takes this area's place, the old content moves into the half away from the
+	//edge, the new view into the half at the edge: the asset at path, or gen, a view that moves here from another
+	//area. Without both that half stays empty (Split right / Split down)
+	split(path, zone, gen = None) {
+		side_by_side = zone == "left" || zone == "right";
+		new_first = zone == "left" || zone == "top";
+
+		//An area in a split of the same direction: the new area goes into that split, beside this one. No split in a
+		//split, so three or more areas in a row share one split (splitpanes.shio)
+		if(owner && !in_tab && owner.is_split() && owner.item.module.has("insert_view") &&
+			(owner.item.module.call("is_side_by_side") ? true : false) == side_by_side) {
+			//The saved shares of a maximized area would not fit the split any more (a drop on the edge of a maximized
+			//area): the others would keep no room
+			maximized_view = std.global("engine").env.maximized_view;
+			if(maximized_view)
+				maximized_view.restore_maximized();
+			added = owner.item.module.call("insert_view", new_first ? slot : slot + 1, slot);
+			if(!added)
+				return None;
+			owner.adopt();
+			last_added = added;
+			if(gen)
+				return added.attach(gen);
+			if(path)
+				return added.add_generator(added.area, path);
+			return owner.item;
+		}
+
+		old = detach();
+		split_gen = add_generator(area, side_by_side ? SPLIT_SIDE_BY_SIDE : SPLIT_ONE_ABOVE);
+		if(!split_gen) {
+			if(old)
+				attach(old);
+			return None;
+		}
+
+		//Through a function of the split: module.get() only returns functions, not view1 / view2
+		first = split_gen.module.call("get_view", 0);  //left / top
+		second = split_gen.module.call("get_view", 1); //right / bottom
+
+		kept = new_first ? second : first;
+		added = new_first ? first : second;
+		last_added = added;
+
+		if(old)
+			kept.attach(old);
+
+		//This area is only layout now: the shortcuts go on with the area that took its place (generators.shio)
+		env = std.global("engine").env;
+		if(env.area_replaced)
+			env.area_replaced(uid, kept.uid);
+
+		//So does the cable view: left on here it would show in every area of the split, with no button lit and
+		//nothing in a menu to end it
+		if(cables) {
+			set_cables(false);
+			kept.set_cables(true);
+			refresh_tree();
+		}
+
+		if(gen)
+			return added.attach(gen);
+		if(path)
+			return added.add_generator(added.area, path);
+		return split_gen;
+	}
+
+	//Middle of a filled area: the new view becomes a tab. A Tabview gets one more tab; any other content becomes
+	//the first tab of a new Tabview
+	add_as_tab(path, gen = None) {
+		//The area of a tab: its Tabview gets one more tab, not a Tabview inside the tab (#362)
+		if(in_tab && owner && owner.is_tabs())
+			return owner.add_as_tab(path, gen);
+
+		name = fileio.pure_name(gen ? gen.get_relative_path() : path);
+
+		if(is_tabs()) {
+			new_view = item.module.call("add_new_tab", -1, name);
+			if(!new_view)
+				return None;
+			item.module.call("select_tab", -1);
+			if(gen)
+				return new_view.attach(gen);
+			return new_view.add_generator(new_view.area, path);
+		}
+
+		old = detach();
+		tabs_gen = add_generator(area, TABS_VIEW);
+		if(!tabs_gen || !tabs_gen.module.has("add_new_tab")) {
+			if(tabs_gen)
+				tabs_gen.release();
+			item = None;
+			attach(old);
+			return None;
+		}
+
+		//The Tabview starts with one empty tab: the old content goes there, under its own name
+		first_view = tabs_gen.module.call("get_view", 0);
+		if(first_view) {
+			first_view.attach(old);
+			tabs_gen.module.call("set_tab_name", 0, fileio.pure_name(old.get_relative_path()));
+		}
+
+		new_view = tabs_gen.module.call("add_new_tab", -1, name);
+		if(!new_view)
+			return None;
+		tabs_gen.module.call("select_tab", -1);
+		if(gen)
+			return new_view.attach(gen);
+		return new_view.add_generator(new_view.area, path);
+	}
+
+	add_generator(parent, path, guid = "") {
+
 		try {
-			if(info_label)
-				info_label = None; //Remove info label
-			
 			if(this.item) {
-				this.item.release();				
+				this.item.release();
 				// Very special function, this avoids reloading same project GUID's while the current objects may not be destroyed yet
 				for(!area.screen().garbage_cleared()) {
 					std.sleep(0);
 				}
 			}
-			
+
 			this.item = generator(parent, path, vec2f(0,0), guid);
 			item_guid = item.guid;
-			
+
 			if(!this.item || !item_guid) {
 				if(this.item)
 					std.free(this.item);
+				refresh_chrome();
 				return None;
 			}
-			
+
 			this.item.window.anchor(0);
-			
+
 			this.item.window.header_enabled(false);
 			this.item.window.resizable(false);
 			this.item.window.movable(false);
-			
+
+			frame_item();
+			adopt();
+			refresh_chrome();
+			name_tab(true);
+
 			return this.item;
 		}
 		catch(e) {
+			refresh_chrome();
 			return None;
-		}	
+		}
 	}
+
+	// =========================================================================
+	// Moving a view to another area
+	// =========================================================================
+
+	//Starts the drag of the view in this area from the widget that was grabbed (the head, or the tab strip of a Tabview)
+	start_drag(source) {
+		if(locked() || !item)
+			return false;
+		restore_maximized();
+		std.global("engine").env.dragged_view = this;
+		//layout: the drop lands on the area under the cursor, not on what that area shows (nanogui screen)
+		source.begin_dragdrop([type="area", layout=1, name=item_meta().name]);
+		return true;
+	}
+
+	//This area is the area with that uid, or lies in it
+	is_inside(other_uid) {
+		view = this;
+		for(view) {
+			if(view.uid == other_uid)
+				return true;
+			view = view.owner;
+		}
+		return false;
+	}
+
+	//The dragged view was dropped here: it moves in, on the edge as a split, in the middle as a tab
+	drop_view(zone) {
+		env = std.global("engine").env;
+		source = env.dragged_view;
+		env.dragged_view = None;
+
+		if(locked() || !source || !source.item)
+			return false;
+
+		//Ctrl held at the drop: a copy lands here and the dragged view stays where it is (#347)
+		if(std.global("engine").screen.modifier_ctrl())
+			return drop_copy(source, zone);
+
+		//Onto itself, or into something it holds
+		if(is_inside(source.uid))
+			return false;
+
+		gen = source.detach();
+		if(!item)
+			attach(gen);
+		else if(zone == "center" || !can_split())
+			add_as_tab(None, gen);
+		else
+			split(None, zone, gen);
+
+		source.moved_out();
+		return true;
+	}
+
+	//Generators dragged out of a Patchview are dropped on this area (generatorview.start_drag, #348). The first one
+	//goes where it is dropped: it fills an empty area, splits a filled one on an edge, or becomes a tab in the
+	//middle. The others become tabs beside it. They move alive (controls, links and MIDI mappings stay); Ctrl at the
+	//drop leaves copies
+	drop_generators(zone) {
+		env = std.global("engine").env;
+		drag = env.dragged_generators;
+		env.dragged_generators = None;
+		if(locked() || !drag)
+			return false;
+
+		source = drag.view;
+		copy = std.global("engine").screen.modifier_ctrl();
+		target = this;
+		placed = 0;
+
+		for(i = 0; i < drag.guids.size(); i++) {
+			guid = drag.guids[i];
+			if(!source.items.has(guid))
+				continue;
+
+			where = placed == 0 ? zone : "center";
+			if(copy) {
+				original = source.items[guid];
+				path = original.get_relative_path();
+				state = original.save_state(false);
+				node_state = original.node.serialize_json(false);
+				made = None;
+				if(!target.item)
+					made = target.add_generator(target.area, path);
+				else if(where == "center" || !target.can_split())
+					made = target.add_as_tab(path);
+				else {
+					made = target.split(path, where);
+					//The next ones become tabs beside this one, in the area the split made
+					if(target.last_added)
+						target = target.last_added;
+				}
+				if(made)
+					target.copy_settings(made, state, node_state);
+			}
+			else {
+				//Where it was, so an undo can put it back as the window it was (generators.shio, return_home)
+				original = source.items[guid];
+				if(!env.generator_homes)
+					env.generator_homes = [];
+				env.generator_homes[original.uid] = [
+					view = source.uid,
+					x = original.window.x(),
+					y = original.window.y(),
+					w = original.window.fixed_width(),
+					h = original.window.fixed_height(),
+					margin = original.window.margin(),
+				];
+
+				gen = source.forget(guid);
+				if(!gen)
+					continue;
+				if(!target.item)
+					target.attach(gen);
+				else if(where == "center" || !target.can_split())
+					target.add_as_tab(None, gen);
+				else {
+					target.split(None, where, gen);
+					if(target.last_added)
+						target = target.last_added;
+				}
+			}
+			placed++;
+		}
+		return placed > 0;
+	}
+
+	//A copy of the view of source lands here: on an edge as a split, in the middle as a tab. Also on the area the
+	//view is in, which duplicates it to that side
+	drop_copy(source, zone) {
+		path = source.item.get_relative_path();
+		state = source.item.save_state(false);
+		node_state = source.item.node.serialize_json(false);
+
+		copy = None;
+		if(!item)
+			copy = add_generator(area, path);
+		else if(zone == "center" || !can_split())
+			copy = add_as_tab(path);
+		else
+			copy = split(path, zone);
+		if(!copy)
+			return false;
+		copy_settings(copy, state, node_state);
+		return true;
+	}
+
+	//A new view gets the settings of another one of the same asset, as a clip copied with Ctrl in the Clipview does:
+	//the state of the view and its controls. Links to controls outside the view are not copied
+	copy_settings(copy, state, node_state) {
+		try {
+			copy.load_state(state);
+			copy.node.deserialize_json(node_state, true);
+		}
+		catch(e) {}
+	}
+
+	//The view of this area went to another one: the area goes and its split dissolves, a tab of a Tabview closes.
+	//The last thing done with this area
+	moved_out() {
+		if(in_tab) {
+			if(owner && owner.is_tabs())
+				owner.item.module.call("remove_tab_of", uid);
+			return;
+		}
+		//The area of a view tab of the top bar: the tab goes (generators.shio)
+		if(!owner) {
+			env = std.global("engine").env;
+			if(env.view_moved_out)
+				env.view_moved_out(uid);
+			return;
+		}
+		close_empty();
+	}
+
+	// =========================================================================
+	// Actions of the head and the menu
+	// =========================================================================
+
+	locked() {
+		return nanogui.show_mode(); //show mode (#285): the layout is locked while performing
+	}
+
+	//A user action on the layout is one step of the history, so it can be undone (generators.shio, #350). An action
+	//inside another one belongs to that step
+	step(name, action) {
+		env = std.global("engine").env;
+		if(env.layout_step)
+			env.layout_step(name, action);
+		else
+			action();
+	}
+
+	//Split right / Split down: the content stays, an empty area appears beside or below it
+	split_empty(zone) {
+		if(locked() || !can_split())
+			return;
+		step(zone == "bottom" ? "Split down" : "Split right", [this, zone](){
+			this.restore_maximized();
+			this.split(None, zone);
+		});
+	}
+
+	//The view moves into a tab of its own in the top bar, with its state, links and MIDI mappings
+	to_tab(gen) {
+		env = std.global("engine").env;
+		if(!gen || !env.view_to_tab)
+			return false;
+		name = fileio.pure_name(gen.get_relative_path());
+		env.view_to_tab(gen, name);
+		return true;
+	}
+
+	//Replace view: the old view goes to the top bar (nothing is lost), the new one takes its place
+	replace_view(path) {
+		if(locked())
+			return;
+		restore_maximized();
+		old = detach();
+		if(old && !to_tab(old)) {
+			attach(old);
+			return;
+		}
+		add_generator(area, path);
+	}
+
+	//Save as preset…: what the area holds, as it is set now. The preset lands in <asset>/presets; a preset of a view is
+	//offered in every empty area
+	save_preset() {
+		if(!item)
+			return;
+		form = [
+			[id="name", label="Preset name", type="text", placeholder = "New Preset"],
+		];
+		res = std.global("engine").screen.modal_form(form, "Save as preset", "Save", "Cancel");
+		if(res.choice != "submit" || !res.values.name)
+			return;
+		item.save_preset(res.values.name);
+	}
+
+	//Swap with…: this area and another one exchange what they hold. Nothing is reloaded, the two views move
+	swap_with(other) {
+		if(locked() || !item || !other || !other.item || other.uid == uid)
+			return;
+		//Not with an area that holds this one, or lies in it
+		if(is_inside(other.uid) || other.is_inside(uid))
+			return;
+		//A step of its own, so Ctrl+Z swaps them back (#350; it was not one, though the wiki lists swapping)
+		step("Swap areas", [this, other](){
+			this.restore_maximized();
+			other.restore_maximized();
+
+			mine = this.detach();
+			theirs = other.detach();
+			this.attach(theirs);
+			other.attach(mine);
+			this.name_tab();
+			other.name_tab();
+		});
+	}
+
+	//The area of a tab: the tab is named after what the area holds now. only_new: only a tab that still has the name
+	//a new tab gets, not one the user (or a drop) named
+	name_tab(only_new = false) {
+		if(!in_tab || !item || !owner || !owner.is_tabs() || !owner.item.module.has("set_tab_name_of"))
+			return;
+		owner.item.module.call("set_tab_name_of", uid, fileio.pure_name(item.get_relative_path()), only_new);
+	}
+
+	//Duplicate: an area beside this one gets a copy of the view, set as this one is. The copy is a view of its own
+	//(as a clip copied with Ctrl in the Clipview): its controls and what is in it are new
+	duplicate() {
+		if(locked() || !item || !can_split())
+			return;
+		//A step of its own, so Ctrl+Z takes the copy away again (#350; it was not one, though the wiki lists
+		//duplicating). The copy is a new view: undo frees it, redo makes it again from the state it had
+		step("Duplicate", [this](){
+			this.duplicate_now();
+		});
+	}
+
+	duplicate_now() {
+		restore_maximized();
+
+		source = item;
+		path = source.get_relative_path();
+		state = source.save_state(false);
+		node_state = source.node.serialize_json(false);
+
+		//An empty area to the right of this one: this area becomes a split, or its split gets one more area
+		last_added = None;
+		if(!split(None, "right") || !last_added)
+			return None;
+		added = last_added;
+
+		copy = added.add_generator(added.area, path);
+		if(!copy)
+			return None;
+		copy_settings(copy, state, node_state);
+		added.refresh_chrome();
+		return copy;
+	}
+
+	move_to_tab() {
+		if(locked() || !item)
+			return;
+		//A step of its own, as closing an area is: Ctrl+Z puts the view back into its area (#350)
+		step("Move to new tab", [this](){
+			this.restore_maximized();
+			old = this.detach();
+			if(!this.to_tab(old)) {
+				this.attach(old);
+				return;
+			}
+			this.close_empty();
+		});
+	}
+
+	//Closing never deletes: the view moves to the top bar, then the area goes
+	close_area() {
+		if(locked())
+			return;
+		step("Close area", [this](){
+			this.restore_maximized();
+			if(this.item) {
+				old = this.detach();
+				if(!this.to_tab(old)) {
+					this.attach(old);
+					return;
+				}
+			}
+			this.close_empty();
+		});
+	}
+
+	//Only this destroys a view, after a question
+	delete_view() {
+		if(locked() || !item)
+			return;
+
+		accept = area.screen().modal_yes_no("Delete \"" + item_meta().name + "\" and everything in it?", "Delete view?");
+		if(accept != "yes")
+			return;
+
+		step("Delete view", [this](){
+			this.restore_maximized();
+			//Undo makes it again from what is kept here
+			env = std.global("engine").env;
+			if(env.bury_views)
+				env.bury_views(this);
+			old = this.detach();
+			old.release();
+			this.close_empty();
+		});
+	}
+
+	//The empty area goes: the split it is in dissolves into the side that remains.
+	//Must be the last thing a method does: the owner frees the split and this area with it
+	close_empty() {
+		holder = owner;
+		if(holder && !in_tab)
+			holder.dissolve(slot);
+	}
+
+	//A split lost the area in "gone". With more than two areas the split goes on without it; of the last two, what
+	//the other area holds takes the place of the split
+	dissolve(gone) {
+		if(!is_split())
+			return;
+
+		if(item.module.has("remove_view") && item.module.call("view_count") > 2) {
+			//The saved shares of a maximized area would not fit the split any more
+			maximized_view = std.global("engine").env.maximized_view;
+			if(maximized_view)
+				maximized_view.restore_maximized();
+			item.module.call("remove_view", gone);
+			adopt();
+			return;
+		}
+
+		other = item.module.call("get_view", gone == 0 ? 1 : 0);
+		kept = other ? other.detach() : None;
+		//The view that stays keeps its cable view: its area goes with the split
+		if(other && other.cables)
+			set_cables(true);
+
+		old_split = item;
+		item = None;
+		if(kept)
+			attach(kept);
+		old_split.release();
+		refresh_chrome();
+	}
+
+	//Maximize: every split above this area gives it all of its room, pressing again brings the ratios back
+	toggle_maximize() {
+		if(maximized) {
+			restore_maximized();
+			return;
+		}
+		if(locked())
+			return;
+
+		saved = [];
+		child = this;
+		holder = owner;
+		for(holder) {
+			if(holder.is_split()) {
+				split_module = holder.item.module;
+				saved.push_back([split = split_module, sizes = split_module.call("get_sizes")]);
+				split_module.call("maximize_view", child.slot);
+			}
+			child = holder;
+			holder = holder.owner;
+		}
+
+		if(saved.size() == 0)
+			return;
+
+		maximized = saved;
+		std.global("engine").env.maximized_view = this;
+		refresh_chrome();
+	}
+
+	restore_maximized() {
+		if(!maximized)
+			return;
+		for(i = 0; i < maximized.size(); i++) {
+			try {
+				maximized[i].split.call("set_sizes", maximized[i].sizes);
+			}
+			catch(e) {}
+		}
+		maximized = None;
+		std.global("engine").env.maximized_view = None;
+		refresh_chrome();
+	}
+
+	//This area differs from the setting, or follows it again
+	toggle_auto_hide() {
+		wanted = hides_head() ? 0 : 1;
+		general = std.global("engine").env.area_headers_auto_hide ? 1 : 0;
+		if(wanted == general)
+			auto_hide = None;
+		else
+			auto_hide = wanted;
+		refresh_chrome();
+	}
+
+	// =========================================================================
+	// Keys
+	// =========================================================================
+
+	//The areas that show something, in reading order: every area of a split, of a Tabview the tab in front
+	collect_areas(list) {
+		if(is_split()) {
+			for(i = 0; i < 256; i++) {
+				view = item.module.call("get_view", i);
+				if(!view)
+					break;
+				view.collect_areas(list);
+			}
+			return;
+		}
+		if(is_tabs() && item.module.has("front_view")) {
+			view = item.module.call("front_view");
+			if(view)
+				view.collect_areas(list);
+			return;
+		}
+		list.push_back(this);
+	}
+
+	//The keyboard went to this area, or left it
+	set_marked(value) {
+		marked = value ? true : false;
+		set_shown(mark_line, marked);
+		show_actions();
+	}
+
+	//Takes the mark from this area and every area in it
+	clear_marks() {
+		if(marked)
+			set_marked(false);
+		if(!item || !item.module || !item.module.has("get_view"))
+			return;
+		for(i = 0; i < 256; i++) {
+			view = item.module.call("get_view", i);
+			if(!view)
+				break;
+			view.clear_marks();
+		}
+	}
+
+	//Ctrl+W: the area closes, in a Tabview its tab does. The view moves to the top bar either way
+	close_by_key() {
+		if(locked())
+			return;
+		if(in_tab) {
+			if(owner && owner.is_tabs() && owner.item.module.has("close_tab_of"))
+				owner.item.module.call("close_tab_of", uid);
+			return;
+		}
+		if(owner)
+			close_area();
+	}
+
+	// =========================================================================
+	// Undo (generators.shio, #350)
+	// =========================================================================
+
+	//The layout below this area as data: what each area holds. A view that holds areas (a split, a Tabview) is
+	//described by them and is made again when the layout is rebuilt; anything else is named by the uid of its
+	//generator and is moved into place, alive
+	describe() {
+		if(!item)
+			return [kind = "empty"];
+
+		if(is_split()) {
+			split_views = [];
+			for(i = 0; i < 256; i++) {
+				view = item.module.call("get_view", i);
+				if(!view)
+					break;
+				split_views.push_back(view.describe());
+			}
+			return [
+				kind = "split",
+				path = item.get_relative_path(),
+				guid = item.guid,
+				sizes = item.module.call("get_sizes"),
+				views = split_views,
+			];
+		}
+
+		if(is_tabs() && item.module.has("tab_info")) {
+			tab_list = [];
+			count = item.module.call("tab_count");
+			for(i = 0; i < count; i++) {
+				info = item.module.call("tab_info", i);
+				tab_list.push_back([name = info.name, guid = info.guid, view = item.module.call("get_view", i).describe()]);
+			}
+			return [
+				kind = "tabs",
+				path = item.get_relative_path(),
+				guid = item.guid,
+				selected = item.module.call("selected_tab"),
+				tabs = tab_list,
+			];
+		}
+
+		return [kind = "leaf", uid = item.uid, hide = std.is_none(auto_hide) ? -1 : (auto_hide ? 1 : 0)];
+	}
+
+	//Every area below this one that holds a generator or a view that is not layout, also in tabs that do not show
+	collect_leaves(list) {
+		if(!item)
+			return;
+		if(item.module && item.module.has("get_view")) {
+			for(i = 0; i < 256; i++) {
+				view = item.module.call("get_view", i);
+				if(!view)
+					break;
+				view.collect_leaves(list);
+			}
+			return;
+		}
+		list.push_back(this);
+	}
+
+	//This area and every area in it, after the setting changed
+	refresh_tree() {
+		refresh_chrome();
+		if(!item || !item.module || !item.module.has("get_view"))
+			return;
+		for(i = 0; i < 256; i++) {
+			view = item.module.call("get_view", i);
+			if(!view)
+				break;
+			view.refresh_tree();
+		}
+	}
+
+	// =========================================================================
+	// Head
+	// =========================================================================
+
+	head_button(icon, tip, right) {
+		btn = head.button("").icon(nanogui.icon(icon)).tooltip(tip).transparent(true)
+			.anchor_top(2).anchor_right(right).fixed_width(22).fixed_height(20);
+		return btn;
+	}
+
+	build_head(parent) {
+		head = parent.widget_solid().background_color(AREA_HEAD_COLOR)
+			.anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(AREA_HEAD_HEIGHT).overlay(true);
+
+		grip = head.button("").icon(nanogui.icon("grip_vertical")).transparent(true).enabled(false)
+			.anchor_left(2).anchor_top(2).fixed_width(18).fixed_height(20);
+
+		head_icon = head.button("").transparent(true).enabled(false)
+			.anchor_left(22).anchor_top(2).fixed_width(22).fixed_height(20);
+		head_name = head.label("").font_size(13).anchor_left(48).anchor_right(130).anchor_top(0).fixed_height(AREA_HEAD_HEIGHT);
+
+		//A narrow area: the buttons would cover the grip and the name, so fewer of them show (show_actions)
+		head.on_layout([this](){
+			w = this.head.width();
+			n = w < AREA_TINY ? 2 : (w < AREA_NARROW ? 1 : 0);
+			if(n != this.narrow) {
+				this.narrow = n;
+				this.show_actions();
+			}
+		});
+
+		head_close = head_button("times", "Close this [[area]]: its view moves to a [[view tab|tab]] in the top bar (Ctrl+W)", 4);
+		head_close.on_click([this](){
+			this.close_area();
+		});
+
+		head_more = head.button_popup("").icon(nanogui.icon("ellipsis_h")).side("auto").tooltip("More actions: replace, swap, duplicate, save as [[preset]]\n[[wiki:The-Screen#the-menu-of-an-area]]").transparent(true)
+			.anchor_top(2).anchor_right(28).fixed_width(22).fixed_height(20);
+		head_more.on_screen(true).autoclose(true); //not clipped by the area, closes on a click elsewhere
+		head_more.popup().content().layout(nanogui.layout_vertical());
+		head_more.popup().content().fixed_width(230);
+		head_more.on_change([this](pushed){
+			if(pushed)
+				this.fill_menu(this.head_more);
+			else {
+				this.hide_head();
+				this.show_actions();
+			}
+		});
+
+		head_max = head_button("window_maximize", "Maximize this [[area]] (Ctrl+Space)", 52);
+		head_max.on_click([this](){
+			this.toggle_maximize();
+		});
+
+		head_split_down = head_button("equals", "Split down: an empty [[area]] appears below this one (Ctrl+Shift+E)\n[[wiki:The-Screen#the-header-of-an-area]]", 76);
+		head_split_down.on_click([this](){
+			this.split_empty("bottom");
+		});
+
+		head_split_right = head_button("columns", "Split right: an empty [[area]] appears beside this one (Ctrl+E)\n[[wiki:The-Screen#the-header-of-an-area]]", 100);
+		head_split_right.on_click([this](){
+			this.split_empty("right");
+		});
+
+		//The cable view of this area: lit while it is on, then it also stays when the mouse is elsewhere
+		head_cables = head.button("").icon(nanogui.icon("link")).transparent(true)
+			.tooltip("[[cable view|Cables]] of this [[area]]: every [[link]] of its views as a cable. A cable to another area ends in a card, a click on the card goes there. Pull a cable to lay it, a double click lays it automatically again\n[[wiki:Linking#seeing-your-links]]")
+			.anchor_top(2).anchor_right(124).fixed_width(22).fixed_height(20).visible(false);
+		head_cables.on_click([this](){
+			this.toggle_cables();
+		});
+
+		//The buttons of the head only show while the mouse is in the area
+		parent.on_mouse_enter([this](pos, enter){
+			this.hovered = enter ? true : false;
+			this.show_actions();
+			//The shortcuts of the layout work on the area the mouse is in (generators.shio)
+			if(enter && !this.is_split() && !this.is_tabs()) {
+				env = std.global("engine").env;
+				if(env.area_entered)
+					env.area_entered(this.uid);
+			}
+		});
+
+		//The head is the handle of the area: dragging it moves the view to another area. Its buttons take their own
+		//press, the rest of the head starts the drag once the mouse has moved
+		head.on_mouse_button([this](pos, button, down, mods){
+			if(button == 0 && down)
+				this.drag_distance = 0;
+			return button == 0;
+		});
+		head.on_mouse_drag([this](pos, rel, button, mods){
+			if(this.drag_distance < 0)
+				return true;
+			this.drag_distance += math.abs(rel.x) + math.abs(rel.y);
+			if(this.drag_distance >= 6) {
+				this.drag_distance = -1;
+				this.start_drag(this.head);
+			}
+			return true;
+		});
+
+		//Hairlines towards the neighbours
+		line_right = parent.widget_solid().background_color(AREA_LINE_COLOR)
+			.anchor_top(0).anchor_bottom(0).anchor_right(0).fixed_width(1).overlay(true);
+		line_bottom = parent.widget_solid().background_color(AREA_LINE_COLOR)
+			.anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(1).overlay(true);
+
+		//The same buttons for an area that holds a Tabview: over the right end of its tab strip
+		strip = parent.widget().anchor_top(8).anchor_right(2).fixed_width(STRIP_WIDTH).fixed_height(22).overlay(true).visible(false);
+		strip_button = [this](icon, tip, right) {
+			return this.strip.button("").icon(nanogui.icon(icon)).tooltip(tip).transparent(true)
+				.anchor_top(0).anchor_right(right).fixed_width(22).fixed_height(20);
+		};
+		strip_close = strip_button("times", "Close this [[area]]: the Tabview moves to a [[view tab|tab]] in the top bar (Ctrl+W)", 2);
+		strip_close.on_click([this](){
+			this.close_area();
+		});
+		strip_more = strip.button_popup("").icon(nanogui.icon("ellipsis_h")).side("auto").tooltip("More actions: replace, swap, duplicate, save as [[preset]]\n[[wiki:The-Screen#the-menu-of-an-area]]").transparent(true)
+			.anchor_top(0).anchor_right(26).fixed_width(22).fixed_height(20);
+		strip_more.on_screen(true).autoclose(true);
+		strip_more.popup().content().layout(nanogui.layout_vertical());
+		strip_more.popup().content().fixed_width(230);
+		strip_more.on_change([this](pushed){
+			if(pushed)
+				this.fill_menu(this.strip_more);
+			else
+				this.show_actions();
+		});
+		strip_max = strip_button("window_maximize", "Maximize this [[area]] (Ctrl+Space)", 50);
+		strip_max.on_click([this](){
+			this.toggle_maximize();
+		});
+		strip_split_down = strip_button("equals", "Split down: an empty [[area]] appears below this one (Ctrl+Shift+E)\n[[wiki:The-Screen#the-header-of-an-area]]", 74);
+		strip_split_down.on_click([this](){
+			this.split_empty("bottom");
+		});
+		strip_split_right = strip_button("columns", "Split right: an empty [[area]] appears beside this one (Ctrl+E)\n[[wiki:The-Screen#the-header-of-an-area]]", 98);
+		strip_split_right.on_click([this](){
+			this.split_empty("right");
+		});
+
+		//The area the keyboard went to (F6)
+		mark_line = parent.widget_solid().background_color(AREA_MARK_COLOR)
+			.anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(2).overlay(true).visible(false);
+
+		//The head of a filled area hides when the mouse leaves it
+		head.on_mouse_enter([this](pos, enter){
+			if(!enter)
+				this.hide_head();
+		});
+
+		//The top edge shows it. The head opens over the edge, so leaving the edge downwards is still inside the head
+		hot = parent.widget().anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(AREA_HOT_HEIGHT).overlay(true);
+		hot.on_mouse_enter([this](pos, enter){
+			if(enter)
+				this.head.visible(true);
+			else if(pos.y < 0 || pos.y >= AREA_HEAD_HEIGHT || pos.x < 0 || pos.x >= this.head.width())
+				this.hide_head();
+		});
+
+		//The menu of a right click hangs on a button of no size that is put under the cursor
+		context_btn = parent.button_popup("").side("auto").transparent(true)
+			.anchor_left(0).anchor_top(0).fixed_width(1).fixed_height(1).overlay(true);
+		context_btn.on_screen(true).autoclose(true);
+		context_btn.popup().content().layout(nanogui.layout_vertical());
+		context_btn.popup().content().fixed_width(230);
+	}
+
+	hides_head() {
+		if(std.is_none(auto_hide))
+			return std.global("engine").env.area_headers_auto_hide ? true : false;
+		return auto_hide ? true : false;
+	}
+
+	head_stays() {
+		return !item || !hides_head();
+	}
+
+	//Which buttons the head shows: all that apply while the mouse is in the area (always on an empty area and on a
+	//head that only comes on demand), none otherwise, so the heads of the other areas stay quiet
+	show_actions() {
+		//A Tabview has no head, its tab strip is one. The buttons of the head sit over the right end of the strip
+		//(variant C of #347) while the mouse is in the Tabview
+		if(strip) {
+			on_strip = is_tabs() && !in_tab;
+			active = on_strip && (hovered || marked || strip_more.pushed());
+			inside = owner ? true : false;
+			splits = active && can_split();
+			set_shown(strip, active);
+			if(active) {
+				set_shown(strip_split_right, splits);
+				set_shown(strip_split_down, splits);
+				set_shown(strip_max, inside);
+				set_shown(strip_close, inside);
+				strip_max.icon(nanogui.icon(maximized ? "window_restore" : "window_maximize"));
+				strip_max.tooltip(maximized ? "Restore the [[layout]] (Ctrl+Space)" : "Maximize this [[area]] (Ctrl+Space)");
+			}
+		}
+		if(!head || !has_head())
+			return;
+
+		empty = !item;
+		active = empty || hides_head() || hovered || marked || head_more.pushed();
+		inside = owner ? true : false;
+		splits = active && can_split() && narrow == 0;
+
+		set_shown(head_split_right, splits);
+		set_shown(head_split_down, splits);
+		set_shown(head_max, active && !empty && inside && narrow == 0);
+		set_shown(head_name, narrow < 2);
+		set_shown(head_icon, narrow < 2);
+		set_shown(head_more, active && !empty);
+		set_shown(head_close, active && inside);
+		show_cables_button(active && !empty && narrow == 0);
+		head_name.text_color((active && !empty) ? vec4f(0.93, 0.93, 0.93, 1.0) : AREA_TEXT_2);
+	}
+
+	//Beside the split buttons, or where they would be; the name gets less room while it shows
+	show_cables_button(active) {
+		shown = cables || active;
+		right = can_split() ? 124 : 76;
+		if(head_cables.anchor_right() != right)
+			head_cables.anchor_right(right);
+		//Lit in the accent while it is on (a transparent button shows no pushed state of its own)
+		if(cables_lit != cables) {
+			cables_lit = cables;
+			head_cables.text_color(cables ? AREA_MARK_COLOR : vec4f(0, 0, 0, 0));
+		}
+		set_shown(head_cables, shown);
+		name_room = shown ? right + 30 : (can_split() ? 130 : 82);
+		if(narrow > 0)
+			name_room = shown ? right + 30 : 56; //only the menu and close are left
+		if(placed_name_room != name_room) {
+			placed_name_room = name_room;
+			head_name.anchor_right(name_room);
+		}
+	}
+
+	// =========================================================================
+	// Cable view (#381)
+	// =========================================================================
+
+	//This area or one that holds it shows its cables
+	cables_shown() {
+		if(cables)
+			return true;
+		return owner ? owner.cables_shown() : false;
+	}
+
+	//The cards of other areas name this one after what it shows
+	cable_label() {
+		if(!item)
+			return "Empty area";
+		return item_meta().name;
+	}
+
+	//Counted for the bubble on the cable button of the timeline
+	set_cables(on) {
+		on = on ? true : false;
+		if(on == cables)
+			return;
+		cables = on;
+		env = std.global("engine").env;
+		env.cable_areas_on = math.max(0, (env.cable_areas_on ?? 0) + (on ? 1 : -1));
+	}
+
+	toggle_cables() {
+		if(nanogui.show_mode())
+			return; //no cable view while performing
+		set_cables(!cables);
+		refresh_tree();
+	}
+
+	//Ends the cable view of this area and of every area in it (all tabs of a Tabview, also the hidden ones)
+	cables_off_tree() {
+		set_cables(false);
+		if(item && item.module && item.module.has("get_view")) {
+			for(i = 0; i < 256; i++) {
+				view = item.module.call("get_view", i);
+				if(!view)
+					break;
+				view.cables_off_tree();
+			}
+		}
+		refresh_chrome();
+	}
+
+	//The badges of the cable view on the tabs of every Tabview in this area (generators.refresh_cable_badges): a tab
+	//not in front that holds the hidden end of a cable on screen shows the number of such links
+	cable_badges(targets) {
+		if(!item || !item.module || !item.module.has("get_view"))
+			return;
+		tabs = is_tabs() && item.module.has("tab_badge");
+		front = tabs ? item.module.call("selected_tab") : -1;
+		for(i = 0; i < 256; i++) {
+			view = item.module.call("get_view", i);
+			if(!view)
+				break;
+			if(tabs) {
+				t = (i != front && targets.has(view.uid)) ? targets[view.uid] : None;
+				item.module.call("tab_badge", i, t && t.count > 0 ? std.string(t.count) : "", t && t.hot ? true : false);
+			}
+			view.cable_badges(targets);
+		}
+	}
+
+	//The area with that uid: this one or one in it, also in a tab that is not in front
+	find_area(other_uid) {
+		if(uid == other_uid)
+			return this;
+		if(!item || !item.module || !item.module.has("get_view"))
+			return None;
+		for(i = 0; i < 256; i++) {
+			view = item.module.call("get_view", i);
+			if(!view)
+				break;
+			found = view.find_area(other_uid);
+			if(found)
+				return found;
+		}
+		return None;
+	}
+
+	//A card of the cable view leads here (generators.shio, nanogui.on_cable_jump): every Tabview on the way shows
+	//the tab with this area, a maximized area that hides it goes back
+	reveal() {
+		env = std.global("engine").env;
+		maximized_view = env.maximized_view;
+		if(maximized_view && !is_inside(maximized_view.uid))
+			maximized_view.restore_maximized();
+		child = this;
+		holder = owner;
+		for(holder) {
+			if(holder.is_tabs() && holder.item.module.has("select_tab_of"))
+				holder.item.module.call("select_tab_of", child.uid);
+			child = holder;
+			holder = holder.owner;
+		}
+	}
+
+	//visible() only when it changes: every call asks for a new layout
+	set_shown(widget, shown) {
+		if((widget.visible() ? 1 : 0) != (shown ? 1 : 0))
+			widget.visible(shown);
+	}
+
+	hide_head() {
+		if(head_stays() || !has_head())
+			return;
+		if(head_more.pushed())
+			return; //its menu is open
+		head.visible(false);
+	}
+
+	//An area has a head when it holds nothing or one view. A split is only layout, a Tabview has its tab strip, and
+	//so has the area of a tab
+	has_head() {
+		return !in_tab && !is_split() && !is_tabs();
+	}
+
+	//After every change of what the area holds
+	refresh_chrome() {
+		if(!head)
+			return;
+
+		area.cable_scope(cables_shown(), cable_label(), uid);
+
+		empty = !item;
+		with_head = has_head();
+		fixed = with_head && head_stays();
+
+		head.visible(fixed);
+		hot.visible(with_head && !fixed);
+
+		//An area that shows content has the hairlines; one that only holds layout (or is a tab) has none
+		set_shown(line_right, with_head);
+		set_shown(line_bottom, with_head);
+
+		top = fixed ? AREA_HEAD_HEIGHT : 0;
+		if(placed_top != top) {
+			placed_top = top;
+			area.anchor_top(top);
+		}
+
+		if(with_head) {
+			meta = item_meta();
+			head_name.caption(meta.name);
+			head_icon.visible(meta.icon != "");
+			if(meta.icon != "")
+				head_icon.icon(view_icon(meta.icon));
+
+
+			head_max.icon(nanogui.icon(maximized ? "window_restore" : "window_maximize"));
+			head_max.tooltip(maximized ? "Restore the [[layout]] (Ctrl+Space)" : "Maximize this [[area]] (Ctrl+Space)");
+			show_actions();
+		}
+
+		refresh_zones();
+		if(is_tabs())
+			show_actions();
+
+		if(empty)
+			show_picker();
+		else if(picker)
+			picker = None;
+	}
+
+	// =========================================================================
+	// Menu (the ⋯ of the head and the right click)
+	// =========================================================================
+
+	menu_item(menu, popup_btn, caption, icon, action) {
+		entry = menu.button(caption).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+		if(icon)
+			entry.icon(nanogui.icon(icon));
+		entry.on_click([this, popup_btn, caption, action](){
+			popup_btn.close();
+			this.step(caption.trim(), action);
+		});
+		return entry;
+	}
+
+	//Built when it opens, so it always fits what the area holds
+	fill_menu(popup_btn) {
+		menu = popup_btn.popup().content();
+		menu.clear_children();
+
+		if(is_split())
+			return false;
+		//Nothing applies: an empty area that cannot be split and cannot close
+		if(!item && !can_split() && !(owner && !in_tab))
+			return false;
+
+		if(can_split()) {
+			menu_item(menu, popup_btn, "Split right", "columns", [this](){ this.split_empty("right"); });
+			menu_item(menu, popup_btn, "Split down", "equals", [this](){ this.split_empty("bottom"); });
+		}
+		//In a narrow area the head has no maximize button: it is here
+		if(item && owner && narrow > 0)
+			menu_item(menu, popup_btn, maximized ? "Restore the layout" : "Maximize", maximized ? "window_restore" : "window_maximize", [this](){ this.toggle_maximize(); });
+
+		if(item && !is_tabs()) {
+			//Replace view: the views one below the other, the replaced view goes to the top bar
+			menu.label("Replace view with").font_size(13).text_color(AREA_TEXT_3).fixed_height(24);
+			views = view_assets();
+			for(i = 0; i < views.size(); i++) {
+				if(!views[i].toolbar)
+					continue;
+				path = views[i].path;
+				menu_item(menu, popup_btn, "    " + views[i].name, "", [this, path](){ this.replace_view(path); });
+			}
+			menu.label("").fixed_height(6);
+		}
+
+		//Swap with: the other areas of the tab that hold something
+		env = std.global("engine").env;
+		if(item && env.layout_areas) {
+			others = [];
+			all_areas = env.layout_areas();
+			for(i = 0; i < all_areas.size(); i++) {
+				other = all_areas[i];
+				if(other.uid != uid && other.item && !is_inside(other.uid) && !other.is_inside(uid))
+					others.push_back(other);
+			}
+			if(others.size() > 0) {
+				menu.label("Swap with").font_size(13).text_color(AREA_TEXT_3).fixed_height(24);
+				for(i = 0; i < others.size(); i++) {
+					other = others[i];
+					menu_item(menu, popup_btn, "    " + other.item_meta().name, "", [this, other](){ this.swap_with(other); });
+				}
+				menu.label("").fixed_height(6);
+			}
+		}
+
+		if(item) {
+			if(can_split())
+				menu_item(menu, popup_btn, "Duplicate", "clone", [this](){ this.duplicate(); });
+			if(owner && !in_tab)
+				menu_item(menu, popup_btn, "Move to new tab", "external_link_alt", [this](){ this.move_to_tab(); });
+			if(owner)
+				menu_item(menu, popup_btn, maximized ? "Restore the layout" : "Maximize", maximized ? "compress" : "expand", [this](){ this.toggle_maximize(); });
+		}
+
+		//A Tabview: the menu of its tab strip (a right click on the strip lands here)
+		if(is_tabs() && item.module.has("close_other_tabs")) {
+			tabs_module = item.module;
+			if(tabs_module.call("tab_count") > 1)
+				menu_item(menu, popup_btn, "Close other tabs", "", [this, tabs_module](){ if(!this.locked()) tabs_module.call("close_other_tabs"); });
+			menu_item(menu, popup_btn, "Close all tabs", "", [this, tabs_module](){ if(!this.locked()) tabs_module.call("close_all_tabs"); });
+		}
+
+		if(owner && !in_tab)
+			menu_item(menu, popup_btn, "Close area", "times", [this](){ this.close_area(); });
+
+		if(item) {
+			menu_item(menu, popup_btn, "Save as preset…", "save", [this](){ this.save_preset(); });
+			menu_item(menu, popup_btn, "Delete view…", "trash", [this](){ this.delete_view(); });
+		}
+
+		if(item && has_head())
+			menu_item(menu, popup_btn, hides_head() ? "Keep header" : "Auto-hide header", "thumbtack", [this](){ this.toggle_auto_hide(); });
+
+		//Not in a tab whose Tabview shows the cables of all its tabs
+		if(item && (cables || !cables_shown()) && !nanogui.show_mode())
+			menu_item(menu, popup_btn, cables ? "Hide cables" : "Show cables", "link", [this](){ this.toggle_cables(); });
+
+		return true;
+	}
+
+	//A right click in the area that did not move (nanogui: on_context_menu). pos is in the container of the area
+	open_context_menu(pos) {
+		if(locked() || context_btn.pushed())
+			return;
+		if(!fill_menu(context_btn))
+			return;
+
+		//2 px beside the cursor: a second right click at the same spot would hit this button, and buttons ask for no menu
+		context_btn.anchor_left(pos.x - 2).anchor_top(pos.y - 2);
+		context_btn.pushed(true);
+	}
+
+	// =========================================================================
+	// Empty area: "What goes here?"
+	// =========================================================================
+
+	//The tiles of the picker that can be clicked now, with their middle in window pixels: for vibevj_describe_layout,
+	//so a test (or an agent) finds "Patchview" without knowing how the picker is laid out (#385)
+	picker_tiles() {
+		list = [];
+		if(!picker)
+			return list;
+		for(i = 0; i < picker_targets.size(); i++) {
+			button = picker_targets[i].button;
+			if(!button.visible_recursive())
+				continue;
+			pos = button.absolute_position();
+			list.push_back([name = picker_targets[i].name, x = std.int(pos.x + button.width() / 2), y = std.int(pos.y + button.height() / 2)]);
+		}
+		return list;
+	}
+
+	show_picker() {
+		if(picker)
+			return;
+
+		picker_targets = [];
+		views = [];
+		all_views = view_assets();
+		for(i = 0; i < all_views.size(); i++) {
+			if(all_views[i].toolbar)
+				views.push_back(all_views[i]);
+		}
+
+		picker = container.widget().anchor(0).anchor_top(in_tab ? 0 : AREA_HEAD_HEIGHT).overlay(true);
+		take_drops(picker);
+
+		tile_w = 200;
+		tile_h = 112;
+		gap = 8;
+		box_w = tile_w * 2 + gap;
+		tile_rows = std.int((views.size() + 1) / 2);
+
+		//Tiles when there is room, a plain list when the area is small, one button when it is very small
+		tiles = picker.widget().fixed_width(box_w);
+		y = 0;
+		tiles.label("What goes here?").font_size(16).alignment("center").anchor_left(0).anchor_right(0).anchor_top(y).fixed_height(22);
+		y += 22 + 20;
+
+		for(i = 0; i < views.size(); i++) {
+			view = views[i];
+			row = std.int(i / 2);
+			tx = (i - row * 2) * (tile_w + gap);
+			ty = y + row * (tile_h + gap);
+
+			tile = tiles.widget_solid().background_color(AREA_TILE_COLOR)
+				.anchor_left(tx).anchor_top(ty).fixed_width(tile_w).fixed_height(tile_h);
+			tile.button("").icon(view_icon(view.icon)).transparent(true).enabled(false)
+				.anchor_left(8).anchor_top(8).fixed_width(30).fixed_height(30);
+			tile.label(view.name).font_size(15).anchor_left(14).anchor_right(8).anchor_top(42).fixed_height(20);
+			lines = wrap_words(view.description, 28);
+			for(k = 0; k < lines.size() && k < 2; k++) {
+				tile.label(lines[k]).font_size(13).text_color(AREA_TEXT_2)
+					.anchor_left(14).anchor_right(8).anchor_top(64 + k * 17).fixed_height(17);
+			}
+
+			//The whole tile is the button: a clear one over it takes the click and lights the tile
+			path = view.path;
+			catcher = tile.button("").transparent(true).anchor(0);
+			catcher.tooltip(view.name + (view.description ? "\n" + view.description : ""));
+			picker_targets.push_back([name = view.name, button = catcher]);
+			catcher.on_click([this, path](){
+				this.pick(path);
+			});
+			catcher.on_mouse_enter([tile](pos, enter){
+				tile.background_color(enter ? AREA_TILE_HOT_COLOR : AREA_TILE_COLOR);
+			});
+		}
+		y += tile_rows * (tile_h + gap) - gap + 20;
+
+		//Presets of the views. Those of the two splits are layouts ("Save layout as preset…" of a view tab, #349):
+		//they come first, in a group of their own
+		presets = [];
+		layouts = [];
+		for(i = 0; i < all_views.size(); i++) {
+			presets_dir = all_views[i].path + "/presets";
+			if(!fileio.exists(presets_dir))
+				continue;
+			files = fileio.files(presets_dir, false);
+			for(j = 0; j < files.size(); j++) {
+				preset_path = presets_dir + "/" + fileio.file_name(files[j]);
+				if(!preset_path.ends(".preset"))
+					continue;
+				entry = [name = fileio.pure_name(files[j]), path = preset_path, hint = all_views[i].name + " preset"];
+				if(all_views[i].toolbar)
+					presets.push_back(entry);
+				else {
+					entry.hint = "A layout: " + all_views[i].name;
+					layouts.push_back(entry);
+				}
+			}
+		}
+
+		groups = [
+			[caption = "Layouts", entries = layouts, most = 8],
+			[caption = "Presets", entries = presets, most = 12],
+		];
+		for(g = 0; g < groups.size(); g++) {
+			group = groups[g];
+			if(group.entries.size() == 0)
+				continue;
+
+			tiles.label(group.caption).font_size(13).text_color(AREA_TEXT_3).alignment("center").anchor_left(0).anchor_right(0).anchor_top(y).fixed_height(18);
+			y += 18 + 6;
+
+			//Chips in rows, as many as fit the width
+			x = 0;
+			for(i = 0; i < group.entries.size() && i < group.most; i++) {
+				preset = group.entries[i];
+				chip_w = 24 + std.len(preset.name) * 8;
+				if(chip_w > box_w)
+					chip_w = box_w;
+				if(x + chip_w > box_w) {
+					x = 0;
+					y += 28 + 6;
+				}
+				preset_path = preset.path;
+				chip = tiles.button(preset.name).tooltip(preset.hint)
+					.anchor_left(x).anchor_top(y).fixed_width(chip_w).fixed_height(28);
+				chip.on_click([this, preset_path](){
+					this.pick(preset_path);
+				});
+				picker_targets.push_back([name = preset.name, button = chip]); //vibevj_describe_layout names them too
+				x += chip_w + 6;
+			}
+			y += 28 + 20;
+		}
+
+		tiles.label("or drag an asset from the sidebar here").font_size(14).text_color(AREA_TEXT_3).alignment("center")
+			.anchor_left(0).anchor_right(0).anchor_top(y).fixed_height(24);
+		y += 24;
+		tiles.fixed_height(y);
+		box_h = y;
+
+		//The same choice as a list for a small area
+		//Not wider than a menu: rows across a whole wide area are hard to read
+		compact = picker.widget().anchor_left(8).anchor_top(8).fixed_width(320).layout(nanogui.layout_vertical());
+		compact.label("What goes here?").font_size(14).anchor_left(0).anchor_right(0).fixed_height(24);
+		for(i = 0; i < views.size(); i++) {
+			path = views[i].path;
+			entry = compact.button(views[i].name).icon(view_icon(views[i].icon)).alignment("left")
+				.anchor_left(0).anchor_right(0).fixed_height(28).tooltip(views[i].description);
+			entry.on_click([this, path](){
+				this.pick(path);
+			});
+		}
+		list_h = 8 + 24 + views.size() * 30;
+
+		//The layouts and presets of the tiles, as a menu: the list has no room for their chips
+		if(layouts.size() + presets.size() > 0) {
+			more = compact.button_popup("Layouts and presets").icon(nanogui.icon("clone")).alignment("left").side("auto")
+				.anchor_left(0).anchor_right(0).fixed_height(28).tooltip("A saved [[layout]] or a [[preset]] of a view");
+			more.on_screen(true).autoclose(true);
+			more_menu = more.popup().content().layout(nanogui.layout_vertical());
+			more_menu.fixed_width(240);
+			for(g = 0; g < groups.size(); g++) {
+				group = groups[g];
+				if(group.entries.size() == 0)
+					continue;
+				more_menu.label(group.caption).font_size(13).text_color(AREA_TEXT_3).fixed_height(24);
+				for(i = 0; i < group.entries.size() && i < group.most; i++) {
+					preset_path = group.entries[i].path;
+					b = more_menu.button(group.entries[i].name).alignment("left").anchor_left(0).anchor_right(0)
+						.fixed_height(28).tooltip(group.entries[i].hint);
+					b.on_click([this, more, preset_path](){
+						more.close();
+						this.pick(preset_path);
+					});
+				}
+			}
+			list_h += 30;
+		}
+		list_w = 150;
+
+		//And as one button for an area that is too small for the list: the list would be cut off
+		//Its menu is the menu of the area, with the views in it (open_view_menu)
+		tiny = picker.button("").icon(nanogui.icon("plus"))
+			.tooltip("Pick a [[view]] for this [[area]]")
+			.anchor_left(4).anchor_top(4).fixed_width(24).fixed_height(22);
+		tiny.on_click([this](){
+			this.open_view_menu();
+		});
+
+		//Centered, without a layout pass of its own: only when the size of the area changes
+		//Only a change is applied (the last state is remembered): setting the same again would ask for a new layout
+		//pass every time and the layout would never settle
+		tiles.visible(false);
+		compact.visible(false);
+		tiny.visible(false);
+		placed = [mode = -1, x = -1, y = -1, cw = -1, pending = false, thread = None];
+		picker.on_layout([picker, tiles, compact, tiny, box_w, box_h, list_w, list_h, placed](){
+			w = std.int(picker.width());
+			h = std.int(picker.height());
+			//1: tiles, 0: list, 2: one button
+			mode = 2;
+			if(w >= box_w + 16 && h >= box_h + 16)
+				mode = 1;
+			else if(w >= list_w && h >= list_h)
+				mode = 0;
+			changed = false;
+			if(placed.mode != mode) {
+				placed.mode = mode;
+				tiles.visible(mode == 1);
+				compact.visible(mode == 0);
+				tiny.visible(mode == 2);
+				changed = true;
+			}
+			if(mode == 0) {
+				cw = math.min(w - 16, 320);
+				if(placed.cw != cw) {
+					placed.cw = cw;
+					compact.fixed_width(cw);
+					changed = true;
+				}
+			}
+			//What just became visible was skipped by this layout pass (size 0), and a new layout asked for inside the
+			//pass is dropped: it is asked for again a moment later, from a thread (no callback on every frame). That
+			//pass changes nothing and the layout settles. Without it the list stayed empty at start up (1366 × 768)
+			if(changed && !placed.pending) {
+				placed.pending = true;
+				relayout = std.thread([picker, placed](){
+					std.sleep(30);
+					placed.pending = false;
+					picker.refresh_layout();
+				});
+				relayout.run();
+				placed.thread = relayout; //kept: a thread that goes out of scope would end with it
+			}
+			if(mode == 1) {
+				x = std.int((w - box_w) / 2);
+				y = std.int((h - box_h) / 2);
+				if(placed.x != x || placed.y != y) {
+					placed.x = x;
+					placed.y = y;
+					tiles.position(vec2f(x, y));
+				}
+			}
+		});
+	}
+
+	pick(path) {
+		if(locked())
+			return;
+		step("Add view", [this, path](){
+			this.add_generator(this.area, path);
+		});
+	}
+
+	//The views as a menu, for an empty area that is too small to list them
+	open_view_menu() {
+		if(locked() || context_btn.pushed())
+			return;
+
+		menu = context_btn.popup().content();
+		menu.clear_children();
+		views = view_assets();
+		for(i = 0; i < views.size(); i++) {
+			if(!views[i].toolbar)
+				continue;
+			path = views[i].path;
+			entry = menu.button(views[i].name).icon(view_icon(views[i].icon)).alignment("left")
+				.anchor_left(0).anchor_right(0).fixed_height(28).tooltip(views[i].description);
+			entry.on_click([this, path](){
+				this.context_btn.close();
+				this.pick(path);
+			});
+		}
+
+		//Below the button of the picker
+		context_btn.anchor_left(4).anchor_top((in_tab ? 0 : AREA_HEAD_HEIGHT) + 26);
+		context_btn.pushed(true);
+	}
+
+	// =========================================================================
+	// State
+	// =========================================================================
 
 	save_state() {
 		if(!item)
 			return [];
-		return [
+		state = [
 			item = item.save_state(),
 			item_scale = area.scale(),
 		];
+		if(!std.is_none(auto_hide))
+			state.head_auto_hide = auto_hide ? 1 : 0;
+		if(cables)
+			state.cables = 1;
+		return state;
 	}
 
 	load_state(state) {
 		if(item)
 			item.release();
-			
+		item = None;
+		maximized = None;
+		auto_hide = None;
+		set_cables(state && state.has("cables") && state.cables ? true : false);
+		refresh_chrome();
+
 		if(!state)
 			return;
-		
+
 		// Very special function, this avoids reloading same project GUID's while the current objects may not be destroyed yet
 		for(!area.screen().garbage_cleared()) {
 			std.sleep(0);
@@ -105,10 +1929,15 @@ class singleview
 		try {
 			if(state.item_scale)
 				area.scale(state.item_scale);
+			if(state.has("head_auto_hide"))
+				auto_hide = state.head_auto_hide ? 1 : 0;
 			item = add_generator(area, state.item.path, state.item.guid);
-			if(item)
+			if(item) {
 				item.load_state(state.item);
+				//A split makes its third and further areas while it loads: they belong to this area too
+				adopt();
+			}
 		}
-		catch(e) {}	
+		catch(e) {}
 	}
 }

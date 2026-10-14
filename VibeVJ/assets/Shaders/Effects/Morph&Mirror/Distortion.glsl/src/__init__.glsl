@@ -58,7 +58,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
     distorted_uv.x *= iResolution.x / iResolution.y;
 
-    fragColor = texture2D(iChannel0, distorted_uv);
+    fragColor = texture(iChannel0, distorted_uv);
 
     if (fragColor.a == 0.0)
     {

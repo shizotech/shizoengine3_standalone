@@ -4,32 +4,28 @@ The `Generators/Utility/` directory contains utility and helper generators for d
 
 ## Overview
 
-Utility generators provide auxiliary functionality including debugging tools, value display, and test patterns.
+Utility generators are the controls you play with (pads, button fields, envelopes, step sequencers) and small helpers
+that show or shape a value.
 
 ## Components
 
 | Component | Description |
 |-----------|-------------|
-| **test.asset** | Test generator for debugging |
-| **textbox.asset** | Text display generator |
-| **value_text.asset** | Value display generator |
-
-## Components Detail
-
-### test.asset
-- Basic test pattern generator
-- Useful for verifying pipeline connectivity
-- Can output solid colors or test patterns
-
-### textbox.asset
-- Renders text to screen
-- Configurable font, size, and color
-- Useful for annotations and overlays
-
-### value_text.asset
-- Displays numerical values as text
-- Can show generator parameters
-- Useful for debugging and monitoring
+| **XYPad.asset** | Two sliders (X, Y) set from one pad |
+| **XYPathPad.asset** | Points on a pad form a path; a point travels along it at an even speed |
+| **XYPositions.asset** | A list of X/Y positions; click one to send it |
+| **CurvePad.asset** | Points on a pad, joined by a line or a smooth curve, travelled as a closed loop |
+| **ColorSelector.asset** | A grid of colour buttons; the colours that are on are sent out, with brightness and smoothing |
+| **Button-Feld.asset** | A field of buttons, each Flash, Relative or Absolute, each with its own output |
+| **Control-Button-Matrix.asset** | A matrix of buttons with the same three modes |
+| **EnvelopeOutput.asset** | An editable envelope, run FREE or SYNC, sampled into an output |
+| **StepChaser.asset** | A step sequencer synced to the bar: a value or HOLD for every count |
+| **control4.asset** | Four plain sliders, to link to |
+| **quantize.asset** | Rounds an input to a number of steps |
+| **textbox.asset** | A text field; its text is saved with the project |
+| **value_text.asset** | Shows the value of its input as text |
+| **Chat.asset** | The chat of the sidebar as a generator |
+| **broken.asset** | Fails on purpose: an example of the error report of a broken asset |
 
 ## Usage
 

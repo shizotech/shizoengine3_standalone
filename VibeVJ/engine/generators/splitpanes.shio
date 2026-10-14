@@ -1,0 +1,419 @@
+
+#include "engine/generators/singleview"
+
+//The areas of a split view (HorizontalSplit, VerticalSplit): any number of them side by side or one above the other.
+//- Between two neighbours lies a grip: dragging it shares the room of the two, the others keep theirs. It is made of
+//  two halves, one at the edge of each neighbour, so it sits on the line between them and takes no room.
+//- A split of an area in a split of the same direction adds an area to that split, beside the one that was split
+//  (singleview.split): three or more areas in a row do not need a split in a split.
+//- An area that closes leaves the split, its room goes to its neighbour. The last two dissolve as before
+//  (singleview.dissolve).
+//The shares are fractions of the split (sizes, together 1); they are saved with the view.
+
+SPLIT_GRIP_HALF = 3;   //px of the grip on each side of the line
+SPLIT_MIN = 72;        //px an area keeps when a grip is dragged: its head still shows the menu and close
+SPLIT_LINE_HOT = vec4f(0.616, 0.522, 1.0, 1.0); //accent: the line of the grip under the mouse or in a drag
+SPLIT_LINE_OFF = vec4f(0, 0, 0, 0);            //the line at rest: nothing is drawn
+
+//Not managed: a managed list destroys everything in it when it is replaced, and the grips name the panes. What goes
+//is freed by hand (remove_view, make_grips, on_free)
+panes = [];            //[pane=, view=], in order: left to right / top to bottom
+grips = [];            //per line between two areas: [a=, b=, line_a=, line_b=, pane_a=, pane_b=, lit=], the halves in the two panes
+sizes = [];            //the share of each area
+side_by_side = true;
+root = None;
+holder = None;         //the area that holds this split (singleview.adopt)
+grip_state = [index = -1, hovered = -1];
+
+def insert_pane(index);
+def relayout();
+def set_sizes(list);
+def set_ratio(share);
+def free_grips();
+def make_grips();
+def grips_in_place();
+def grip_half(pane, index, after);
+def show_grip_lines();
+def move_grip(index, at);
+
+//The part of entry() both splits share
+split_entry(generator, parent, horizontal, docs) {
+	side_by_side = horizontal;
+	//The panes go straight into the window of the split: a widget between them with one child would take the
+	//preferred size of that child, and the layout would not settle
+	root = parent;
+	insert_pane(0);
+	insert_pane(1);
+	sizes = [0.5, 0.5];
+	relayout();
+
+	generator.on_get_status([this, docs](){
+		items = [];
+		for(i = 0; i < panes.size(); i++) {
+			view = panes[i].view;
+			items.push_back(view.item ? [asset=view.item.get_relative_path(), live_path=view.item.node.get_full_path()] : ["No item"]);
+		}
+		return [
+			sizes = sizes,
+			items = items,
+			explanation = docs,
+		];
+	});
+
+	first_name = side_by_side ? "LEFT" : "TOP";
+	last_name = side_by_side ? "RIGHT" : "BOTTOM";
+	generator.register("set_item", [path="Path to the generator asset or shader", placement="'" + first_name + "', '" + last_name + "' or the number of the area (0 = " + first_name + ")"], [this, first_name, last_name](args){
+		if(!args.has("path") || !args.has("placement"))
+			return [ok=false, error="Needs 'path' and 'placement' args."];
+
+		index = -1;
+		if(args.placement == first_name)
+			index = 0;
+		else if(args.placement == last_name)
+			index = panes.size() - 1;
+		else {
+			try {
+				index = std.int(args.placement);
+			}
+			catch(e) {}
+		}
+		if(index < 0 || index >= panes.size())
+			return [ok=false, error="No area " + std.string(args.placement) + "."];
+
+		view = panes[index].view;
+		if(view.add_generator(view.area, args.path))
+			return [ok = true, status = "New generator was set."];
+		return [ok = false, error = "Could not add generator."];
+	}, "DANGEROUS: Set the generators, clears anything that is currently set.");
+
+	//"size" is also a function of every list: a literal [size=...] loses the key and args.size is that function.
+	//So the argument is declared and read by index
+	split_args = [];
+	split_args["size"] = "Normalized float value 0.0 - 1.0 (default 0.5): the share of the first area, the rest is shared by the others as before. Or a list with the share of every area.";
+
+	generator.register("set_split", split_args, [this](args){
+		if(!args.has("size"))
+			return [ok=false, error="Needs 'size' arg."];
+		value = args["size"];
+		if(std.is_list(value))
+			set_sizes(value);
+		else
+			set_ratio(std.float(value));
+		return [ok = true, status = "Split size was set."];
+	}, "Set the split proportions.");
+}
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "active") {
+		if(value && !generator.active_btn.value())
+			return None;
+	}
+	for(i = 0; i < panes.size(); i++)
+		panes[i].view.dispatch(cmd, value);
+	return None;
+}
+
+// =========================================================================
+// Areas
+// =========================================================================
+
+//A new, empty area at index (the grips are made again by the caller: relayout)
+insert_pane(index) {
+	//A fixed size as for the frame of an area (singleview): with the area and the halves of a grip in it, the pane
+	//would keep its own size and the layout would not settle. The anchors give it its place
+	pane = root.widget().anchor(0).fixed_size(vec2f(16999, 16999));
+	view = singleview(pane);
+	view.owner = holder;
+	panes.insert(index, [pane = pane, view = view]);
+	return view;
+}
+
+//For the layout code of a singleview (adopt, split): module.get() only returns functions, not the areas.
+//0 = the left / top area
+get_view(index) {
+	if(index < 0 || index >= panes.size())
+		return None;
+	return panes[index].view;
+}
+
+view_count() {
+	return panes.size();
+}
+
+is_side_by_side() {
+	return side_by_side;
+}
+
+set_holder(view) {
+	holder = view;
+}
+
+//Split of the area at "from": a new, empty area at index (from or from + 1) gets half of its room
+insert_view(index, from) {
+	if(from < 0 || from >= sizes.size())
+		from = sizes.size() - 1;
+	share = sizes[from] / 2.0;
+	sizes[from] = share;
+	view = insert_pane(index);
+	sizes.insert(index, share);
+	relayout();
+	return view;
+}
+
+//The area at index went (its view moved or was closed): its room goes to the neighbour before it, the first one's to
+//the one after it. Not the last two: those dissolve the split (singleview.dissolve)
+remove_view(index) {
+	if(index < 0 || index >= panes.size() || panes.size() <= 2)
+		return false;
+	gone = panes[index];
+	share = sizes[index];
+	panes.erase(index);
+	sizes.erase(index);
+	sizes[index > 0 ? index - 1 : 0] += share;
+	//The grips first: two of them have a half in the pane that goes
+	free_grips();
+	std.free(gone.view);
+	std.free(gone.pane);
+	relayout();
+	return true;
+}
+
+//Areas are added until there are count of them, in equal parts (undo builds a split of a description this way)
+ensure_views(count) {
+	if(panes.size() >= count)
+		return;
+	for(panes.size() < count) {
+		insert_pane(panes.size());
+		sizes.push_back(0.0);
+	}
+	for(i = 0; i < sizes.size(); i++)
+		sizes[i] = 1.0 / sizes.size();
+	relayout();
+}
+
+// =========================================================================
+// Shares
+// =========================================================================
+
+get_sizes() {
+	return sizes.copy();
+}
+
+set_sizes(list) {
+	if(!list || list.size() != panes.size())
+		return;
+	total = 0.0;
+	for(i = 0; i < list.size(); i++)
+		total += math.max(0.0, std.float(list[i]));
+	if(total <= 0.0)
+		return;
+	for(i = 0; i < list.size(); i++)
+		sizes[i] = math.max(0.0, std.float(list[i])) / total;
+	relayout();
+}
+
+//Maximize (singleview.toggle_maximize): the area at index gets all of the room
+maximize_view(index) {
+	for(i = 0; i < sizes.size(); i++)
+		sizes[i] = i == index ? 1.0 : 0.0;
+	relayout();
+}
+
+//The share of the first area (0 - 1), as set_split sets it. The others share the rest as they did
+get_ratio() {
+	return sizes.size() > 0 ? sizes[0] : 1.0;
+}
+
+set_ratio(share) {
+	share = math.min(1.0, math.max(0.0, std.float(share)));
+	rest = 1.0 - sizes[0];
+	for(i = 1; i < sizes.size(); i++)
+		sizes[i] = rest > 0.0 ? sizes[i] / rest * (1.0 - share) : (1.0 - share) / (sizes.size() - 1);
+	sizes[0] = share;
+	relayout();
+}
+
+//Every area to its share, and a grip on every line between two of them
+relayout() {
+	start = 0.0;
+	for(i = 0; i < panes.size(); i++) {
+		end = i == panes.size() - 1 ? 1.0 : start + sizes[i];
+		pane = panes[i].pane;
+		if(side_by_side)
+			pane.anchor_top(0).anchor_bottom(0).anchor_left(start, "percent").anchor_right(1.0 - end, "percent");
+		else
+			pane.anchor_left(0).anchor_right(0).anchor_top(start, "percent").anchor_bottom(1.0 - end, "percent");
+		start = end;
+	}
+	if(grips.size() != panes.size() - 1 || !grips_in_place())
+		make_grips();
+}
+
+//The halves of every grip are still in the two panes they belong to (insert and remove change the neighbours)
+grips_in_place() {
+	for(i = 0; i < grips.size(); i++) {
+		if(grips[i].pane_a != panes[i].pane || grips[i].pane_b != panes[i + 1].pane)
+			return false;
+	}
+	return true;
+}
+
+// =========================================================================
+// Grips
+// =========================================================================
+
+free_grips() {
+	for(i = 0; i < grips.size(); i++) {
+		std.free(grips[i].a);
+		std.free(grips[i].b);
+	}
+	grips = [];
+	grip_state.index = -1;
+	grip_state.hovered = -1;
+}
+
+//Made again after every change of the areas: a half is made after the area in its pane, so it lies on top of it
+make_grips() {
+	free_grips();
+
+	for(i = 0; i < panes.size() - 1; i++) {
+		a = grip_half(panes[i].pane, i, false);
+		b = grip_half(panes[i + 1].pane, i, true);
+		grips.push_back([a = a.half, b = b.half, line_a = a.line, line_b = b.line, pane_a = panes[i].pane, pane_b = panes[i + 1].pane, lit = 0]);
+	}
+}
+
+//The half of grip "index" in pane: at its end (after = false) or at its start (after = true)
+grip_half(pane, index, after) {
+	half = pane.widget().overlay(true).cursor(side_by_side ? 4 : 5); //HResize / VResize
+	//The line stays a visible widget and only changes its colour: a press on it gives it the keyboard focus, and
+	//hiding a focused widget takes the focus from the whole window (the keys of the layout would stop working)
+	line = half.widget_solid().background_color(SPLIT_LINE_OFF).overlay(true);
+	if(side_by_side) {
+		half.anchor_top(0).anchor_bottom(0).fixed_width(SPLIT_GRIP_HALF);
+		line.anchor_top(0).anchor_bottom(0).fixed_width(1);
+		if(after) {
+			half.anchor_left(0);
+			line.anchor_left(0);
+		}
+		else {
+			half.anchor_right(0);
+			line.anchor_right(0);
+		}
+	}
+	else {
+		half.anchor_left(0).anchor_right(0).fixed_height(SPLIT_GRIP_HALF);
+		line.anchor_left(0).anchor_right(0).fixed_height(1);
+		if(after) {
+			half.anchor_top(0);
+			line.anchor_top(0);
+		}
+		else {
+			half.anchor_bottom(0);
+			line.anchor_bottom(0);
+		}
+	}
+
+	half.on_mouse_enter([index](pos, enter){
+		grip_state.hovered = enter ? index : (grip_state.hovered == index ? -1 : grip_state.hovered);
+		show_grip_lines();
+	});
+	half.on_mouse_button([index](pos, button, down, mods){
+		if(button != 0)
+			return false;
+		if(nanogui.show_mode())
+			return true; //show mode (#285): the layout is locked while performing
+		grip_state.index = down ? index : -1;
+		show_grip_lines();
+		return true;
+	});
+	half.on_mouse_drag([pane, index](pos, rel, button, mods){
+		if(grip_state.index != index)
+			return true;
+		//pos is in the pane: into the split, then the share
+		at = side_by_side ? (pos.x + pane.x()) / root.width() : (pos.y + pane.y()) / root.height();
+		move_grip(index, at);
+		return true;
+	});
+	return [half = half, line = line];
+}
+
+//The line of the grip under the mouse, or of the one being dragged
+show_grip_lines() {
+	for(i = 0; i < grips.size(); i++) {
+		shown = i == grip_state.index || (grip_state.index < 0 && i == grip_state.hovered);
+		if(grips[i].lit != (shown ? 1 : 0)) {
+			grips[i].lit = shown ? 1 : 0;
+			grips[i].line_a.background_color(shown ? SPLIT_LINE_HOT : SPLIT_LINE_OFF);
+			grips[i].line_b.background_color(shown ? SPLIT_LINE_HOT : SPLIT_LINE_OFF);
+		}
+	}
+}
+
+//Grip "index" to "at" (0 - 1 of the split): the two areas beside it share their room, each keeps SPLIT_MIN px
+move_grip(index, at) {
+	if(index < 0 || index + 1 >= sizes.size())
+		return;
+	start = 0.0;
+	for(i = 0; i < index; i++)
+		start += sizes[i];
+	end = start + sizes[index] + sizes[index + 1];
+
+	length = side_by_side ? root.width() : root.height();
+	keep = length > 0 ? SPLIT_MIN / length : 0.0;
+	at = math.max(start + keep, math.min(end - keep, at));
+	if(at < start || at > end)
+		return; //too small for two areas: it stays as it is
+
+	sizes[index] = at - start;
+	sizes[index + 1] = end - at;
+	relayout();
+}
+
+// =========================================================================
+// Save / load
+// =========================================================================
+
+//Called by the generator before this module goes (generator.free_module_content, #361): the managed globals of a
+//module are not always released with it, and everything they hold then stays alive
+on_free() {
+	//The widgets go with the window of the split; the areas are objects of their own and free what they hold
+	grips = [];
+	for(i = 0; i < panes.size(); i++)
+		std.free(panes[i].view);
+	panes = [];
+}
+
+save_state() {
+	views = [];
+	for(i = 0; i < panes.size(); i++)
+		views.push_back(panes[i].view.save_state());
+	return [
+		views = views,
+		sizes = sizes,
+	];
+}
+
+load_state(state) {
+	//Projects and presets from before #382 (view1 / view2) are brought to this format on load (engine/migrate, #386)
+	states = state.has("views") ? state.views : [];
+	shares = state.has("sizes") ? state.sizes : [];
+
+	ensure_views(states.size());
+	if(shares.size() == panes.size())
+		set_sizes(shares);
+
+	threads = [];
+	for(i = 0; i < states.size() && i < panes.size(); i++) {
+		view = panes[i].view;
+		view_state = states[i];
+		t = std.thread([view, view_state](){
+			view.load_state(view_state);
+		});
+		threads.push_back(t);
+	}
+	for(i = 0; i < threads.size(); i++)
+		threads[i].run();
+	for(i = 0; i < threads.size(); i++)
+		threads[i].join();
+}

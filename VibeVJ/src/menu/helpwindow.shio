@@ -1,0 +1,822 @@
+
+using eigen;
+
+HELP_DIR = "wiki";
+HELP_GLOSSARY = "wiki/glossary.json";
+HELP_GLOSSARY_PAGE = "Glossary"; //a page that is built from the glossary, not read from a file
+HELP_WHEEL = 96;                 //pixels a page moves per notch of the mouse wheel
+HELP_TIP_DELAY = 0.15;           //seconds the mouse rests on a link before its tooltip shows
+HELP_TIP_LENGTH = 260;           //letters of a part of the wiki that the tooltip of a link shows
+
+//The pages in reading order; files in wiki/ that are not listed come after them, by name
+HELP_ORDER = [
+	"Getting-Started", "The-Screen", "Generators", "Assets", "Linking", "Clipview", "CueList", "Timeline", "MIDI",
+	"Audio", "Video", "Output-and-Devices", "Settings", "Shortcuts-and-Tips", "Troubleshooting",
+];
+
+HELP_NESTED_INDENT = 26; //an item of a list below another item
+HELP_PAGE_WIDTH = 740; //tables and pictures are laid out for this width; text follows the width of the window
+HELP_TEXT = vec4f(0.86, 0.86, 0.88, 1.0);
+HELP_TEXT_DIM = vec4f(0.608, 0.608, 0.627, 1.0);
+HELP_TITLE = vec4f(0.96, 0.96, 0.97, 1.0);
+HELP_RULE = vec4f(1.0, 1.0, 1.0, 0.09);
+HELP_BLOCK = vec4f(0.086, 0.086, 0.094, 1.0);    //code and notes
+HELP_HEAD_ROW = vec4f(0.135, 0.135, 0.15, 1.0);  //the header row of a table
+HELP_CLEAR = vec4f(0.0, 0.0, 0.0, 0.0);
+
+//Where a link of a page leads: "Linking.md" -> "Linking", "Linking.md#make-a-link" -> "Linking#make-a-link",
+//"#make-a-link" stays (the same page). "" for a link that leads out of the wiki (a web address, a file elsewhere)
+help_link_target(target) {
+	if(target.starts("#"))
+		return target;
+	if(target.starts("http") || target.contains("/"))
+		return "";
+	dot = target.find(".md");
+	if(dot <= 0)
+		return "";
+	return target.substr(0, dot) + target.substr(dot + 3);
+}
+
+//The marks inside a line of markdown: only their text stays (**bold**, *italic*, `code`). A link into the wiki
+//becomes [[target|text]], which a label shows as a link (label.links); any other link keeps its text only
+help_marks(text) {
+	out = "";
+	rest = text;
+	for(true) {
+		mid = rest.find("](");
+		if(mid < 0)
+			break;
+		lb = rest.substr(0, mid).rfind("[");
+		rb = rest.find(")", mid);
+		if(lb < 0 || rb < 0)
+			break;
+
+		shown = rest.substr(lb + 1, mid - lb - 1);
+		target = help_link_target(rest.substr(mid + 2, rb - mid - 2));
+		out += rest.substr(0, lb) + (target != "" ? "[[" + target + "|" + shown + "]]" : shown);
+		rest = rest.substr(rb + 1);
+	}
+	out += rest;
+
+	out = out.replace("**", "").replace("`", "");
+	out.regex_replace_inplace(R"(\*([^*]+)\*)", "$1");
+	return out.replace("&lt;", "<").replace("&gt;", ">");
+}
+
+//Signs the font of the program does not have
+help_glyphs(text) {
+	return text.replace("⋯", "…").replace("✕", "×").replace("≡", "=").replace("⚙", "(gear)").replace("→", "->")
+		.replace("▾", "v").replace("⛶", "");
+}
+
+help_inline(text) {
+	return help_glyphs(help_marks(text));
+}
+
+//The text without its links: "see [[Linking|the page]]" -> "see the page"
+help_plain(text) {
+	out = text;
+	out.regex_replace_inplace(R"(\[\[[^\]|]*\|([^\]]*)\]\])", "$1");
+	out.regex_replace_inplace(R"(\[\[([^\]]*)\]\])", "$1");
+	return out;
+}
+
+//The name a heading has in a link ("#moving-a-view"), made the way GitHub makes it: small letters, the signs
+//dropped, a "-" for every blank
+help_slug(text) {
+	return text.lowercase().removecharsexcept("abcdefghijklmnopqrstuvwxyz0123456789 -_").replace(" ", "-");
+}
+
+//true for "1. text", "12. text"
+help_is_numbered(trimmed) {
+	dot = trimmed.find(". ");
+	if(dot != 1 && dot != 2)
+		return false;
+	return "0123456789".contains(trimmed.substr(0, 1));
+}
+
+help_is_item(trimmed) {
+	return trimmed.starts("- ") || trimmed.starts("* ") || help_is_numbered(trimmed);
+}
+
+help_is_table_rule(trimmed) {
+	return trimmed.starts("|--") || trimmed.starts("| --") || trimmed.starts("|:-") || trimmed.starts("| :-");
+}
+
+//A wiki page as a list of blocks, in order:
+//  [kind="h", level=, text=, slug=]     a heading; slug: its name in a link
+//  [kind="p", text=]                    a paragraph (its lines joined)
+//  [kind="li", text=, mark=, level=]    an item of a list
+//  [kind="table", rows=, header=]       rows of cells; header: the first row is the header
+//  [kind="img", path=, alt=]            a picture or an animated GIF
+//  [kind="code", text=]                 a block of code
+//  [kind="quote", text=]                a note
+//  [kind="rule"]
+//Text may hold links as [[target|text]] (help_marks)
+help_blocks(markdown) {
+	lines = markdown.replace("\r", "").split("\n");
+	blocks = [];
+	para = "";
+	total = lines.size();
+
+	for(i = 0; i < total; i++) {
+		line = lines[i];
+		trimmed = line.trim();
+
+		//A block of code runs to the line that closes it
+		if(trimmed.starts("```")) {
+			if(para != "") {
+				blocks.push_back([kind = "p", text = help_inline(para)]);
+				para = "";
+			}
+			code = "";
+			i++;
+			for(i < total && !lines[i].trim().starts("```")) {
+				code += (code == "" ? "" : "\n") + lines[i];
+				i++;
+			}
+			blocks.push_back([kind = "code", text = code]);
+			continue;
+		}
+
+		//Everything but a plain line of text ends the paragraph before it
+		plain = trimmed != "" && !trimmed.starts("#") && !trimmed.starts("![") && !trimmed.starts(">")
+			&& !trimmed.starts("|") && !help_is_item(trimmed) && trimmed != "---";
+		if(!plain && para != "") {
+			blocks.push_back([kind = "p", text = help_inline(para)]);
+			para = "";
+		}
+
+		if(trimmed == "")
+			continue;
+
+		if(plain) {
+			para += (para == "" ? "" : " ") + trimmed;
+			continue;
+		}
+
+		if(trimmed.starts("#")) {
+			level = 1;
+			if(trimmed.starts("### "))
+				level = 3;
+			else if(trimmed.starts("## "))
+				level = 2;
+			title = help_plain(help_marks(trimmed.substr(level + 1).trim()));
+			blocks.push_back([kind = "h", level = level, text = help_glyphs(title), slug = help_slug(title)]);
+			continue;
+		}
+
+		if(trimmed == "---") {
+			blocks.push_back([kind = "rule"]);
+			continue;
+		}
+
+		if(trimmed.starts("![")) {
+			mid = trimmed.find("](");
+			rb = trimmed.find(")", mid);
+			if(mid > 0 && rb > mid)
+				blocks.push_back([kind = "img", alt = trimmed.substr(2, mid - 2), path = trimmed.substr(mid + 2, rb - mid - 2)]);
+			continue;
+		}
+
+		if(trimmed.starts(">")) {
+			quote = trimmed.substr(1).trim();
+			for(i + 1 < total && lines[i + 1].trim().starts(">")) {
+				i++;
+				quote += " " + lines[i].trim().substr(1).trim();
+			}
+			//Notes for the authors of the wiki are not for the reader
+			if(quote.starts("Screenshot to"))
+				continue;
+			blocks.push_back([kind = "quote", text = help_inline(quote)]);
+			continue;
+		}
+
+		if(trimmed.starts("|")) {
+			rows = [];
+			header = false;
+			i--;
+			for(i + 1 < total && lines[i + 1].trim().starts("|")) {
+				i++;
+				row_line = lines[i].trim();
+				if(help_is_table_rule(row_line)) {
+					header = rows.size() == 1;
+					continue;
+				}
+				//"\|" is a "|" inside a cell
+				parts = row_line.replace(R"(\|)", "&#124;").split("|");
+				cells = [];
+				//The line starts and ends with "|": the first and the last part are empty
+				for(c = 1; c < parts.size() - 1; c++)
+					cells.push_back(help_inline(parts[c].trim().replace("&#124;", "|")));
+				rows.push_back(cells);
+			}
+			blocks.push_back([kind = "table", rows = rows, header = header]);
+			continue;
+		}
+
+		//An item of a list; the lines below it that are indented belong to it
+		mark = "•";
+		text = trimmed.substr(2);
+		if(help_is_numbered(trimmed)) {
+			dot = trimmed.find(". ");
+			mark = trimmed.substr(0, dot + 1);
+			text = trimmed.substr(dot + 2);
+		}
+		indent = line.find(trimmed.substr(0, 1));
+		for(i + 1 < total) {
+			below = lines[i + 1];
+			next_trimmed = below.trim();
+			if(next_trimmed == "" || !below.starts("  ") || help_is_item(next_trimmed) || next_trimmed.starts("|")
+				|| next_trimmed.starts("```") || next_trimmed.starts("!["))
+				break;
+			i++;
+			text += " " + next_trimmed;
+		}
+		blocks.push_back([kind = "li", mark = mark, level = indent >= 2 ? 1 : 0, text = help_inline(text)]);
+	}
+
+	if(para != "")
+		blocks.push_back([kind = "p", text = help_inline(para)]);
+	return blocks;
+}
+
+//The wiki in the program (#357): a window with the pages of wiki/ listed at its side (the window system of the
+//settings, toolwindow).
+//- The ? button of the top bar and "Help…" in the menu open it where it was. F1 opens it on the page for the part
+//  of the screen the mouse is in, or where the tooltip under the mouse leads (#358).
+//- A page is read when it is first shown and built from widgets: headings, paragraphs and lists as text that wraps,
+//  tables with columns, pictures and animated GIFs (wiki/media), notes and code in a box.
+//- A link to another page or to a heading ("Linking.md#make-a-link", "#make-a-link") is a link in the text. A click
+//  goes there; the arrow in the header of the window goes back.
+//- A link shows a tooltip while the mouse is on it: the term of the glossary with its name, or the heading and the
+//  first lines of the part it leads to.
+//- The page "Glossary" is built from wiki/glossary.json, the terms of the tooltips.
+//- Tooltips lead here: [[wiki:Page#heading]] in a tooltip is a link, and F1 follows it (screen.on_tooltip_link).
+class helpwindow
+{
+	managed tool = None;
+	entries = [];    //[name=, content=, loaded=, anchors=], in the order of the list. anchors: slug -> heading
+	glossary = None; //wiki/glossary.json: key -> [title=, text=, page=]
+	trail = [];      //where the links that were followed left from: [index=, pos=], for "back"
+	summaries = None; //"Page" or "Page#heading" -> its heading and first lines, for the tooltips of links
+	back_btn = None;
+
+	//A click on a picture shows it big, in a window of its own
+	managed viewer = None;
+	viewer_picture = None;
+	pressed_picture = ""; //the picture the mouse button went down on
+	engine = None;
+
+	__init__(engine) {
+		this.engine = engine;
+		tool = toolwindow(engine, "Help", 1000, 720);
+		tool.side_nav(tool.window);
+
+		back_btn = tool.window.button_panel().button("").icon(nanogui.icon("arrow_left"))
+			.tooltip("Back to where you followed the last link")
+			.anchor_top(0).anchor_bottom(0).anchor_left(0).fixed_width(25).enabled(false);
+		back_btn.on_click([this](){
+			this.back();
+		});
+
+		load_glossary();
+
+		names = [];
+		for(i = 0; i < HELP_ORDER.size(); i++) {
+			if(fileio.exists(HELP_DIR + "/" + HELP_ORDER[i] + ".md"))
+				names.push_back(HELP_ORDER[i]);
+		}
+		try {
+			files = fileio.files(HELP_DIR, false);
+			for(i = 0; i < files.size(); i++) {
+				file = fileio.file_name(files[i]);
+				if(!file.ends(".md") || file == "README.md")
+					continue;
+				name = fileio.pure_name(file);
+				listed = false;
+				for(k = 0; k < names.size(); k++) {
+					if(names[k] == name)
+						listed = true;
+				}
+				if(!listed)
+					names.push_back(name);
+			}
+		}
+		catch(e) {}
+		if(glossary)
+			names.push_back(HELP_GLOSSARY_PAGE);
+
+		for(i = 0; i < names.size(); i++) {
+			content = tool.add_page(names[i].replace("-", " "));
+			tool.pages[i].outer.scroll_step_pixels(HELP_WHEEL);
+			entries.push_back([name = names[i], content = content, loaded = false, anchors = []]);
+		}
+
+		//A page is built when it first shows (open builds the first one)
+		tool.on_page = [this](index){
+			this.load(index);
+		};
+
+		engine.env.open_help = [this](page){
+			this.open(page);
+		};
+
+		//A link in a tooltip that leads into the wiki, by a click on it or by F1
+		nanogui.tooltip_link_label("More in the wiki (F1)");
+		engine.screen.on_tooltip_link([this](target){
+			if(target.starts("wiki:"))
+				this.open(target);
+		});
+	}
+
+	//The terms of wiki/glossary.json for the tooltips (#358): a tooltip writes [[area]] or [[area|areas]], the term
+	//is shown as a link there and has a tooltip of its own (nanogui, nested tooltips). A term that names its place
+	//in the wiki (page) ends with a link to it
+	load_glossary() {
+		try {
+			if(!fileio.exists(HELP_GLOSSARY))
+				return;
+			terms = fileio.read_json(HELP_GLOSSARY);
+			for(i = 0; i < terms.size(); i++) {
+				term = terms[i];
+				text = term.text;
+				if(term.page)
+					text += "\n[[wiki:" + term.page + "]]";
+				nanogui.tooltip_term(terms.key(i), text, term.title ?? terms.key(i));
+			}
+			glossary = terms;
+		}
+		catch(e) {
+			std.error("Cannot read " + HELP_GLOSSARY);
+		}
+	}
+
+	load(index) {
+		if(index < 0 || index >= entries.size() || entries[index].loaded)
+			return;
+		entries[index].loaded = true;
+		content = entries[index].content;
+		if(entries[index].name == HELP_GLOSSARY_PAGE) {
+			build_glossary(index);
+			return;
+		}
+		try {
+			blocks = help_blocks(fileio.read_string(HELP_DIR + "/" + entries[index].name + ".md"));
+			for(i = 0; i < blocks.size(); i++)
+				add_block(index, blocks[i]);
+			content.label("").fixed_height(24);
+		}
+		catch(e) {
+			content.label("This page could not be read.").text_color(HELP_TEXT_DIM);
+		}
+	}
+
+	index_of(page) {
+		for(i = 0; i < entries.size(); i++) {
+			if(entries[i].name == page)
+				return i;
+		}
+		return -1;
+	}
+
+	//Shows the window. target: "" (where it was), a page ("The-Screen"), a heading of a page
+	//("The-Screen#moving-a-view"), also as the link of a tooltip ("wiki:The-Screen#moving-a-view")
+	open(target = "") {
+		if(target.starts("wiki:"))
+			target = target.substr(5);
+		was_open = tool.visible();
+		load(tool.shown_page);
+		tool.show();
+		if(target != "")
+			follow(target, "", was_open);
+	}
+
+	// =========================================================================
+	// Links
+	// =========================================================================
+
+	//Goes where a link leads. target: "Page", "Page#heading", "#heading" (on the page "from"), or a term of the
+	//glossary. keep: the place that is left can be reached again with "back"
+	follow(target, from = "", keep = true) {
+		page = target;
+		anchor = "";
+		hash = target.find("#");
+		if(hash >= 0) {
+			page = target.substr(0, hash);
+			anchor = target.substr(hash + 1);
+		}
+		if(page == "")
+			page = from;
+		if(index_of(page) < 0 && glossary && glossary.has(page)) {
+			anchor = "term-" + help_slug(page);
+			page = HELP_GLOSSARY_PAGE;
+		}
+		index = index_of(page);
+		if(index < 0)
+			return;
+
+		pressed_picture = "";
+		if(keep) {
+			trail.push_back([index = tool.shown_page, pos = tool.pages[tool.shown_page].outer.scroll_pixels()]);
+			if(trail.size() > 50)
+				trail.erase(0);
+			back_btn.enabled(true);
+		}
+
+		tool.show_page(index);
+		outer = tool.pages[index].outer;
+		if(anchor == "") {
+			outer.scroll(0);
+			return;
+		}
+		//A page that was just built has the places of its headings after the next layout
+		std.sleep(0);
+		std.sleep(0);
+		anchors = entries[index].anchors;
+		if(anchors.has(anchor))
+			outer.scroll_pixels(anchors[anchor].y() - 6);
+		else
+			outer.scroll(0);
+	}
+
+	back() {
+		if(trail.size() == 0)
+			return;
+		step = trail[trail.size() - 1];
+		trail.erase(trail.size() - 1);
+		back_btn.enabled(trail.size() > 0);
+		tool.show_page(step.index);
+		std.sleep(0);
+		std.sleep(0);
+		tool.pages[step.index].outer.scroll_pixels(step.pos);
+	}
+
+	//The heading and the first lines of every part of the wiki, read once: summaries["Linking#make-a-link"]
+	build_summaries() {
+		if(summaries)
+			return;
+		summaries = [];
+		for(n = 0; n < entries.size(); n++) {
+			name = entries[n].name;
+			if(name == HELP_GLOSSARY_PAGE)
+				continue;
+			try {
+				lines = fileio.read_string(HELP_DIR + "/" + name + ".md").replace("\r", "").split("\n");
+				place = "";
+				title = "";
+				text = "";
+				open_text = false; //the first lines of the part are still being read
+				for(i = 0; i <= lines.size(); i++) {
+					trimmed = i < lines.size() ? lines[i].trim() : "#";
+					if(trimmed.starts("#")) {
+						//The part before this heading is complete
+						if(place != "") {
+							if(std.len(text) > HELP_TIP_LENGTH) {
+								cut = text.substr(0, HELP_TIP_LENGTH).rfind(" ");
+								text = text.substr(0, cut > 0 ? cut : HELP_TIP_LENGTH) + " …";
+							}
+							summaries[place] = "# " + title + (text != "" ? "\n" + text : "");
+						}
+						if(i >= lines.size())
+							break;
+						blank = trimmed.find(" ");
+						title = help_plain(help_marks(trimmed.substr(blank + 1).trim()));
+						place = blank == 1 ? name : name + "#" + help_slug(title);
+						title = help_glyphs(title);
+						text = "";
+						open_text = true;
+						continue;
+					}
+					if(!open_text)
+						continue;
+					if(trimmed == "") {
+						open_text = text == "";
+						continue;
+					}
+					//Pictures, tables, notes and code are no text for a tooltip
+					if(trimmed.starts("![") || trimmed.starts("|") || trimmed.starts(">") || trimmed.starts("```"))
+						continue;
+					if(help_is_item(trimmed)) {
+						//A part that starts with a list: its first item
+						if(text == "") {
+							dot = help_is_numbered(trimmed) ? trimmed.find(". ") + 2 : 2;
+							text = help_plain(help_inline(trimmed.substr(dot)));
+						}
+						open_text = false;
+						continue;
+					}
+					text += (text == "" ? "" : " ") + help_plain(help_inline(trimmed));
+				}
+			}
+			catch(e) {}
+		}
+	}
+
+	//What a link shows while the mouse is on it: the term of the glossary that has its name, or the heading and the
+	//first lines of the part of the wiki it leads to. shown: the text of the link, from: the page it is on
+	link_tip(target, shown, from) {
+		name = shown.lowercase();
+		if(glossary && glossary.has(name)) {
+			term = glossary[name];
+			return "# " + (term.title ?? shown) + "\n" + help_glyphs(term.text);
+		}
+		if(glossary && glossary.has(target)) {
+			term = glossary[target];
+			return "# " + (term.title ?? target) + "\n" + help_glyphs(term.text);
+		}
+		build_summaries();
+		place = target.starts("#") ? from + target : target;
+		if(summaries.has(place))
+			return summaries[place];
+		return "";
+	}
+
+	//What a link to a place in the wiki is called: "The-Screen#moving-a-view" -> "The Screen: moving a view"
+	place_name(target) {
+		hash = target.find("#");
+		if(hash < 0)
+			return target.replace("-", " ");
+		return target.substr(0, hash).replace("-", " ") + ": " + target.substr(hash + 1).replace("-", " ");
+	}
+
+	//The page "Glossary": every term of the tooltips with its text, and where the wiki says more about it
+	build_glossary(index) {
+		content = entries[index].content;
+		content.label("Glossary").font_size(26).bold(true).wrap(true).text_color(HELP_TITLE);
+		space(content, 8);
+		add_text(index, content, "The words VibeVJ uses for its parts. In a tooltip such a word is shown as a link: rest the mouse on the tooltip until it locks, then on the word, and this explanation opens. F1 on a tooltip opens the wiki at the place the tooltip is about.", 15, HELP_TEXT);
+		space(content, 8);
+
+		for(i = 0; i < glossary.size(); i++) {
+			key = glossary.key(i);
+			term = glossary[i];
+			space(content, 10);
+			head = content.label(term.title ?? key).font_size(16).bold(true).wrap(true).text_color(HELP_TITLE);
+			entries[index].anchors["term-" + help_slug(key)] = head;
+			space(content, 2);
+			add_text(index, content, help_glyphs(term.text), 15, HELP_TEXT);
+			if(term.page)
+				add_text(index, content, "[[" + term.page + "|Wiki: " + place_name(term.page) + "]]", 14, HELP_TEXT_DIM);
+		}
+		content.label("").fixed_height(24);
+	}
+
+	// =========================================================================
+	// A page from its blocks
+	// =========================================================================
+
+	space(content, height) {
+		content.label("").fixed_height(height);
+	}
+
+	rule(content) {
+		content.widget_solid().background_color(HELP_RULE).fixed_height(1);
+	}
+
+	//Text that wraps. Links in it ([[target|text]]) are followed with a click
+	add_text(index, parent, text, font, color) {
+		label = parent.label(text).font_size(font).wrap(true).text_color(color);
+		if(text.contains("[[")) {
+			page = entries[index].name;
+			label.links(true);
+			label.on_link([this, page](target){
+				this.follow(target, page);
+			});
+
+			//Every link has a tooltip
+			label.tooltip_delay(HELP_TIP_DELAY);
+			rest = text;
+			for(true) {
+				a = rest.find("[[");
+				b = a < 0 ? -1 : rest.find("]]", a);
+				if(b < 0)
+					break;
+				inner = rest.substr(a + 2, b - a - 2);
+				bar = inner.find("|");
+				target = bar >= 0 ? inner.substr(0, bar) : inner;
+				tip = link_tip(target, bar >= 0 ? inner.substr(bar + 1) : inner, page);
+				if(tip != "")
+					label.link_tip(target, tip);
+				rest = rest.substr(b + 2);
+			}
+		}
+		return label;
+	}
+
+	add_block(index, block) {
+		content = entries[index].content;
+		kind = block.kind;
+
+		if(kind == "h") {
+			head = None;
+			if(block.level == 1) {
+				head = content.label(block.text).font_size(26).bold(true).wrap(true).text_color(HELP_TITLE);
+				space(content, 8);
+			}
+			else if(block.level == 2) {
+				space(content, 18);
+				head = content.label(block.text).font_size(20).bold(true).wrap(true).text_color(HELP_TITLE);
+				space(content, 4);
+				rule(content);
+				space(content, 8);
+			}
+			else {
+				space(content, 10);
+				head = content.label(block.text).font_size(16).bold(true).wrap(true).text_color(HELP_TITLE);
+				space(content, 2);
+			}
+			//Links lead to it by its name
+			if(block.slug != "")
+				entries[index].anchors[block.slug] = head;
+			return;
+		}
+
+		if(kind == "p") {
+			add_text(index, content, block.text, 15, HELP_TEXT);
+			space(content, 8);
+			return;
+		}
+
+		if(kind == "li") {
+			//An item that is only a link (a "See also" list) is a button
+			text = block.text;
+			if(text.starts("[[") && text.ends("]]") && text.substr(2).find("[[") < 0 && text.contains("|")) {
+				inner = text.substr(2, std.len(text) - 4);
+				bar = inner.find("|");
+				target = inner.substr(0, bar);
+				page = entries[index].name;
+				btn = content.button(inner.substr(bar + 1)).icon(nanogui.icon("arrow_right")).alignment("left").transparent(true)
+					.fixed_height(26).tooltip(link_tip(target, inner.substr(bar + 1), page)).tooltip_delay(HELP_TIP_DELAY);
+				btn.on_click([this, target, page](){
+					this.follow(target, page);
+				});
+				return;
+			}
+			//An item below an item is indented by a margin of its own: blanks in front of the text were lost where the
+			//label broke its lines (#378)
+			parent = content;
+			if(block.level > 0)
+				parent = content.widget().layout(nanogui.layout_vertical().padding(vec4f(HELP_NESTED_INDENT, 0, 0, 0)));
+			add_text(index, parent, block.mark + "  " + text, 15, HELP_TEXT);
+			space(content, 3);
+			return;
+		}
+
+		if(kind == "quote") {
+			box = content.widget_solid().background_color(HELP_BLOCK);
+			add_text(index, box, block.text, 14, HELP_TEXT_DIM).fixed_width(HELP_PAGE_WIDTH - 24);
+			space(content, 8);
+			return;
+		}
+
+		if(kind == "code") {
+			box = content.widget_solid().background_color(HELP_BLOCK);
+			box.label(help_glyphs(block.text)).font_size(14).wrap(true).text_color(HELP_TEXT).fixed_width(HELP_PAGE_WIDTH - 24);
+			space(content, 8);
+			return;
+		}
+
+		if(kind == "rule") {
+			space(content, 6);
+			rule(content);
+			space(content, 6);
+			return;
+		}
+
+		if(kind == "img") {
+			add_picture(content, block);
+			return;
+		}
+
+		if(kind == "table")
+			add_table(index, block);
+	}
+
+	//A picture, or an animated GIF, not wider than the text. Its text below it
+	add_picture(content, block) {
+		path = HELP_DIR + "/" + block.path;
+		if(!fileio.exists(path))
+			return;
+		picture = content.image(path);
+		w = picture.width();
+		h = picture.height();
+		if(w <= 0 || h <= 0)
+			return;
+		if(w > HELP_PAGE_WIDTH) {
+			h = std.int(h * HELP_PAGE_WIDTH / w);
+			w = HELP_PAGE_WIDTH;
+		}
+		picture.fixed_size(vec2f(w, h));
+		picture.magnifier(true);
+		//Only a click that began on the picture: a click on a link moves the page, and its release may land here
+		picture.on_mouse_button([this, path](pos, btn, down, mods){
+			if(btn == 0 && down)
+				this.pressed_picture = path;
+			else if(btn == 0 && this.pressed_picture == path) {
+				this.pressed_picture = "";
+				this.show_big(path);
+			}
+			return true;
+		});
+		if(block.alt != "")
+			content.label(help_plain(help_inline(block.alt))).font_size(13).wrap(true).text_color(HELP_TEXT_DIM);
+		space(content, 12);
+	}
+
+	//The picture in a window of its own, as big as the screen allows (never bigger than the picture itself). A click
+	//on it, its cross or Esc closes it
+	show_big(path) {
+		if(!viewer) {
+			viewer = toolwindow(engine, "Picture", 800, 600);
+			viewer_picture = viewer.window.image("").anchor(0);
+			viewer_picture.tooltip("Click to close");
+			viewer_picture.on_mouse_button([this](pos, btn, down, mods){
+				if(btn == 0 && !down)
+					this.viewer.hide();
+				return true;
+			});
+		}
+		viewer_picture.filename(path);
+		w = viewer_picture.width();
+		h = viewer_picture.height();
+		if(w <= 0 || h <= 0)
+			return;
+
+		//Fit the screen, with some room around the window
+		room_w = engine.screen.width() - 120;
+		room_h = engine.screen.height() - 160;
+		if(w > room_w) {
+			h = std.int(h * room_w / w);
+			w = room_w;
+		}
+		if(h > room_h) {
+			w = std.int(w * room_h / h);
+			h = room_h;
+		}
+		viewer.resize(w, h + viewer.window.header_height());
+		viewer.show();
+	}
+
+	//A table with columns. The last column gets most of the width: it holds the explanation. A row is as high as
+	//its longest cell needs (estimated from the number of letters: the cells wrap)
+	add_table(index, block) {
+		content = entries[index].content;
+		rows = block.rows;
+		if(rows.size() == 0)
+			return;
+
+		columns = 0;
+		for(r = 0; r < rows.size(); r++) {
+			if(rows[r].size() > columns)
+				columns = rows[r].size();
+		}
+		if(columns == 0)
+			return;
+
+		shares = [];
+		if(columns == 1)
+			shares = [1.0];
+		else if(columns == 2)
+			shares = [0.30, 0.70];
+		else if(columns == 3)
+			shares = [0.22, 0.24, 0.54];
+		else {
+			for(c = 0; c < columns; c++)
+				shares.push_back(1.0 / columns);
+		}
+
+		font = 14;
+		pad = 8;
+		for(r = 0; r < rows.size(); r++) {
+			cells = rows[r];
+			is_header = block.header && r == 0;
+
+			//How many lines the longest cell of the row takes
+			most_lines = 1;
+			for(c = 0; c < cells.size() && c < columns; c++) {
+				cell_w = HELP_PAGE_WIDTH * shares[c] - pad * 2;
+				per_line = std.int(cell_w / (font * 0.54));
+				if(per_line < 4)
+					per_line = 4;
+				cell_lines = std.int((std.len(help_plain(cells[c])) + per_line - 1) / per_line);
+				if(cell_lines > most_lines)
+					most_lines = cell_lines;
+			}
+			row_h = std.int(most_lines * font * 1.3 + pad * 2);
+
+			row = content.widget_solid().background_color(is_header ? HELP_HEAD_ROW : HELP_CLEAR).fixed_height(row_h);
+			x = 0;
+			for(c = 0; c < cells.size() && c < columns; c++) {
+				col_w = HELP_PAGE_WIDTH * shares[c];
+				cell = add_text(index, row, cells[c], font, (is_header || c == 0) ? HELP_TITLE : HELP_TEXT)
+					.position(vec2f(x + pad, pad)).fixed_size(vec2f(col_w - pad * 2, row_h - pad));
+				if(is_header)
+					cell.bold(true);
+				x += col_w;
+			}
+			rule(content);
+		}
+		space(content, 10);
+	}
+}
