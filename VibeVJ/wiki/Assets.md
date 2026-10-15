@@ -40,6 +40,7 @@ How a generator window works is on [Generators](Generators.md). Your own setting
 | `Mapping` | *MapLab*, *LEDMapper*, *MaskTransform*. See [Mapping](Output-and-Devices.md#mapping). |
 | `Fixtures`, `FixturesEffects` | Lamps and effects over them. See [Fixtures](Output-and-Devices.md#fixtures). |
 | `Textures`, `Videos` | Pictures and [video files](Video.md). Each opens as a generator with an *OUT* port. |
+| `FFGL` | FFGL plugins you add yourself (`.dll`, `.bundle`, `.so`). See [FFGL plugins](#ffgl-plugins). |
 
 ## Generators › Math
 
@@ -60,6 +61,7 @@ in step with the [timeline](Timeline.md).
 
 | Generator | What it is for |
 |---|---|
+| *ShowControls* | Your own surface of faders, knobs, buttons and toggles for a show. See [Show controls](#show-controls). |
 | *XYPad* | A pad you drag on: X and Y. |
 | *XYPathPad*, *CurvePad* | A point that walks along a path, free or on the beat. |
 | *XYPositions* | A list of positions that glide into one X / Y output. |
@@ -71,6 +73,38 @@ in step with the [timeline](Timeline.md).
 | *value_text* | Shows a value as text. |
 | *textbox* | A note. It is saved with the project. |
 | *Chat* | The AI chat of the sidebar as a window. |
+
+### Show controls
+
+*ShowControls* (`Generators` › `Utility`) is a surface you lay out yourself, for the controls you play during a show.
+
+1. Drag *ShowControls* into an area or a Patchview. It starts in edit mode with one fader.
+2. *Edit* on: *+ Fader*, *+ Knob*, *+ Button* (on while it is held) and *+ Toggle* (on and off) add a control. Drag a
+   control to move it, drag its lower right corner to resize it, × removes it. Everything snaps to a 10 px grid.
+3. *Edit* off: the controls are played. A fader and a knob go up and down with the mouse (Shift: finer), a double
+   click types a value.
+
+Each control is a normal control of the program: [link](Linking.md#make-a-link) it, map it to MIDI, rename it in its
+options (tab *Main*, the name field), set its range and envelope there. Several surfaces make a show UI: put them into
+the areas or tabs of a view tab, or as windows into a Patchview. The surface, its controls and their values are saved
+with the project.
+
+## FFGL plugins
+
+FFGL plugins, for example the ones made for Resolume, run in VibeVJ like a shader. Put the plugin into the folder
+`VibeVJ/assets/FFGL/` (`.dll` on Windows, `.bundle` on macOS, `.so` on Linux); it shows in the *Assets* tab under
+`FFGL`.
+
+1. Drag the plugin into a Patchview or an area, or onto a clip of the [Clipview](Clipview.md) to stack it as an effect.
+2. Its window is the one of a shader: preview, *OUT*, and in *Settings* and *Outputs* the render size, Spout, NDI and
+   the display.
+3. The section *FFGL* in the *Control* tab holds its parameters as controls: sliders with the range the plugin gives,
+   buttons, lists and text fields. Link them and map them to MIDI like any control.
+4. An effect has the port *In 1* (a mixer also *In 2*): link a picture into it. In a clip or in the effects of a MapLab
+   output it gets the picture before it by itself.
+
+The time and the beat of the timeline go to the plugin. Only FFGL 2 plugins load (Resolume 7 and later); an older one
+says so in its window.
 
 ## Generators › Audio and Network
 

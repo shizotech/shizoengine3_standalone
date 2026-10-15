@@ -17,18 +17,20 @@ the timeline area. You design most of the screen yourself, by splitting it into 
 
 ## The program window
 
-VibeVJ runs without the frame of Windows or Linux, so it brings its own:
+VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it brings its own:
 
 - **The buttons** sit at the top right, on the top bar. From left to right the window gets bigger: *Minimize*,
   *Maximize*, *Full screen*, and *Close* in the corner.
 - **Maximize** fills the screen but leaves the taskbar free, and turns into *Restore* while the window is maximized.
-- **Full screen** (Windows and Linux): the window fills the whole monitor and covers the taskbar or panel,
+- **Full screen**: the window fills the whole monitor and covers the taskbar or panel,
   which is what you want for a show or on a small screen. The button or **F11** switch it on, and again lead back to
   where the window was before (maximized or its own size). *Maximize* also leads out of it.
   - VibeVJ starts this way. On Windows you also get there by dragging a tab bar to the top of the screen, and out of it
     by dragging a tab bar away from the top.
   - On Linux the window manager does the full screen, so its own keys or menu for it work too, and the buttons follow.
   - On a Wayland desktop VibeVJ runs through XWayland, and the full screen works the same way.
+  - On a Mac it is the full screen of macOS: VibeVJ moves into a Space of its own, the menu bar and the Dock hide,
+    Cmd + Tab and the swipe between Spaces keep working. **Ctrl + Cmd + F** switches it too.
 - **Close** (✕) works like *Exit* in the menu: a project with a name is saved and VibeVJ quits, an unnamed project
   first asks "Save the new project before quitting?". In show mode it does nothing, so a stray click does not end the
   show.
@@ -251,7 +253,8 @@ the drop lands:
 ### View windows
 
 A view tab can move into a window of its own, for example onto a second monitor: the clips on one screen, the
-Patchview or the mapping on the other.
+Patchview or the mapping on the other. This works on Windows and Linux, not yet on a Mac: there the menu item is missing,
+and a project saved with view windows opens their views in their tabs.
 
 - **Open:** right-click the view tab in the top bar › *Open in own window*. The views go into the new window as they
   are, with their state, links and MIDI mappings. Nothing is reloaded and the output does not stop.

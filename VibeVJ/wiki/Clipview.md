@@ -30,6 +30,7 @@ Layer 1 is the top row and gives the final picture. Each layer lays its live cli
 
 | Control | What it does |
 |---|---|
+| Blend mode (above the picture) | How the layer is laid over the layers below: *No Blend*, *Add*, *Add Mask*, *Mix*, *Multiply*, *MultiplyInput*, or a chroma key on red, green or blue. The same setting as *LayerBlend* in the *Layer* window. |
 | *Master* | Brightness of the whole layer. 1 = full (the start value), 0 = black. |
 | *Mix* | How strongly the clip of the layer is blended over the layers below. Starts at 0.5. What it does depends on the blend mode. |
 | *Transition* | How long the fade to a new clip takes, in seconds, up to 60. 0 = a hard cut. |
@@ -37,11 +38,12 @@ Layer 1 is the top row and gives the final picture. Each layer lays its live cli
 *Transition* counts seconds, whatever the tempo: *Transition* 4 fades for four seconds. Lower it during a fade and the
 fade gets shorter.
 
+A layer stays in its row: its name tag selects it, it is not dragged into the grid like a clip.
+
 Click the name tag of a layer to select it. The *Layer* window then shows:
 
-- **The stack** at its left: the entry *LayerBlend*. It sets how the layer is laid over the ones below: *No Blend*,
-  *Add*, *Add Mask*, *Mix*, *Multiply*, *MultiplyInput*, or a chroma key on red, green or blue. With *No Blend*, *Mix*
-  has no effect.
+- **The stack** at its left: the entry *LayerBlend*. Its *Controls* hold the blend mode of the layer, the same one as
+  in the layer cell. With *No Blend*, *Mix* has no effect.
 - **The section *Layer Settings*:**
 
 | Setting | What it does |

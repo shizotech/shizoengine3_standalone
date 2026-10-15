@@ -88,7 +88,8 @@ changes it for VibeVJ alone:
 3. Start VibeVJ again.
 
 Useful on a 4K screen under Linux without display scaling (pick *150 %* or *200 %*), or when you stand far from the
-screen. It works on Windows and on Linux with X11; on Wayland and macOS the scale of the system alone applies.
+screen. It works the same on Windows, Linux and macOS: on a Mac the window keeps its size and everything in it is
+drawn bigger or smaller, still sharp on a Retina screen.
 
 ### Calm notches
 

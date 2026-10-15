@@ -14,6 +14,10 @@ VibeVJ decodes video with FFmpeg. On Windows the FFmpeg libraries (`avformat-60.
 VibeVJ looks for them in this order: the folder named in the environment variable `SHZ_FFMPEG_DIR`, the folder of
 `shzmodule_nanogui.dll`, its `ffmpeg` folder, then the system path.
 
+On Linux VibeVJ needs FFmpeg 6 (`libavformat.so.60`; on Ubuntu 24.04 the package `libavformat60`). On a Mac, install it with Homebrew:
+`brew install ffmpeg@6`. VibeVJ finds it there by itself; the plain `ffmpeg` formula is a newer version that does not
+fit.
+
 ## Use a video
 
 1. Open the *Assets* tab and find the file (`.mp4 .mov .m4v .mkv .webm .avi .mxf .mpg .mpeg .ts .wmv`).

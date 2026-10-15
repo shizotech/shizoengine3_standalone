@@ -11,6 +11,7 @@ that show or shape a value.
 
 | Component | Description |
 |-----------|-------------|
+| **ShowControls.asset** | A surface of faders, knobs, buttons and toggles laid out by hand (edit mode), for show UIs (#428) |
 | **XYPad.asset** | Two sliders (X, Y) set from one pad |
 | **XYPathPad.asset** | Points on a pad form a path; a point travels along it at an even speed |
 | **XYPositions.asset** | A list of X/Y positions; click one to send it |

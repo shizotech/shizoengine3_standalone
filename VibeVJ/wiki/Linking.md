@@ -192,6 +192,8 @@ A greyed-out control has no grip dots on its notches and takes no links.
   generator) and shows its value as it changes. Several links of one row to the same place share a card with their
   number. Where there is less room the card is a narrow tag of one line, and where there is none at all a small
   arrow at the notch.
+- **No cards inside a view's own parts.** A link to a control that a generator keeps hidden itself, for example the
+  Clipview behind the lists of a [CueList](CueList.md), gets no card: it would cover the view.
 - **Hover a card** (or tag, or arrow) to open it and see where its cables go. **Click it** to go there:
   the view tab and the tab of a Tabview come to the front, a maximized area gives the room back, a Patchview scrolls,
   and the control flashes.

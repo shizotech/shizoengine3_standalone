@@ -150,12 +150,36 @@ for.
 
 | Generator | What it is for |
 |---|---|
-| *MapLab* | Projection mapping with several inputs, slices and outputs: cut slices out of the inputs, place and warp them with a grid, mask them, blend their edges. Each output has an *OUT* port and a video router. |
+| *MapLab* | Projection mapping with several inputs, slices and outputs: cut slices out of the inputs, place and warp them with a grid, mask them, blend their edges. Each output has an *OUT* port and goes to a display, Spout, NDI or a video router: see [the outputs of MapLab](#the-outputs-of-maplab). |
 | *LEDMapper* | Draws LED segments over a video input, groups them into scenes and sends the colours to Art-Net nodes or fixtures. |
 | *MaskTransform* | One mask or warp surface between an *IN* and an *OUT*. |
 
 Their inputs list every picture that is offered by a *Video router*: a shader, a [video](Video.md#controls) or a
 receiver with its router on.
+
+### The outputs of MapLab
+
+Open an output with its arrow (right column of MapLab). Besides *Width*, *Height* and *Edge Smooth* it sends its picture
+on, without a shader generator in between:
+
+| Section | What it does |
+|---|---|
+| *VideoRouter* › *Enable Router* | Offers the output under its name in every input list (shaders, LEDMapper, MapLab). |
+| *Display* | *Display*: the screen it is shown on (*Off*: none). *Display mode*: *Fullscreen* covers that screen, *Window* is a window of its own on it. |
+| *Spout* | *Enable Spout* sends it as a Spout source (Windows), named after *Spout name*. |
+| *NDI stream* | *Enable NDI* sends it as an NDI source, named after *NDI name*. |
+
+The names start as the name of the output.
+
+**Effects of an output.** *Effects* opens the effects of the output in the upper half of MapLab (where an input mask
+shows). Drag shaders from the *Assets* tab onto the list on the left of it: the first one gets the mapped output, each
+next one the one before, and the last one is what the output sends (*Out*, the display, Spout, NDI and the video
+router). Click an entry to see its controls; × removes it. The effects are saved with the project.
+
+**LED mapping of an output.** *LED mapping* adds a *LEDMapper* to the effects of the output and opens them: it gets
+the picture of this output (after the effects before it), maps its LEDs from it and passes the picture on unchanged.
+How the LEDMapper works: see the table above. A second click adds a second LEDMapper, for example for another set of
+nodes.
 
 ## Prolink (CDJs)
 

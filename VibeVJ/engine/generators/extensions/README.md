@@ -9,6 +9,10 @@ and calls its `load_extension(generator)` entry point.
 engine/generators/extensions/
 ├── asset/
 │   └── __init__.shio            # Loader for .asset directories (src/__init__.shio entry point)
+├── ffgl/
+│   ├── __init__.shio            # Loader for FFGL plugins (.dll, .bundle, .so), #428
+│   ├── ffgl_loader.shio         # shader_loader + the nanogui ffgl host, parameters as controls
+│   └── passthrough.glsl         # the shader generator around the plugin reads it from here
 ├── glsl/
 │   ├── __init__.shio            # Loader for .glsl directories (src/__init__.glsl entry point)
 │   └── shader_loader.shio

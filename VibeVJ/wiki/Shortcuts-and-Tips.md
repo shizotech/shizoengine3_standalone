@@ -35,6 +35,22 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
 - Undo, redo and the keys for areas are off in [show mode](Timeline.md#show-mode).
 - Play, Stop and Tap of the timeline have no key: map them to [MIDI](MIDI.md).
 
+### On a Mac
+
+Cmd (⌘) does what this page calls Ctrl: Cmd + Z, Cmd + E, Cmd + W, Cmd + 0, Cmd while dropping a clip, Cmd + C in a text
+field, and so on. macOS keeps a few keys for itself, so these differ:
+
+| Windows and Linux | Mac | Why |
+|---|---|---|
+| F11 | Ctrl + Cmd + F (F11 too, where macOS does not use it for itself) | The Mac key for the full screen. VibeVJ goes into the full screen of macOS, in a Space of its own. |
+| Ctrl + Space (maximize an area) | Cmd + Return | Cmd + Space opens Spotlight. |
+| Ctrl + Tab / Ctrl + Shift + Tab | Control + Tab / Control + Shift + Tab | Cmd + Tab switches programs. |
+| Ctrl + Space in the code editor | Control + Space | Spotlight. |
+| Ctrl + H in the code editor | Cmd + Option + F | Cmd + H hides the program. |
+| Right click | Control + click also works | As everywhere on a Mac. |
+
+The tooltips name the Ctrl keys of Windows and Linux.
+
 ## Tooltips
 
 Rest the mouse on a button or a control and its tooltip shows.

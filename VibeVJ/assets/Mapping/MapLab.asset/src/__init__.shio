@@ -1,5 +1,6 @@
 
 #include "engine/interfaces/videorouter"
+#include "engine/generators/clipstackview"
 
 import nanogui;
 
@@ -22,6 +23,7 @@ selected_output = None;
 
 active_input_mask = None;
 active_input_mask_btn = None;
+active_fx_btn = None; //the Effects button of the output whose effects show in the upper half (#428)
 
 add_input_btn = None;
 input_area = None;
@@ -798,6 +800,10 @@ link_shaders() {
 	// based on the outputs it is currently visible on.
 	// ------------------------------------------------------------
 	for(i = 0; i < inputs.size(); i++) {
+		//The size of the input mask these render sizes are made for: update_post links again when it changes
+		mask_size = inputs[i].input_mask.output_size();
+		inputs[i].linked_mask_size = [x = mask_size.x, y = mask_size.y];
+
 		for(j = 0; j < inputs[i].slices.size(); j++) {
 			slice = inputs[i].slices[j];
 
@@ -976,6 +982,108 @@ link_shaders() {
 	}
 }
 
+//The effects of an output (#428): the mapped picture goes into the first one, the last one is what goes out (OUT, the
+//display, Spout and NDI). Without effects that is the output shader itself
+route_output(out) {
+	final = out.shader;
+	items = out.fx_stack.items;
+	if(items.size() > 0) {
+		//A shader in a stack renders once it is active (in the Clipview its cell does that). It loads after it was
+		//added: made active once it has loaded
+		for(i = 0; i < items.size(); i++) {
+			if(!out.fx_live.has(items[i].guid) && items[i].is_loaded()) {
+				items[i].dispatch("active", true);
+				out.fx_live[items[i].guid] = 1;
+			}
+		}
+
+		first_in = items[0].dispatch("get_default_input");
+		if(first_in && first_in.value() != out.shader)
+			first_in.value(out.shader);
+		//The last effect with a picture: one without an output is left out, it does not end the chain
+		for(i = items.size() - 1; i >= 0; i--) {
+			last_out = items[i].dispatch("get_default_output");
+			if(last_out && last_out.value()) {
+				final = last_out.value();
+				break;
+			}
+		}
+	}
+	else if(final == out.final_shader)
+		return; //no effects, nothing changed
+
+	if(final != out.final_shader) {
+		old = out.final_shader;
+		old.spout_enabled(false);
+		old.ndi_enabled(false);
+		out.final_shader = final;
+		if(out.spout_enable.value()) {
+			final.spout_sender_name(out.spout_name.value());
+			final.spout_enabled(true);
+		}
+		if(out.ndi_enable.value()) {
+			final.ndi_source_name(out.ndi_name.value());
+			final.ndi_enabled(true);
+		}
+	}
+
+	if(out.output_ctrl.value() != final)
+		out.output_ctrl.value(final);
+	if(out.monitor_shader && out.monitor_input != final) {
+		out.monitor_shader.input("in_texture", final);
+		out.monitor_input = final;
+	}
+}
+
+//The effects of one output in the upper half of MapLab, as an input mask shows there (only one of them at a time)
+show_effects(out, v) {
+	if(v) {
+		if(active_input_mask_btn) {
+			cb = active_input_mask_btn.on_change();
+			cb(false);
+		}
+		for(i = 0; i < outputs.size(); i++) {
+			if(outputs[i].fx_btn != out.fx_btn && outputs[i].fx_btn.pushed()) {
+				outputs[i].fx_btn.pushed(false);
+				outputs[i].fx_panel.visible(false);
+			}
+		}
+		active_fx_btn = out.fx_btn;
+		out.fx_panel.visible(true);
+		projection_window.anchor_top(0.5, "percent");
+	}
+	else {
+		out.fx_panel.visible(false);
+		if(active_fx_btn == out.fx_btn) {
+			active_fx_btn = None;
+			projection_window.anchor_top(0);
+		}
+	}
+	out.fx_btn.pushed(v);
+	projection_window.refresh_layout();
+}
+
+//Closes the effects that show, before an input mask takes the upper half
+hide_effects() {
+	for(i = 0; i < outputs.size(); i++) {
+		if(outputs[i].fx_btn == active_fx_btn) {
+			show_effects(outputs[i], false);
+			return;
+		}
+	}
+}
+
+free_effects(out) {
+	items = out.fx_stack.items;
+	for(i = 0; i < items.size(); i++) {
+		try {
+			std.free(items[i]);
+		}
+		catch(e) {}
+	}
+	items.clear();
+}
+
 add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 	
 	if(!slice_guid)
@@ -1133,6 +1241,7 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 			if(active_input_mask_btn)
 				old_cb = active_input_mask_btn.on_change();
 				old_cb(false);
+			hide_effects(); //the upper half shows one thing at a time
 			active_input_mask = current_slice.input_mask;
 			active_input_mask_btn = input_mask_btn;
 			if(!current_slice.input_mask)
@@ -1566,6 +1675,7 @@ add_input(input_name = "", input_guid = "") {
 		select_video_router = select_video_router,
 		
 		input_mask = input_mask,
+		linked_mask_size = None,
 	]);
 	
 	current_input = inputs[-1];
@@ -1595,6 +1705,7 @@ add_input(input_name = "", input_guid = "") {
 			if(active_input_mask_btn)
 				old_cb = active_input_mask_btn.on_change();
 				old_cb(false);
+			hide_effects(); //the upper half shows one thing at a time
 			active_input_mask = input_mask;
 			active_input_mask_btn = input_mask_btn;
 			input_mask.visible(true);
@@ -1667,6 +1778,43 @@ add_output(output_name, output_guid = "") {
 	videorouter_vec = slice_area.controlvector("VideoRouter", output_guid).expanded(false).transparent(true);
 	videorouter_enable = videorouter_vec.controlbutton("Enable Router").push(1);	
 
+	//The output straight to a display, as Spout or as NDI (#428), as a shader generator has it in its Outputs
+	monitor_vec = slice_area.controlvector("Monitor", output_guid).caption("Display").expanded(false).transparent(true);
+	monitor_type = monitor_vec.controlcombo("monitor_type", output_guid).caption("Display mode").items(["Fullscreen", "Window"]).segmented(true)
+		.tooltip("Fullscreen: the display shows only this output. Window: a window of its own on that display.");
+	monitor_select = monitor_vec.controlcombo("monitor_select", output_guid).caption("Display")
+		.tooltip("The display this output is shown on. Off: none.");
+	monitor_select.on_open([monitor_select](){
+		ctx = nanogui.current_context();
+		items = ["Off"];
+		for(i = 0; i < ctx.monitor_count(); i++) {
+			items.push_back("Display " + (i+1));
+		}
+		monitor_select.items(items);
+	});
+	mon_cb = monitor_select.on_open();
+	mon_cb();
+
+	spout_vec = slice_area.controlvector("SPOUT", output_guid).caption("Spout").expanded(false).transparent(true);
+	spout_enable = spout_vec.controlbutton("Enable SPOUT", output_guid).caption("Enable Spout").push(1).tooltip("Sends this output as a Spout source (Windows)");
+	spout_name = spout_vec.controltext("SpoutName", output_guid).caption("Spout name").hide_config_menu();
+
+	ndi_vec = slice_area.controlvector("NDI Stream", output_guid).caption("NDI stream").expanded(false).transparent(true);
+	ndi_enable = ndi_vec.controlbutton("Enable NDI", output_guid).caption("Enable NDI").push(1).tooltip("Sends this output as an NDI source");
+	ndi_name = ndi_vec.controltext("NDI Name", output_guid).caption("NDI name").hide_config_menu();
+
+	//Effects of the output (#428): a stack of shaders after the mapping, as in a clip of the Clipview. They show in the
+	//upper half of MapLab, like an input mask; drop shaders from the Assets tab onto their list
+	fx_btn = slice_area.pushbutton("Effects").fixed_height(25)
+		.tooltip("Shaders that work on the whole output, after the mapping. Drop shaders from the Assets tab onto the list that opens.");
+	fx_panel = main_area.widget().anchor_top(0).anchor_bottom(0.5, "percent").anchor_left(side_width).anchor_right(side_width).visible(false);
+	//LED mapping of the output (#428): a LEDMapper in its effects gets this output as its picture and passes it on
+	led_btn = slice_area.button("LED mapping").fixed_height(25)
+		.tooltip("Adds a LEDMapper to the effects of this output: it maps the LEDs from this output and passes the picture on.");
+	fx_hint = fx_panel.label("Drop shaders from the Assets tab onto the list on the left. The first one gets the mapped output, the last one is what goes out.")
+		.anchor_left(260).anchor_right(10).anchor_top(10).fixed_height(40).text_color(vec4f(0.608, 0.608, 0.627, 1.0));
+	fx_stack = stackview(fx_panel);
+
 	engine = std.global("engine");
 	
 	shader_slice = projection_area.shader()
@@ -1692,9 +1840,35 @@ add_output(output_name, output_guid = "") {
 		
 		width_ctrl = output_width,
 		height_ctrl = output_height,
+
+		fx_btn = fx_btn,
+		fx_panel = fx_panel,
+		fx_stack = fx_stack,
+		final_shader = shader_slice, //the shader at the end of the effects: what goes out
+		spout_enable = spout_enable,
+		spout_name = spout_name,
+		ndi_enable = ndi_enable,
+		ndi_name = ndi_name,
+		monitor_shader = None,
+		monitor_input = None,
+		fx_live = [], //guids of the effects that were made active
 	]);
 	
 	current_output = outputs[-1];
+
+	fx_stack.on_items_changed = [current_output, fx_hint](stack){
+		fx_hint.visible(stack.items.size() == 0);
+		route_output(current_output);
+	};
+
+	fx_btn.on_change([current_output](v){
+		show_effects(current_output, v);
+	});
+
+	led_btn.on_click([current_output](){
+		current_output.fx_stack.add_generator("assets/Mapping/LEDMapper.asset");
+		show_effects(current_output, true);
+	});
 	
 	name.on_change([current_output](v){
 		current_output.output_name = v;
@@ -1702,6 +1876,66 @@ add_output(output_name, output_guid = "") {
 			current_output.video_router.name = v;
 	});
 	
+	spout_name.value(current_output.output_name);
+	ndi_name.value(current_output.output_name);
+
+	//Spout and NDI send the end of the effects (route_output moves them when the effects change)
+	spout_enable.callback([current_output, spout_name](v){
+		current_output.final_shader.spout_sender_name(spout_name.value());
+		current_output.final_shader.spout_enabled(v);
+	});
+	spout_name.callback([current_output](v){
+		current_output.final_shader.spout_sender_name(v);
+	});
+	ndi_enable.callback([current_output, ndi_name](v){
+		current_output.final_shader.ndi_source_name(ndi_name.value());
+		current_output.final_shader.ndi_enabled(v);
+	});
+	ndi_name.callback([current_output](v){
+		current_output.final_shader.ndi_source_name(v);
+	});
+
+	current_output.monitor_index = 0;
+	monitor_select.callback([current_output, shader_slice, monitor_type, monitor_select](index){
+		if(index == current_output.monitor_index)
+			return;
+		current_output.monitor_index = index;
+
+		if(current_output.monitor_screen) {
+			std.free(current_output.monitor_screen);
+			current_output.monitor_screen = None;
+			current_output.monitor_shader = None;
+		}
+		if(index <= 0)
+			return;
+
+		ctx = nanogui.current_context();
+		screen = ctx.fullscreen(index - 1, "maplab_output", !monitor_type.value());
+		screen.decorated(0);
+		screen.should_close([current_output, monitor_select](){
+			monitor_select.value(0);
+		});
+
+		//The output as it is rendered, scaled to the display
+		shader = screen.shader();
+		shader.anchor(0);
+		shader.render_size(eigen.vec2i(screen.width(), screen.height()));
+		shader.fragment_source("uniform sampler2D in_texture;void main(){ fragColor = texture(in_texture, v_uv); }");
+		shader.input("in_texture", current_output.final_shader);
+		current_output.monitor_input = current_output.final_shader;
+		current_output.monitor_shader = shader;
+		current_output.monitor_screen = screen;
+	});
+	//The display mode applies at once: the display is opened again in the new mode
+	monitor_type.callback([current_output, monitor_select](v){
+		index = current_output.monitor_index;
+		if(index <= 0)
+			return;
+		current_output.monitor_index = -1;
+		cb = monitor_select.callback();
+		cb(index);
+	});
+
 	videorouter_enable.callback([current_output](v){
 		if(v)
 			if(!current_output.video_router)
@@ -1712,6 +1946,14 @@ add_output(output_name, output_guid = "") {
 	});
 	
 	delete_btn.on_click([current_output](){
+		if(current_output.monitor_screen) {
+			std.free(current_output.monitor_screen);
+			current_output.monitor_screen = None;
+		}
+		if(active_fx_btn == current_output.fx_btn)
+			show_effects(current_output, false);
+		free_effects(current_output);
+		std.free(current_output.fx_panel);
 		std.free(current_output.area);
 		std.free(current_output.shader);
 		std.free(current_output.output_ctrl);
@@ -2121,8 +2363,8 @@ add_output(output_name, output_guid = "") {
 	});
 	
 	output_ctrl.value(shader_slice);
-	output_ctrl.callback([output_ctrl, shader_slice](v){
-		output_ctrl.value(shader_slice);
+	output_ctrl.callback([output_ctrl, current_output](v){
+		output_ctrl.value(current_output.final_shader);
 	});
 	
 	output_area.refresh_layout();
@@ -2138,6 +2380,7 @@ dispatcher(generator, cmd, value) {
 			return None;
 		for(i = 0; i < outputs.size(); i++) {
 			outputs[i].shader.rendering_enabled(value);
+			outputs[i].fx_stack.dispatch("active", value);
 		}
 		for(i = 0; i < inputs.size(); i++) {
 			inputs[i].input_mask.rendering_enabled(value);
@@ -2211,6 +2454,25 @@ entry(generator, area) {
 }
 
 update_post(generator) {
+	//An input mask takes its size from its input when it renders, a frame after the input was set: the slices were
+	//still limited to the size before (blurry until a slice was moved, #428). Link again once the size changed
+	if(!link_shaders_lazy) {
+		for(i = 0; i < inputs.size(); i++) {
+			linked = inputs[i].linked_mask_size;
+			size = inputs[i].input_mask.output_size();
+			if(!linked || linked.x != size.x || linked.y != size.y) {
+				link_shaders_lazy = true;
+				break;
+			}
+		}
+	}
+
+	//A shader added to the effects of an output gets its input and output when it has loaded: route again until it has
+	for(i = 0; i < outputs.size(); i++) {
+		if(outputs[i].fx_stack.items.size() > 0)
+			route_output(outputs[i]);
+	}
+
 	if(link_shaders_lazy) {
 		try {
 			link_shaders();
@@ -2269,6 +2531,7 @@ save_state() {
 			w = shader.fixed_width(),
 			h = shader.fixed_height(),
 			shader_state = shader.projection_save(),
+			effects = output.fx_stack.save_state(),
 		]);
 	}
 	
@@ -2330,6 +2593,11 @@ load_state(state) {
 			shader.size(shader.fixed_size());
 			
 			shader.projection_load(state_output.shader_state);
+
+			if(state_output.effects ?? false) {
+				if(state_output.effects.size() > 0)
+					output.fx_stack.load_state(state_output.effects);
+			}
 		}
 	}
 	
