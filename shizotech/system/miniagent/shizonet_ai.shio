@@ -1,0 +1,982 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  shizonet_ai.shio — ShizoNet transport for the AI node ⇄ router protocol
+//
+//  #include "shizonet_ai"
+//
+//  Contract: router_api.md. This file is the single place where the wire format
+//  lives; node.shio and router_api.shio only call the two attach functions.
+//
+//      ai_node_attach(node, host, [name, description, capabilities, tags])
+//      ai_router_attach(server, router, [name, description])
+//
+//  Every reply is [ok = true, ...] or [ok = false, error = "..."]. ok / busy /
+//  online travel as 1/0 (shizoscript has no bool type), so the receiver tests
+//  them for truthiness and never compares them to a JSON literal true.
+//
+//  on_get handlers run on the ShizoNet script thread: they only touch the
+//  request table and return. They never block and never call device.get().
+//  All blocking work (host.request) runs on the service worker thread.
+//  ai_request_update is recorded in the update queue and applied by the
+//  refresh thread (the worker thread is blocked inside host.request while the
+//  request it runs is the one a follow-up has to reach).
+// ═════════════════════════════════════════════════════════════════════════════
+
+AI_NET_VERSION = "1.0";
+
+// node props
+AI_PROP_NODE = "AINode";					// version string, presence marks an AI node
+AI_PROP_NODE_INFO = "AINodeInfo";			// node info json, fetched live
+AI_PROP_ROUTER = "AIRouter";
+AI_PROP_ROUTER_INFO = "AIRouterInfo";
+
+// node answers, router asks
+AI_CMD_INFO = "ai_info";
+AI_CMD_REQUEST = "ai_request";
+AI_CMD_REQUEST_POLL = "ai_request_poll";
+AI_CMD_REQUEST_STOP = "ai_request_stop";
+AI_CMD_REQUEST_UPDATE = "ai_request_update";	// follow-up into a delegated receptionist turn
+AI_CMD_OVERVIEW = "ai_overview";
+AI_CMD_TASKS = "ai_tasks";
+AI_CMD_TASK = "ai_task";
+AI_CMD_TASK_ADD = "ai_task_add";
+AI_CMD_TASK_UPDATE = "ai_task_update";
+AI_CMD_TASK_STOP = "ai_task_stop";
+
+// node pushes to routers (broadcast, fire and forget)
+AI_CMD_EVENT = "ai_event";
+
+AI_TIMEOUT_CONTROL = 5000;
+AI_TIMEOUT_POLL = 2000;
+AI_MAX_KEPT = 200;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Service tuning (not part of the wire contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+AI_REFRESH_MS = 5000;			// AINodeInfo / AIRouterInfo refresh period
+AI_REAPER_MS = 1000;			// finished-request sweep period
+AI_REQUEST_TTL_MS = 120000;		// keep a finished request this long for re-polls
+AI_WORKER_IDLE_MS = 25;			// worker sleep on an empty queue
+AI_UPDATE_MS = 50;				// follow-up (ai_request_update) apply period
+
+AI_STARTED_AT = std.millis();	// module load time, the basis for uptime_ms
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Small helpers (payloads arrive as parsed JSON, fields are all optional)
+// ─────────────────────────────────────────────────────────────────────────────
+
+ai_str(value, def = "") {
+	if(std.is_none(value))
+		return def;
+
+	return std.string(value);
+}
+
+// The shizonet node name field is fixed width: names come back space padded and
+// are truncated to 16 characters, so every name read from the wire is stripped.
+ai_name(value, def = "") {
+	n = ai_str(value, def).strip();
+
+	if(n.empty())
+		return def;
+
+	return n;
+}
+
+// opts is an optional json: [name, description, capabilities, tags, model]
+ai_opt(opts, key, def = None) {
+	if(!std.is_json(opts))
+		return def;
+
+	if(!opts.hasi(key))
+		return def;
+
+	value = opts.geti(key);
+
+	if(std.is_none(value))
+		return def;
+
+	return value;
+}
+
+ai_opt_str(opts, key, def = "") {
+	return ai_str(ai_opt(opts, key, None), def);
+}
+
+ai_opt_list(opts, key) {
+	value = ai_opt(opts, key, None);
+
+	if(!std.is_json(value))
+		return [];
+
+	return value;
+}
+
+// Read a string field out of a command payload (None / wrong type -> def).
+ai_field(data, key, def = "") {
+	if(!std.is_json(data))
+		return def;
+
+	if(!data.hasi(key))
+		return def;
+
+	return ai_str(data.geti(key), def);
+}
+
+ai_trim(list, max_keep) {
+	for(list.size() > max_keep)
+		list.erase(0);
+}
+
+// A Megamind overview, always with the four task groups present and no
+// object members (a task's `worker` is a miniagent, it must never go on the wire).
+ai_norm_overview(ov) {
+	if(!std.is_json(ov))
+		return [tasks = [], tasks_scheduled = [], tasks_finished = [], tasks_failed = []];
+
+	if(!ov.has("tasks"))
+		ov.tasks = [];
+
+	if(!ov.has("tasks_scheduled"))
+		ov.tasks_scheduled = [];
+
+	if(!ov.has("tasks_finished"))
+		ov.tasks_finished = [];
+
+	if(!ov.has("tasks_failed"))
+		ov.tasks_failed = [];
+
+	ov.remove_all_keys("worker");
+
+	return ov;
+}
+
+ai_host_overview(host) {
+	ov = None;
+
+	try {
+		ov = host.get_overview();
+	}
+	catch(e) {
+		ov = None;
+	}
+
+	return ai_norm_overview(ov);
+}
+
+// One task as a plain json, safe to serialize.
+ai_task_copy(task) {
+	if(!std.is_json(task))
+		return [text = ai_str(task)];
+
+	cpy = task.copy();
+	cpy.remove_all_keys("worker");
+
+	return cpy;
+}
+
+// Flatten a Megamind overview into one task list (same shape as node_api).
+ai_task_list(ov) {
+	ov = ai_norm_overview(ov);
+	list = [];
+
+	for(i = 0; i < ov.tasks_scheduled.size(); i++) {
+		task = ai_task_copy(ov.tasks_scheduled[i]);
+		task.state = "planned";
+		list.push_back(task);
+	}
+
+	for(i = 0; i < ov.tasks.size(); i++)
+		list.push_back(ai_task_copy(ov.tasks[i]));
+
+	for(i = 0; i < ov.tasks_finished.size(); i++)
+		list.push_back(ai_task_copy(ov.tasks_finished[i]));
+
+	for(i = 0; i < ov.tasks_failed.size(); i++)
+		list.push_back(ai_task_copy(ov.tasks_failed[i]));
+
+	return list;
+}
+
+// Node info json for the AINodeInfo prop / ai_info reply (see router_api.md).
+ai_node_info(host, opts = None) {
+	ov = ai_host_overview(host);
+
+	name = ai_name(ai_opt(opts, "name", ""), "AI Node");
+
+	model = ai_opt_str(opts, "model", "");
+
+	if(model.empty()) {
+		try {
+			model = ai_str(host.receptionist.model_config.name);
+		}
+		catch(e) {
+			model = "";
+		}
+	}
+
+	workers = 0;
+
+	try {
+		workers = host.worker_threads.size();
+	}
+	catch(e) {
+		workers = 0;
+	}
+
+	queued = 0;
+
+	try {
+		queued = host.request_queue.size();
+	}
+	catch(e) {
+		queued = 0;
+	}
+
+	active = false;
+
+	try {
+		active = host._receptionist_active ? true : false;
+	}
+	catch(e) {
+		active = false;
+	}
+
+	running = ov.tasks.size();
+	planned = ov.tasks_scheduled.size();
+
+	return [
+		name = name,
+		version = AI_NET_VERSION,
+		description = ai_opt_str(opts, "description", ""),
+		capabilities = ai_opt_list(opts, "capabilities"),
+		tags = ai_opt_list(opts, "tags"),
+		model = model,
+		max_workers = workers,
+		busy = (active || queued > 0 || running > 0) ? true : false,
+		tasks_running = running,
+		tasks_planned = planned,
+		uptime_ms = std.millis() - AI_STARTED_AT,
+	];
+}
+
+// Router info json for the AIRouterInfo prop.
+ai_router_info(server, router, opts = None) {
+	name = ai_name(ai_opt(opts, "name", ""), "");
+
+	if(name.empty()) {
+		try {
+			name = ai_name(server.name(), "AIRouter");
+		}
+		catch(e) {
+			name = "AIRouter";
+		}
+	}
+
+	nodes = 0;
+
+	try {
+		nodes = server.devices().size();
+	}
+	catch(e) {
+		nodes = 0;
+	}
+
+	tasks = 0;
+
+	try {
+		if(std.is_json(router.remote_tasks))
+			tasks = router.remote_tasks.size();
+	}
+	catch(e) {
+		tasks = 0;
+	}
+
+	events = 0;
+
+	try {
+		if(std.is_json(router.events))
+			events = router.events.size();
+	}
+	catch(e) {
+		events = 0;
+	}
+
+	return [
+		name = name,
+		version = AI_NET_VERSION,
+		nodes = nodes,
+		tasks = tasks,
+		events = events,
+		uptime_ms = std.millis() - AI_STARTED_AT,
+	];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AiService — the attach handle. One instance per shizonet server, "node"
+//  runs the AI node service on a Megamind host, "router" receives ai_event.
+//  The handle is what ai_node_attach / ai_router_attach return: .stop() tears
+//  the service down, .info() / .requests / .counters are live state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class AiService {
+
+	kind = "node";
+	server = None;
+	host = None;			// node side: the Megamind
+	router = None;			// router side: the Router
+	opts = [];
+	running = false;
+	started_at = 0;
+
+	requests = [];			// request_id -> [status, queue, result, error, created, last_poll]
+	request_order = [];		// request ids in insertion order (for the cap + the reaper)
+	pending = [];			// request ids waiting for the worker thread
+	updates = [];			// [request_id, message] follow-ups waiting to be applied
+
+	counters = [
+		requests_total = 0,
+		requests_done = 0,
+		requests_error = 0,
+		events_sent = 0,
+	];
+
+	threads = [];
+	pending_state = false;		// node_state event waiting for a safe thread
+
+	__init__(kind, server, target, opts = None) {
+		this.kind = kind;
+		this.server = server;
+		this.running = true;
+		this.started_at = std.millis();
+
+		if(std.is_json(opts))
+			this.opts = opts;
+		else
+			this.opts = [];
+
+		if(kind == "node")
+			host = target;
+		else
+			router = target;
+
+		// keep the resolved node name in opts so ai_node_info reports it
+		this.opts.name = node_name();
+	}
+
+	__deinit__() {
+		stop();
+	}
+
+	// The shizonet node name, overridable with opts.name. Always stripped:
+	// the wire name field is fixed width and space padded.
+	node_name() {
+		n = ai_name(ai_opt(opts, "name", ""), "");
+
+		if(!n.empty())
+			return n;
+
+		n = "";
+
+		try {
+			n = ai_name(server.name());
+		}
+		catch(e) {
+			n = "";
+		}
+
+		if(n.empty())
+			n = "AI Node";
+
+		opts.name = n;
+
+		return n;
+	}
+
+	stop() {
+		if(!running)
+			return true;
+
+		running = false;
+
+		for(i = 0; i < threads.size(); i++)
+			threads[i].join();
+
+		threads = [];
+
+		return true;
+	}
+
+	info() {
+		return ai_node_info(host, opts);
+	}
+
+	// ── registration ──────────────────────────────────────────────────────
+
+	register_node() {
+		server.set_prop(AI_PROP_NODE, AI_NET_VERSION);
+		server.set_prop(AI_PROP_NODE_INFO, info());
+
+		server.on_get(AI_CMD_INFO, [this](dev, data) { return handle_info(dev, data); });
+		server.on_get(AI_CMD_REQUEST, [this](dev, data) { return handle_request(dev, data); });
+		server.on_get(AI_CMD_REQUEST_POLL, [this](dev, data) { return handle_poll(dev, data); });
+		server.on_get(AI_CMD_REQUEST_STOP, [this](dev, data) { return handle_request_stop(dev, data); });
+		server.on_get(AI_CMD_REQUEST_UPDATE, [this](dev, data) { return handle_request_update(dev, data); });
+		server.on_get(AI_CMD_OVERVIEW, [this](dev, data) { return handle_overview(dev, data); });
+		server.on_get(AI_CMD_TASKS, [this](dev, data) { return handle_tasks(dev, data); });
+		server.on_get(AI_CMD_TASK, [this](dev, data) { return handle_task(dev, data); });
+		server.on_get(AI_CMD_TASK_ADD, [this](dev, data) { return handle_task_add(dev, data); });
+		server.on_get(AI_CMD_TASK_UPDATE, [this](dev, data) { return handle_task_update(dev, data); });
+		server.on_get(AI_CMD_TASK_STOP, [this](dev, data) { return handle_task_stop(dev, data); });
+
+		server.on_connect([this](dev) { node_connected(dev); });
+
+		hook_host();
+	}
+
+	register_router() {
+		server.set_prop(AI_PROP_ROUTER, AI_NET_VERSION);
+		server.set_prop(AI_PROP_ROUTER_INFO, ai_router_info(server, router, opts));
+
+		server.on_get(AI_CMD_EVENT, [this](dev, data) {
+			try {
+				router.handle_event(data);
+			}
+			catch(e) {
+				std.error("ai_event handler failed: ", e);
+			}
+
+			return "ok";
+		});
+	}
+
+	// Megamind hooks: every notify / finished task is pushed to the routers.
+	hook_host() {
+		try {
+			host.on_notify([this](msg) {
+				push_event([kind = "notify", message = ai_str(msg)]);
+			});
+		}
+		catch(e) {
+			std.error("ai_node_attach: host.on_notify not available");
+		}
+
+		try {
+			host.on_task_finished([this](task) {
+				push_event([
+					kind = "task_finished",
+					taskid = ai_str(task.taskid),
+					name = ai_str(task.name),
+					state = ai_str(task.state),
+					report = ai_str(task.report),
+				]);
+			});
+		}
+		catch(e) {
+			std.error("ai_node_attach: host.on_task_finished not available");
+		}
+	}
+
+	// on_connect runs on the ShizoNet script thread: never touch the transport
+	// from here. The node_state event goes out from the refresh thread.
+	node_connected(dev) {
+		pending_state = true;
+	}
+
+	start_threads() {
+		threads = [];
+
+		if(kind == "node") {
+			worker = std.thread([this]() { worker_loop(); });
+			worker.run();
+			threads.push_back(worker);
+
+			reaper = std.thread([this]() { reaper_loop(); });
+			reaper.run();
+			threads.push_back(reaper);
+		}
+
+		refresher = std.thread([this]() { refresh_loop(); });
+		refresher.run();
+		threads.push_back(refresher);
+	}
+
+	// ── events (node -> routers, fire and forget) ─────────────────────────
+
+	push_event(e) {
+		if(!std.is_json(e))
+			return 0;
+
+		payload = e;
+		payload.kind = ai_str(payload.kind, "notify");
+		payload.time = std.millis();
+		payload.node = node_name();
+
+		accepted = 0;
+
+		try {
+			accepted = server.broadcast(AI_CMD_EVENT, payload);
+		}
+		catch(err) {
+			accepted = 0;
+		}
+
+		counters.events_sent += accepted;
+
+		return accepted;
+	}
+
+	// ── prop refresh + request housekeeping ───────────────────────────────
+
+	update_props() {
+		try {
+			if(kind == "node")
+				server.set_prop(AI_PROP_NODE_INFO, info());
+			else
+				server.set_prop(AI_PROP_ROUTER_INFO, ai_router_info(server, router, opts));
+		}
+		catch(e) {
+			// a broken host must never take the transport down
+		}
+	}
+
+	refresh_loop() {
+		elapsed = 0;
+
+		for(running) {
+			std.sleep(AI_UPDATE_MS);
+
+			if(!running)
+				break;
+
+			// the only consumer of the update queue: this thread never blocks on a
+			// request, so it can reach a receptionist turn the worker is inside.
+			apply_updates();
+
+			if(pending_state) {
+				pending_state = false;
+				push_event([kind = "node_state", online = true]);
+			}
+
+			elapsed += AI_UPDATE_MS;
+
+			if(elapsed < AI_REFRESH_MS)
+				continue;
+
+			elapsed = 0;
+			update_props();
+		}
+	}
+
+	// Apply the recorded ai_request_update follow-ups (router_api.md):
+	//   generating -> inject into the live receptionist conversation, the same
+	//                 mechanism Megamind.update_task uses for a running worker
+	//   queued     -> append to the stored prompt, part of the task at start
+	//   done/error/stopped/reaped -> dropped (the handler already answered not found)
+	apply_updates() {
+		if(kind != "node") {
+			updates = [];
+			return;
+		}
+
+		for(updates.size()) {
+			upd = updates[0];
+			updates.erase(0);
+
+			request_id = std.string(upd.request_id);
+			message = std.string(upd.message);
+
+			if(!requests.has(request_id))
+				continue;
+
+			req = requests[request_id];
+			status = std.string(req.status);
+
+			if(status == "queued") {
+				req.prompt = std.string(req.prompt) + "\n\n" + message;
+				continue;
+			}
+
+			if(status != "generating")
+				continue;
+
+			// a host without a receptionist member (stub hosts) must not take the
+			// service down: the update is simply skipped.
+			try {
+				if(std.is_function(host.receptionist.send_prompt))
+					host.receptionist.send_prompt(message);
+			}
+			catch(e) {
+				// no receptionist handle / the injection failed: nothing to do
+			}
+		}
+	}
+
+	reaper_loop() {
+		for(running) {
+			std.sleep(AI_REAPER_MS);
+
+			if(!running)
+				break;
+
+			now = std.millis();
+
+			for(i = 0; i < request_order.size(); i++) {
+				rid = request_order[i];
+
+				if(!requests.has(rid)) {
+					request_order.erase(i);
+					i--;
+					continue;
+				}
+
+				status = std.string(requests[rid].status);
+				terminal = (status == "done" || status == "error" || status == "stopped");
+
+				if(terminal && now - requests[rid].last_poll > AI_REQUEST_TTL_MS) {
+					requests.erase(rid);
+					request_order.erase(i);
+					i--;
+				}
+			}
+		}
+	}
+
+	// One request at a time: the receptionist is a single serial queue.
+	worker_loop() {
+		for(running) {
+			if(!pending.size()) {
+				std.sleep(AI_WORKER_IDLE_MS);
+				continue;
+			}
+
+			rid = pending[0];
+			pending.erase(0);
+
+			if(!requests.has(rid))
+				continue;
+
+			if(std.string(requests[rid].status) == "stopped")
+				continue;
+
+			requests[rid].status = "generating";
+			prompt = std.string(requests[rid].prompt);
+
+			on_action = [this, rid](action) {
+				if(!requests.has(rid))
+					return;
+
+				requests[rid].queue.push_back(action);
+
+				if(std.string(requests[rid].status) != "stopped")
+					requests[rid].status = "generating";
+			};
+
+			on_finish = [this, rid](result) {
+				if(!requests.has(rid))
+					return;
+
+				requests[rid].result = result;
+			};
+
+			try {
+				result = host.request(prompt, on_finish, on_action);
+
+				if(requests.has(rid)) {
+					requests[rid].result = result;
+
+					if(std.string(requests[rid].status) != "stopped") {
+						requests[rid].status = "done";
+						counters.requests_done++;
+					}
+				}
+			}
+			catch(e) {
+				if(requests.has(rid)) {
+					requests[rid].status = "error";
+					requests[rid].error = std.string(e);
+					counters.requests_error++;
+				}
+			}
+		}
+	}
+
+	trim_requests() {
+		for(request_order.size() > AI_MAX_KEPT) {
+			oldest = request_order[0];
+			request_order.erase(0);
+
+			if(requests.has(oldest))
+				requests.erase(oldest);
+		}
+	}
+
+	// ── command handlers (never blocking) ─────────────────────────────────
+
+	handle_info(dev, data) {
+		reply = info();
+		reply.ok = true;
+		return reply;
+	}
+
+	handle_request(dev, data) {
+		prompt = ai_field(data, "prompt");
+
+		if(prompt.empty())
+			return [ok = false, error = "missing 'prompt'"];
+
+		request_id = std.random_hash(24);
+
+		requests[request_id] = [
+			id = request_id,
+			prompt = prompt,
+			status = "queued",
+			queue = [],
+			result = None,
+			error = "",
+			created = std.millis(),
+			last_poll = std.millis(),
+		];
+
+		request_order.push_back(request_id);
+		pending.push_back(request_id);
+		counters.requests_total++;
+		trim_requests();
+
+		return [ok = true, request_id = request_id, status = "queued"];
+	}
+
+	handle_poll(dev, data) {
+		request_id = ai_field(data, "request_id");
+
+		if(request_id.empty())
+			return [ok = false, error = "missing 'request_id'"];
+
+		if(!requests.has(request_id))
+			return [ok = false, error = "not found", request_id = request_id];
+
+		req = requests[request_id];
+		req.last_poll = std.millis();
+
+		if(req.queue.size()) {
+			delta = req.queue[0];
+			req.queue.erase(0);
+			return [ok = true, request_id = request_id, status = "generating", delta = delta];
+		}
+
+		status = std.string(req.status);
+
+		if(status == "done")
+			return [ok = true, request_id = request_id, status = "done", result = req.result];
+
+		if(status == "error")
+			return [ok = true, request_id = request_id, status = "error", error = req.error];
+
+		if(status == "stopped")
+			return [ok = true, request_id = request_id, status = "done", result = req.result, note = "stopped"];
+
+		// queued / generating without a new delta yet
+		return [ok = true, request_id = request_id, status = "waiting"];
+	}
+
+	handle_request_stop(dev, data) {
+		request_id = ai_field(data, "request_id");
+
+		if(request_id.empty())
+			return [ok = false, error = "missing 'request_id'"];
+
+		if(!requests.has(request_id))
+			return [ok = false, error = "not found", request_id = request_id];
+
+		req = requests[request_id];
+		status = std.string(req.status);
+
+		if(status == "done" || status == "error" || status == "stopped")
+			return [ok = true, request_id = request_id, status = status];
+
+		for(i = 0; i < pending.size(); i++) {
+			if(pending[i] == request_id) {
+				pending.erase(i);
+				break;
+			}
+		}
+
+		req.status = "stopped";
+		req.result = [
+			ok = false,
+			reports = [[report = "The request was stopped."]],
+			execution_time_ms = std.millis() - req.created,
+		];
+
+		// best effort: ask the receptionist to abort the running turn
+		try {
+			if(std.is_function(host.receptionist.stop))
+				host.receptionist.stop();
+		}
+		catch(e) {
+			// the host has no receptionist handle, the request stays marked stopped
+		}
+
+		return [ok = true, request_id = request_id, status = "stopped"];
+	}
+
+	// Follow-up into a delegated request (router_api.md "ai_request_update").
+	// Runs on the ShizoNet script thread: it only records the update and returns,
+	// the refresh thread applies it. A finished / stopped / reaped request is
+	// reported as not found, exactly like the poll and stop handlers do.
+	handle_request_update(dev, data) {
+		request_id = ai_field(data, "request_id");
+		message = ai_field(data, "message");
+
+		if(request_id.empty())
+			return [ok = false, error = "missing 'request_id'"];
+
+		if(message.empty())
+			return [ok = false, error = "missing 'message'"];
+
+		if(!requests.has(request_id))
+			return [ok = false, error = "not found", request_id = request_id];
+
+		status = std.string(requests[request_id].status);
+
+		if(status != "queued" && status != "generating")
+			return [ok = false, error = "not found", request_id = request_id];
+
+		updates.push_back([request_id = request_id, message = message]);
+
+		return [ok = true, request_id = request_id, state = "updated"];
+	}
+
+	handle_overview(dev, data) {
+		return [ok = true, overview = ai_host_overview(host)];
+	}
+
+	handle_tasks(dev, data) {
+		return [ok = true, tasks = ai_task_list(ai_host_overview(host))];
+	}
+
+	handle_task(dev, data) {
+		taskid = ai_field(data, "taskid");
+
+		if(taskid.empty())
+			return [ok = false, error = "missing 'taskid'"];
+
+		// NOTE: never name a local `info` inside this class - the member slot
+		// holds the info() method and the assignment would hit that slot.
+		task_info = None;
+
+		try {
+			task_info = host.inspect_task(taskid);
+		}
+		catch(e) {
+			task_info = None;
+		}
+
+		if(std.is_none(task_info) || std.is_string(task_info))
+			return [ok = false, error = "not found", taskid = taskid];
+
+		return [ok = true, task = ai_task_copy(task_info)];
+	}
+
+	handle_task_add(dev, data) {
+		goal = ai_field(data, "goal");
+
+		if(goal.empty())
+			return [ok = false, error = "missing 'goal'"];
+
+		name = ai_field(data, "name");
+
+		if(name.empty())
+			name = "Task-" + std.random_hash(6);
+
+		taskid = None;
+
+		try {
+			taskid = host.add_task(name, goal);
+		}
+		catch(e) {
+			taskid = None;
+		}
+
+		if(std.is_none(taskid))
+			return [ok = false, error = "add_task failed"];
+
+		return [ok = true, taskid = std.string(taskid), name = name, state = "planned"];
+	}
+
+	handle_task_update(dev, data) {
+		taskid = ai_field(data, "taskid");
+		message = ai_field(data, "message");
+
+		if(taskid.empty())
+			return [ok = false, error = "missing 'taskid'"];
+
+		if(message.empty())
+			return [ok = false, error = "missing 'message'"];
+
+		updated = false;
+
+		try {
+			updated = host.update_task(taskid, message) ? true : false;
+		}
+		catch(e) {
+			updated = false;
+		}
+
+		if(!updated)
+			return [ok = false, error = "not found", taskid = taskid];
+
+		return [ok = true, taskid = taskid, state = "updated"];
+	}
+
+	handle_task_stop(dev, data) {
+		taskid = ai_field(data, "taskid");
+
+		if(taskid.empty())
+			return [ok = false, error = "missing 'taskid'"];
+
+		try {
+			host.stop_task(taskid);
+		}
+		catch(e) {
+			return [ok = false, error = std.string(e), taskid = taskid];
+		}
+
+		return [ok = true, taskid = taskid, state = "stopped"];
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Node side: register the AI service on a shizonet server.
+//  host is a Megamind(). Handlers never block: they enqueue and return.
+//  opts: [name, description, capabilities, tags]
+// ─────────────────────────────────────────────────────────────────────────────
+ai_node_attach(server, host, opts = None) {
+	if(std.is_none(server) || std.is_none(host)) {
+		std.error("ai_node_attach: server and host are required");
+		return None;
+	}
+
+	svc = AiService("node", server, host, opts);
+	svc.register_node();
+	svc.start_threads();
+
+	return svc;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Router side: register the ai_event receiver + AIRouter props.
+//  router is a Router(). Events land in router.handle_event(payload).
+// ─────────────────────────────────────────────────────────────────────────────
+ai_router_attach(server, router, opts = None) {
+	if(std.is_none(server) || std.is_none(router)) {
+		std.error("ai_router_attach: server and router are required");
+		return None;
+	}
+
+	svc = AiService("router", server, router, opts);
+	svc.register_router();
+	svc.start_threads();
+
+	return svc;
+}

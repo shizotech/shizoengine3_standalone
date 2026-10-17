@@ -1,0 +1,1049 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  telegram_router.shio — the Telegram front end of the Router: the README
+//  example built for real (class TelegramRouter : Router).
+//
+//  Usage:  shz telegram_router.shio --bot-token 123456:ABCDEF...
+//                [--name TelegramRouter] [--role router] [--poll 1000]
+//                [--trusted <path>] [--no-stream] [--verbose-events]
+//
+//  What it does:
+//    * plain text from a TRUSTED chat is ONE router-agent turn: the agent
+//      (roles/router) reads get_nodes(), picks the node and delegates. The
+//      answer of the turn is sent back to that chat.
+//    * the chat stays quiet. The owner sees only what deserves attention:
+//      the router agent's answer, a task that FINISHED / FAILED / was LOST on
+//      any node (with the node's report), and a notify from a node (its report
+//      or its question to the owner). Node online/offline, queued/running
+//      transitions, stops and tool calls are NOT sent. --verbose-events
+//      restores the full event stream (tg_events = "all").
+//    * access control: only chats listed in the trusted_chats json are served.
+//      No file / empty list -> the FIRST chat that messages the bot becomes the
+//      trusted chat and is written to the file (bootstrap). Every other chat is
+//      ignored (console log only, the bot never answers strangers).
+//
+//  trusted_chats json (default: std.config_path("miniagent","trusted_chats")):
+//
+//      {"chats":[{"chatid":123456,"name":"Peter","added":1700000000000}]}
+//
+//  Commands in a trusted chat:
+//    /help /id /nodes /tasks [state] /status
+//    /allow <chatid> [name]   /deny <chatid>   /forget
+//
+//  Subclass it the way the README shows (router_api.md §Events):
+//
+//      class MyBot : TelegramRouter {
+//          __init__(cfg) {
+//              super.__init__(cfg, [name = "MyBot"]);
+//              attach_bot(telegram.bot(token));
+//          }
+//      }
+//
+//  Threading: the ai_event sink (Router.on_event) runs on the ShizoNet script
+//  thread — it must not block, so events are queued (tg_out) and the bot's own
+//  worker thread performs the Telegram HTTP calls. Inbound turns run in the same
+//  worker thread, so a long LLM turn never blocks message intake.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "router_api"
+
+import tgbot;
+
+TG_TRUSTED_KEY = "trusted_chats";
+TG_MAX_MSG = 3900;
+TG_REPORT_CHARS = 900;
+TG_DRAFT_MS = 3000;
+TG_MAX_QUEUED_OUT = 100;
+TG_DEDUPE_MS = 1500;
+
+class TelegramRouter : Router
+{
+    tg_bot = None;
+    tg_path = "";
+    tg_chats = [];          // [{chatid, name, added}] — the trust list
+    tg_queue = [];          // inbound turns: [chatdata, text]
+    tg_out = [];            // outbound event texts (never sent on the shizonet thread)
+    tg_thread = None;
+    tg_running = false;
+    tg_active = None;       // the chat of the turn currently streaming
+    tg_acc = "";            // streamed text of the current turn
+    tg_draft = 0;
+    tg_last_draft = 0;
+    tg_stream = true;
+    tg_draft_ms = TG_DRAFT_MS;
+    tg_last_chat = 0;       // the last accepted message, for duplicate deliveries
+    tg_last_text = "";
+    tg_last_ms = 0;
+    tg_events = "reports";  // "reports" = only what deserves attention (default)
+                            // "all"    = every node event (the verbose stream)
+    tg_lock = "telegram:chats";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  cfg: ModelConfig
+    //  opts: Router opts (name, role, description, capabilities, tags, poll_ms)
+    //        plus: trusted_chats (path), stream (bool), draft_ms (int),
+    //              events ("reports" | "all")
+    // ─────────────────────────────────────────────────────────────────────────
+    __init__(cfg, opts = None)
+    {
+        opts_name = "TelegramRouter";
+        opts_role = "router";
+        opts_path = "";
+        opts_stream = true;
+        opts_poll = 1000;
+        opts_draft = TG_DRAFT_MS;
+        opts_events = "reports";
+
+        if(opts) {
+            if(opts.has("name") && opts.name) {
+                opts_name = std.string(opts.name);
+            }
+            if(opts.has("role") && opts.role) {
+                opts_role = std.string(opts.role);
+            }
+            if(opts.has("trusted_chats") && opts.trusted_chats) {
+                opts_path = std.string(opts.trusted_chats);
+            }
+            if(opts.has("stream")) {
+                opts_stream = opts.stream ? true : false;
+            }
+            if(opts.has("poll_ms") && opts.poll_ms > 0) {
+                opts_poll = std.int(opts.poll_ms);
+            }
+            if(opts.has("draft_ms") && opts.draft_ms >= 0) {
+                opts_draft = std.int(opts.draft_ms);
+            }
+            if(opts.has("events") && opts.events) {
+                opts_events = std.string(opts.events).strip().lowercase();
+            }
+        }
+
+        super.__init__(cfg, [
+            name = opts_name,
+            role = opts_role,
+            description = "telegram front of the router fleet",
+            poll_ms = opts_poll,
+        ]);
+
+        tg_stream = opts_stream;
+        tg_draft_ms = opts_draft;
+        tg_events = opts_events;
+        tg_path = opts_path;
+
+        if(!tg_path) {
+            tg_path = std.config_path("miniagent", TG_TRUSTED_KEY);
+        }
+
+        tg_load();
+
+        // the README hook: every node event of every node goes to the chat
+        on_event([this](e) { this.tg_push_event(e); });
+        on_action([this](a) { this.tg_stream_action(a); });
+
+        tg_running = true;
+        tg_thread = std.thread([this]() { this.tg_worker(); });
+        tg_thread.run();
+    }
+
+    __deinit__()
+    {
+        tg_stop_worker();
+        super.__deinit__();
+    }
+
+    // The transport. Pass a telegram.bot() (or any object with send_rich /
+    // send_rich_draft / new_draft_id) — on_any_message is wired here.
+    attach_bot(bot)
+    {
+        tg_bot = bot;
+
+        if(tg_bot) {
+            tg_bot.on_any_message = [this](chatdata) { this.tg_handle_message(chatdata); };
+        }
+
+        return tg_bot ? true : false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  trust list on disk
+    // ─────────────────────────────────────────────────────────────────────────
+
+    tg_load()
+    {
+        data = fileio.read_json(tg_path, true);
+        list = [];
+
+        if(std.is_json(data) && data.has("chats") && std.is_json(data.chats)) {
+            for(i = 0; i < data.chats.size(); i++) {
+                c = data.chats[i];
+                if(std.is_json(c) && c.has("chatid") && std.int(c.chatid) != 0) {
+                    list.push_back([
+                        chatid = std.int(c.chatid),
+                        name = std.string(c.name ?? ""),
+                        added = std.int(c.added ?? 0),
+                    ]);
+                }
+            }
+        }
+
+        cs = std.critical_section_named(tg_lock);
+        tg_chats = list;
+        cs.release();
+
+        return tg_chats.size();
+    }
+
+    tg_save()
+    {
+        out = [chats = []];
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = 0; i < tg_chats.size(); i++) {
+            out.chats.push_back(tg_chats[i].copy());
+        }
+        cs.release();
+
+        try {
+            dir = fileio.file_dir(tg_path);
+            if(dir && !fileio.exists(dir)) {
+                fileio.mkdir(dir);
+            }
+        }
+        catch(e) {}
+
+        try {
+            fileio.write_text(tg_path, std.string(out));
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram] could not write ", tg_path, ": ", e);
+            return false;
+        }
+    }
+
+    tg_is_trusted(chatid)
+    {
+        want = std.int(chatid);
+        found = false;
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = 0; i < tg_chats.size(); i++) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                found = true;
+                break;
+            }
+        }
+        cs.release();
+
+        return found;
+    }
+
+    tg_trust(chatid, chat_name = "")
+    {
+        want = std.int(chatid);
+
+        if(want == 0 || tg_is_trusted(want)) {
+            return false;
+        }
+
+        cs = std.critical_section_named(tg_lock);
+        tg_chats.push_back([chatid = want, name = std.string(chat_name), added = std.millis()]);
+        cs.release();
+
+        tg_save();
+
+        return true;
+    }
+
+    tg_untrust(chatid)
+    {
+        want = std.int(chatid);
+        removed = false;
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = tg_chats.size() - 1; i >= 0; i--) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                tg_chats.erase(i);
+                removed = true;
+            }
+        }
+        cs.release();
+
+        if(removed) {
+            tg_save();
+        }
+
+        return removed;
+    }
+
+    tg_chat_list()
+    {
+        out = [];
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = 0; i < tg_chats.size(); i++) {
+            out.push_back(tg_chats[i].copy());
+        }
+        cs.release();
+
+        return out;
+    }
+
+    tg_trusted_text()
+    {
+        list = tg_chat_list();
+
+        if(!list.size()) {
+            return "none yet — the first chat that messages the bot becomes the trusted one";
+        }
+
+        out = "";
+        for(i = 0; i < list.size(); i++) {
+            out += "- " + std.string(list[i].chatid);
+            if(list[i].name) {
+                out += " (" + std.string(list[i].name) + ")";
+            }
+            out += "\n";
+        }
+
+        return out;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  inbound
+    // ─────────────────────────────────────────────────────────────────────────
+
+    tg_handle_message(chatdata)
+    {
+        if(!std.is_json(chatdata)) {
+            std.print("[telegram] message without chatdata\n");
+            return;
+        }
+
+        chat_id = std.int(chatdata.chatid ?? 0);
+        txt = std.string(chatdata.text ?? "").strip();
+
+        if(chat_id == 0) {
+            return;
+        }
+
+        if(!tg_is_trusted(chat_id)) {
+            if(tg_chats.size() > 0) {
+                std.print("[telegram] ignored message from untrusted chat ", chat_id, "\n");
+                return;
+            }
+
+            // bootstrap: no trusted chat exists -> the first chat wins, on disk
+            who = std.string(chatdata.username ?? "");
+            if(!who) {
+                who = std.string(chatdata.first_name ?? "");
+            }
+
+            tg_trust(chat_id, who);
+            std.print("[telegram] bootstrap: chat ", chat_id, " (", who, ") is now trusted\n");
+            tg_send(chatdata, tg_welcome_text());
+        }
+
+        // A transport can deliver the same update twice (a getUpdates replay). One
+		// message, one action: the identical text from the same chat inside a short
+		// window is the same message, not a request to do it twice.
+		if(chat_id == tg_last_chat && txt == tg_last_text && std.millis() - tg_last_ms < TG_DEDUPE_MS) {
+			std.print("[telegram] duplicate delivery from chat ", chat_id, " ignored\n");
+			return;
+		}
+
+		tg_last_chat = chat_id;
+		tg_last_text = txt;
+		tg_last_ms = std.millis();
+
+		if(!txt) {
+			return;
+		}
+
+		if(txt.starts("/")) {
+			tg_command(chatdata, txt);
+			return;
+		}
+
+		tg_enqueue(chatdata, txt);
+	}
+
+    tg_command(chatdata, txt)
+    {
+        chat_id = std.int(chatdata.chatid ?? 0);
+        parts = txt.split(" ", 3, true);
+        cmd = std.string(parts[0]).lowercase();
+        arg = "";
+        who = "";
+
+        if(parts.size() > 1) {
+            arg = std.string(parts[1]).strip();
+        }
+        if(parts.size() > 2) {
+            who = std.string(parts[2]).strip();
+        }
+
+        if(cmd == "/help" || cmd == "/start") {
+            tg_send(chatdata, tg_help_text());
+            return;
+        }
+
+        if(cmd == "/id") {
+            tg_send(chatdata, "This chat: " + std.string(chat_id) + "\nTrusted chats:\n" + tg_trusted_text() + "File: " + tg_path);
+            return;
+        }
+
+        if(cmd == "/nodes") {
+            tg_send(chatdata, tg_nodes_text());
+            return;
+        }
+
+        if(cmd == "/tasks") {
+            tg_send(chatdata, tg_tasks_text(arg));
+            return;
+        }
+
+        if(cmd == "/status") {
+            tg_send(chatdata, tg_status_text());
+            return;
+        }
+
+        if(cmd == "/allow") {
+            if(!arg) {
+                tg_send(chatdata, "usage: /allow <chatid> [name]");
+                return;
+            }
+
+            new_id = std.int(arg);
+
+            if(new_id == 0) {
+                tg_send(chatdata, "Not a chat id: " + arg);
+                return;
+            }
+
+            if(tg_trust(new_id, who)) {
+                tg_send(chatdata, "Trusted " + std.string(new_id) + ".\nTrusted chats:\n" + tg_trusted_text());
+            }
+            else {
+                tg_send(chatdata, "Already trusted: " + std.string(new_id));
+            }
+            return;
+        }
+
+        if(cmd == "/deny") {
+            if(!arg) {
+                tg_send(chatdata, "usage: /deny <chatid>");
+                return;
+            }
+
+            if(tg_untrust(std.int(arg))) {
+                tg_send(chatdata, "Dropped " + arg + ".\nTrusted chats:\n" + tg_trusted_text());
+            }
+            else {
+                tg_send(chatdata, "Not trusted: " + arg);
+            }
+            return;
+        }
+
+        if(cmd == "/forget") {
+            tg_untrust(chat_id);
+            tg_send(chatdata, "This chat is no longer trusted. The bot ignores it until it is listed in " + tg_path + " again.");
+            return;
+        }
+
+        tg_send(chatdata, "Unknown command. /help");
+    }
+
+    tg_enqueue(chatdata, txt)
+    {
+        cs = std.critical_section_named(tg_lock);
+        tg_queue.push_back([chatdata = chatdata, text = std.string(txt)]);
+        cs.release();
+    }
+
+    // one worker thread: sends queued event notifications, then runs one
+    // router-agent turn. Telegram HTTP never happens on the shizonet thread.
+    tg_worker()
+    {
+        for(tg_running) {
+            sent = tg_flush_out();
+
+            if(tg_queue.size()) {
+                tg_run_turn();
+                continue;
+            }
+
+            if(!sent) {
+                std.sleep(100);
+            }
+        }
+    }
+
+    tg_run_turn()
+    {
+        cs = std.critical_section_named(tg_lock);
+        item = tg_queue[0];
+        tg_queue.erase(0);
+        cs.release();
+
+        tg_active = item.chatdata;
+        tg_acc = "";
+        tg_draft = 0;
+        tg_last_draft = std.millis();
+
+        res = None;
+        try {
+            res = route_task(std.string(item.text));
+        }
+        catch(e) {
+            res = [ok = false, error = std.string(e)];
+        }
+
+        tg_active = None;
+
+        tg_send(item.chatdata, tg_answer_text(res));
+    }
+
+    tg_flush_out()
+    {
+        n = 0;
+
+        for(tg_out.size()) {
+            cs = std.critical_section_named(tg_lock);
+            txt = tg_out[0];
+            tg_out.erase(0);
+            cs.release();
+
+            tg_broadcast(std.string(txt));
+            n++;
+        }
+
+        return n;
+    }
+
+    tg_stop_worker()
+    {
+        tg_running = false;
+
+        if(tg_thread) {
+            try {
+                tg_thread.join();
+            }
+            catch(e) {}
+            tg_thread = None;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  outbound
+    // ─────────────────────────────────────────────────────────────────────────
+
+    tg_send(chatdata, txt)
+    {
+        msg = tg_clip(txt);
+
+        if(!tg_bot) {
+            std.print("[telegram:", std.string(chatdata.chatid ?? 0), "] ", msg, "\n");
+            return false;
+        }
+
+        try {
+            tg_bot.send_rich(chatdata, [markdown = msg]);
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram] send to ", std.string(chatdata.chatid ?? 0), " failed: ", e);
+            return false;
+        }
+    }
+
+    tg_broadcast(txt)
+    {
+        msg = tg_clip(txt);
+        list = tg_chat_list();
+
+        for(i = 0; i < list.size(); i++) {
+            tg_send([chatid = std.int(list[i].chatid)], msg);
+        }
+
+        return list.size();
+    }
+
+    // queue an event notification (safe from any thread, never blocks)
+    tg_notify(txt)
+    {
+        cs = std.critical_section_named(tg_lock);
+        tg_out.push_back(std.string(txt));
+        for(tg_out.size() > TG_MAX_QUEUED_OUT) {
+            tg_out.erase(0);
+        }
+        cs.release();
+    }
+
+    tg_push_event(e)
+    {
+        msg = tg_render_event(e);
+
+        if(!msg) {
+            return;
+        }
+
+        tg_notify(msg);
+    }
+
+    // What deserves the owner's attention (the default, tg_events = "reports"):
+    //   * a task FINISHED on a node, with the node's report
+    //   * a task FAILED, and a task LOST (the node went offline with it)
+    //   * a notify from a node — its report, or its question to the owner
+    //   * a notify from the router itself (the role's notify tool)
+    // Everything else stays out of the chat: node online/offline, queued/running
+    // transitions, a stop the owner asked for, tool calls. tg_events = "all"
+    // (--verbose-events) restores the full stream.
+    tg_is_report(kind, state)
+    {
+        if(kind == "task_finished") {
+            return true;
+        }
+
+        if(kind == "notify") {
+            return true;
+        }
+
+        if(kind == "task_state") {
+            return state == "finished" || state == "failed" || state == "lost";
+        }
+
+        return false;
+    }
+
+    // The Router de-duplicates its event stream (router_api.md §Events), so a
+    // finished task arrives exactly once — as task_finished (node push) or as
+    // task_state -> finished (poller). Both render to the same one message.
+    tg_render_event(e)
+    {
+        kind = std.string(e.kind ?? "event");
+        node = std.string(e.node ?? "?");
+        task_name = std.string(e.name ?? "");
+        st = std.string(e.state ?? "");
+        rep = std.string(e.report ?? "");
+
+        if(tg_events != "all" && !tg_is_report(kind, st)) {
+            return "";
+        }
+
+        if(kind == "task_finished" || (kind == "task_state" && (st == "finished" || st == "failed" || st == "lost" || st == "stopped"))) {
+            label = "[done]";
+
+            if(st == "failed") {
+                label = "[failed]";
+            }
+            else if(st == "lost") {
+                label = "[lost]";
+            }
+            else if(st == "stopped") {
+                label = "[stopped]";
+            }
+
+            out = label + " " + node + ": task " + task_name + " " + st;
+
+            if(rep) {
+                out += "\n" + tg_clip(rep, TG_REPORT_CHARS);
+            }
+
+            return out;
+        }
+
+        if(kind == "notify") {
+            return "[notify] " + node + ": " + std.string(e.message ?? "");
+        }
+
+        if(kind == "node_state") {
+            if(e.online) {
+                return "[node] " + node + " online";
+            }
+
+            return "[node] " + node + " offline";
+        }
+
+        if(kind == "task_state") {
+            return "[" + st + "] " + node + ": task " + task_name;
+        }
+
+        return "[" + kind + "] " + node + " " + std.string(e.message ?? "");
+    }
+
+    // live progress of the current turn as a streaming draft (optional).
+    // Streaming is a nicety: NOTHING in here may ever break the turn, so the
+    // whole path is wrapped and any problem switches streaming off.
+    tg_stream_action(action)
+    {
+        if(!tg_stream || !tg_bot || !tg_active) {
+            return;
+        }
+
+        try {
+            tg_stream_inner(action);
+        }
+        catch(e) {
+            tg_stream = false;
+            std.warn("[telegram] draft streaming disabled: ", e);
+        }
+    }
+
+    // new_draft_id() has no documented return type and can hand back a number, a
+    // string, a json wrapper, None or nothing at all (it only drafts private
+    // chats). Extract a positive int from whatever shape arrives, 0 = unusable.
+    tg_draft_id(v)
+    {
+        if(std.is_none(v)) {
+            return 0;
+        }
+
+        if(std.is_json(v)) {
+            if(v.has("draft_id")) {
+                return tg_draft_id(v.draft_id);
+            }
+            if(v.has("draft")) {
+                return tg_draft_id(v.draft);
+            }
+            if(v.has("id")) {
+                return tg_draft_id(v.id);
+            }
+            if(v.size() == 1) {
+                return tg_draft_id(v[0]);
+            }
+            return 0;
+        }
+
+        if(std.is_string(v)) {
+            s = std.string(v).strip();
+
+            if(!s) {
+                return 0;
+            }
+
+            return std.int(s);
+        }
+
+        t = std.type(v);
+
+        if(t == "int" || t == "float") {
+            return std.int(v);
+        }
+
+        return 0;
+    }
+
+    tg_stream_inner(action)
+    {
+        // only the agent's own text: tool calls are plumbing, not news
+        txt = "";
+
+        if(action.text) {
+            txt = std.string(action.text);
+        }
+
+        if(!txt) {
+            return;
+        }
+
+        tg_acc += txt;
+
+        if(std.millis() - tg_last_draft < tg_draft_ms) {
+            return;
+        }
+
+        if(tg_draft <= 0) {
+            cid = std.int(tg_active.chatid ?? 0);
+            id = tg_bot.new_draft_id(cid);
+            tg_draft = tg_draft_id(id);
+
+            if(tg_draft <= 0) {
+                tg_stream = false;
+                std.warn("[telegram] no usable draft id for chat ", cid, " (got '", std.type(id), "') - streaming off");
+                return;
+            }
+        }
+
+        tg_bot.send_rich_draft(tg_active, tg_draft, [markdown = tg_clip(tg_acc)]);
+        tg_last_draft = std.millis();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  text
+    // ─────────────────────────────────────────────────────────────────────────
+
+    tg_clip(txt, max_len = 3900)
+    {
+        s = std.string(txt ?? "");
+
+        if(s.length() <= max_len) {
+            return s;
+        }
+
+        return s.substr(0, max_len) + "\n... (truncated)";
+    }
+
+    tg_welcome_text()
+    {
+        return "This chat is now the trusted chat of router '" + name + "'.\n" +
+            "Plain text is routed to the node my router agent picks. /help for the commands.\n" +
+            "Trust list: " + tg_path;
+    }
+
+    tg_help_text()
+    {
+        return "Router '" + name + "' (role " + role + ")\n" +
+            "plain text   one router-agent turn: I pick the node and delegate\n" +
+            "/nodes       the fleet: name, capabilities, load\n" +
+            "/tasks [state]  routed tasks of ALL nodes (state: open, finished, failed, stopped, lost)\n" +
+            "/status      router + trust state\n" +
+            "/id          this chat id + the trust list\n" +
+            "/allow <chatid> [name]   /deny <chatid>   /forget\n" +
+            "/help        this list\n" +
+            "You get a message when a task finishes, fails or is lost on a node (with the node's report), and when a node reports or asks something. Node online/offline, progress updates and tool calls stay out of this chat.";
+    }
+
+    tg_answer_text(res)
+    {
+        if(!std.is_json(res)) {
+            return "The router agent turn returned nothing usable.";
+        }
+
+        out = std.string(res.answer ?? "");
+
+		// a task was delegated: that is a success, whatever the turn result claims
+		if(res.routed && res.node) {
+			if(!out) {
+				out = "Routed.";
+			}
+
+			out += "\n\n[task] " + std.string(res.name ?? "") + " on " + std.string(res.node) + " — I will message you when it is done.";
+
+			return out;
+		}
+
+		if(!res.ok) {
+			return "The router agent turn failed: " + std.string(res.error ?? "no details");
+		}
+
+		if(!out) {
+			// the agent answered without routing a task (an arbitrary question is
+			// not a job): a normal answer, not a routing failure
+			out = "Nothing was routed. Ask me a job for the fleet, or use /nodes /tasks /status.";
+		}
+
+		return out;
+    }
+
+    tg_nodes_text()
+    {
+        list = nodes_summary();
+
+        if(!list.size()) {
+            return "No AI node is online right now — nothing can be routed.";
+        }
+
+        out = "Nodes (" + std.string(list.size()) + "):\n";
+
+        for(i = 0; i < list.size(); i++) {
+            n = list[i];
+            out += "- " + std.string(n.name);
+            if(n.description) {
+                out += "  " + std.string(n.description);
+            }
+            out += "\n  capabilities: " + std.string(n.capabilities) +
+                "  model: " + std.string(n.model) +
+                "  busy: " + (n.busy ? "yes" : "no") +
+                "  running: " + std.string(n.tasks_running) +
+                "  open: " + std.string(n.open_tasks) + "\n";
+        }
+
+        return out;
+    }
+
+    tg_tasks_text(filter = None)
+    {
+        want = std.string(filter ?? "").strip();
+        list = tasks_summary(want);
+
+        if(!list.size()) {
+            if(want) {
+                return "No routed tasks in state '" + want + "'.";
+            }
+            return "No routed tasks yet.";
+        }
+
+        out = "Tasks (" + std.string(list.size()) + "):\n";
+
+        for(i = 0; i < list.size(); i++) {
+            t = list[i];
+            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] on " + std.string(t.node);
+            if(t.report) {
+                out += "\n  " + tg_clip(t.report, 160);
+            }
+            if(t.last_error) {
+                out += "\n  error: " + tg_clip(t.last_error, 160);
+            }
+            out += "\n";
+        }
+
+        return out;
+    }
+
+    tg_status_text()
+    {
+        ov = get_overview();
+
+        out = "Router " + std.string(ov.name) + " (role " + std.string(ov.role) + ")\n";
+        out += "uptime: " + std.string(std.int(ov.uptime_ms / 1000)) + "s\n";
+        out += "nodes online: " + std.string(ov.nodes_online) + "\n";
+        out += "tasks open: " + std.string(ov.tasks_open) + "  mirrored: " + std.string(ov.remote_tasks.size()) + "\n";
+        out += "trusted chats:\n" + tg_trusted_text();
+        out += "trust file: " + tg_path + "\n";
+
+        return out;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  The runnable host. telegram_router.shio is a library first: including it
+//  must not start a bot (the selftest includes it), so the host only runs when
+//  this file is the entry point.
+// ─────────────────────────────────────────────────────────────────────────────
+
+tg_is_main()
+{
+    raw = std.argv(0);
+    arg0 = "";
+
+    if(raw) {
+        arg0 = std.string(raw);
+    }
+
+    if(arg0.find("telegram_router_selftest") >= 0) {
+        return false;
+    }
+
+    return arg0.find("telegram_router") >= 0;
+}
+
+// a value-less flag (--no-stream): argvoption only answers flags WITH a value
+tg_has_flag(flag)
+{
+    for(i = 1; i < std.argc(); i++) {
+        a = std.argv(i);
+        if(a && std.string(a) == std.string(flag)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+tg_host_get_cfg(cfg, cfg_path)
+{
+    if(cfg.load(cfg_path)) {
+        return true;
+    }
+
+    api_url = "";
+    auth_token = "";
+    model_name = "";
+    max_ctx = 128000;
+    max_running_agents = 4;
+
+    for(1) {
+        std.print("Enter v1 url ( e.g. http://localhost:8000 )\n");
+        api_url = std.input(">>> ");
+
+        std.print("Enter model name (OPTIONAL)\n");
+        model_name = std.input(">>> ");
+
+        std.print("Enter auth token (OPTIONAL)\n");
+        auth_token = std.input(">>> ");
+
+        std.print("Enter model context length (OPTIONAL)\n");
+        max_ctx_num = std.int(std.input(">>> "));
+        if(max_ctx_num > 0) {
+            max_ctx = max_ctx_num;
+        }
+
+        std.print("Enter max simultaneous agents (OPTIONAL)\n");
+        max_running_agents = std.int(std.input(">>> "));
+
+        api_url = api_url.removesuffix("/v1/");
+        api_url = api_url.removesuffix("/v1");
+        api_url = api_url.removesuffix("/");
+
+        if(cfg.set(api_url, auth_token, model_name, max_ctx, max_running_agents)) {
+            break;
+        }
+
+        std.print("Could not get an answer from the API.\n");
+    }
+
+    cfg.save(cfg_path);
+
+    return true;
+}
+
+if(tg_is_main()) {
+    cfg_path = std.config_path("miniagent", "default_model");
+    cfg = ModelConfig();
+
+    tg_host_get_cfg(cfg, cfg_path);
+
+    token_opt = std.argvoption("--bot-token");
+    token = "";
+    if(token_opt) {
+        token = std.string(token_opt).strip();
+    }
+    name_opt = std.argvoption("--name");
+    role_opt = std.argvoption("--role");
+    poll_opt = std.argvoption("--poll");
+    trusted_opt = std.argvoption("--trusted");
+
+    if(!token) {
+        std.print("usage: shz telegram_router.shio --bot-token <token> [--name X] [--role router] [--poll ms] [--trusted <path>] [--no-stream] [--verbose-events]\n");
+        return;
+    }
+
+    opts = [name = "TelegramRouter"];
+
+    if(name_opt) {
+        opts.name = std.string(name_opt);
+    }
+    if(role_opt) {
+        opts.role = std.string(role_opt);
+    }
+    if(poll_opt) {
+        opts.poll_ms = std.int(poll_opt);
+    }
+    if(trusted_opt) {
+        opts.trusted_chats = std.string(trusted_opt);
+    }
+    if(tg_has_flag("--no-stream")) {
+        opts.stream = false;
+    }
+    if(tg_has_flag("--verbose-events")) {
+        opts.events = "all";
+    }
+
+    bot = telegram.bot(token);
+
+    rtr = TelegramRouter(cfg, opts);
+    rtr.attach_bot(bot);
+
+    std.print("Telegram router '", rtr.name, "' up (role: ", rtr.role, ", poll: ", rtr.poll_ms, "ms)\n");
+    std.print("trusted chats: ", rtr.tg_chats.size(), "  file: ", rtr.tg_path, "\n");
+    std.print("waiting for messages... (Ctrl+C to stop)\n");
+
+    std.sleep(-1);
+
+    rtr.tg_stop_worker();
+    rtr.running = false;
+    try { rtr.stop(); } catch(e) {}
+    if(rtr.service) {
+        try { rtr.service.stop(); } catch(e) {}
+    }
+}

@@ -127,6 +127,32 @@ batch_default_concurrency = 4;
 // Per-item report size returned to the parent (the full report stays in the task record).
 batch_report_max_chars = 1500;
 
+class parallel_run_guard {
+	agt = None;
+	__init__(_agt) {
+		agt = _agt;
+		
+		shared_agents_global = std.global("shared_agents_global");
+		
+		if(!shared_agents_global.count)
+			shared_agents_global.count = 0;
+		
+		first = true;
+		for(shared_agents_global.count >= agt.model_config.max_running_agents) {
+			if(first)
+				std.print("Max running agents: " + shared_agents_global.count + " / " + agt.model_config.max_running_agents);
+				first = false;
+			std.sleep(10);
+		}
+		
+		shared_agents_global.count++;
+	}
+	__deinit__() {
+		shared_agents_global = std.global("shared_agents_global");
+		shared_agents_global.count--;
+	}
+}
+
 batch_max_parallel(agt)
 {
 	limit = batch_default_concurrency;
@@ -207,28 +233,17 @@ batch_create_child(agt, batch_goal, batch_context, batch_contract, batch_constra
 	return task;
 }
 
-// Drive one batch child until it reaches a terminal state (FINISHED / FAILED / QUESTION).
+// Drive one batch child until it reaches a terminal state (finished / failed / question).
 batch_run_child(agt, task)
 {
 	executor = task.agent;
 
 	res = None;
 
-	parent_agt = agt._parent;
-	parent_task_id = parent_agt.env.active_task.id;
-	task_lock = std.global("agent_task_lock");
-	if(parent_task_id)
-		task_lock.tasks.erase(parent_task_id);
-	if(agt.model_config.max_running_agents > 0) {
-		first = true;
-		for(task_lock.tasks.size() >= agt.model_config.max_running_agents) {
-			if(first)
-				std.print("MAX PARALLEL AGENT COUNT!");
-				first = false;
-			std.sleep(10);
-		}					
-	}
-	task_lock.tasks[task.id] = agt;
+	managed _grd = parallel_run_guard(agt);
+
+	if(agt.should_stop())
+		return;
 
 	try {
 		res = executor.task(executor.env.batch_prompt);
@@ -237,17 +252,13 @@ batch_run_child(agt, task)
 		res = None;
 	}
 	
-	task_lock.tasks.erase(task.id);
-	if(parent_task_id)
-		task_lock.tasks[parent_task_id] = parent_agt;	
-
 	executor.env.batch_runs++;
 
 	// Ran out of runs without ever signalling.
 	if(!task.finished) {
 	
 		task.finished = true;
-		task.finish_reason = "FAILED";
+		task.finish_reason = "failed";
 
 		if(!task.report)
 			task.report = "The batch child crashed or returned nothing before emitting a signal.\nManual verification of this item is required.";
@@ -260,6 +271,82 @@ batch_run_child(agt, task)
 
 add_tools(agt)
 {
+	agt.add_tool(
+		"fork",
+		"Fork yourself to save on context and on deterministic steps.\nThis creates copies of the current conversation and runs separate agents to work on different things in parallel.\nMake sure to tell your siblings what to do exactly so they dont continue on your path.\nYou will receive their aggregated results once they are finished.\nYour execution is paused until all forks finished.",
+		[
+			tasks = "&uarray(string): The tasks/messages to the siblings.",
+		],
+		[](agt, args)
+		{		
+			fork_results = [];
+			
+			for(i = 0; i < args.tasks.size(); i++) {
+				fork_results.push_back([
+					report = "Fork did not emit any reports.",
+				]);
+			}
+		
+			fork_thread = [agt, args, fork_results](task_index) {
+				
+				task = args.tasks[task_index];
+				
+				executor = agt.subagent(agt.role);
+				
+				if(agt.env.active_task)
+					executor.env.active_task = agt.env.active_task.copy();
+				
+				history = agt.history().copy();
+				
+				//Manually build single fork tool call with result here...
+				history[-1].tool_calls = [args.tool_call];
+				history.push_back(
+					[role = "tool", tool_call_id = args.tool_call.id, content = "forked_index: " + task_index]
+				);
+				
+				executor.import_history(history);
+				
+				if(agt.on_action) {
+					executor.on_action = [agt](act) {
+						agt.on_action(act);
+					};
+				}
+				
+				managed _grd = parallel_run_guard(agt);
+				
+				if(agt.should_stop())
+					return;
+				
+				std.print("\n\n---NEW FORK---\n");
+				
+				try {
+					prompt = "You are forked sibling number " + task_index + ".\nFocus only on the following part of the task only, then immediately finish with signal():\n\n" + task;
+					executor.task(prompt);
+					fork_results[task_index].report = executor.env.signal_report;
+				}
+				catch(e) {
+					fork_results[task_index].report = "This sibling died during execution.";
+				}
+			};
+			
+			fork_threads = [];
+		
+			for(i = 0; i < args.tasks.size(); i++) {
+				t = std.thread(fork_thread);
+				t.run(i);
+				fork_threads.push_back(t);
+			}
+			
+			for(i = 0; i < fork_threads.size(); i++) {
+				fork_threads[i].join();
+			}
+		
+			std.print("--- FORK finished ---");
+
+			return [results = fork_results];
+		}
+	);
+	
 	agt.add_tool(
 		"start_task",
 		"Create/delegate work, 'effort' defines the reasoning effort. Very complex tasks: high, easy or clearly defined tasks: medium, Single quick instant actions: low.",
@@ -318,21 +405,10 @@ add_tools(agt)
 				build_task_hierachy(executor)
 			);
 			
-			parent_agt = agt._parent;
-			parent_task_id = parent_agt.env.active_task.id;
-			task_lock = std.global("agent_task_lock");
-			if(parent_task_id)
-				task_lock.tasks.erase(parent_task_id);
-			if(agt.model_config.max_running_agents > 0) {
-				first = true;
-				for(task_lock.tasks.size() >= agt.model_config.max_running_agents) {
-					if(first)
-						std.print("MAX PARALLEL AGENT COUNT!");
-						first = false;
-					std.sleep(10);
-				}					
-			}
-			task_lock.tasks[task.id] = agt;
+			managed _grd = parallel_run_guard(agt);
+			
+			if(agt.should_stop())
+				return;
 			
 			std.print("\n\n---NEW TASK---\n");
 			
@@ -350,10 +426,6 @@ add_tools(agt)
 			catch(e) {
 
 			}
-			
-			task_lock.tasks.erase(task.id);
-			if(parent_task_id)
-				task_lock.tasks[parent_task_id] = parent_agt;
 			
 			if(!task.report) {
 				if(!task.milestones) {
@@ -435,21 +507,10 @@ add_tools(agt)
 				"[HIERACHY]" = hierarchy,
 			]);
 			
-			parent_agt = agt._parent;
-			parent_task_id = parent_agt.env.active_task.id;
-			task_lock = std.global("agent_task_lock");
-			if(parent_task_id)
-				task_lock.tasks.erase(parent_task_id);
-			if(agt.model_config.max_running_agents > 0) {
-				first = true;
-				for(task_lock.tasks.size() >= agt.model_config.max_running_agents) {
-					if(first)
-						std.print("MAX PARALLEL AGENT COUNT!");
-						first = false;
-					std.sleep(10);
-				}					
-			}
-			task_lock.tasks[task.id] = agt;
+			managed _grd = parallel_run_guard(agt);
+			
+			if(agt.should_stop())
+				return;
 			
 			try {
 				step_result = executor.task(prompt);
@@ -457,10 +518,6 @@ add_tools(agt)
 			catch(e) {
 				//Todo: add fail counter
 			}
-			
-			task_lock.tasks.erase(task.id);
-			if(parent_task_id)
-				task_lock.tasks[parent_task_id] = parent_agt;
 			
 			if(!task.report) {
 				if(!task.milestones) {
@@ -490,7 +547,7 @@ add_tools(agt)
 		"signal",
 		"Emit an event",
 		[
-			event = ["FINISHED", "FAILED", "QUESTION"],
+			event = ["finished", "failed", "question"],
 			report = "&string(): What to signal",
 		],
 		[](agt, args)
@@ -502,9 +559,9 @@ add_tools(agt)
 				agt.env.active_task.finish_reason = args.event;
 				agt.env.active_task.report = args.report;
 			}
-			else
-				agt.env.signal_report = args.report;
-				agt.env.signal_event = args.event;
+
+			agt.env.signal_report = args.report;
+			agt.env.signal_event = args.event;
 			
 			return "Signal sent, exit and wait for further instructions.";
 		}
@@ -523,13 +580,19 @@ add_tools(agt)
 				agt.env.active_task.milestones.push_back(args.description);
 			}
 			
+			if(std.is_function(agt.on_action)) {
+				agt.on_action([
+					milestone = args.description,
+				]);
+			}
+			
 			return "I've made the checkpoint; continue working.";
 		}
 	);
 
 	agt.add_tool(
 		"file_task_batch",
-		"**ONLY CALL THIS TOOL ONE AT A TIME, NOT IN PARALLEL!**\nCreate one independent agent task for every item matched by a path selector.\n\nThe agent provides the workload, the harness resolves 'target' with glob() semantics, snapshots the file list, creates and schedules one child task per matched file, manages concurrency internally, and aggregates the per-item results.\n\nPath selector semantics: an exact path matches that file, a directory path matches the files inside it, '*' matches everything within one directory level, '**' matches recursively across directory levels, and '?' matches a single character. Examples: 'src/', 'src/**/*.cpp', 'src/shaders/*.frag'. The selector is resolved once at batch creation into a fixed snapshot; files created, deleted or renamed afterwards do not become new batch items.\n\nThis is a WORKLOAD multiplier, not an action multiplier: every child owns the complete workload (inspect, implement, debug, test, verify) for its assigned item. Never describe a sequence of trivial actions in 'goal' and never enumerate the files in 'goal'; the harness tells each child which file it owns.\n\nA failure or question of one child does not affect the other children. The batch returns only after every matched item reached FINISHED, FAILED or QUESTION.\n\nAn empty target is not an error.",
+		"**ONLY CALL THIS TOOL ONE AT A TIME, NOT IN PARALLEL!**\nCreate one independent agent task for every item matched by a path selector.\n\nThe agent provides the workload, the harness resolves 'target' with glob() semantics, snapshots the file list, creates and schedules one child task per matched file, manages concurrency internally, and aggregates the per-item results.\n\nPath selector semantics: an exact path matches that file, a directory path matches the files inside it, '*' matches everything within one directory level, '**' matches recursively across directory levels, and '?' matches a single character. Examples: 'src/', 'src/**/*.cpp', 'src/shaders/*.frag'. The selector is resolved once at batch creation into a fixed snapshot; files created, deleted or renamed afterwards do not become new batch items.\n\nThis is a WORKLOAD multiplier, not an action multiplier: every child owns the complete workload (inspect, implement, debug, test, verify) for its assigned item. Never describe a sequence of trivial actions in 'goal' and never enumerate the files in 'goal'; the harness tells each child which file it owns.\n\nA failure or question of one child does not affect the other children. The batch returns only after every matched item reached finished, failed or question.\n\nAn empty target is not an error.",
 		[
 			target = "&string(): Path selector describing the files to process (exact path, directory, '*', '**', '?'). Resolved once into a fixed snapshot.",
 			goal = "&string(): The workload every child must complete for its assigned file. Describe the desired result, not a list of actions and not a list of files.",
@@ -574,7 +637,7 @@ add_tools(agt)
 				return [
 					batch_id = batch_id,
 					target = args.target,
-					status = "BATCH FINISHED",
+					status = "BATCH finished",
 					total = 0,
 					finished = 0,
 					failed = 0,
@@ -641,11 +704,11 @@ add_tools(agt)
 
 				status = task.finish_reason;
 				if(!status)
-					status = "FAILED";
+					status = "failed";
 
-				if(status == "FINISHED")
+				if(status == "finished")
 					finished++;
-				else if(status == "QUESTION")
+				else if(status == "question")
 					questions++;
 				else
 					failed++;
@@ -665,7 +728,7 @@ add_tools(agt)
 			return [
 				batch_id = batch_id,
 				target = args.target,
-				status = "BATCH FINISHED",
+				status = "BATCH finished",
 				total = total,
 				finished = finished,
 				failed = failed,

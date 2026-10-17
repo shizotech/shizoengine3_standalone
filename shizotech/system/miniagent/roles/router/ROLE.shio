@@ -1,0 +1,423 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Role: Router  (router_api.md §"Router role surface")
+//
+//  A thin, non-blocking receptionist for a FLEET of remote AI nodes. Exactly the
+//  ten coordination tools of the role surface exist on this role. Deliberately
+//  NOT registered: file, write, command, skill, search, taskroute, worker or
+//  task-execution tools. The router cannot investigate, plan or execute — the
+//  boundary is enforced by the runtime, not by prompt wording.
+//
+//  Difference from the receptionist role: the receptionist delegates to local
+//  Minds on ONE machine (agt.env.mind); the router delegates to remote
+//  receptionists on OTHER servers, reached over ShizoNet (agt.env.router). Every
+//  task goes to exactly one node, picked from the node table. Node events
+//  (task_finished / notify / node_state) arrive later as system events and are
+//  forwarded to the owner by the host — nothing here polls, waits or blocks.
+//
+//  Every tool call goes through the contracted Router methods only
+//  (nodes_summary, node_overview, tasks_summary, add_task, update_task, stop_task,
+//  inspect_task, notify_user) and returns immediately.
+// ═════════════════════════════════════════════════════════════════════════════
+
+ROUTER_NO_ROUTER = "No Router instance is attached to this agent (agt.env.router is empty).\nNothing can be routed. This is a host setup error: report it to the user and finish the turn.";
+
+// The shared action ring buffer (Router.last_actions is aliased into env by router_api.shio)
+router_actions(agt) {
+	if(!agt.env.last_actions) {
+		agt.env.last_actions = [];
+	}
+	return agt.env.last_actions;
+}
+
+// node names of the online nodes, straight from router.nodes_summary()
+router_node_names(router) {
+	names = [];
+
+	if(!router) {
+		return names;
+	}
+
+	summary = None;
+	try {
+		summary = router.nodes_summary();
+	}
+	catch(e) {
+		summary = None;
+	}
+
+	if(!std.is_json(summary)) {
+		return names;
+	}
+
+	for(i = 0; i < summary.size(); i++) {
+		n = summary[i];
+		if(std.is_json(n) && n.has("name") && n.name) {
+			names.push_back(std.string(n.name));
+		}
+	}
+
+	return names;
+}
+
+// canonical node name for a (case-insensitive) request, None if there is no such node
+router_match_node(router, node) {
+	want = std.string(node).strip().lowercase();
+	names = router_node_names(router);
+
+	for(i = 0; i < names.size(); i++) {
+		if(names[i].lowercase() == want) {
+			return names[i];
+		}
+	}
+
+	return None;
+}
+
+router_node_hint(router) {
+	names = router_node_names(router);
+
+	if(!names.size()) {
+		return "No AI node is online right now. Call get_nodes() to re-check. Never invent a node name.";
+	}
+
+	list = "";
+	for(i = 0; i < names.size(); i++) {
+		list += names[i];
+		if(i + 1 < names.size()) {
+			list += ", ";
+		}
+	}
+
+	return "Valid node names: " + list + ". Pick exactly one of them (see get_nodes()).";
+}
+
+add_tools(agt)
+{
+	agt.add_tool(
+		"get_nodes",
+		"Inspect the routing table: every online AI node with name, description, capabilities, tags, model, load and open tasks.\nRead-only. Use it to pick the node for a task and to check which nodes exist at all.\nThis call never wakes, invokes or runs a node, and it does not start anything.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
+		None,
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			res = None;
+			try {
+				res = agt.env.router.nodes_summary();
+			}
+			catch(e) {
+				return "The router could not read the node table: " + std.string(e);
+			}
+
+			if(std.is_json(res) && !res.size()) {
+				return "No AI node is online. Nothing can be routed right now. Tell the user; do not invent a node.";
+			}
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"get_node_overview",
+		"Live overview of ONE node: its tasks and their states, as the node reports them.\nRead-only. Use it to find the task a user is referring to on a specific node.\n'node' must be a node name exactly as listed by get_nodes.",
+		[
+			node = "&string(): The node name, taken from get_nodes.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			node = router_match_node(agt.env.router, args.node);
+
+			if(!node) {
+				return "Unknown node: '" + std.string(args.node) + "'. " + router_node_hint(agt.env.router);
+			}
+
+			res = None;
+			try {
+				res = agt.env.router.node_overview(node);
+			}
+			catch(e) {
+				return "The node '" + node + "' did not answer the overview request: " + std.string(e);
+			}
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"get_tasks",
+		"List the routed tasks of the WHOLE fleet from the router's own task mirror: taskid, node, name, state, goal, report, updates, times.\nRead-only. Use it to answer 'what is running?' across all nodes and to find the taskid of a task the user refers to (inspect_task / update_task / stop_task need that taskid).\n'state' filters: open (queued + running), finished, failed, stopped, lost, all (default). 'node' restricts the list to one node name from get_nodes.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
+		[
+			state = "string(): OPTIONAL state filter: open | finished | failed | stopped | lost | all.",
+			node = "string(): OPTIONAL node name, exactly as listed by get_nodes.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			res = None;
+			try {
+				res = agt.env.router.tasks_summary(args.state, args.node);
+			}
+			catch(e) {
+				return "The router could not read its task table: " + std.string(e);
+			}
+
+			if(std.is_json(res) && !res.size()) {
+				return "No routed tasks" + ((args.state ?? false) ? " in state '" + std.string(args.state) + "'" : "") + ((args.node ?? false) ? " on node '" + std.string(args.node) + "'" : "") + ". The router's task mirror is empty for that filter; do not invent a taskid.";
+			}
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"start_task",
+		"Route a task to exactly ONE node. Forward the user's intent as given: do NOT pre-validate feasibility, do NOT research the task, do NOT inspect anything first. The node's receptionist investigates, plans, executes and reports.\n'node' must be a name from get_nodes — never invent one.\nReturns promptly with the taskid, the task name and the node. The goal is NOT executed by this call and you must not wait for it: completion arrives later as a system event.",
+		[
+			node = "&string(): Target node name, exactly as listed by get_nodes.",
+			name = "&string(): Funny short task name for the task like 'Sexy-Sushi'.",
+			task = "&string(): Repeat the user's intention word-by-word.",
+			summary = "&string(): Short summary of the task.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			node = router_match_node(agt.env.router, args.node);
+
+			if(!node) {
+				return "Unknown node: '" + std.string(args.node) + "'. " + router_node_hint(agt.env.router) + "\nNo task was routed.";
+			}
+
+			actions = router_actions(agt);
+
+			taskname = std.string(args.name).strip() + "-" + std.random_hash(6);
+
+			taskid = None;
+			try {
+				taskid = agt.env.router.add_task(taskname, args.task, node);
+			}
+			catch(e) {
+				taskid = None;
+			}
+
+			if(!taskid) {
+				return "The node '" + node + "' did not accept the task (offline, unreachable or it refused).\nNo task was created. Report that to the user; do not claim the task is running.";
+			}
+
+			//upside down for easier handling
+			actions.insert(0, [
+				action="start_task",
+				node=node,
+				name=taskname,
+				summary=args.summary,
+				taskid=std.string(taskid),
+			]);
+
+			return [taskid=std.string(taskid), name=taskname, node=node, suggestion="Tell the user the task name and the node it runs on, keep the taskid private."];
+		}
+	);
+
+	agt.add_tool(
+		"update_task",
+		"Forward a follow-up instruction, clarification or answer to an existing routed task on its node.\n'taskid' is the taskid from start_task (private, never shown to the user).\nReturns promptly; the node processes the message in its own time.",
+		[
+			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
+		message = "&string(): The instruction or answer to forward, phrased for the node that owns the goal.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			actions = router_actions(agt);
+
+			ok = false;
+			try {
+				ok = agt.env.router.update_task(args.taskid, args.message);
+			}
+			catch(e) {
+				ok = false;
+			}
+
+			if(!ok) {
+				return "The task does not exist, has already finished, or its node is offline / has no update channel for it.\nCan only send task updates to tasks that are queued or running on an online node.\nMust create a new task.";
+			}
+
+			//upside down for easier handling
+			actions.insert(0, [
+				action="update_task",
+				message=args.message,
+				taskid=std.string(args.taskid),
+			]);
+
+			return "OK";
+		}
+	);
+
+	agt.add_tool(
+		"stop_task",
+		"Requests that a routed task on its node stops its work.\nReports only what the node confirmed: a confirmed stop is not the same as a stop request.",
+		[
+			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
+		reason = "string(): OPTIONAL short reason, kept in the router's task record.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			actions = router_actions(agt);
+
+			ok = false;
+			try {
+				ok = agt.env.router.stop_task(args.taskid);
+			}
+			catch(e) {
+				ok = false;
+			}
+
+			if(!ok) {
+				return "The task does not exist anymore, is already finished, or its node did not confirm the stop.\nDo not claim it has stopped.";
+			}
+
+			//upside down for easier handling
+			actions.insert(0, [
+				action="stop_task",
+				reason=args.reason,
+				taskid=std.string(args.taskid),
+			]);
+
+			return "OK";
+		}
+	);
+
+	agt.add_tool(
+		"inspect_task",
+		"Inspect one routed task: its mirrored state on the router plus, when its node answers, the live remote task record.\nRead-only. Never call it repeatedly to watch progress: node events arrive later as system events.",
+		[
+			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			res = None;
+			try {
+				res = agt.env.router.inspect_task(args.taskid);
+			}
+			catch(e) {
+				return "The task could not be inspected: " + std.string(e);
+			}
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
+		"get_last_actions",
+		"Retrieve the compressed list of this router's recent actions, newest first.\nUse it ONLY to resolve references such as 'do that again' or 'the one from before' when the current context does not already identify the action.\nIt identifies the action, its taskid and its node; it is not a historical search and it contains no implementation logs.",
+		[
+			limit = "int(1,100): OPTIONAL number of recent actions to return (default 20)",
+		],
+		[](agt, args)
+		{
+			limit = (args.limit ?? false) ? args.limit : 20;
+
+			actions = router_actions(agt).copy();
+
+			//the ring is newest-first already, and resize() keeps the leading
+			//(= newest) entries, so it only ever shrinks towards the request.
+			if(actions.size() > limit) {
+				actions.resize(limit);
+			}
+
+			return actions;
+		}
+	);
+
+	agt.add_tool(
+		"notify",
+		"Send a notification to the user/owner (the router forwards it to telegram, CLI or web).",
+		[
+			message = "&string(): The message (short and snappy)",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			actions = router_actions(agt);
+
+			//upside down for easier handling
+			actions.insert(0, [
+				action="notify",
+				message=args.message,
+			]);
+
+			try {
+				agt.env.router.notify_user(args.message);
+			}
+			catch(e) {
+				return "The notification could not be sent: " + std.string(e);
+			}
+
+			return "OK";
+		}
+	);
+
+	agt.add_tool(
+		"finish",
+		"End the turn and report back to the owner. Every turn ends with this call - routing, listing, answering a question, all of it.\n'report' is the text the owner (telegram, CLI, web) shows the user verbatim: answer what they asked, do not just say 'done'. An empty report is refused.",
+		[
+			report = "&string(): The answer for the user: what was routed (task name + node) or the answer to their question. Never empty.",
+		],
+		[](agt, args)
+		{
+			actions = router_actions(agt);
+
+			rep = std.string(args.report).strip();
+
+			if(!rep) {
+				return "The report must not be empty - the owner shows exactly this text to the user. Write the answer to the user's request and call finish(report) again.";
+			}
+
+			// The report IS the turn result the host shows: Router folds
+			// agent.env.reports into the result (router_api.md).
+			if(!std.is_json(agt.env.reports)) {
+				agt.env.reports = [];
+			}
+
+			agt.env.reports.push_back([
+				report = rep,
+				time = std.millis(),
+				time_str = std.timestamp(),
+			]);
+
+			//upside down for easier handling
+			actions.insert(0, [
+				action="turn_report",
+				report=rep,
+			]);
+
+			agt.stop();
+			return "OK";
+		}
+	);
+}

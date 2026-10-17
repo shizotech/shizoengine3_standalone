@@ -1,0 +1,295 @@
+
+// ============================================================================
+// curl skill — HTTP requests for the agent, one-shot and streaming
+//
+// Entry point: add_tools(agt)
+//
+// Tools:
+//   curl_request - one-shot request, returns status + body
+//   curl_start   - start a background request (streaming), returns an id
+//   curl_poll    - non-blocking: chunks that arrived since the last poll
+//   curl_wait    - blocking: wait for the request to finish
+//   curl_stop    - abort a running request, optionally close it
+//   curl_streams - list the open requests of this agent
+//   curl_upload  - multipart/form-data upload (file on disk or in memory)
+//   curl_status  - libcurl version, limits, registry state
+//
+// The library is curl_client.shio: plain shizoscript, #include it and call
+// curl_http() / curl_stream_start() directly from a script.
+// ============================================================================
+
+#include "curl_client.shio"
+
+add_tools(agt)
+{
+	// ------------------------------------------------------------------------
+	// one-shot
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"curl_request",
+		"Send one HTTP request and return the response. Runs synchronously: the tool waits for the answer.\n\n'ok' means a response ARRIVED - HTTP 404 and 500 are ok=true with that http_code. ok=false is a transport failure (dns, refused, timeout) and carries 'error'.\n\nFor a request that streams, takes long, or must not block, use curl_start + curl_poll / curl_wait.",
+		[
+			url = "&string(): The http(s) url, e.g. 'http://localhost:13337/api/health'",
+			method = "enum(GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS): OPTIONAL HTTP method (default GET)",
+			body = "string(): OPTIONAL Raw request body. For json APIs pass the json as a string.",
+			headers = "any(): OPTIONAL Request headers as json, e.g. [Authorization = \"Bearer xyz\", \"Content-Type\" = \"application/json\"]. A JSON object string like '{\"Authorization\":\"Bearer xyz\"}' is accepted too.",
+			timeout_ms = "int(100,600000): OPTIONAL Request timeout in milliseconds (default 20000)",
+			max_chars = "int(200,60000): OPTIONAL Maximum characters of the response body to return (default 20000)",
+			save_to = "string(): OPTIONAL Write the full response body to this file instead of returning it (for downloads)",
+		],
+		[](agt, args)
+		{
+			save_to = std.string(args.geti("save_to"));
+			timeout = std.int(args.geti("timeout_ms"));
+			headers = args.geti("headers");
+			method = std.string(args.geti("method"));
+			url = std.string(args.geti("url"));
+			body = std.string(args.geti("body"));
+
+			if(save_to.size())
+			{
+				r = curl_download(url, save_to, headers, timeout);
+
+				if(!r.ok)
+					return [ok = false, error = r.error, http_code = r.geti("http_code"), url = url];
+
+				return [
+					ok = true,
+					http_code = r.http_code,
+					content_type = r.content_type,
+					saved_to = r.saved_to,
+					bytes = r.bytes,
+					note = "The body was written to the file, it is not in this result.",
+				];
+			}
+
+			r = curl_http(method, url, body, headers, timeout);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, code = r.geti("code"), url = url, method = method ? method : "GET"];
+
+			max_chars = std.int(args.geti("max_chars"));
+			text = curl_skill_cut(r.body, max_chars);
+
+			res = [
+				ok = true,
+				http_code = r.http_code,
+				content_type = r.content_type,
+				body = text,
+				bytes = r.body.length(),
+			];
+
+			if(text.length() < r.body.length())
+			{
+				res.truncated = 1;
+				res.note = "Body cut at " + std.string(max_chars) + " of " + std.string(r.body.length()) + " bytes. Raise max_chars, or set save_to to write it to a file.";
+			}
+
+			if(r.http_code >= 400)
+				res.warning = "The server answered HTTP " + std.string(r.http_code) + " - the request arrived, the server rejected it.";
+
+			return res;
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// background requests: start / poll / wait / stop
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"curl_start",
+		"Start an HTTP request in the BACKGROUND and return its id right away. Chunks are buffered by a reader thread, so nothing is lost while you do something else.\n\nUse this for: long-running jobs, server-sent events / streaming endpoints, and requests you want to watch while working.\n\nThen use curl_poll (non-blocking, gives the new chunks) or curl_wait (blocks until finished). Finish with curl_stop to free it.",
+		[
+			url = "&string(): The http(s) url to request",
+			method = "enum(GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS): OPTIONAL HTTP method (default GET)",
+			body = "string(): OPTIONAL Raw request body",
+			headers = "any(): OPTIONAL Request headers as json, e.g. [Accept = \"text/event-stream\"]",
+			timeout_ms = "int(100,600000): OPTIONAL Transfer timeout in milliseconds (default 20000; a stream that must stay open needs a large value)",
+			label = "string(): OPTIONAL Short name for this request, shown in curl_streams",
+		],
+		[](agt, args)
+		{
+			r = curl_stream_start(
+				std.string(args.geti("method")),
+				std.string(args.geti("url")),
+				std.string(args.geti("body")),
+				args.geti("headers"),
+				std.int(args.geti("timeout_ms")),
+				std.string(args.geti("label"))
+			);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, open = r.geti("open")];
+
+			return r;
+		}
+	);
+
+	agt.add_tool(
+		"curl_poll",
+		"Return the chunks of a background request that arrived since the last poll. Never blocks.\n\nstatus: 'running' (more data expected), 'finished' (transfer done), 'stopped', 'error'.\nChunks are raw bytes: a chunk can end in the middle of a line, so buffer partial lines yourself when you parse line-based protocols.\n'pending' > 0 means data is buffered and not handed to you yet.",
+		[
+			id = "&string(): The id returned by curl_start",
+			max_chunks = "int(1,10000): OPTIONAL Maximum chunks to return in one call (default 100)",
+			max_chars = "int(200,60000): OPTIONAL Maximum characters of 'text' to return (default 20000)",
+		],
+		[](agt, args)
+		{
+			r = curl_stream_poll(
+				std.string(args.geti("id")),
+				std.int(args.geti("max_chunks")),
+				std.int(args.geti("max_chars"))
+			);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, id = r.geti("id"), hint = "curl_streams lists the ids that are open."];
+
+			r.text = curl_skill_cut(r.text, std.int(args.geti("max_chars")));
+			r.erase("chunks");
+			r.note = "Chunks are concatenated into 'text'. status='running' means the transfer is still going.";
+
+			if(r.dropped)
+				r.warning = std.string(r.dropped) + " chunks were dropped (buffer full). The result is incomplete - poll more often.";
+
+			return r;
+		}
+	);
+
+	agt.add_tool(
+		"curl_wait",
+		"Wait for a background request to finish (or for the timeout) and return the WHOLE buffered response.\n\nUse it when you have nothing else to do and just need the answer. Use curl_poll when you want to keep working and consume the chunks as they arrive.\n'timed_out' tells you the transfer is still running; the chunks so far are still returned.",
+		[
+			id = "&string(): The id returned by curl_start",
+			timeout_ms = "int(100,600000): OPTIONAL Maximum time to wait in milliseconds (default 30000)",
+			max_chars = "int(200,60000): OPTIONAL Maximum characters of 'text' to return (default 20000)",
+		],
+		[](agt, args)
+		{
+			r = curl_stream_wait(
+				std.string(args.geti("id")),
+				std.int(args.geti("timeout_ms")),
+				std.int(args.geti("max_chars"))
+			);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, id = r.geti("id"), hint = "curl_streams lists the ids that are open."];
+
+			r.text = curl_skill_cut(r.text, std.int(args.geti("max_chars")));
+
+			if(r.timed_out)
+				r.note = "Still running after " + std.string(r.waited_ms) + " ms. Everything received so far is in 'text'; wait again, or curl_stop it.";
+			else
+				r.note = "The transfer finished. 'text' is the whole response.";
+
+			return r;
+		}
+	);
+
+	agt.add_tool(
+		"curl_stop",
+		"Abort a background request and free it. Returns what was received so far.\n\nAlways stop streams you opened when you are done: the number of open streams is limited.",
+		[
+			id = "&string(): The id returned by curl_start",
+			close = "int(0,1): OPTIONAL 1 (default) also closes and frees the entry, 0 keeps the buffer readable",
+		],
+		[](agt, args)
+		{
+			close_flag = std.string(args.geti("close"));
+			do_close = true;
+
+			if(close_flag == "0")
+				do_close = false;
+
+			r = curl_stream_stop(std.string(args.geti("id")), do_close);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, id = r.geti("id")];
+
+			r.text = curl_skill_cut(r.text, 0);
+
+			return r;
+		}
+	);
+
+	agt.add_tool(
+		"curl_streams",
+		"List the background requests of this agent: id, label, method, url, status, buffered bytes, age. Also reports the counters and the open-stream limit.",
+		None,
+		[](agt, args)
+		{
+			r = curl_stream_list();
+
+			if(!r.streams.size())
+				return [ok = true, streams = [], open = 0, note = "No background requests open. Start one with curl_start."];
+
+			return r;
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// upload
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"curl_upload",
+		"Upload with multipart/form-data. Pass 'path' for a file on disk, or 'data' to send content from memory.\n\nReturns the server response (status + body).",
+		[
+			url = "&string(): The http(s) url that accepts the upload",
+			path = "string(): OPTIONAL Path of the file to upload",
+			data = "string(): OPTIONAL Content to upload from memory (used when path is empty)",
+			filename = "string(): OPTIONAL File name reported to the server (default 'file', or the basename of path)",
+			fieldname = "string(): OPTIONAL Form field name (default 'file')",
+			content_type = "string(): OPTIONAL MIME type of the part, e.g. 'application/json'",
+			headers = "any(): OPTIONAL Extra request headers as json (do not set Content-Type, the boundary needs it)",
+			timeout_ms = "int(100,600000): OPTIONAL Timeout in milliseconds (default 20000)",
+			max_chars = "int(200,60000): OPTIONAL Maximum characters of the response body to return",
+		],
+		[](agt, args)
+		{
+			path = std.string(args.geti("path"));
+			data = std.string(args.geti("data"));
+			url = std.string(args.geti("url"));
+			fieldname = std.string(args.geti("fieldname"));
+			filename = std.string(args.geti("filename"));
+			headers = args.geti("headers");
+			timeout = std.int(args.geti("timeout_ms"));
+			content_type = std.string(args.geti("content_type"));
+
+			if(!path.size() && !data.size())
+				return [ok = false, error = "Provide 'path' (a file on disk) or 'data' (content from memory)."];
+
+			var r = None;
+
+			if(path.size())
+				r = curl_upload_file(url, path, fieldname, headers, timeout);
+			else
+				r = curl_upload_data(url, data, filename ? filename : "upload", fieldname, content_type, headers, timeout);
+
+			if(!r.ok)
+				return [ok = false, error = r.error, code = r.geti("code"), url = url];
+
+			return [
+				ok = true,
+				http_code = r.http_code,
+				content_type = r.content_type,
+				body = curl_skill_cut(r.body, std.int(args.geti("max_chars"))),
+				sent = path.size() ? path : std.string(data.length()) + " bytes of data",
+			];
+		}
+	);
+
+	// ------------------------------------------------------------------------
+	// diagnostics
+	// ------------------------------------------------------------------------
+
+	agt.add_tool(
+		"curl_status",
+		"Report the curl setup: libcurl version, the open background requests, the buffer/timeout limits of this skill and the transport facts you need to reason about streams.\nUse it when requests keep failing or when you wonder what is still open.",
+		None,
+		[](agt, args)
+		{
+			return curl_skill_info();
+		}
+	);
+}

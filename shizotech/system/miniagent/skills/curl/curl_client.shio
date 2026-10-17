@@ -1,0 +1,841 @@
+// ============================================================================
+// curl_client.shio — HTTP library on top of the shizoscript `curl` module
+//
+//   #include "curl_client.shio"
+//
+// One-shot requests:
+//
+//   r = curl_http("GET", "https://example.com");          // [ok, http_code, body, content_type, error]
+//   r = curl_post("https://api/x", '{"a":1}', ["Content-Type" = "application/json"]);
+//
+// Streaming (start / poll / wait / stop) — the request runs in the background,
+// a reader thread drains the chunks into a buffer you can poll at your leisure:
+//
+//   s = curl_stream_start("GET", "https://api/x/events");
+//   while(!s.finished) {
+//       p = curl_stream_poll(s.id);
+//       std.print(p.text);
+//       std.sleep(100);
+//   }
+//   w = curl_stream_wait(s.id, 5000);
+//   curl_stream_close(s.id);
+//
+// Streams live in a global registry (std.global("curl_streams")) so they survive
+// a single call and are shared by the whole agent tree. Every function returns a
+// json result and never throws on network failure: ok = false carries `error`.
+//
+// Module facts this file relies on (shzmodule_curl/curl.cpp, verified):
+//   - get/post/request/delete return [ok, http_code, body, content_type];
+//     ok = 1 means "a response arrived", even for HTTP 404.
+//   - a transport failure returns [ok = 0, code, error] and does not throw.
+//   - start_stream(method, url, body?, headers?, timeout_ms?) runs in its own
+//     worker thread and returns immediately.
+//   - poll_stream() BLOCKS until the next chunk and returns None once the
+//     transfer is finished and drained. There is no non-blocking peek.
+//   - the chunk queue holds at most 256 chunks; a consumer that is too slow
+//     makes libcurl ABORT the transfer. Hence the reader thread.
+//   - a stream with timeout_ms = 0 has NO timeout at all.
+//   - defaults: follow redirects (max 10), http/https only, 10 s connect
+//     timeout; non-streaming without a timeout aborts after 300 s of no progress.
+// ============================================================================
+
+import curl;
+
+// Limits of this layer (not of the transport).
+CURL_SKILL_MAX_TEXT = 20000;          // one tool result
+CURL_SKILL_MAX_STREAMS = 8;           // concurrent background streams
+CURL_SKILL_MAX_CHUNKS = 4000;         // chunks kept per stream
+CURL_SKILL_MAX_BYTES = 4194304;       // bytes kept per stream (4 MB)
+CURL_SKILL_DEFAULT_TIMEOUT_MS = 20000;
+CURL_SKILL_MAX_TIMEOUT_MS = 600000;
+CURL_SKILL_FINISHED_TTL_MS = 120000;  // close finished streams after 2 min idle
+CURL_SKILL_STREAM_MAX_AGE_MS = 1800000;  // kill a running stream after 30 min
+CURL_SKILL_STORE = "curl_streams";
+
+// Forward declarations (shizoscript resolves calls by position in the source).
+def curl_stream_sweep(locked);
+def curl_stream_summaries();
+def curl_stream_text(id);
+def curl_stream_close(id);
+def curl_stream_get(id);
+def curl_stream_poll(id, max_chunks, max_chars);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Small helpers (never use `call() ?? default`: broken in the current compiler)
+// ─────────────────────────────────────────────────────────────────────────────
+
+curl_skill_str(value, def = "") {
+    if(std.is_none(value))
+        return def;
+
+    return std.string(value);
+}
+
+curl_skill_int(value, def = 0) {
+    if(std.is_none(value))
+        return def;
+
+    return std.int(value);
+}
+
+curl_skill_bool(value) {
+    if(std.is_none(value))
+        return json.bool(false);
+
+    if(value)
+        return json.bool(true);
+
+    return json.bool(false);
+}
+
+// Headers arrive as a json object, a json string, or nothing.
+curl_skill_headers(value) {
+    if(std.is_none(value))
+        return [];
+
+    if(std.is_json(value))
+        return value;
+
+    if(std.is_string(value)) {
+        s = std.string(value).strip();
+
+        if(s.empty())
+            return [];
+
+        j = std.json(s, true);
+
+        if(std.is_json(j))
+            return j;
+    }
+
+    return [];
+}
+
+curl_skill_url_error(url) {
+    u = curl_skill_str(url, "").strip();
+
+    if(u.empty())
+        return "Empty url.";
+
+    if(!u.starts("http://") && !u.starts("https://"))
+        return "Only http:// and https:// urls are supported, got '" + u.substr(0, 24) + "'.";
+
+    return "";
+}
+
+curl_skill_timeout(timeout_ms, streaming) {
+    t = curl_skill_int(timeout_ms, 0);
+
+    if(t <= 0)
+        t = CURL_SKILL_DEFAULT_TIMEOUT_MS;
+
+    if(t > CURL_SKILL_MAX_TIMEOUT_MS)
+        t = CURL_SKILL_MAX_TIMEOUT_MS;
+
+    return t;
+}
+
+curl_skill_cut(text, max_chars) {
+    s = std.string(text);
+    limit = curl_skill_int(max_chars, CURL_SKILL_MAX_TEXT);
+
+    if(limit <= 0)
+        limit = CURL_SKILL_MAX_TEXT;
+
+    if(s.length() <= limit)
+        return s;
+
+    return s.substr(0, limit) + "\n...[output truncated]...";
+}
+
+// curl's result shape, normalized. `c` is the curl object (for last_error).
+curl_skill_result(res, c) {
+    if(!std.is_json(res))
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = "curl returned no result."];
+
+    if(res.has("ok") && res.ok)
+        return [
+            ok = json.bool(true),
+            http_code = curl_skill_int(res.geti("http_code"), 0),
+            body = curl_skill_str(res.geti("body"), ""),
+            content_type = curl_skill_str(res.geti("content_type"), ""),
+            error = "",
+        ];
+
+    error = curl_skill_str(res.geti("error"), "");
+
+    if(!error && (c ?? false)) {
+        try {
+            error = std.string(c.last_error());
+        }
+        catch(e) {}
+    }
+
+    if(!error)
+        error = "The request failed.";
+
+    return [
+        ok = json.bool(false),
+        http_code = 0,
+        body = curl_skill_str(res.geti("body"), ""),
+        content_type = "",
+        error = error,
+        code = curl_skill_int(res.geti("code"), 0),
+    ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+curl_skill_store() {
+    store = std.global(CURL_SKILL_STORE);
+
+    if(!store.streams)
+        store.streams = [];
+
+    if(!store.counters)
+        store.counters = [started = 0, finished = 0, stopped = 0, closed = 0, requests = 0];
+
+    return store;
+}
+
+// Tool callbacks run on their own threads, so the registry is accessed
+// concurrently. A named critical section is shared by every script location
+// using the same name, which is exactly what the registry needs.
+curl_skill_lock() {
+    return std.critical_section_named(CURL_SKILL_STORE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  One-shot requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+curl_http(method, url, body = "", headers = None, timeout_ms = 0) {
+    url_error = curl_skill_url_error(url);
+
+    if(url_error)
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = url_error];
+
+    m = curl_skill_str(method, "GET").uppercase();
+
+    if(m.empty())
+        m = "GET";
+
+    t = curl_skill_timeout(timeout_ms, false);
+
+    c = curl.curl();
+    res = None;
+
+    try {
+        res = c.request(m, curl_skill_str(url, ""), curl_skill_str(body, ""), curl_skill_headers(headers), t);
+    }
+    catch(e) {
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = "curl exception: " + std.string(e)];
+    }
+
+    out = curl_skill_result(res, c);
+
+    store = curl_skill_store();
+    store.counters.requests++;
+
+    return out;
+}
+
+curl_get(url, headers = None, timeout_ms = 0) {
+    return curl_http("GET", url, "", headers, timeout_ms);
+}
+
+curl_post(url, payload = "", headers = None, timeout_ms = 0) {
+    return curl_http("POST", url, payload, headers, timeout_ms);
+}
+
+curl_put(url, payload = "", headers = None, timeout_ms = 0) {
+    return curl_http("PUT", url, payload, headers, timeout_ms);
+}
+
+curl_patch(url, payload = "", headers = None, timeout_ms = 0) {
+    return curl_http("PATCH", url, payload, headers, timeout_ms);
+}
+
+curl_delete(url, headers = None, timeout_ms = 0) {
+    return curl_http("DELETE", url, "", headers, timeout_ms);
+}
+
+curl_head(url, headers = None, timeout_ms = 0) {
+    return curl_http("HEAD", url, "", headers, timeout_ms);
+}
+
+// GET and write the body to a file. Returns without the body in the result.
+curl_download(url, path, headers = None, timeout_ms = 0) {
+    r = curl_get(url, headers, timeout_ms);
+
+    if(!r.ok)
+        return r;
+
+    try {
+        fileio.write_string(std.string(path), r.body);
+    }
+    catch(e) {
+        return [ok = json.bool(false), http_code = r.http_code, body = "", content_type = r.content_type, error = "Cannot write '" + std.string(path) + "': " + std.string(e)];
+    }
+
+    return [
+        ok = json.bool(true),
+        http_code = r.http_code,
+        content_type = r.content_type,
+        saved_to = std.string(path),
+        bytes = r.body.length(),
+        error = "",
+    ];
+}
+
+// multipart/form-data upload of a file on disk.
+curl_upload_file(url, path, fieldname = "file", headers = None, timeout_ms = 0) {
+    url_error = curl_skill_url_error(url);
+
+    if(url_error)
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = url_error];
+
+    if(!fileio.exists(std.string(path)))
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = "File not found: " + curl_skill_str(path)];
+
+    t = curl_skill_timeout(timeout_ms, false);
+    c = curl.curl();
+    res = None;
+
+    try {
+        res = c.post_file(curl_skill_str(url, ""), std.string(path), curl_skill_str(fieldname, "file"), curl_skill_headers(headers), t);
+    }
+    catch(e) {
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = "curl exception: " + std.string(e)];
+    }
+
+    return curl_skill_result(res, c);
+}
+
+// multipart/form-data upload from memory.
+curl_upload_data(url, data, filename = "file", fieldname = "file", content_type = "", headers = None, timeout_ms = 0) {
+    url_error = curl_skill_url_error(url);
+
+    if(url_error)
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = url_error];
+
+    t = curl_skill_timeout(timeout_ms, false);
+    c = curl.curl();
+    res = None;
+
+    try {
+        res = c.post_file_data(
+            curl_skill_str(url, ""),
+            curl_skill_str(data, ""),
+            curl_skill_str(filename, "file"),
+            curl_skill_str(fieldname, "file"),
+            curl_skill_headers(headers),
+            curl_skill_str(content_type, ""),
+            t
+        );
+    }
+    catch(e) {
+        return [ok = json.bool(false), http_code = 0, body = "", content_type = "", error = "curl exception: " + std.string(e)];
+    }
+
+    return curl_skill_result(res, c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Streaming: start / poll / wait / stop / close
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Background reader: poll_stream() blocks until the next chunk, so this loop is
+// the cheapest way to keep the libcurl queue drained. Not draining it aborts the
+// transfer after 256 queued chunks.
+curl_stream_reader(entry) {
+    c = entry.curl;
+    chunks = entry.chunks;
+    bytes = 0;
+
+    for(1) {
+        chunk = None;
+
+        try {
+            chunk = c.poll_stream();
+        }
+        catch(e) {
+            entry.error = "poll_stream failed: " + std.string(e);
+            break;
+        }
+
+        if(std.is_none(chunk))
+            break;
+
+        s = std.string(chunk);
+
+        if(s.empty())
+            continue;
+
+        chunks.push_back(s);
+        entry.bytes += s.length();
+        entry.total += 1;
+        entry.updated = std.millis();
+
+        // Keep the buffer bounded: drop the oldest chunks, the cursor is absolute.
+        for(chunks.size() > CURL_SKILL_MAX_CHUNKS || entry.bytes > CURL_SKILL_MAX_BYTES) {
+            if(!chunks.size())
+                break;
+
+            old = std.string(chunks[0]);
+            chunks.erase(0);
+            entry.dropped += 1;
+            entry.dropped_bytes += old.length();
+        }
+
+        if(entry.status == "stopped")
+            break;
+    }
+
+    if(entry.status != "stopped") {
+        entry.status = "finished";
+
+        if(!entry.error.size()) {
+            try {
+                last = std.string(c.last_error());
+                if(last.size())
+                    entry.error = last;
+            }
+            catch(e) {}
+        }
+    }
+
+    entry.finished = json.bool(true);
+    entry.updated = std.millis();
+
+    store = curl_skill_store();
+    store.counters.finished++;
+}
+
+curl_stream_start(method, url, body = "", headers = None, timeout_ms = 0, label = "") {
+    url_error = curl_skill_url_error(url);
+
+    if(url_error)
+        return [ok = json.bool(false), error = url_error];
+
+    managed lock = curl_skill_lock();
+
+    store = curl_skill_store();
+
+    curl_stream_sweep(true);
+
+    if(store.streams.size() >= CURL_SKILL_MAX_STREAMS)
+        return [
+            ok = json.bool(false),
+            error = "Too many open streams (" + std.string(store.streams.size()) + " of " + std.string(CURL_SKILL_MAX_STREAMS) + "). Close one with curl_stop / curl_stream_close.",
+            open = curl_stream_summaries(),
+        ];
+
+    m = curl_skill_str(method, "GET").uppercase();
+
+    if(m.empty())
+        m = "GET";
+
+    t = curl_skill_timeout(timeout_ms, true);
+    id = "req_" + std.random_hash(12);
+
+    entry = [
+        id = id,
+        label = curl_skill_str(label, ""),
+        method = m,
+        url = curl_skill_str(url, ""),
+        timeout_ms = t,
+        created = std.millis(),
+        updated = std.millis(),
+        status = "running",
+        finished = json.bool(false),
+        error = "",
+        chunks = [],
+        bytes = 0,
+        total = 0,
+        dropped = 0,
+        dropped_bytes = 0,
+        cursor = 0,
+        curl = curl.curl(),
+    ];
+
+    try {
+        entry.curl.start_stream(m, entry.url, curl_skill_str(body, ""), curl_skill_headers(headers), t);
+    }
+    catch(e) {
+        return [ok = json.bool(false), error = "start_stream failed: " + std.string(e)];
+    }
+
+    // Detached reader thread. Do NOT store the std.thread object in the entry:
+    // a thread object that is parked in a global json and run later dies with
+    // "Global scope root mismatch when creating routine".
+    store.streams[id] = entry;
+    store.counters.started++;
+
+    // Detached reader thread. It must be a lambda created HERE: a
+    // std.thread(<named function>) started from a skill tool callback dies with
+    // "Global scope root mismatch when creating routine", and the thread object
+    // must never be parked in the global registry json.
+    read_fn = [entry]() {
+        curl_stream_reader(entry);
+    };
+
+    std.thread(read_fn).run();
+
+    return [
+        ok = json.bool(true),
+        id = id,
+        status = "running",
+        method = m,
+        url = entry.url,
+        label = entry.label,
+        timeout_ms = t,
+        note = "The request runs in the background. Use curl_poll / curl_wait with this id.",
+    ];
+}
+
+// The entry of a stream, or None.
+curl_stream_get(id) {
+    managed lock = curl_skill_lock();
+
+    store = curl_skill_store();
+    key = curl_skill_str(id, "");
+
+    if(!key || !store.streams.has(key))
+        return None;
+
+    return store.streams[key];
+}
+
+curl_stream_exists(id) {
+    return curl_stream_get(id) ? true : false;
+}
+
+// Chunks that arrived since the last call. Never blocks.
+curl_stream_poll(id, max_chunks = 100, max_chars = 0) {
+    entry = curl_stream_get(id);
+
+    if(!entry)
+        return [ok = json.bool(false), error = "No stream with that id (it was closed, or the id is wrong).", id = curl_skill_str(id)];
+
+    chunks = entry.chunks;
+
+    limit_chunks = curl_skill_int(max_chunks, 100);
+
+    if(limit_chunks < 1)
+        limit_chunks = 100;
+
+    limit_chars = curl_skill_int(max_chars, 0);
+
+    if(limit_chars <= 0)
+        limit_chars = CURL_SKILL_MAX_TEXT;
+
+    start = entry.cursor - entry.dropped;
+
+    if(start < 0)
+        start = 0;
+
+    out = [];
+    chars = 0;
+    taken = 0;
+
+    for(i = start; i < chunks.size() && taken < limit_chunks; i++) {
+        s = std.string(chunks[i]);
+
+        if(taken && chars + s.length() > limit_chars)
+            break;
+
+        out.push_back(s);
+        chars += s.length();
+        taken++;
+    }
+
+    entry.cursor = entry.dropped + taken;
+    entry.updated = std.millis();
+
+    text = "";
+    for(i = 0; i < out.size(); i++)
+        text += out[i];
+
+    return [
+        ok = json.bool(true),
+        id = entry.id,
+        label = entry.label,
+        status = entry.status,
+        finished = entry.finished,
+        new_chunks = out.size(),
+        text = text,
+        chunks = out,
+        bytes = entry.bytes,
+        buffered = chunks.size(),
+        pending = chunks.size() - (entry.cursor - entry.dropped),
+        dropped = entry.dropped,
+        dropped_bytes = entry.dropped_bytes,
+        error = entry.error,
+    ];
+}
+
+// Block until the stream is finished or the timeout hits, then return the WHOLE
+// buffer (not only the new chunks) — the poll cursor stays where it was.
+curl_stream_wait(id, timeout_ms = 30000, max_chars = 0) {
+    entry = curl_stream_get(id);
+
+    if(!entry)
+        return [ok = json.bool(false), error = "No stream with that id (it was closed, or the id is wrong).", id = curl_skill_str(id)];
+
+    t = curl_skill_int(timeout_ms, 30000);
+
+    if(t < 100)
+        t = 100;
+
+    if(t > CURL_SKILL_MAX_TIMEOUT_MS)
+        t = CURL_SKILL_MAX_TIMEOUT_MS;
+
+    waited = 0;
+    deadline = std.millis() + t;
+
+    for(!entry.finished && std.millis() < deadline) {
+        std.sleep(25);
+        waited = t - (deadline - std.millis());
+    }
+
+    chunks = entry.chunks;
+    text = curl_stream_text(id);
+
+    limit_chars = curl_skill_int(max_chars, 0);
+
+    if(limit_chars > 0 && text.length() > limit_chars)
+        text = text.substr(0, limit_chars);
+
+    return [
+        ok = json.bool(true),
+        id = entry.id,
+        label = entry.label,
+        status = entry.status,
+        finished = entry.finished,
+        text = text,
+        bytes = entry.bytes,
+        buffered = chunks.size(),
+        dropped = entry.dropped,
+        dropped_bytes = entry.dropped_bytes,
+        error = entry.error,
+        timed_out = json.bool(!entry.finished),
+        waited_ms = waited < 0 ? 0 : waited,
+        note = "'text' is the whole buffer, the poll cursor is untouched.",
+    ];
+}
+
+// Ask libcurl to abort the transfer, then close the entry.
+curl_stream_stop(id, do_close = true) {
+    entry = curl_stream_get(id);
+
+    if(!entry)
+        return [ok = json.bool(false), error = "No stream with that id.", id = curl_skill_str(id)];
+
+    signaled = 0;
+
+    try {
+        signaled = std.int(entry.curl.stop_stream());
+    }
+    catch(e) {
+        entry.error = "stop_stream failed: " + std.string(e);
+    }
+
+    entry.status = "stopped";
+    entry.updated = std.millis();
+
+    // The reader exits when poll_stream() returns None.
+    deadline = std.millis() + 3000;
+    for(!entry.finished && std.millis() < deadline)
+        std.sleep(20);
+
+    entry.finished = json.bool(true);
+
+    store = curl_skill_store();
+    store.counters.stopped++;
+
+    text = curl_stream_text(id);
+
+    result = [
+        ok = json.bool(true),
+        id = entry.id,
+        status = "stopped",
+        stop_signaled = json.bool(signaled != 0),
+        bytes = entry.bytes,
+        buffered = entry.chunks.size(),
+        text = curl_skill_cut(text, CURL_SKILL_MAX_TEXT),
+        error = entry.error,
+    ];
+
+    if(do_close)
+        curl_stream_close(id);
+
+    return result;
+}
+
+// Everything currently buffered, as one string.
+curl_stream_text(id) {
+    entry = curl_stream_get(id);
+
+    if(!entry)
+        return "";
+
+    out = "";
+    chunks = entry.chunks;
+
+    for(i = 0; i < chunks.size(); i++)
+        out += std.string(chunks[i]);
+
+    return out;
+}
+
+// Drop the entry (and with it the curl object and the reader thread reference).
+curl_stream_close(id) {
+    managed lock = curl_skill_lock();
+
+    store = curl_skill_store();
+    key = curl_skill_str(id, "");
+
+    if(!key || !store.streams.has(key))
+        return json.bool(false);
+
+    entry = store.streams[key];
+
+    try {
+        entry.curl.stop_stream();
+    }
+    catch(e) {}
+
+    store.streams.erase(key);
+    store.counters.closed++;
+
+    return json.bool(true);
+}
+
+curl_stream_summary(entry) {
+    chunks = entry.chunks;
+
+    return [
+        id = entry.id,
+        label = entry.label,
+        method = entry.method,
+        url = entry.url,
+        status = entry.status,
+        finished = entry.finished,
+        chunks = chunks.size(),
+        pending = chunks.size() - (entry.cursor - entry.dropped),
+        bytes = entry.bytes,
+        dropped = entry.dropped,
+        age_ms = std.millis() - entry.created,
+        idle_ms = std.millis() - entry.updated,
+        error = entry.error,
+    ];
+}
+
+curl_stream_summaries() {
+    managed lock = curl_skill_lock();
+
+    store = curl_skill_store();
+    list = [];
+
+    for(i = 0; i < store.streams.size(); i++) {
+        key = store.streams.key(i);
+        list.push_back(curl_stream_summary(store.streams[key]));
+    }
+
+    return list;
+}
+
+curl_stream_list() {
+    return [
+        ok = json.bool(true),
+        streams = curl_stream_summaries(),
+        open = curl_skill_store().streams.size(),
+        max_streams = CURL_SKILL_MAX_STREAMS,
+        counters = curl_skill_store().counters,
+    ];
+}
+
+// Close finished streams that nobody looked at, and kill ancient running ones.
+// `locked` = the caller already holds the registry lock.
+curl_stream_sweep(locked = false) {
+    if(!locked) {
+        managed lock = curl_skill_lock();
+        return curl_stream_sweep(true);
+    }
+
+    store = curl_skill_store();
+    now = std.millis();
+    closed = [];
+
+    for(i = 0; i < store.streams.size(); i++) {
+        key = store.streams.key(i);
+        entry = store.streams[key];
+        age = now - entry.created;
+        idle = now - entry.updated;
+
+        kill = false;
+
+        if(entry.finished && idle > CURL_SKILL_FINISHED_TTL_MS)
+            kill = true;
+
+        if(age > CURL_SKILL_STREAM_MAX_AGE_MS)
+            kill = true;
+
+        if(kill) {
+            try {
+                entry.curl.stop_stream();
+            }
+            catch(e) {}
+
+            store.streams.erase(key);
+            closed.push_back(key);
+            i--;
+        }
+    }
+
+    return closed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+
+curl_skill_info() {
+    version = "";
+
+    try {
+        version = std.string(curl.curl().version());
+    }
+    catch(e) {
+        version = "unavailable";
+    }
+
+    store = curl_skill_store();
+
+    return [
+        ok = json.bool(true),
+        libcurl = version,
+        open_streams = store.streams.size(),
+        max_streams = CURL_SKILL_MAX_STREAMS,
+        streams = curl_stream_summaries(),
+        counters = store.counters,
+        limits = [
+            result_max_chars = CURL_SKILL_MAX_TEXT,
+            stream_max_chunks = CURL_SKILL_MAX_CHUNKS,
+            stream_max_bytes = CURL_SKILL_MAX_BYTES,
+            default_timeout_ms = CURL_SKILL_DEFAULT_TIMEOUT_MS,
+            max_timeout_ms = CURL_SKILL_MAX_TIMEOUT_MS,
+            finished_ttl_ms = CURL_SKILL_FINISHED_TTL_MS,
+            stream_max_age_ms = CURL_SKILL_STREAM_MAX_AGE_MS,
+        ],
+        transport = [
+            chunk_queue_limit = 256,
+            note = "libcurl aborts a stream whose chunks are not drained; this library reads them in a background thread.",
+            follows_redirects = json.bool(true),
+            schemes = "http, https",
+        ],
+    ];
+}

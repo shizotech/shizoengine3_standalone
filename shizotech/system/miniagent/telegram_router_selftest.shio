@@ -1,0 +1,857 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  telegram_router_selftest.shio — the Telegram front end, end to end, no LLM
+//
+//  Usage:  shz telegram_router_selftest.shio
+//
+//  Passes when it prints "ALL PASSED" and never "FAIL" (exit code 0).
+//
+//  It drives the real TelegramRouter (telegram_router.shio, class
+//  TelegramRouter : Router) against a FAKE telegram bot (records every send) and
+//  real AI nodes (ai_node_attach on a stub Megamind host), plus the real
+//  roles/router tool callbacks driven by a stub agent that plays the model.
+//
+//  Covered:
+//    * trusted_chats bootstrap: no file -> the first chat is trusted and written
+//    * every other chat is ignored (no answer, no routing)
+//    * /allow /deny /forget /id /nodes /tasks /status
+//    * plain text = one router-agent turn, the answer goes back to that chat,
+//      progress streams as a draft
+//    * a task finished on ANY node is a notification in EVERY trusted chat,
+//      carrying the report, exactly once per chat (the Router de-duplicates)
+//    * node notify + node online/offline are forwarded
+//    * a reload reads the trust file from disk
+//
+//  ShizoNet on one machine: the Router process owns UDP 6454, the stub nodes get
+//  6455 / 6456 (see .megamind/router_node_network/notes).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "telegram_router"
+
+ROUTER_WIRE = "SHZ_TG_TEST";
+NODE_A_WIRE = "SHZ_TG_GPU";
+NODE_B_WIRE = "SHZ_TG_WEB";
+NODE_A_PORT = 6455;
+NODE_B_PORT = 6456;
+
+GPU_NAME = "GPUBox";
+WEB_NAME = "WebBox";
+
+CHAT_A = 111111;
+CHAT_B = 222222;
+
+TRUSTED_FILE = "_tg_selftest_trusted.json";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Harness
+// ─────────────────────────────────────────────────────────────────────────────
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+    if(cond) {
+        passed++;
+        std.print("  PASS  ", name, "\n");
+    }
+    else {
+        failed++;
+        std.print("  FAIL  ", name, "  -> ", info, "\n");
+    }
+}
+
+wait_for(cond, ms) {
+    for(w = 0; w < ms / 10; w++) {
+        if(cond())
+            return true;
+
+        std.sleep(10);
+    }
+
+    return cond();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  tg_fake_bot — the telegram.bot surface the front end uses, recording sends
+// ─────────────────────────────────────────────────────────────────────────────
+
+class tg_fake_bot {
+
+    sent = [];              // [[chatid, text]]
+    drafts = [];
+    on_any_message = None;
+    next_draft = 1;
+    draft_id_mode = "int";      // int | json | string | none | raise — the shapes
+                                // new_draft_id can hand back (undocumented return)
+
+    send_rich(chatdata, options) {
+        cid = 0;
+
+        if(std.is_json(chatdata)) {
+            cid = std.int(chatdata.chatid ?? 0);
+        }
+        else {
+            cid = std.int(chatdata);
+        }
+
+        sent.push_back([chatid = cid, text = std.string(options.markdown ?? "")]);
+
+        return [ok = true, message_id = sent.size()];
+    }
+
+    send_rich_draft(chatdata, draft_id, options) {
+        // the real module rejects a missing / zero id with exactly this message
+        if(!draft_id) {
+            std.runtime_error("send_rich_draft: draft_id must be non-zero, using a fresh per-chat draft id");
+        }
+
+        d = std.int(draft_id);
+
+        if(d <= 0) {
+            std.runtime_error("send_rich_draft: draft_id must be non-zero, using a fresh per-chat draft id");
+        }
+
+        cid = 0;
+
+        if(std.is_json(chatdata)) {
+            cid = std.int(chatdata.chatid ?? 0);
+        }
+        else {
+            cid = std.int(chatdata);
+        }
+
+        drafts.push_back([chatid = cid, draft = d, text = std.string(options.markdown ?? "")]);
+
+        return [ok = true];
+    }
+
+    new_draft_id(chatid) {
+        if(draft_id_mode == "raise") {
+            std.runtime_error("new_draft_id: this chat cannot be drafted");
+        }
+
+        if(draft_id_mode == "none") {
+            return None;
+        }
+
+        if(draft_id_mode == "json") {
+            return [draft_id = 4242];
+        }
+
+        if(draft_id_mode == "string") {
+            return "4242";
+        }
+
+        next_draft++;
+        return next_draft;
+    }
+
+    count_for(chatid) {
+        want = std.int(chatid);
+        n = 0;
+
+        for(i = 0; i < sent.size(); i++) {
+            if(std.int(sent[i].chatid) == want) {
+                n++;
+            }
+        }
+
+        return n;
+    }
+
+    has_for(chatid, needle) {
+        want = std.int(chatid);
+
+        for(i = 0; i < sent.size(); i++) {
+            if(std.int(sent[i].chatid) == want && std.string(sent[i].text).contains(needle)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    count_with(needle) {
+        n = 0;
+
+        for(i = 0; i < sent.size(); i++) {
+            if(std.string(sent[i].text).contains(needle)) {
+                n++;
+            }
+        }
+
+        return n;
+    }
+
+    last_for(chatid) {
+        want = std.int(chatid);
+        out = "";
+
+        for(i = 0; i < sent.size(); i++) {
+            if(std.int(sent[i].chatid) == want) {
+                out = std.string(sent[i].text);
+            }
+        }
+
+        return out;
+    }
+
+    clear() {
+        sent = [];
+        drafts = [];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  tg_stub_host — the Megamind surface of a node, without an LLM
+// ─────────────────────────────────────────────────────────────────────────────
+
+class tg_stub_receptionist {
+
+    prompts = [];
+
+    send_prompt(msg) {
+        prompts.push_back(std.string(msg));
+        return [ok = true, reports = [[report = "injected: " + std.string(msg)]], execution_time_ms = 1];
+    }
+
+    stop() { }
+
+    wait_finish() { }
+
+    has(msg) {
+        for(i = 0; i < prompts.size(); i++) {
+            if(prompts[i] == std.string(msg))
+                return true;
+        }
+
+        return false;
+    }
+}
+
+class tg_stub_host {
+
+    running = true;
+
+    _receptionist_active = false;
+    request_queue = [];
+    worker_threads = [[], [], []];
+    receptionist = tg_stub_receptionist();
+
+    tasks = [];
+    tasks_scheduled = [];
+    tasks_finished = [];
+    tasks_failed = [];
+
+    _notify_cb = None;
+    _task_finish_cb = None;
+
+    on_notify(cb) { _notify_cb = cb; }
+    on_task_finished(cb) { _task_finish_cb = cb; }
+    on_action(cb) { }
+
+    notify_user(msg) {
+        if(_notify_cb)
+            _notify_cb(std.string(msg));
+    }
+
+    request(prompt, on_finish_cb = None, on_action_cb = None) {
+        _receptionist_active = true;
+
+        result = [
+            ok = true,
+            reports = [[report = "stub answer: " + std.string(prompt), time = std.millis(), time_str = std.timestamp()]],
+            execution_time_ms = 1,
+        ];
+
+        _receptionist_active = false;
+
+        if(on_finish_cb)
+            on_finish_cb(result);
+
+        return result;
+    }
+
+    get_overview() {
+        return [
+            tasks = tasks,
+            tasks_scheduled = tasks_scheduled,
+            tasks_finished = tasks_finished,
+            tasks_failed = tasks_failed,
+        ];
+    }
+
+    add_task(name, goal) {
+        taskid = std.random_hash(16);
+        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+        return taskid;
+    }
+
+    stop_task(taskid) {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid) {
+                tasks_scheduled.erase(i);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    update_task(taskid, message) {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid) {
+                if(!tasks_scheduled[i].user_updates)
+                    tasks_scheduled[i].user_updates = [];
+
+                tasks_scheduled[i].user_updates.push_back(std.string(message));
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    inspect_task(taskid) {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid)
+                return tasks_scheduled[i];
+        }
+
+        for(i = 0; i < tasks_finished.size(); i++) {
+            if(tasks_finished[i].taskid == taskid)
+                return tasks_finished[i];
+        }
+
+        return "Not found.";
+    }
+
+    // move a planned task to finished and fire the Megamind hook (-> ai_event)
+    finish_task(taskid, state = "finished", report = "stub report") {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid) {
+                task = tasks_scheduled[i];
+                tasks_scheduled.erase(i);
+                task.state = state;
+                task.report = report;
+                tasks_finished.push_back(task);
+
+                if(_task_finish_cb)
+                    _task_finish_cb(task);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  tg_stub_agent — plays the router AGENT turn (the model): reads get_nodes(),
+//  picks one node, delegates with the role's start_task tool.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class tg_stub_agent {
+
+    env = [];
+    on_action = None;
+
+    prompts = [];
+    turns = 0;
+    routed = [];
+    seen_table = false;
+
+    router = None;
+    callbacks = None;
+    decisions = [];
+
+    __init__(router, callbacks, decisions) {
+        this.router = router;
+        this.callbacks = callbacks;
+        this.decisions = decisions;
+    }
+
+    set_reasoning_effort(effort) { }
+    clear_chat() { }
+    stop() { }
+    wait_finish() { }
+
+    node_online(name) {
+        list = router.nodes_summary();
+        for(i = 0; i < list.size(); i++) {
+            if(list[i].name == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    task(prompt) {
+        turns++;
+        prompts.push_back(std.string(prompt));
+
+        // miniagent resets env.reports at the start of every turn
+        if(std.is_json(env)) {
+            env.reports = [];
+        }
+
+        // an arbitrary question: the agent ANSWERS and routes nothing. That is a
+        // normal turn, not a failure (router_api.md: ok vs routed).
+        if(std.string(prompt).starts("QUESTION:")) {
+            if(on_action) {
+                on_action([text = "thinking about the question"]);
+            }
+
+            nodes = router.nodes_summary();
+            return this.report("the fleet has " + std.string(nodes.size()) + " nodes and nothing to do right now");
+        }
+
+        if(on_action) {
+            on_action([text = "router agent thinking about: " + std.string(prompt)]);
+            on_action([tool_start = [id = "t1", name = "get_nodes", args = []]]);
+            on_action([tool = [id = "t1", name = "get_nodes", result = "[]"]]);
+        }
+
+        table = callbacks["get_nodes"]([]);
+        if(std.string(table).length() > 0) {
+            seen_table = true;
+        }
+
+        node = "";
+        for(i = 0; i < decisions.size(); i++) {
+            cue = std.string(decisions[i].cue);
+            cand = std.string(decisions[i].node);
+            if(std.string(prompt).find(cue) >= 0 && node_online(cand)) {
+                node = cand;
+                break;
+            }
+        }
+
+        if(!node) {
+            return this.report("no node picked for this");
+        }
+
+        res = callbacks["start_task"]([
+            node = node,
+            name = "AgentPick",
+            task = std.string(prompt),
+            summary = "stub agent turn",
+        ]);
+
+        if(std.is_json(res) && std.string(res.taskid ?? "").length() > 0) {
+            routed.push_back([node = node, taskid = std.string(res.taskid)]);
+        }
+
+        return this.report("picked " + node);
+    }
+
+    // The real role ends every turn with finish(report) (the answer lands in
+    // agent.env.reports) and miniagent then hands back
+    // [ok = false, error = "Agent returned nothing (maybe crashed)."] for the
+    // stopped turn. Router._turn_result must fold the report in - reproduced here
+    // on purpose, because that is exactly the live bug the owner reported.
+    report(rep) {
+        if(callbacks.has("finish")) {
+            callbacks["finish"]([report = rep]);
+        }
+
+        return [ok = false, error = "Agent returned nothing (maybe crashed).", execution_time_ms = 1];
+    }
+}
+
+tg_stop_router(r) {
+    r.tg_stop_worker();
+    r.running = false;
+
+    try { r.stop(); } catch(e) {}
+
+    if(r.service) {
+        try { r.service.stop(); } catch(e) {}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Fixture: no trust file, Router first (UDP 6454), then the two stub nodes
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.print("telegram_router_selftest: fake bot + router + 2 stub AI nodes\n");
+
+if(fileio.exists(TRUSTED_FILE)) {
+    fileio.remove(TRUSTED_FILE);
+}
+
+bot = tg_fake_bot();
+
+rtr = TelegramRouter(
+    ModelConfig(),
+    [
+        name = ROUTER_WIRE,
+        role = "receptionist",
+        description = "telegram selftest front",
+        trusted_chats = TRUSTED_FILE,
+        poll_ms = 100,
+        draft_ms = 0,
+    ]
+);
+
+rtr.attach_bot(bot);
+
+hostA = tg_stub_host();
+hostB = tg_stub_host();
+
+nodeA = shizonet.server(NODE_A_WIRE, NODE_A_PORT);
+svcA = ai_node_attach(nodeA, hostA, [name = GPU_NAME, description = "cuda training and gpu number crunching", capabilities = ["gpu", "cuda", "training"]]);
+
+nodeB = shizonet.server(NODE_B_WIRE, NODE_B_PORT);
+svcB = ai_node_attach(nodeB, hostB, [name = WEB_NAME, description = "web scraping and http requests", capabilities = ["web", "http", "scrape"]]);
+
+found = wait_for([]() { return rtr.nodes().size() >= 2; }, 10000);
+check("router discovers both AI nodes", found, "nodes: " + std.string(rtr.nodes().size()));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  1. Bootstrap: no trusted chat exists -> the first chat wins, on disk
+// ─────────────────────────────────────────────────────────────────────────────
+
+check("no trusted chat before the first message", rtr.tg_chats.size() == 0, std.string(rtr.tg_chats));
+
+bot.on_any_message([chatid = CHAT_A, text = "/help", username = "peter"]);
+
+check("the first chat is trusted", rtr.tg_is_trusted(CHAT_A), std.string(rtr.tg_chats));
+check("the trust file was written", fileio.exists(TRUSTED_FILE), TRUSTED_FILE);
+
+data = fileio.read_json(TRUSTED_FILE, true);
+check("the trust file lists the chatid",
+    std.is_json(data) && data.has("chats") && data.chats.size() == 1 && std.int(data.chats[0].chatid) == CHAT_A,
+    std.string(data));
+check("the bootstrap chat got welcome + help", bot.count_for(CHAT_A) >= 2, std.string(bot.count_for(CHAT_A)));
+check("the help lists the commands", bot.has_for(CHAT_A, "/allow"), bot.last_for(CHAT_A));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  2. A stranger is ignored: no answer, no routing
+// ─────────────────────────────────────────────────────────────────────────────
+
+tasks_before = rtr.tasks_summary().size();
+
+bot.on_any_message([chatid = CHAT_B, text = "train the model with cuda on the gpu"]);
+
+std.sleep(600);
+
+check("an untrusted chat gets no answer", bot.count_for(CHAT_B) == 0, std.string(bot.count_for(CHAT_B)));
+check("an untrusted chat routes nothing", rtr.tasks_summary().size() == tasks_before, std.string(rtr.tasks_summary()));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  3. /allow from the trusted chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.on_any_message([chatid = CHAT_A, text = "/allow " + std.string(CHAT_B) + " guest"]);
+
+check("/allow trusts the chat", rtr.tg_is_trusted(CHAT_B), std.string(rtr.tg_chats));
+
+data2 = fileio.read_json(TRUSTED_FILE, true);
+check("/allow persists to disk", std.is_json(data2) && data2.chats.size() == 2, std.string(data2));
+check("/allow confirms in the chat", bot.has_for(CHAT_A, "Trusted " + std.string(CHAT_B)), bot.last_for(CHAT_A));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4. Plain text = one router-agent turn (the agent picks the node)
+// ─────────────────────────────────────────────────────────────────────────────
+
+ragt = miniagent(ModelConfig(), "router");
+ragt.env.router = rtr;
+ragt.env.last_actions = rtr.last_actions;
+callbacks = ragt.llm_api.tools.tool_callbacks;
+
+stub_agent = tg_stub_agent(rtr, callbacks, [
+    [cue = "cuda", node = GPU_NAME],
+    [cue = "http", node = WEB_NAME],
+]);
+
+// finish(report) writes into the AGENT's env and Router._turn_result reads
+// agent.env.reports — the stub and the real role tools must share one env.
+stub_agent.env = ragt.env;
+
+rtr.agent = stub_agent;
+
+bot.clear();
+
+bot.on_any_message([chatid = CHAT_A, text = "train the model with cuda on the gpu"]);
+
+answered = wait_for([bot]() { return bot.has_for(CHAT_A, "picked " + GPU_NAME); }, 8000);
+check("plain text runs a router-agent turn and answers the chat", answered, bot.last_for(CHAT_A));
+check("a routed turn never says 'Agent returned nothing'",
+	!bot.has_for(CHAT_A, "Agent returned nothing") && !bot.has_for(CHAT_A, "failed"),
+	bot.last_for(CHAT_A));
+check("the agent read the routing table", stub_agent.seen_table, "");
+check("progress streamed as a draft", bot.drafts.size() > 0, std.string(bot.drafts.size()));
+check("the draft streams no tool calls", !std.string(bot.drafts).contains("[tool]"), std.string(bot.drafts));
+
+tasks = rtr.tasks_summary();
+check("the routed task is mirrored", tasks.size() > 0, std.string(tasks));
+
+gpu_seen = false;
+for(i = 0; i < tasks.size(); i++) {
+    if(std.string(tasks[i].node) == GPU_NAME) {
+        gpu_seen = true;
+    }
+}
+check("tasks_summary shows the node that owns it", gpu_seen, std.string(tasks));
+
+// the answer also tells the user it will report back
+check("the answer promises the completion notification", bot.has_for(CHAT_A, "when it is done"), bot.last_for(CHAT_A));
+
+// every draft must have used a NON-ZERO int draft id (the module rejects 0 / None
+// with "send_rich_draft: draft_id must be non-zero, using a fresh per-chat draft id")
+bad_drafts = 0;
+for(i = 0; i < bot.drafts.size(); i++) {
+    d = bot.drafts[i].draft;
+    if(!d || std.int(d) <= 0) {
+        bad_drafts++;
+    }
+}
+check("every draft used a non-zero int draft id", bad_drafts == 0, std.string(bot.drafts));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4b. An arbitrary question is answered, NOT reported as a routing failure:
+//      the agent routes nothing and that is a perfectly normal turn.
+// ─────────────────────────────────────────────────────────────────────────────
+
+tasks_q = rtr.tasks_summary().size();
+
+bot.clear();
+bot.on_any_message([chatid = CHAT_A, text = "QUESTION: what do you have running?"]);
+
+q_answered = wait_for([bot]() { return bot.has_for(CHAT_A, "the fleet has"); }, 8000);
+check("an arbitrary question gets the agent's answer", q_answered, bot.last_for(CHAT_A));
+check("a question is not framed as a failure", !bot.has_for(CHAT_A, "failed") && !bot.has_for(CHAT_A, "Routing") && !bot.has_for(CHAT_A, "Agent returned nothing"), bot.last_for(CHAT_A));
+check("a question routes no task", rtr.tasks_summary().size() == tasks_q, std.string(rtr.tasks_summary()));
+
+// the question turn streams too -> its draft ids must be valid as well
+bad_drafts2 = 0;
+for(i = 0; i < bot.drafts.size(); i++) {
+    d = bot.drafts[i].draft;
+    if(!d || std.int(d) <= 0) {
+        bad_drafts2++;
+    }
+}
+check("the question turn also used a non-zero draft id", bad_drafts2 == 0, std.string(bot.drafts));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4c. new_draft_id has no documented return type. Every shape it can hand back
+//      must be handled: a number, a json wrapper, a string, None, or a throw.
+//      Streaming is a nicety - it may never break the turn or the answer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+tg_mode_run(mode) {
+    bot.draft_id_mode = mode;
+    rtr.tg_stream = true;
+    bot.clear();
+
+    bot.on_any_message([chatid = CHAT_A, text = "QUESTION: draft mode " + mode]);
+
+    return wait_for([bot]() { return bot.count_for(CHAT_A) > 0; }, 8000);
+}
+
+check("a json draft id is answered", tg_mode_run("json"), bot.last_for(CHAT_A));
+check("a json draft id is extracted", bot.drafts.size() > 0 && std.int(bot.drafts[0].draft) == 4242, std.string(bot.drafts));
+check("a json draft id keeps streaming on", rtr.tg_stream, "");
+check("no 'Agent returned nothing' with a json id", !bot.has_for(CHAT_A, "Agent returned nothing"), bot.last_for(CHAT_A));
+
+check("a string draft id is answered", tg_mode_run("string"), bot.last_for(CHAT_A));
+check("a string draft id is extracted", bot.drafts.size() > 0 && std.int(bot.drafts[0].draft) == 4242, std.string(bot.drafts));
+
+check("a None draft id is answered", tg_mode_run("none"), bot.last_for(CHAT_A));
+check("no draft is sent for a None id", bot.drafts.size() == 0, std.string(bot.drafts));
+check("streaming turns itself off for a None id", !rtr.tg_stream, std.string(rtr.tg_stream));
+
+check("a throwing draft id is answered", tg_mode_run("raise"), bot.last_for(CHAT_A));
+check("no draft is sent when new_draft_id throws", bot.drafts.size() == 0, std.string(bot.drafts));
+check("streaming turns itself off when new_draft_id throws", !rtr.tg_stream, std.string(rtr.tg_stream));
+check("a throwing draft id does not break the turn", !bot.has_for(CHAT_A, "failed") && !bot.has_for(CHAT_A, "Agent returned nothing"), bot.last_for(CHAT_A));
+
+bot.draft_id_mode = "int";
+rtr.tg_stream = true;
+bot.clear();
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4d. One message, one action. A transport can replay an update; the router must
+//      not answer it twice and must not spawn two tasks for one goal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+dup_text = "train the model with cuda on the gpu twice please";
+
+tasks_pre = rtr.tasks_summary().size();
+turns_pre = stub_agent.turns;
+
+bot.on_any_message([chatid = CHAT_A, text = dup_text]);
+bot.on_any_message([chatid = CHAT_A, text = dup_text]);
+
+dup_answered = wait_for([bot]() { return bot.has_for(CHAT_A, "picked " + GPU_NAME); }, 8000);
+std.sleep(400);
+
+check("a replayed update is one agent turn", stub_agent.turns == turns_pre + 1, std.string(stub_agent.turns - turns_pre));
+check("a replayed update is one task", rtr.tasks_summary().size() == tasks_pre + 1, std.string(rtr.tasks_summary().size()) + " vs " + std.string(tasks_pre));
+check("the replay is answered once", bot.count_with("picked " + GPU_NAME) == 1, std.string(bot.count_with("picked " + GPU_NAME)));
+
+// outside the dedup window the same text is a new request
+std.sleep(TG_DEDUPE_MS + 500);
+bot.on_any_message([chatid = CHAT_A, text = dup_text]);
+
+after_window = wait_for([stub_agent]() { return stub_agent.turns == turns_pre + 2; }, 8000);
+check("the same text after the dedup window is a new turn", after_window, std.string(stub_agent.turns - turns_pre));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  5. A task finished on ANY node is a notification in EVERY trusted chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+wid = rtr.add_task("TGJob", "compile the thing", GPU_NAME, "worker");
+wrec = rtr.inspect_task(wid);
+check("worker task mirrored on the gpu node", std.is_json(wrec) && std.string(wrec.node) == GPU_NAME, std.string(wrec));
+
+rtid = "";
+if(std.is_json(wrec))
+    rtid = std.string(wrec.remote_taskid);
+
+check("the node accepted the task", hostA.finish_task(rtid, "finished", "the telegram report text"), rtid);
+
+notified = wait_for([bot]() {
+        return bot.has_for(CHAT_A, "[done] " + GPU_NAME + ": task TGJob") && bot.has_for(CHAT_B, "[done] " + GPU_NAME + ": task TGJob");
+    }, 8000);
+
+check("a finished task notifies every trusted chat", notified, std.string(bot.sent));
+check("the notification carries the report", bot.has_for(CHAT_A, "the telegram report text"), bot.last_for(CHAT_A));
+check("the finish is announced exactly once per chat", bot.count_with("[done] " + GPU_NAME + ": task TGJob") == 2, std.string(bot.count_with("[done] " + GPU_NAME + ": task TGJob")));
+
+// node -> router notify
+hostA.notify_user("telegram ping from the gpu box");
+
+pinged = wait_for([bot]() { return bot.has_for(CHAT_A, "telegram ping from the gpu box"); }, 6000);
+check("a node notify reaches the chats", pinged, std.string(bot.count_with("telegram ping")));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  5b. The chat stays quiet: only what deserves attention is sent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.clear();
+
+rtr.handle_event([kind = "node_state", node = "GhostBox", online = true]);
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "queued"]);
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "generating"]);
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "stopped"]);
+
+std.sleep(700);
+
+check("node online/offline is not sent", !bot.has_for(CHAT_A, "[node]"), bot.last_for(CHAT_A));
+check("queued/running transitions are not sent", !bot.has_for(CHAT_A, "[queued]") && !bot.has_for(CHAT_A, "[running]"), bot.last_for(CHAT_A));
+check("a stop is not sent", !bot.has_for(CHAT_A, "ChatterJob"), bot.last_for(CHAT_A));
+
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x2", name = "FailJob", state = "failed", report = "the gpu ran out of memory"]);
+
+failed_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[failed] GPUBox: task FailJob"); }, 6000);
+check("a failed task is reported", failed_seen, bot.last_for(CHAT_A));
+check("the failure carries the node's report", bot.has_for(CHAT_A, "the gpu ran out of memory"), bot.last_for(CHAT_A));
+
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x3", name = "LostJob", state = "lost"]);
+
+lost_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[lost] GPUBox: task LostJob"); }, 6000);
+check("a lost task is reported", lost_seen, bot.last_for(CHAT_A));
+
+rtr.handle_event([kind = "notify", node = GPU_NAME, message = "the node asks: which python shall I use?"]);
+
+question_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "which python shall I use?"); }, 6000);
+check("a node report / question (notify) is delivered", question_seen, bot.last_for(CHAT_A));
+
+// tg_events = "all" (--verbose-events) restores the full stream.
+// A node name the table does not know is always a transition, so the event is
+// never swallowed by the Router's own node_state de-duplication.
+rtr.tg_events = "all";
+bot.clear();
+
+rtr.handle_event([kind = "node_state", node = "GhostBox", online = false]);
+
+verbose_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[node] GhostBox offline"); }, 6000);
+check("tg_events=all restores the full event stream", verbose_seen, bot.last_for(CHAT_A));
+
+rtr.tg_events = "reports";
+bot.clear();
+
+rtr.handle_event([kind = "node_state", node = "GhostBox", online = true]);
+std.sleep(700);
+check("back to reports: node state is silent again", !bot.has_for(CHAT_A, "[node]"), bot.last_for(CHAT_A));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  6. Commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.clear();
+
+bot.on_any_message([chatid = CHAT_B, text = "/tasks"]);
+check("/tasks lists tasks of ALL nodes", wait_for([bot]() { return bot.has_for(CHAT_B, GPU_NAME); }, 3000), bot.last_for(CHAT_B));
+check("/tasks shows the finished job", bot.has_for(CHAT_B, "TGJob [finished]"), bot.last_for(CHAT_B));
+
+bot.clear();
+
+bot.on_any_message([chatid = CHAT_B, text = "/tasks open"]);
+check("/tasks <state> filters out finished work", !bot.has_for(CHAT_B, "TGJob [finished]"), bot.last_for(CHAT_B));
+
+bot.on_any_message([chatid = CHAT_B, text = "/nodes"]);
+check("/nodes lists the fleet", bot.has_for(CHAT_B, WEB_NAME) && bot.has_for(CHAT_B, GPU_NAME), bot.last_for(CHAT_B));
+
+bot.on_any_message([chatid = CHAT_B, text = "/status"]);
+check("/status shows the trust state", bot.has_for(CHAT_B, "trusted chats") && bot.has_for(CHAT_B, TRUSTED_FILE), bot.last_for(CHAT_B));
+
+bot.on_any_message([chatid = CHAT_B, text = "/id"]);
+check("/id shows this chat id", bot.has_for(CHAT_B, std.string(CHAT_B)), bot.last_for(CHAT_B));
+
+bot.on_any_message([chatid = CHAT_B, text = "/bogus"]);
+check("an unknown command is answered", bot.has_for(CHAT_B, "Unknown command"), bot.last_for(CHAT_B));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  7. /deny drops a chat; a reload reads the file; /forget + re-bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.on_any_message([chatid = CHAT_A, text = "/deny " + std.string(CHAT_B)]);
+check("/deny drops the chat", !rtr.tg_is_trusted(CHAT_B), std.string(rtr.tg_chats));
+
+bot.clear();
+bot.on_any_message([chatid = CHAT_B, text = "/nodes"]);
+check("a dropped chat is ignored", bot.count_for(CHAT_B) == 0, std.string(bot.sent));
+
+rtr2 = TelegramRouter(
+    ModelConfig(),
+    [
+        name = "SHZ_TG_R2",
+        role = "receptionist",
+        description = "telegram selftest reload",
+        trusted_chats = TRUSTED_FILE,
+        poll_ms = 100,
+    ]
+);
+
+check("a reload reads the trust file from disk", rtr2.tg_is_trusted(CHAT_A) && !rtr2.tg_is_trusted(CHAT_B), std.string(rtr2.tg_chats));
+
+tg_stop_router(rtr2);
+
+bot.on_any_message([chatid = CHAT_A, text = "/forget"]);
+check("/forget drops this chat", !rtr.tg_is_trusted(CHAT_A), std.string(rtr.tg_chats));
+
+bot.clear();
+bot.on_any_message([chatid = CHAT_A, text = "/nodes"]);
+check("with an empty trust list the first chat bootstraps again", rtr.tg_is_trusted(CHAT_A), std.string(rtr.tg_chats));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  8. Teardown
+// ─────────────────────────────────────────────────────────────────────────────
+
+tg_stop_router(rtr);
+
+try { svcA.stop(); } catch(e) {}
+try { svcB.stop(); } catch(e) {}
+
+if(fileio.exists(TRUSTED_FILE)) {
+    fileio.remove(TRUSTED_FILE);
+}
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+if(!failed) {
+    std.print("ALL PASSED\n");
+}

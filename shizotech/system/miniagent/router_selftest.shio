@@ -1,0 +1,922 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  router_selftest.shio — end-to-end check of the router ⇄ node stack
+//
+//  Usage:  shz router_selftest.shio
+//
+//  Passes when it prints "ALL PASSED" and never "FAIL" (exit code 0).
+//
+//  This is the SEAM test: it drives the real Router class (router_api.shio) against
+//  real AI nodes (ai_node_attach from shizonet_ai.shio on a stub Megamind host),
+//  and it drives the real role tools (roles/router/ROLE.shio) against that
+//  Router. No LLM, no model endpoint, no IPs.
+//
+//  ShizoNet on one machine: the process binding UDP 6454 sees every peer, so the
+//  Router's server is created FIRST (it takes 6454) and the stub nodes get
+//  explicit ports 6455 / 6456 (see .megamind/router_node_network/notes).
+//
+//  Covered: discovery + node identity, routing table, ROUTER-AGENT routing (the
+//  agent turn picks the node through get_nodes()/start_task(), there is no
+//  keyword scoring), delegate -> poll -> finished with report, follow-up
+//  injection into a running remote receptionist turn (ai_request_update), stop,
+//  direct worker tasks, node -> router event forwarding (notify / task_finished),
+//  event de-duplication (one connect = one node_state, one finish = one event,
+//  one node notify = one notify), the ten role tools (incl. the fleet-wide
+//  get_tasks listing + lifecycle from a listed taskid), and the offline -> lost
+//  mirror rule.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "router_api"
+
+// shizonet node names are a fixed 16-char wire field: keep them short
+ROUTER_WIRE = "SHZ_RT_TEST";
+NODE_A_WIRE = "SHZ_NODE_GPU";
+NODE_B_WIRE = "SHZ_NODE_WEB";
+NODE_A_PORT = 6455;
+NODE_B_PORT = 6456;
+
+GPU_NAME = "GPUBox";
+WEB_NAME = "WebBox";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Harness
+// ─────────────────────────────────────────────────────────────────────────────
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name, "\n");
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info, "\n");
+	}
+}
+
+wait_for(cond, ms) {
+	for(w = 0; w < ms / 10; w++) {
+		if(cond())
+			return true;
+
+		std.sleep(10);
+	}
+
+	return cond();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  rt_stub_receptionist — the miniagent handle a Megamind exposes as
+//  host.receptionist: send_prompt() is the follow-up channel of a running turn.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class rt_stub_receptionist {
+
+	prompts = [];
+	stops = 0;
+
+	send_prompt(msg) {
+		prompts.push_back(std.string(msg));
+		return [ok = true, reports = [[report = "injected: " + std.string(msg)]], execution_time_ms = 1];
+	}
+
+	stop() {
+		stops++;
+	}
+
+	wait_finish() { }
+
+	has(msg) {
+		for(i = 0; i < prompts.size(); i++) {
+			if(prompts[i] == std.string(msg))
+				return true;
+		}
+
+		return false;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  rt_stub_host — the Megamind surface (megamind.shio) without an LLM
+// ─────────────────────────────────────────────────────────────────────────────
+
+class rt_stub_host {
+
+	running = true;
+
+	_receptionist_active = false;
+	request_queue = [];
+	worker_threads = [[], [], []];
+	receptionist = rt_stub_receptionist();
+
+	tasks = [];
+	tasks_scheduled = [];
+	tasks_finished = [];
+	tasks_failed = [];
+
+	_notify_cb = None;
+	_task_finish_cb = None;
+
+	on_notify(cb) { _notify_cb = cb; }
+	on_task_finished(cb) { _task_finish_cb = cb; }
+	on_action(cb) { }
+
+	notify_user(msg) {
+		if(_notify_cb)
+			_notify_cb(std.string(msg));
+	}
+
+	// VERYSLOW keeps the turn busy long enough to inject a follow-up into it.
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		_receptionist_active = true;
+
+		if(on_action_cb) {
+			on_action_cb([text = "thinking: "]);
+			on_action_cb([tool_start = [id = "t1", name = "get_overview", args = []]]);
+			on_action_cb([milestone = "stub milestone"]);
+		}
+
+		if(prompt.starts("VERYSLOW"))
+			std.sleep(1500);
+
+		result = [
+			ok = true,
+			reports = [[report = "stub answer: " + std.string(prompt), time = std.millis(), time_str = std.timestamp()]],
+			execution_time_ms = 12,
+		];
+
+		_receptionist_active = false;
+
+		if(on_finish_cb)
+			on_finish_cb(result);
+
+		return result;
+	}
+
+	get_overview() {
+		return [
+			tasks = tasks,
+			tasks_scheduled = tasks_scheduled,
+			tasks_finished = tasks_finished,
+			tasks_failed = tasks_failed,
+		];
+	}
+
+	add_task(name, goal) {
+		taskid = std.random_hash(16);
+		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+		return taskid;
+	}
+
+	stop_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				tasks_scheduled.erase(i);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	update_task(taskid, message) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				if(!tasks_scheduled[i].user_updates)
+					tasks_scheduled[i].user_updates = [];
+
+				tasks_scheduled[i].user_updates.push_back(std.string(message));
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	inspect_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				return tasks_scheduled[i];
+		}
+
+		for(i = 0; i < tasks_finished.size(); i++) {
+			if(tasks_finished[i].taskid == taskid)
+				return tasks_finished[i];
+		}
+
+		return "Not found.";
+	}
+
+	// Move a planned task to finished and fire the Megamind hook (-> ai_event).
+	finish_task(taskid, state = "finished", report = "stub report") {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				task = tasks_scheduled[i];
+				tasks_scheduled.erase(i);
+				task.state = state;
+				task.report = report;
+				tasks_finished.push_back(task);
+
+				if(_task_finish_cb)
+					_task_finish_cb(task);
+
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	find_scheduled(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				return tasks_scheduled[i];
+		}
+
+		return None;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  rt_stub_agent — stands in for the ROUTER AGENT turn (the miniagent the Router
+//  runs with role "router"). It implements the miniagent surface the Router uses
+//  (task / clear_chat / stop / set_reasoning_effort / on_action / env) and, inside
+//  task(), it does what the model does: read the routing table with get_nodes(),
+//  pick ONE node, delegate with the role's start_task tool. The decision list is
+//  the test's "brain" — the Router class contributes no routing intelligence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class rt_stub_agent {
+
+	env = [];
+	on_action = None;
+
+	prompts = [];		// every prompt the Router handed to the agent
+	turns = 0;			// how many agent turns ran
+	routed = [];		// [node, taskid] per start_task the agent performed
+	seen_table = false;	// the agent read get_nodes() before routing
+
+	router = None;
+	callbacks = None;
+	decisions = [];
+
+	__init__(router, callbacks, decisions) {
+		this.router = router;
+		this.callbacks = callbacks;
+		this.decisions = decisions;
+	}
+
+	set_reasoning_effort(effort) { }
+	clear_chat() { }
+	stop() { }
+	wait_finish() { }
+
+	_node_online(name) {
+		list = router.nodes_summary();
+		for(i = 0; i < list.size(); i++) {
+			if(list[i].name == name) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	task(prompt) {
+		turns++;
+		prompts.push_back(std.string(prompt));
+
+		// miniagent resets env.reports at the start of every turn
+		if(std.is_json(env)) {
+			env.reports = [];
+		}
+
+		// the test's way to make the TURN fail (not the routing)
+		if(std.string(prompt).starts("FAILTURN")) {
+			return [ok = false, error = "stub turn exploded"];
+		}
+
+		if(on_action) {
+			on_action([text = "router agent thinking about: " + std.string(prompt)]);
+		}
+
+		// the agent looks at the fleet before choosing
+		table = callbacks["get_nodes"]([]);
+		if(std.string(table).length() > 0) {
+			seen_table = true;
+		}
+
+		node = "";
+		for(i = 0; i < decisions.size(); i++) {
+			cue = std.string(decisions[i].cue);
+			cand = std.string(decisions[i].node);
+			if(std.string(prompt).find(cue) >= 0 && _node_online(cand)) {
+				node = cand;
+				break;
+			}
+		}
+
+		rep = "no node picked for this";
+
+		if(node) {
+			res = callbacks["start_task"]([
+				node = node,
+				name = "AgentPick",
+				task = std.string(prompt),
+				summary = "stub agent turn",
+			]);
+
+			if(std.is_json(res) && std.string(res.taskid ?? "").length() > 0) {
+				routed.push_back([node = node, taskid = std.string(res.taskid)]);
+			}
+
+			rep = "picked " + node;
+		}
+
+		// The real role ends every turn with finish(report), which puts the answer
+		// into agent.env.reports; miniagent then hands back
+		// [ok = false, error = "Agent returned nothing (maybe crashed)."] for the
+		// stopped turn. Router._turn_result must fold the report in - this stub
+		// reproduces that shape on purpose.
+		if(callbacks.has("finish")) {
+			callbacks["finish"]([report = rep]);
+		}
+
+		return [ok = false, error = "Agent returned nothing (maybe crashed).", execution_time_ms = 1];
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Fixture: Router first (it takes UDP 6454), then the two stub nodes
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.print("router_selftest: starting router + 2 stub AI nodes\n");
+
+seen_events = [];
+notified = [];
+
+hostA = rt_stub_host();
+hostB = rt_stub_host();
+
+// role = "receptionist": the router-agent layer must construct without an LLM;
+// the router role itself is exercised through its tool callbacks below.
+rtr = Router(
+	ModelConfig(),
+	[
+		name = ROUTER_WIRE,
+		role = "receptionist",
+		description = "selftest router",
+		capabilities = ["routing"],
+		poll_ms = 100,
+		on_event = [seen_events](e) { seen_events.push_back(e); },
+		on_notify = [notified](m) { notified.push_back(std.string(m)); },
+	]
+);
+
+nodeA = shizonet.server(NODE_A_WIRE, NODE_A_PORT);
+svcA = ai_node_attach(nodeA, hostA, [name = GPU_NAME, description = "cuda training and gpu number crunching", capabilities = ["gpu", "cuda", "training"]]);
+
+nodeB = shizonet.server(NODE_B_WIRE, NODE_B_PORT);
+svcB = ai_node_attach(nodeB, hostB, [name = WEB_NAME, description = "web scraping and http requests", capabilities = ["web", "http", "scrape"]]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  1. Discovery + routing table
+// ─────────────────────────────────────────────────────────────────────────────
+
+found = wait_for([]() { return rtr.nodes().size() >= 2; }, 10000);
+
+check("router discovers both AI nodes", found, "nodes: " + std.string(rtr.nodes().size()));
+
+if(!found) {
+	std.print("\n  diagnostic: shizonet discovery needs UDP 6454 free for this process\n\n");
+}
+
+summary = rtr.nodes_summary();
+names = "";
+
+for(i = 0; i < summary.size(); i++) {
+	names += std.string(summary[i].name) + ",";
+}
+
+check("node display names come from AINodeInfo", names.contains(GPU_NAME) && names.contains(WEB_NAME), names);
+check("routing table is serializable (no device objects)", !summary[0].has("dev"), std.string(summary[0]));
+check("capabilities reach the router", std.string(summary).contains("cuda"), std.string(summary));
+check("description reaches the router", std.string(summary).contains("scraping"), std.string(summary));
+
+ov = rtr.node_overview(GPU_NAME);
+check("node_overview returns the remote overview", std.is_json(ov) && ov.has("tasks_scheduled"), std.string(ov));
+
+missing = rtr.node_overview("NoSuchNode");
+check("node_overview of an unknown node is a message", std.is_string(missing), std.string(missing));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  1b. One connect = ONE node_state event.
+//
+//  A node coming online is the same fact on two channels: the router discovers it
+//  (shizonet on_connect -> _register_node) and the node pushes node_state over
+//  ai_event. The owner must be told once, not twice (that was the duplicate
+//  "[node] X online" line in the CLI).
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.sleep(1500);   // the node flushes its pending node_state push from the refresh thread
+
+ns_names = "";
+ns_dup = false;
+ns_total = 0;
+
+for(i = 0; i < seen_events.size(); i++) {
+    e = seen_events[i];
+    if(std.string(e.kind) != "node_state") {
+        continue;
+    }
+    n = std.string(e.node);
+    ns_total++;
+    if(ns_names.contains(n + ",")) {
+        ns_dup = true;
+    }
+    ns_names += n + ",";
+}
+
+check("one connect is exactly one node_state event per node", ns_total == 2 && !ns_dup, ns_names);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  2. Routing: the ROUTER AGENT picks the node.
+//
+//  The role tools are the agent's hands, so the role agent is built here and its
+//  tool callbacks are handed to the stub agent that plays the model. The Router
+//  class itself contributes zero routing intelligence: no keyword scoring, no
+//  capability matching, no guessing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+managed ragt = miniagent(ModelConfig(), "router");
+ragt.env.router = rtr;
+ragt.env.last_actions = rtr.last_actions;
+callbacks = ragt.llm_api.tools.tool_callbacks;
+
+stub_agent = rt_stub_agent(rtr, callbacks, [
+	[cue = "cuda", node = GPU_NAME],
+	[cue = "http", node = WEB_NAME],
+]);
+
+// the stub plays the real agent: finish(report) writes into the AGENT's env, and
+// Router._turn_result reads agent.env.reports — so they must share one env.
+stub_agent.env = ragt.env;
+
+rtr.agent = stub_agent;
+
+turns_before = stub_agent.turns;
+
+gpu_res = rtr.route_task("train the model with cuda on the gpu");
+
+check("route_task runs a router-agent turn", stub_agent.turns == turns_before + 1, std.string(stub_agent.turns));
+check("the agent reads the routing table before choosing", stub_agent.seen_table, "");
+check("the agent picked the gpu node", gpu_res.ok && gpu_res.node == GPU_NAME, std.string(gpu_res));
+check("a finish-reported turn is never 'Agent returned nothing'",
+	gpu_res.ok &&
+	!std.string(gpu_res.answer).contains("Agent returned nothing") &&
+	std.string(gpu_res.answer).contains("picked GPUBox"),
+	std.string(gpu_res));
+check("route_task returns the agent's answer", std.string(gpu_res.answer).contains("picked " + GPU_NAME), std.string(gpu_res));
+
+web_res = rtr.route_task("scrape this web page over http");
+
+check("the agent picked the web node", web_res.ok && web_res.node == WEB_NAME, std.string(web_res));
+check("one route_task is exactly one agent turn", stub_agent.turns == turns_before + 2, std.string(stub_agent.turns));
+
+gpu_task = rtr.inspect_task(gpu_res.taskid);
+
+check("delegated task is mirrored", std.is_json(gpu_task) && gpu_task.taskid == gpu_res.taskid, std.string(gpu_task));
+check("mirror records the remote request id", std.string(gpu_task.remote_request_id).length() > 0, std.string(gpu_task));
+check("mirror records the owning node", gpu_task.node == GPU_NAME, std.string(gpu_task));
+check("a routed turn reports routed", gpu_res.ok && gpu_res.routed, std.string(gpu_res));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  2b. An arbitrary question is NOT an error: the agent answers, routes nothing.
+//      ok is about the turn, routed is about the delegation (router_api.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+q_tasks = rtr.tasks_summary().size();
+q_res = rtr.route_task("what is the weather like on your nodes?");
+
+check("a question that routes nothing is ok", q_res.ok, std.string(q_res));
+check("a question that routes nothing is routed=false", !q_res.routed, std.string(q_res));
+check("the answer of a non-routing turn is returned", std.string(q_res.answer).contains("no node picked"), std.string(q_res));
+check("a non-routing turn has no taskid", std.is_none(q_res.taskid), std.string(q_res));
+check("a non-routing turn creates no task", rtr.tasks_summary().size() == q_tasks, std.string(rtr.tasks_summary()));
+check("a non-routing turn reports no error", !std.string(q_res.error ?? ""), std.string(q_res));
+
+// a FAILED turn is a failure
+f_res = rtr.route_task("FAILTURN do the impossible");
+check("a failed agent turn is ok=false", !f_res.ok && !f_res.routed, std.string(f_res));
+check("the failure carries the agent's error", std.string(f_res.error).contains("stub turn exploded"), std.string(f_res));
+
+// the class never invents a node on its own
+tasks_before = rtr.get_overview().remote_tasks.size();
+
+check("add_task without a node is refused (no scoring fallback)", !rtr.add_task("GuessMe", "do the thing", ""), "");
+check("the refused task created no mirror entry", rtr.get_overview().remote_tasks.size() == tasks_before, std.string(rtr.get_overview().remote_tasks.size()));
+check("add_task with an unknown node is refused", !rtr.add_task("X", "y", "NoSuchNode"), "");
+
+// explicit node: the programmatic path, no agent turn involved
+turns_now = stub_agent.turns;
+exp_res = rtr.route_task("quiet job", GPU_NAME);
+
+check("route_task(node) delegates without an agent turn",
+	exp_res.ok && exp_res.node == GPU_NAME && stub_agent.turns == turns_now, std.string(exp_res));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  3. Follow-up into a running remote receptionist turn (ai_request_update)
+// ─────────────────────────────────────────────────────────────────────────────
+
+slow_res = rtr.delegate(GPU_NAME, "VERYSLOW long running job");
+
+check("delegate accepts a long job", slow_res.ok, std.string(slow_res));
+
+running = wait_for([rtr, slow_res]() {
+		t = rtr.inspect_task(slow_res.taskid);
+		return std.is_json(t) && t.state == "generating";
+	}, 8000);
+
+check("poller mirrors the running state", running, std.string(rtr.inspect_task(slow_res.taskid)));
+
+upd = rtr.update_task(slow_res.taskid, "please use tabs");
+
+check("update_task reaches a delegated task", upd, std.string(rtr.inspect_task(slow_res.taskid)));
+check("the remote receptionist got the follow-up",
+	wait_for([hostA]() { return hostA.receptionist.has("please use tabs"); }, 4000),
+	std.string(hostA.receptionist.prompts));
+
+stopped = rtr.stop_task(slow_res.taskid);
+
+check("stop_task stops a delegated task", stopped, std.string(rtr.inspect_task(slow_res.taskid)));
+
+st = rtr.inspect_task(slow_res.taskid);
+check("mirror shows the task stopped", std.is_json(st) && st.state == "stopped", std.string(st));
+
+check("update_task on an unknown taskid is false", !rtr.update_task("nope-not-a-task", "x"), "");
+check("stop_task on an unknown taskid is false", !rtr.stop_task("nope-not-a-task"), "");
+check("inspect_task on an unknown taskid says so", rtr.inspect_task("nope-not-a-task") == "Not found.", "");
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4. Finished delegated work: report lands in the mirror
+// ─────────────────────────────────────────────────────────────────────────────
+
+done = wait_for([rtr, web_res]() {
+		t = rtr.inspect_task(web_res.taskid);
+		return std.is_json(t) && t.state == "finished";
+	}, 8000);
+
+fin = rtr.inspect_task(web_res.taskid);
+
+check("delegated task reaches finished", done, std.string(fin));
+check("the remote report is mirrored", std.is_json(fin) && std.string(fin.report).contains("stub answer"), std.string(fin));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  5. Direct worker-pool tasks (ai_task_add path, mode = "worker")
+// ─────────────────────────────────────────────────────────────────────────────
+
+wid = rtr.add_task("cli", "compile the thing", GPU_NAME, "worker");
+
+check("add_task(worker) returns a taskid", std.string(wid).length() > 0, std.string(wid));
+
+wrec = rtr.inspect_task(wid);
+check("worker task is mirrored as ai_task-backed", std.is_json(wrec) && std.string(wrec.remote_taskid).length() > 0, std.string(wrec));
+
+scheduled = wait_for([hostA]() { return hostA.tasks_scheduled.size() > 0; }, 4000);
+check("the remote worker pool received the task", scheduled, std.string(hostA.tasks_scheduled));
+
+wupd = rtr.update_task(wid, "worker follow-up");
+check("update_task drives the remote task", wupd, std.string(rtr.inspect_task(wid)));
+
+srec = hostA.find_scheduled(wrec.remote_taskid);
+check("the remote task recorded the update", srec && std.string(srec).contains("worker follow-up"), std.string(srec));
+
+check("hostA finishes the remote task", hostA.finish_task(wrec.remote_taskid, "finished", "worker report"), std.string(wrec));
+
+tf = wait_for([rtr, wid]() {
+		t = rtr.inspect_task(wid);
+		return std.is_json(t) && (t.state == "finished" || t.state == "failed");
+	}, 8000);
+
+check("the task_finished event updates the mirror", tf, std.string(rtr.inspect_task(wid)));
+
+// the poller (task_state) and the node's task_finished push describe ONE
+// completion: the owner must see the finish once, not as "[task] -> finished"
+// plus "[done] finished".
+fin_count = 0;
+fin_events = "";
+
+for(i = 0; i < seen_events.size(); i++) {
+    e = seen_events[i];
+    k = std.string(e.kind);
+    if(k != "task_finished" && k != "task_state") {
+        continue;
+    }
+    if(std.string(e.state ?? "") != "finished") {
+        continue;
+    }
+    et = std.string(e.taskid ?? "");
+    if(et != std.string(wid) && et != std.string(wrec.remote_taskid)) {
+        continue;
+    }
+    fin_count++;
+    fin_events += k + ",";
+}
+
+check("a finished task is announced exactly once", fin_count == 1, fin_events);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  6. Node events reach the router owner (the telegram hook)
+// ─────────────────────────────────────────────────────────────────────────────
+
+hostA.notify_user("ping from the gpu box");
+
+got_notify = wait_for([]() {
+		for(i = 0; i < seen_events.size(); i++) {
+			if(seen_events[i].kind == "notify" && std.string(seen_events[i].message).contains("ping from the gpu box"))
+				return true;
+		}
+
+		return false;
+	}, 6000);
+
+check("node notify reaches on_event", got_notify, std.string(seen_events.size()));
+
+// one node notify_user = one notify event (no second copy on the router side)
+ping_count = 0;
+for(i = 0; i < seen_events.size(); i++) {
+    if(seen_events[i].kind == "notify" && std.string(seen_events[i].message).contains("ping from the gpu box"))
+        ping_count++;
+}
+check("a node notify is delivered once", ping_count == 1, std.string(ping_count));
+
+router_notify = rtr.notify_user("local router notice");
+check("Router.notify_user fires on_notify", notified.size() > 0 && notified[0] == "local router notice", std.string(notified));
+
+// documented double sink: notify_user() emits a notify event AND calls on_notify.
+// A front end registers ONE of them (router_api.md), otherwise it shows its own
+// notification twice.
+local_notice = 0;
+for(i = 0; i < seen_events.size(); i++) {
+    if(seen_events[i].kind == "notify" && std.string(seen_events[i].message) == "local router notice")
+        local_notice++;
+}
+check("notify_user emits exactly one notify event", local_notice == 1, std.string(local_notice));
+check("notify_user sinks: on_event + on_notify (register one of them)", local_notice == 1 && notified.size() == 1, std.string(local_notice) + "/" + std.string(notified.size()));
+
+ev_kinds = "";
+for(i = 0; i < seen_events.size(); i++) {
+	ev_kinds += std.string(seen_events[i].kind) + ",";
+}
+
+check("task lifecycle events were forwarded", ev_kinds.contains("task_finished") || ev_kinds.contains("task_state"), ev_kinds);
+
+ovw = rtr.get_overview();
+check("get_overview carries nodes, tasks and events", ovw.has("nodes") && ovw.has("remote_tasks") && ovw.has("events"), std.string(ovw));
+check("get_overview is serializable", std.string(ovw).length() > 0, "");
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  7. The role tools (roles/router/ROLE.shio) against the live Router
+//     (ragt + callbacks were built in section 2 — they are the router agent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+tool_names = "get_nodes,get_node_overview,get_tasks,start_task,update_task,stop_task,inspect_task,get_last_actions,notify,finish";
+
+all_tools = true;
+need = tool_names.split(",");
+for(i = 0; i < need.size(); i++) {
+	if(!callbacks.has(need[i]))
+		all_tools = false;
+}
+
+check("the router role registers all ten tools", all_tools, tool_names);
+
+// tool_callbacks[name](args): the registered callback takes the args json only.
+nodes_res = callbacks["get_nodes"]([]);
+check("get_nodes lists the fleet", std.string(nodes_res).contains(GPU_NAME) && std.string(nodes_res).contains(WEB_NAME), std.string(nodes_res));
+
+node_ov = callbacks["get_node_overview"]([node = WEB_NAME]);
+check("get_node_overview answers for a node", std.string(node_ov).length() > 0, std.string(node_ov));
+
+bad_node = callbacks["start_task"]([node = "NoSuchNode", name = "Bad", task = "do it", summary = "s"]);
+check("start_task refuses an unknown node", std.string(bad_node).contains("Unknown node"), std.string(bad_node));
+
+role_res = callbacks["start_task"]([node = GPU_NAME, name = "Seam", task = "VERYSLOW seam job", summary = "seam test"]);
+
+check("start_task routes to the chosen node", std.string(role_res).contains("taskid") && std.string(role_res).contains(GPU_NAME), std.string(role_res));
+
+role_taskid = "";
+if(std.is_json(role_res))
+	role_taskid = std.string(role_res.taskid ?? "");
+
+role_rec = rtr.inspect_task(role_taskid);
+check("the role's task is tracked as receptionist work",
+	std.is_json(role_rec) && std.string(role_rec.remote_request_id).length() > 0 && std.string(role_rec.remote_taskid).empty(),
+	std.string(role_rec));
+
+role_rid = "";
+if(std.is_json(role_rec))
+	role_rid = std.string(role_rec.remote_request_id);
+
+role_upd = callbacks["update_task"]([taskid = role_taskid, message = "seam follow-up"]);
+check("the role can follow up on routed work", std.string(role_upd) == "OK", std.string(role_upd));
+
+// router_api.md: a follow-up on a RUNNING turn is injected through
+// receptionist.send_prompt, one on a QUEUED request is appended to its prompt.
+// Both are delivery; assert delivery, not one mechanism.
+delivered = wait_for([hostA, svcA, role_rid]() {
+		if(hostA.receptionist.has("seam follow-up"))
+			return true;
+
+		if(svcA.requests.has(role_rid))
+			return std.string(svcA.requests[role_rid].prompt).contains("seam follow-up");
+
+		return false;
+	}, 4000);
+
+check("the follow-up reached the remote node", delivered,
+	"prompts: " + std.string(hostA.receptionist.prompts) + " rid: " + role_rid);
+
+role_stop = callbacks["stop_task"]([taskid = role_taskid, reason = "done testing"]);
+check("the role can stop routed work", std.string(role_stop) == "OK", std.string(role_stop));
+
+role_inspect = callbacks["inspect_task"]([taskid = role_taskid]);
+check("the role can inspect routed work", std.string(role_inspect).contains(role_taskid), std.string(role_inspect));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  7b. The agent sees the WHOLE FLEET: list every routed task, then drive the
+//      lifecycle (inspect / update / stop) from a taskid taken out of the listing
+//      — the "what is running on my nodes?" answer plus control over it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fleet_res = callbacks["start_task"]([node = WEB_NAME, name = "Fleet", task = "VERYSLOW fleet listing job", summary = "fleet listing"]);
+fleet_taskid = "";
+if(std.is_json(fleet_res))
+    fleet_taskid = std.string(fleet_res.taskid ?? "");
+
+fleet = callbacks["get_tasks"]([]);
+fleet_txt = std.string(fleet);
+check("get_tasks lists routed tasks of BOTH nodes", fleet_txt.contains(GPU_NAME) && fleet_txt.contains(WEB_NAME), fleet_txt);
+check("get_tasks is serializable for the LLM", std.is_json(fleet) && fleet.size() > 0, fleet_txt);
+
+open_list = callbacks["get_tasks"]([state = "open"]);
+open_txt = std.string(open_list);
+check("get_tasks(state=open) lists the running job", open_txt.contains(fleet_taskid), open_txt);
+check("get_tasks(state=open) hides the stopped job", !open_txt.contains(role_taskid), open_txt);
+
+one_node = callbacks["get_tasks"]([node = WEB_NAME]);
+one_txt = std.string(one_node);
+check("get_tasks(node=...) restricts the listing to that node", one_txt.contains(fleet_taskid) && !one_txt.contains(GPU_NAME), one_txt);
+
+found_id = "";
+if(std.is_json(open_list)) {
+    for(i = 0; i < open_list.size(); i++) {
+        if(std.string(open_list[i].node) == WEB_NAME) {
+            found_id = std.string(open_list[i].taskid);
+            break;
+        }
+    }
+}
+check("the listing carries a usable taskid", found_id == fleet_taskid, found_id + " != " + fleet_taskid);
+
+li_inspect = callbacks["inspect_task"]([taskid = found_id]);
+check("inspect_task works on a taskid from the listing", std.string(li_inspect).contains(found_id), std.string(li_inspect));
+
+li_upd = callbacks["update_task"]([taskid = found_id, message = "fleet follow-up"]);
+check("update_task works on a taskid from the listing", std.string(li_upd) == "OK", std.string(li_upd));
+
+li_stop = callbacks["stop_task"]([taskid = found_id, reason = "fleet test done"]);
+check("stop_task works on a taskid from the listing", std.string(li_stop) == "OK", std.string(li_stop));
+
+after_stop = callbacks["get_tasks"]([state = "open"]);
+check("the stopped task leaves the open listing", !std.string(after_stop).contains(found_id), std.string(after_stop));
+
+role_notify = callbacks["notify"]([message = "role notice"]);
+check("the role can notify the owner", notified.size() > 1 && notified[notified.size() - 1] == "role notice", std.string(notified));
+
+acts = callbacks["get_last_actions"]([limit = 10]);
+check("get_last_actions is newest-first", std.string(acts[0]).contains("notify"), std.string(acts[0]));
+check("get_last_actions records the routing", std.string(acts).contains("start_task"), std.string(acts));
+
+// finish(report): mandatory, never empty, and the report IS the answer the host shows
+empty_rep = callbacks["finish"]([report = "   "]);
+check("finish refuses an empty report", std.string(empty_rep).contains("must not be empty"), std.string(empty_rep));
+
+reports_before = ragt.env.reports.size();
+fin_res = callbacks["finish"]([report = "the fleet has two nodes"]);
+check("finish accepts a report", std.string(fin_res) == "OK", std.string(fin_res));
+check("the report becomes the turn's answer",
+	ragt.env.reports.size() == reports_before + 1 &&
+	std.string(ragt.env.reports[ragt.env.reports.size() - 1].report) == "the fleet has two nodes",
+	std.string(ragt.env.reports));
+check("finish ends the turn", ragt.stopped, "");
+check("the report is recorded in the action ring", std.string(callbacks["get_last_actions"]([limit = 3])).contains("turn_report"), "");
+
+check("Router.get_overview shows the routed work", rtr.get_overview().tasks_open >= 0 && rtr.get_overview().remote_tasks.size() > 0, "");
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  9. One goal, one task — and the node's internal worker task of a delegated
+//     request must never become a second mirror entry (the "two tasks spawned"
+//     bug the owner saw with a single node connected).
+// ─────────────────────────────────────────────────────────────────────────────
+
+dup_goal = "compile the same thing twice";
+
+d1 = rtr.add_task("DupA", dup_goal, GPU_NAME, "worker");
+d2 = rtr.add_task("DupB", dup_goal, GPU_NAME, "worker");
+
+check("the same goal on the same node returns the same taskid", std.string(d1) == std.string(d2) && std.string(d1).length() > 0, std.string(d1) + " / " + std.string(d2));
+
+dup_mirror = 0;
+dup_tasks = rtr.tasks_summary();
+for(i = 0; i < dup_tasks.size(); i++) {
+    if(std.string(dup_tasks[i].goal) == dup_goal) {
+        dup_mirror++;
+    }
+}
+check("no second mirror entry for the same goal", dup_mirror == 1, std.string(dup_mirror));
+
+dup_node = 0;
+for(i = 0; i < hostA.tasks_scheduled.size(); i++) {
+    if(std.string(hostA.tasks_scheduled[i].task) == dup_goal) {
+        dup_node++;
+    }
+}
+check("the node never got the goal twice", dup_node == 1, std.string(dup_node));
+
+// a delegated request that is still open: the node's own worker task finishing
+// is that request, not extra work -> no adoption, no second task, no 2nd notify
+probe = rtr.delegate(GPU_NAME, "VERYSLOW adoption probe");
+probe_open = std.is_json(probe) && probe.ok;
+before_adopt = rtr.tasks_summary().size();
+
+rtr.handle_event([
+	kind = "task_finished",
+	node = GPU_NAME,
+	taskid = "node-internal-worker-1",
+	name = "Receptionist worker",
+	state = "finished",
+	report = "the node's internal worker finished",
+]);
+
+std.sleep(400);
+
+check("a delegated request is open for the probe", probe_open, std.string(probe));
+check("the node's internal worker task is not adopted while a request is open",
+	rtr.tasks_summary().size() == before_adopt, std.string(rtr.tasks_summary().size()) + " vs " + std.string(before_adopt));
+
+// settle the probe, then the same kind of push for a node with nothing open is
+// genuine independent work and IS adopted
+if(probe_open) {
+	rtr.stop_task(probe.taskid);
+}
+
+idle = wait_for([rtr, probe]() {
+		t = rtr.inspect_task(probe.taskid);
+		return std.is_json(t) && !router_is_open_state(t.state);
+	}, 6000);
+
+check("the probe request settled", idle, std.string(rtr.inspect_task(probe.taskid)));
+
+before_legit = rtr.tasks_summary().size();
+
+rtr.handle_event([
+	kind = "task_finished",
+	node = WEB_NAME,
+	taskid = "node-own-job-42",
+	name = "Local job",
+	state = "finished",
+	report = "done on its own",
+]);
+
+adopted = wait_for([rtr]() {
+		t = rtr.inspect_task("node-own-job-42");
+		return std.is_json(t);
+	}, 4000);
+
+check("work of a node with nothing open is adopted", adopted && rtr.tasks_summary().size() == before_legit + 1, std.string(rtr.tasks_summary().size()) + " vs " + std.string(before_legit));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  8. Teardown
+// ─────────────────────────────────────────────────────────────────────────────
+
+rtr.running = false;
+rtr.stop();
+
+// The Router owns an AiService (its own transport threads): it must be stopped
+// explicitly, exactly like Router.__deinit__ does, or the process never exits.
+if(rtr.service) {
+	rtr.service.stop();
+}
+
+svcA.stop();
+svcB.stop();
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+if(failed == 0) {
+	std.print("ALL PASSED\n");
+}
+else {
+	std.runtime_error("router_selftest: " + std.string(failed) + " checks failed");
+}

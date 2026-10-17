@@ -1,0 +1,690 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  node_api.shio — JSON Web API for the Megamind node host
+//
+//  #include "node_api"
+//
+//  api = node_api_start(host, cfg, port, api_token = "");   // returns the
+//                                                            webserver object
+//  api.stop();
+//
+//  `host` is a Megamind() (see megamind.shio): the receptionist router plus the
+//  worker pool. This module exposes it as a plain JSON web API so a node can be
+//  driven from any machine in the network.
+//
+//  Every answer uses the same envelope (as the miniagent dashboard API):
+//
+//      { "ok": true,  "data":  { ... } }
+//      { "ok": false, "error": "message" }
+//
+//  Endpoints
+//  ---------
+//   GET     /                               API index
+//   GET     /api/health                     liveness probe (never needs a token)
+//   GET     /api/status                     node, model and task statistics
+//   GET     /api/overview                   raw mind overview
+//   GET     /api/tasks                      flattened task list
+//   GET     /api/task/<id>                  inspect one task
+//   POST    /api/task                       {name, goal}   -> {taskid, name}
+//   PUT     /api/task/<id>                  {message}      -> follow-up for a task
+//   DELETE  /api/task/<id>                                   -> stop a task
+//   POST    /api/request                    {prompt}       -> {request_id}
+//   POST    /api/request/poll               {request_id}   -> {status, delta|result}
+//   GET     /api/request/stream?request_id=<id>             -> SSE delta stream
+//   POST    /api/request/stop               {request_id}   -> abort the turn
+//   GET     /api/notifications              (?drain=1 to clear the list)
+//   GET     /api/events                     (?since=<ms> task lifecycle events)
+//   POST    /api/shutdown                                      -> stop the node
+//
+//  Request lifecycle: "queued" -> "generating" -> "waiting" -> "done" | "error",
+//  the same contract the dashboard chat client uses for /api/adminagent.
+//
+//  api_token: when non-empty every endpoint except /api/health requires
+//  "Authorization: Bearer <token>" or "X-Api-Token: <token>".
+//
+//  curl examples:
+//      curl -X POST http://host:13337/api/request -d '{"prompt":"hello"}'
+//      curl -X POST http://host:13337/api/request/poll -d '{"request_id":"abc"}'
+//      curl http://host:13337/api/tasks
+// ═════════════════════════════════════════════════════════════════════════════
+
+import webserver;
+
+NODE_API_VERSION = "1.0.0";
+NODE_API_MAX_KEPT = 200;
+NODE_API_STREAM_POLL_MS = 50;
+NODE_API_STREAM_PING_MS = 15000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Response helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+node_api_headers(extra = None) {
+    h = [
+        "Content-Type" = "application/json; charset=utf-8",
+        "Cache-Control" = "no-store",
+        "Access-Control-Allow-Origin" = "*",
+        "Access-Control-Allow-Methods" = "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers" = "Content-Type, Authorization, X-Api-Token",
+    ];
+
+    if(extra) {
+        for(i = 0; i < extra.size(); i++)
+            h[extra.key(i)] = extra[i];
+    }
+
+    return h;
+}
+
+node_api_res(status_code, payload) {
+    return [
+        status_code = status_code,
+        headers = node_api_headers(),
+        body = std.string(payload),
+    ];
+}
+
+node_api_ok(data = None) {
+    response = [ok = json.bool(true)];
+
+    if(!std.is_none(data))
+        response.data = data;
+
+    return node_api_res(200, response);
+}
+
+node_api_err(error, status_code = 400) {
+    return node_api_res(status_code, [ok = json.bool(false), error = std.string(error)]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Optional value helpers
+//
+//  `some_call(...) ?? default` is broken in the current shizoscript compiler
+//  ("not a function, the value is int" / "Cannot return namespace"), so every
+//  optional value goes through these helpers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+node_api_str(value, def = "") {
+    if(std.is_none(value))
+        return def;
+
+    return std.string(value);
+}
+
+node_api_get(container, key, def = "") {
+    if(!std.is_json(container))
+        return def;
+
+    if(!container.hasi(key))
+        return def;
+
+    return node_api_str(container.geti(key), def);
+}
+
+node_api_int(container, key, def = 0) {
+    text = node_api_get(container, key, "");
+
+    if(text.empty())
+        return def;
+
+    return std.int(text);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Request helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Parsed JSON body, [] for an empty body, None for invalid JSON.
+node_api_body(req) {
+    raw = std.string(req.body);
+
+    if(raw.strip().empty())
+        return [];
+
+    parsed = None;
+
+    try {
+        parsed = std.json(raw, true);
+    }
+    catch(e) {
+        return None;
+    }
+
+    if(!std.is_json(parsed))
+        return None;
+
+    return parsed;
+}
+
+node_api_authorized(req, api_token) {
+    expected = std.string(api_token);
+
+    if(expected.empty())
+        return true;
+
+    token = node_api_get(req.headers, "x-api-token");
+
+    if(token.empty()) {
+        auth = node_api_get(req.headers, "authorization");
+
+        if(auth.starts("Bearer "))
+            token = auth.substr(7).strip();
+        else
+            token = auth.strip();
+    }
+
+    return token == expected;
+}
+
+node_api_trim(list) {
+    for(list.size() > NODE_API_MAX_KEPT)
+        list.erase(0);
+}
+
+// Flatten the overview groups into one task list.
+node_api_task_list(ov) {
+    list = [];
+
+    for(i = 0; i < ov.tasks_scheduled.size(); i++) {
+        task = ov.tasks_scheduled[i].copy();
+        task.state = "planned";
+        list.push_back(task);
+    }
+
+    for(i = 0; i < ov.tasks.size(); i++)
+        list.push_back(ov.tasks[i].copy());
+
+    for(i = 0; i < ov.tasks_finished.size(); i++)
+        list.push_back(ov.tasks_finished[i].copy());
+
+    for(i = 0; i < ov.tasks_failed.size(); i++)
+        list.push_back(ov.tasks_failed[i].copy());
+
+    return list;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Server
+// ─────────────────────────────────────────────────────────────────────────────
+
+node_api_start(host, cfg, port, api_token = "") {
+    port = std.int(port);
+    api_token = std.string(api_token);
+
+    server = webserver.http_server(port);
+
+    // API state. All of these are shared by reference with the route lambdas.
+    requests = [];          // request_id -> request state
+    notifications = [];     // host.on_notify messages
+    events = [];            // host.on_task_finished events
+    counters = [requests_total = 0, requests_done = 0, requests_error = 0];
+    started_at = std.millis();
+
+    host.on_notify([notifications](msg) {
+        notifications.push_back([message = std.string(msg), time = std.millis()]);
+        node_api_trim(notifications);
+    });
+
+    host.on_task_finished([events](task) {
+        events.push_back([
+            time = std.millis(),
+            taskid = task.taskid,
+            name = task.name,
+            state = task.state,
+            report = task.report,
+        ]);
+        node_api_trim(events);
+    });
+
+    // Preflight for browser clients.
+    server.route("OPTIONS", "^.*$", [](req, writer) {
+        return [status_code = 204, headers = node_api_headers(), body = ""];
+    });
+
+    // GET / — API index
+    server.route("GET", "^/$", [port](req, writer) {
+        return node_api_ok([
+            name = "megamind-node-api",
+            version = NODE_API_VERSION,
+            port = port,
+            endpoints = [
+                [method = "GET", path = "/api/health"],
+                [method = "GET", path = "/api/status"],
+                [method = "GET", path = "/api/overview"],
+                [method = "GET", path = "/api/tasks"],
+                [method = "GET", path = "/api/task/<id>"],
+                [method = "POST", path = "/api/task", body = "name, goal"],
+                [method = "PUT", path = "/api/task/<id>", body = "message"],
+                [method = "DELETE", path = "/api/task/<id>"],
+                [method = "POST", path = "/api/request", body = "prompt"],
+                [method = "POST", path = "/api/request/poll", body = "request_id"],
+                [method = "GET", path = "/api/request/stream?request_id=<id>", body = "server sent events"],
+                [method = "POST", path = "/api/request/stop", body = "request_id"],
+                [method = "GET", path = "/api/notifications"],
+                [method = "GET", path = "/api/events"],
+                [method = "POST", path = "/api/shutdown"],
+            ],
+        ]);
+    });
+
+    // GET /api/health — liveness probe, always allowed
+    server.route("GET", "^/api/health$", [host, port, counters, started_at](req, writer) {
+        return node_api_ok([
+            status = "ok",
+            port = port,
+            uptime_ms = std.millis() - started_at,
+            running = json.bool(host.running),
+            requests_total = counters.requests_total,
+            time = std.millis(),
+        ]);
+    });
+
+    // GET /api/status — node statistics
+    server.route("GET", "^/api/status$", [host, cfg, requests, notifications, events, counters, port, started_at, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        ov = host.get_overview();
+
+        return node_api_ok([
+            node = [
+                name = "megamind-node-api",
+                version = NODE_API_VERSION,
+                port = port,
+                running = json.bool(host.running),
+                uptime_ms = std.millis() - started_at,
+                auth_required = json.bool(!api_token.empty()),
+            ],
+            model = [
+                url = cfg.url,
+                name = cfg.name,
+                max_tokens = cfg.max_tokens,
+                max_running_agents = cfg.max_running_agents,
+            ],
+            receptionist = [
+                active = json.bool(host._receptionist_active),
+                queued = host.request_queue.size(),
+            ],
+            workers = host.worker_threads.size(),
+            tasks = [
+                running = ov.tasks.size(),
+                planned = ov.tasks_scheduled.size(),
+                finished = ov.tasks_finished.size(),
+                failed = ov.tasks_failed.size(),
+            ],
+            requests = [
+                open = requests.size(),
+                total = counters.requests_total,
+                done = counters.requests_done,
+                error = counters.requests_error,
+            ],
+            notifications = notifications.size(),
+            events = events.size(),
+        ]);
+    });
+
+    // GET /api/overview — raw overview (what the receptionist sees)
+    server.route("GET", "^/api/overview$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok(host.get_overview());
+    });
+
+    // GET /api/tasks — flattened task list
+    server.route("GET", "^/api/tasks$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok(node_api_task_list(host.get_overview()));
+    });
+
+    // GET /api/task/<id>
+    server.route("GET", "^/api/task/([0-9a-zA-Z_-]+)$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        taskid = std.string(req.matches[0]);
+        info = host.inspect_task(taskid);
+
+        if(std.is_string(info))
+            return node_api_err(info, 404);
+
+        return node_api_ok(info);
+    });
+
+    // POST /api/task — {name, goal}
+    server.route("POST", "^/api/task$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        goal = node_api_get(body, "goal");
+
+        if(goal.strip().empty())
+            return node_api_err("Missing 'goal'");
+
+        name = node_api_get(body, "name");
+
+        if(name.strip().empty())
+            name = "Task-" + std.random_hash(6);
+
+        taskid = host.add_task(name, goal);
+
+        return node_api_ok([taskid = taskid, name = name, state = "planned"]);
+    });
+
+    // PUT /api/task/<id> — {message}
+    server.route("PUT", "^/api/task/([0-9a-zA-Z_-]+)$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        message = node_api_get(body, "message");
+
+        if(message.strip().empty())
+            return node_api_err("Missing 'message'");
+
+        taskid = std.string(req.matches[0]);
+
+        if(!host.update_task(taskid, message))
+            return node_api_err("The task is not running or planned anymore, create a new task.", 409);
+
+        return node_api_ok([taskid = taskid, state = "updated"]);
+    });
+
+    // DELETE /api/task/<id>
+    server.route("DELETE", "^/api/task/([0-9a-zA-Z_-]+)$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        taskid = std.string(req.matches[0]);
+        host.stop_task(taskid);
+
+        return node_api_ok([taskid = taskid, state = "stopped"]);
+    });
+
+    // POST /api/request — {prompt}
+    server.route("POST", "^/api/request$", [host, requests, counters, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        prompt = node_api_get(body, "prompt");
+
+        if(prompt.strip().empty())
+            return node_api_err("Missing 'prompt'");
+
+        request_id = std.random_hash(24);
+
+        requests[request_id] = [
+            id = request_id,
+            prompt = prompt,
+            status = "queued",
+            queue = [],
+            result = None,
+            error = "",
+            created = std.millis(),
+            last_poll = std.millis(),
+            client_ip = std.string(req.client_ip),
+        ];
+
+        counters.requests_total++;
+
+        run_request = [host, requests, counters, request_id, prompt]() {
+            on_action = [requests, request_id](action) {
+                if(!requests.has(request_id))
+                    return;
+
+                requests[request_id].queue.push_back(action);
+                requests[request_id].status = "generating";
+            };
+
+            on_finish = [requests, request_id](result) {
+                if(!requests.has(request_id))
+                    return;
+
+                requests[request_id].result = result;
+            };
+
+            try {
+                result = host.request(prompt, on_finish, on_action);
+
+                if(requests.has(request_id)) {
+                    requests[request_id].result = result;
+                    requests[request_id].status = "done";
+                    counters.requests_done++;
+                }
+            }
+            catch(e) {
+                if(requests.has(request_id)) {
+                    requests[request_id].status = "error";
+                    requests[request_id].error = std.string(e);
+                    counters.requests_error++;
+                }
+            }
+        };
+
+        std.thread(run_request).run();
+
+        return node_api_ok([request_id = request_id, status = "queued"]);
+    });
+
+    // POST /api/request/poll — {request_id}
+    server.route("POST", "^/api/request/poll$", [requests, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        request_id = node_api_get(body, "request_id");
+
+        if(request_id.empty())
+            return node_api_err("Missing 'request_id'");
+
+        if(!requests.has(request_id))
+            return node_api_ok([request_id = request_id, status = "done", note = "unknown request_id"]);
+
+        requests[request_id].last_poll = std.millis();
+
+        queue = &requests[request_id].queue;
+
+        if(queue.size()) {
+            delta = queue[0];
+            queue.erase(0);
+            return node_api_ok([request_id = request_id, status = "generating", delta = delta]);
+        }
+
+        status = std.string(requests[request_id].status);
+
+        if(status == "done") {
+            result = requests[request_id].result;
+            requests.erase(request_id);
+            return node_api_ok([request_id = request_id, status = "done", result = result]);
+        }
+
+        if(status == "error") {
+            error = requests[request_id].error;
+            requests.erase(request_id);
+            return node_api_ok([request_id = request_id, status = "error", error = error]);
+        }
+
+        // queued / generating without new deltas yet
+        return node_api_ok([request_id = request_id, status = "waiting"]);
+    });
+
+    // GET /api/request/stream?request_id=<id> — server sent events
+    server.route("GET", "^/api/request/stream$", [requests, api_token](req, writer) {
+        request_id = node_api_get(req.query_params, "request_id");
+
+        if(!node_api_authorized(req, api_token)) {
+            writer.write_header(401, "application/json; charset=utf-8", node_api_headers());
+            writer.write(std.string([ok = json.bool(false), error = "Unauthorized"]));
+            writer.end();
+            return;
+        }
+
+        if(request_id.empty() || !requests.has(request_id)) {
+            writer.write_header(404, "application/json; charset=utf-8", node_api_headers());
+            writer.write(std.string([ok = json.bool(false), error = "Unknown request_id"]));
+            writer.end();
+            return;
+        }
+
+        if(!writer.write_header(200, "text/event-stream", node_api_headers([
+            "Cache-Control" = "no-cache",
+            "Connection" = "keep-alive",
+            "X-Accel-Buffering" = "no",
+        ])))
+            return;
+
+        writer.write_sse(std.string([request_id = request_id, status = "connected"]), "status");
+
+        last_ping = std.millis();
+
+        for(requests.has(request_id) && writer.is_client_alive()) {
+            queue = &requests[request_id].queue;
+            sent = false;
+
+            for(queue.size()) {
+                delta = queue[0];
+                queue.erase(0);
+
+                writer.write_sse(std.string(delta), "delta");
+                sent = true;
+            }
+
+            if(!writer.is_client_alive())
+                break;
+
+            status = std.string(requests[request_id].status);
+
+            if(status == "done") {
+                writer.write_sse(std.string([
+                    request_id = request_id,
+                    status = "done",
+                    result = requests[request_id].result,
+                ]), "done");
+                requests.erase(request_id);
+                break;
+            }
+
+            if(status == "error") {
+                writer.write_sse(std.string([
+                    request_id = request_id,
+                    status = "error",
+                    error = requests[request_id].error,
+                ]), "error");
+                requests.erase(request_id);
+                break;
+            }
+
+            if(!sent && std.millis() - last_ping > NODE_API_STREAM_PING_MS) {
+                writer.write(": ping\n\n");
+                last_ping = std.millis();
+            }
+
+            std.sleep(NODE_API_STREAM_POLL_MS);
+        }
+
+        writer.end();
+    });
+
+    // POST /api/request/stop — {request_id}
+    server.route("POST", "^/api/request/stop$", [host, requests, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        request_id = node_api_get(body, "request_id");
+
+        if(request_id.empty())
+            return node_api_err("Missing 'request_id'");
+
+        if(!requests.has(request_id))
+            return node_api_ok([request_id = request_id, status = "done", note = "unknown request_id"]);
+
+        requests[request_id].queue.clear();
+        requests[request_id].status = "done";
+        requests[request_id].result = None;
+        requests.erase(request_id);
+
+        // The receptionist is a single shared agent: stopping it ends the current
+        // turn of this node, exactly like the dashboard stop endpoint.
+        try {
+            host.receptionist.stop();
+        }
+        catch(e) {}
+
+        return node_api_ok([request_id = request_id, status = "stopped"]);
+    });
+
+    // GET /api/notifications — ?drain=1 clears the list
+    server.route("GET", "^/api/notifications$", [notifications, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        list = notifications.copy();
+
+        if(node_api_get(req.query_params, "drain") == "1")
+            notifications.clear();
+
+        return node_api_ok(list);
+    });
+
+    // GET /api/events — ?since=<ms>
+    server.route("GET", "^/api/events$", [events, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        since = node_api_int(req.query_params, "since");
+
+        if(!since)
+            return node_api_ok(events.copy());
+
+        list = [];
+
+        for(i = 0; i < events.size(); i++) {
+            if(events[i].time > since)
+                list.push_back(events[i]);
+        }
+
+        return node_api_ok(list);
+    });
+
+    // POST /api/shutdown
+    server.route("POST", "^/api/shutdown$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        host.running = false;
+
+        return node_api_ok([status = "stopping"]);
+    });
+
+    if(!server.start()) {
+        std.error("node_api: cannot start the HTTP server on port ", port, ".");
+        return None;
+    }
+
+    return server;
+}

@@ -1,0 +1,580 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  router.shio — interactive CLI host for the Router class (router_api.shio)
+//
+//  Usage:   shz router.shio                      interactive router CLI
+//           shz router.shio "route this task"     single shot: route, print, quit
+//           shz router.shio --name AIRouter --role router --poll 1000
+//           shz router.shio --timeout 120 "task text"
+//
+//  The host owns one Router(): it prints the nodes it discovers, hands every text
+//  entered by the user to the ROUTER AGENT (roles/router — the LLM that picks the
+//  node and delegates), and prints node events as they arrive (Router.on_event).
+//
+//  Console commands:
+//    /nodes                 discovered AI nodes (routing table)
+//    /tasks                 mirrored remote task state
+//    /overview [node]       router overview, or a live node overview
+//    /route <text>          one router-agent turn: the agent picks the node + delegates
+//    /node <node> <text>    explicit delegation to one node (no agent turn)
+//    /addworker <node> <name> <goal>
+//                           direct worker-pool task on that node (bypasses the
+//                           remote receptionist — management / debugging use)
+//    /notify <msg>          push a notification through Router.notify_user
+//    /clear                 clear the router agent transcript
+//    /config                show the model config path
+//    /help                  this list
+//    /exit                  quit
+//
+//  Plain text (no leading '/') is a request to the router agent, like /route. Real
+//  user work always goes through the node's receptionist; only /addworker drives the
+//  remote worker pool.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "router_api"
+
+cfg_path = std.config_path("miniagent", "default_model");
+
+cfg = ModelConfig();
+
+router_host_get_cfg() {
+	if(cfg.load(cfg_path)) {
+		return true;
+	}
+
+	api_url = "";
+	auth_token = "";
+	model_name = "";
+	max_ctx = 128000;
+	max_running_agents = 4;
+
+	for(1) {
+		std.print("Enter v1 url ( e.g. http://localhost:8000 )");
+		api_url = std.input(">>> ");
+
+		std.print("Enter model name (OPTIONAL)");
+		model_name = std.input(">>> ");
+
+		std.print("Enter auth token (OPTIONAL)");
+		auth_token = std.input(">>> ");
+
+		std.print("Enter model context length (OPTIONAL)");
+		max_ctx_num = std.int(std.input(">>> "));
+		if(max_ctx_num > 0) {
+			max_ctx = max_ctx_num;
+		}
+
+		std.print("Enter max simultaneous agents (OPTIONAL)");
+		max_running_agents = std.int(std.input(">>> "));
+
+		api_url = api_url.removesuffix("/v1/");
+		api_url = api_url.removesuffix("/v1");
+		api_url = api_url.removesuffix("/");
+
+		if(cfg.set(api_url, auth_token, model_name, max_ctx, max_running_agents)) {
+			break;
+		}
+
+		std.print("Could not get an answer from the API.");
+	}
+
+	cfg.save(cfg_path);
+
+	return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  console output
+// ─────────────────────────────────────────────────────────────────────────────
+
+last_state = "";
+
+router_host_print(action) {
+	if(action.text) {
+		if(last_state != "text") {
+			last_state = "text";
+			std.cout("\n");
+		}
+		stdfcol("white");
+		std.cout(action.text);
+	}
+
+	if(action.reasoning) {
+		if(last_state != "reasoning") {
+			last_state = "reasoning";
+			std.cout("\n");
+		}
+		stdfcol("yellow");
+		std.cout(action.reasoning);
+	}
+
+	if(action.tool_start) {
+		last_state = "tool";
+		std.cout("\n\n");
+		stdfcol("yellow");
+		std.cout("[TOOL] ", action.tool_start.name, "\n");
+		stdfcol("white");
+	}
+
+	if(action.tool) {
+		last_state = "tool";
+		std.cout("\n\n");
+		stdfcol("yellow");
+		std.cout("[TOOL] ", action.tool.name, "\n");
+		stdfcol("white");
+	}
+}
+
+router_host_print_event(e) {
+	kind = std.string(e.kind ?? "event");
+	node = std.string(e.node ?? "?");
+	txt = "";
+
+	if(kind == "node_state") {
+		stdfcol(e.online ? "green" : "red");
+		txt = "[node] " + node + (e.online ? " online" : " offline");
+	}
+	else if(kind == "task_state") {
+		state = std.string(e.state ?? "?");
+		if(state == "finished") {
+			stdfcol("green");
+		}
+		else if(state == "failed" || state == "lost") {
+			stdfcol("red");
+		}
+		else {
+			stdfcol("cyan");
+		}
+		txt = "[task] " + node + " " + std.string(e.name ?? "") + " " + std.string(e.prev ?? "-") + " -> " + state;
+	}
+	else if(kind == "task_finished") {
+		stdfcol("green");
+		txt = "[done] " + node + " " + std.string(e.name ?? "") + " " + std.string(e.state ?? "");
+	}
+	else if(kind == "notify") {
+		stdfcol("magenta");
+		txt = "[notify] " + node + ": " + std.string(e.message ?? "");
+	}
+	else {
+		stdfcol("cyan");
+		txt = "[" + kind + "] " + std.string(e);
+	}
+
+	std.cout("\n" + txt + "\n");
+	stdfcol("white");
+}
+
+router_host_print_nodes(rtr) {
+	list = rtr.nodes_summary();
+
+	if(!list.size()) {
+		stdfcol("yellow");
+		std.cout("\nNo AI nodes discovered yet (looking for the AINode prop on the ShizoNet network).\n");
+		stdfcol("white");
+		return;
+	}
+
+	stdfcol("white");
+	std.cout("\nNodes (", list.size(), "):\n");
+
+	for(i = 0; i < list.size(); i++) {
+		n = list[i];
+		std.cout("  ", (i + 1), ". ", n.name, "  [", n.mac, "]");
+		if(n.description) {
+			std.cout("  - ", n.description);
+		}
+		std.cout("\n");
+		std.cout("     capabilities: ", std.string(n.capabilities), "  tags: ", std.string(n.tags), "\n");
+		std.cout("     model: ", n.model, "  busy: ", (n.busy ? "yes" : "no"), "  running: ", n.tasks_running, "  planned: ", n.tasks_planned, "  open(router): ", n.open_tasks, "\n");
+	}
+
+	stdfcol("white");
+}
+
+router_host_print_tasks(rtr) {
+	ov = rtr.get_overview();
+	tasks = ov.remote_tasks;
+
+	if(!tasks.size()) {
+		stdfcol("yellow");
+		std.cout("\nNo remote tasks.\n");
+		stdfcol("white");
+		return;
+	}
+
+	stdfcol("white");
+	std.cout("\nRemote tasks (", tasks.size(), ", ", ov.tasks_open, " open):\n");
+
+	for(i = 0; i < tasks.size(); i++) {
+		t = tasks[i];
+		std.cout("  ", t.name, "  [", t.taskid, "]  node=", t.node, "  state=", t.state);
+		if(t.report) {
+			std.cout("  report: ", router_first_line(t.report, 60));
+		}
+		std.cout("\n");
+	}
+
+	stdfcol("white");
+}
+
+// the router agent's own words for a turn (route_task -> [.., answer]); the tool
+// stream is already printed live by router_host_print, this is the wrap-up.
+router_host_print_answer(res) {
+	answer = std.string(res.answer ?? "");
+	if(!answer) {
+		return;
+	}
+
+	stdfcol("white");
+	std.cout("\nrouter: ", answer, "\n");
+}
+
+router_host_help() {
+	std.cout(
+		"\n/nodes                 discovered AI nodes\n" +
+		"/tasks                 mirrored remote task state\n" +
+		"/overview [node]       router overview / live node overview\n" +
+		"/route <text>          router-agent turn: the agent picks the node\n" +
+		"/node <node> <text>    explicit delegation to one node (no agent turn)\n" +
+		"/addworker <node> <name> <goal>\n" +
+		"                       direct worker-pool task on that node (no receptionist)\n" +
+		"/notify <msg>          notify_user()\n" +
+		"/clear                 clear the router agent transcript\n" +
+		"/config                model config path\n" +
+		"/help                  this list\n" +
+		"/exit                  quit\n\n" +
+		"plain text is a request to the router agent (like /route)\n"
+	);
+}
+
+// block until the mirrored task reaches a terminal state (single-shot mode)
+router_host_wait(rtr, taskid, timeout_ms) {
+	deadline = std.millis() + timeout_ms;
+	shown = "";
+
+	for(1) {
+		t = rtr.inspect_task(taskid);
+
+		if(!std.is_json(t)) {
+			std.cout("task vanished: ", std.string(t), "\n");
+			return None;
+		}
+
+		if(t.state != shown) {
+			shown = t.state;
+			stdfcol("cyan");
+			std.cout("  ", t.node, " -> ", t.state, "\n");
+			stdfcol("white");
+		}
+
+		if(!router_is_open_state(t.state)) {
+			return t;
+		}
+
+		if(std.millis() > deadline) {
+			stdfcol("yellow");
+			std.cout("  timed out after ", timeout_ms / 1000, "s, the task keeps running on the node.\n");
+			stdfcol("white");
+			return t;
+		}
+
+		std.sleep(250);
+	}
+}
+
+// join the free-form arguments of a single-shot run, skipping the known flags
+router_host_prompt() {
+	out = "";
+	skip = false;
+
+	for(i = 1; i < std.argc(); i++) {
+		a = std.string(std.argv(i));
+		if(skip) {
+			skip = false;
+			continue;
+		}
+		if(a.starts("--")) {
+			if(a == "--name" || a == "--role" || a == "--poll" || a == "--timeout") {
+				skip = true;
+			}
+			continue;
+		}
+		if(out) {
+			out += " ";
+		}
+		out += a;
+	}
+
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Teardown. The Router owns threads (agent, poller) and an AiService (the
+//  shizonet transport). A top-level `return` does not tear them down in time, so
+//  the process would keep running after the work is done: stop them explicitly,
+//  exactly like Router.__deinit__ does.
+// ─────────────────────────────────────────────────────────────────────────────
+router_host_shutdown(rtr) {
+	rtr.running = false;
+
+	try {
+		rtr.stop();
+	}
+	catch(e) {}
+
+	if(rtr.service) {
+		try {
+			rtr.service.stop();
+		}
+		catch(e) {}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+router_host_get_cfg();
+
+name_opt = std.argvoption("--name");
+role_opt = std.argvoption("--role");
+poll_opt = std.argvoption("--poll");
+timeout_opt = std.argvoption("--timeout");
+
+opts = [name = "AIRouter"];
+
+if(name_opt) {
+	opts.name = std.string(name_opt);
+}
+if(role_opt) {
+	opts.role = std.string(role_opt);
+}
+if(poll_opt) {
+	opts.poll_ms = std.int(poll_opt);
+}
+
+rtr = Router(cfg, opts);
+
+rtr.on_action(router_host_print);
+rtr.on_event(router_host_print_event);
+
+stdfcol("white");
+std.cout("\nRouter '", rtr.name, "' online (role: ", rtr.role, ", poll: ", rtr.poll_ms, "ms). Scanning for AI nodes...\n");
+
+for(t = 0; t < 20; t++) {
+	if(rtr.nodes().size()) {
+		break;
+	}
+	std.sleep(250);
+}
+
+router_host_print_nodes(rtr);
+
+timeout_ms = 300000;
+if(timeout_opt) {
+	timeout_ms = std.int(timeout_opt) * 1000;
+}
+
+// ── single shot: hand the text to the router agent, print the answer, quit ─────
+prompt = router_host_prompt();
+
+if(prompt) {
+	std.cout("\nRouter agent turn: ", prompt, "\n");
+
+	res = rtr.route_task(prompt);
+
+	router_host_print_answer(res);
+
+	// a delegated task is the fact that matters: report it even when the turn
+	// result itself is odd. Only a turn that neither routed nor succeeded is a failure.
+	if(!res.routed) {
+		if(!res.ok) {
+			stdfcol("red");
+			std.cout("\nThe router agent turn failed: ", std.string(res.error ?? "no details"), "\n");
+			stdfcol("white");
+		}
+
+		// the agent answered the user without delegating (an arbitrary question):
+		// its answer is already printed, there is no task to wait for.
+		router_host_shutdown(rtr);
+		return;
+	}
+
+	std.cout("delegated to ", res.node, "  taskid=", res.taskid, "\n");
+
+	task = router_host_wait(rtr, res.taskid, timeout_ms);
+
+	if(std.is_json(task)) {
+		std.cout("\n--- ", task.node, " ", task.state, " ---\n");
+		if(task.report) {
+			std.cout(task.report, "\n");
+		}
+		if(task.last_error && !task.report) {
+			std.cout("error: ", task.last_error, "\n");
+		}
+	}
+
+	router_host_shutdown(rtr);
+	return;
+}
+
+// ── interactive console ──────────────────────────────────────────────────────
+router_host_help();
+
+for(1) {
+	std.color("green");
+	std.cout("\n>>> (router) ");
+
+	cmd = std.input().strip();
+
+	if(cmd.empty()) {
+		std.sleep(100);
+		continue;
+	}
+
+	if(cmd == "exit" || cmd == "/exit") {
+		break;
+	}
+
+	if(cmd == "/nodes") {
+		router_host_print_nodes(rtr);
+		continue;
+	}
+
+	if(cmd == "/tasks") {
+		router_host_print_tasks(rtr);
+		continue;
+	}
+
+	if(cmd == "/config") {
+		std.cout(cfg_path, "\n");
+		continue;
+	}
+
+	if(cmd == "/help") {
+		router_host_help();
+		continue;
+	}
+
+	if(cmd == "/clear") {
+		rtr.agent.clear_chat();
+		std.cout("Cleared the router agent transcript.\n");
+		continue;
+	}
+
+	if(cmd.starts("/overview")) {
+		arg = cmd.removeprefix("/overview").strip();
+		if(arg) {
+			std.print(rtr.node_overview(arg));
+		}
+		else {
+			std.print(rtr.get_overview());
+		}
+		continue;
+	}
+
+	if(cmd.starts("/notify")) {
+		msg = cmd.removeprefix("/notify").strip();
+		if(!msg) {
+			std.cout("usage: /notify <message>\n");
+			continue;
+		}
+		rtr.notify_user(msg);
+		continue;
+	}
+
+	// direct worker-pool task: bypasses the remote receptionist (management use).
+	// Real user work stays on the /route / plain-text receptionist path above.
+	if(cmd.starts("/addworker")) {
+		rest = cmd.removeprefix("/addworker").strip();
+		parts = rest.split(" ", 3, true);
+
+		if(parts.size() < 3) {
+			std.cout("usage: /addworker <node> <name> <goal>\n");
+			continue;
+		}
+
+		wnode = parts[0];
+		wname = parts[1];
+		wgoal = parts[2];
+
+		tid = rtr.add_task(wname, wgoal, wnode, "worker");
+
+		if(tid) {
+			stdfcol("green");
+			std.cout("worker task on ", wnode, "  taskid=", tid, "  (watch /tasks)\n");
+			stdfcol("white");
+		}
+		else {
+			stdfcol("red");
+			std.cout("add_task(worker) failed on ", wnode, " (see the [router] error above)\n");
+			stdfcol("white");
+		}
+		continue;
+	}
+
+	// explicit delegation: the caller names the node, no router-agent turn.
+	if(cmd.starts("/node")) {
+		rest = cmd.removeprefix("/node").strip();
+		parts = rest.split(" ", 2, true);
+
+		if(parts.size() < 2) {
+			std.cout("usage: /node <node> <text>\n");
+			continue;
+		}
+
+		res = rtr.delegate(parts[0], parts[1]);
+
+		if(res.ok) {
+			stdfcol("green");
+			std.cout("delegated to ", res.node, "  taskid=", res.taskid, "  (watch /tasks)\n");
+			stdfcol("white");
+		}
+		else {
+			stdfcol("red");
+			std.cout("delegation failed: ", std.string(res.error ?? "no details"), "\n");
+			stdfcol("white");
+		}
+		continue;
+	}
+
+	text = cmd;
+	if(cmd.starts("/route")) {
+		text = cmd.removeprefix("/route").strip();
+	}
+
+	if(cmd.starts("/") && !cmd.starts("/route")) {
+		std.cout("unknown command. /help\n");
+		continue;
+	}
+
+	if(!text) {
+		std.cout("usage: /route <text>\n");
+		continue;
+	}
+
+	// one router-agent turn: the AGENT reads get_nodes() and delegates
+	res = rtr.route_task(text);
+
+	router_host_print_answer(res);
+
+	// a delegated task is a success even if the turn result is odd; a turn that
+	// answered without delegating is not an error; only a failed turn is.
+	if(res.routed) {
+		stdfcol("green");
+		std.cout("delegated to ", res.node, "  taskid=", res.taskid, "  (watch /tasks)\n");
+		stdfcol("white");
+	}
+	else if(res.ok) {
+		// an arbitrary question: the agent answered, nothing was routed
+		stdfcol("cyan");
+		std.cout("no task routed (the agent answered above)\n");
+		stdfcol("white");
+	}
+	else {
+		stdfcol("red");
+		std.cout("the router agent turn failed: ", std.string(res.error ?? "no details"), "\n");
+		stdfcol("white");
+	}
+}
+
+router_host_shutdown(rtr);
+
+std.cout("\nRouter host stopped.\n");

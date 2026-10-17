@@ -1,0 +1,296 @@
+// ============================================================================
+// skill_selftest.shio — self test of the curl skill layer
+//
+//   shz skill_selftest.shio
+//
+// Loads SKILL.shio exactly the way the miniagent does (std.module +
+// add_tools(agt)) with a stub agent that mimics the miniagent API, then drives
+// every tool against the local fixture server. No LLM endpoint, no internet.
+// Exits 1 when a check fails.
+// ============================================================================
+
+#include "curl_test_server.shio"
+
+class stub_agent
+{
+	added_tools = [];
+	env = [];
+	calls = [];
+
+	add_tool(name, description, params, callback)
+	{
+		calls[name] = [description = description, params = params, callback = callback];
+		added_tools[name] = [description = description];
+	}
+}
+
+call_tool(agt, tool_name, args)
+{
+	if(!agt.calls.has(tool_name))
+	{
+		std.print("FAIL  tool registered: ", tool_name, "\n");
+		return [ok = false, error = "not registered"];
+	}
+
+	res = None;
+
+	try {
+		res = agt.calls[tool_name].callback(agt, args);
+	}
+	catch(e) {
+		std.print("FAIL  tool call ", tool_name, " -> ", e, "\n");
+		return [ok = false, error = std.string(e)];
+	}
+
+	return res;
+}
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS  ", label, "\n");
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL  ", label, "  -> ", std.string(detail), "\n");
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_PORT = 13359;
+BASE = "http://127.0.0.1:" + TEST_PORT;
+TMPFILE = __DIR__ + "/_curl_skill_selftest_download.txt";
+
+server = curl_test_server_start(TEST_PORT);
+
+if(!server)
+{
+	std.print("FAIL  the fixture server did not start on port ", TEST_PORT, "\n");
+	std.exitprocess(1);
+}
+
+std.sleep(300);
+
+managed agt = stub_agent();
+
+skill = std.module();
+skill.load_file(__DIR__ + "/SKILL.shio");
+
+if(!skill.has("add_tools"))
+{
+	std.print("FAIL  SKILL.shio exposes add_tools\n");
+	std.exitprocess(1);
+}
+
+skill.call("add_tools", agt);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  registration
+// ─────────────────────────────────────────────────────────────────────────────
+
+expected = ["curl_request", "curl_start", "curl_poll", "curl_wait", "curl_stop", "curl_streams", "curl_upload", "curl_status"];
+
+for(i = 0; i < expected.size(); i++)
+	check("registers " + expected[i], agt.calls.has(expected[i]));
+
+check("no tool beyond the expected set", agt.added_tools.size() == expected.size(), agt.added_tools.size());
+
+for(i = 0; i < expected.size(); i++)
+{
+	name = expected[i];
+
+	if(!agt.calls.has(name))
+		continue;
+
+	c = agt.calls[name];
+	check(name + " has a description", c.description.length() > 30, c.description.length());
+
+	if(name == "curl_streams" || name == "curl_status")
+		check(name + " takes no params", std.is_none(c.params), c.params);
+	else
+		check(name + " has params", std.is_json(c.params) && c.params.size() > 0, c.params);
+}
+
+check("curl_request requires url", agt.calls.curl_request.params.url.starts("&string()"), agt.calls.curl_request.params.url);
+check("curl_start requires url", agt.calls.curl_start.params.url.starts("&string()"), agt.calls.curl_start.params.url);
+check("curl_poll requires id", agt.calls.curl_poll.params.id.starts("&string()"), agt.calls.curl_poll.params.id);
+check("curl_wait requires id", agt.calls.curl_wait.params.id.starts("&string()"), agt.calls.curl_wait.params.id);
+check("curl_stop requires id", agt.calls.curl_stop.params.id.starts("&string()"), agt.calls.curl_stop.params.id);
+check("curl_upload requires url", agt.calls.curl_upload.params.url.starts("&string()"), agt.calls.curl_upload.params.url);
+check("curl_request has a method enum", agt.calls.curl_request.params.method.contains("enum(GET"), agt.calls.curl_request.params.method);
+check("curl_request has save_to", agt.calls.curl_request.params.has("save_to"), agt.calls.curl_request.params);
+check("curl_start has label", agt.calls.curl_start.params.has("label"), agt.calls.curl_start.params);
+check("curl_poll has max_chars", agt.calls.curl_poll.params.has("max_chars"), agt.calls.curl_poll.params);
+check("curl_wait has timeout_ms", agt.calls.curl_wait.params.has("timeout_ms"), agt.calls.curl_wait.params);
+check("curl_upload has path and data", agt.calls.curl_upload.params.has("path") && agt.calls.curl_upload.params.has("data"), agt.calls.curl_upload.params);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  curl_request
+// ─────────────────────────────────────────────────────────────────────────────
+
+r = call_tool(agt, "curl_request", [url = BASE + "/plain"]);
+check("curl_request ok", r.ok, r);
+check("curl_request http_code", r.http_code == 200, r.http_code);
+check("curl_request body", r.body == "hello world", r.body);
+check("curl_request reports bytes", r.bytes == 11, r.bytes);
+check("curl_request content_type", r.content_type.contains("text/plain"), r.content_type);
+check("curl_request defaults to GET", !r.has("warning"), r);
+
+r = call_tool(agt, "curl_request", [url = BASE + "/echo", method = "POST", body = "tool-payload", headers = ["Content-Type" = "text/plain"]]);
+check("curl_request POST arrives", r.ok && r.body.contains("tool-payload"), r.body);
+check("curl_request POST reports the method", r.body.contains("POST"), r.body);
+
+r = call_tool(agt, "curl_request", [url = BASE + "/echo", headers = "{\"X-Marker\": \"skill-mk\"}"]);
+check("curl_request sends headers from a json string", r.ok && r.body.contains("skill-mk"), r.body);
+
+r = call_tool(agt, "curl_request", [url = BASE + "/status/404"]);
+check("curl_request 404 is ok=true", r.ok && r.http_code == 404, r);
+check("curl_request warns on 4xx", r.warning.contains("404"), r.warning);
+
+r = call_tool(agt, "curl_request", [url = BASE + "/big/9000", max_chars = 500]);
+check("curl_request truncates", r.ok && r.truncated == 1, [t = r.geti("truncated"), n = r.body.length()]);
+check("curl_request respects max_chars", r.body.length() <= 600, r.body.length());
+check("curl_request explains the cut", r.note.contains("max_chars") || r.note.contains("save_to"), r.note);
+check("curl_request reports the real size", r.bytes >= 9000, r.bytes);
+
+fileio.remove(TMPFILE);
+r = call_tool(agt, "curl_request", [url = BASE + "/big/4000", save_to = TMPFILE]);
+check("curl_request save_to ok", r.ok && r.http_code == 200, r);
+check("curl_request save_to wrote the file", fileio.exists(TMPFILE), TMPFILE);
+check("curl_request save_to reports bytes", r.bytes >= 4000, r.bytes);
+check("curl_request save_to omits the body", !r.has("body"), r);
+fileio.remove(TMPFILE);
+
+r = call_tool(agt, "curl_request", [url = "ftp://example.com/x"]);
+check("curl_request refuses a bad scheme", !r.ok && r.error.size() > 0, r);
+
+r = call_tool(agt, "curl_request", [url = "http://127.0.0.1:1/nope"]);
+check("curl_request reports a dead port", !r.ok && r.error.size() > 0, r);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  curl_start / curl_poll / curl_wait / curl_stop
+// ─────────────────────────────────────────────────────────────────────────────
+
+s = call_tool(agt, "curl_start", [url = BASE + "/stream/5/100", label = "skill-stream", timeout_ms = "30000"]);
+check("curl_start ok", s.ok, s);
+check("curl_start returns an id", s.id.starts("req_"), s.id);
+check("curl_start says running", s.status == "running", s.status);
+check("curl_start explains the next step", s.note.contains("curl_poll"), s.note);
+
+id = s.id;
+
+p = call_tool(agt, "curl_poll", [id = id]);
+tries = 0;
+for(tries < 40 && p.new_chunks == 0) {
+	tries++;
+	p = call_tool(agt, "curl_poll", [id = id]);
+	std.sleep(25);
+}
+
+check("curl_poll returns chunks", p.new_chunks >= 1, [n = p.new_chunks, tries = tries]);
+check("curl_poll text has chunk1", p.text.contains("chunk1"), p.text);
+check("curl_poll reports the status", p.status == "running" || p.status == "finished", p.status);
+check("curl_poll does not return the raw chunk list", !p.has("chunks"), p);
+
+w = call_tool(agt, "curl_wait", [id = id, timeout_ms = "8000"]);
+check("curl_wait finishes", w.ok && w.status == "finished", [s = w.status, t = w.geti("timed_out")]);
+check("curl_wait is not timed out", !w.timed_out, w.timed_out);
+check("curl_wait has all chunks", w.text.contains("chunk1") && w.text.contains("chunk5"), w.text);
+check("curl_wait notes the finish", w.note.contains("finished"), w.note);
+check("curl_wait drops the raw chunk list", !w.has("chunks"), w);
+check("curl_wait reports the byte count", w.bytes >= 35, w.bytes);
+
+p = call_tool(agt, "curl_poll", [id = id]);
+check("curl_wait leaves the poll cursor alone", p.new_chunks >= 4, [n = p.new_chunks, t = p.text]);
+
+r = call_tool(agt, "curl_stop", [id = id]);
+check("curl_stop ok", r.ok && r.status == "stopped", r);
+
+p = call_tool(agt, "curl_poll", [id = id]);
+check("curl_poll on a closed id is ok=false", !p.ok && p.error.size() > 0, p);
+check("curl_poll gives a hint", p.hint.contains("curl_streams"), p.hint);
+
+w = call_tool(agt, "curl_wait", [id = "req_nosuch"]);
+check("curl_wait on a closed id is ok=false", !w.ok, w);
+
+// a stream that does not end -> stop it
+s = call_tool(agt, "curl_start", [url = BASE + "/forever", label = "skill-forever", timeout_ms = "300000"]);
+id2 = s.id;
+check("curl_start of a long stream ok", s.ok, s);
+
+std.sleep(400);
+
+st = call_tool(agt, "curl_streams", []);
+check("curl_streams reports one open", st.ok && st.open == 1, st);
+check("curl_streams lists the label", st.streams[0].label == "skill-forever", st.streams);
+check("curl_streams reports the max", st.max_streams > 0, st.max_streams);
+
+r = call_tool(agt, "curl_stop", [id = id2]);
+check("curl_stop of the long stream ok", r.ok, r);
+check("curl_stop received data", r.bytes > 0, r.bytes);
+check("curl_stop returns the text", r.text.contains("tick"), r.text);
+
+st = call_tool(agt, "curl_streams", []);
+check("curl_streams is empty after stopping", st.open == 0, st);
+check("curl_streams explains how to start one", st.note.contains("curl_start"), st.note);
+
+// a stream that outlives the wait timeout
+s = call_tool(agt, "curl_start", [url = BASE + "/forever", timeout_ms = "300000"]);
+id3 = s.id;
+w = call_tool(agt, "curl_wait", [id = id3, timeout_ms = "600"]);
+check("curl_wait times out on a live stream", w.ok && w.timed_out, [t = w.geti("timed_out"), s = w.status]);
+check("curl_wait explains the timeout", w.note.contains("Still running"), w.note);
+check("curl_wait returns the partial text", w.text.contains("tick"), w.text);
+call_tool(agt, "curl_stop", [id = id3]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  curl_upload
+// ─────────────────────────────────────────────────────────────────────────────
+
+u = call_tool(agt, "curl_upload", [url = BASE + "/upload", data = "UPLOADDATA-tool", filename = "note.txt", content_type = "text/plain"]);
+check("curl_upload from data ok", u.ok && u.http_code == 200, u);
+check("curl_upload body reports the upload", u.body.contains("true"), u.body);
+check("curl_upload reports what it sent", u.sent.contains("bytes"), u.sent);
+
+fileio.write_string(TMPFILE, "UPLOADDATA-tool-file");
+u = call_tool(agt, "curl_upload", [url = BASE + "/upload", path = TMPFILE, fieldname = "file"]);
+check("curl_upload of a file ok", u.ok, u);
+check("curl_upload reports the path", u.sent == TMPFILE, u.sent);
+fileio.remove(TMPFILE);
+
+u = call_tool(agt, "curl_upload", [url = BASE + "/upload"]);
+check("curl_upload without content is ok=false", !u.ok && u.error.size() > 0, u);
+
+u = call_tool(agt, "curl_upload", [url = BASE + "/upload", path = __DIR__ + "/nope-missing.bin"]);
+check("curl_upload of a missing file is ok=false", !u.ok, u);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  curl_status
+// ─────────────────────────────────────────────────────────────────────────────
+
+info = call_tool(agt, "curl_status", []);
+check("curl_status ok", info.ok, info);
+check("curl_status reports libcurl", info.libcurl.contains("libcurl"), info.libcurl);
+check("curl_status reports the limits", info.limits.max_timeout_ms == 600000, info.limits);
+check("curl_status reports the counters", info.counters.requests > 0 && info.counters.started > 0, info.counters);
+check("curl_status warns about the chunk queue", info.transport.chunk_queue_limit == 256, info.transport);
+check("curl_status lists the streams", std.is_json(info.streams) && info.streams.size() == 0, info.streams);
+check("curl_status reports the stream cap", info.max_streams >= 1, info.max_streams);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+server.stop();
+
+std.print("\nCURL SKILL SELFTEST: ", passed, " passed, ", failed, " failed\n");
+
+if(failed)
+	std.exitprocess(1);
+
+std.exitprocess(0);

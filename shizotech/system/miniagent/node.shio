@@ -2,12 +2,22 @@
 // ═════════════════════════════════════════════════════════════════════════════
 //  Mind host — runnable entry point for the Receptionist + Mind runtime
 //
-//  Usage:   shz runtime/mind_host.shio            (interactive)
-//           shz runtime/mind_host.shio "your request"   (single request)
+//  Usage:   shz node.shio                       interactive (shizonet is on too)
+//           shz node.shio --name Box --description "GPU box"   headless AI node
+//           shz node.shio --webserver --port 13337             + JSON web API
+//           shz node.shio --port 13337 --api-token secret
 //
 //  The host owns:
 //    - one Receptionist agent (the router for user requests)
 //    - the event dispatcher (runs Minds as short-lived LLM invocations)
+//
+//  ShizoNet is the de-facto transport: every node runs the AI node service
+//  (shizonet_ai.shio, contract in router_api.md) so routers on the network can
+//  delegate work, read the overview and receive ai_event pushes.
+//
+//  In --webserver / --port mode the node ALSO serves a headless JSON web API:
+//  POST /api/request with {"prompt": "..."} and poll /api/request/poll for the
+//  deltas. Every endpoint is documented in node_api.shio.
 //
 //  Host commands:
 //    /overview            all Minds and their lifecycle states
@@ -22,6 +32,9 @@
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "megamind"
+#include "mcp/mcp_server"
+#include "node_api"
+#include "shizonet_ai"
 
 cfg_path = std.config_path("miniagent", "default_model");
 
@@ -109,41 +122,84 @@ mind_host_get_cfg();
 host = Megamind(cfg);
 host.on_action(mind_host_print);
 
-//std.cout("\nmind dispatcher: ", start.status, "  store: ", mind_store_root(), "\n");
+// ── shizonet AI node service: always on, the de-facto transport ─────────────
+//  shizonet_ai.shio implements the router_api.md contract on this server:
+//  ai_request / ai_overview / ai_task_* answers + ai_event pushes.
+//  The JSON web API is opt-in and runs ALONGSIDE the shizonet node.
 
-if(std.argc() >= 2) {
-	request = "";
-	for(i = 1; i < std.argc(); i++) {
-		if(i > 1)
-			request += " ";
-		request += std.argv(i);
+var node_name = std.argvoption("--name");
+var node_desc = std.argvoption("--description");
+
+node = shizonet.server(node_name);
+
+ai = ai_node_attach(node, host, [
+	name = node_name,
+	description = node_desc,
+]);
+
+std.print("Shizonet AI node online: " + ai.node_name());
+
+// ── interactive mode: no arguments ──────────────────────────────────────────
+
+if(std.argc() == 1) {
+	for(1) {
+		std.color("green");
+		std.cout("\n>>> (user) ");
+
+		cmd = std.input().strip();
+
+		if(cmd == "exit" || cmd == "/exit")
+			break;
+
+		if(cmd.empty())
+			std.sleep(100);
+			continue;
+		
+		try {
+			host.request(cmd);
+		}
+		catch(e) {
+			std.error("receptionist run failed: ", e);
+		}
+
 	}
-
-	host.run(request);
-	mind_host_report(host.receptionist);
-
-	std.cout("\nThe request has been routed. Keep the host running to let Minds execute.\n");
 }
 
-for(1) {
-	std.color("green");
-	std.cout("\n>>> (user) ");
+// ── optional JSON web API, alongside shizonet ────────────────────────────────
+else if(std.argvoption("--webserver") || std.argvoption("--port")) {
+	// ── headless JSON web API mode ───────────────────────────────────────────
+	var port_opt = std.argvoption("--port");
+	var token_opt = std.argvoption("--api-token");
 
-	cmd = std.input().strip();
+	api_port = std.int(port_opt);
+	api_token = "";
 
-	if(cmd == "exit" || cmd == "/exit")
-		break;
+	if(api_port <= 0)
+		api_port = 13337;
 
-	if(cmd.empty())
-		continue;
-	
-	try {
-		host.run(cmd);
+	if(token_opt)
+		api_token = std.string(token_opt);
+
+	std.print("Starting API server at " + api_port);
+
+	api = node_api_start(host, cfg, api_port, api_token);
+
+	if(!api)
+		std.error("Could not start the API server on port ", api_port, ".");
+	else {
+		std.print("Node JSON API: http://localhost:" + api_port + "/api/health\n");
+
+		for(host.running)
+			std.sleep(250);
+
+		api.stop();
 	}
-	catch(e) {
-		std.error("receptionist run failed: ", e);
-	}
-
+}
+else {
+	// headless AI node: shizonet is up, nothing to do but stay alive
+	std.print("Headless AI node. Ctrl+C to stop.\n");
+	std.sleep(-1);
 }
 
-std.cout("\nhost stopped.\n");
+ai.stop();
+std.cout("\nHost stopped.\n");

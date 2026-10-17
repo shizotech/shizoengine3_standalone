@@ -1,0 +1,1852 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  router_api.shio — the Router class (Megamind-style, subclassable)
+//
+//  Binding contract:  router_api.md      Wire format:  shizonet_ai.shio
+//  Demo CLI host:     router.shio        (include THIS file, not router.shio)
+//
+//  The Router is the runtime substrate of the **router agent**: a miniagent running
+//  the "router" role (roles/router/) is the brain that decides which node owns a
+//  task, this class is the body that executes the agent's decisions — it discovers
+//  AI nodes over ShizoNet, delegates tasks to the right node's receptionist, mirrors
+//  their task state into a local table and forwards every node event to its owner.
+//
+//      #include "router_api"
+//
+//      r = Router(cfg);                                   // role "router"
+//      r = Router(cfg, [role = "receptionist", name = "AIRouter", poll_ms = 500]);
+//
+//      r.on_event([](e) { send_to_telegram(e); });        // the telegram hook
+//      r.on_action([](a) { print(a); });
+//      r.request("summarize this repo");                  // one router-agent turn
+//      r.route_task("summarize this repo");               // agent turn + the routed task
+//      r.delegate("Box", "train the model");              // explicit node, no model
+//
+//  Subclassing works exactly like Megamind:
+//
+//      class TelegramRouter : Router {
+//          __init__(cfg) {
+//              super.__init__(cfg, [name = "TelegramRouter"]);
+//              on_event([this](e) { this.push(e); });
+//          }
+//      }
+//
+//  The router miniagent (the LLM turn layer, see roles/router/) reaches the live
+//  router through  agt.env.router  — mirroring  agt.env.mind  in megamind.shio.
+//
+//  Threading rule (router_api.md): every device.get() runs in one of the Router's
+//  own threads (agent thread / poller thread) or in the host's main thread. Never
+//  inside a shizonet on_get handler — the ai_event sink only touches local state.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "miniagent"
+#include "shizonet_ai"
+
+ROUTER_VERSION = "1.0";
+
+ROUTER_MAX_SUMMARY_NODES = 32;
+ROUTER_MAX_TASKS_KEPT = 100;
+ROUTER_MAX_TASKS_SHOWN = 40;
+ROUTER_MAX_EVENTS_SHOWN = 25;
+ROUTER_MAX_ACTIONS_KEPT = 50;
+ROUTER_MAX_OUTPUT_CHARS = 2000;
+ROUTER_INFO_REFRESH_MS = 5000;
+ROUTER_MAX_POLL_FAILS = 3;
+
+// remote task states (router_api.md): queued | generating | finished | failed | stopped | lost
+router_is_open_state(state) {
+	if(state == "queued") {
+		return true;
+	}
+	if(state == "generating") {
+		return true;
+	}
+	return false;
+}
+
+// node_api request lifecycle: queued -> generating -> waiting -> done | error
+router_map_request_status(status) {
+	if(status == "queued") {
+		return "queued";
+	}
+	if(status == "generating") {
+		return "generating";
+	}
+	if(status == "waiting") {
+		return "generating";
+	}
+	if(status == "done") {
+		return "finished";
+	}
+	if(status == "error") {
+		return "failed";
+	}
+	if(status == "stopped") {
+		return "stopped";
+	}
+	return "generating";
+}
+
+// Megamind worker task states: planned | research | implement | finished | failed | question
+router_map_task_state(state) {
+	if(state == "planned") {
+		return "queued";
+	}
+	if(state == "research") {
+		return "generating";
+	}
+	if(state == "implement") {
+		return "generating";
+	}
+	if(state == "question") {
+		return "generating";
+	}
+	if(state == "finished") {
+		return "finished";
+	}
+	if(state == "done") {
+		return "finished";
+	}
+	if(state == "failed") {
+		return "failed";
+	}
+	if(state == "error") {
+		return "failed";
+	}
+	if(state == "stopped") {
+		return "stopped";
+	}
+	if(state == "lost") {
+		return "lost";
+	}
+	return "generating";
+}
+
+router_first_line(text, max_len = 90) {
+	line = std.string(text).strip().split("\n")[0];
+	if(line.length() > max_len) {
+		line = line.substr(0, max_len) + "...";
+	}
+	return line;
+}
+
+// miniagent result json -> plain report text ([ok, reports=[[report=...]], ...])
+router_report_text(result) {
+	if(!std.is_json(result)) {
+		return std.string(result);
+	}
+	if(result.has("reports") && result.reports.size()) {
+		out = "";
+		for(i = 0; i < result.reports.size(); i++) {
+			r = result.reports[i];
+			if(std.is_json(r) && r.has("report")) {
+				out += std.string(r.report) + "\n";
+			}
+			else {
+				out += std.string(r) + "\n";
+			}
+		}
+		return out.strip();
+	}
+	if(result.has("report")) {
+		return std.string(result.report);
+	}
+	if(result.has("error")) {
+		return std.string(result.error);
+	}
+	return std.string(result);
+}
+
+class Router {
+
+	running = true;
+
+	// routing identity, published through the AIRouter props
+	name = "AIRouter";
+	description = "Routes tasks to AI nodes over ShizoNet.";
+	capabilities = [];
+	tags = [];
+	version = ROUTER_VERSION;
+
+	// LLM turn layer (roles/router by default)
+	role = "router";
+	managed agent = None;
+
+	// transport
+	server = None;
+	service = None;			// the AiService handle from ai_router_attach: it owns
+								// the wire threads and dies with this Router, so the
+								// reference must be kept (its __deinit__ stops them)
+	poll_ms = 1000;
+
+	// state
+	_nodes = [];				// node records, keyed by mac (device object in .dev)
+	remote_tasks = [];			// mirrored remote task records
+	events = [];				// newest last, capped at AI_MAX_KEPT
+	request_queue = [];			// router-agent turns, Megamind.request style
+	last_actions = [];			// newest first, for the role's get_last_actions
+	threads = [];
+
+	started_at = 0;
+	_last_refresh = 0;
+	_turn_active = false;
+	_lock = "router:global";
+
+	_notify_cb = None;
+	_event_cb = None;
+	_action_cb = None;
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  cfg:  ModelConfig
+	//  opts: [name, description, capabilities, tags, role, on_event, on_notify,
+	//         on_action, poll_ms]
+	//
+	//  opts.role defaults to "router". Override it to reuse an existing role
+	//  (e.g. "receptionist") while roles/router/ is being written, or to run a
+	//  router with a different persona.
+	// ─────────────────────────────────────────────────────────────────────────
+	__init__(cfg, opts = None) {
+		started_at = std.millis();
+
+		if(opts) {
+			if(opts.has("name") && opts.name) {
+				name = std.string(opts.name);
+			}
+			if(opts.has("description") && opts.description) {
+				description = std.string(opts.description);
+			}
+			if(opts.has("capabilities")) {
+				capabilities = opts.capabilities;
+			}
+			if(opts.has("tags")) {
+				tags = opts.tags;
+			}
+			if(opts.has("role") && opts.role) {
+				role = std.string(opts.role);
+			}
+			if(opts.has("poll_ms") && opts.poll_ms > 0) {
+				poll_ms = std.int(opts.poll_ms);
+			}
+			if(opts.has("on_event")) {
+				_event_cb = opts.on_event;
+			}
+			if(opts.has("on_notify")) {
+				_notify_cb = opts.on_notify;
+			}
+			if(opts.has("on_action")) {
+				_action_cb = opts.on_action;
+			}
+		}
+
+		_lock = "router:" + name + ":" + std.random_hash(8);
+
+		agent = miniagent(cfg, role);
+		agent.set_reasoning_effort("low");
+		agent.env.router = this;
+		agent.env.last_actions = last_actions;
+		agent.on_action = _action_cb;
+
+		server = shizonet.server(name);
+		server.set_prop(AI_PROP_ROUTER, AI_NET_VERSION);
+		server.set_prop(AI_PROP_ROUTER_INFO, router_info_prop());
+
+		// registers on_get(ai_event) -> handle_event + the AIRouter props.
+		// The returned handle owns the transport threads: keep it alive.
+		service = ai_router_attach(server, this);
+
+		server.on_connect(this._on_connect);
+		server.on_disconnect(this._on_disconnect);
+
+		// pick up everything that is already out there
+		refresh_nodes();
+
+		at = std.thread(this.agent_thread);
+		at.run();
+		threads.push_back(at);
+
+		pt = std.thread(this.poller_thread);
+		pt.run();
+		threads.push_back(pt);
+	}
+
+	__deinit__() {
+		running = false;
+
+		if(agent) {
+			try {
+				agent.stop();
+			}
+			catch(e) {}
+		}
+
+		// tear the transport threads down before joining our own
+		if(service) {
+			try {
+				service.stop();
+			}
+			catch(e) {}
+		}
+
+		for(i = 0; i < threads.size(); i++) {
+			try {
+				threads[i].join();
+			}
+			catch(e) {}
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  Router-agent turns (queued, blocking) — same contract as Megamind.request
+	// ─────────────────────────────────────────────────────────────────────────
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		new_request = [
+			id = std.random_hash(),
+			prompt = prompt,
+			finished = false,
+			result = None,
+			on_finish_cb = on_finish_cb,
+			on_action_cb = on_action_cb,
+		];
+
+		request_queue.push_back(new_request);
+
+		for(!new_request.finished) {
+			std.sleep(100);
+		}
+
+		return new_request.result;
+	}
+
+	// Stop the current router-agent turn (request() returns, the queue keeps running).
+	stop() {
+		if(agent) {
+			try {
+				agent.stop();
+			}
+			catch(e) {}
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  Nodes
+	// ─────────────────────────────────────────────────────────────────────────
+
+	// online node records (the shizonet device object lives in .dev)
+	nodes() {
+		res = [];
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < _nodes.size(); i++) {
+			if(_node_online(_nodes[i])) {
+				res.push_back(_nodes[i]);
+			}
+		}
+		cs.release();
+		return res;
+	}
+
+	// routing table for the LLM: serializable, no device objects
+	nodes_summary() {
+		list = nodes();
+		res = [];
+		for(i = 0; i < list.size(); i++) {
+			if(i >= ROUTER_MAX_SUMMARY_NODES) {
+				break;
+			}
+			res.push_back(_node_summary(list[i]));
+		}
+		return res;
+	}
+
+	// re-discover + re-fetch the node info of every online device
+	refresh_nodes() {
+		if(!server) {
+			return nodes();
+		}
+
+		all = server.all_devices();
+
+		for(i = 0; i < all.size(); i++) {
+			dev = all[i];
+			if(!dev.online()) {
+				continue;
+			}
+			ver = None;
+			try {
+				ver = dev.get_prop(AI_PROP_NODE, AI_TIMEOUT_CONTROL);
+			}
+			catch(e) {
+				ver = None;
+			}
+			if(!ver) {
+				continue;
+			}
+			// register WITHOUT announcing, fetch AINodeInfo, THEN announce: the one
+			// node_state event carries the node's display name, not the wire name.
+			rec = _register_node(dev, std.string(ver), false);
+			_fetch_node_info(rec);
+			_announce_node_online(rec);
+		}
+
+		// drop the online flag of records no device answers anymore
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < _nodes.size(); i++) {
+			if(!_node_online(_nodes[i]) && _nodes[i].online) {
+				_nodes[i].online = false;
+				// the node is no longer announced online: a later reconnect is a
+				// transition again (see _announce_node_online)
+				_nodes[i].online_announced = false;
+			}
+		}
+		cs.release();
+
+		_last_refresh = std.millis();
+
+		return nodes();
+	}
+
+	// live Megamind.get_overview() of one node
+	node_overview(node_name) {
+		rec = _find_node(node_name);
+
+		if(!rec) {
+			return "No such node: " + std.string(node_name) + ". Use get_nodes() to list the available nodes.";
+		}
+		if(!_node_online(rec)) {
+			return "Node is offline: " + rec.name;
+		}
+
+		reply = _node_get(rec, AI_CMD_OVERVIEW, [], AI_TIMEOUT_CONTROL);
+
+		if(!std.is_json(reply)) {
+			return "Node did not answer " + AI_CMD_OVERVIEW + ".";
+		}
+		if(!reply.ok) {
+			return "Node error: " + std.string(reply.error ?? "no details");
+		}
+
+		return reply.overview ?? reply;
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  Delegation
+	// ─────────────────────────────────────────────────────────────────────────
+
+	// Explicit node, no model involved: the goal goes as an ai_request to that
+	// node's RECEPTIONIST. Programmatic / management path. -> [ok, taskid, node]
+	delegate(node_name, prompt) {
+		return _delegate(node_name, prompt, router_first_line(prompt));
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  THE ROUTING PATH: one router-agent turn.
+	//
+	//  The router AGENT (roles/router — the receptionist of the fleet) reads the
+	//  routing table with get_nodes(), decides which node owns the goal and
+	//  delegates it with its start_task tool. Node selection is the agent's
+	//  decision, made by the model, exactly like the local receptionist decides
+	//  which worker gets a task. There is NO keyword/capability scoring in this
+	//  class: nothing here guesses at a node.
+	//
+	//  Blocks until the turn is done (Megamind.request semantics).
+	//  -> [ok, routed, taskid, node, name, answer, error]
+	//
+	//  ok is about the TURN, routed is about the DELEGATION: an arbitrary question
+	//  ("what nodes do you have?", "hi") is answered by the agent and routes no task.
+	//  That is ok = true, routed = false — not an error. ok = false only when the
+	//  agent turn itself failed (it returned nothing / reported an error).
+	// ─────────────────────────────────────────────────────────────────────────
+	route_task(prompt, node_name = None) {
+		if(node_name) {
+			return delegate(std.string(node_name), prompt);
+		}
+
+		t0 = std.millis();
+		res = request(std.string(prompt));
+
+		answer = router_report_text(res);
+		rec = _task_created_since(t0);
+
+		if(rec) {
+			return [ok = true, routed = true, taskid = rec.taskid, node = rec.node, name = rec.name, answer = answer, error = ""];
+		}
+
+		// nothing was delegated: a failure only when the turn failed
+		turn_failed = true;
+		err = "The router agent turn returned nothing.";
+
+		if(std.is_json(res)) {
+			turn_failed = res.ok ? false : true;
+
+			if(turn_failed) {
+				err = std.string(res.error ?? "The router agent turn failed.");
+			}
+		}
+
+		return [
+			ok = !turn_failed,
+			routed = false,
+			taskid = None,
+			node = None,
+			name = None,
+			answer = answer,
+			error = turn_failed ? err : "",
+		];
+	}
+
+	// Role entry point (the router agent's start_task tool). Real user work goes to
+	// the node's RECEPTIONIST over ai_request: the remote receptionist is the one
+	// that decides how to execute it, exactly like a local Megamind receptionist.
+	// mode = "worker" bypasses it and drives the remote worker pool directly
+	// (ai_task_add) — CLI / management use.
+	//
+	// The target node is the AGENT's decision (it picks it from get_nodes() and
+	// passes it here). An empty node is a routing error, not something this class
+	// guesses. -> taskid, None on failure.
+	add_task(name, goal, node_name = None, mode = "receptionist") {
+		target = std.string(node_name ?? "").strip();
+
+		if(!target) {
+			std.error("[router] add_task: no target node for '", name, "'. The router agent must pick a node from get_nodes().");
+			return None;
+		}
+
+		rec = _find_node(target);
+
+		if(!rec) {
+			std.error("[router] add_task: unknown node: ", target);
+			return None;
+		}
+		if(!_node_online(rec)) {
+			std.error("[router] add_task: node offline: ", rec.name);
+			return None;
+		}
+
+		// One goal, one task: the same goal on the same node while it is still open
+		// IS the same task. The agent must not delegate one goal twice, and a
+		// transport that delivers one message twice must not create two tasks.
+		// Idempotence, not guessing: the goal text and the node must match exactly.
+		dup = _find_open_duplicate(rec.name, goal);
+
+		if(dup) {
+			_note_action("add_task_duplicate", [taskid = dup.taskid, node = rec.name, task_name = name]);
+			return dup.taskid;
+		}
+
+		if(mode != "worker") {
+			res = _delegate(rec.name, goal, name);
+
+			if(!res.ok) {
+				std.error("[router] add_task: ", std.string(res.error ?? "delegation failed"));
+				return None;
+			}
+
+			return res.taskid;
+		}
+
+		reply = _node_get(rec, AI_CMD_TASK_ADD, [name = name, goal = goal], AI_TIMEOUT_CONTROL);
+
+		if(!std.is_json(reply) || !reply.ok) {
+			err = "node did not answer";
+			if(std.is_json(reply)) {
+				err = std.string(reply.error ?? err);
+			}
+			std.error("[router] add_task failed on ", rec.name, ": ", err);
+			return None;
+		}
+
+		taskid = std.random_hash(16);
+
+		_add_remote_task([
+			taskid = taskid,
+			node = rec.name,
+			nodeid = rec.mac,
+			remote_request_id = "",
+			remote_taskid = std.string(reply.taskid ?? ""),
+			name = std.string(reply.name ?? name),
+			goal = goal,
+			state = router_map_task_state(std.string(reply.state ?? "planned")),
+			report = "",
+		]);
+
+		_note_action("add_task", [node = rec.name, taskid = taskid, task_name = name]);
+
+		return taskid;
+	}
+
+	// Follow-up on a mirrored task. Two wire channels (router_api.md):
+	//   ai_request-backed (delegated user work)  -> ai_request_update: the message
+	//     reaches the remote RECEPTIONIST turn that owns request_id.
+	//   ai_task_add-backed (direct worker pool)  -> ai_task_update: the remote task.
+	// The user message is recorded in the local mirror in every case, so the owner
+	// always sees what it sent, even when the node rejected it.
+	// -> true when the node accepted the update, false otherwise.
+	update_task(taskid, message) {
+		rec = _find_task(taskid);
+
+		if(!rec) {
+			return false;
+		}
+
+		if(!rec.remote_taskid && !rec.remote_request_id) {
+			// no remote id at all: keep the update in the mirror so the owner can see it.
+			_append_update(rec, message);
+			return false;
+		}
+
+		cmd = AI_CMD_REQUEST_UPDATE;
+		payload = [request_id = rec.remote_request_id, message = message];
+
+		if(rec.remote_taskid) {
+			cmd = AI_CMD_TASK_UPDATE;
+			payload = [taskid = rec.remote_taskid, message = message];
+		}
+
+		reply = _node_get(rec, cmd, payload, AI_TIMEOUT_CONTROL);
+
+		_append_update(rec, message);
+
+		accepted = false;
+		if(std.is_json(reply) && reply.ok) {
+			accepted = true;
+		}
+
+		if(accepted) {
+			_note_action("update_task", [taskid = taskid, node = rec.node]);
+		}
+
+		return accepted;
+	}
+
+	stop_task(taskid) {
+		rec = _find_task(taskid);
+
+		if(!rec) {
+			return false;
+		}
+
+		cmd = AI_CMD_REQUEST_STOP;
+		payload = [request_id = rec.remote_request_id];
+
+		if(rec.remote_taskid) {
+			cmd = AI_CMD_TASK_STOP;
+			payload = [taskid = rec.remote_taskid];
+		}
+		else if(!rec.remote_request_id) {
+			_set_task_state(rec, "stopped", "stopped locally (no remote id)");
+			return true;
+		}
+
+		reply = _node_get(rec, cmd, payload, AI_TIMEOUT_CONTROL);
+		_set_task_state(rec, "stopped", "");
+		_note_action("stop_task", [taskid = taskid, node = rec.node]);
+
+		if(!std.is_json(reply)) {
+			return false;
+		}
+
+		return reply.ok ? true : false;
+	}
+
+	inspect_task(taskid) {
+		rec = _find_task(taskid);
+
+		if(!rec) {
+			return "Not found.";
+		}
+
+		out = rec.copy();
+
+		if(rec.remote_taskid && _task_device(rec)) {
+			reply = _node_get(rec, AI_CMD_TASK, [taskid = rec.remote_taskid], AI_TIMEOUT_POLL);
+			if(std.is_json(reply) && reply.ok && std.is_json(reply.task)) {
+				out.remote = reply.task;
+			}
+		}
+
+		return out;
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  Overview / notifications / callbacks
+	// ─────────────────────────────────────────────────────────────────────────
+	get_overview() {
+		tasks = [];
+		open = 0;
+		evs = [];
+
+		cs = std.critical_section_named(_lock);
+
+		start = remote_tasks.size() - ROUTER_MAX_TASKS_SHOWN;
+		if(start < 0) {
+			start = 0;
+		}
+		for(i = start; i < remote_tasks.size(); i++) {
+			t = remote_tasks[i].copy();
+			tasks.push_back(t);
+			if(router_is_open_state(t.state)) {
+				open++;
+			}
+		}
+
+		start = events.size() - ROUTER_MAX_EVENTS_SHOWN;
+		if(start < 0) {
+			start = 0;
+		}
+		for(i = events.size() - 1; i >= start; i--) {
+			evs.push_back(events[i]);
+		}
+
+		cb_count = last_actions.size();
+
+		cs.release();
+
+		online = nodes();
+
+		return [
+			name = name,
+			version = version,
+			description = description,
+			capabilities = capabilities,
+			tags = tags,
+			role = role,
+			running = running,
+			uptime_ms = std.millis() - started_at,
+			poll_ms = poll_ms,
+			nodes = nodes_summary(),
+			nodes_online = online.size(),
+			remote_tasks = tasks,
+			tasks_open = open,
+			events = evs,
+			last_actions = last_actions.copy(),
+			last_actions_count = cb_count,
+		];
+	}
+
+	// The router's own task mirror as a compact, serializable list — the fleet-wide
+	// "what is running?" answer for the router AGENT (the role's get_tasks tool).
+	// Newest first. state: "all" (default) | "open"/"running" (queued+generating) |
+	// "finished" | "failed" | "stopped" | "lost". node_name restricts it to one node.
+	tasks_summary(state = None, node_name = None) {
+		want_state = std.string(state ?? "all").strip().lowercase();
+		want_node = std.string(node_name ?? "").strip().lowercase();
+
+		res = [];
+
+		cs = std.critical_section_named(_lock);
+
+		start = remote_tasks.size() - ROUTER_MAX_TASKS_SHOWN;
+		if(start < 0) {
+			start = 0;
+		}
+
+		for(i = remote_tasks.size() - 1; i >= start; i--) {
+			t = remote_tasks[i];
+			st = std.string(t.state ?? "");
+
+			if(want_node && std.string(t.node ?? "").lowercase() != want_node) {
+				continue;
+			}
+
+			if(want_state && want_state != "all") {
+				if(want_state == "open" || want_state == "running") {
+					if(!router_is_open_state(st)) {
+						continue;
+					}
+				}
+				else if(st != want_state) {
+					continue;
+				}
+			}
+
+			res.push_back(_task_summary(t));
+		}
+
+		cs.release();
+
+		return res;
+	}
+
+	_task_summary(rec) {
+		st = std.string(rec.state ?? "");
+		updates = 0;
+		if(std.is_json(rec.user_updates)) {
+			updates = rec.user_updates.size();
+		}
+
+		return [
+			taskid = std.string(rec.taskid ?? ""),
+			node = std.string(rec.node ?? ""),
+			name = std.string(rec.name ?? ""),
+			state = st,
+			open = router_is_open_state(st),
+			goal = router_first_line(rec.goal ?? ""),
+			report = router_first_line(rec.report ?? ""),
+			last_error = std.string(rec.last_error ?? ""),
+			user_updates = updates,
+			created = std.int(rec.created ?? 0),
+			updated = std.int(rec.updated ?? 0),
+		];
+	}
+
+	notify_user(msg) {
+		_emit_event([
+			kind = "notify",
+			time = std.millis(),
+			node = name,
+			message = std.string(msg),
+		]);
+
+		if(_notify_cb) {
+			try {
+				_notify_cb(std.string(msg));
+			}
+			catch(e) {
+				std.error("[router] notify callback failed: ", e);
+			}
+		}
+	}
+
+	on_notify(cb) {
+		_notify_cb = cb;
+	}
+
+	on_event(cb) {
+		_event_cb = cb;
+	}
+
+	on_action(cb) {
+		_action_cb = cb;
+		if(agent) {
+			agent.on_action = cb;
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  ai_event sink. Called from shizonet_ai's on_get handler: local state only,
+	//  no device.get() in here (router_api.md ground rule).
+	// ─────────────────────────────────────────────────────────────────────────
+	handle_event(payload) {
+		ev = [];
+
+		if(std.is_json(payload)) {
+			ev = payload.copy();
+		}
+		else {
+			ev = [kind = "notify", message = std.string(payload)];
+		}
+
+		if(!ev.has("kind")) {
+			ev.kind = "notify";
+		}
+		if(!ev.has("time")) {
+			ev.time = std.millis();
+		}
+		if(!ev.has("node")) {
+			ev.node = "";
+		}
+
+		// One event per fact (the owner must not see the same message twice):
+		//   node_state    — the router announces a node coming online itself
+		//     (_register_node from on_connect / refresh_nodes); the node pushes the
+		//     same fact over ai_event a moment later.
+		//   task_finished — the poller already moved the mirror into that terminal
+		//     state and emitted task_state with the report.
+		// The mirror is updated in every case, only the callback is skipped.
+		dup = false;
+
+		if(ev.kind == "node_state") {
+			dup = !_node_state_transition(ev);
+		}
+		else if(ev.kind == "task_finished") {
+			dup = _task_state_announced(ev);
+		}
+
+		_mirror_event(ev);
+
+		if(dup) {
+			return "ok";
+		}
+
+		_emit_event(ev);
+
+		return "ok";
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	//  internals
+	// ─────────────────────────────────────────────────────────────────────────
+
+	_on_connect(dev) {
+		ver = None;
+		try {
+			ver = dev.get_prop(AI_PROP_NODE, AI_TIMEOUT_CONTROL);
+		}
+		catch(e) {
+			ver = None;
+		}
+
+		if(!ver) {
+			return;
+		}
+
+		if(std.string(ver) != AI_NET_VERSION) {
+			std.warn("[router] AINode version mismatch from ", dev.name(), ": ", std.string(ver));
+		}
+
+		// register WITHOUT announcing, fetch AINodeInfo, THEN announce: the one
+		// node_state event carries the node's display name, not the wire name.
+		rec = _register_node(dev, std.string(ver), false);
+		_fetch_node_info(rec);
+		_announce_node_online(rec);
+	}
+
+	_on_disconnect(dev) {
+		node_name = dev.name();
+		nkey = _node_key(dev);
+
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < _nodes.size(); i++) {
+			if(_nodes[i].nodekey == nkey) {
+				_nodes[i].online = false;
+				_nodes[i].online_announced = false;
+				_nodes[i].dev = dev;
+				node_name = _nodes[i].name;
+			}
+		}
+		for(i = 0; i < remote_tasks.size(); i++) {
+			if(remote_tasks[i].node == node_name && router_is_open_state(remote_tasks[i].state)) {
+				remote_tasks[i].state = "lost";
+				remote_tasks[i].updated = std.millis();
+				remote_tasks[i].last_error = "node offline";
+			}
+		}
+		cs.release();
+
+		_emit_event([
+			kind = "node_state",
+			time = std.millis(),
+			node = node_name,
+			online = false,
+		]);
+	}
+
+	// Node record identity. router_api.md: key node records by mac, so records keep
+	// their identity across restarts. Verified in-process: every shizonet server gets
+	// its own synthetic mac (A0:.., A1:.., A2:.. on the same NIC), and several node
+	// processes on one machine share the real NIC mac — the shizonet node name
+	// disambiguates them. (Never name a json field "key": it is a reserved token in
+	// shizoscript object literals and the entry is silently dropped.)
+	_node_key(dev) {
+		return std.string(dev.mac()) + ":" + std.string(dev.name());
+	}
+
+	// Register / refresh a node record. announce = false defers the node_state
+	// event to _announce_node_online() (the caller fetches AINodeInfo first, so the
+	// single event carries the node's display name instead of the 16-char shizonet
+	// wire name).
+	_register_node(dev, ver, announce = true) {
+		mac = dev.mac();
+		nkey = _node_key(dev);
+		found = None;
+		is_new = false;
+		was_online = true;
+
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < _nodes.size(); i++) {
+			if(_nodes[i].nodekey == nkey) {
+				was_online = _nodes[i].online ? true : false;
+				_nodes[i].dev = dev;
+				_nodes[i].online = true;
+				_nodes[i].seen = std.millis();
+				if(ver) {
+					_nodes[i].version = ver;
+				}
+				found = _nodes[i];
+			}
+		}
+
+		if(!found) {
+			_nodes.push_back([
+				name = dev.name(),
+				mac = mac,
+				nodekey = nkey,
+				ip = dev.ip(),
+				version = ver,
+				online = true,
+				online_announced = false,
+				announce_pending = false,
+				description = "",
+				capabilities = [],
+				tags = [],
+				model = "",
+				max_workers = 0,
+				busy = false,
+				tasks_running = 0,
+				tasks_planned = 0,
+				uptime_ms = 0,
+				seen = std.millis(),
+				last_info = 0,
+				dev = dev,
+			]);
+			found = _nodes[_nodes.size() - 1];
+			is_new = true;
+		}
+		cs.release();
+
+		if(!found) {
+			return None;
+		}
+
+		// announce only real transitions: refresh_nodes() re-registers every node
+		if(!is_new && was_online) {
+			return found;
+		}
+
+		if(!announce) {
+			cs = std.critical_section_named(_lock);
+			found.announce_pending = true;
+			cs.release();
+			return found;
+		}
+
+		_announce_node_online(found, true);
+
+		return found;
+	}
+
+	// The ONE node_state(online) event for a node record. No std.print: the Router
+	// is a library, the owner renders events (Router.on_event) — printing on top of
+	// the callback is what made "device connected" show up twice.
+	// force = the caller (_register_node) already proved this is a real transition.
+	// Without force this is the deferred path: emit only when _register_node left
+	// announce_pending, i.e. only for a transition, never for a re-connect.
+	_announce_node_online(rec, force = false) {
+		if(!rec) {
+			return;
+		}
+
+		cs = std.critical_section_named(_lock);
+		pending = rec.announce_pending ? true : false;
+		rec.announce_pending = false;
+		already = rec.online_announced ? true : false;
+		rec.online_announced = true;
+		nm = rec.name;
+		cs.release();
+
+		// the owner has already heard this node online (its own push, deduplicated
+		// in handle_event) — one event per fact
+		if(already) {
+			return;
+		}
+
+		// deferred path: only announce what _register_node proved to be a transition
+		if(!force && !pending) {
+			return;
+		}
+
+		_emit_event([
+			kind = "node_state",
+			time = std.millis(),
+			node = nm,
+			online = true,
+		]);
+	}
+
+	_fetch_node_info(rec) {
+		if(!rec) {
+			return None;
+		}
+		if(!rec.dev) {
+			return None;
+		}
+
+		info = None;
+		try {
+			info = rec.dev.get_prop(AI_PROP_NODE_INFO, AI_TIMEOUT_CONTROL);
+		}
+		catch(e) {
+			info = None;
+		}
+
+		if(!std.is_json(info)) {
+			return None;
+		}
+
+		_apply_node_info(rec, info);
+
+		return info;
+	}
+
+	_apply_node_info(rec, info) {
+		cs = std.critical_section_named(_lock);
+
+		if(info.has("name") && info.name) {
+			rec.name = std.string(info.name);
+		}
+		if(info.has("version")) {
+			rec.version = std.string(info.version);
+		}
+		if(info.has("description")) {
+			rec.description = std.string(info.description);
+		}
+		if(info.has("capabilities")) {
+			rec.capabilities = info.capabilities;
+		}
+		if(info.has("tags")) {
+			rec.tags = info.tags;
+		}
+		if(info.has("model")) {
+			rec.model = std.string(info.model);
+		}
+		if(info.has("max_workers")) {
+			rec.max_workers = std.int(info.max_workers);
+		}
+		if(info.has("busy")) {
+			rec.busy = info.busy ? true : false;
+		}
+		if(info.has("tasks_running")) {
+			rec.tasks_running = std.int(info.tasks_running);
+		}
+		if(info.has("tasks_planned")) {
+			rec.tasks_planned = std.int(info.tasks_planned);
+		}
+		if(info.has("uptime_ms")) {
+			rec.uptime_ms = std.int(info.uptime_ms);
+		}
+
+		rec.last_info = std.millis();
+		rec.seen = std.millis();
+
+		cs.release();
+	}
+
+	_node_summary(rec) {
+		return [
+			name = rec.name,
+			mac = rec.mac,
+			ip = rec.ip,
+			version = rec.version,
+			online = _node_online(rec),
+			description = rec.description,
+			capabilities = rec.capabilities,
+			tags = rec.tags,
+			model = rec.model,
+			max_workers = rec.max_workers,
+			busy = rec.busy,
+			tasks_running = rec.tasks_running,
+			tasks_planned = rec.tasks_planned,
+			uptime_ms = rec.uptime_ms,
+			open_tasks = _count_open_tasks(rec.name),
+		];
+	}
+
+	_node_online(rec) {
+		if(rec.dev) {
+			return rec.dev.online() ? true : false;
+		}
+		return rec.online ? true : false;
+	}
+
+	_find_node(node_name) {
+		want = std.string(node_name).lowercase();
+
+		cs = std.critical_section_named(_lock);
+		match = None;
+		for(i = 0; i < _nodes.size(); i++) {
+			if(_nodes[i].name.lowercase() == want) {
+				match = _nodes[i];
+			}
+		}
+		cs.release();
+
+		return match;
+	}
+
+	_device_for(rec) {
+		if(!rec) {
+			return None;
+		}
+		if(rec.dev) {
+			return rec.dev;
+		}
+		if(!server || !rec.nodeid) {
+			return None;
+		}
+		return server.find_device(rec.nodeid);
+	}
+
+	_task_device(rec) {
+		dev = _device_for(rec);
+		if(!dev) {
+			return None;
+		}
+		return dev.online() ? dev : None;
+	}
+
+	// blocking device.get with the contract timeouts — call from a thread only
+	_node_get(rec, cmd, payload, timeout) {
+		dev = _device_for(rec);
+
+		if(!dev) {
+			return [ok = false, error = "node device not available: " + std.string(rec.name)];
+		}
+		if(!dev.online()) {
+			return [ok = false, error = "node offline: " + std.string(rec.name)];
+		}
+
+		reply = None;
+		try {
+			reply = dev.get(cmd, payload, timeout);
+		}
+		catch(e) {
+			return [ok = false, error = cmd + " failed: " + std.string(e)];
+		}
+
+		if(!reply) {
+			return [ok = false, error = cmd + ": no reply from " + std.string(rec.name)];
+		}
+
+		return reply;
+	}
+
+	_delegate(node_name, prompt, task_name) {
+		rec = _find_node(node_name);
+
+		if(!rec) {
+			return [ok = false, routed = false, error = "node not found: " + std.string(node_name), taskid = None, answer = ""];
+		}
+		if(!_node_online(rec)) {
+			return [ok = false, routed = false, error = "node offline: " + rec.name, taskid = None, answer = ""];
+		}
+
+		reply = _node_get(rec, AI_CMD_REQUEST, [prompt = prompt], AI_TIMEOUT_CONTROL);
+
+		taskid = std.random_hash(16);
+
+		if(!std.is_json(reply)) {
+			return [ok = false, routed = false, error = std.string(reply ?? "node did not answer"), taskid = taskid, answer = ""];
+		}
+		if(!reply.ok) {
+			return [ok = false, routed = false, error = std.string(reply.error ?? "node rejected the request"), taskid = taskid, answer = ""];
+		}
+
+		_add_remote_task([
+			taskid = taskid,
+			node = rec.name,
+			nodeid = rec.mac,
+			remote_request_id = std.string(reply.request_id ?? ""),
+			remote_taskid = "",
+			name = task_name,
+			goal = prompt,
+			state = router_map_request_status(std.string(reply.status ?? "queued")),
+			report = "",
+		]);
+
+		_note_action("delegate", [node = rec.name, taskid = taskid, task_name = task_name]);
+
+		return [ok = true, routed = true, taskid = taskid, node = rec.name, name = task_name, request_id = reply.request_id ?? "", answer = "", error = ""];
+	}
+
+	_add_remote_task(rec) {
+		rec.created = std.millis();
+		rec.updated = std.millis();
+		rec.last_poll = 0;
+		rec.poll_fails = 0;
+		rec.output = "";
+		rec.last_error = "";
+
+		if(!rec.has("report")) {
+			rec.report = "";
+		}
+		if(!rec.has("user_updates")) {
+			rec.user_updates = [];
+		}
+
+		cs = std.critical_section_named(_lock);
+		remote_tasks.push_back(rec);
+		count = remote_tasks.size();
+		cs.release();
+
+		for(count > ROUTER_MAX_TASKS_KEPT) {
+			cs = std.critical_section_named(_lock);
+			remote_tasks.erase(0);
+			count = remote_tasks.size();
+			cs.release();
+		}
+
+		_emit_event([
+			kind = "task_state",
+			time = std.millis(),
+			node = rec.node,
+			taskid = rec.taskid,
+			name = rec.name,
+			state = rec.state,
+			report = "",
+		]);
+
+		return rec.taskid;
+	}
+
+	// The mirror record of an OPEN task on `node_name` with exactly this goal.
+	// add_task uses it for idempotence (one goal, one task).
+	_find_open_duplicate(node_name, goal) {
+		want_goal = std.string(goal ?? "").strip();
+		want_node = std.string(node_name ?? "").lowercase();
+		match = None;
+
+		if(!want_goal) {
+			return None;
+		}
+
+		cs = std.critical_section_named(_lock);
+		for(i = remote_tasks.size() - 1; i >= 0; i--) {
+			t = remote_tasks[i];
+			if(std.string(t.node).lowercase() != want_node) {
+				continue;
+			}
+			if(!router_is_open_state(std.string(t.state ?? ""))) {
+				continue;
+			}
+			if(std.string(t.goal ?? "").strip() != want_goal) {
+				continue;
+			}
+			match = t;
+			break;
+		}
+		cs.release();
+
+		return match;
+	}
+
+	// True while the router is still waiting for a delegated ai_request on that
+	// node. The node runs such a request in its own receptionist, and the worker
+	// task it finishes is that request - not extra work.
+	_node_has_open_request(node_name) {
+		want_node = std.string(node_name ?? "").lowercase();
+		found = false;
+
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < remote_tasks.size(); i++) {
+			t = remote_tasks[i];
+			if(std.string(t.node).lowercase() != want_node) {
+				continue;
+			}
+			if(std.string(t.remote_request_id ?? "").length() == 0) {
+				continue;
+			}
+			if(!router_is_open_state(std.string(t.state ?? ""))) {
+				continue;
+			}
+			found = true;
+			break;
+		}
+		cs.release();
+
+		return found;
+	}
+
+	_find_task(taskid) {
+		want = std.string(taskid);
+
+		cs = std.critical_section_named(_lock);
+		match = None;
+		for(i = 0; i < remote_tasks.size(); i++) {
+			t = remote_tasks[i];
+			if(t.taskid == want) {
+				match = t;
+				break;
+			}
+			if(t.remote_taskid && t.remote_taskid == want) {
+				match = t;
+				break;
+			}
+			if(t.remote_request_id && t.remote_request_id == want) {
+				match = t;
+				break;
+			}
+		}
+		cs.release();
+
+		return match;
+	}
+
+	_append_update(rec, message) {
+		cs = std.critical_section_named(_lock);
+		if(!rec.has("user_updates")) {
+			rec.user_updates = [];
+		}
+		rec.user_updates.push_back([message = std.string(message), time = std.millis()]);
+		rec.updated = std.millis();
+		cs.release();
+	}
+
+	_set_task_state(rec, new_state, note) {
+		if(!rec) {
+			return false;
+		}
+
+		old = rec.state;
+
+		cs = std.critical_section_named(_lock);
+		rec.state = new_state;
+		rec.updated = std.millis();
+		if(note) {
+			rec.last_error = std.string(note);
+		}
+		report = rec.report;
+		node = rec.node;
+		taskid = rec.taskid;
+		task_name = rec.name;
+		cs.release();
+
+		if(old == new_state) {
+			return true;
+		}
+
+		_emit_event([
+			kind = "task_state",
+			time = std.millis(),
+			node = node,
+			taskid = taskid,
+			name = task_name,
+			state = new_state,
+			prev = old,
+			report = report,
+		]);
+
+		return true;
+	}
+
+	_count_open_tasks(node_name) {
+		n = 0;
+		cs = std.critical_section_named(_lock);
+		for(i = 0; i < remote_tasks.size(); i++) {
+			if(remote_tasks[i].node == node_name && router_is_open_state(remote_tasks[i].state)) {
+				n++;
+			}
+		}
+		cs.release();
+		return n;
+	}
+
+	// The newest mirrored task created at or after t0 (the router-agent turn
+	// created it through its start_task tool). None when the turn routed nothing.
+	_task_created_since(t0) {
+		cs = std.critical_section_named(_lock);
+		best = None;
+		for(i = 0; i < remote_tasks.size(); i++) {
+			t = remote_tasks[i];
+			if(std.int(t.created ?? 0) >= t0) {
+				if(!best || std.int(t.created) >= std.int(best.created)) {
+					best = t;
+				}
+			}
+		}
+		cs.release();
+		return best;
+	}
+
+	// ── events ────────────────────────────────────────────────────────────────
+
+	// True when a node_state pushed by a node is a real change for the owner.
+	// The router announces node transitions itself (_register_node / _on_disconnect)
+	// and records what it announced in rec.online_announced, so the node's own
+	// ai_event push of the same state is the same fact, not a second event.
+	_node_state_transition(ev) {
+		rec = _find_node(ev.node);
+
+		if(!rec) {
+			return true;
+		}
+
+		online = ev.online ? true : false;
+
+		cs = std.critical_section_named(_lock);
+		announced = rec.online_announced ? true : false;
+		rec.online_announced = online;
+		cs.release();
+
+		return announced != online;
+	}
+
+	// True when the mirror already sits in the terminal state the node reports:
+	// the poller announced that transition (task_state carries the report), so
+	// the node's task_finished push is the same completion a second time.
+	_task_state_announced(ev) {
+		if(!ev.has("taskid")) {
+			return false;
+		}
+
+		rec = _find_task(ev.taskid);
+
+		if(!rec) {
+			return false;
+		}
+
+		return std.string(rec.state) == router_map_task_state(std.string(ev.state ?? "finished"));
+	}
+
+	_mirror_event(ev) {
+		if(ev.kind == "node_state") {
+			rec = _find_node(ev.node);
+			if(rec) {
+				cs = std.critical_section_named(_lock);
+				rec.online = ev.online ? true : false;
+				rec.seen = std.millis();
+				cs.release();
+			}
+			return;
+		}
+
+		if(!ev.has("taskid")) {
+			return;
+		}
+
+		rec = _find_task(ev.taskid);
+
+		if(!rec) {
+			// A node finished work the router never delegated: adopt it into the
+			// mirror.
+			//
+			// One exception: a delegated ai_request is executed by the node's own
+			// receptionist, and the worker task it finishes is unknown to the
+			// router. That task IS the open request - adopting it would show the
+			// user two tasks for one goal and notify twice. The request record is
+			// settled by ai_request_poll (state + report), so the push is dropped.
+			if(ev.kind != "task_finished") {
+				return;
+			}
+
+			if(_node_has_open_request(std.string(ev.node ?? ""))) {
+				return;
+			}
+
+			_add_remote_task([
+				taskid = std.string(ev.taskid),
+				node = std.string(ev.node),
+				nodeid = "",
+				remote_request_id = "",
+				remote_taskid = std.string(ev.taskid),
+				name = std.string(ev.name ?? ""),
+				goal = "",
+				state = router_map_task_state(std.string(ev.state ?? "finished")),
+				report = std.string(ev.report ?? ""),
+			]);
+			return;
+		}
+
+		cs = std.critical_section_named(_lock);
+		if(ev.has("state")) {
+			rec.state = router_map_task_state(std.string(ev.state));
+		}
+		if(ev.has("report") && ev.report) {
+			rec.report = std.string(ev.report);
+		}
+		if(ev.has("name") && ev.name) {
+			rec.name = std.string(ev.name);
+		}
+		rec.updated = std.millis();
+		cs.release();
+	}
+
+	_emit_event(ev) {
+		cs = std.critical_section_named(_lock);
+		events.push_back(ev);
+		for(events.size() > AI_MAX_KEPT) {
+			events.erase(0);
+		}
+		cb = _event_cb;
+		cs.release();
+
+		if(cb) {
+			try {
+				cb(ev);
+			}
+			catch(e) {
+				std.error("[router] event callback failed: ", e);
+			}
+		}
+	}
+
+	_note_action(action, data) {
+		entry = [action = action, time = std.millis()];
+		entry.merge(data);
+
+		cs = std.critical_section_named(_lock);
+		last_actions.insert(0, entry);
+		for(last_actions.size() > ROUTER_MAX_ACTIONS_KEPT) {
+			last_actions.erase(last_actions.size() - 1);
+		}
+		cs.release();
+	}
+
+	// ── threads ───────────────────────────────────────────────────────────────
+
+	// Normalize the result of one agent turn (see agent_thread): the reports the
+	// role's finish(report) tool left in agent.env.reports win over the
+	// "Agent returned nothing" shape miniagent produces for a stopped turn.
+	_turn_result(res) {
+		out = res;
+
+		if(!std.is_json(out)) {
+			out = [ok = false, error = "The router agent turn returned nothing.", reports = []];
+		}
+
+		reps = [];
+
+		if(agent && std.is_json(agent.env) && agent.env.has("reports") && std.is_json(agent.env.reports)) {
+			reps = agent.env.reports.copy();
+		}
+
+		if(reps.size()) {
+			out.ok = true;
+			out.reports = reps;
+			out.error = "";
+		}
+
+		return out;
+	}
+
+	agent_thread() {
+		for(this.running) {
+			if(!request_queue.size()) {
+				std.sleep(100);
+				continue;
+			}
+
+			req = request_queue[0];
+			result = None;
+
+			_turn_active = true;
+			try {
+				agent.on_action = req.on_action_cb ?? _action_cb;
+				agent.clear_chat();
+				result = agent.task(req.prompt);
+			}
+			catch(e) {
+				result = [ok = false, error = std.string(e)];
+			}
+			_turn_active = false;
+
+			// The role's finish(report) tool puts the agent's answer into
+			// agent.env.reports; miniagent only returns them when env.use_finalize
+			// is set, so a turn that ended with finish() would come back as
+			// "Agent returned nothing (maybe crashed)" although everything worked.
+			// Fold them in: the report IS the answer, and the turn is a success.
+			result = _turn_result(result);
+
+			agent.on_action = _action_cb;
+
+			if(req.on_finish_cb) {
+				try {
+					req.on_finish_cb(result);
+				}
+				catch(e) {
+					std.error("[router] finish callback failed: ", e);
+				}
+			}
+
+			req.result = result;
+			req.finished = true;
+
+			cs = std.critical_section_named(_lock);
+			request_queue.erase(0);
+			cs.release();
+
+			std.sleep(10);
+		}
+	}
+
+	poller_thread() {
+		for(this.running) {
+			std.sleep(poll_ms);
+
+			if(!this.running) {
+				break;
+			}
+
+			if(std.millis() - _last_refresh >= ROUTER_INFO_REFRESH_MS) {
+				try {
+					refresh_nodes();
+				}
+				catch(e) {
+					std.error("[router] refresh_nodes failed: ", e);
+				}
+				if(server) {
+					try {
+						server.set_prop(AI_PROP_ROUTER_INFO, router_info_prop());
+					}
+					catch(e) {}
+				}
+			}
+
+			poll_open_tasks();
+		}
+	}
+
+	poll_open_tasks() {
+		for(i = 0; i < remote_tasks.size(); i++) {
+			if(!this.running) {
+				return;
+			}
+			rec = remote_tasks[i];
+			if(!router_is_open_state(rec.state)) {
+				continue;
+			}
+			_poll_task(rec);
+		}
+	}
+
+	_poll_task(rec) {
+		dev = _task_device(rec);
+
+		if(!dev) {
+			rec.poll_fails += 1;
+			if(rec.poll_fails >= ROUTER_MAX_POLL_FAILS) {
+				_set_task_state(rec, "lost", "node offline");
+			}
+			return;
+		}
+
+		cmd = "";
+		payload = [];
+
+		if(rec.remote_request_id) {
+			cmd = AI_CMD_REQUEST_POLL;
+			payload = [request_id = rec.remote_request_id];
+		}
+		else if(rec.remote_taskid) {
+			cmd = AI_CMD_TASK;
+			payload = [taskid = rec.remote_taskid];
+		}
+		else {
+			_set_task_state(rec, "lost", "no remote id to poll");
+			return;
+		}
+
+		reply = None;
+		try {
+			reply = dev.get(cmd, payload, AI_TIMEOUT_POLL);
+		}
+		catch(e) {
+			rec.poll_fails += 1;
+			rec.last_error = std.string(e);
+			if(rec.poll_fails >= ROUTER_MAX_POLL_FAILS) {
+				_set_task_state(rec, "lost", rec.last_error);
+			}
+			return;
+		}
+
+		rec.last_poll = std.millis();
+
+		if(!std.is_json(reply)) {
+			rec.poll_fails += 1;
+			if(rec.poll_fails >= ROUTER_MAX_POLL_FAILS) {
+				_set_task_state(rec, "lost", "no reply from node");
+			}
+			return;
+		}
+
+		rec.poll_fails = 0;
+
+		if(!reply.ok) {
+			if(std.string(reply.error ?? "") == "not found") {
+				_set_task_state(rec, "lost", "unknown remote id");
+				return;
+			}
+			rec.last_error = std.string(reply.error ?? "poll failed");
+			return;
+		}
+
+		// ai_task -> [ok, task]
+		if(reply.has("task") && std.is_json(reply.task)) {
+			_apply_task_record(rec, reply.task);
+			return;
+		}
+
+		// ai_request_poll -> [ok, request_id, status, delta?, result?, error?]
+		if(reply.has("delta")) {
+			_append_delta(rec, reply.delta);
+		}
+
+		if(reply.has("status")) {
+			new_state = router_map_request_status(std.string(reply.status));
+
+			if(new_state == "finished") {
+				report = rec.report;
+				if(reply.has("result")) {
+					report = router_report_text(reply.result);
+				}
+				cs = std.critical_section_named(_lock);
+				rec.report = report;
+				cs.release();
+			}
+			if(new_state == "failed" && reply.has("error")) {
+				cs = std.critical_section_named(_lock);
+				rec.last_error = std.string(reply.error);
+				cs.release();
+			}
+
+			_set_task_state(rec, new_state, "");
+		}
+	}
+
+	_apply_task_record(rec, task) {
+		cs = std.critical_section_named(_lock);
+		if(task.has("report") && task.report) {
+			rec.report = std.string(task.report);
+		}
+		if(task.has("name") && task.name) {
+			rec.name = std.string(task.name);
+		}
+		cs.release();
+
+		new_state = router_map_task_state(std.string(task.state ?? "research"));
+		_set_task_state(rec, new_state, "");
+	}
+
+	_append_delta(rec, delta) {
+		if(!std.is_json(delta)) {
+			return;
+		}
+
+		txt = "";
+
+		if(delta.has("text")) {
+			txt = std.string(delta.text);
+		}
+		else if(delta.has("reasoning")) {
+			txt = std.string(delta.reasoning);
+		}
+		else if(delta.has("milestone")) {
+			txt = std.string(delta.milestone);
+		}
+		else if(delta.has("tool_start") && std.is_json(delta.tool_start)) {
+			txt = "[tool] " + std.string(delta.tool_start.name);
+		}
+		else if(delta.has("tool") && std.is_json(delta.tool)) {
+			txt = "[tool] " + std.string(delta.tool.name);
+		}
+
+		if(!txt) {
+			return;
+		}
+
+		cs = std.critical_section_named(_lock);
+		rec.output += txt;
+		if(rec.output.length() > ROUTER_MAX_OUTPUT_CHARS) {
+			rec.output = rec.output.substr(rec.output.length() - ROUTER_MAX_OUTPUT_CHARS);
+		}
+		rec.last_poll = std.millis();
+		cs.release();
+	}
+
+	router_info_prop() {
+		return [
+			name = name,
+			version = version,
+			nodes = _nodes.size(),
+			tasks = remote_tasks.size(),
+			uptime_ms = std.millis() - started_at,
+		];
+	}
+}

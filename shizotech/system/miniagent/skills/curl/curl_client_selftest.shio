@@ -1,0 +1,315 @@
+// ============================================================================
+// curl_client_selftest.shio — library test of the curl skill
+//
+//   shz curl_client_selftest.shio
+//
+// Starts the local fixture server (curl_test_server.shio) and drives every
+// function of curl_client.shio against it: one-shot requests, headers,
+// redirects, downloads, uploads, and the streaming start/poll/wait/stop cycle.
+// No internet and no LLM endpoint needed. Exits 1 when a check fails.
+// ============================================================================
+
+#include "curl_client.shio"
+#include "curl_test_server.shio"
+
+TEST_PORT = 13357;
+BASE = "http://127.0.0.1:" + TEST_PORT;
+TMPFILE = __DIR__ + "/_curl_selftest_download.txt";
+
+passed = 0;
+failed = 0;
+
+check(label, condition, detail = "")
+{
+	if(condition)
+	{
+		passed++;
+		std.print("PASS  ", label, "\n");
+	}
+	else
+	{
+		failed++;
+		std.print("FAIL  ", label, "  -> ", std.string(detail), "\n");
+	}
+}
+
+server = curl_test_server_start(TEST_PORT);
+
+if(!server)
+{
+	std.print("FAIL  the fixture server did not start on port ", TEST_PORT, "\n");
+	std.exitprocess(1);
+}
+
+std.sleep(300);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  one-shot
+// ─────────────────────────────────────────────────────────────────────────────
+
+r = curl_get(BASE + "/plain");
+check("GET /plain is ok", r.ok, r);
+check("GET /plain http_code 200", r.http_code == 200, r.http_code);
+check("GET /plain body", r.body == "hello world", r.body);
+check("GET /plain content_type", r.content_type.contains("text/plain"), r.content_type);
+
+r = curl_post(BASE + "/echo", "PAYLOAD-123", ["Content-Type" = "text/plain"]);
+j = std.json(r.body, true);
+check("POST /echo is ok", r.ok, r);
+check("POST /echo method", j.method == "POST", j.method);
+check("POST /echo body arrives", j.body.contains("PAYLOAD-123"), j.body);
+check("POST /echo content_type arrives", j.content_type.contains("text/plain"), j.content_type);
+
+r = curl_get(BASE + "/echo", ["X-Marker" = "mk-42"]);
+j = std.json(r.body, true);
+check("headers are sent (case-insensitive lookup)", j.x_marker == "mk-42", j);
+
+r = curl_get(BASE + "/echo?a=1&b=2");
+j = std.json(r.body, true);
+check("query string arrives", j.query.contains("a=1"), j.query);
+check("query_params arrive", j.query_params.a == "1", j.query_params);
+
+r = curl_http("DELETE", BASE + "/echo");
+j = std.json(r.body, true);
+check("DELETE via request()", j.method == "DELETE", j.method);
+
+r = curl_http("PUT", BASE + "/echo", "putbody");
+j = std.json(r.body, true);
+check("PUT via request()", j.method == "PUT" && j.body.contains("putbody"), j);
+
+r = curl_get(BASE + "/status/404");
+check("HTTP 404 is ok=true (a response arrived)", r.ok && r.http_code == 404, r);
+
+r = curl_get(BASE + "/status/500");
+check("HTTP 500 is ok=true with that code", r.ok && r.http_code == 500, r);
+
+r = curl_get(BASE + "/redirect");
+check("redirects are followed", r.ok && r.http_code == 200 && r.body == "hello world", r);
+
+r = curl_head(BASE + "/plain");
+check("HEAD answers ok", r.ok && r.http_code == 200, r);
+
+r = curl_get("ftp://example.com/x");
+check("non-http scheme is refused", !r.ok && r.error.size() > 0, r);
+
+r = curl_get("");
+check("empty url is refused", !r.ok && r.error.size() > 0, r);
+
+r = curl_get("http://127.0.0.1:1/nothing");
+check("dead port is ok=false with an error", !r.ok && r.error.size() > 0, r);
+
+r = curl_get("http://no-such-host.invalid/x");
+check("dead dns is ok=false", !r.ok && r.error.size() > 0, r);
+
+r = curl_get(BASE + "/big/5000", None, 10000);
+check("a 5000 byte body arrives", r.ok && r.body.length() >= 5000, r.body.length());
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  download to file
+// ─────────────────────────────────────────────────────────────────────────────
+
+fileio.remove(TMPFILE);
+
+r = curl_download(BASE + "/big/9000", TMPFILE);
+check("curl_download ok", r.ok && r.http_code == 200, r);
+check("curl_download reports bytes", r.bytes >= 9000, r.bytes);
+check("curl_download wrote the file", fileio.exists(TMPFILE), TMPFILE);
+
+onDisk = "";
+if(fileio.exists(TMPFILE))
+	onDisk = fileio.read_string(TMPFILE);
+
+check("the file holds the body", onDisk.length() >= 9000, onDisk.length());
+check("curl_download does not return the body", !r.has("body"), r);
+fileio.remove(TMPFILE);
+
+r = curl_download("ftp://x/y", TMPFILE);
+check("curl_download refuses a bad url", !r.ok, r);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  uploads
+// ─────────────────────────────────────────────────────────────────────────────
+
+r = curl_upload_data(BASE + "/upload", "UPLOADDATA-content", "note.txt", "file", "text/plain");
+j = std.json(r.body, true);
+check("upload from memory ok", r.ok && r.http_code == 200, r);
+check("the server saw the multipart data", j.has_upload, j);
+check("the server saw the filename", j.has_filename, j);
+check("the server reports a part", j.parts >= 1, j);
+
+r = curl_upload_data(BASE + "/upload", "UPLOADDATA-content", "note.txt");
+check("upload from memory without a fieldname ok", r.ok, r);
+
+fileio.write_string(TMPFILE, "UPLOADDATA-from-file");
+r = curl_upload_file(BASE + "/upload", TMPFILE, "file");
+j = std.json(r.body, true);
+check("upload of a file ok", r.ok, r);
+check("the server saw the file content", j.has_upload, j);
+fileio.remove(TMPFILE);
+
+r = curl_upload_file(BASE + "/upload", __DIR__ + "/does-not-exist.bin");
+check("upload of a missing file is ok=false", !r.ok && r.error.contains("not found"), r);
+
+r = curl_upload_file("ftp://x/y", TMPFILE);
+check("upload refuses a bad url", !r.ok, r);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  streaming: start / poll / wait / stop
+// ─────────────────────────────────────────────────────────────────────────────
+
+s = curl_stream_start("GET", BASE + "/stream/5/100", "", None, 30000, "five-chunks");
+check("curl_stream_start ok", s.ok, s);
+check("curl_stream_start gives an id", s.id.starts("req_"), s.id);
+check("curl_stream_start reports running", s.status == "running", s.status);
+
+id = s.id;
+
+p = curl_stream_poll(id);
+check("poll is ok", p.ok, p);
+check("poll reports the id", p.id == id, p.id);
+
+// The reader thread needs a moment to pick the first chunk up.
+tries = 0;
+for(tries < 40 && p.new_chunks == 0) {
+	tries++;
+	p = curl_stream_poll(id);
+	std.sleep(25);
+}
+
+check("poll sees chunks", p.new_chunks >= 1, [n = p.new_chunks, tries = tries]);
+check("poll text has the first chunk", p.text.contains("chunk1"), p.text);
+
+p2 = curl_stream_poll(id);
+check("a second poll does not repeat chunks", !p2.text.contains("chunk1") || p2.new_chunks == 0, [t = p2.text, n = p2.new_chunks]);
+
+w = curl_stream_wait(id, 8000);
+check("wait finishes", w.ok && w.status == "finished", [s = w.status, t = w.timed_out]);
+check("wait is not timed out", !w.timed_out, w.timed_out);
+check("wait collected all 5 chunks", w.text.contains("chunk1") && w.text.contains("chunk5"), w.text);
+check("wait reports bytes", w.bytes >= 35, w.bytes);
+check("wait reports no drops", w.dropped == 0, w.dropped);
+
+full = curl_stream_text(id);
+check("curl_stream_text has everything", full.contains("chunk1") && full.contains("chunk5"), full.length());
+
+closed = curl_stream_close(id);
+check("curl_stream_close ok", closed, closed);
+
+p = curl_stream_poll(id);
+check("poll on a closed id is ok=false", !p.ok && p.error.size() > 0, p);
+
+closed = curl_stream_close(id);
+check("closing twice reports false", !closed, closed);
+
+// stop a stream that never ends
+s = curl_stream_start("GET", BASE + "/forever", "", None, 300000, "forever");
+check("start of a long stream ok", s.ok, s);
+id2 = s.id;
+
+std.sleep(400);
+
+st = curl_stream_list();
+check("curl_stream_list shows the open stream", st.open >= 1, st);
+
+found = false;
+for(i = 0; i < st.streams.size(); i++)
+	if(st.streams[i].id == id2)
+		found = true;
+
+check("the open stream is listed by id", found, st.streams);
+
+r = curl_stream_stop(id2);
+check("curl_stream_stop ok", r.ok, r);
+check("curl_stream_stop reports stopped", r.status == "stopped", r.status);
+check("curl_stream_stop received data", r.bytes > 0, r.bytes);
+check("curl_stream_stop returns the text", r.text.contains("tick"), r.text);
+check("curl_stream_stop closed the entry", !curl_stream_exists(id2), curl_stream_exists(id2));
+
+// poll without waiting, non-blocking
+s = curl_stream_start("GET", BASE + "/stream/4/250", "", None, 30000, "four-chunks");
+id3 = s.id;
+seen = 0;
+loops = 0;
+
+for(loops < 200 && seen < 4)
+{
+	loops++;
+	p = curl_stream_poll(id3);
+	seen += p.new_chunks;
+	if(p.status == "finished")
+		break;
+	std.sleep(50);
+}
+
+check("polling alone reaches every chunk", seen >= 4, [seen = seen, loops = loops]);
+curl_stream_close(id3);
+
+// stream a POST body
+s = curl_stream_start("POST", BASE + "/echo", "streamed-body", ["Content-Type" = "text/plain"], 30000, "post-stream");
+w = curl_stream_wait(s.id, 8000);
+check("a streaming POST sends its body", w.ok && w.text.contains("streamed-body"), w.text);
+check("a streaming POST reports method POST", w.text.contains("\"POST\""), w.text);
+curl_stream_close(s.id);
+
+// bad url / limits
+s = curl_stream_start("GET", "ftp://x/y");
+check("stream refuses a bad url", !s.ok && s.error.size() > 0, s);
+
+open_ids = [];
+for(i = 0; i < CURL_SKILL_MAX_STREAMS; i++)
+{
+	s = curl_stream_start("GET", BASE + "/forever", "", None, 300000, "cap-" + std.string(i));
+	if(s.ok)
+		open_ids.push_back(s.id);
+}
+
+check("the cap allows MAX_STREAMS streams", open_ids.size() == CURL_SKILL_MAX_STREAMS, open_ids.size());
+
+s = curl_stream_start("GET", BASE + "/forever", "", None, 300000, "one-too-many");
+check("one stream over the cap is refused", !s.ok && s.error.contains("Too many"), s);
+
+for(i = 0; i < open_ids.size(); i++)
+	curl_stream_stop(open_ids[i]);
+
+st = curl_stream_list();
+check("all capped streams are closed", st.open == 0, st.open);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  helpers + diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+
+info = curl_skill_info();
+check("curl_skill_info ok", info.ok, info);
+check("libcurl version is reported", info.libcurl.contains("libcurl"), info.libcurl);
+check("info reports the limits", info.limits.result_max_chars == CURL_SKILL_MAX_TEXT, info.limits);
+check("info reports the counters", info.counters.requests > 0 && info.counters.started > 0, info.counters);
+check("info names the chunk queue limit", info.transport.chunk_queue_limit == 256, info.transport);
+
+check("curl_skill_str keeps a value", curl_skill_str("abc") == "abc", curl_skill_str("abc"));
+check("curl_skill_str defaults on None", curl_skill_str(None, "d") == "d", curl_skill_str(None, "d"));
+check("curl_skill_int converts", curl_skill_int("42") == 42, curl_skill_int("42"));
+check("curl_skill_int defaults", curl_skill_int(None, 7) == 7, curl_skill_int(None, 7));
+
+h = curl_skill_headers('{"A": "b"}');
+check("headers accept a json string", h.A == "b", h);
+check("headers accept None", curl_skill_headers(None).size() == 0, curl_skill_headers(None));
+check("headers pass a json through", curl_skill_headers(["X" = "y"]).X == "y", curl_skill_headers(["X" = "y"]));
+check("headers ignore junk", curl_skill_headers("nonsense").size() == 0, curl_skill_headers("nonsense"));
+
+cut = curl_skill_cut("0123456789", 5);
+check("curl_skill_cut cuts and marks", cut.starts("01234") && cut.contains("truncated"), cut);
+check("curl_skill_cut leaves short text alone", curl_skill_cut("abc", 100) == "abc", curl_skill_cut("abc", 100));
+
+check("curl_skill_url_error accepts https", curl_skill_url_error("https://x/y").empty(), curl_skill_url_error("https://x/y"));
+check("curl_skill_url_error rejects file", curl_skill_url_error("file:///etc/passwd").size() > 0, curl_skill_url_error("file:///etc/passwd"));
+
+check("the registry is empty at the end", curl_skill_store().streams.size() == 0, curl_skill_store().streams.size());
+
+server.stop();
+
+std.print("\nCURL LIBRARY SELFTEST: ", passed, " passed, ", failed, " failed\n");
+
+if(failed)
+	std.exitprocess(1);
+
+std.exitprocess(0);

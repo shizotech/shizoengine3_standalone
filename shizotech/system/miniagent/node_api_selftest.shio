@@ -1,0 +1,333 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  node_api_selftest.shio — end-to-end check of the node JSON web API
+//
+//  Usage:  shz node_api_selftest.shio
+//
+//  Starts node_api on a stub Megamind host (no LLM endpoint needed) and drives
+//  it through real HTTP with curl. Exits with code 0 when every check passes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "node_api"
+
+import curl;
+
+TEST_PORT = 13339;
+TEST_TOKEN = "s3cret-test-token";
+TEST_SECRET = "super-secret-model-token";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Stub host: the same surface Megamind offers to node_api.shio
+// ─────────────────────────────────────────────────────────────────────────────
+
+class StubHost {
+    running = true;
+    _receptionist_active = false;
+    request_queue = [];
+    worker_threads = [];
+    receptionist = None;
+
+    tasks = [];
+    tasks_scheduled = [];
+    tasks_finished = [];
+    tasks_failed = [];
+
+    _notify_cb = None;
+    _task_finish_cb = None;
+
+    on_notify(cb) { _notify_cb = cb; }
+    on_task_finished(cb) { _task_finish_cb = cb; }
+
+    notify_user(msg) {
+        if(_notify_cb)
+            _notify_cb(msg);
+    }
+
+    request(prompt, on_finish_cb = None, on_action_cb = None) {
+        _receptionist_active = true;
+
+        if(on_action_cb) {
+            on_action_cb([text = "Looking at "]);
+            on_action_cb([text = prompt]);
+            on_action_cb([tool_start = [id = "t1", name = "get_overview", args = []]]);
+            on_action_cb([milestone = "stub milestone"]);
+        }
+
+        _receptionist_active = false;
+
+        result = "stub answer: " + prompt;
+
+        if(on_finish_cb)
+            on_finish_cb(result);
+
+        return result;
+    }
+
+    get_overview() {
+        return [
+            tasks = tasks,
+            tasks_scheduled = tasks_scheduled,
+            tasks_finished = tasks_finished,
+            tasks_failed = tasks_failed,
+        ];
+    }
+
+    add_task(name, goal) {
+        taskid = std.random_hash(16);
+        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+        return taskid;
+    }
+
+    stop_task(taskid) {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid) {
+                tasks_scheduled.erase(i);
+                return;
+            }
+        }
+    }
+
+    update_task(taskid, message) {
+        return false;
+    }
+
+    inspect_task(taskid) {
+        for(i = 0; i < tasks_scheduled.size(); i++) {
+            if(tasks_scheduled[i].taskid == taskid)
+                return tasks_scheduled[i];
+        }
+
+        return "Not found.";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Harness
+// ─────────────────────────────────────────────────────────────────────────────
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+    if(cond) {
+        passed++;
+        std.print("  PASS  ", name, "\n");
+    }
+    else {
+        failed++;
+        std.print("  FAIL  ", name, "  -> ", info, "\n");
+    }
+}
+
+http(method, path, body = "", token = TEST_TOKEN) {
+    headers = ["Content-Type" = "application/json"];
+
+    if(token)
+        headers["Authorization"] = "Bearer " + token;
+
+    managed c = curl.curl();
+
+    return c.request(method, "http://127.0.0.1:" + TEST_PORT + path, std.string(body), headers, 20000);
+}
+
+json_of(res) {
+    return std.json(std.string(res.body), true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.print("node_api selftest, port ", TEST_PORT, "\n\n");
+
+host = StubHost();
+
+cfg = [
+    url = "http://127.0.0.1:8000",
+    name = "stub-model",
+    token = TEST_SECRET,
+    max_tokens = 128000,
+    max_running_agents = 4,
+];
+
+api = node_api_start(host, cfg, TEST_PORT, TEST_TOKEN);
+
+if(!api) {
+    std.print("FAIL: the API server did not start\n");
+    std.exitprocess(1);
+}
+
+std.sleep(500);
+
+// GET / — index
+res = http("GET", "/", None, "");
+check("GET / lists the endpoints", res.http_code == 200 && std.string(res.body).contains("/api/request/poll"), std.string(res.body));
+
+// GET /api/health — always open
+res = http("GET", "/api/health", None, "");
+json = json_of(res);
+check("GET /api/health without a token", res.http_code == 200 && json.ok, std.string(res.body));
+
+// auth
+res = http("GET", "/api/status", None, "");
+check("GET /api/status without a token -> 401", res.http_code == 401, std.string(res.body));
+
+res = http("GET", "/api/status", None, "wrong-token");
+check("GET /api/status with a bad token -> 401", res.http_code == 401, std.string(res.body));
+
+res = http("GET", "/api/status");
+json = json_of(res);
+check(
+    "GET /api/status with a token",
+    res.http_code == 200 && json.ok && json.data.model.name == "stub-model" && json.data.workers == 0,
+    std.string(res.body)
+);
+check("the model auth token is never leaked", !std.string(res.body).contains(TEST_SECRET), std.string(res.body));
+
+// X-Api-Token header auth
+res = http("GET", "/api/tasks", None, "");
+check("GET /api/tasks without a token -> 401", res.http_code == 401, std.string(res.body));
+
+// tasks
+res = http("POST", "/api/task", '{"name":"Sexy-Sushi","goal":"roll the web api"}');
+json = json_of(res);
+taskid = std.string(json.data.taskid);
+check("POST /api/task", res.http_code == 200 && !taskid.empty(), std.string(res.body));
+
+res = http("POST", "/api/task", '{"goal":"no name given"}');
+check("POST /api/task without a name", res.http_code == 200 && std.string(res.body).contains("planned"), std.string(res.body));
+
+res = http("POST", "/api/task", '{"name":"empty"}');
+check("POST /api/task without a goal -> 400", res.http_code == 400, std.string(res.body));
+
+res = http("GET", "/api/tasks");
+json = json_of(res);
+check(
+    "GET /api/tasks",
+    res.http_code == 200 && json.data.size() == 2 && json.data[0].name == "Sexy-Sushi" && json.data[0].state == "planned",
+    std.string(res.body)
+);
+
+res = http("GET", "/api/task/" + taskid);
+check("GET /api/task/<id>", res.http_code == 200 && std.string(res.body).contains("roll the web api"), std.string(res.body));
+
+res = http("GET", "/api/task/deadbeefdeadbeef");
+check("GET /api/task/<unknown> -> 404", res.http_code == 404, std.string(res.body));
+
+res = http("PUT", "/api/task/" + taskid, '{"message":"more sushi please"}');
+check("PUT /api/task/<id> (not updatable) -> 409", res.http_code == 409, std.string(res.body));
+
+res = http("PUT", "/api/task/" + taskid, '{}');
+check("PUT /api/task/<id> without a message -> 400", res.http_code == 400, std.string(res.body));
+
+res = http("GET", "/api/overview");
+check("GET /api/overview", res.http_code == 200 && std.string(res.body).contains("tasks_scheduled"), std.string(res.body));
+
+res = http("DELETE", "/api/task/" + taskid);
+check("DELETE /api/task/<id>", res.http_code == 200, std.string(res.body));
+
+res = http("GET", "/api/task/" + taskid);
+check("the task is gone -> 404", res.http_code == 404, std.string(res.body));
+
+// request + poll
+res = http("POST", "/api/request", '{"prompt":"hello node"}');
+json = json_of(res);
+request_id = std.string(json.data.request_id);
+check("POST /api/request", res.http_code == 200 && !request_id.empty() && json.data.status == "queued", std.string(res.body));
+
+res = http("POST", "/api/request", '{"prompt":"   "}');
+check("POST /api/request with an empty prompt -> 400", res.http_code == 400, std.string(res.body));
+
+res = http("POST", "/api/request", "this is not json");
+check("POST /api/request with invalid json -> 400", res.http_code == 400, std.string(res.body));
+
+deltas = [];
+final_status = "";
+final_result = None;
+polls = 0;
+
+for(polls < 200) {
+	polls++;
+
+	res = http("POST", "/api/request/poll", '{"request_id":"' + request_id + '"}');
+    json = json_of(res);
+    status = std.string(json.data.status);
+
+    if(status == "generating") {
+        deltas.push_back(json.data.delta);
+        continue;
+    }
+
+    if(status == "waiting") {
+        std.sleep(20);
+        continue;
+    }
+
+    final_status = status;
+    final_result = json.data.result;
+    break;
+}
+
+check("poll reaches done", final_status == "done", final_status);
+check("poll streams every delta", deltas.size() == 4, std.string(deltas.size()));
+check("poll reports the final result", std.string(final_result).contains("stub answer"), std.string(final_result));
+
+res = http("POST", "/api/request/poll", '{"request_id":"' + request_id + '"}');
+check("polling a finished request_id -> done", res.http_code == 200 && std.string(res.body).contains("done"), std.string(res.body));
+
+res = http("POST", "/api/request/poll", '{}');
+check("poll without a request_id -> 400", res.http_code == 400, std.string(res.body));
+
+// request stop
+res = http("POST", "/api/request", '{"prompt":"stop me"}');
+json = json_of(res);
+stop_id = std.string(json.data.request_id);
+
+res = http("POST", "/api/request/stop", '{"request_id":"' + stop_id + '"}');
+check("POST /api/request/stop", res.http_code == 200 && std.string(res.body).contains("stopped"), std.string(res.body));
+
+res = http("POST", "/api/request/poll", '{"request_id":"' + stop_id + '"}');
+check("the stopped request is gone", std.string(res.body).contains("unknown request_id"), std.string(res.body));
+
+// server sent events
+res = http("POST", "/api/request", '{"prompt":"stream me"}');
+json = json_of(res);
+stream_id = std.string(json.data.request_id);
+
+res = http("GET", "/api/request/stream?request_id=" + stream_id);
+body = std.string(res.body);
+check("GET /api/request/stream sends SSE", res.http_code == 200 && body.contains("event: delta") && body.contains("event: done"), body);
+check("the SSE stream carries the deltas", body.contains("Looking at ") && body.contains("stub milestone"), body);
+
+res = http("GET", "/api/request/stream?request_id=doesnotexist");
+check("GET /api/request/stream with an unknown id -> 404", res.http_code == 404, std.string(res.body));
+
+// notifications + events
+host.notify_user("Sexy-Sushi is done, go eat");
+
+res = http("GET", "/api/notifications?drain=1");
+check("GET /api/notifications", res.http_code == 200 && std.string(res.body).contains("go eat"), std.string(res.body));
+
+res = http("GET", "/api/notifications");
+json = json_of(res);
+check("notifications are drained", json.data.size() == 0, std.string(res.body));
+
+host._task_finish_cb([taskid = "abc123", name = "Evo-Gloop", state = "finished", report = "all good"]);
+
+res = http("GET", "/api/events");
+check("GET /api/events", res.http_code == 200 && std.string(res.body).contains("Evo-Gloop"), std.string(res.body));
+
+res = http("GET", "/api/events?since=99999999999999");
+json = json_of(res);
+check("GET /api/events?since filters", json.data.size() == 0, std.string(res.body));
+
+// CORS preflight
+res = http("OPTIONS", "/api/request", None, "");
+check("OPTIONS preflight -> 204", res.http_code == 204, std.string(res.body));
+
+// shutdown
+res = http("POST", "/api/shutdown");
+check("POST /api/shutdown", res.http_code == 200 && !host.running, std.string(res.body));
+
+api.stop();
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+std.exitprocess(failed ? 1 : 0);

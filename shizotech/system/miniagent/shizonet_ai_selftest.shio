@@ -1,0 +1,650 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  shizonet_ai_selftest.shio — end-to-end check of the ShizoNet AI protocol
+//
+//  Usage:  shz shizonet_ai_selftest.shio
+//
+//  Passes when it prints "ALL PASSED" and never "FAIL" (exit code 0).
+//
+//  Two ShizoNet servers in ONE process (the _testing/shizonet.shio trick: the
+//  second server binds the next port and they find each other by beacon):
+//
+//      node side    ai_node_attach(node_server, ai_stub_host())
+//      router side  ai_router_attach(router_server, ai_stub_router())
+//
+//  No LLM, no model config, no IPs, no network setup: the host is a stub that
+//  mimics the Megamind surface (request() emits deltas and a miniagent-shaped
+//  result), the router is a stub that records every ai_event.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "shizonet_ai"
+
+// shizonet node names are fixed width (16 chars, space padded): keep them short
+NODE_NAME = "SHZ_AI_NODE";
+ROUTER_NAME = "SHZ_AI_ROUTER";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Harness
+// ─────────────────────────────────────────────────────────────────────────────
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name, "\n");
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info, "\n");
+	}
+}
+
+wait_for(cond, ms) {
+	for(w = 0; w < ms / 10; w++) {
+		if(cond())
+			return true;
+
+		std.sleep(10);
+	}
+
+	return cond();
+}
+
+// The peer device by node name: other shizonet nodes may live on this machine,
+// so never trust devices()[0]. Names are stripped (fixed width wire field).
+find_named(server, name) {
+	devs = server.devices();
+
+	for(i = 0; i < devs.size(); i++) {
+		if(devs[i].name().strip() == name)
+			return devs[i];
+	}
+
+	return None;
+}
+
+dev_names(server) {
+	devs = server.devices();
+	out = "";
+
+	for(i = 0; i < devs.size(); i++) {
+		if(i)
+			out += ",";
+
+		out += devs[i].name().strip();
+	}
+
+	return out;
+}
+
+// Node-side request state, read straight off the service handle: the poll
+// status "waiting" is shared by queued and generating, so the lifecycle tests
+// that need the exact state read the request table.
+req_status(svc, request_id) {
+	if(!svc.requests.has(request_id))
+		return "gone";
+
+	return std.string(svc.requests[request_id].status);
+}
+
+req_prompt(svc, request_id) {
+	if(!svc.requests.has(request_id))
+		return "";
+
+	return std.string(svc.requests[request_id].prompt);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ai_stub_receptionist — the miniagent handle a Megamind exposes as
+//  `host.receptionist`: send_prompt() is the follow-up channel of a running
+//  turn (it stops the generation, keeps the chat and continues with the new
+//  user message), so the selftest can observe what ai_request_update injects.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ai_stub_receptionist {
+
+	prompts = [];			// every message injected through send_prompt
+	stops = 0;
+
+	send_prompt(msg) {
+		prompts.push_back(msg);
+		return [ok = true, reports = [[report = "injected: " + msg]], execution_time_ms = 1];
+	}
+
+	stop() {
+		stops++;
+	}
+
+	wait_finish() { }
+
+	count() {
+		return prompts.size();
+	}
+
+	has(msg) {
+		for(i = 0; i < prompts.size(); i++) {
+			if(std.string(prompts[i]) == msg)
+				return true;
+		}
+
+		return false;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ai_stub_host — the Megamind surface (megamind.shio) without an LLM
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ai_stub_host {
+
+	running = true;
+
+	_receptionist_active = false;
+	request_queue = [];
+	worker_threads = [[], [], []];		// three idle fake workers
+	receptionist = ai_stub_receptionist();
+
+	tasks = [];
+	tasks_scheduled = [];
+	tasks_finished = [];
+	tasks_failed = [];
+
+	_notify_cb = None;
+	_task_finish_cb = None;
+
+	on_notify(cb) { _notify_cb = cb; }
+	on_task_finished(cb) { _task_finish_cb = cb; }
+	on_action(cb) { }
+
+	notify_user(msg) {
+		if(_notify_cb)
+			_notify_cb(msg);
+	}
+
+	// A prompt starting with SLOW keeps the receptionist busy, so the test can
+	// watch the busy flag flip. VERYSLOW keeps the worker busy long enough for a
+	// second request to stay queued while a follow-up is applied to it.
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		_receptionist_active = true;
+
+		if(on_action_cb) {
+			on_action_cb([text = "thinking: "]);
+			on_action_cb([text = prompt]);
+			on_action_cb([tool_start = [id = "t1", name = "get_overview", args = []]]);
+			on_action_cb([milestone = "stub milestone"]);
+		}
+
+		if(prompt.starts("SLOW"))
+			std.sleep(600);
+
+		if(prompt.starts("VERYSLOW"))
+			std.sleep(1500);
+
+		result = [
+			ok = true,
+			reports = [[report = "stub answer: " + prompt, time = std.millis(), time_str = std.timestamp()]],
+			execution_time_ms = 12,
+		];
+
+		_receptionist_active = false;
+
+		if(on_finish_cb)
+			on_finish_cb(result);
+
+		return result;
+	}
+
+	get_overview() {
+		return [
+			tasks = tasks,
+			tasks_scheduled = tasks_scheduled,
+			tasks_finished = tasks_finished,
+			tasks_failed = tasks_failed,
+		];
+	}
+
+	add_task(name, goal) {
+		taskid = std.random_hash(16);
+		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+		return taskid;
+	}
+
+	stop_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				tasks_scheduled.erase(i);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	update_task(taskid, message) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				if(!tasks_scheduled[i].user_updates)
+					tasks_scheduled[i].user_updates = [];
+
+				tasks_scheduled[i].user_updates.push_back(message);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	inspect_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				return tasks_scheduled[i];
+		}
+
+		for(i = 0; i < tasks_finished.size(); i++) {
+			if(tasks_finished[i].taskid == taskid)
+				return tasks_finished[i];
+		}
+
+		return "Not found.";
+	}
+
+	// Move a planned task to finished and fire the Megamind hook.
+	finish_task(taskid, state = "finished", report = "stub report") {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				task = tasks_scheduled[i];
+				tasks_scheduled.erase(i);
+				task.state = state;
+				task.report = report;
+				tasks_finished.push_back(task);
+
+				if(_task_finish_cb)
+					_task_finish_cb(task);
+
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	find_scheduled(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				return tasks_scheduled[i];
+		}
+
+		return None;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ai_stub_router — the Router surface: events land in handle_event()
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ai_stub_router {
+
+	running = true;
+	name = ROUTER_NAME;
+	remote_tasks = [];
+	events = [];
+
+	handle_event(e) {
+		events.push_back(e);
+		return true;
+	}
+
+	count_kind(kind) {
+		n = 0;
+
+		for(i = 0; i < events.size(); i++) {
+			if(std.string(events[i].kind) == kind)
+				n++;
+		}
+
+		return n;
+	}
+
+	last_of(kind) {
+		for(i = events.size() - 1; i >= 0; i--) {
+			if(std.string(events[i].kind) == kind)
+				return events[i];
+		}
+
+		return None;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Two shizonet servers, one process
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.print("ShizoNet AI protocol selftest\n\n");
+
+host = ai_stub_host();
+stub_router = ai_stub_router();
+
+node_server = shizonet.server(NODE_NAME);
+router_server = shizonet.server(ROUTER_NAME);
+
+node = ai_node_attach(node_server, host, [
+	name = NODE_NAME,
+	description = "selftest node",
+	capabilities = ["gpu", "coding"],
+	tags = ["selftest"],
+]);
+
+router = ai_router_attach(router_server, stub_router, [
+	name = ROUTER_NAME,
+	description = "selftest router",
+]);
+
+check("ai_node_attach returns a handle", !std.is_none(node));
+check("ai_router_attach returns a handle", !std.is_none(router));
+check("the handle has stop()", std.is_function(node.stop) && std.is_function(router.stop));
+check("timeouts per contract", AI_TIMEOUT_CONTROL == 5000 && AI_TIMEOUT_POLL == 2000 && AI_MAX_KEPT == 200);
+
+// ── discovery ───────────────────────────────────────────────────────────────
+
+check("node discovers the router", wait_for([node_server, ROUTER_NAME]() { return !std.is_none(find_named(node_server, ROUTER_NAME)); }, 10000), "node sees: " + dev_names(node_server));
+check("router discovers the node", wait_for([router_server, NODE_NAME]() { return !std.is_none(find_named(router_server, NODE_NAME)); }, 10000), "router sees: " + dev_names(router_server));
+
+dev = find_named(router_server, NODE_NAME);
+node_dev = find_named(node_server, ROUTER_NAME);
+
+check("the node peer is online", !std.is_none(dev) && dev.state() == "online", std.is_none(dev) ? "no peer" : dev.state());
+check("the router peer is online", !std.is_none(node_dev) && node_dev.state() == "online", std.is_none(node_dev) ? "no peer" : node_dev.state());
+
+if(std.is_none(dev) || std.is_none(node_dev)) {
+	std.print("\nno shizonet discovery between the two servers, the rest cannot run\n");
+	std.print("(one of them must own the Art-Net port 6454 to be discoverable)\n");
+	std.exitprocess(1);
+}
+
+// ── props ───────────────────────────────────────────────────────────────────
+
+check("AINode prop marks the node", dev.get_prop(AI_PROP_NODE, AI_TIMEOUT_CONTROL) == AI_NET_VERSION);
+
+info = dev.get_prop(AI_PROP_NODE_INFO, AI_TIMEOUT_CONTROL);
+check("AINodeInfo is json", std.is_json(info), std.string(info));
+check("AINodeInfo name", std.is_json(info) && info.name == NODE_NAME, std.string(info));
+check("AINodeInfo version", std.is_json(info) && info.version == AI_NET_VERSION);
+check("AINodeInfo description", std.is_json(info) && info.description == "selftest node");
+check("AINodeInfo capabilities", std.is_json(info) && info.capabilities.size() == 2);
+check("AINodeInfo tags", std.is_json(info) && info.tags.size() == 1);
+check("AINodeInfo max_workers", std.is_json(info) && info.max_workers == 3);
+check("AINodeInfo idle", std.is_json(info) && !info.busy);
+check("AINodeInfo uptime_ms", std.is_json(info) && info.uptime_ms >= 0);
+
+check("AIRouter prop marks the router", node_dev.get_prop(AI_PROP_ROUTER, AI_TIMEOUT_CONTROL) == AI_NET_VERSION);
+
+rinfo = node_dev.get_prop(AI_PROP_ROUTER_INFO, AI_TIMEOUT_CONTROL);
+check("AIRouterInfo name", std.is_json(rinfo) && rinfo.name == ROUTER_NAME, std.string(rinfo));
+check("AIRouterInfo version", std.is_json(rinfo) && rinfo.version == AI_NET_VERSION);
+check("AIRouterInfo refreshes live", wait_for([node_dev]() {
+	ri = node_dev.get_prop(AI_PROP_ROUTER_INFO, AI_TIMEOUT_CONTROL);
+	return std.is_json(ri) && ri.nodes >= 1;
+}, 9000));
+
+// ── ai_info ─────────────────────────────────────────────────────────────────
+
+nodeinfo = dev.get(AI_CMD_INFO, [], AI_TIMEOUT_CONTROL);
+check("ai_info ok", std.is_json(nodeinfo) && nodeinfo.ok, std.string(nodeinfo));
+check("ai_info name", std.is_json(nodeinfo) && nodeinfo.name == NODE_NAME);
+check("ai_info model key", std.is_json(nodeinfo) && nodeinfo.has("model"));
+
+// ── ai_request -> poll -> done ──────────────────────────────────────────────
+
+req = dev.get(AI_CMD_REQUEST, [prompt = "hello node"], AI_TIMEOUT_CONTROL);
+check("ai_request ok", std.is_json(req) && req.ok, std.string(req));
+check("ai_request queued", std.is_json(req) && req.status == "queued");
+
+request_id = ai_str(req.request_id, "");
+check("ai_request request_id", request_id.length() == 24, request_id);
+
+deltas = 0;
+saw_text = false;
+saw_tool = false;
+saw_milestone = false;
+final = None;
+last_status = "";
+
+for(poll = 0; poll < 200; poll++) {
+	std.sleep(25);
+	p = dev.get(AI_CMD_REQUEST_POLL, [request_id = request_id], AI_TIMEOUT_POLL);
+
+	if(!std.is_json(p) || !p.ok)
+		break;
+
+	last_status = std.string(p.status);
+
+	if(last_status == "generating") {
+		deltas++;
+
+		if(p.delta.text)
+			saw_text = true;
+		if(p.delta.tool_start)
+			saw_tool = true;
+		if(p.delta.milestone)
+			saw_milestone = true;
+
+		continue;
+	}
+
+	if(last_status == "done") {
+		final = p.result;
+		break;
+	}
+
+	if(last_status == "error")
+		break;
+}
+
+check("poll delivered deltas", deltas >= 4, "deltas = " + deltas + ", last status " + last_status);
+check("delta carries text", saw_text);
+check("delta carries tool_start", saw_tool);
+check("delta carries milestone", saw_milestone);
+check("poll reached done", std.is_json(final), "last status " + last_status);
+check("result is miniagent shaped", std.is_json(final) && final.ok && final.reports[0].report == "stub answer: hello node", std.string(final));
+check("result carries execution_time_ms", std.is_json(final) && final.has("execution_time_ms"));
+
+// ── unknown ids ─────────────────────────────────────────────────────────────
+
+bad = dev.get(AI_CMD_REQUEST_POLL, [request_id = "does-not-exist"], AI_TIMEOUT_POLL);
+check("unknown request_id -> not found", std.is_json(bad) && !bad.ok && bad.error == "not found", std.string(bad));
+
+badtask = dev.get(AI_CMD_TASK, [taskid = "does-not-exist"], AI_TIMEOUT_CONTROL);
+check("unknown taskid -> not found", std.is_json(badtask) && !badtask.ok && badtask.error == "not found", std.string(badtask));
+
+noprompt = dev.get(AI_CMD_REQUEST, [prompt = ""], AI_TIMEOUT_CONTROL);
+check("empty prompt -> ok=false", std.is_json(noprompt) && !noprompt.ok, std.string(noprompt));
+
+nostop = dev.get(AI_CMD_REQUEST_STOP, [request_id = "does-not-exist"], AI_TIMEOUT_CONTROL);
+check("stop unknown request -> not found", std.is_json(nostop) && !nostop.ok);
+
+// ── overview + tasks ────────────────────────────────────────────────────────
+
+ov = dev.get(AI_CMD_OVERVIEW, [], AI_TIMEOUT_CONTROL);
+check("ai_overview ok", std.is_json(ov) && ov.ok, std.string(ov));
+check("ai_overview is the raw overview", std.is_json(ov) && std.is_json(ov.overview) && ov.overview.has("tasks") && ov.overview.has("tasks_scheduled"));
+
+add = dev.get(AI_CMD_TASK_ADD, [name = "Build the thing", goal = "build it"], AI_TIMEOUT_CONTROL);
+check("ai_task_add ok", std.is_json(add) && add.ok, std.string(add));
+check("ai_task_add planned", std.is_json(add) && add.state == "planned" && add.name == "Build the thing");
+
+taskid = ai_str(add.taskid, "");
+check("ai_task_add taskid", taskid.length() > 0, taskid);
+
+tasks = dev.get(AI_CMD_TASKS, [], AI_TIMEOUT_CONTROL);
+listed = false;
+
+if(std.is_json(tasks) && tasks.ok) {
+	for(i = 0; i < tasks.tasks.size(); i++) {
+		if(tasks.tasks[i].taskid == taskid)
+			listed = true;
+	}
+}
+
+check("ai_tasks lists the task", listed, std.string(tasks));
+
+one = dev.get(AI_CMD_TASK, [taskid = taskid], AI_TIMEOUT_CONTROL);
+check("ai_task returns the task", std.is_json(one) && one.ok && one.task.name == "Build the thing", std.string(one));
+
+upd = dev.get(AI_CMD_TASK_UPDATE, [taskid = taskid, message = "use tabs"], AI_TIMEOUT_CONTROL);
+check("ai_task_update ok", std.is_json(upd) && upd.ok, std.string(upd));
+
+scheduled = host.find_scheduled(taskid);
+check("ai_task_update reached the host", std.is_json(scheduled) && scheduled.user_updates.size() == 1);
+
+upd_bad = dev.get(AI_CMD_TASK_UPDATE, [taskid = "does-not-exist", message = "hi"], AI_TIMEOUT_CONTROL);
+check("ai_task_update unknown -> not found", std.is_json(upd_bad) && !upd_bad.ok);
+
+// ── events: node -> router ──────────────────────────────────────────────────
+
+check("node_state event on connect", wait_for([stub_router]() { return stub_router.count_kind("node_state") > 0; }, 5000), std.string(stub_router.events));
+
+fin = dev.get(AI_CMD_TASK_ADD, [name = "Finish me", goal = "finish it"], AI_TIMEOUT_CONTROL);
+check("second task added", std.is_json(fin) && fin.ok, std.string(fin));
+finid = ai_str(fin.taskid, "");
+
+check("stub host finished the task", host.finish_task(finid, "finished", "all good"));
+check("task_finished event reached the router", wait_for([stub_router]() { return stub_router.count_kind("task_finished") > 0; }, 5000), std.string(stub_router.events));
+
+te = stub_router.last_of("task_finished");
+check("task_finished taskid", std.is_json(te) && te.taskid == finid, std.string(te));
+check("task_finished state", std.is_json(te) && te.state == "finished");
+check("task_finished report", std.is_json(te) && te.report == "all good");
+check("task_finished node name", std.is_json(te) && te.node == NODE_NAME);
+check("task_finished time", std.is_json(te) && te.time > 0);
+
+host.notify_user("ping from the node");
+check("notify event reached the router", wait_for([stub_router]() { return stub_router.count_kind("notify") > 0; }, 5000), std.string(stub_router.events));
+
+ne = stub_router.last_of("notify");
+check("notify message", std.is_json(ne) && ne.message == "ping from the node", std.string(ne));
+check("notify node name", std.is_json(ne) && ne.node == NODE_NAME);
+
+check("node counted the pushed events", node.counters.events_sent > 0, std.string(node.counters));
+
+// ── stop paths ──────────────────────────────────────────────────────────────
+
+stp = dev.get(AI_CMD_TASK_STOP, [taskid = taskid], AI_TIMEOUT_CONTROL);
+check("ai_task_stop ok", std.is_json(stp) && stp.ok, std.string(stp));
+
+gone = dev.get(AI_CMD_TASK, [taskid = taskid], AI_TIMEOUT_CONTROL);
+check("stopped task is gone", std.is_json(gone) && !gone.ok, std.string(gone));
+
+slow = dev.get(AI_CMD_REQUEST, [prompt = "SLOW turn"], AI_TIMEOUT_CONTROL);
+check("slow request accepted", std.is_json(slow) && slow.ok, std.string(slow));
+check("node reports busy while generating", wait_for([node]() { return node.info().busy ? true : false; }, 3000));
+
+rstp = dev.get(AI_CMD_REQUEST_STOP, [request_id = ai_str(slow.request_id)], AI_TIMEOUT_CONTROL);
+check("ai_request_stop ok", std.is_json(rstp) && rstp.ok, std.string(rstp));
+
+for(poll = 0; poll < 200; poll++) {
+	std.sleep(25);
+	p = dev.get(AI_CMD_REQUEST_POLL, [request_id = ai_str(slow.request_id)], AI_TIMEOUT_POLL);
+
+	if(!std.is_json(p))
+		break;
+
+	if(p.status == "done" || p.status == "error")
+		break;
+}
+
+check("request table drains back to idle", wait_for([node]() { return !node.info().busy; }, 5000));
+check("request counters", node.counters.requests_total >= 2, std.string(node.counters));
+
+// ── ai_request_update: follow-ups into delegated work ───────────────────────
+
+// unknown request_id -> not found
+u_unknown = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = "does-not-exist", message = "use tabs"], AI_TIMEOUT_CONTROL);
+check("ai_request_update unknown -> not found", std.is_json(u_unknown) && !u_unknown.ok && u_unknown.error == "not found", std.string(u_unknown));
+
+// a finished request is not updatable (request_id is the first, done request)
+u_done = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = request_id, message = "late follow-up"], AI_TIMEOUT_CONTROL);
+check("ai_request_update finished request -> not found", std.is_json(u_done) && !u_done.ok && u_done.error == "not found", std.string(u_done));
+
+// a stopped request is not updatable (slow.request_id was stopped above)
+u_stopped = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = ai_str(slow.request_id), message = "too late"], AI_TIMEOUT_CONTROL);
+check("ai_request_update stopped request -> not found", std.is_json(u_stopped) && !u_stopped.ok && u_stopped.error == "not found", std.string(u_stopped));
+
+// a message is required
+u_nomsg = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = request_id], AI_TIMEOUT_CONTROL);
+check("ai_request_update without a message -> ok=false", std.is_json(u_nomsg) && !u_nomsg.ok, std.string(u_nomsg));
+
+// running: the message is injected into the live receptionist conversation
+live = dev.get(AI_CMD_REQUEST, [prompt = "SLOW live turn"], AI_TIMEOUT_CONTROL);
+check("live request accepted", std.is_json(live) && live.ok, std.string(live));
+liveid = ai_str(live.request_id, "");
+
+check("live request is generating", wait_for([node, liveid]() { return req_status(node, liveid) == "generating"; }, 4000), req_status(node, liveid));
+check("the receptionist is inside the turn", wait_for([host]() { return host._receptionist_active ? true : false; }, 2000));
+
+u_live = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = liveid, message = "FOLLOW-UP use tabs"], AI_TIMEOUT_CONTROL);
+check("ai_request_update running -> ok", std.is_json(u_live) && u_live.ok, std.string(u_live));
+check("ai_request_update running echoes request_id", std.is_json(u_live) && u_live.request_id == liveid, std.string(u_live));
+check("ai_request_update running -> state updated", std.is_json(u_live) && u_live.state == "updated", std.string(u_live));
+
+check("running follow-up injected into the receptionist", wait_for([host]() { return host.receptionist.has("FOLLOW-UP use tabs"); }, 3000), std.string(host.receptionist.prompts));
+check("running follow-up injected exactly once", host.receptionist.count() == 1, std.string(host.receptionist.prompts));
+
+// queued: the message is appended to the stored prompt, not injected
+block = dev.get(AI_CMD_REQUEST, [prompt = "VERYSLOW blocker"], AI_TIMEOUT_CONTROL);
+check("blocker request accepted", std.is_json(block) && block.ok, std.string(block));
+blockid = ai_str(block.request_id, "");
+
+check("the blocker occupies the worker", wait_for([node, blockid]() { return req_status(node, blockid) == "generating"; }, 4000), req_status(node, blockid));
+
+queued = dev.get(AI_CMD_REQUEST, [prompt = "queued base prompt"], AI_TIMEOUT_CONTROL);
+check("queued request accepted", std.is_json(queued) && queued.ok && queued.status == "queued", std.string(queued));
+queuedid = ai_str(queued.request_id, "");
+
+check("the new request is still queued", req_status(node, queuedid) == "queued", req_status(node, queuedid));
+
+u_queued = dev.get(AI_CMD_REQUEST_UPDATE, [request_id = queuedid, message = "EXTRA use tabs"], AI_TIMEOUT_CONTROL);
+check("ai_request_update queued -> ok", std.is_json(u_queued) && u_queued.ok && u_queued.state == "updated", std.string(u_queued));
+
+check("queued follow-up appended to the prompt", wait_for([node, queuedid]() { return req_prompt(node, queuedid).contains("EXTRA use tabs"); }, 3000), req_prompt(node, queuedid));
+check("queued prompt keeps the original task", req_prompt(node, queuedid).starts("queued base prompt"), req_prompt(node, queuedid));
+check("queued follow-up did not touch the receptionist", !host.receptionist.has("EXTRA use tabs"), std.string(host.receptionist.prompts));
+
+// start it: the appended message is part of the task
+qfinal = None;
+
+for(poll = 0; poll < 250; poll++) {
+	std.sleep(25);
+	p = dev.get(AI_CMD_REQUEST_POLL, [request_id = queuedid], AI_TIMEOUT_POLL);
+
+	if(!std.is_json(p) || !p.ok)
+		break;
+
+	if(p.status == "done") {
+		qfinal = p.result;
+		break;
+	}
+
+	if(p.status == "error")
+		break;
+}
+
+check("queued request ran after the blocker", std.is_json(qfinal), std.string(qfinal));
+check("the follow-up became part of the task", std.is_json(qfinal) && qfinal.reports[0].report.contains("EXTRA use tabs"), std.string(qfinal));
+
+check("node idle again after the follow-up tests", wait_for([node]() { return !node.info().busy; }, 5000), std.string(node.info()));
+
+// ── teardown ────────────────────────────────────────────────────────────────
+
+node.stop();
+router.stop();
+
+check("node service stopped", !node.running);
+check("router service stopped", !router.running);
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+if(failed == 0)
+	std.print("ALL PASSED\n");
+
+std.exitprocess(failed ? 1 : 0);
