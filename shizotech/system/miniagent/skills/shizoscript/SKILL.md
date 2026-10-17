@@ -1196,6 +1196,12 @@ Note that due to shizoscript's dynamic type system it might be necessary to util
 
 ---
 
+# Code Design
+
+For quick probes use the dynamic functional aspect of the language
+
+For projects and modules prefer 'strict' mode and typed coding styles with proper classes and modular OOP
+
 # FINAL RULE
 
 If you did not explicitly verify it:

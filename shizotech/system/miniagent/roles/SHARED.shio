@@ -897,14 +897,18 @@ cmd_drain_output(proc)
 
 // Collect output for up to wait_ms milliseconds (negative = wait without limit).
 // Stops early as soon as output appears OR the process exits.
-// Returns [output, exited, exit_code].
-cmd_wait_for_output(proc, wait_ms)
+// stop_check is an OPTIONAL predicate (a stopped agent must not sit in a wait).
+// Returns [output, exited, exit_code, stopped].
+cmd_wait_for_output(proc, wait_ms, stop_check = None)
 {
 	out = "";
 	deadline = (wait_ms < 0) ? 9223372036854775807 : std.millis() + wait_ms;
 
 	for(1)
 	{
+		if(stop_check && std.is_function(stop_check) && stop_check())
+			return [output = out, exited = false, stopped = true];
+
 		new_out = cmd_drain_output(proc);
 		if(new_out)
 			out += new_out;
@@ -942,8 +946,10 @@ cmd_max_wait_ms = 1800000;
 // Block until the process exits, collecting everything it prints while waiting.
 // Unlike cmd_wait_for_output this does NOT return early when new output appears.
 // max_ms < 0 waits without a caller timeout (bounded by cmd_max_wait_ms).
-// Returns [output, exited, exit_code].
-cmd_wait_for_exit(proc, max_ms)
+// stop_check is an OPTIONAL predicate: a stopped agent leaves the wait promptly,
+// the process itself is left running (the session stays registered and usable).
+// Returns [output, exited, exit_code, stopped].
+cmd_wait_for_exit(proc, max_ms, stop_check = None)
 {
 	out = "";
 	keep = cmd_max_collect_bytes - 60;
@@ -952,6 +958,9 @@ cmd_wait_for_exit(proc, max_ms)
 
 	for(1)
 	{
+		if(stop_check && std.is_function(stop_check) && stop_check())
+			return [output = out, exited = false, stopped = true];
+
 		out += cmd_drain_output(proc);
 
 		// A chatty process must not grow the buffer without bound: drop the oldest output.
@@ -976,12 +985,12 @@ cmd_wait_for_exit(proc, max_ms)
 // Dispatch to the right waiting mode for a caller-supplied timeout.
 // wait_ms < 0 requests a definitive wait until the process exits, collecting all output.
 // wait_ms >= 0 returns early as soon as output appears (interactive use).
-cmd_wait_for_process(proc, wait_ms)
+cmd_wait_for_process(proc, wait_ms, stop_check = None)
 {
 	if(wait_ms < 0)
-		return cmd_wait_for_exit(proc, wait_ms);
+		return cmd_wait_for_exit(proc, wait_ms, stop_check);
 
-	return cmd_wait_for_output(proc, wait_ms);
+	return cmd_wait_for_output(proc, wait_ms, stop_check);
 }
 
 cmd_format_result(out)
@@ -1129,7 +1138,9 @@ agt_add_command_tools(agt)
 
 			wait_ms = args.timeout ?? 0;
 
-			res = cmd_wait_for_process(proc, wait_ms);
+			//A stopped agent must not block in a command wait: the process keeps
+			//running, the session stays registered, only the wait ends.
+			res = cmd_wait_for_process(proc, wait_ms, [agt]() { return agt.should_stop(); });
 			fmt = cmd_format_result(res.output);
 
 			if(res.exited)
@@ -1162,7 +1173,10 @@ agt_add_command_tools(agt)
 				session_id = session_id,
 				output = fmt.out,
 				truncated = fmt.truncated,
-				note = "Process is still running. Use command_read/command_input with this session_id. Do not restart it.",
+				stopped = (res.stopped ?? false),
+				note = (res.stopped ?? false)
+					? "The agent was stopped, so the wait ended early. The process was NOT terminated; the session is still registered under this id."
+					: "Process is still running. Use command_read/command_input with this session_id. Do not restart it.",
 			];
 		}
 	);
@@ -1191,7 +1205,7 @@ agt_add_command_tools(agt)
 
 			wait_ms = (args.timeout ?? false) ? args.timeout : 0;
 
-			res = cmd_wait_for_output(proc, wait_ms);
+			res = cmd_wait_for_output(proc, wait_ms, [agt]() { return agt.should_stop(); });
 			fmt = cmd_format_result(res.output);
 
 			if(res.exited)
@@ -1213,6 +1227,7 @@ agt_add_command_tools(agt)
 				session_id = args.session_id,
 				output = fmt.out,
 				truncated = fmt.truncated,
+				stopped = (res.stopped ?? false),
 			];
 		}
 	);
@@ -1267,7 +1282,7 @@ agt_add_command_tools(agt)
 
 			started_ms = std.millis();
 
-			res = cmd_wait_for_exit(proc, wait_ms);
+			res = cmd_wait_for_exit(proc, wait_ms, [agt]() { return agt.should_stop(); });
 			fmt = cmd_format_result(res.output);
 
 			if(res.exited)
@@ -1293,7 +1308,10 @@ agt_add_command_tools(agt)
 				waited_ms = std.millis() - started_ms,
 				output = fmt.out,
 				truncated = fmt.truncated,
-				note = "The process is still running after the wait timeout. It was not terminated; call command_wait again or use command_read.",
+				stopped = (res.stopped ?? false),
+				note = (res.stopped ?? false)
+					? "The agent was stopped, so the wait ended early. The process was NOT terminated; the session is still registered under this id."
+					: "The process is still running after the wait timeout. It was not terminated; call command_wait again or use command_read.",
 			];
 		}
 	);

@@ -1,0 +1,555 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  model_config_cli.shio — shared command-line model config handling
+//
+//  #include "model_config_cli"
+//
+//  This module gives the runnable miniagent scripts one config story:
+//
+//    --config <name|path[#profile]>
+//    --new-config <name|path[#profile]>
+//    --save-config <name|path[#profile]>
+//    --list-configs
+//    --config-path
+//
+//  A config spec can be:
+//    - a plain name:        "gpu"
+//    - a file path:         "./configs/gpu.json"
+//    - a profile in a file: "./endpoints.json#worker"
+//
+//  Plain names are searched in:
+//    1. the current working directory
+//    2. .agent/configs/
+//    3. the default ShizoScript config directory
+//
+//  New plain-name configs are created in the current working directory, so a
+//  project can carry its own endpoint files.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "openai/generic_agent"
+#include "model_config"
+
+MODEL_CONFIG_PACKAGE = "miniagent";
+MODEL_CONFIG_DEFAULT_KEY = "default_model";
+MODEL_CONFIG_LOCAL_DIR = ".agent/configs/";
+
+def model_config_cli_endpoint_args(prefix);
+def model_config_cli_has_endpoint_args(prefix);
+def model_config_cli_make(cfg, spec, package, default_key, prefix, interactive, connect);
+
+model_config_with_ext(name) {
+	s = std.string(name ?? "");
+
+	if(s.empty())
+		return s;
+
+	if(fileio.file_ext(s).lowercase() == "json")
+		return s;
+
+	return s + ".json";
+}
+
+model_config_is_path(spec) {
+	s = std.string(spec ?? "");
+
+	if(s.empty())
+		return false;
+
+	if(s.find("/") >= 0)
+		return true;
+	if(s.find("\\") >= 0)
+		return true;
+	if(s.starts("."))
+		return true;
+	if(fileio.file_ext(s).lowercase() == "json")
+		return true;
+
+	return false;
+}
+
+model_config_safe_token(name) {
+	s = std.string(name ?? "");
+
+	if(s.empty())
+		return false;
+
+	if(s.find("/") >= 0)
+		return false;
+	if(s.find("\\") >= 0)
+		return false;
+	if(s.find(":") >= 0)
+		return false;
+	if(s.find("*") >= 0)
+		return false;
+	if(s.find("?") >= 0)
+		return false;
+	if(s.find('"') >= 0)
+		return false;
+	if(s.find("<") >= 0)
+		return false;
+	if(s.find(">") >= 0)
+		return false;
+	if(s.find("|") >= 0)
+		return false;
+	if(s.find(" ") >= 0)
+		return false;
+
+	return true;
+}
+
+model_config_split_profile(spec) {
+	s = std.string(spec ?? "");
+	idx = s.find("#");
+
+	if(idx < 0)
+		return [path = s, profile = ""];
+
+	return [
+		path = s.substr(0, idx),
+		profile = s.substr(idx + 1, s.length() - idx - 1),
+	];
+}
+
+model_config_name(spec) {
+	parts = model_config_split_profile(spec);
+	raw = std.string(parts.path).strip();
+
+	if(raw.empty())
+		return MODEL_CONFIG_DEFAULT_KEY;
+
+	if(model_config_is_path(raw))
+		return fileio.pure_name(raw);
+
+	return raw;
+}
+
+model_config_default_path(spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	parts = model_config_split_profile(spec);
+	raw = std.string(parts.path).strip();
+
+	if(raw.empty())
+		return std.config_path(package, default_key);
+
+	if(model_config_is_path(raw))
+		return raw;
+
+	return std.wd() + "/" + model_config_with_ext(raw);
+}
+
+model_config_add_candidate(list, path) {
+	p = std.string(path ?? "");
+
+	if(p.empty())
+		return;
+
+	for(i = 0; i < list.size(); i++) {
+		if(std.string(list[i]) == p)
+			return;
+	}
+
+	list.push_back(p);
+}
+
+model_config_candidates(spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	parts = model_config_split_profile(spec);
+	raw = std.string(parts.path).strip();
+	c = [];
+
+	if(raw.empty()) {
+		model_config_add_candidate(c, std.config_path(package, default_key));
+		return c;
+	}
+
+	wd = std.wd();
+
+	if(model_config_is_path(raw)) {
+		model_config_add_candidate(c, raw);
+		model_config_add_candidate(c, raw + ".json");
+		model_config_add_candidate(c, wd + "/" + raw);
+		model_config_add_candidate(c, wd + "/" + raw + ".json");
+		model_config_add_candidate(c, wd + "/" + MODEL_CONFIG_LOCAL_DIR + raw);
+		model_config_add_candidate(c, wd + "/" + MODEL_CONFIG_LOCAL_DIR + raw + ".json");
+	}
+	else {
+		model_config_add_candidate(c, wd + "/" + raw);
+		model_config_add_candidate(c, wd + "/" + raw + ".json");
+		model_config_add_candidate(c, wd + "/" + MODEL_CONFIG_LOCAL_DIR + raw + ".json");
+		model_config_add_candidate(c, wd + "/" + MODEL_CONFIG_LOCAL_DIR + raw);
+
+		if(model_config_safe_token(raw)) {
+			model_config_add_candidate(c, std.config_path(package, raw));
+			model_config_add_candidate(c, std.config_path(package, fileio.pure_name(raw)));
+		}
+	}
+
+	return c;
+}
+
+model_config_resolve_existing(spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	c = model_config_candidates(spec, package, default_key);
+
+	for(i = 0; i < c.size(); i++) {
+		if(fileio.exists(c[i]))
+			return c[i];
+	}
+
+	return None;
+}
+
+model_config_resolve(spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	existing = model_config_resolve_existing(spec, package, default_key);
+
+	if(existing)
+		return existing;
+
+	return model_config_default_path(spec, package, default_key);
+}
+
+model_config_load_spec(cfg, spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY, connect = true) {
+	parts = model_config_split_profile(spec);
+	path = model_config_resolve_existing(spec, package, default_key);
+
+	if(!path)
+		return false;
+
+	return cfg.load_profile(path, parts.profile, connect);
+}
+
+model_config_save_spec(cfg, spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	parts = model_config_split_profile(spec);
+	path = model_config_resolve(spec, package, default_key);
+
+	return cfg.save_profile(path, parts.profile);
+}
+
+model_config_cli_interactive(cfg, title = "", connect = true) {
+	label = std.string(title ?? "default");
+
+	api_url = "";
+	auth_token = "";
+	model_name = "";
+	max_ctx = 128000;
+	max_running_agents = 4;
+
+	for(1) {
+		std.print("Enter v1 url for '", label, "' ( e.g. http://localhost:8000 )");
+		api_url = std.input(">>> ");
+
+		std.print("Enter model name (OPTIONAL)");
+		model_name = std.input(">>> ");
+
+		std.print("Enter auth token (OPTIONAL)");
+		auth_token = std.input(">>> ");
+
+		std.print("Enter model context length (OPTIONAL)");
+		max_ctx_num = std.int(std.input(">>> "));
+		if(max_ctx_num > 0)
+			max_ctx = max_ctx_num;
+
+		std.print("Enter max simultaneous agents (OPTIONAL)");
+		max_running_agents = std.int(std.input(">>> "));
+
+		if(cfg.set(api_url, auth_token, model_name, max_ctx, max_running_agents, connect))
+			break;
+
+		std.print("Could not get an answer from the API.");
+	}
+
+	return true;
+}
+
+model_config_cli_get(cfg, spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY, interactive = true, save = true, title = "", prefix = "") {
+	parts = model_config_split_profile(spec);
+	path = model_config_resolve_existing(spec, package, default_key);
+	save_path = "";
+
+	if(path) {
+		if(cfg.load_profile(path, parts.profile, true))
+			return true;
+
+		save_path = path;
+	}
+	else {
+		save_path = model_config_resolve(spec, package, default_key);
+	}
+
+	if(model_config_cli_has_endpoint_args(prefix))
+		return model_config_cli_make(cfg, spec, package, default_key, prefix, interactive, true);
+
+	if(!interactive)
+		return false;
+
+	label = std.string(title ?? "");
+	if(label.empty())
+		label = std.string(spec ?? "default");
+
+	std.print("Model config not found or endpoint not reachable: ", label, "\n");
+	std.print("Creating/saving to: ", save_path, "\n");
+
+	if(!model_config_cli_interactive(cfg, label, true))
+		return false;
+
+	if(save)
+		cfg.save_profile(save_path, parts.profile);
+
+	return true;
+}
+
+model_config_cli_endpoint_args(prefix = "") {
+	p = std.string(prefix ?? "");
+
+	url = std.argvoption("--" + p + "url");
+	token = std.argvoption("--" + p + "token");
+	model = std.argvoption("--" + p + "model");
+	context = std.argvoption("--" + p + "context");
+	agents = std.argvoption("--" + p + "agents");
+
+	ctx = 128000;
+	if(context)
+		ctx = std.int(context);
+
+	ag = 0;
+	if(agents)
+		ag = std.int(agents);
+
+	return [
+		present = url ? true : false,
+		url = std.string(url ?? ""),
+		token = std.string(token ?? ""),
+		model = std.string(model ?? ""),
+		context = ctx,
+		agents = ag,
+	];
+}
+
+model_config_cli_has_endpoint_args(prefix = "") {
+	return model_config_cli_endpoint_args(prefix).present;
+}
+
+model_config_cli_make(cfg, spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY, prefix = "", interactive = true, connect = false) {
+	args = model_config_cli_endpoint_args(prefix);
+
+	if(args.present) {
+		if(args.url.empty()) {
+			std.error("--", prefix, "url is required when endpoint arguments are used.");
+			return false;
+		}
+
+		if(!cfg.set(args.url, args.token, args.model, args.context, args.agents, connect))
+			return false;
+
+		path = model_config_save_spec(cfg, spec, package, default_key);
+		std.print("Saved model config: ", model_config_resolve(spec, package, default_key), "\n");
+		return true;
+	}
+
+	if(!interactive)
+		return false;
+
+	if(!model_config_cli_interactive(cfg, std.string(spec ?? "default"), true))
+		return false;
+
+	model_config_save_spec(cfg, spec, package, default_key);
+	std.print("Saved model config: ", model_config_resolve(spec, package, default_key), "\n");
+	return true;
+}
+
+model_config_cli_has_flag(flag) {
+	want = std.string(flag);
+
+	for(i = 1; i < std.argc(); i++) {
+		a = std.argv(i);
+
+		if(a && std.string(a) == want)
+			return true;
+	}
+
+	return false;
+}
+
+model_config_cli_value_flags(extra = None) {
+	flags = [
+		"--config",
+		"--new-config",
+		"--save-config",
+		"--config-url",
+		"--config-token",
+		"--config-model",
+		"--config-context",
+		"--config-agents",
+		"--receptionist-config",
+		"--new-receptionist-config",
+		"--save-receptionist-config",
+		"--receptionist-url",
+		"--receptionist-token",
+		"--receptionist-model",
+		"--receptionist-context",
+		"--receptionist-agents",
+		"--worker-config",
+		"--new-worker-config",
+		"--save-worker-config",
+		"--worker-url",
+		"--worker-token",
+		"--worker-model",
+		"--worker-context",
+		"--worker-agents",
+		"--max-workers",
+		"--workers",
+	];
+
+	if(extra) {
+		for(i = 0; i < extra.size(); i++)
+			flags.push_back(std.string(extra[i]));
+	}
+
+	return flags;
+}
+
+model_config_cli_positional_prompt(value_flags = None) {
+	flags = model_config_cli_value_flags(value_flags);
+	out = "";
+	skip = false;
+
+	for(i = 1; i < std.argc(); i++) {
+		raw = std.argv(i);
+		a = "";
+
+		if(raw)
+			a = std.string(raw);
+
+		if(skip) {
+			skip = false;
+			continue;
+		}
+
+		if(a.starts("--")) {
+			for(j = 0; j < flags.size(); j++) {
+				if(a == flags[j]) {
+					skip = true;
+					break;
+				}
+			}
+			continue;
+		}
+
+		if(out)
+			out += " ";
+
+		out += a;
+	}
+
+	return out;
+}
+
+model_config_cli_print_path(spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY, label = "") {
+	path = model_config_resolve(spec, package, default_key);
+
+	if(label)
+		std.print(label, ": ");
+
+	std.print(path, "\n");
+	return path;
+}
+
+model_config_cli_list_dir(dir, label, seen) {
+	dir = std.string(dir ?? "");
+
+	if(!dir.empty() && !fileio.exists(dir))
+		return;
+
+	files = fileio.files(dir, false);
+
+	if(!std.is_json(files) || !files.size())
+		return;
+
+	std.print("\n", label, " (", dir, "):\n");
+
+	for(i = 0; i < files.size(); i++) {
+		name = std.string(files[i]);
+
+		if(fileio.file_ext(name).lowercase() != "json")
+			continue;
+
+		path = dir + "/" + name;
+		abs = fileio.absolute_path(path);
+		dup = false;
+
+		for(j = 0; j < seen.size(); j++) {
+			if(std.string(seen[j]) == abs) {
+				dup = true;
+				break;
+			}
+		}
+
+		if(dup)
+			continue;
+
+		seen.push_back(abs);
+
+		data = fileio.read_json(path, true);
+		desc = "";
+
+		if(std.is_json(data)) {
+			if(data.has("url"))
+				desc += std.string(data.url);
+			if(data.has("name"))
+				desc += "  model=" + std.string(data.name);
+			if(data.has("profiles") && std.is_json(data.profiles))
+				desc += "  profiles=" + std.string(data.profiles.size());
+		}
+
+		std.print("  ", name, "  ", desc, "\n");
+	}
+}
+
+model_config_cli_list(package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	seen = [];
+
+	std.print("Model configs:\n");
+
+	model_config_cli_list_dir(std.wd(), "current directory", seen);
+	model_config_cli_list_dir(std.wd() + "/" + MODEL_CONFIG_LOCAL_DIR, ".agent/configs", seen);
+
+	config_dir = fileio.file_dir(std.config_path(package, default_key));
+	model_config_cli_list_dir(config_dir, "user config directory", seen);
+}
+
+model_config_cli_handle_config_commands(package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY, prefixes = None) {
+	if(model_config_cli_has_flag("--list-configs")) {
+		model_config_cli_list(package, default_key);
+		return true;
+	}
+
+	if(model_config_cli_has_flag("--config-path")) {
+		model_config_cli_print_path(std.argvoption("--config"), package, default_key, "Config path");
+		return true;
+	}
+
+	new_main = std.argvoption("--new-config");
+
+	if(new_main) {
+		cfg = ModelConfig();
+		model_config_cli_make(cfg, new_main, package, default_key, "config-", true, false);
+		return true;
+	}
+
+	if(prefixes) {
+		for(i = 0; i < prefixes.size(); i++) {
+			prefix = std.string(prefixes[i]);
+			flag = "--new-" + prefix + "config";
+			value = std.argvoption(flag);
+
+			if(value) {
+				cfg = ModelConfig();
+				model_config_cli_make(cfg, value, package, default_key, prefix, true, false);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+model_config_cli_print_loaded(label, cfg, spec, package = MODEL_CONFIG_PACKAGE, default_key = MODEL_CONFIG_DEFAULT_KEY) {
+	path = model_config_resolve(spec, package, default_key);
+	std.print(label, ": ", path, "  ", cfg.summary(), "\n");
+}

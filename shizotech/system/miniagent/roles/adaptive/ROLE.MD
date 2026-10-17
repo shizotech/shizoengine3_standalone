@@ -113,8 +113,8 @@ Gather context in this order, then act:
    skill: re-check `list_skills()`. If it is genuinely absent, the harness is broken — report it,
    do not invent it.
 2. **Docs** — `AGENTS.MD` / `README.md` in the root and in the directories you will touch.
-3. **The Mind** — `.megamind/` (see The Mind). Read the relevant topic before starting so you do
-   not repeat a finished investigation or walk into a known dead end.
+3. **The Mind** — `.megamind/` (see The Mind). Read the relevant topic's `index.md`, then follow
+   the edges you need, so you do not repeat a finished investigation or walk into a known dead end.
 4. **Code** — last. The actual implementation is authoritative over any doc or note.
 
 Paths are always relative to the working directory: `./src/foo.cpp`. Absolute paths starting with
@@ -248,9 +248,10 @@ Build game
 
 The Mind is shared, so split the writes:
 
-- Each child writes only its own file: `.megamind/<topic>/notes/<owner>.md`, or the mirrored
-  repository path for its own subsystem.
-- Only the parent edits `roadmap.md` and `taskboard.md`.
+- Each child writes only its own node: `.megamind/<topic>/notes/<owner>.md`.
+- The graph files — `index.md`, `roadmap.md`, `taskboard.md` — are **owned by the parent**.
+  Children report the nodes and edges they produced, the parent links them into `index.md`.
+  A node that is not in the index does not exist.
 
 ### Integration is yours
 
@@ -343,6 +344,10 @@ Trust child reports. Re-verify where the puzzle pieces do not fit, plus the inte
 `.megamind/` is the shared workspace for every agent in the current task hierarchy. Use it — it is
 how the next agent, or you after a context reset, knows what already happened.
 
+The Mind is a **knowledge graph**, not a dump. Topics are its subgraphs, files are its **nodes**,
+cross-links between files are its **edges**. A Mind that is only appended to becomes a landfill
+after a dozen runs; a Mind that is linked, merged and pruned stays usable forever.
+
 ### Topics
 
 Never write flat into `.megamind/`. Each distinct mental task owns one topic directory:
@@ -356,37 +361,80 @@ Never write flat into `.megamind/`. Each distinct mental task owns one topic dir
 Topic name: short lowercase phrase, words joined by underscores, no punctuation, no ids, no
 timestamps, still readable in a month. Before writing: list `.megamind/`, reuse an existing topic
 when it is the same mental task, otherwise create one. The `.megamind/` root contains only topic
-directories.
+directories — never a stray file, never a topic named after a date, never a second topic for a
+problem a topic already covers.
 
-Inside a topic, mirror the repository structure for subsystem-specific notes:
+### The graph inside a topic
+
+A topic is a small graph with one entry point. Keep exactly this shape:
 
 ```text
 .megamind/<topic>/
-├── roadmap.md
-├── taskboard.md
-├── notes.md
-├── avoid.md
-├── docs.md
-├── notes/                 ← one file per parallel owner
+├── index.md               ← the graph: node list + edges. Entry point, always.
+├── roadmap.md             ← direction, progress, key discoveries
+├── taskboard.md           ← checklist with statuses
+├── avoid.md               ← dead ends, pitfalls, things that must not be tried again
+├── notes.md               ← general working notes not tied to one path
+├── nodes/                 ← one node per claim, subsystem, symbol, decision, path
+│   ├── renderer_pipeline.md
+│   └── src_router_api.md
+├── notes/                 ← one file per parallel owner (children write here only)
 │   └── renderer_child.md
-└── src/
-    └── renderer/
-        └── discoveries.md
+├── log.md                 ← append-only journal, distilled into nodes, then trimmed
+└── archive/               ← finished / superseded nodes and closed subtopics
 ```
 
-The Mind never contains copies of source files.
+- **Node** = one file holding one coherent thing (a subsystem, a hypothesis, a decision, a
+  dead end). Small topics may keep their nodes at the topic root; do not create a directory for
+  a single file.
+- **Edge** = a markdown link to another node, written where it is used:
+  `see [renderer pipeline](nodes/renderer_pipeline.md) — blocks on the shader cache`.
+  A node nobody links to is clutter, not knowledge.
+- `index.md` is the only file an agent must read on entry. It lists every live node with one line
+  of description plus the edges between them:
+
+  ```text
+  # fixing_the_scrollbar
+  status: active | done | superseded-by <topic>
+  - [renderer pipeline](nodes/renderer_pipeline.md) — scroll delta comes from the input queue
+  - [avoid: polling](avoid.md) — 60 Hz poll of the viewport was measured slower
+  - [taskboard](taskboard.md) — 3/7 done
+  ```
+
+### Graph discipline
+
+- **Read**: `index.md` first, then follow the edges relevant to your task. Do not walk the whole
+  topic.
+- **Write**: a new node is created **and linked from `index.md` in the same edit**. An unlinked
+  node is a bug.
+- **Merge before you create**: a new discovery about an existing node extends that node.
+  `scrollbar_notes.md`, `scrollbar_notes_2.md`, `final_scrollbar_v3.md` is how a Mind dies.
+- **Close the run**: prune — delete what is now wrong, obsolete or duplicated, update the edges
+  that your change broke, append one dated line to `log.md`.
+- **Promote**: a node that is durable project knowledge moves into the repository docs and is
+  reduced in the Mind to a one-line pointer.
+- **Finish**: when a topic is done, set `status: done` in `index.md`, promote what lasts, and
+  `mv` the topic to `.megamind/archive/<topic>/`. A finished topic is never a live entry point.
+
+Budget: `index.md` under ~40 lines, a node under ~100 lines, a topic under ~10 live files.
+Exceeding the budget is a signal to split a node into two linked nodes, or to archive — not a
+signal to add an eleventh file.
+
+If you catch yourself iterating over steps, write them into the taskboard/checklist instead of
+trusting your context. The steps that come later are exactly the ones that get forgotten.
 
 ### Standard files
 
+- `index.md` — the graph: every live node, one line each, plus the edges. Entry point and exit
+  point of every run.
 - `roadmap.md` — progress, direction, key discoveries, useful ideas.
 - `taskboard.md` — the checklist with statuses. Big goals need this: keep it updated, tick things
   off, add discovered work.
 - `notes.md` — general working notes not tied to one path.
 - `avoid.md` — dead ends, pitfalls, things that must not be tried again.
 - `docs.md` — resolved external facts useful during the hierarchy.
-
-If you catch yourself iterating over steps, write them into the taskboard/checklist instead of
-trusting your context. The steps that come later are exactly the ones that get forgotten.
+- `log.md` — the journal: one dated line per meaningful step. Distil it into nodes, then trim it;
+  it is never a source of truth on its own.
 
 ### Durable vs. temporary
 
@@ -396,7 +444,31 @@ repository is authoritative whenever the two disagree.
 
 Temporary agent knowledge — hypotheses, discoveries, debugging observations, in-progress state —
 belongs in the Mind. If a temporary discovery turns out to be a durable fact, document it in the
-repository.
+repository and leave a pointer in the node.
+
+### What never goes into the Mind
+
+The Mind holds **conclusions and links**, never artifacts:
+
+- no copies of source files;
+- no test scripts, repro cases, probes, benchmarks, logs, dumps, generated data, screenshots;
+- no session transcripts, no pasted tool output, no "notes on my notes".
+
+Scratch work lives in **`testbench/`** at the repository root, one subdirectory per topic:
+
+```text
+testbench/
+└── fixing_the_scrollbar/
+    ├── repro_scroll.py
+    ├── bench_scroll.py
+    └── out/                     ← logs, dumps, generated data
+```
+
+`testbench/` is disposable scratch: nothing ships from it, it is not a test suite, and no
+production code may depend on it. Permanent tests belong to the repository's own test directory
+(here: `tests/`, `*_selftest.shio`) and ship with the code. The Mind stores only the conclusion
+plus a pointer to the artifact — `repro_scroll.py confirms the 1px drift →
+testbench/fixing_the_scrollbar/` — never the artifact itself.
 
 Keep Mind files compact. No verbose reasoning, no noise, nothing the next agent does not need.
 Summarize. Delete what is wrong, obsolete, or bullshit. If you fought with something and found a
@@ -410,6 +482,10 @@ Verify what you implement.
 
 - Always try to build/run/test the change. Use command sessions for long work: `command_start`
   with a generous timeout, `command_wait` for builds that must finish.
+- Throwaway verification goes to the bench, not to the Mind: scratch test scripts, repro cases,
+  probes and benchmarks live in `testbench/<topic>/`, their outputs in `testbench/<topic>/out/`.
+  Only the conclusion and the path to the artifact go into the Mind. A test that must outlive the
+  task belongs in the repository's real test directory, next to the existing selftests.
 - Do not force testing where the environment offers no way to test. If there is no reliable way to
   run it, get the code demonstrably correct by inspection and say exactly that in your report.
 - A running process is not a blocked agent: keep working and read the session later. Never restart
@@ -443,9 +519,13 @@ Before you finish, all of these must be true:
 2. The task is verified — or the missing verification is stated explicitly.
 3. Substantial remaining required work exists as created subtasks, not as intentions.
 4. Optional work is recorded as deferred in the Mind taskboard.
-5. `.megamind/<topic>/` is updated: taskboard statuses, roadmap, discoveries, dead ends.
-6. Repository docs that must reflect the change are updated.
-7. No child of yours is left sitting on a `QUESTION`.
+5. The Mind graph is updated: new nodes exist **and are linked from `index.md`**, taskboard
+   statuses are current, dead ends are in `avoid.md`, stale and duplicated nodes are pruned, one
+   line added to `log.md`.
+6. Scratch work sits in `testbench/<topic>/` only — nothing left in the Mind, nothing scattered in
+   the source tree, scratch that proved nothing deleted.
+7. Repository docs that must reflect the change are updated.
+8. No child of yours is left sitting on a `QUESTION`.
 
 Then write one short snappy conclusion and call:
 
@@ -475,6 +555,9 @@ report, or end up inside a subtask contract.
 
 > "A tree with strong roots laughs at storms." A task tree with strong contracts laughs at merge
 > conflicts.
+
+> "The palest ink beats the best memory" — but only if the ink is filed where the next reader can
+> find it. Link it, prune it, or watch the Mind rot.
 
 # PLATFORM
 

@@ -129,8 +129,17 @@ batch_report_max_chars = 1500;
 
 class parallel_run_guard {
 	agt = None;
+	acquired = false;
 	__init__(_agt) {
 		agt = _agt;
+		
+		//max_running_agents <= 0 means "no cap" (same rule as batch_max_parallel).
+		//A cap of 0 used to queue every agent forever: nothing ever started, and a
+		//stop could not drain the queue, so the run looked like it never ended.
+		limit = agt.model_config.max_running_agents;
+		
+		if(limit <= 0)
+			return;
 		
 		shared_agents_global = std.global("shared_agents_global");
 		
@@ -138,18 +147,35 @@ class parallel_run_guard {
 			shared_agents_global.count = 0;
 		
 		first = true;
-		for(shared_agents_global.count >= agt.model_config.max_running_agents) {
+		for(shared_agents_global.count >= limit) {
+			//A stop must never queue for a slot that may never become free.
+			if(agt.should_stop())
+				return;
+			
 			if(first)
-				std.print("Max running agents: " + shared_agents_global.count + " / " + agt.model_config.max_running_agents);
+				std.print("Max running agents: " + shared_agents_global.count + " / " + limit);
 				first = false;
 			std.sleep(10);
 		}
 		
+		if(agt.should_stop())
+			return;
+		
+		cs = std.critical_section_named("miniagent_slots");
 		shared_agents_global.count++;
+		acquired = true;
+		cs.release();
 	}
 	__deinit__() {
+		//Only give back a slot that was actually taken.
+		if(!acquired)
+			return;
+		
 		shared_agents_global = std.global("shared_agents_global");
+		
+		cs = std.critical_section_named("miniagent_slots");
 		shared_agents_global.count--;
+		cs.release();
 	}
 }
 
@@ -242,8 +268,22 @@ batch_run_child(agt, task)
 
 	managed _grd = parallel_run_guard(agt);
 
-	if(agt.should_stop())
+	//Stopped from above: tear the child down and publish a terminal state, so the
+	//batch scheduler drains instead of queueing work that must never run.
+	if(agt.should_stop()) {
+		executor.stop();
+
+		if(!task.finished) {
+			task.finished = true;
+			task.finish_reason = "failed";
+
+			if(!task.report)
+				task.report = "The batch was stopped by the parent agent before this item started.";
+		}
+
+		task.batch_done = true;
 		return;
+	}
 
 	try {
 		res = executor.task(executor.env.batch_prompt);
@@ -253,6 +293,11 @@ batch_run_child(agt, task)
 	}
 	
 	executor.env.batch_runs++;
+
+	//The parent was stopped while this item ran: the child goes down with it, and
+	//whatever it produced is not a report the parent will ever read.
+	if(agt.should_stop())
+		executor.stop();
 
 	// Ran out of runs without ever signalling.
 	if(!task.finished) {
@@ -313,9 +358,14 @@ add_tools(agt)
 				}
 				
 				managed _grd = parallel_run_guard(agt);
-				
-				if(agt.should_stop())
+
+				//Stopped from above: this sibling must not start, and it is torn
+				//down so nothing below it keeps generating.
+				if(agt.should_stop()) {
+					executor.stop();
+					fork_results[task_index].report = "The fork was stopped before this sibling started.";
 					return;
+				}
 				
 				std.print("\n\n---NEW FORK---\n");
 				
@@ -326,6 +376,13 @@ add_tools(agt)
 				}
 				catch(e) {
 					fork_results[task_index].report = "This sibling died during execution.";
+				}
+				
+				//The parent was stopped while this sibling ran: it goes down with
+				//its own subagent tree, and its output is not a report anyone reads.
+				if(agt.should_stop()) {
+					executor.stop();
+					fork_results[task_index].report = "The fork was stopped while this sibling was running.";
 				}
 			};
 			
@@ -342,6 +399,14 @@ add_tools(agt)
 			}
 		
 			std.print("--- FORK finished ---");
+
+			if(agt.should_stop()) {
+				return [
+					stopped = true,
+					results = fork_results,
+					note = "The agent was stopped. Do not continue, end the run with signal().",
+				];
+			}
 
 			return [results = fork_results];
 		}
@@ -407,8 +472,17 @@ add_tools(agt)
 			
 			managed _grd = parallel_run_guard(agt);
 			
-			if(agt.should_stop())
-				return;
+			//A stop must end the turn: returning nothing here handed the model an
+			//empty tool result and it simply kept generating.
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped before this task started.\nDo not continue, end the run with signal().",
+				];
+			}
 			
 			std.print("\n\n---NEW TASK---\n");
 			
@@ -425,6 +499,18 @@ add_tools(agt)
 			}
 			catch(e) {
 
+			}
+			
+			//Stopped while the child ran: the child goes down with its own tree and
+			//the parent gets a stop, not a report to continue from.
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped while this task was running.\nDo not continue, end the run with signal().",
+				];
 			}
 			
 			if(!task.report) {
@@ -478,7 +564,17 @@ add_tools(agt)
 			if(!task) {
 				return "No task with the specified ID was found, cannot continue non existing task.";
 			}
-		
+			
+			//A stop is checked before any task state is touched: a stopped agent
+			//must not resurrect a child and hand the model a fresh report.
+			if(agt.should_stop()) {
+				return [
+					task_id = args.task_id,
+					stopped = true,
+					report = "The agent was stopped.\nDo not continue, end the run with signal().",
+				];
+			}
+
 			executor = task.agent;
 			
 			task.finished = false;
@@ -509,14 +605,32 @@ add_tools(agt)
 			
 			managed _grd = parallel_run_guard(agt);
 			
-			if(agt.should_stop())
-				return;
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped before this task continued.\nDo not continue, end the run with signal().",
+				];
+			}
 			
 			try {
 				step_result = executor.task(prompt);
 			}
 			catch(e) {
 				//Todo: add fail counter
+			}
+			
+			//Stopped while the child ran: the child goes down with its own tree.
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped while this task was running.\nDo not continue, end the run with signal().",
+				];
 			}
 			
 			if(!task.report) {
@@ -661,6 +775,10 @@ add_tools(agt)
 			batch_launch = [&next_item, &batch_running, &children, batch_pool, agt](max_parallel) {
 				for(*next_item < children.size()) {
 
+					//A stop drains the queue: nothing new is started below a stopped agent.
+					if(agt.should_stop())
+						break;
+
 					if(batch_running >= max_parallel)
 						break;
 
@@ -683,8 +801,27 @@ add_tools(agt)
 			batch_launch(max_parallel);
 			
 			for(next_item < children.size() || batch_running > 0) {
+				if(agt.should_stop())
+					break;
 				std.sleep(25);
 				batch_launch(max_parallel);
+			}
+			
+			// ── Stop: tear the whole batch down ──
+			// Every item of a batch is a child agent of this agent; a stop must
+			// reach all of them, not just the one that happens to be scheduled.
+			if(agt.should_stop()) {
+				for(i = 0; i < children.size(); i++) {
+					children[i].agent.stop();
+
+					if(!children[i].finished) {
+						children[i].finished = true;
+						children[i].finish_reason = "failed";
+
+						if(!children[i].report)
+							children[i].report = "The batch was stopped by the parent agent before this item finished.";
+					}
+				}
 			}
 			
 			for(i = 0; i < batch_pool.size(); i++) {
@@ -725,16 +862,28 @@ add_tools(agt)
 				]);
 			}
 
-			return [
+			batch_status = "BATCH finished";
+
+			if(agt.should_stop())
+				batch_status = "BATCH stopped";
+
+			result = [
 				batch_id = batch_id,
 				target = args.target,
-				status = "BATCH finished",
+				status = batch_status,
 				total = total,
 				finished = finished,
 				failed = failed,
 				questions = questions,
 				results = results,
 			];
+
+			if(agt.should_stop()) {
+				result.stopped = true;
+				result.note = "The agent was stopped and the batch was torn down.\nDo not continue, end the run with signal().";
+			}
+
+			return result;
 		}
 	);
 

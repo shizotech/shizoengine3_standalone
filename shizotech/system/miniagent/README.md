@@ -20,6 +20,8 @@ can be used.
 
 | File | What it is |
 |---|---|
+| `model_config.shio` | `ModelConfig()` — endpoint/model/generation config, flat and profile JSON layouts |
+| `model_config_cli.shio` | shared CLI config resolver: named configs, cwd search, profiles, create/list/save |
 | `miniagent.shio` | the agent class: role loading, tools, subagents, LLM turn loop |
 | `megamind.shio` | `Megamind()` — one machine: a *receptionist* agent that routes user requests into a pool of worker agents |
 | `node.shio` | the runnable **AI node**: a `Megamind()` plus a ShizoNet service, so other machines can drive it |
@@ -29,6 +31,82 @@ can be used.
 | `shizonet_ai.shio` | the node ⇄ router wire protocol (both sides, one place) |
 | `node_api.shio` | optional JSON web API of a node (`--webserver` / `--port`) |
 | `roles/` | the AI roles: `receptionist`, `router`, `adaptive`, `single_action/*`, `util/*` |
+
+## Model configs
+
+The runnable scripts share one config story:
+
+```
+shz __init__.shio --config gpu
+shz router.shio --config router-fast
+shz telegram_router.shio --bot-token ... --config router-fast
+
+shz node.shio --config gpu
+shz node.shio --receptionist-config chat --worker-config gpu
+shz node.shio --worker-config ./endpoints.json#worker
+shz node.shio --max-workers 4
+```
+
+A config spec can be:
+
+- a plain name: `gpu`
+- a file path: `./configs/gpu.json`
+- a profile inside a file: `./endpoints.json#worker`
+
+Plain names are searched in this order:
+
+1. current working directory (`gpu.json`)
+2. `.agent/configs/gpu.json`
+3. the default ShizoScript config directory
+
+New plain-name configs are created in the current working directory, so a project
+can carry its own endpoint files.
+
+Useful CLI commands:
+
+```
+--list-configs
+--config-path
+--new-config <name|path[#profile]>
+--save-config <name|path[#profile]>
+--config-url <url> --config-token <token> --config-model <name>
+--config-context <tokens> --config-agents <n>
+```
+
+For `node.shio`, the receptionist and worker pool can use different endpoints:
+
+```
+shz node.shio \
+  --new-receptionist-config chat \
+  --receptionist-url http://localhost:8000 \
+  --receptionist-model small-chat
+
+shz node.shio \
+  --new-worker-config gpu \
+  --worker-url http://localhost:8001 \
+  --worker-model big-coder \
+  --worker-context 128000 \
+  --worker-agents 8
+
+shz node.shio --receptionist-config chat --worker-config gpu --max-workers 4
+```
+
+The same file can store multiple endpoints as profiles:
+
+```
+{
+  "profiles": {
+    "default": {"url": "http://localhost:8000", "name": "chat"},
+    "worker": {"url": "http://localhost:8001", "name": "coder"}
+  }
+}
+```
+
+Then use:
+
+```
+shz node.shio --config ./endpoints.json#default --worker-config ./endpoints.json#worker
+```
 
 ## Router
 
@@ -90,7 +168,9 @@ That example, built for real: `class TelegramRouter : Router`.
 
 ```
 shz telegram_router.shio --bot-token 123456:ABC...
+    [--config <name|path[#profile]>]
     [--name TelegramRouter] [--role router] [--poll 1000] [--trusted <path>] [--no-stream]
+    [--list-configs] [--new-config <name>]
 ```
 
 * **Trusted chats.** The bot answers only chats listed in the `trusted_chats` json
@@ -131,9 +211,10 @@ CLI (a demo application — the product is `Router()` + the `router` role):
 
 ```
 shz router.shio                    console: plain text is a router-agent turn
-                                     /nodes /tasks /overview [node] /route <text>
-                                     /node <node> <text>  explicit delegation (no agent turn)
-                                     /addworker <node> <name> <goal> /notify /config /exit
+                                      /nodes /tasks /overview [node] /route <text>
+                                      /node <node> <text>  explicit delegation (no agent turn)
+                                      /addworker <node> <name> <goal> /notify /config /configs /exit
+shz router.shio --config router-fast
 shz router.shio "task text"        single shot: one agent turn, print the answer
 ```
 
@@ -141,7 +222,10 @@ shz router.shio "task text"        single shot: one agent turn, print the answer
 
 ```
 shz node.shio                                        interactive
+shz node.shio --interactive --config gpu             interactive with a named config
 shz node.shio --name GPUBox --description "cuda training box"
+shz node.shio --receptionist-config chat --worker-config gpu
+shz node.shio --worker-config ./endpoints.json#worker --max-workers 4
 shz node.shio --webserver --port 13337 --api-token secret   + JSON web API
 ```
 
@@ -157,9 +241,31 @@ chat on another.
 `Router` surface and the role tool surface. `shizonet_ai.shio` is the only place the wire
 format is implemented.
 
+## Stop
+
+`miniagent.stop()` is **top-down and total**: it aborts the agent's own stream and
+recurses into every child registered in `_child_agents` (a child's own `stop()`
+walks its subtree), so one call on the root ends generation everywhere.
+
+* Live children stay in `_child_agents` — that list is the propagation path. Pruning
+  it down to the newest child leaves the siblings generating after a stop.
+* `should_stop()` is true for an agent whose **ancestor** was stopped. `task()`
+  refuses to start under a stopped ancestor, and a child created under a stopped
+  parent is born stopped, so a stop cannot be undone by a late `start_task`,
+  `continue_task` or batch item.
+* A child stopping **itself** (`signal()`, `finalize()`) stops only its own subtree:
+  the parent keeps running and can continue that child later.
+* Blocking tools (`sleep`, `command_start` / `command_read` / `command_wait`) poll
+  `should_stop()`: a stopped agent leaves the wait instead of sitting out the
+  timeout. A command process is never killed by a stop — only the wait ends.
+* `Megamind.stop_task()` stops the **running** worker (and with it its whole
+  subagent tree), not only a task that was still scheduled.
+
 ## Tests
 
 ```
+shz model_config_selftest.shio    config paths, cwd search, profiles, save/load
+                                 -> 24 checks, ALL PASSED
 shz router_selftest.shio        full stack: Router + protocol + role tools, stub nodes,
                                 stub router-agent turn, no LLM  -> 94 checks, ALL PASSED
 shz telegram_router_selftest.shio  Telegram front end against a fake bot + stub nodes:
@@ -175,7 +281,14 @@ shz telegram_router_selftest.shio  Telegram front end against a fake bot + stub 
 shz shizonet_ai_selftest.shio   protocol only: node service + router service, no LLM
                                 -> 94 checks, ALL PASSED
 shz node_api_selftest.shio      node JSON API over real HTTP, stub host
-                                -> 37 checks, ALL PASSED
+                                 -> 37 checks, ALL PASSED
+shz tests/stop_propagation_test.shio  miniagent.stop() across the agent tree, no LLM:
+                                 every child and grandchild registered and stopped,
+                                 no generation under a stopped ancestor, a child
+                                 that signalled itself stays continuable, no finalize
+                                 nudge after a stop, interruptible sleep, and
+                                 start_task / continue_task / fork / file_task_batch
+                                 obeying a stop  -> 45 checks, ALL PASSED
 ```
 
 ShizoNet on one machine: the process binding UDP **6454** sees every peer, so a selftest

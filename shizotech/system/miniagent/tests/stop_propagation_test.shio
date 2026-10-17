@@ -1,0 +1,349 @@
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Stop propagation tests (headless — no LLM endpoint required)
+//
+//  Run:  shz tests/stop_propagation_test.shio
+//
+//  miniagent.stop() must reach every descendant of the agent tree, and a stopped
+//  ancestor must keep every descendant down. The adaptive role spawns subagents
+//  for start_task / continue_task / fork / file_task_batch; when stop() only
+//  reached the most recently created child, the rest of the tree kept generating
+//  after the user asked for a stop.
+//
+//  The LLM API of the agents under test is replaced by a stub that counts
+//  stop() and task() calls, so the whole suite runs offline: a single extra
+//  generation request would be visible as a stub task() call.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+
+tests_passed = 0;
+tests_failed = 0;
+failures = [];
+
+check(name, cond, detail = "") {
+	if(cond) {
+		tests_passed++;
+		std.cout("  [ok]   ", name, "\n");
+		return;
+	}
+	tests_failed++;
+	failures.push_back(name + (detail ? " :: " + detail : ""));
+	std.cout("  [FAIL] ", name, " ", detail, "\n");
+}
+
+section(title) {
+	std.cout("\n== ", title, " ==\n");
+}
+
+call(agt, name, args) {
+	if(!agt.llm_api.tools.tool_callbacks.has(name))
+		return [ok = false, error = "tool_not_registered", tool = name];
+	return agt.llm_api.tools.tool_callbacks[name](args);
+}
+
+// A stub LLM API: counts how often it was stopped and how often it was asked to
+// generate. miniagent.stop() must reach it, miniagent.task() must not start it
+// under a stopped ancestor.
+//
+// It is a class on purpose: a JSON literal holding lambdas that capture the
+// agent is a capture-lifetime minefield in this harness, and a test that fails
+// because of the stub is worse than a test that cannot fail.
+class stub_api {
+	owner = None;
+	stops = 0;
+	runs = 0;
+	prompts = [];
+	selfstop = false;
+	
+	__init__(_owner, _selfstop = false) {
+		owner = _owner;
+		selfstop = _selfstop;
+	}
+	
+	stop() {
+		stops++;
+	}
+	
+	task(prompt) {
+		runs++;
+		prompts.push_back(prompt);
+		
+		//The selfstopper stands in for a tool (finalize/signal) that stops the
+		//agent in the middle of a turn.
+		if(selfstop && runs == 1)
+			owner.stop();
+		
+		return "";
+	}
+	
+	set_reasoning_effort(effort) { }
+	set_model(model) { }
+	add_tool(name, description, params, cb) { }
+}
+
+stub_llm(agt) {
+	agt.llm_api = stub_api(agt);
+}
+
+stub_llm_selfstopper(agt) {
+	agt.llm_api = stub_api(agt, true);
+}
+
+count_stopped(list) {
+	n = 0;
+	for(i = 0; i < list.size(); i++)
+		if(list[i] && list[i].stopped)
+			n++;
+	return n;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.cout("\nStop propagation tests\n");
+
+cfg = ModelConfig();
+
+// ── 1. the child registry keeps every live child ────────────────────────────
+
+section("Registry: every subagent stays registered (stop() walks this list)");
+
+managed root = miniagent(cfg, "adaptive");
+stub_llm(root);
+
+a = root.subagent("single_action/explorer");
+stub_llm(a);
+b = root.subagent("single_action/explorer");
+stub_llm(b);
+c = root.subagent("single_action/explorer");
+stub_llm(c);
+
+check("all 3 children are registered", root._child_agents.size() == 3, "size=" + std.string(root._child_agents.size()));
+check("the parent links are set", a._parent == root && c._parent == root);
+
+ga = a.subagent("single_action/explorer");
+stub_llm(ga);
+gb = b.subagent("single_action/explorer");
+stub_llm(gb);
+
+check("a grandchild is registered under its own parent", a._child_agents.size() == 1, "size=" + std.string(a._child_agents.size()));
+
+// ── 2. one stop reaches the whole tree ──────────────────────────────────────
+
+section("Propagation: one stop() reaches every child and grandchild");
+
+root.stop();
+
+check("root stream stopped", root.llm_api.stops == 1, std.string(root.llm_api.stops));
+check("first child stopped", a.llm_api.stops == 1, std.string(a.llm_api.stops));
+check("middle child stopped", b.llm_api.stops == 1, std.string(b.llm_api.stops));
+check("last child stopped", c.llm_api.stops == 1, std.string(c.llm_api.stops));
+check("grandchild of the first child stopped", ga.llm_api.stops == 1, std.string(ga.llm_api.stops));
+check("grandchild of the middle child stopped", gb.llm_api.stops == 1, std.string(gb.llm_api.stops));
+
+check("root should_stop", root.should_stop());
+check("child inherits the stop", a.should_stop() && b.should_stop() && c.should_stop());
+check("grandchild inherits the stop", ga.should_stop() && gb.should_stop());
+
+// ── 3. a stopped tree never generates again ─────────────────────────────────
+
+section("No resurrection: a stopped ancestor keeps every descendant down");
+
+d = root.subagent("single_action/explorer");
+stub_llm(d);
+
+check("a child created under a stopped parent is born stopped", d.stopped == true);
+
+res_late = d.task("do it");
+check("a late child does not generate", d.llm_api.runs == 0, "runs=" + std.string(d.llm_api.runs));
+check("a late child reports a stop", res_late.stopped == true && !res_late.ok, std.string(res_late));
+
+res_resume = b.task("continue it");
+check("a continued child does not generate", b.llm_api.runs == 0, "runs=" + std.string(b.llm_api.runs));
+check("a continued child reports a stop", res_resume.stopped == true && !res_resume.ok, std.string(res_resume));
+
+res_grand = ga.task("continue it");
+check("a continued grandchild does not generate", ga.llm_api.runs == 0, "runs=" + std.string(ga.llm_api.runs));
+
+// ── 4. a child that stops itself is still continuable ───────────────────────
+
+section("Non regression: signal() in a child stops the child, not the tree");
+
+// NOTE: this suite never names a global variable 'e'. Every included file uses
+// catch(e), and in the merged script scope that aliases the global slot, which
+// silently corrupts an agent stored in a global named 'e'.
+managed root2 = miniagent(cfg, "adaptive");
+stub_llm(root2);
+
+selfstop = root2.subagent("single_action/explorer");
+stub_llm(selfstop);
+selfstop_gc = selfstop.subagent("single_action/explorer");
+stub_llm(selfstop_gc);
+
+selfstop.stop();
+
+check("the child is stopped", selfstop.stopped == true && selfstop.llm_api.stops == 1, "stops=" + std.string(selfstop.llm_api.stops));
+check("the child's own stop reaches its grandchild", selfstop_gc.llm_api.stops == 1, "stops=" + std.string(selfstop_gc.llm_api.stops));
+check("the parent is NOT stopped by a child's stop", !root2.stopped && !root2.should_stop());
+
+selfstop.task("continue after its own signal");
+check("a child that stopped itself can be continued", selfstop.llm_api.runs >= 1, "runs=" + std.string(selfstop.llm_api.runs));
+
+root2.stop();
+
+check("stopping the parent reaches the child and the grandchild", selfstop.llm_api.stops == 2 && selfstop_gc.llm_api.stops == 2, "child=" + std.string(selfstop.llm_api.stops) + " gc=" + std.string(selfstop_gc.llm_api.stops));
+
+// ── 5. the finalize nudge must not fire after a stop ────────────────────────
+
+section("No extra generation on the way out (finalize nudge)");
+
+managed rootf = miniagent(cfg, "adaptive");
+stub_llm(rootf);
+
+f = rootf.subagent("single_action/explorer");
+stub_llm_selfstopper(f);
+
+check("the explorer role uses finalize", f.env.use_finalize == true);
+
+res_f = f.task("work");
+
+check("the stopped run issues exactly one generation", f.llm_api.runs == 1, "runs=" + std.string(f.llm_api.runs) + " prompts=" + std.string(f.llm_api.prompts));
+check("the stopped run reports a stop, not a crash", res_f.stopped == true && !res_f.ok, std.string(res_f));
+
+// ── 6. sleep is interruptible and honours its unit ──────────────────────────
+
+section("Sleep: seconds, and interruptible by a stop");
+
+managed root3 = miniagent(cfg, "adaptive");
+
+t0 = std.millis();
+res_live = call(root3, "sleep", [duration = 1]);
+slept_ms = std.millis() - t0;
+
+check("sleep(1) sleeps about a second", slept_ms >= 900 && slept_ms < 3000, "slept_ms=" + std.string(slept_ms));
+check("sleep(1) reports waking up", std.string(res_live).contains("Wake up"), std.string(res_live));
+
+root3.stop();
+
+t1 = std.millis();
+res_stopped = call(root3, "sleep", [duration = 600]);
+waited_ms = std.millis() - t1;
+
+check("a stopped agent leaves sleep immediately", waited_ms < 1000, "waited_ms=" + std.string(waited_ms));
+check("sleep reports the interruption", std.string(res_stopped).contains("stopped"), std.string(res_stopped));
+
+// ── 7. the adaptive role refuses to run children under a stop ───────────────
+
+section("Adaptive role: start_task / continue_task / fork / file_task_batch obey a stop");
+
+managed root4 = miniagent(cfg, "adaptive");
+
+root4.stop();
+
+res_st2 = call(root4, "start_task", [
+	name = "Stopper2",
+	goal = "Must never run",
+	context = "offline test",
+	contract = "offline test",
+	effort = "low",
+	constraints = "",
+]);
+
+check("start_task returns a stopped result", res_st2.stopped == true, std.string(res_st2));
+check("start_task tells the model to end the run", std.string(res_st2.report).contains("stopped"), std.string(res_st2));
+
+new_children = root4._child_agents;
+check("every child created by start_task is stopped", count_stopped(new_children) == new_children.size(), std.string(count_stopped(new_children)) + "/" + std.string(new_children.size()));
+
+res_ct = call(root4, "continue_task", [task_id = "task_does_not_exist", response = "go on"]);
+check("continue_task on an unknown id is reported", std.string(res_ct).contains("No task"), std.string(res_ct));
+
+res_fk = call(root4, "fork", [tasks = ["fork a", "fork b"], tool_call = [id = "tc_1"]]);
+
+check("fork returns a stopped result", res_fk.stopped == true, std.string(res_fk));
+check("fork reports one entry per sibling", res_fk.results.size() == 2, std.string(res_fk.results.size()));
+
+batch_dir = ".agent/stop_test_batch/";
+fileio.mkdir(batch_dir);
+fileio.write_text(batch_dir + "a.txt", "batch fixture a\n");
+fileio.write_text(batch_dir + "b.txt", "batch fixture b\n");
+
+res_bt = call(root4, "file_task_batch", [
+	target = batch_dir + "*.txt",
+	goal = "Must never run",
+	context = "offline test",
+	contract = "offline test",
+	constraints = "",
+]);
+
+check("file_task_batch reports a stopped batch", res_bt.status == "BATCH stopped", std.string(res_bt.status));
+check("file_task_batch saw the items", res_bt.total == 2, "total=" + std.string(res_bt.total));
+check("file_task_batch marks every item terminal", res_bt.finished + res_bt.failed + res_bt.questions == res_bt.total, std.string(res_bt));
+
+batch_children = root4._child_agents;
+check("all batch children are stopped", count_stopped(batch_children) == batch_children.size(), std.string(count_stopped(batch_children)) + "/" + std.string(batch_children.size()));
+
+// ── 8. simple_agent bookkeeping ─────────────────────────────────────────────
+
+section("simple_agent: live children stay registered, no queue deadlock");
+
+managed root5 = miniagent(cfg, "adaptive");
+
+s1 = root5.simple_agent("You are a stub.");
+s2 = root5.simple_agent("You are a stub.");
+
+check("simple_agent keeps live children", root5._child_agents.size() == 2, "size=" + std.string(root5._child_agents.size()));
+
+root5.stop();
+
+s3 = root5.simple_agent("You are a stub.");
+
+check("a simple_agent created after a stop is born stopped", s3.context.stream._stop_stream == true);
+
+root5.stop();
+
+check("stop() with a mixed child list is safe", root5._child_agents.size() == 3, "size=" + std.string(root5._child_agents.size()));
+
+// ── 9. concurrent child creation (fork / batch reality) ─────────────────────
+
+section("Concurrency: children created from tool threads all stay reachable");
+
+managed root6 = miniagent(cfg, "adaptive");
+
+make_threads = [];
+
+for(i = 0; i < 4; i++) {
+	t = std.thread([root6](idx) {
+		for(j = 0; j < 3; j++)
+			root6.subagent("single_action/explorer");
+	});
+	t.run(i);
+	make_threads.push_back(t);
+}
+
+for(i = 0; i < make_threads.size(); i++) {
+	make_threads[i].join();
+}
+
+check("all 12 concurrent children are registered", root6._child_agents.size() == 12, "size=" + std.string(root6._child_agents.size()));
+
+root6.stop();
+
+check("the stop reaches every concurrent child", count_stopped(root6._child_agents) == 12, std.string(count_stopped(root6._child_agents)) + "/12");
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.cout("\n----------------------------------------\n");
+std.cout("passed: ", tests_passed, "  failed: ", tests_failed, "\n");
+
+if(tests_failed) {
+	std.cout("failures:\n");
+	for(i = 0; i < failures.size(); i++)
+		std.cout("  - ", failures[i], "\n");
+}
+
+std.cout("----------------------------------------\n");
+
+fileio.remove(batch_dir.removesuffix("/"));
+
+std.exitprocess(tests_failed ? 1 : 0);

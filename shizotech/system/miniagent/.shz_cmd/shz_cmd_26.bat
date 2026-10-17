@@ -1,0 +1,1 @@
+for %a in (0 1) do for %b in (0 1) do (echo === tasks=%a late=%b === & C:\Users\neu\AppData\Local\Shizoscript\shz.exe --silent testbench/fixing_stop_propagation/probe_bisect.shio %a %b | findstr /I /C:"sec4 post")

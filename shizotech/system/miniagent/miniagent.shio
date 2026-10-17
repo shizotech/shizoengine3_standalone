@@ -134,8 +134,23 @@ class miniagent
 				//context = "&string(): Context for this action",
 			],
 			[](agt, args)
-			{		
-				std.sleep(args.duration);
+			{	
+				//std.sleep() takes milliseconds, and the sleep must stay interruptible:
+				//a stopped agent may not sit out the rest of a 600s nap.
+				deadline = std.millis() + args.duration * 1000;
+
+				for(1)
+				{
+					if(agt.should_stop())
+						return "Interrupted: the agent was stopped. Stop now, do not continue.";
+
+					remaining = deadline - std.millis();
+
+					if(remaining <= 0)
+						break;
+
+					std.sleep(math.min(250, remaining));
+				}
 
 				return "Wake up!";
 			}
@@ -246,6 +261,19 @@ class miniagent
 	
 	task(prompt, continue_task = false)
 	{
+		//A stop from above survives: starting a run clears this agent's own stop
+		//flag, never the stop of an ancestor. A subagent whose parent was stopped
+		//must not start generating again.
+		if(ancestor_stopped()) {
+			stopped = true;
+			return [
+				ok=false,
+				stopped=true,
+				reports=[],
+				error="The agent was stopped by its parent before the task started.",
+			];
+		}
+
 		if(!continue_task)
 			env["task"] = prompt;
 			env["text"] = "";
@@ -291,11 +319,24 @@ class miniagent
 				else {
 					
 					//res returned something so agent must be alive, force it to report...
-					if(env.reports.size() == 0)
+					//Never while stopped: stop() means generation ends now, and
+					//firing another request here is exactly how a stopped agent
+					//kept talking.
+					if(env.reports.size() == 0 && !stopped)
 						llm_api.task("Summarize your last actions so far with ONE SINGLE call to finalize()!\nDo not write or call anything else!");
 					
 					//Still no reports, but we have some text from the agent, return that
 					if(env.reports.size() == 0) {
+						if(stopped) {
+							return [
+								ok=false,
+								stopped=true,
+								reports=[],
+								error="Agent was stopped.",
+								execution_time_ms=delta_time,
+							];
+						}
+
 						return [
 							ok=true, 
 							reports=[[report=res]], 
@@ -317,6 +358,17 @@ class miniagent
 					execution_time_ms=delta_time,
 				];		
 			}
+			
+			//Stopped and nothing to show: report the stop, never a crash, and never
+			//start another generation on the way out.
+			if(stopped)
+				return [
+					ok=false,
+					stopped=true,
+					reports=[],
+					error="Agent was stopped.",
+					execution_time_ms=delta_time,
+				];
 			
 			return [ok=false, error="Agent returned nothing (maybe crashed).", execution_time_ms=delta_time];	
 		}
@@ -350,23 +402,61 @@ class miniagent
 		return task(prompt, true);
 	}
 
+	//Stop this agent and, top-down, the whole agent tree below it.
+	//Every child created through subagent()/simple_agent() is registered in
+	//_child_agents, and a child's own stop() recurses into its children, so one
+	//call here reaches every descendant that can generate.
 	stop()
 	{
 		stopped = true;
 		
-		llm_api.stop();
+		try {
+			if(llm_api && std.is_function(llm_api.stop))
+				llm_api.stop();
+		}
+		catch(e) { }
 		
-		for(i = 0; i < _child_agents.size(); i++) {
+		//Children are created and pruned from tool threads while a stop walks the
+		//tree, so iterate over a snapshot taken under the tree lock: a concurrent
+		//mutation must never make this loop skip a running child.
+		children = [];
+		cs = std.critical_section_named("miniagent_tree");
+		children = _child_agents.copy();
+		cs.release();
+		
+		for(i = 0; i < children.size(); i++) {
 			try {
-				if(_child_agents[i])
-					_child_agents[i].stop();
+				if(children[i] && std.is_function(children[i].stop))
+					children[i].stop();
 			}
 			catch(e) { }		
 		}
 	}
 	
+	//True when any agent above this one in the tree was stopped.
+	//A stop travels top-down: whoever stops the root stops every descendant, and
+	//no descendant may be (re)started underneath a stopped ancestor.
+	ancestor_stopped() {
+		p = _parent;
+		
+		for(p) {
+			if(!std.is_class(p, miniagent))
+				break;
+			
+			if(p.stopped)
+				return true;
+			
+			p = p._parent;
+		}
+		
+		return false;
+	}
+	
 	should_stop() {
-		return stopped;
+		if(stopped)
+			return true;
+		
+		return ancestor_stopped();
 	}
 	
 	wait_finish() {
@@ -559,14 +649,26 @@ class miniagent
 			sub_agt.model_config = ModelConfig();
 			sub_agt.model_config.copy_from(model_config);
 
-		//Clear old entries first
+		//Prune dead entries only.
+		//Live children MUST stay registered: stop() walks this list to reach every
+		//running descendant. Dropping live children here (the old "clear old
+		//entries" loop) left only the most recently created child reachable, so a
+		//stop never reached the siblings a batch/fork had spawned and generation
+		//kept running.
+		//The tree is mutated from tool threads, so the bookkeeping runs under the
+		//shared tree lock.
+		cs = std.critical_section_named("miniagent_tree");
+		
 		for(i = 0; i < _child_agents.size(); i++) {
-			if(_child_agents[i])
+			if(!_child_agents[i]) {
 				_child_agents.erase(i);
 				i--;
+			}
 		}
-
+		
 		_child_agents.push_back(sub_agt);
+		
+		cs.release();
 		
 		sub_agt._parent = this;
 		if(_parent_root)
@@ -578,6 +680,11 @@ class miniagent
 		sub_agt.filesystem = filesystem;
 		sub_agt.filesystem_virtual = filesystem_virtual;
 		
+		//A child created under a stopped parent is born stopped: it must never
+		//start generating, and stop() has already passed this point.
+		if(stopped)
+			sub_agt.stop();
+		
 		return sub_agt;
 	}
 	
@@ -585,14 +692,25 @@ class miniagent
 	{
 		sub_agt = generic_agent(model_config.url, model_name ? model_name : model_config.name, system_role, model_config.token);
 	
-		//Clear old entries first
+		//Prune dead entries only (live children stay: stop() needs them).
+		//The old loop ran "i--" unconditionally, which spun forever on the first
+		//live entry and dropped the children it was supposed to keep.
+		cs = std.critical_section_named("miniagent_tree");
+		
 		for(i = 0; i < _child_agents.size(); i++) {
-			if(!_child_agents[i])
+			if(!_child_agents[i]) {
 				_child_agents.erase(i);
 				i--;
+			}
 		}
 
 		_child_agents.push_back(sub_agt);
+		
+		cs.release();
+		
+		//Same rule as subagent(): no generation below a stopped agent.
+		if(stopped)
+			sub_agt.stop();
 		
 		return sub_agt;
 	}
