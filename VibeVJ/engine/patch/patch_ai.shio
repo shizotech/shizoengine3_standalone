@@ -1,0 +1,612 @@
+//The fixture setup for AI agents (#440): queries for the in-app Chat and MCP clients to list, add, change and remove
+//lamps, groups and Art-Net nodes of the patch, to look at a universe and to find channels two senders write.
+//No UI; tested headless in _testing/patch_ai.shio.
+//
+//Needs engine/patch/patch.shio, engine/patch/dmx.shio and engine/interfaces/aiinterface.shio included before it.
+//
+//The engine owns one interface (engine.patch_ai, made by patch_ai_create()). It is in engine.ai_interfaces with the
+//live_path "fixture_setup", so:
+//  - MCP: vibevj_list_generators lists it, each query is a tool of its own (list_fixtures, add_fixtures, ...) with the
+//    live_path "fixture_setup" (or empty: a query only one generator has goes to that one)
+//  - Chat: the tool vibevj_fixture_setup(action, args) of the vibevj skill
+//
+//holder: the engine (a stand-in in tests) with patch, net, dmx_users, dmx_revision, ai_interfaces, fixture_menu and
+//patch_changed_soon() (a write tells the others at the end of the frame, not from the thread of the query).
+//Lamps and groups are named by their id or by their name (when only one has it); nodes by MAC, IP or name; fixture
+//types by their path (assets/Fixtures/...json) or their name.
+//Argument names are never names of JSON methods (filter, remove, map, any, all, ...): a JSON literal drops such keys.
+
+PATCH_AI_LIVE_PATH = "fixture_setup";
+
+//What the interface belongs to: the live_path and file the MCP server and the Chat show for it
+class patch_ai_target {
+	get_live_path() {
+		return "fixture_setup";
+	}
+	get_relative_path() {
+		return "assets/Fixtures/Setup.menu";
+	}
+}
+
+// =========================================================================
+// Finding things by what an agent calls them
+// =========================================================================
+
+//A lamp by id or name (runtime error when there is none, or more than one of that name)
+patch_ai_lamp(p, key) {
+	key = std.string(key);
+	f = patch_find(p, key);
+	if(f)
+		return f;
+	found = None;
+	count = 0;
+	want = key.lowercase();
+	for(i = 0; i < p.fixtures.size(); i++) {
+		if(std.string(p.fixtures[i].name).lowercase() == want) {
+			found = p.fixtures[i];
+			count++;
+		}
+	}
+	if(count == 1)
+		return found;
+	if(count > 1)
+		std.runtime_error("More than one lamp is called '" + key + "', use its id (list_fixtures).");
+	std.runtime_error("No lamp '" + key + "' (list_fixtures lists them).");
+	return None;
+}
+
+//Lamps from a list of ids / names (or one string), in that order, each once
+patch_ai_lamps(p, keys) {
+	if(std.is_none(keys))
+		return [];
+	if(!std.is_json(keys))
+		keys = [keys];
+	list = [];
+	ids = [];
+	for(i = 0; i < keys.size(); i++) {
+		f = patch_ai_lamp(p, keys[i]);
+		if(!ids.has_value(f.id)) {
+			ids.push_back(f.id);
+			list.push_back(f);
+		}
+	}
+	return list;
+}
+
+patch_ai_ids(lamps) {
+	ids = [];
+	for(i = 0; i < lamps.size(); i++)
+		ids.push_back(lamps[i].id);
+	return ids;
+}
+
+//A group by id or name
+patch_ai_group(p, key) {
+	key = std.string(key);
+	g = patch_group(p, key);
+	if(g)
+		return g;
+	found = None;
+	count = 0;
+	want = key.lowercase();
+	for(i = 0; i < p.groups.size(); i++) {
+		if(std.string(p.groups[i].name).lowercase() == want) {
+			found = p.groups[i];
+			count++;
+		}
+	}
+	if(count == 1)
+		return found;
+	if(count > 1)
+		std.runtime_error("More than one group is called '" + key + "', use its id (list_fixture_groups).");
+	std.runtime_error("No group '" + key + "' (list_fixture_groups lists them).");
+	return None;
+}
+
+//A node by MAC, IP or name: its MAC. "" = no node. A MAC no node has yet is taken as it is (the node is not on the
+//network yet).
+patch_ai_node(holder, p, key) {
+	if(std.is_none(key))
+		return "";
+	key = std.string(key).strip();
+	if(!key || key.lowercase() == "none" || key.lowercase() == "no node")
+		return "";
+	nodes = patch_known_nodes(holder.net, p);
+	want = key.lowercase();
+	for(i = 0; i < nodes.size(); i++) {
+		n = nodes[i];
+		if(std.string(n.mac).lowercase() == want || (n.ip && n.ip == key) || std.string(n.name).lowercase() == want)
+			return n.mac;
+	}
+	for(i = 0; i < p.fixtures.size(); i++) {
+		if(std.string(p.fixtures[i].node).lowercase() == want)
+			return p.fixtures[i].node;
+	}
+	//"AA:BB:CC:DD:EE:FF"
+	if(key.length() == 17 && key.split(":").size() == 6)
+		return key.uppercase();
+	std.runtime_error("No Art-Net node '" + key + "'. list_artnet_nodes lists them; add_artnet_node adds one by its IP.");
+	return "";
+}
+
+//The fixture types there are (assets/Fixtures), each [path, name, channels, controls]
+patch_ai_type_list() {
+	list = [];
+	files = [];
+	try {
+		files = fileio.files(PATCH_ROOT + "assets/Fixtures");
+	}
+	catch(e) {
+		files = [];
+	}
+	for(i = 0; i < files.size(); i++) {
+		rel = patch_norm_path(files[i]);
+		if(!rel.lowercase().ends(".json"))
+			continue;
+		path = "assets/Fixtures/" + rel;
+		t = patch_type(path);
+		if(!t.valid)
+			continue;
+		labels = [];
+		for(k = 0; k < t.controls.size(); k++)
+			labels.push_back(t.controls[k].label);
+		list.push_back([path = path, name = t.name, channels = patch_footprint(path), pixels = patch_pixel_slots(path).size(),
+			controls = labels]);
+	}
+	return list;
+}
+
+//A fixture type by path or name: its path
+patch_ai_type(key) {
+	key = patch_norm_path(std.string(key));
+	if(patch_type(key).valid)
+		return key;
+	types = patch_ai_type_list();
+	want = key.lowercase();
+	for(i = 0; i < types.size(); i++) {
+		if(types[i].name.lowercase() == want || types[i].path.lowercase() == want || types[i].path.lowercase().ends("/" + want))
+			return types[i].path;
+	}
+	std.runtime_error("No fixture type '" + key + "' (list_fixture_types lists them).");
+	return "";
+}
+
+// =========================================================================
+// Answers
+// =========================================================================
+
+//A lamp as an agent sees it
+patch_ai_describe_lamp(holder, p, f, problems = None) {
+	if(std.is_none(problems))
+		problems = dmx_lamp_problems(holder, p);
+	groups = [];
+	for(i = 0; i < p.groups.size(); i++) {
+		if(p.groups[i].fixtures.has_value(f.id))
+			groups.push_back(p.groups[i].name);
+	}
+	return [
+		id = f.id,
+		name = f.name,
+		type = f.type,
+		type_name = patch_type(f.type).name,
+		node = f.node,
+		node_name = patch_node_name(holder.net, p, f.node),
+		universe = f.universe,
+		address = f.address,
+		last_channel = patch_end(f),
+		channels = patch_footprint(f.type),
+		x = f.x,
+		y = f.y,
+		rotation = f.rotation ?? 0,
+		groups = groups,
+		problems = problems[f.id] ?? [],
+	];
+}
+
+patch_ai_describe_lamps(holder, p, lamps) {
+	problems = dmx_lamp_problems(holder, p);
+	list = [];
+	for(i = 0; i < lamps.size(); i++)
+		list.push_back(patch_ai_describe_lamp(holder, p, lamps[i], problems));
+	return list;
+}
+
+patch_ai_describe_group(p, g) {
+	lamps = [];
+	for(i = 0; i < g.fixtures.size(); i++) {
+		f = patch_find(p, g.fixtures[i]);
+		if(f)
+			lamps.push_back([id = f.id, name = f.name]);
+	}
+	return [id = g.id, name = g.name, target = "group:" + g.id, fixtures = lamps];
+}
+
+//Everything that writes the same channels as something else
+patch_ai_conflicts(holder, p) {
+	conflicts = dmx_conflicts(holder, p, true);
+	list = [];
+	for(i = 0; i < conflicts.size(); i++) {
+		c = conflicts[i];
+		list.push_back([
+			node = c.node,
+			node_name = patch_node_name(holder.net, p, c.node),
+			universe = c.universe,
+			first = c.first,
+			last = c.last,
+			channels = dmx_channels_text(c),
+			a = dmx_who(c.a),
+			b = dmx_who(c.b),
+		]);
+	}
+	problems = dmx_lamp_problems(holder, p, conflicts);
+	lamps = [];
+	for(i = 0; i < problems.size(); i++) {
+		f = patch_find(p, problems.key(i));
+		if(f)
+			lamps.push_back([id = f.id, name = f.name, problems = problems[i]]);
+	}
+	//(not "ok": a query result with ok = false is a failed query)
+	return [conflicts = list, lamps_with_problems = lamps, clean = list.size() == 0 && lamps.size() == 0];
+}
+
+//What uses the channels of a universe of a node: [[first, last, what], ...] in channel order, plus the free channels
+patch_ai_universe(holder, p, node, universe) {
+	used = [];
+	map = patch_universe_map(p, node, universe);
+	cells = dmx_universe_cells(holder, p, node, universe);
+	for(i = 0; i < p.fixtures.size(); i++) {
+		f = p.fixtures[i];
+		if(f.node != node || f.universe != universe)
+			continue;
+		used.push_back([first = f.address, last = patch_end(f), what = f.name + " (fixture setup)", fixture = f.id]);
+	}
+	sources = dmx_sources(holder, p);
+	for(s = 1; s < sources.size(); s++) {
+		for(i = 0; i < sources[s].ranges.size(); i++) {
+			r = sources[s].ranges[i];
+			if(r.node == node && std.int(r.universe) == universe)
+				used.push_back([first = r.first, last = r.last, what = r.label + " (" + sources[s].name + ")"]);
+		}
+	}
+	used = patch_sort_by(used, "first");
+	free = 0;
+	conflicting = 0;
+	for(c = 0; c < PATCH_UNIVERSE_SIZE; c++) {
+		if(!map[c] && !cells[c].state)
+			free++;
+		if(map[c] == "!" || cells[c].state == "!")
+			conflicting++;
+	}
+	return [node = node, node_name = patch_node_name(holder.net, p, node), universe = universe, used = used,
+		free_channels = free, conflicting_channels = conflicting];
+}
+
+// =========================================================================
+// The interface
+// =========================================================================
+
+//A write changed the patch: the fixture setup, Devices > Fixtures, the Phaser and the LEDMappers follow
+patch_ai_changed(holder) {
+	holder.patch_changed_soon();
+}
+
+patch_ai_int(args, name, fallback) {
+	return args.has(name) && !std.is_none(args[name]) ? std.int(args[name]) : fallback;
+}
+
+patch_ai_float(args, name, fallback) {
+	return args.has(name) && !std.is_none(args[name]) ? std.float(args[name]) : fallback;
+}
+
+patch_ai_register(iface, holder) {
+	iface.register("list_fixtures", [
+		search = "string(): Only lamps whose name, fixture type or group contains this text (case-insensitive)",
+	], [holder](args) {
+		p = holder.patch;
+		needle = args.has("search") && args.search ? std.string(args.search).lowercase() : "";
+		all = patch_ai_describe_lamps(holder, p, p.fixtures);
+		list = [];
+		with_problems = 0;
+		for(i = 0; i < all.size(); i++) {
+			f = all[i];
+			if(needle) {
+				text = (f.name + " " + f.type_name + " " + f.groups.combine_string(" ")).lowercase();
+				if(!text.contains(needle))
+					continue;
+			}
+			if(f.problems.size())
+				with_problems++;
+			list.push_back(f);
+		}
+		return [fixtures = list, count = list.size(), total = p.fixtures.size(), with_problems = with_problems];
+	}, "Fixture setup: every lamp with id, name, fixture type, Art-Net node, universe, DMX address (first and last channel), position on the stage plan (metres from the middle, x to the right, y towards the audience), its groups and its problems (same channels as another lamp or an LEDMapper segment, past channel 512, no node).");
+
+	iface.register("list_fixture_types", [], [](args) {
+		return patch_ai_type_list();
+	}, "Fixture setup: the fixture types that lamps can be (files in assets/Fixtures) with their channels, pixels (colour channels an LEDMapper can fill) and controls.");
+
+	iface.register("list_fixture_groups", [], [holder](args) {
+		p = holder.patch;
+		list = [];
+		for(i = 0; i < p.groups.size(); i++)
+			list.push_back(patch_ai_describe_group(p, p.groups[i]));
+		return list;
+	}, "Fixture setup: the groups, each an ordered list of lamps (the order of a Phaser). 'target' is what a Phaser or the LEDMapper takes.");
+
+	iface.register("list_artnet_nodes", [], [holder](args) {
+		p = holder.patch;
+		nodes = patch_known_nodes(holder.net, p);
+		for(i = 0; i < nodes.size(); i++) {
+			count = 0;
+			for(k = 0; k < p.fixtures.size(); k++) {
+				if(p.fixtures[k].node == nodes[i].mac)
+					count++;
+			}
+			nodes[i].lamps = count;
+			added = false;
+			for(k = 0; k < p.nodes.size(); k++) {
+				if(p.nodes[k].mac == nodes[i].mac || (nodes[i].ip && p.nodes[k].ip == nodes[i].ip))
+					added = true;
+			}
+			nodes[i].added_by_hand = added;
+		}
+		return nodes;
+	}, "Fixture setup: the Art-Net nodes lamps can be on: the ones that answer on the network and the ones added by IP, with how many lamps each has.");
+
+	iface.register("get_dmx_universe", [
+		node = "&string(): The Art-Net node: MAC, IP or name (list_artnet_nodes)",
+		universe = "int(0,32767): The universe (Art-Net port-address), default 0",
+	], [holder](args) {
+		p = holder.patch;
+		node = patch_ai_node(holder, p, args.node);
+		if(!node)
+			return [ok = false, error = "Pick a node."];
+		return patch_ai_universe(holder, p, node, patch_ai_int(args, "universe", 0));
+	}, "Fixture setup: what uses the 512 channels of a universe of a node (lamps and LEDMapper segments, in channel order), how many are free and how many are written twice.");
+
+	iface.register("get_dmx_conflicts", [], [holder](args) {
+		return patch_ai_conflicts(holder, holder.patch);
+	}, "Fixture setup: every place where two senders write the same DMX channels of a node (lamps of the fixture setup, segments of every LEDMapper), and every lamp with a problem. clean is true when there is none.");
+
+	iface.register("add_fixtures", [
+		type = "&string(): Fixture type: its path (assets/Fixtures/...json) or name (list_fixture_types)",
+		count = "int(1,512): How many lamps (default 1)",
+		node = "string(): Art-Net node: MAC, IP or name (default: the node of the last lamp, else none)",
+		universe = "int(0,32767): Universe (default: of the last lamp on that node, else 0)",
+		address = "int(0,512): DMX address of the first lamp, 0 or missing = the next free channels (also into the next universes)",
+		x = "float(): Position of the first lamp on the stage plan in metres (the others one metre apart to the right)",
+		y = "float(): Position in metres, towards the audience",
+		name = "string(): Name (with count > 1 the lamps are numbered: 'Name 1', 'Name 2', ...). Default: type name and number",
+		group = "string(): Also put the new lamps into this group (id or name; a new group when there is none of that name)",
+	], [holder](args) {
+		p = holder.patch;
+		type = patch_ai_type(args.type);
+		count = math.max(1, patch_ai_int(args, "count", 1));
+		node = "";
+		universe = 0;
+		if(p.fixtures.size()) {
+			node = p.fixtures[-1].node;
+			universe = p.fixtures[-1].universe;
+		}
+		if(args.has("node"))
+			node = patch_ai_node(holder, p, args.node);
+		if(args.has("universe"))
+			universe = patch_ai_int(args, "universe", 0);
+		else if(node) {
+			universe = 0;
+			for(i = 0; i < p.fixtures.size(); i++) {
+				if(p.fixtures[i].node == node)
+					universe = p.fixtures[i].universe;
+			}
+		}
+		address = patch_ai_int(args, "address", 0);
+		if(address > 0 && address + patch_footprint(type) - 1 > PATCH_UNIVERSE_SIZE)
+			return [ok = false, error = "A lamp of " + patch_footprint(type) + " channels does not fit at address " + address + "."];
+		added = patch_add(p, type, count, node, universe, address, patch_ai_float(args, "x", 0.0), patch_ai_float(args, "y", 0.0));
+		if(args.has("name") && args.name) {
+			for(i = 0; i < added.size(); i++)
+				added[i].name = count > 1 ? args.name + " " + std.string(i + 1) : std.string(args.name);
+		}
+		group = None;
+		if(args.has("group") && args.group) {
+			try {
+				group = patch_ai_group(p, args.group);
+			}
+			catch(e) {
+				group = patch_group_add(p, std.string(args.group));
+			}
+			for(i = 0; i < added.size(); i++) {
+				if(!group.fixtures.has_value(added[i].id))
+					group.fixtures.push_back(added[i].id);
+			}
+		}
+		patch_ai_changed(holder);
+		result = [fixtures = patch_ai_describe_lamps(holder, p, added)];
+		if(group)
+			result.group = patch_ai_describe_group(p, group);
+		return result;
+	}, "Fixture setup: adds lamps of a fixture type to the patch, at the next free DMX addresses unless an address is given. Returns the new lamps with their addresses and problems.");
+
+	iface.register("set_fixture", [
+		fixture = "&string(): The lamp: id or name",
+		name = "string(): New name",
+		type = "string(): Other fixture type (path or name)",
+		node = "string(): Art-Net node: MAC, IP or name; empty = no node",
+		universe = "int(0,32767): Universe",
+		address = "int(1,512): DMX start address",
+		x = "float(): Position on the stage plan in metres",
+		y = "float(): Position in metres",
+		rotation = "float(): Rotation in degrees",
+	], [holder](args) {
+		p = holder.patch;
+		f = patch_ai_lamp(p, args.fixture);
+		if(args.has("name") && args.name)
+			f.name = std.string(args.name);
+		if(args.has("type") && args.type)
+			f.type = patch_ai_type(args.type);
+		if(args.has("node"))
+			f.node = patch_ai_node(holder, p, args.node);
+		if(args.has("universe"))
+			f.universe = math.clamp(patch_ai_int(args, "universe", f.universe), 0, PATCH_MAX_UNIVERSE);
+		if(args.has("address"))
+			f.address = math.clamp(patch_ai_int(args, "address", f.address), 1, PATCH_UNIVERSE_SIZE);
+		if(args.has("x"))
+			f.x = patch_ai_float(args, "x", f.x);
+		if(args.has("y"))
+			f.y = patch_ai_float(args, "y", f.y);
+		if(args.has("rotation"))
+			f.rotation = std.int(patch_ai_float(args, "rotation", 0.0));
+		patch_ai_changed(holder);
+		return patch_ai_describe_lamp(holder, p, f);
+	}, "Fixture setup: changes one lamp (name, fixture type, node, universe, address, position). Returns the lamp with its problems, e.g. when it now shares channels with another lamp.");
+
+	iface.register("remove_fixtures", [
+		fixtures = "&array(string): The lamps: ids or names",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = patch_ai_lamps(p, args.fixtures);
+		names = [];
+		for(i = 0; i < lamps.size(); i++)
+			names.push_back(lamps[i].name);
+		patch_remove(p, patch_ai_ids(lamps));
+		patch_ai_changed(holder);
+		return [removed = names, count = names.size()];
+	}, "Fixture setup: removes lamps (also from their groups). Their controls in Devices > Fixtures go too.");
+
+	iface.register("address_fixtures", [
+		fixtures = "&array(string): The lamps, in the order they get their addresses: ids or names",
+		node = "string(): Art-Net node: MAC, IP or name (default: the node of the first lamp)",
+		universe = "int(0,32767): Universe (default: of the first lamp)",
+		address = "int(0,512): Address of the first lamp; 0 or missing = the first free channels",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = patch_ai_lamps(p, args.fixtures);
+		if(!lamps.size())
+			return [ok = false, error = "No lamps given."];
+		node = args.has("node") ? patch_ai_node(holder, p, args.node) : lamps[0].node;
+		universe = patch_ai_int(args, "universe", lamps[0].universe);
+		patch_readdress(p, patch_ai_ids(lamps), node, universe, patch_ai_int(args, "address", 0));
+		patch_ai_changed(holder);
+		return patch_ai_describe_lamps(holder, p, lamps);
+	}, "Fixture setup: gives lamps one address after the other (into the next universe when one is full), like 'Address in order' of the fixture setup.");
+
+	iface.register("arrange_fixtures", [
+		fixtures = "&array(string): The lamps, in order: ids or names",
+		shape = "&enum(row,grid,circle): row: a line; grid: rows of 'columns'; circle: around the middle, facing out",
+		spacing = "float(0.1,50): Metres between the lamps (default 1)",
+		columns = "int(1,64): Lamps per row of a grid (default 4)",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = patch_ai_lamps(p, args.fixtures);
+		patch_arrange(lamps, args.shape, patch_ai_float(args, "spacing", 1.0), patch_ai_int(args, "columns", 4));
+		patch_ai_changed(holder);
+		list = [];
+		for(i = 0; i < lamps.size(); i++)
+			list.push_back([id = lamps[i].id, name = lamps[i].name, x = lamps[i].x, y = lamps[i].y, rotation = lamps[i].rotation ?? 0]);
+		return list;
+	}, "Fixture setup: arranges lamps on the stage plan around their middle (row, grid or circle). The positions matter for a Phaser spread by position and for the LEDMapper.");
+
+	iface.register("add_fixture_group", [
+		name = "&string(): Name of the group",
+		fixtures = "array(string): The lamps in order (ids or names), default none",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = patch_ai_lamps(p, args.has("fixtures") ? args.fixtures : []);
+		g = patch_group_add(p, std.string(args.name), patch_ai_ids(lamps));
+		patch_ai_changed(holder);
+		return patch_ai_describe_group(p, g);
+	}, "Fixture setup: a new group: an ordered list of lamps, the order of a Phaser.");
+
+	iface.register("set_fixture_group", [
+		group = "&string(): The group: id or name",
+		name = "string(): New name",
+		fixtures = "array(string): All its lamps in their new order (replaces the list)",
+		add = "array(string): Lamps to add at the end",
+		take_out = "array(string): Lamps to take out",
+	], [holder](args) {
+		p = holder.patch;
+		g = patch_ai_group(p, args.group);
+		if(args.has("name") && args.name)
+			g.name = std.string(args.name);
+		if(args.has("fixtures"))
+			g.fixtures = patch_ai_ids(patch_ai_lamps(p, args.fixtures));
+		if(args.has("add")) {
+			lamps = patch_ai_lamps(p, args.add);
+			for(i = 0; i < lamps.size(); i++) {
+				if(!g.fixtures.has_value(lamps[i].id))
+					g.fixtures.push_back(lamps[i].id);
+			}
+		}
+		if(args.has("take_out")) {
+			ids = patch_ai_ids(patch_ai_lamps(p, args.take_out));
+			for(i = g.fixtures.size() - 1; i >= 0; i--) {
+				if(ids.has_value(g.fixtures[i]))
+					g.fixtures.erase(i);
+			}
+		}
+		patch_ai_changed(holder);
+		return patch_ai_describe_group(p, g);
+	}, "Fixture setup: renames a group, sets the order of its lamps, adds or takes out lamps.");
+
+	iface.register("remove_fixture_group", [
+		group = "&string(): The group: id or name",
+	], [holder](args) {
+		p = holder.patch;
+		g = patch_ai_group(p, args.group);
+		name = g.name;
+		patch_group_remove(p, g.id);
+		patch_ai_changed(holder);
+		return [removed = name];
+	}, "Fixture setup: removes a group (the lamps stay). Phasers on it have no lamps until they get another target.");
+
+	iface.register("add_artnet_node", [
+		ip = "&string(): IP address of the node",
+		name = "string(): Name to show for it",
+		mac = "string(): MAC address, if known (else found when the node answers)",
+	], [holder](args) {
+		p = holder.patch;
+		ip = std.string(args.ip).strip();
+		if(ip.split(".").size() != 4)
+			return [ok = false, error = "'" + ip + "' is not an IPv4 address."];
+		n = patch_node_add(p, ip, args.has("name") ? std.string(args.name ?? "") : "", args.has("mac") ? std.string(args.mac ?? "").uppercase() : "");
+		patch_ai_changed(holder);
+		return n;
+	}, "Fixture setup: adds an Art-Net node by its IP, for a node that does not answer ArtPoll or is not on the network yet. Lamps can be put on it right away.");
+
+	iface.register("remove_artnet_node", [
+		node = "&string(): The node added by hand: IP, MAC or name",
+	], [holder](args) {
+		p = holder.patch;
+		key = std.string(args.node).lowercase();
+		for(i = 0; i < p.nodes.size(); i++) {
+			n = p.nodes[i];
+			if(std.string(n.ip).lowercase() == key || std.string(n.mac).lowercase() == key || std.string(n.name).lowercase() == key) {
+				p.nodes.erase(i);
+				patch_ai_changed(holder);
+				return [removed = key];
+			}
+		}
+		return [ok = false, error = "No node '" + args.node + "' was added by hand (nodes on the network cannot be removed)."];
+	}, "Fixture setup: removes a node that was added by IP. Its lamps keep their node.");
+
+	iface.register("highlight_fixtures", [
+		fixtures = "&array(string): The lamps to light at full (ids or names); empty = all back to their values",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = patch_ai_lamps(p, args.fixtures);
+		if(holder.fixture_menu)
+			holder.fixture_menu.set_highlight(patch_ai_ids(lamps));
+		names = [];
+		for(i = 0; i < lamps.size(); i++)
+			names.push_back(lamps[i].name);
+		return [highlighted = names];
+	}, "Fixture setup: lights lamps at full (white, intensity full) so they can be found in the rig, like Highlight in the fixture setup. Empty list: off.");
+}
+
+//The interface of the fixture setup: in holder.ai_interfaces (when it is the engine), live_path "fixture_setup"
+patch_ai_create(holder) {
+	iface = AIInterface(patch_ai_target(), None, "assets/Fixtures/Setup.menu");
+	iface.add_capability("fixtures");
+	patch_ai_register(iface, holder);
+	return iface;
+}

@@ -24,15 +24,15 @@ start.
 | Source | What it uses | Line under *Source* |
 |---|---|---|
 | *Sound card* | The standard recording input of your computer (line-in, microphone, audio interface). Choose that input in the sound settings of your system; VibeVJ has no device list of its own. | "Sound card" |
-| *ESP32 (USB)* | The microphone or line-in of a prolink-bridge ESP32 on USB. It shares the USB connection with the [Prolink generators](Output-and-Devices.md#prolink-cdjs). | "ESP32 USB: … kHz" while audio comes in |
-| *ESP32 (network)* | The same audio from a relay ESP32 in your network, over ShizoNet. | "ESP32 relay: … kHz" or "ESP32 listener via relay: … kHz" |
+| *DJ Watch (USB)* | The microphone or line-in of DJ Watch (the ESP32 box in the DJ network, formerly prolink-bridge) on USB. It shares the USB connection with the [Prolink generators](Output-and-Devices.md#prolink-cdjs). | "DJ Watch USB: … kHz" while audio comes in |
+| *DJ Watch (network)* | The same audio from a relay ESP32 in your network, over ShizoNet. | "DJ Watch relay: … kHz" or "DJ Watch listener via relay: … kHz" |
 
-- For the ESP32 the firmware must send audio (firmware command "audio mic" or "audio line"). If it does not, the line
-  says "No audio from the ESP32 (firmware: audio mic|line)".
-- With *ESP32 (USB)* and no board found it says "ESP32 not connected".
-- *ESP32 port (empty = auto)*, in the section *Settings* of the window, picks a USB port by hand. Leave it empty to
+- For DJ Watch the firmware must send audio (firmware command "audio mic" or "audio line"). If it does not, the line
+  says "No audio from DJ Watch (firmware: audio mic|line)".
+- With *DJ Watch (USB)* and no board found it says "DJ Watch not connected".
+- *DJ Watch port (empty = auto)*, in the section *Settings* of the window, picks a USB port by hand. Leave it empty to
   find the board by itself.
-- For *ESP32 (network)*, *Shizonet* must be on in the sidebar: see [Output and devices](Output-and-Devices.md#shizonet).
+- For *DJ Watch (network)*, *Shizonet* must be on in the sidebar: see [Output and devices](Output-and-Devices.md#shizonet).
 
 ## The values
 
@@ -78,7 +78,7 @@ The section *Settings* of the window. (The settings of the program are in a wind
 | *Drop threshold* | 0.6 | The break ends (the drop) when the bass comes back above this share of its normal level. |
 | *Low energy cutoff* | 250 Hz | Upper end of *Low energy*, lower end of *Mid energy*. 20 to 20000 Hz. |
 | *High energy cutoff* | 4000 Hz | Upper end of *Mid energy*, lower end of *High energy*. 20 to 20000 Hz. |
-| *ESP32 port (empty = auto)* | empty | Only for *ESP32 (USB)*, see above. |
+| *DJ Watch port (empty = auto)* | empty | Only for *DJ Watch (USB)*, see above. |
 
 A break lasts at least 1.5 seconds, and a new one can start 3 seconds after the last one at the earliest. There is no
 separate drop row: the drop is the moment *Break* goes back to 0.

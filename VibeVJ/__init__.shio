@@ -1,6 +1,9 @@
 
 #include "src/defs"
 #include "engine/migrate/migrate"
+#include "engine/interfaces/aiinterface"
+#include "engine/patch/dmx"
+#include "engine/patch/patch_ai"
 #include "src/menu/menu"
 
 import nanogui;
@@ -28,12 +31,21 @@ class shizoengine
 	net = None;
 	artnet_callbacks = [];
 	
-	//Quick link as its used widely, primarily holds links to the actual "physical" controls for this fixture
+	//Devices > Fixtures: holds the controls of every lamp (they write its DMX channels)
 	fixture_menu = None;
 	
-	//Needs to be managed so all json objects are invalidated everywhere when fixtures are deleted
-	//Holds fixture layout information only, can be serialized, pure information
-	managed fixtures = [];
+	//The patch: lamps, groups, nodes added by hand (engine/patch/patch.shio). Pure data, saved as fixture_setup.json.
+	//Managed: a lamp that is deleted is gone for every holder of its JSON
+	managed patch = patch_new();
+	//Goes up with every change of the patch: the fixture menu, the Phaser and the LEDMapper rebuild what they took from it
+	patch_revision = 0;
+	//A change of the patch from another thread (an AI query): patch_changed() runs at the end of the frame
+	patch_change_pending = false;
+	//What else sends DMX (the LEDMappers), to find channels written twice (engine/patch/dmx.shio)
+	dmx_users = [];
+	dmx_revision = 0;
+	//The fixture setup for AI agents: queries on the patch, live_path "fixture_setup" (engine/patch/patch_ai.shio)
+	managed patch_ai = None;
 	
 	load_hooks = [];
 	save_hooks = [];
@@ -53,6 +65,9 @@ class shizoengine
 	
 		engine_global = std.global("engine");
 		engine_global.set(this);
+
+		//In engine.ai_interfaces from the start: the Chat and the MCP server can change the fixture setup
+		patch_ai = patch_ai_create(this);
 	
 		net = shizonet.server("SHIZOV3");
 	
@@ -152,6 +167,12 @@ class shizoengine
 			if(load_in_progress)
 				return;
 			
+			//An AI agent changed the patch (its queries run on other threads): the fixture menu and the rest follow here
+			if(this.patch_change_pending) {
+				this.patch_change_pending = false;
+				this.patch_changed();
+			}
+
 			//The asset browser rebuilds its Recent list here. clear_children() deletes the widgets
 			//immediately, so that must never run inside a widget event callback (#315).
 			if(this.env.recent_dirty) {
@@ -211,10 +232,8 @@ class shizoengine
 		if(old_format < PROJECT_FORMAT && fileio.exists(project_dir + "/generators.json"))
 			backup_project_files(project_dir, old_format);
 
-		if(fixtures)
-			tmp_fixtures = fixtures.copy();
-			tmp_fixtures.remove_all_keys("device");
-			fileio.write_json("projects/" + project_env.name + "/" + "fixture_setup.json", tmp_fixtures);
+		if(patch)
+			fileio.write_json("projects/" + project_env.name + "/" + "fixture_setup.json", patch);
 		
 		for(i = 0; i < save_hooks.size(); i++) {
 			hook_name = save_hooks.key(i);
@@ -340,8 +359,12 @@ class shizoengine
 		load_timer = std.millis();
 		
 		try {
+			//A project without lamps starts with an empty patch, not with the lamps of the project before
 			if(fileio.exists(project_dir + "/fixture_setup.json"))
-				fixtures = migrate_project_file("fixture_setup", fileio.read_json(project_dir + "/fixture_setup.json"), format);
+				patch = patch_normalize(migrate_project_file("fixture_setup", fileio.read_json(project_dir + "/fixture_setup.json"), format));
+			else
+				patch = patch_new();
+			patch_changed();
 			
 			managed load_threads = [];
 			
@@ -386,6 +409,34 @@ class shizoengine
 		load_in_progress = false;
 		
 		return true;
+	}
+
+	//A change of the patch from outside the UI thread (AI queries): patch_changed() at the end of the frame. The revision
+	//goes up right away, so a query that follows sees the change
+	patch_changed_soon() {
+		patch_revision++;
+		patch_change_pending = true;
+	}
+
+	//Call after any change of the patch (lamps, addresses, groups, nodes)
+	patch_changed() {
+		patch_revision++;
+		//Nodes added by hand by their IP: known to shizonet, so data is sent to them before (or without) an ArtPoll reply
+		for(i = 0; i < patch.nodes.size(); i++) {
+			node = patch.nodes[i];
+			if(!node.ip)
+				continue;
+			try {
+				dev = net.add_artnet_device(node.ip, node.name ?? "", node.mac ?? "");
+				if(dev && !node.mac && dev.mac())
+					node.mac = dev.mac();
+			}
+			catch(e) {
+				std.warn("Cannot add the Art-Net node " + node.ip + ": " + e);
+			}
+		}
+		if(fixture_menu)
+			fixture_menu.build_fixture_menu();
 	}
 
 	get_style(name, default_value) {

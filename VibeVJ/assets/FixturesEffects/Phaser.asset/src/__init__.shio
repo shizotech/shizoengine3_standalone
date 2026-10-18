@@ -1,202 +1,456 @@
+//Phaser (#439): runs a wave over the lamps of a group, one attribute (a channel such as DIMMER, PAN or a colour), each
+//lamp a bit later than the one before.
+//
+//For light operators the words of a console: wave, speed (beats per cycle, follows the BPM), phase (how far the wave is
+//spread over the lamps), width, low / high, wings. Without the cue stacks and effect layers of a console: a phaser is a
+//row here, its controls can be linked and mapped to MIDI like any other.
+//
+//- Target: a group of the fixture setup (in its order) or every lamp of a fixture type.
+//- Spread: which lamp comes first: in order, from the middle, left to right, ... (by where they hang on the stage plan).
+//- Wave "Input": the value of the Level slider (moved by a link, an LFO in the area on the left, ...) reaches each lamp
+//  "Phase delay" beats later, as the Phaser did before #439.
+//- The lamps are moved through their controls in Devices > Fixtures; with several phasers on the same control, the one
+//  with the higher Priority wins.
+
+import nanogui;
 
 using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/palette"
+#include "engine/generators/generatorview"
+
+PHASER_WAVES = ["Sine", "Triangle", "Ramp up", "Ramp down", "Square", "Pulse", "Random", "Input"];
+PHASER_WAVE_INPUT = 7;
+//The ids of the first four stay what they were (INDEX, CENTER UV, LEFT UV, RIGHT UV): old projects keep their choice
+PHASER_SPREADS = ["In order", "From the middle", "Left to right", "Right to left", "Back to front", "Front to back", "Outside in"];
+PHASER_SPREAD_MODES = ["index", "center", "left", "right", "back", "front", "outside"];
+PHASER_ROW = 28;
+PHASER_SIDE_W = 300;
 
 engine = None;
-
 target_list = None;
+priority_ctrl = None;
+managed preview = None;
 
 control_targets = [];
-
-priority_ctrl = None;
+preview_guid = ""; //the phaser the plan on the left shows
 
 clip_transit_active = false;
 clip_is_transit_a = true;
 clip_transition_value = 1.0;
 clip_is_preview = false;
 
-//CENTER UV, LEFT UV, RIGHT UV: the share of the phase delay of each fixture, from where it lies (its uv). Worked out
-//when the mode changes, and again when the fixtures of a target are found (the mode is often set before they are,
-//when a project loads)
-phase_uv_shares(current_target) {
-	if(!current_target.target_controls || current_target.target_controls.size() == 0)
+current_timeline = 0.0;
+
+phaser_index_of(list, text) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == text)
+			return i;
+	}
+	return -1;
+}
+
+// =========================================================================
+// The wave
+// =========================================================================
+
+phaser_hash(n) {
+	x = math.sin(n * 12.9898 + 78.233) * 43758.5453;
+	return x - math.floor(x);
+}
+
+//0..1 of a wave at `pos` (0..1 of a cycle). width: the part of the cycle the wave runs, the rest is 0. cycle and lamp
+//pick the step of Random.
+phaser_wave(wave, pos, width, cycle = 0, lamp = 0) {
+	width = math.clamp(width, 0.01, 1.0);
+	if(pos >= width)
+		return 0.0;
+	x = pos / width;
+	if(wave == 0)
+		return 0.5 - 0.5 * math.cos(2.0 * math.PI * x);
+	if(wave == 1)
+		return 1.0 - math.abs(2.0 * x - 1.0);
+	if(wave == 2)
+		return x;
+	if(wave == 3)
+		return 1.0 - x;
+	if(wave == 4)
+		return x < 0.5 ? 1.0 : 0.0;
+	if(wave == 5)
+		return 1.0;
+	if(wave == 6)
+		return phaser_hash(cycle * 31.0 + lamp * 7.0);
+	return 0.0;
+}
+
+//The share of each lamp (0..1) for the phase: by the spread, then folded by the wings (2 wings: the second half runs
+//back, as a mirror of the first)
+phaser_shares(lamps, spread, wings) {
+	mode = PHASER_SPREAD_MODES[math.clamp(spread, 0, PHASER_SPREAD_MODES.size() - 1)];
+	shares = patch_spread(lamps, mode);
+	if(wings >= 2) {
+		for(i = 0; i < shares.size(); i++) {
+			s = shares[i] * wings;
+			part = math.min(math.floor(s), wings - 1);
+			local = s - part;
+			shares[i] = math.mod(part, 2) == 1 ? 1.0 - local : local;
+		}
+	}
+	return shares;
+}
+
+// =========================================================================
+// Rows
+// =========================================================================
+
+//The combobox of the targets of the patch
+fill_target_combo(combo, current) {
+	targets = patch_targets(engine.patch);
+	items = ["Pick lamps…"];
+	sel = 0;
+	for(i = 0; i < targets.size(); i++) {
+		items.push_back(targets[i].name);
+		if(targets[i].id == current)
+			sel = i + 1;
+	}
+	if(current && sel == 0) {
+		items.push_back(patch_target_name(engine.patch, current) + " (gone)");
+		sel = items.size() - 1;
+	}
+	combo.items(items).selected(sel);
+	return targets;
+}
+
+fill_attribute_combo(combo, target, current) {
+	attrs = patch_target_attributes(engine.patch, target);
+	items = ["Pick an attribute…"];
+	sel = 0;
+	for(i = 0; i < attrs.size(); i++) {
+		items.push_back(attrs[i].label);
+		if(attrs[i].label == current)
+			sel = i + 1;
+	}
+	if(current && sel == 0) {
+		items.push_back(current + " (gone)");
+		sel = items.size() - 1;
+	}
+	combo.items(items).selected(sel);
+	return attrs;
+}
+
+//What the Level slider shows: "Group 1 › DIMMER"
+row_caption(item) {
+	if(!item.target || !item.attribute)
+		return "Level";
+	return patch_target_name(engine.patch, item.target) + " › " + item.attribute;
+}
+
+add_target(guid = "", open_settings = false, target = "", attribute = "", wave = -1) {
+	if(!guid)
+		guid = std.random_hash();
+
+	cnt = target_list.widget().layout(nanogui.layout_vertical());
+
+	head = cnt.widget().fixed_height(PHASER_ROW + 2);
+	slider = head.controlslider("Control", guid).anchor_left(0).anchor_right(56).fixed_height(PHASER_ROW);
+	slider.tooltip("Level of this phaser: 0 holds the lamps at Low, 1 runs the full wave. With the wave Input it is the value that runs over the lamps.");
+	slider.value(1.0);
+	settings_btn = head.pushbutton("").icon(nanogui.icon("cog")).tooltip("Settings of this phaser").anchor_right(28).fixed_width(26).fixed_height(PHASER_ROW).pushed(open_settings);
+	delete_btn = head.button("").icon(nanogui.icon("times")).tooltip("Remove this phaser").anchor_right(0).fixed_width(26).fixed_height(PHASER_ROW);
+
+	//The values it sends, one bar per lamp
+	bars = cnt.widget().fixed_height(18);
+
+	setts = cnt.widget().layout(nanogui.layout_vertical()).section_guide(true);
+	setts.visible(open_settings);
+
+	control_targets[guid] = [cnt = cnt, guid = guid, slider = slider, target = target, attribute = attribute,
+		lamps = [], controls = [], shares = [], buffers = [], values = [], revision = -1];
+	item = control_targets[guid];
+
+	settings_btn.on_change([setts, guid](v) {
+		setts.visible(v);
+		if(v)
+			preview_guid = guid;
+	});
+	delete_btn.on_click([guid, cnt]() {
+		control_targets.erase(guid);
+		if(preview_guid == guid)
+			preview_guid = "";
+		std.free(cnt);
+	});
+
+	bars.on_draw([guid, bars]() {
+		item = control_targets[guid] ?? None;
+		if(!item)
+			return;
+		s = bars.size();
+		n = item.values.size();
+		nvgBeginPath();
+		nvgRect(vec2f(0, 2), vec2f(s.x, s.y - 4));
+		nvgFillColor(PAL_FIELD);
+		nvgFill();
+		if(!n) {
+			pal_text(vec2f(4, s.y / 2.0), item.target ? "No lamps or no attribute" : "Open the settings to pick lamps", 10, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+			return;
+		}
+		w = s.x / n;
+		for(i = 0; i < n; i++) {
+			v = math.clamp(item.values[i], 0.0, 1.0);
+			nvgBeginPath();
+			nvgRect(vec2f(i * w + 0.5, 2 + (s.y - 4) * (1.0 - v)), vec2f(math.max(1.0, w - 1.0), (s.y - 4) * v));
+			nvgFillColor(PAL_ON);
+			nvgFill();
+		}
+	});
+
+	//Lamps and attribute
+	target_row = setts.widget().fixed_height(PHASER_ROW + 2);
+	target_row.label("Lamps").anchor_left(4).fixed_width(76).fixed_height(PHASER_ROW).text_color(PAL_TEXT_2);
+	target_combo = target_row.combobox().anchor_left(80).anchor_right(0).fixed_height(PHASER_ROW);
+	target_combo.tooltip("Which lamps: a group of the fixture setup (in its order) or all lamps of a type");
+	attribute_row = setts.widget().fixed_height(PHASER_ROW + 2);
+	attribute_row.label("Attribute").anchor_left(4).fixed_width(76).fixed_height(PHASER_ROW).text_color(PAL_TEXT_2);
+	attribute_combo = attribute_row.combobox().anchor_left(80).anchor_right(0).fixed_height(PHASER_ROW);
+	attribute_combo.tooltip("Which attribute of the lamps the phaser moves");
+	fill_target_combo(target_combo, target);
+	fill_attribute_combo(attribute_combo, target, attribute);
+	target_combo.on_open([target_combo, guid]() {
+		fill_target_combo(target_combo, control_targets[guid].target);
+	});
+	target_combo.on_change([guid, attribute_combo, slider](index, text) {
+		item = control_targets[guid];
+		targets = patch_targets(engine.patch);
+		if(index < 1 || index > targets.size())
+			return;
+		item.target = targets[index - 1].id;
+		item.revision = -1;
+		attrs = fill_attribute_combo(attribute_combo, item.target, item.attribute);
+		//The same attribute if the new lamps have it, else the first one
+		if(attrs.size() && attribute_combo.selected() == 0) {
+			item.attribute = attrs[0].label;
+			attribute_combo.selected(1);
+		}
+		slider.display_name(row_caption(item));
+	});
+	attribute_combo.on_open([attribute_combo, guid]() {
+		fill_attribute_combo(attribute_combo, control_targets[guid].target, control_targets[guid].attribute);
+	});
+	attribute_combo.on_change([guid, slider](index, text) {
+		item = control_targets[guid];
+		attrs = patch_target_attributes(engine.patch, item.target);
+		if(index < 1 || index > attrs.size())
+			return;
+		item.attribute = attrs[index - 1].label;
+		item.revision = -1;
+		slider.display_name(row_caption(item));
+	});
+	slider.display_name(row_caption(item));
+
+	wave_row = setts.widget().fixed_height(PHASER_ROW + 2);
+	wave_row.label("Wave").anchor_left(4).fixed_width(76).fixed_height(PHASER_ROW).text_color(PAL_TEXT_2);
+	item.wave = wave_row.controlcombo("Wave", guid).items(PHASER_WAVES).anchor_left(80).anchor_right(0).fixed_height(PHASER_ROW);
+	item.wave.tooltip("The shape each lamp runs through in a cycle. Input: the Level slider, each lamp a Phase delay later.");
+	item.speed = setts.controlfloat("Beats", guid).min(0.0625).max(256.0).value(4.0);
+	item.speed.tooltip("Length of one cycle in beats: follows the BPM of the timeline");
+	item.phase = setts.controlfloat("Phase", guid).min(0.0).max(3600.0).value(360.0);
+	item.phase.tooltip("How far the wave is spread over the lamps in degrees: 0 all together, 360 one cycle from the first lamp to the last, 720 two waves");
+	spread_row = setts.widget().fixed_height(PHASER_ROW + 2);
+	spread_row.label("Spread").anchor_left(4).fixed_width(76).fixed_height(PHASER_ROW).text_color(PAL_TEXT_2);
+	item.phase_mode = spread_row.controlcombo("phase_mode", guid).items(PHASER_SPREADS).anchor_left(80).anchor_right(0).fixed_height(PHASER_ROW);
+	item.phase_mode.tooltip("Which lamp comes first. The directions use where the lamps hang on the stage plan of the fixture setup.");
+	item.width = setts.controlslider("Width", guid).value(1.0);
+	item.width.tooltip("The part of a cycle the wave runs; the rest of the cycle the lamp stays at Low");
+	item.low = setts.controlslider("Low", guid).value(0.0);
+	item.low.tooltip("Value at the bottom of the wave");
+	item.high = setts.controlslider("High", guid).value(1.0);
+	item.high.tooltip("Value at the top of the wave");
+	item.wings = setts.controlint("Wings", guid).min(0).max(16).value(0);
+	item.wings.tooltip("Mirrors the phase: with 2 wings the lamps of the second half run the other way, as a mirror of the first");
+	item.phase_duration = setts.controlfloat("Phase Delay", guid).min(0).value(1.0);
+	item.phase_duration.tooltip("Input wave: how many beats the last lamp follows the first");
+	item.start_device = setts.controlint("Start device", guid).min(0).max(99999);
+	item.start_device.tooltip("The first lamp of the target that takes part (0 = the first)");
+	item.end_device = setts.controlint("End device", guid).min(-1).max(99999).value(-1);
+	item.end_device.tooltip("The last lamp that takes part (-1 = up to the last)");
+	item.auto_mirrorx = setts.controlbutton("Auto Mirror X", guid).push(1);
+	item.auto_mirrorx.tooltip("Lamps left of the middle of the stage get the mirrored value (1 - value): pan and tilt move symmetric");
+	item.auto_mirrory = setts.controlbutton("Auto Mirror Y", guid).push(1);
+	item.auto_mirrory.tooltip("Lamps behind the middle of the stage get the mirrored value");
+
+	if(wave >= 0)
+		item.wave.value(wave);
+
+	refresh_shares = [guid](v) {
+		item = control_targets[guid] ?? None;
+		if(item)
+			item.revision = -1;
+	};
+	item.phase_mode.callback(refresh_shares);
+	item.wings.callback(refresh_shares);
+	item.start_device.callback(refresh_shares);
+	item.end_device.callback(refresh_shares);
+
+	if(open_settings)
+		preview_guid = guid;
+	return item;
+}
+
+// =========================================================================
+// Running
+// =========================================================================
+
+//The lamps, their controls and shares of a phaser, again when the patch, the target or the spread changed
+resolve(item) {
+	if(item.revision == engine.patch_revision)
 		return;
-	if(current_target.phase_mode.value() != 0) {
-		
-		min_x = 1.0;
-		max_x = 0.0;
-		min_y = 1.0;
-		max_y = 0.0;
-		
-		for(i = 0; i < current_target.target_controls.size(); i++) {
-			uv = current_target.target_controls[i].uv;
-			if(math.abs(uv.x) < min_x)
-				min_x = math.abs(uv.x);
-			else if(math.abs(uv.x) > max_x)
-				max_x = math.abs(uv.x);
-			if(math.abs(uv.y) < min_y)
-				min_y = math.abs(uv.y);
-			else if(math.abs(uv.y) > max_y)
-				max_y = math.abs(uv.y);
-		}
-		
-		current_target.min_uv = [x = min_x, y = min_y];
-		current_target.max_uv = [x = max_x, y = max_y];
-		
-		min_uv = vec2f(min_x, min_y);
-		max_uv = vec2f(max_x, max_y);
-		
-		if(current_target.phase_mode.value() == 1) {
-			for(i = 0; i < current_target.target_controls.size(); i++) {
-				tc = current_target.target_controls[i];
-				uv = current_target.target_controls[i].uv;
-				uv_vec = vec2f(math.abs(uv.x), math.abs(uv.y));
-				diff = (uv_vec - min_uv) / max_uv;
-				tc.uv_perc = diff.length();
+	item.revision = engine.patch_revision;
+	item.lamps = [];
+	item.controls = [];
+	item.buffers = [];
+	item.values = [];
+	if(!item.target || !item.attribute || !engine.fixture_menu)
+		return;
+	lamps = patch_target_fixtures(engine.patch, item.target);
+	first = math.max(0, item.start_device.value());
+	last = item.end_device.value();
+	if(last < 0 || last >= lamps.size())
+		last = lamps.size() - 1;
+	for(i = first; i <= last; i++) {
+		f = lamps[i];
+		ci = patch_control_index(f.type, item.attribute);
+		if(ci < 0)
+			continue;
+		ctrls = engine.fixture_menu.lamp_controls(f.id);
+		if(ci >= ctrls.size())
+			continue;
+		item.lamps.push_back(f);
+		item.controls.push_back(ctrls[ci]);
+		item.buffers.push_back([]);
+		item.values.push_back(0.0);
+	}
+	item.shares = phaser_shares(item.lamps, item.phase_mode.value(), item.wings.value());
+}
+
+//A value for a control: the phaser with the higher Priority wins in a frame; during a clip transition it is blended
+set_control_value(ctrl, value) {
+	current_frame = nanogui.current_context().frame_index();
+	current_prio = priority_ctrl.value();
+	if(current_frame == ctrl.attr.ph_id) {
+		if(current_prio < ctrl.attr.ph_pr)
+			return;
+	}
+	ctrl.attr.ph_pr = clip_is_preview ? 999999 : current_prio;
+	ctrl.attr.ph_id = current_frame;
+	if(!clip_transit_active) {
+		ctrl.value(value);
+		return;
+	}
+	//envelope_value: the value without the envelope of the control
+	ctrl.value(ctrl.envelope_value() * (1.0 - clip_transition_value) + value * clip_transition_value);
+}
+
+update_control_target(item) {
+	resolve(item);
+	n = item.controls.size();
+	if(n == 0)
+		return;
+
+	wave = item.wave.value();
+	level = item.slider.value();
+	low = item.low.value();
+	high = item.high.value();
+	width = item.width.value();
+	beats = math.max(0.0625, item.speed.value());
+	phase = item.phase.value() / 360.0;
+
+	for(i = 0; i < n; i++) {
+		share = item.shares[i];
+		f = item.lamps[i];
+		value = 0.0;
+		if(wave == PHASER_WAVE_INPUT) {
+			value = level;
+			delay = item.phase_duration.value() * share;
+			if(delay > 0.0001) {
+				buf = item.buffers[i];
+				buf.push_back([time = current_timeline + delay, value = value]);
+				if(current_timeline < buf[0].time)
+					continue;
+				value = buf[0].value;
+				buf.erase(0);
 			}
 		}
-		else { //LEFT UV runs from left to right, RIGHT UV from right to left (by uv.x as it is, not mirrored)
-			left_x = 1.0;
-			right_x = -1.0;
-			for(i = 0; i < current_target.target_controls.size(); i++) {
-				x = current_target.target_controls[i].uv.x;
-				if(x < left_x)
-					left_x = x;
-				if(x > right_x)
-					right_x = x;
-			}
-			span_x = right_x - left_x;
-			for(i = 0; i < current_target.target_controls.size(); i++) {
-				tc = current_target.target_controls[i];
-				p = 0.0;
-				if(span_x > 0.0)
-					p = (tc.uv.x - left_x) / span_x;
-				tc.uv_perc = current_target.phase_mode.value() == 2 ? p : 1.0 - p;
-			}
+		else {
+			t = current_timeline / beats - share * phase;
+			cycle = math.floor(t);
+			value = low + (high - low) * phaser_wave(wave, t - cycle, width, cycle, i) * level;
 		}
+		if(item.auto_mirrorx.value() && f.x < 0.0)
+			value = 1.0 - value;
+		if(item.auto_mirrory.value() && f.y < 0.0)
+			value = 1.0 - value;
+		item.values[i] = value;
+		set_control_value(item.controls[i], value);
 	}
 }
 
-add_target(guid = "", open_settings = false) {
-	
-	if(!guid)
-		guid = std.random_hash();
-	
-	cnt = target_list.widget().layout(nanogui.layout_vertical());
-
-	splitter = cnt.widget().fixed_height(30).layout(nanogui.layout_horizontal());
-	slider = splitter.controlslider("Control", guid).anchor(0).anchor_right(50);
-	settings_btn = splitter.pushbutton("").icon(nanogui.icon("cog")).tooltip("Settings").anchor_right(25).fixed_width(25).pushed(open_settings);
-	delete_btn = splitter.button("").icon(nanogui.icon("times")).anchor_right(0).fixed_width(25);
-
-	setts = cnt.widget().layout(nanogui.layout_vertical()).section_guide(true);
-
-	setts.visible(open_settings);
-	
-	settings_btn.on_change([setts](v){
-		setts.visible(v);
-	});
-
-	control_targets[guid] = [
-		cnt=cnt,
-		guid=guid,
-		slider=slider,
-	];
-
-	delete_btn.on_click([guid, cnt](){
-		control_targets.erase(guid);
-		std.free(cnt);
-	});
-	
-	current_target = control_targets[guid];
-	
-	target_fixture = setts.combobox().items(["Select Fixture"]);
-	target_fixture.on_open([target_fixture](){
-		
-		items = ["Select Fixture"];
-		
-		for(i = 0; i < engine.fixtures.size(); i++) {
-			items.push_back(fileio.pure_name(engine.fixtures.key(i)));
-		}
-		
-		target_fixture.items(items);
-	});
-	
-	target_channel = setts.combobox().items(["Select Channel"]);
-	target_channel.on_open([target_channel, target_fixture](){
-		
-		items = ["Select Channel"];
-		target_channel.items(items);
-		
-		id = target_fixture.selected();
-		if(id == 0)
-			return;
-		id--;
-		if(id >= engine.fixtures.size())
-			return;
-		
-		fixture_config = fileio.read_json(engine.fixtures.key(id));
-
-		for(i = 0; i < fixture_config.channels.size(); i++) {
-			if(fixture_config.channels[i].batch_count > 1) {				
-				for(j = 0; j < fixture_config.channels[i].batch_count; j++) {
-					if(fixture_config.channels[i].type == "RGB")
-						items.push_back(fixture_config.channels[i].name + " - R" + " (" + (j+1) + ")");
-						items.push_back(fixture_config.channels[i].name + " - G" + " (" + (j+1) + ")");
-						items.push_back(fixture_config.channels[i].name + " - B" + " (" + (j+1) + ")");
-					else if(fixture_config.channels[i].type == "RGBW")
-						items.push_back(fixture_config.channels[i].name + " - R" + " (" + (j+1) + ")");
-						items.push_back(fixture_config.channels[i].name + " - G" + " (" + (j+1) + ")");
-						items.push_back(fixture_config.channels[i].name + " - B" + " (" + (j+1) + ")");
-						items.push_back(fixture_config.channels[i].name + " - W" + " (" + (j+1) + ")");
-					else
-						items.push_back(fixture_config.channels[i].name + " (" + (j+1) + ")");
-				}
-			}
-			else {
-				if(fixture_config.channels[i].type == "RGB")
-					items.push_back(fixture_config.channels[i].name + " - R");
-					items.push_back(fixture_config.channels[i].name + " - G");
-					items.push_back(fixture_config.channels[i].name + " - B");
-				else if(fixture_config.channels[i].type == "RGBW")
-					items.push_back(fixture_config.channels[i].name + " - R");
-					items.push_back(fixture_config.channels[i].name + " - G");
-					items.push_back(fixture_config.channels[i].name + " - B");
-					items.push_back(fixture_config.channels[i].name + " - W");
-				else
-					items.push_back(fixture_config.channels[i].name);
-			}
-		}
-		
-		target_channel.items(items);
-	});
-	
-	target_channel.on_change([target_fixture, slider, current_target](index, txt){
-		
-		if(index == 0)
-			return;
-		index--;
-		target_name = fileio.pure_name(engine.fixtures.key(target_fixture.selected()-1));
-		slider.display_name(target_name + " > " + txt);
-		
-		current_target.target_fixture = engine.fixtures.key(target_fixture.selected()-1);
-		current_target.target_control_name = txt;
-		current_target.target_control_index = index;
-		current_target.target_controls = [];
-	});
-	
-	current_target.phase_mode = setts.controlcombo("phase_mode", guid).items(["INDEX", "CENTER UV", "LEFT UV", "RIGHT UV"]);
-	current_target.phase_duration = setts.controlfloat("Phase Delay", guid).min(0).value(1.0);
-	current_target.start_device = setts.controlint("Start device", guid).min(0).max(99999);
-	current_target.end_device = setts.controlint("End device", guid).min(-1).max(99999).value(-1);
-	current_target.auto_mirrorx = setts.controlbutton("Auto Mirror X", guid).push(1);
-	current_target.auto_mirrory = setts.controlbutton("Auto Mirror Y", guid).push(1);
-	
-	current_target.phase_mode.callback([current_target](v){
-		phase_uv_shares(current_target);
-	});
+update_pre(generator, tl_pos, pos_delta) {
+	current_timeline = tl_pos;
 }
 
-#include "engine/generators/generatorview"
+update_post(generator) {
+	if(!generator.active_btn.value())
+		return;
+	for(i = 0; i < control_targets.size(); i++)
+		update_control_target(control_targets[i]);
+}
+
+// =========================================================================
+// The plan on the left: the lamps of the phaser whose settings are open, lit by their values
+// =========================================================================
+
+draw_preview() {
+	s = preview.size();
+	nvgBeginPath();
+	nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
+	nvgFillColor(PAL_CANVAS);
+	nvgFill();
+	item = control_targets[preview_guid] ?? None;
+	if(!item && control_targets.size())
+		item = control_targets[0];
+	if(!item || !item.lamps.size()) {
+		pal_text(vec2f(s.x / 2.0, s.y / 2.0), engine.patch.fixtures.size() ? "Add a phaser and pick its lamps" : "No lamps yet: set them up in Fixtures > Setup", 13, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		return;
+	}
+	b = patch_bounds(item.lamps);
+	w = math.max(1.0, b.max_x - b.min_x);
+	h = math.max(1.0, b.max_y - b.min_y);
+	scale = math.min((s.x - 60) / w, (s.y - 80) / h);
+	scale = math.min(scale, 80.0);
+	cx = (b.min_x + b.max_x) / 2.0;
+	cy = (b.min_y + b.max_y) / 2.0;
+	r = math.clamp(scale * 0.25, 5.0, 14.0);
+	for(i = 0; i < item.lamps.size(); i++) {
+		f = item.lamps[i];
+		p = vec2f(s.x / 2.0 + (f.x - cx) * scale, s.y / 2.0 + 6 + (f.y - cy) * scale);
+		v = math.clamp(item.values[i], 0.0, 1.0);
+		nvgBeginPath();
+		nvgCircle(p, r);
+		nvgFillColor(vec4f(0.15 + 0.85 * v, 0.15 + 0.85 * v, 0.15 + 0.8 * v, 1.0));
+		nvgFill();
+		nvgStrokeColor(PAL_LINE_STRONG);
+		nvgStrokeWidth(1.0);
+		nvgStroke();
+		pal_text(vec2f(p.x, p.y + r + 8), std.string(i + 1), 10, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+	}
+	pal_text(vec2f(8, 12), row_caption(item) + " · " + PHASER_WAVES[item.wave.value()] + " · " + item.lamps.size() + " lamps", 12, PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE);
+}
+
+// =========================================================================
+// Generator
+// =========================================================================
 
 managed view = None;
 
@@ -206,170 +460,150 @@ dispatcher(generator, cmd, value) {
 		if(value && !generator.active_btn.value())
 			return;
 	}
-	
-	if(cmd == "transition")
-		if(value.value != 1.0)
-			clip_transit_active = true;
-		else
-			clip_transit_active = false;
+	if(cmd == "transition") {
+		clip_transit_active = value.value != 1.0;
 		clip_transition_value = value.value;
 		clip_is_transit_a = value.is_transit_a;
-	
+	}
 	if(cmd == "clip_preview")
 		clip_is_preview = value;
-	
 	return view.dispatch(cmd, value);
 }
 
+//What a phaser is for the AI interface
+describe_item(item) {
+	return [
+		guid = item.guid,
+		target = item.target,
+		target_name = patch_target_name(engine.patch, item.target),
+		attribute = item.attribute,
+		wave = PHASER_WAVES[item.wave.value()],
+		beats = item.speed.value(),
+		phase = item.phase.value(),
+		spread = PHASER_SPREADS[item.phase_mode.value()],
+		width = item.width.value(),
+		low = item.low.value(),
+		high = item.high.value(),
+		wings = item.wings.value(),
+		level = item.slider.value(),
+		lamps = item.lamps.size(),
+		values = item.values,
+	];
+}
+
+register_queries(generator) {
+	generator.register("list_targets", [], [](args) {
+		targets = patch_targets(engine.patch);
+		for(i = 0; i < targets.size(); i++) {
+			attrs = patch_target_attributes(engine.patch, targets[i].id);
+			labels = [];
+			for(j = 0; j < attrs.size(); j++)
+				labels.push_back(attrs[j].label);
+			targets[i].attributes = labels;
+			targets[i].lamps = patch_target_fixtures(engine.patch, targets[i].id).size();
+		}
+		return [ok = true, value = targets];
+	}, "The lamps a phaser can run over (groups of the fixture setup, all lamps of a type) and their attributes");
+
+	generator.register("list_phasers", [], [](args) {
+		list = [];
+		for(i = 0; i < control_targets.size(); i++)
+			list.push_back(describe_item(control_targets[i]));
+		return [ok = true, value = list];
+	}, "The phasers of this generator with their settings and the values they sent last");
+
+	generator.register("add_phaser", [
+		target = "&string(): Target id from list_targets (group:<id> or type:<path>)",
+		attribute = "&string(): Attribute label from list_targets",
+		wave = "string(): " + PHASER_WAVES.combine_string(", ") + " (default Sine)",
+		beats = "float(): Beats per cycle (default 4)",
+		phase = "float(): Phase spread over the lamps in degrees (default 360)",
+		spread = "string(): " + PHASER_SPREADS.combine_string(", ") + " (default In order)",
+		wings = "int(): Wings (default 0)",
+	], [](args) {
+		wave = args.has("wave") ? math.max(0, phaser_index_of(PHASER_WAVES, args.wave)) : 0;
+		item = add_target("", false, args.target, args.attribute, wave);
+		item.slider.display_name(row_caption(item));
+		if(args.has("beats"))
+			item.speed.value(std.float(args.beats));
+		if(args.has("phase"))
+			item.phase.value(std.float(args.phase));
+		if(args.has("spread") && phaser_index_of(PHASER_SPREADS, args.spread) >= 0)
+			item.phase_mode.value(phaser_index_of(PHASER_SPREADS, args.spread));
+		if(args.has("wings"))
+			item.wings.value(std.int(args.wings));
+		item.revision = -1;
+		return [ok = true, value = item.guid];
+	}, "Adds a phaser: a wave over the lamps of a target on one attribute");
+
+	generator.register("remove_phaser", [guid = "&string(): guid from list_phasers"], [](args) {
+		item = control_targets[args.guid] ?? None;
+		if(!item)
+			return [ok = false, error = "No phaser " + args.guid];
+		std.free(item.cnt);
+		control_targets.erase(args.guid);
+		return [ok = true];
+	}, "Removes a phaser");
+}
+
 entry(generator, area) {
-	
+	engine = generator.engine;
+	generator.window.fixed_size(vec2f(900, 560));
 	area.layout(None);
 
-	ctrl_area = area.widget().anchor_top(0).anchor_right(0).anchor_bottom(0).fixed_width(250);
-	view_area = area.widget().anchor_top(0).anchor_left(0).anchor_right(250).anchor_bottom(0);
-	
+	ctrl_area = area.widget().anchor_top(0).anchor_right(0).anchor_bottom(0).fixed_width(PHASER_SIDE_W);
+	left = area.widget().anchor_top(0).anchor_left(0).anchor_right(PHASER_SIDE_W + 4).anchor_bottom(0);
+
+	preview = left.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(200);
+	preview.on_draw([]() { draw_preview(); });
+	view_area = left.widget().anchor_left(0).anchor_right(0).anchor_top(204).anchor_bottom(0);
+	view_area.tooltip("Generators for the Input wave: link an LFO or the audio analysis into the Level slider of a phaser");
+
 	ctrl_area.layout(nanogui.layout_vertical());
-	
+
 	view = generatorview(view_area);
-	view.area.fixed_size(vec2f(1024,1024));
-	
-	engine = generator.engine;
-	
-	add_target_btn = ctrl_area.button("Add Target").anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(27);
-	priority_ctrl = ctrl_area.controlint("Priority").anchor_top(30).anchor_left(0).anchor_right(0).fixed_height(30);
-	
-	add_target_btn.on_click([](){
+	view.area.fixed_size(vec2f(1024, 1024));
+
+	add_target_btn = ctrl_area.button("Add phaser").icon(nanogui.icon("plus")).fixed_height(PHASER_ROW);
+	add_target_btn.tooltip("A wave over the lamps of a group of the [[fixture setup]], on one of their attributes\n[[wiki:Output-and-Devices#effects-over-fixtures]]");
+	priority_ctrl = ctrl_area.controlint("Priority").fixed_height(PHASER_ROW);
+	priority_ctrl.tooltip("When several phasers move the same control, the higher priority wins");
+
+	add_target_btn.on_click([]() {
 		add_target("", true);
 	});
 
-	//Weird that I have to set fixed_width for this...
-	target_list = ctrl_area.vscroll().anchor(0).anchor_top(60).content().layout(nanogui.layout_vertical()).fixed_width(ctrl_area.fixed_width());	
-}
+	target_list = ctrl_area.vscroll().anchor(0).anchor_top(60).content().layout(nanogui.layout_vertical()).fixed_width(PHASER_SIDE_W - 12);
 
-current_timeline = 0;
-
-update_control_target(target) {
-	if(!target.target_control_name ?? false)
-		return;
-
-	//Important TODO:
-	//Instead of having "target_buffers" and a buffer for each fixture instance, instead have one "delay_buffer" and indivisual read heads for each fixture
-	//The last read head then pops the buffer when necessary, uses way less memory
-
-	if(!target.target_controls && target.target_control_name && target.target_fixture) {
-		if(engine.fixture_menu.active_fixtures.has(target.target_fixture)) {
-			targets = engine.fixture_menu.active_fixtures[target.target_fixture].instances_controls;
-			target_instance = engine.fixtures[target.target_fixture].instances;
-			for(i = 0; i < targets.size(); i++) {
-				target_ctrls = targets[i];
-				if(target.target_control_index < target_ctrls.size())
-					target.target_controls.push_back([
-						control=target_ctrls[target.target_control_index],
-						uv = target_instance[i].uv_pos,
-					]);
-			}
-			
-			target.target_buffers = [];
-			target.target_buffers.resize(target.target_controls.size());
-			phase_uv_shares(target);
-		}
-	}
-
-	phase_mode = target.phase_mode.value();
-	max_index = target.target_controls.size();
-
-	set_control_value(ctrl, value) {
-		
-		//Use short names here for faster internal string checks
-		current_frame = nanogui.current_context().frame_index();
-		current_prio = priority_ctrl.value();
-		
-		if(current_frame == ctrl.attr.ph_id) {
-			if(current_prio < ctrl.attr.ph_pr)
-				return;
-		}
-		
-		ctrl.attr.ph_pr = clip_is_preview ? 999999 : current_prio;
-		ctrl.attr.ph_id = current_frame;
-		
-		//std.print(ctrl.attr);
-		
-		if(!clip_transit_active)
-			ctrl.value(value);
-			return;
-
-		//Since all of these controls should be sliders, envelope_value should be safe here
-		//We use this instead of value() so envelopes set on the control do not affect the calculations here...
-		if(clip_is_transit_a)
-			ctrl.value(ctrl.envelope_value() * (1.0 - clip_transition_value) + value * clip_transition_value);
-		else
-			ctrl.value(ctrl.envelope_value() * (1.0 - clip_transition_value) + value * clip_transition_value);
-	}
-
-	for(i = 0; i < max_index; i++) {
-
-		phase_perc = i / std.float(max_index-1);	
-		
-		//CENTER UV, LEFT UV, RIGHT UV: the share is worked out when the mode is chosen (phase_mode callback)
-		if(phase_mode != 0) {
-			phase_perc = target.target_controls[i].uv_perc; 
-		}
-
-		value_delay = target.phase_duration.value()*phase_perc;
-		value = target.slider.value();
-		
-		if(target.auto_mirrorx.value() && target.target_controls[i].uv.x < 0.0)
-			value = 1.0 - value;
-		if(target.auto_mirrory.value() && target.target_controls[i].uv.y < 0.0)
-			value = 1.0 - value;
-		
-		if(value_delay <= 0.0001)
-			set_control_value(target.target_controls[i].control, value);
-		else
-			target.target_buffers[i].push_back([time=current_timeline+value_delay, value=value]);
-			target_buffer = target.target_buffers[i];
-			if(current_timeline >= target_buffer[0].time)
-				set_control_value(target.target_controls[i].control, target_buffer[0].value);
-				target_buffer.erase(0);
-	}
-	
-}
-
-update_pre(generator, tl_pos, pos_delta) {	
-	current_timeline = tl_pos;
-}
-
-update_post(generator) {
-	for(i = 0; i < control_targets.size(); i++) {
-		update_control_target(control_targets[i]);
-	}
+	register_queries(generator);
 }
 
 save_state() {
-	state = [view=view.save_state()];
-	
+	state = [view = view.save_state(), items = std.json()];
 	for(i = 0; i < control_targets.size(); i++) {
-		state.items[control_targets[i].guid] = [
-			fixture=control_targets[i].target_fixture,
-			control_name=control_targets[i].target_control_name,
-			control_index=control_targets[i].target_control_index,
-		];
+		item = control_targets[i];
+		state.items[item.guid] = [target = item.target, attribute = item.attribute, order = i];
 	}
-	
 	return state;
 }
 
 load_state(state) {
-	
+	for(i = control_targets.size() - 1; i >= 0; i--)
+		std.free(control_targets[i].cnt);
 	control_targets.clear();
-	
-	for(i = 0; i < state.items.size(); i++) {
-		guid = state.items.key(i);
-		add_target(guid);
-		control_targets[guid].target_fixture = state.items[i].fixture;
-		control_targets[guid].target_control_name = state.items[i].control_name;
-		control_targets[guid].target_control_index = state.items[i].control_index;
+
+	items = state.items ?? [];
+	//in the order they were added (the keys of a saved JSON object come back sorted)
+	order = [];
+	for(i = 0; i < items.size(); i++)
+		order.push_back([guid = items.key(i), order = items[i].has("order") ? items[i]["order"] : i]);
+	order = patch_sort_by(order, "order");
+	for(i = 0; i < order.size(); i++) {
+		guid = order[i].guid;
+		data = items[guid];
+		//A phaser of a project before #439 (migrated: wave "Input") keeps its effect: the input with a delay
+		wave = (data.wave ?? "") == "Input" ? PHASER_WAVE_INPUT : -1;
+		add_target(guid, false, data.target ?? "", data.attribute ?? "", wave);
 	}
-	
 	view.load_state(state.view);
 }

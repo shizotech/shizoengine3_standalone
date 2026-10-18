@@ -1,385 +1,363 @@
+//Devices > Fixtures (#439): the controls of every lamp of the patch (engine.patch, engine/patch/patch.shio).
+//
+//- One section per fixture type with its Dimmers (scale a channel on every lamp of the type) and Flashers (while Flash is
+//  held, every lamp of the type takes the value of the slider on that channel), then one section per lamp.
+//- The controls of a lamp are the one place that writes its DMX channels: the Phaser and links move these controls.
+//- The IDs of the controls (name + group) are those from before #439 for lamps of an old project (legacy_index), so MIDI
+//  mappings and links keep working. New lamps use their id.
+//- Highlight (from the fixture setup): the lamp goes to full (colours white, intensity channels full) to find it in the rig.
+//- The menu follows the patch: build_fixture_menu() (called by engine.patch_changed()) adds, renames and removes what
+//  changed and keeps the controls of the lamps that are still there.
 
 class fixtures_menu {
-	
+
 	engine = None;
 
 	managed fixture_controls = None;
-	managed active_fixtures = [];
+	managed types = []; //type path -> [entry, content, dimmers = [slot -> control], flashers = [slot -> [btn, ctrl]], signature]
+	managed lamps = []; //lamp id -> [entry, controls = [one per control of the type], type, signature]
+
+	devices = []; //node MAC -> Art-Net device (found when first needed)
+	highlight = []; //lamp id -> true
 
 	__init__(_engine, parent) {
 		engine = _engine;
-		
+
 		engine.fixture_menu = this;
-		
-		engine.load_hooks["fixture_menu"] = [this](states){					
+
+		engine.load_hooks["fixture_menu"] = [this](states){
 			this.build_fixture_menu();
 		};
-		
+
 		fixture_controls = parent.matrixnode("fixture_menu").layout(nanogui.layout_vertical());
-		
+
+		build_fixture_menu();
 	}
-	
-	build_fixture_menu() {
-		
-		for(i = 0; i < active_fixtures.size(); i++) {
-			if(!engine.fixtures.has(active_fixtures.key(i)))
-				std.free(active_fixtures[i].entry);
-				active_fixtures.erase(i);
-				i--;
+
+	// =========================================================================
+	// Output
+	// =========================================================================
+
+	device(node) {
+		if(!node)
+			return None;
+		dev = devices[node] ?? None;
+		if(!dev) {
+			dev = engine.net.find_artnet_device(node);
+			if(dev)
+				devices[node] = dev;
 		}
-		
-		for(i = 0; i < engine.fixtures.size(); i++) {
-			
-			entry = None;
-			
-			pure_name = fileio.pure_name(engine.fixtures.key(i));
-			
-			active_fix = None;
-			
-			instances = [];
-			
-			conf = fileio.read_json(engine.fixtures.key(i));
-			
-			if(active_fixtures.has(engine.fixtures.key(i)))
-				active_fix = active_fixtures[engine.fixtures.key(i)];
-				entry = active_fix.entry;
+		return dev;
+	}
+
+	//An 8-bit or 16-bit channel that sets the brightness: full while the lamp is highlighted
+	is_intensity(name) {
+		n = std.string(name).lowercase();
+		return n.contains("dim") || n.contains("intens") || n.contains("master") || n.contains("bright");
+	}
+
+	//Writes one value (0..1) of a lamp at a channel offset; bytes 2 sends coarse and fine
+	write(f, offset, v, bytes = 1) {
+		dev = device(f.node);
+		if(!dev)
+			return;
+		v = math.clamp(v, 0.0, 1.0);
+		channel = f.address - 1 + offset;
+		if(bytes == 2) {
+			value_16bit = std.int(v * 65535.0);
+			dev.set_artnet_channel(f.universe, channel, std.int(value_16bit / 256));
+			dev.set_artnet_channel(f.universe, channel + 1, value_16bit % 256);
+		}
+		else
+			dev.set_artnet_channel(f.universe, channel, std.int(v * 255.0 + 0.5));
+	}
+
+	//The value a control sends: scaled by the dimmer of its type, replaced by a flash, full when highlighted
+	out_value(f, type_entry, slot_index, v, highlight_value = None) {
+		dimmer = type_entry.dimmers[slot_index] ?? None;
+		if(dimmer)
+			v = v * dimmer.value();
+		flasher = type_entry.flashers[slot_index] ?? None;
+		if(flasher && flasher.btn.value())
+			v = flasher.ctrl.value();
+		if(highlight.has(f.id) && !std.is_none(highlight_value))
+			v = highlight_value;
+		return v;
+	}
+
+	//Sends every control of a lamp again (after a highlight, a flash or a change of its address)
+	refresh_lamp(id) {
+		lamp = lamps[id] ?? None;
+		if(!lamp)
+			return;
+		for(i = 0; i < lamp.controls.size(); i++) {
+			ctrl = lamp.controls[i];
+			ctrl.value(ctrl.value());
+		}
+	}
+
+	refresh_type(path) {
+		for(i = 0; i < engine.patch.fixtures.size(); i++) {
+			f = engine.patch.fixtures[i];
+			if(f.type == path)
+				refresh_lamp(f.id);
+		}
+	}
+
+	refresh_all() {
+		for(i = 0; i < lamps.size(); i++)
+			refresh_lamp(lamps.key(i));
+	}
+
+	//Highlight these lamps (ids), all others back to normal
+	set_highlight(ids) {
+		old = highlight;
+		highlight = [];
+		for(i = 0; i < ids.size(); i++)
+			highlight[ids[i]] = true;
+		for(i = 0; i < old.size(); i++) {
+			if(!highlight.has(old.key(i)))
+				refresh_lamp(old.key(i));
+		}
+		for(i = 0; i < ids.size(); i++)
+			refresh_lamp(ids[i]);
+	}
+
+	//The controls of a lamp, one per control of its type (patch_type(type).controls), for the Phaser
+	lamp_controls(id) {
+		lamp = lamps[id] ?? None;
+		return lamp ? lamp.controls : [];
+	}
+
+	//Colour of a lamp for the stage plan: [r, g, b] 0..1 of its first colour, or of its intensity channel; None if it has none
+	lamp_color(f) {
+		lamp = lamps[f.id] ?? None;
+		if(!lamp)
+			return None;
+		t = patch_type(f.type);
+		type_entry = types[f.type] ?? None;
+		if(!type_entry)
+			return None;
+		intensity = -1.0;
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			c = t.controls[i];
+			if((c.kind == "RGB" || c.kind == "RGBW") && c.comp == 0 && i + 2 < lamp.controls.size()) {
+				r = out_value(f, type_entry, c.slot, lamp.controls[i].value(), 1.0);
+				g = out_value(f, type_entry, c.slot, lamp.controls[i + 1].value(), 1.0);
+				b = out_value(f, type_entry, c.slot, lamp.controls[i + 2].value(), 1.0);
+				if(c.kind == "RGBW" && i + 3 < lamp.controls.size()) {
+					w = out_value(f, type_entry, c.slot, lamp.controls[i + 3].value(), 1.0);
+					r = math.min(1.0, r + w);
+					g = math.min(1.0, g + w);
+					b = math.min(1.0, b + w);
+				}
+				return [r = r, g = g, b = b];
+			}
+			if(intensity < 0.0 && is_intensity(t.slots[c.slot].name))
+				intensity = out_value(f, type_entry, c.slot, lamp.controls[i].value(), 1.0);
+		}
+		if(intensity >= 0.0)
+			return [r = intensity, g = intensity, b = intensity];
+		return None;
+	}
+
+	// =========================================================================
+	// Building
+	// =========================================================================
+
+	//The section of a fixture type: Dimmers and Flashers (IDs as before #439)
+	build_type(path) {
+		t = patch_type(path);
+		entry = fixture_controls.collapsable(t.name);
+		entry.content().layout(nanogui.layout_vertical());
+		type_entry = [entry = entry, content = entry.content(), dimmers = [], flashers = [], signature = t.signature];
+		types[path] = type_entry;
+		type_entry = types[path];
+
+		control_dimmers = entry.content().collapsable("Dimmers").content().layout(nanogui.layout_vertical());
+		control_flashers = entry.content().collapsable("Flashers").content().layout(nanogui.layout_vertical());
+
+		for(s = 0; s < t.slots.size(); s++) {
+			slot = t.slots[s];
+			chan_name = t.channels[slot.channel].name;
+			k = slot.channel;
+
+			ctrl = control_dimmers.controlslider("DIM " + slot.name, "dim_" + chan_name + "_" + k).caption("Dim " + slot.name);
+			ctrl.tooltip("Scales " + slot.name + " on every lamp of this type");
+			ctrl.value(1.0);
+			ctrl.callback([this, path](v) {
+				this.refresh_type(path);
+			});
+			type_entry.dimmers.push_back(ctrl);
+
+			splitter = control_flashers.widget().fixed_height(28).layout(nanogui.layout_horizontal());
+			flash_ctrl = splitter.controlslider(slot.name, "flash_" + chan_name + "_" + k).fixed_height(28).anchor_right(100).anchor_left(0);
+			flash_btn = splitter.controlbutton("FLASH", "flashbtn_" + chan_name + "_" + k).caption("Flash").anchor_right(0).fixed_width(100);
+			flash_btn.tooltip("While held, every lamp of this type takes the value of the slider on " + slot.name);
+			flash_btn.hold(true);
+			type_entry.flashers.push_back([btn = flash_btn, ctrl = flash_ctrl]);
+			flash_btn.callback([this, path](v) {
+				this.refresh_type(path);
+			});
+			flash_ctrl.callback([this, path, flash_btn](v) {
+				if(flash_btn.value())
+					this.refresh_type(path);
+			});
+		}
+		return type_entry;
+	}
+
+	//The section of one lamp: a slider per channel, a colour picker per colour
+	build_lamp(f, type_entry) {
+		t = patch_type(f.type);
+		inst_entry = type_entry.content.collapsable(lamp_title(f));
+		inst_content = inst_entry.content().layout(nanogui.layout_vertical());
+		lamp = [entry = inst_entry, controls = [], type = f.type, signature = t.signature];
+		lamps[f.id] = lamp;
+		lamp = lamps[f.id];
+		id = f.id;
+
+		for(s = 0; s < t.slots.size(); s++) {
+			slot = t.slots[s];
+			chan_name = t.channels[slot.channel].name;
+			group = patch_control_group(f, chan_name, slot.channel);
+			offset = slot.offset;
+			slot_index = s;
+			full = is_intensity(slot.name) ? 1.0 : None;
+
+			if(slot.kind == "RGB" || slot.kind == "RGBW") {
+				rgb_vec = inst_content.controlvector(slot.name, group);
+				color_selector = rgb_vec.color_selector();
+				r_comp = rgb_vec.controlslider("R", group);
+				g_comp = rgb_vec.controlslider("G", group);
+				b_comp = rgb_vec.controlslider("B", group);
+				lamp.controls.push_back(r_comp);
+				lamp.controls.push_back(g_comp);
+				lamp.controls.push_back(b_comp);
+
+				if(slot.kind == "RGB") {
+					color_selector.on_color_change([r_comp, g_comp, b_comp](col) {
+						r_comp.value(col.x);
+						g_comp.value(col.y);
+						b_comp.value(col.z);
+					});
+					comps = [r_comp, g_comp, b_comp];
+					for(c = 0; c < 3; c++) {
+						comp_offset = offset + c;
+						comps[c].callback([this, id, comp_offset, slot_index](v) {
+							f = patch_find(this.engine.patch, id);
+							if(f)
+								this.write(f, comp_offset, this.out_value(f, this.types[f.type], slot_index, v, 1.0));
+						});
+					}
+				}
+				else {
+					w_comp = rgb_vec.controlslider("W", group);
+					lamp.controls.push_back(w_comp);
+
+					//The white of a colour is sent on W (as before #439): W follows min(R, G, B), R, G and B send the rest
+					color_selector.on_color_change([r_comp, g_comp, b_comp, w_comp](col) {
+						w = math.min(col.x, math.min(col.y, col.z));
+						r_comp.value(col.x - w);
+						g_comp.value(col.y - w);
+						b_comp.value(col.z - w);
+						w_comp.value(w);
+					});
+					w_comp.callback([this, id, offset, slot_index](v) {
+						f = patch_find(this.engine.patch, id);
+						if(f)
+							this.write(f, offset + 3, this.out_value(f, this.types[f.type], slot_index, v, 1.0));
+					});
+					update_rgbw = [this, id, offset, slot_index, r_comp, g_comp, b_comp, w_comp](v) {
+						f = patch_find(this.engine.patch, id);
+						if(!f)
+							return;
+						type_entry = this.types[f.type];
+						r = r_comp.value();
+						g = g_comp.value();
+						b = b_comp.value();
+						w = math.min(r, g, b);
+						w_comp.value(w);
+						flasher = type_entry.flashers[slot_index] ?? None;
+						flash = flasher && flasher.btn.value();
+						lit = this.highlight.has(id);
+						this.write(f, offset, lit ? 1.0 : (flash ? 0.0 : this.out_value(f, type_entry, slot_index, r - w)));
+						this.write(f, offset + 1, lit ? 1.0 : (flash ? 0.0 : this.out_value(f, type_entry, slot_index, g - w)));
+						this.write(f, offset + 2, lit ? 1.0 : (flash ? 0.0 : this.out_value(f, type_entry, slot_index, b - w)));
+					};
+					r_comp.callback(update_rgbw);
+					g_comp.callback(update_rgbw);
+					b_comp.callback(update_rgbw);
+				}
+			}
 			else {
-				entry = fixture_controls.collapsable(pure_name);
-				entry.content().layout(nanogui.layout_vertical());
-				active_fixtures[engine.fixtures.key(i)] = [entry=entry, instances=[], controls=[]];
-				active_fix = active_fixtures[engine.fixtures.key(i)];
-				
-				control_dimmers = entry.collapsable("Dimmers").content().layout(nanogui.layout_vertical());
-				control_flashers = entry.collapsable("Flashers").content().layout(nanogui.layout_vertical());
-				
-				//Flashers should have desired value and "Flash!" button which overrides the current input completely
-				
-				active_fix.dimmer_controls = [];
-				active_fix.flasher_controls = [];
-
-				for(k = 0; k < conf.channels.size(); k++) {
-					chan = conf.channels[k];
-					for(h = 0; h < chan.batch_count; h++) {
-						ctrl_name = chan.name;
-						if(h > 0)
-							ctrl_name += " (" + (h+1) + ")";
-
-						ctrl = control_dimmers.controlslider("DIM " + ctrl_name, "dim_" + chan.name + "_" + k).caption("Dim " + ctrl_name);
-						ctrl.value(1.0);
-						active_fix.dimmer_controls.push_back(ctrl);
-						splitter = control_flashers.widget().fixed_height(30).layout(nanogui.layout_horizontal());	
-						
-						ctrl = splitter.controlslider(ctrl_name, "flash_" + chan.name + "_" + k).fixed_height(30).anchor_right(100).anchor_left(0);;
-						flash_btn = splitter.controlbutton("FLASH", "flashbtn_" + chan.name + "_" + k).caption("Flash").anchor_right(0).fixed_width(100);
-						active_fix.flasher_controls.push_back([btn=flash_btn,ctrl=ctrl,target_ctrls=[]]); 
-						target_ctrls =  active_fix.flasher_controls[-1].target_ctrls;
-						flash_btn.hold(true);
-						flash_btn.callback([target_ctrls](v) {
-							for(tt = 0; tt < target_ctrls.size(); tt++) {
-								target_ctrls[tt].value(target_ctrls[tt].value()); //Value doesnt matter here as its overwritten in the ctrl's callback anyways when flash btn is active
-							}
-						});
-						ctrl.callback([target_ctrls, flash_btn](v) {
-							if(flash_btn.value()) {
-								for(tt = 0; tt < target_ctrls.size(); tt++) {
-									target_ctrls[tt].value(v);
-								}
-							}
-						});
-					}
-				}
-			}
-			
-			total_byte_count = 0;
-			for(j = 0; j < conf.channels.size(); j++) {
-				total_byte_count += conf.channels[j].byte_count;
-			}
-			
-			for(j = 0; j < engine.fixtures[i].instances.size(); j++) {
-				instances.push_back(engine.fixtures[i].instances[j]);
-				if(engine.fixtures[i].instances[j].batch_count > 1) {
-					for(k = 1; k < engine.fixtures[i].instances[j].batch_count; k++) {
-						instances.push_back(engine.fixtures[i].instances[j].copy());
-						instances[-1].batch_count=1;
-						instances[-1].start_channel += total_byte_count * k;
-						instances[-1].batch_index = k+1;
-					}
-				}
-			}
-			
-			start_index = 0;
-			if(active_fix.instances)
-				for(instances.size() < active_fix.instances.size()) {
-					std.free(active_fix.instances[-1]);
-					active_fix.instances.erase(-1);
-				}
-				start_index = active_fix.instances.size();
-			
-			index_counter = start_index;
-			
-			//Potentially update changed names
-			for(j = 0; j < start_index; j++) {
-				
-				inst = instances[j];
-				inst_entry_name = instances[j].name ?? pure_name;
-				
-				if(inst.batch_index ?? false)
-					if(!instances[j].name)
-						inst_entry_name += " #"+(index_counter);
-					inst_entry_name += " ("+inst.batch_index+")";
-				else
-					if(!instances[j].name)
-						inst_entry_name += " #"+(index_counter+1);
-					index_counter++;
-				active_fix.instances[j].title(inst_entry_name);
-			}
-			
-			for(j = start_index; j < instances.size(); j++) {
-				inst = instances[j];
-				inst_entry_name = instances[j].name ?? pure_name;
-				
-				if(inst.batch_index ?? false)
-					if(!instances[j].name)
-						inst_entry_name += " #"+(index_counter);
-					inst_entry_name += " ("+inst.batch_index+")";
-				else
-					if(!instances[j].name)
-						inst_entry_name += " #"+(index_counter+1);
-					index_counter++;
-
-				inst_entry = entry.collapsable(inst_entry_name);
-				inst_content = inst_entry.content().layout(nanogui.layout_vertical());
-				active_fix.instances.push_back(inst_entry);
-				
-				if(!active_fix.instances_controls)
-					active_fix.instances_controls = [];
-				active_fix.instances_controls.push_back([]);
-				
-				offset = 0;
-				control_index = 0;
-				
-				for(k = 0; k < conf.channels.size(); k++) {
-					chan = conf.channels[k];
-					for(h = 0; h < chan.batch_count; h++) {
-						ctrl_name = chan.name;
-						if(h > 0)
-							ctrl_name += " (" + (h+1) + ")";
-						
-						dimmer_ctrl = active_fix.dimmer_controls[control_index];
-						flasher_ctrl = active_fix.flasher_controls[control_index];
-						
-						if(chan.type == "8-bit") {
-							ctrl = inst_content.controlslider(ctrl_name, chan.name + "_" + k + "_" + j);						
-							ctrl.callback([this, inst, offset, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;								
-								//First scale based on dimmer here
-								v = v * dimmer_ctrl.value();
-								//Check if flasher is active and override value if so, ignoring dimmer...
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset, v * 255.0);
-							});
-							
-							active_fix.instances_controls[-1].push_back(ctrl);
-							flasher_ctrl.target_ctrls.push_back(ctrl);
-						}
-						else if(chan.type == "16-bit") {
-							ctrl = inst_content.controlslider(ctrl_name, chan.name + "_" + k + "_" + j);
-							ctrl.callback([this, inst, offset, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;
-								
-								v = v * dimmer_ctrl.value();							
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();
-								value_16bit = v * 65535.0;
-								current_coarse = std.int(value_16bit / 256.0);
-								current_fine = std.int(math.mod(value_16bit,256.0));
-
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset, current_coarse);
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset+1, current_fine);
-							});
-							
-							active_fix.instances_controls[-1].push_back(ctrl);
-							flasher_ctrl.target_ctrls.push_back(ctrl);
-						}
-						else if(chan.type == "RGB") {
-							ctrl_group = chan.name + "_" + k + "_" + j;
-							
-							rgb_vec = inst_content.controlvector(ctrl_name, ctrl_group);
-							color_selector = rgb_vec.color_selector();
-							
-							r_comp = rgb_vec.controlslider("R", ctrl_group);
-							g_comp = rgb_vec.controlslider("G", ctrl_group);
-							b_comp = rgb_vec.controlslider("B", ctrl_group);
-							
-							active_fix.instances_controls[-1].push_back(r_comp);
-							active_fix.instances_controls[-1].push_back(g_comp);
-							active_fix.instances_controls[-1].push_back(b_comp);
-							flasher_ctrl.target_ctrls.push_back(r_comp);
-							flasher_ctrl.target_ctrls.push_back(g_comp);
-							flasher_ctrl.target_ctrls.push_back(b_comp);
-							
-							color_selector.on_color_change([r_comp,g_comp,b_comp](col) {
-								r_comp.value(col.x);
-								g_comp.value(col.y);
-								b_comp.value(col.z);
-							});
-							
-							r_comp.callback([this, inst, offset, color_selector, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;	
-								v = v * dimmer_ctrl.value();							
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();	
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset, v * 255.0);
-							});
-							g_comp.callback([this, inst, offset, color_selector, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;
-								v = v * dimmer_ctrl.value();							
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();	
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset+1, v * 255.0);
-							});
-							b_comp.callback([this, inst, offset, color_selector, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;	
-								v = v * dimmer_ctrl.value();							
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();	
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset+2, v * 255.0);
-							});
-						}						
-						else if(chan.type == "RGBW") {
-							ctrl_group = chan.name + "_" + k + "_" + j;
-							
-							rgb_vec = inst_content.controlvector(ctrl_name, ctrl_group);
-							color_selector = rgb_vec.color_selector();
-							
-							r_comp = rgb_vec.controlslider("R", ctrl_group);
-							g_comp = rgb_vec.controlslider("G", ctrl_group);
-							b_comp = rgb_vec.controlslider("B", ctrl_group);
-							w_comp = rgb_vec.controlslider("W", ctrl_group);
-							
-							active_fix.instances_controls[-1].push_back(r_comp);
-							active_fix.instances_controls[-1].push_back(g_comp);
-							active_fix.instances_controls[-1].push_back(b_comp);
-							active_fix.instances_controls[-1].push_back(w_comp);
-							flasher_ctrl.target_ctrls.push_back(r_comp);
-							flasher_ctrl.target_ctrls.push_back(g_comp);
-							flasher_ctrl.target_ctrls.push_back(b_comp);
-							flasher_ctrl.target_ctrls.push_back(w_comp);
-							
-							color_selector.on_color_change([r_comp,g_comp,b_comp,w_comp](col) {
-								w = math.min(col.x, math.min(col.y, col.z));
-								
-								r_comp.value(col.x - w);
-								g_comp.value(col.y - w);
-								b_comp.value(col.z - w);
-								w_comp.value(w);
-							});
-							
-							w_comp.callback([this, inst, offset, color_selector, dimmer_ctrl, flasher_ctrl](v){
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-									if(!inst.device)
-										return;	
-								v = v * dimmer_ctrl.value();							
-								if(flasher_ctrl.btn.value())
-									v = flasher_ctrl.ctrl.value();		
-								inst.device.set_artnet_channel(inst.universe, inst.start_channel+offset+3, v * 255.0);
-							});			
-
-							update_rgbw = [this, inst, offset, r_comp, g_comp, b_comp, w_comp, dimmer_ctrl, flasher_ctrl](v) {
-								r = r_comp.value();
-								g = g_comp.value();
-								b = b_comp.value();
-
-								w = math.min(r, g, b);
-								
-								w_comp.value(w);
-
-								if(!inst.device)
-									if(inst.device_mac)
-										inst.device = this.engine.net.find_artnet_device(inst.device_mac);
-										if(inst.device)
-											inst.device_ip = inst.device.ip();
-
-								if(!inst.device)
-									return;
-								
-								r = (r - w) * dimmer_ctrl.value();
-								g = (g - w) * dimmer_ctrl.value();
-								b = (b - w) * dimmer_ctrl.value();
-						
-								if(flasher_ctrl.btn.value())
-									r = 0;
-									g = 0;
-									b = 0;
-	
-								inst.device.set_artnet_channel(
-									inst.universe,
-									inst.start_channel + offset,
-									r * 255.0
-								);
-
-								inst.device.set_artnet_channel(
-									inst.universe,
-									inst.start_channel + offset + 1,
-									g * 255.0
-								);
-
-								inst.device.set_artnet_channel(
-									inst.universe,
-									inst.start_channel + offset + 2,
-									b * 255.0
-								);
-							};
-
-							r_comp.callback(update_rgbw);
-
-							g_comp.callback(update_rgbw);
-
-							b_comp.callback(update_rgbw);
-						}
-						else
-							std.error("Unrecognized fixture channel type: ", chan.type);
-						
-						control_index++;
-						offset += chan.byte_count;
-					}
-				}
+				bytes = slot.kind == "16-bit" ? 2 : 1;
+				ctrl = inst_content.controlslider(slot.name, group);
+				ctrl.callback([this, id, offset, slot_index, bytes, full](v) {
+					f = patch_find(this.engine.patch, id);
+					if(f)
+						this.write(f, offset, this.out_value(f, this.types[f.type], slot_index, v, full), bytes);
+				});
+				lamp.controls.push_back(ctrl);
 			}
 		}
+		return lamp;
+	}
+
+	lamp_title(f) {
+		if(!f.node)
+			return f.name + "  (no node)";
+		return f.name + "  " + patch_address_text(f);
+	}
+
+	//Brings the menu in line with the patch: new types and lamps are added, deleted ones removed, a lamp whose type changed
+	//(or whose fixture file was edited) is built again, the others keep their controls
+	build_fixture_menu() {
+		if(!engine || !engine.patch || !fixture_controls)
+			return;
+		p = engine.patch;
+
+		//Lamps that are gone, or whose type changed
+		for(i = lamps.size() - 1; i >= 0; i--) {
+			id = lamps.key(i);
+			f = patch_find(p, id);
+			lamp = lamps[i];
+			if(!f || f.type != lamp.type || patch_type(f.type).signature != lamp.signature) {
+				std.free(lamp.entry);
+				lamps.erase(id);
+				highlight.erase(id);
+			}
+		}
+
+		//Types without lamps, or whose file changed
+		for(i = types.size() - 1; i >= 0; i--) {
+			path = types.key(i);
+			used = patch_fixtures_of_type(p, path).size() > 0;
+			if(!used || patch_type(path).signature != types[i].signature) {
+				for(j = lamps.size() - 1; j >= 0; j--) {
+					if(lamps[j].type == path) {
+						std.free(lamps[j].entry);
+						lamps.erase(j);
+					}
+				}
+				std.free(types[i].entry);
+				types.erase(path);
+			}
+		}
+
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			type_entry = types[f.type] ?? None;
+			if(!type_entry)
+				type_entry = build_type(f.type);
+			lamp = lamps[f.id] ?? None;
+			if(!lamp)
+				build_lamp(f, type_entry);
+			else
+				lamp.entry.title(lamp_title(f));
+		}
+
+		//A node may have changed: look the devices up again
+		devices = [];
 	}
 }

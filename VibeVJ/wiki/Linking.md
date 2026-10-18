@@ -54,7 +54,8 @@ project:
 - You can also start from the left notch. The result is the same: the link goes from the row where you start to the
   row where you let go.
 - A control cannot link to itself.
-- A new link has the type *Absolute*. Change it in the options: see [Link types](#link-types).
+- A new link between a slider and a slider, button or combo box gets the type *Normalized* (the place in the range is what
+  counts); every other new link is *Absolute*. Change it in the options: see [Link types](#link-types).
 - While you drag, only the cable you drag is drawn. To see the others, turn on the [cable view](#seeing-your-links).
 
 ### Hold and drag

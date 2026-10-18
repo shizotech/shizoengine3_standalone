@@ -39,6 +39,12 @@ engine/
 │   └── videorouter.shio
 ├── migrate/
 │   └── migrate.shio               # Format of projects and presets on disk, steps from older formats (#386)
+├── patch/                         # The fixture setup as data (#439), no UI
+│   ├── patch.shio                 # Lamps (node > universe > address), groups, nodes: engine.patch
+│   ├── ledmap.shio                # LED positions and DMX addresses of the LEDMapper
+│   ├── dmx.shio                   # Who sends to which channels, channels written twice (#440)
+│   ├── patch_ai.shio              # The fixture setup's AI queries: engine.patch_ai, live_path fixture_setup (#440)
+│   └── palette.shio
 └── processes/                     # Subprocess code (DO NOT CHANGE)
     ├── audio_process.shio         # Audio processing subprocess
     └── monitor_process.shio       # Monitor processing subprocess
@@ -68,6 +74,13 @@ generator.register("set_split", [size = "&float(0,1): Normalized split position"
   `engine.ai_activity` and shown in both tabs ("AI control").
 - All interfaces are listed in `engine.ai_interfaces`. Asset modules include the engine files into their
   own `std.module()`, so shared state lives on the engine object, not in file globals.
+- The fixture setup is no generator but has an interface too: `engine.patch_ai` (`patch/patch_ai.shio`),
+  live_path `fixture_setup`. Its queries list, add, change and remove lamps, groups and nodes of the patch and
+  report channels written twice (`patch/dmx.shio`: lamps and the segments every LEDMapper publishes). The Chat
+  reaches it with the tool `vibevj_fixture_setup`, MCP clients with its query tools (`list_fixtures`, ...);
+  a query tool without a live_path goes to the only generator that has that query. Writes change
+  `engine.patch` at once and call `engine.patch_changed()` at the end of the frame (`patch_changed_soon()`),
+  not from the query's thread.
 
 The MCP tab runs the server on a configurable port (default 13340, `configs/mcp_server.json`):
 `http://localhost:<port>/mcp` (Streamable HTTP) and `/sse` (HTTP+SSE). Each query name becomes a tool
@@ -78,7 +91,7 @@ the layout runs) and `vibevj_list_links` (every link between controls with both 
 `nanogui.cable_place`, the type and the values; optional `filter`). "Pause" rejects every request, "Allow changes"
 off rejects every write.
 
-Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio` (repo root, no GUI needed), and the Linux smoke test
+Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio`, `_testing/patch_ai.shio` (repo root, no GUI needed), and the Linux smoke test
 `_testing/linux_app/smoke.py`, which drives the running app and checks it through this server (#385).
 
 ## Components

@@ -132,6 +132,10 @@ The sidebar has four tabs. The project actions and the settings are not here: th
 
 Next time, one click on *Connect* is enough.
 
+The chat works on the generator you clicked last, and on the [fixture setup](Output-and-Devices.md#set-up-your-lamps)
+without a click: its lamps, groups, nodes and DMX addresses, and the channels that are used twice. An AI tool on the
+*MCP* tab gets the same (the generator `fixture_setup` in its list).
+
 ## Views and tabs
 
 The big area on the right has the view tabs of the top bar. A view tab starts as one empty *area*. An area holds one

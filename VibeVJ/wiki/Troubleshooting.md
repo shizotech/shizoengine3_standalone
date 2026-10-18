@@ -106,19 +106,20 @@ The line under *Source* says what is heard: see [Audio](Audio.md#source).
 
 ## ESP32 not found
 
-Prolink Bridge and Prolink Decks show the state of the ESP32 in a status line. Audio Input Analysis has its own,
-shorter messages (the last two rows).
+Prolink Bridge and Prolink Decks show the state of DJ Watch (the ESP32 box in the DJ network) in a status line. Audio
+Input Analysis has its own, shorter messages (the last two rows).
 
 | Message | What to do |
 |---|---|
-| "No ESP32 found (USB cable, CH343 driver?)" | Check the USB cable and install the CH343 driver. Or type the port into *Port*. |
+| "No DJ Watch found (USB cable, CH343 driver?)" | Check the USB cable and install the CH343 driver. Or type the port into *Port*. |
 | "Port busy (is bridge.py or a serial monitor running?)" | Close the other program that uses the port. |
 | "Permission denied (add the user to the dialout group)" | Linux: add your user to the group *dialout*, then log in again. |
-| "Lost the ESP32 (cable unplugged or restart)" | Plug it in again. VibeVJ reconnects by itself. |
+| "Lost the DJ Watch (cable unplugged or restart)" | Plug it in again. VibeVJ reconnects by itself. |
 | "Waiting for the relay (ShizoNet)" or "No data from the relay (ShizoNet)" | Source *Network*: the relay ESP32 is not on the same network as VibeVJ, or it is off. Check that [*Shizonet*](Output-and-Devices.md#shizonet) is on in *Devices* › *Network*. |
-| "Connected, no tempo master" | Prolink Bridge is connected, but no CDJ is tempo master. Make a deck master on the CDJs. |
-| "ESP32 not connected" | Audio with *ESP32 (USB)*: the board is not connected. See the first row. |
-| "No audio from the ESP32 (firmware: audio mic\|line)" | Audio: the board sends no audio. Turn audio on in the firmware (command "audio mic" or "audio line"). |
+| "Connecting to DJ Watch…" | VibeVJ is still looking for the box. If it stays, see the rows above. |
+| "DJ Watch connected, no tempo master" | Prolink Bridge is connected, but no CDJ is tempo master. Make a deck master on the CDJs. |
+| "DJ Watch not connected" | Audio with *DJ Watch (USB)*: the board is not connected. See the first row. |
+| "No audio from DJ Watch (firmware: audio mic\|line)" | Audio: the board sends no audio. Turn audio on in the firmware (command "audio mic" or "audio line"). |
 
 ## A video does not play
 
@@ -161,10 +162,15 @@ More on [MIDI](MIDI.md).
 ## Lights do not react (Art-Net, fixtures)
 
 1. In *Devices* › *Network* › *Artnet*, check that the node is listed. If not, VibeVJ cannot see it on the network.
-2. In the [fixture setup](Output-and-Devices.md#set-up-your-lamps), every lamp needs a node in *Select Target*, the
-   right *Uni* and *Adr*.
+2. In the [fixture setup](Output-and-Devices.md#set-up-your-lamps), every lamp needs a node, the right *Universe* and
+   *Address*. Red lamps have a problem: point at them in the list to see which. *Highlight* lights the selected lamps
+   to check the address.
 3. In *Devices* › *Fixtures*, check that the *Dim* sliders are not at 0.
-4. In *ArtnetSender*, pick the node in the list at the top. Values are sent once the node is found; move the slider
+4. LEDMapper: the group needs a node; *Test* lights the selected segment white. A strip that shows wrong colours needs
+   another *Colours* order (many are *GRB*). A red segment shares its channels with something else (another segment,
+   another LEDMapper or a lamp of the fixture setup): its settings say with what. Two senders on one channel flicker
+   between their values.
+5. In *ArtnetSender*, pick the node in the list at the top. Values are sent once the node is found; move the slider
    again.
 
 ## A tooltip is in the way

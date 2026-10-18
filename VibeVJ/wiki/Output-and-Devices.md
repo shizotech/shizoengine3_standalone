@@ -102,46 +102,114 @@ For whole lamps instead of single channels, use fixtures.
 
 ## Fixtures
 
-Fixtures are lamps described by a file in `Fixtures` of the *Assets* tab (`Bars`, `MovingHeads`, `Pars` and some
-examples). Set them up once per project.
+Fixtures are lamps: a par, a moving head, a pixel bar. Each kind of lamp is described once by a file in `Fixtures` of
+the *Assets* tab (`Bars`, `MovingHeads`, `Pars` and some examples). The lamps of your rig are set up once per project
+in the fixture setup, and saved with the project.
+
+A lamp is addressed the way it is set on the lamp: a node, a universe and a DMX start address. There are no internal
+universes or patch layers in between.
 
 ### Set up your lamps
 
-1. In the tab *Assets*, open `Fixtures` and double-click *Setup.menu*. The fixture setup opens in a new tab.
-2. Drag a fixture file from `Fixtures` onto "Drop fixtures here" on the left, or onto the grid.
-3. Click the fixture name. Its settings open on the right.
-4. Set *Total count*, or click *Add New Instance* for each lamp of this type.
-5. For each lamp: type a name, pick the Art-Net node in *Select Target*, set *Uni* (universe 0–15), *Adr* (start
-   address 1–512) and *Count* (several identical lamps at following addresses).
-6. Move the lamps on the grid in the middle to where they hang. They snap to a grid.
+![The fixture setup: fixture types and lamps on the left, the stage plan in the middle, the lamp settings on the right, the universe map below](media/fixture-setup.png)
 
-The setup is saved with the project.
+1. In the tab *Assets*, open `Fixtures` and double-click *Setup.menu*. The fixture setup opens in a new tab.
+2. Your Art-Net nodes are listed on the right under *Nodes* as soon as they answer. A node that does not answer
+   ArtPoll (or is not on the network yet): *Add node by IP*, with its IP address and a name.
+3. In *Fixture types* on the left, click a type, set *Count* and click *Add lamps*. Or drag the type onto the plan.
+   New lamps get the next free channels of the node you picked last, one after the other.
+4. Click a lamp on the plan or in the list *Lamps*. On the right: *Name*, *Node*, *Universe* and *Address*.
+   *Next free address* moves it to the first channels nobody else uses.
+5. Move the lamps on the plan to where they hang: drag them, *Row*, *Grid* or *Circle* for the selected lamps. The plan
+   is the stage seen from above, the audience at the bottom, one square a metre.
+
+| On the plan | What it does |
+|---|---|
+| Click | Selects a lamp |
+| Shift+click, or a box dragged on the empty plan | Selects more lamps. The numbers show the order you picked them in |
+| Drag a lamp | Moves the selected lamps (in quarter metres while *Snap* is on) |
+| Scroll, right mouse button | Zoom, move the plan. *Fit* shows all lamps |
+| Delete, Ctrl+D, Ctrl+A, Esc | Remove, duplicate, select all, select none |
+
+With several lamps selected, *Node*, *Universe* and *Start address* go to all of them: *Address in order* gives them
+addresses one after the other in the order you picked them.
+
+**Problems are red.** Two lamps on the same channels, a lamp past channel 512 or without a node are red in the list
+and on the plan, and the top right says how many lamps need attention. A lamp is also red when a segment of a
+[LEDMapper](#ledmapper) writes its channels without being meant for it (a segment or group whose *Lamp* is that lamp
+is fine). The *universe map* at the bottom shows the 512 channels of the universe of the selected lamp: each lamp has
+its own colour, the selected ones are highlighted, channels a LEDMapper sends to are grey, red channels are used twice.
+Point at a channel to see who uses it, lamps and LEDMapper segments; click it to select that lamp.
+
+**Find a lamp in the rig.** Switch on *Highlight*: the selected lamps go to full (white, intensity full). Select other
+lamps and they light up instead. Off: back to their values.
+
+**With the AI.** The *Chat* and an AI tool connected over the *MCP* tab can work on the fixture setup too: list, add,
+address, move, group and remove lamps, add nodes by IP, show a universe and find channels that are used twice ("put
+eight hexapads on the truss node from address 1 and make a group of them"). See [The screen](The-Screen.md#chat-tab).
+
+**Groups.** *New group from selection* makes a group of the selected lamps, in the order you picked them: that order
+is the order of a [Phaser](#effects-over-fixtures). ✓ selects the lamps of a group, ⟳ replaces them by the selection.
 
 ### Play them
 
-The lamps then appear in the tab *Devices*, section *Fixtures*:
+![Devices, Fixtures: one section per fixture type with Dimmers and Flashers, then one per lamp](media/devices-fixtures.png)
+
+The lamps appear in the tab *Devices*, section *Fixtures*, one section per fixture type:
 
 | Part | What it does |
 |---|---|
 | *Dimmers* | One *Dim* slider per channel. Scales that channel on every lamp of this type. |
 | *Flashers* | A slider and a *Flash* button per channel. While *Flash* is held, every lamp takes the slider value on that channel. |
-| One section per lamp | A slider per channel. A colour channel has a colour picker; an RGBW colour has sliders for red, green, blue and white. |
+| One section per lamp | Its name and address, then a slider per channel. A colour channel has a colour picker; an RGBW colour has sliders for red, green, blue and white. |
 
 Every slider has notches: [link](Linking.md) it to an LFO or the [audio analysis](Audio.md), or map it to
-[MIDI](MIDI.md).
+[MIDI](MIDI.md). Links and MIDI mappings stay when you re-address or move a lamp.
 
 ### Make a fixture file
 
 *Editor.menu* in `Fixtures` opens the fixture editor.
 
-1. Click *Create new fixture*. Double-click its name to rename it.
+1. Click *Create new fixture*. Double-click its name to rename it (lamps of that type follow the new name).
 2. Click the fixture, then *Add Channel* for each channel, in the order of the DMX chart of the lamp.
-3. Give each channel its type: *8-bit*, *16-bit*, *RGB* or *RGBW*.
+3. Give each channel its type: *8-bit*, *16-bit*, *RGB* or *RGBW*, and a count for channels that repeat (the 8
+   pixels of a bar: one *RGB* channel with a count of 8).
+
+Lamps of the type in the fixture setup take the change at once.
 
 ### Effects over fixtures
 
-*Phaser* in `FixturesEffects` runs one value over many lamps: *Add Target* picks a fixture and a channel, and the
-list *INDEX* / *CENTER UV* / *LEFT UV* / *RIGHT UV* sets how the value is spread over the lamps.
+![The Phaser: a plan of the lamps lit by their values on the left, the phasers on the right, one with its settings open](media/phaser.png)
+
+The *Phaser* in `FixturesEffects` runs a wave over the lamps of a group: each lamp a bit later than the one before. It
+uses the words of a lighting desk: wave, speed, phase, width, wings.
+
+1. Drag *Phaser* into a view and click *Add phaser*.
+2. *Lamps*: a group of the fixture setup, or all lamps of a type. *Attribute*: the channel it moves, such as *DIMMER*,
+   *PAN* or a colour.
+3. Pick the *Wave* and how fast it runs (*Beats* per cycle: it follows the BPM of the [timeline](Timeline.md)).
+4. *Phase* spreads the wave over the lamps: 0° all together, 360° one wave from the first lamp to the last.
+
+| Setting | What it does |
+|---|---|
+| Level slider (the row) | 0 holds the lamps at *Low*, 1 runs the full wave. Link or map it like any slider. |
+| *Wave* | *Sine*, *Triangle*, *Ramp up*, *Ramp down*, *Square*, *Pulse*, *Random*, or *Input* (below). |
+| *Beats* | Length of a cycle in beats. |
+| *Phase* | Degrees of the wave spread over the lamps. 720 makes two waves. |
+| *Spread* | Which lamp comes first: *In order* (the order of the group), *From the middle*, *Left to right*, *Right to left*, *Back to front*, *Front to back*, *Outside in*. The directions use where the lamps hang on the plan. |
+| *Width* | The part of a cycle the wave runs; the rest of it the lamp stays at *Low*. A *Pulse* with a small width is a chase. |
+| *Low*, *High* | The values at the bottom and the top of the wave. |
+| *Wings* | Mirrors the phase: with 2 wings the second half of the lamps runs the other way. |
+| *Start device*, *End device* | Only the lamps from … to … of the group (counted from 0, *End device* -1: to the last). |
+| *Auto Mirror X* / *Y* | Lamps left of (behind) the middle of the stage get the mirrored value: pan and tilt move symmetrically. |
+| *Priority* (top) | When two phasers move the same channel, the higher priority wins. |
+
+The bars under each row show what it sends to each lamp; the plan on the left shows the lamps of the phaser whose
+settings are open, lit by their values.
+
+**Input.** With the wave *Input* the Level slider is the value that runs over the lamps, each lamp *Phase Delay* beats
+later than the first. Put an LFO or the audio analysis into the area on the left of the Phaser and link it into the
+slider. This is what the Phaser did before; phasers of older projects keep doing it.
 
 ## Mapping
 
@@ -151,7 +219,7 @@ for.
 | Generator | What it is for |
 |---|---|
 | *MapLab* | Projection mapping with several inputs, slices and outputs: cut slices out of the inputs, place and warp them with a grid, mask them, blend their edges. Each output has an *OUT* port and goes to a display, Spout, NDI or a video router: see [the outputs of MapLab](#the-outputs-of-maplab). |
-| *LEDMapper* | Draws LED segments over a video input, groups them into scenes and sends the colours to Art-Net nodes or fixtures. |
+| *LEDMapper* | LED strips, bars and matrices drawn over a picture; their colours go to Art-Net nodes or to lamps of the fixture setup. See [LEDMapper](#ledmapper). |
 | *MaskTransform* | One mask or warp surface between an *IN* and an *OUT*. |
 
 Their inputs list every picture that is offered by a *Video router*: a shader, a [video](Video.md#controls) or a
@@ -178,13 +246,69 @@ router). Click an entry to see its controls; × removes it. The effects are save
 
 **LED mapping of an output.** *LED mapping* adds a *LEDMapper* to the effects of the output and opens them: it gets
 the picture of this output (after the effects before it), maps its LEDs from it and passes the picture on unchanged.
-How the LEDMapper works: see the table above. A second click adds a second LEDMapper, for example for another set of
-nodes.
+How the LEDMapper works: see [LEDMapper](#ledmapper). A second click adds a second LEDMapper, for example for
+another set of nodes.
+
+### LEDMapper
+
+![The LEDMapper: the layout and the library on the left, the picture with a line, a curve and a matrix in the middle, the settings of the selected segment on the right](media/ledmapper.png)
+
+The LEDMapper takes the colours for your LEDs from a picture. Each **segment** is one strip with its own number of
+LEDs, drawn where it is in the picture: a line, a curve, or a matrix with several rows. A **group** is what one node
+gets (its segments one after the other), a **scene** is a set of groups with a master.
+
+1. Pick the picture in *Input* (every shader, video or receiver whose *Video router* is on).
+2. Choose *Line* or *Curve* in the toolbar and drag on the picture. A scene and a group are made for the first
+   segment; the group goes to the first node found.
+3. Click the segment: on the right set *LEDs*, *Rows* (a matrix), *Colours* (the order of the colour channels; many
+   strips are *GRB*) and *White channel* for RGBW LEDs.
+4. Click its group in the *Layout* on the left: *Node*, *Universe* and *Address* of the first LED. The segments of a
+   group follow one after the other.
+5. Switch on *Test*: the selected segment, group or scene is white on the real LEDs and everything else black, to find
+   a strip in the rig.
+
+| On the picture | What it does |
+|---|---|
+| *Select* (V) | Click a segment to pick it. Drag it, its ends, or the square handle of a curve. Delete removes it, Ctrl+D duplicates it, R reverses it. |
+| *Line* (L), *Curve* (C) | Drag to draw a segment into the selected group. Its LEDs and colours are those of the segment before. |
+| *Transform* (T) | Moves and scales the whole selected group (drag the corners or the middle); *Angle* in its settings turns it. |
+| *Snap*, grid | Ends snap to a grid of this many cells across the picture. |
+| *Addresses* | Shows the first and the last DMX address of each segment. |
+
+**Where the data starts.** The big dot is the first LED, the arrow the direction of the data. *Reverse* (R) turns it
+around; *Zigzag rows* makes every second row of a matrix run back, as most LED panels are wired.
+
+**Addresses.** The first and last address of the selection are under its settings. A segment can have its *Own
+address* (the next ones follow it). *Spacing* in the group: 0 = each segment right after the one before, otherwise
+the channels from the start of one segment to the start of the next (512: a universe each). *Whole pixels per
+universe* fills a universe with whole LEDs only (170 RGB, 128 RGBW), as many nodes expect. A segment is red when
+another one writes the same channels of its node: in this LEDMapper, in another LEDMapper, or a lamp of the
+[fixture setup](#set-up-your-lamps) it is not meant for. The status under the picture counts them, and the settings
+of the segment say what it overlaps with.
+
+**Lamps of the fixture setup.** A group's *Output* can be a *Lamp of the setup* instead of a node, and a segment can
+have a *Lamp*: the address then comes from the lamp and follows it when you re-address the lamp. *Add these lamps*
+in the settings of a scene makes a group of all lamps of a group or type that have colour channels, one segment per
+lamp, placed as they hang on the stage plan.
+
+**Masters and switching off.** Under the picture is a *Master* slider per scene (link it or map it to MIDI). The eye
+in the *Layout* switches a scene or group off: it is not sent at all. *Brightness* in a group scales its LEDs.
+
+**Presets.** *Preset* in the settings of a scene, group or segment saves it; the *Library* on the left lists the
+presets: click one to insert it where the selection is. Presets can also be dragged in from the *Assets* tab
+(`Mapping` › `LEDMapper` › `scenes`, `groups`, `segments`).
+
+| Left column | What it does |
+|---|---|
+| *LED Radius* | 0: each LED takes the pixel under it. More: the average of a circle of this many pixels. |
+| *LED Smoothing* | Changes fade over a few frames. |
+| *Analog Mode* | Smoothing like a light bulb: up quickly, down slowly. |
+| *Width*, *Height* | Size of the picture the segments are drawn on. |
 
 ## Prolink (CDJs)
 
-Two generators in `Generators` › `Network` read the CDJs through a prolink-bridge ESP32. Both use the same
-connection.
+Two generators in `Generators` › `Network` read the CDJs through **DJ Watch**, a small ESP32 box in the DJ network
+(`dj-watch.local`; it was called prolink-bridge before). Both use the same connection.
 
 - **Prolink Bridge** (*ProlinkBridge*) gives the values of the tempo master deck: BPM, beat and bar, beat and downbeat
   pulses, beats to the next cue, cue ramp, drop pulse, progress, playing, on air, master deck, and *Low* / *Mid* /
@@ -198,16 +322,26 @@ connection.
     *On air*, *Phrase ramp*, *Buildup* and *Drop*. These are [pure outputs](Linking.md#pure-outputs): link from them,
     not into them.
   - The section *History* lists the tracks that were played, with *Save CSV*, *Save TXT* and *Clear*.
+  - *Time display* (section *Settings*) shows the *Remaining* time of each track (default) or the *Elapsed* time.
+  - Next to the BPM of each deck the words *On air* (green, needs a mixer on the network), *Master* and *Sync*; a green
+    ▶ before the time while a deck plays.
+  - *Style* changes the colours of the waveforms (*CDJ* or *VibeVJ*); the background, texts and badges look like the
+    rest of VibeVJ in both.
   - Keys on its picture: H shows the history, + and - zoom, 0 resets the zoom.
+  - *Output* sets the size of the picture: fixed sizes from 1920 x 1080 to 3840 x 1080 and flat strips, *Custom*
+    (*Width (px)* and *Height (px)*) or *Fit window* (the shape of the generator window, *Height (px)* high). The picture in the
+    window takes the whole width of the window.
+  - *Zoom* is the time across the waveforms at a width of 1920 px. A wider output shows more seconds at the same speed,
+    most of them ahead of the playhead. The zoom bar under the picture shows the seconds you see.
 
-*Source* (in the section *Settings*) is *USB* (finds the ESP32 by itself, or set *Port*), *Demo* (plays a recorded
-set, no hardware) or *Network* (a relay ESP32 over ShizoNet). The line at the top shows the connection or what is
-wrong: the messages are on [Troubleshooting](Troubleshooting.md#esp32-not-found).
+*Source* (in the section *Settings*) is *USB* (finds DJ Watch by itself, or set *Port*), *Demo* (plays a recorded
+set, no hardware) or *Network* (a relay ESP32 over ShizoNet). The line at the top shows the connection ("DJ Watch
+connected") or what is wrong: the messages are on [Troubleshooting](Troubleshooting.md#esp32-not-found).
 
 ## Shizonet
 
 *Devices* › *Network* › *Shizonet* switches ShizoNet on or off (on at the start). Off stops VibeVJ from looking for
-ShizoNet devices and from talking to them; Art-Net keeps running. ShizoNet is used by the ESP32 sources of
+ShizoNet devices and from talking to them; Art-Net keeps running. ShizoNet is used by the DJ Watch sources of
 [Audio](Audio.md#source) and Prolink when they come over the network.
 
 ## See also

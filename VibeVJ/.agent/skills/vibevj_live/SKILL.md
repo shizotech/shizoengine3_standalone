@@ -72,6 +72,25 @@ You can get and set attribute controls just like any other regular control.
 
 # fixtures
 
+## The fixture setup (the lamps of the rig)
+
+Use the tool 'vibevj_fixture_setup(action, args)' for the lamps, groups and Art-Net nodes. You do not need a focus for it.
+
+- 'list_queries' lists every action with its arguments.
+- Lamps and groups are named by their id or their name, nodes by MAC, IP or name, fixture types by path or name.
+- 'list_fixtures' / 'list_fixture_types' / 'list_fixture_groups' / 'list_artnet_nodes' show what is there.
+- 'add_fixtures' adds lamps at the next free DMX addresses (or at 'address'), optionally into a group.
+- 'set_fixture' changes one lamp; 'address_fixtures' addresses lamps one after the other; 'arrange_fixtures' places them
+  on the stage plan (row, grid, circle); 'remove_fixtures' removes them.
+- 'add_fixture_group' / 'set_fixture_group' / 'remove_fixture_group': groups are ordered, the order is the order of a
+  Phaser.
+- 'get_dmx_universe' shows what uses the 512 channels of a universe of a node; 'get_dmx_conflicts' lists every place where
+  two senders (lamps, LEDMapper segments) write the same channels. Check it after you changed addresses and tell the user
+  about conflicts.
+- 'highlight_fixtures' lights lamps at full so the user finds them in the rig (empty list: off).
+
+## Fixture types
+
 Fixture definitions are located in assets/Fixtures using a simple json scheme
 To get an overview of the exact format and possible channel definitions, look at assets/Fixtures/example.json which showcases all possibilities
 You can create new fixtures there using regular file operation tools

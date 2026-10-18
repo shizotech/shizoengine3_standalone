@@ -1,0 +1,463 @@
+//What the LEDMapper sends where (#439): LED positions of segments and the DMX addresses of each LED. No UI: the
+//LEDMapper asset draws and edits, this builds; _testing/ledmap.shio checks it.
+//
+//Needs engine/patch/patch.shio included before it (lamps as targets).
+//
+//Layout (the LEDMapper's state, compatible with the one before #439, new keys get defaults):
+//  scenes   = [[id, name, enabled, master, groups = [...]]]
+//  group    = [id, name, enabled, device_mac, target, start_universe, start_channel (0-based), channel_gap, wrap_leds,
+//              max_brightness, transform_uv (4 corners 0..1), transform_angle, segments = [...]]
+//  segment  = [id, name, start_pos, end_pos, control (curve handle), shape ("line" / "curve"), width (LEDs),
+//              height (rows), serpentine, reversed, rgb_type, is_rgbw, universe / channel (-1: after the one before),
+//              custom_device_mac, target]
+//Positions are 0..1 of the picture (x right, y down).
+//- group.target / segment.target "fixture:<id>": a lamp of the patch; node, universe and address come from it (its first
+//  colour channel), so the LEDMapper follows when the lamp is re-addressed in the fixture setup.
+//- channel_gap 0: each segment starts right after the one before; otherwise each starts channel_gap channels after the
+//  start of the one before.
+
+using eigen;
+
+LEDMAP_RGB_TYPES = ["Single channel", "RGB", "RBG", "GRB", "GBR", "BRG", "BGR"];
+
+ledmap_default_transform() {
+	return [[x = 0, y = 0], [x = 1, y = 0], [x = 1, y = 1], [x = 0, y = 1]];
+}
+
+//Missing keys of an older layout (or one from a preset) get their defaults; ids for everything
+ledmap_normalize_segment(seg) {
+	if(!seg.has("id") || !seg.id)
+		seg.id = std.random_hash();
+	if(!seg.has("name"))
+		seg.name = "Segment";
+	if(!seg.has("start_pos") || std.type(seg.start_pos) != "json")
+		seg.start_pos = [x = 0.25, y = 0.5];
+	if(!seg.has("end_pos") || std.type(seg.end_pos) != "json")
+		seg.end_pos = [x = 0.75, y = 0.5];
+	if(!seg.has("shape") || !seg.shape)
+		seg.shape = "line";
+	if(!seg.has("control") || std.type(seg.control) != "json")
+		seg.control = [x = (seg.start_pos.x + seg.end_pos.x) / 2.0, y = (seg.start_pos.y + seg.end_pos.y) / 2.0];
+	if(!seg.has("width") || std.is_none(seg.width))
+		seg.width = 1;
+	if(!seg.has("height") || std.is_none(seg.height))
+		seg.height = 1;
+	if(!seg.has("serpentine"))
+		seg.serpentine = 1;
+	if(!seg.has("reversed"))
+		seg.reversed = 0;
+	if(!seg.has("rgb_type") || std.is_none(seg.rgb_type))
+		seg.rgb_type = 1;
+	if(!seg.has("is_rgbw") || std.is_none(seg.is_rgbw))
+		seg.is_rgbw = 0;
+	if(!seg.has("universe") || std.is_none(seg.universe))
+		seg.universe = -1;
+	if(!seg.has("channel") || std.is_none(seg.channel))
+		seg.channel = -1;
+	if(!seg.has("target"))
+		seg.target = "";
+	return seg;
+}
+
+ledmap_normalize_group(group) {
+	if(!group.has("id") || !group.id)
+		group.id = std.random_hash();
+	if(!group.has("name"))
+		group.name = "Group";
+	if(!group.has("enabled"))
+		group.enabled = 1;
+	if(!group.has("device_mac") || std.is_none(group.device_mac))
+		group.device_mac = "";
+	if(!group.has("target"))
+		group.target = "";
+	if(!group.has("start_universe") || std.is_none(group.start_universe))
+		group.start_universe = 0;
+	if(!group.has("start_channel") || std.is_none(group.start_channel))
+		group.start_channel = 0;
+	if(!group.has("channel_gap") || std.is_none(group.channel_gap))
+		group.channel_gap = 0;
+	if(!group.has("wrap_leds"))
+		group.wrap_leds = 0;
+	if(!group.has("max_brightness") || std.is_none(group.max_brightness))
+		group.max_brightness = 1.0;
+	//Groups saved before the transform existed (#385)
+	if(!group.has("transform_uv") || std.type(group.transform_uv) != "json" || group.transform_uv.size() < 4)
+		group.transform_uv = ledmap_default_transform();
+	if(!group.has("transform_angle") || std.is_none(group.transform_angle))
+		group.transform_angle = 0;
+	if(!group.has("segments") || std.type(group.segments) != "json")
+		group.segments = [];
+	for(i = 0; i < group.segments.size(); i++)
+		ledmap_normalize_segment(group.segments[i]);
+	return group;
+}
+
+ledmap_normalize_scene(scene) {
+	if(!scene.has("id") || !scene.id)
+		scene.id = std.random_hash();
+	if(!scene.has("name"))
+		scene.name = "Scene";
+	if(!scene.has("enabled"))
+		scene.enabled = 1;
+	if(!scene.has("master") || std.is_none(scene.master))
+		scene.master = 1.0;
+	if(!scene.has("groups") || std.type(scene.groups) != "json")
+		scene.groups = [];
+	for(i = 0; i < scene.groups.size(); i++)
+		ledmap_normalize_group(scene.groups[i]);
+	return scene;
+}
+
+ledmap_normalize(scenes) {
+	for(i = 0; i < scenes.size(); i++)
+		ledmap_normalize_scene(scenes[i]);
+	return scenes;
+}
+
+//A copy with new ids (a duplicate, or a preset inserted a second time)
+ledmap_new_ids(node) {
+	if(std.type(node) != "json")
+		return node;
+	if(node.has("id"))
+		node.id = std.random_hash();
+	if(node.has("groups"))
+		for(i = 0; i < node.groups.size(); i++)
+			ledmap_new_ids(node.groups[i]);
+	if(node.has("segments"))
+		for(i = 0; i < node.segments.size(); i++)
+			ledmap_new_ids(node.segments[i]);
+	return node;
+}
+
+// =========================================================================
+// Geometry
+// =========================================================================
+
+ledmap_vec(p) {
+	return vec2f(p.x, p.y);
+}
+
+//Point of the path of a segment at t (0..1): a line, or a curve through its handle (quadratic Bezier)
+ledmap_path_point(seg, t) {
+	a = ledmap_vec(seg.start_pos);
+	b = ledmap_vec(seg.end_pos);
+	if(seg.shape == "curve") {
+		c = ledmap_vec(seg.control);
+		u = 1.0 - t;
+		return a * (u * u) + c * (2.0 * u * t) + b * (t * t);
+	}
+	return a * (1.0 - t) + b * t;
+}
+
+//Points of the path at even distances: n points, the first at the start, the last at the end (one LED: the middle)
+//Returns [[p = vec2f, n = normal vec2f (length 1)], ...]
+ledmap_path_even(seg, n) {
+	list = [];
+	if(n <= 0)
+		return list;
+	steps = seg.shape == "curve" ? 64 : 1;
+	pts = [];
+	lens = [0.0];
+	for(i = 0; i <= steps; i++)
+		pts.push_back(ledmap_path_point(seg, i / std.float(steps)));
+	total = 0.0;
+	for(i = 1; i <= steps; i++) {
+		total += (pts[i] - pts[i - 1]).length();
+		lens.push_back(total);
+	}
+	k = 1;
+	for(i = 0; i < n; i++) {
+		d = n == 1 ? total * 0.5 : total * i / std.float(n - 1);
+		for(k < steps && lens[k] < d)
+			k++;
+		seg_len = lens[k] - lens[k - 1];
+		f = seg_len > 0.0 ? (d - lens[k - 1]) / seg_len : 0.0;
+		p = pts[k - 1] * (1.0 - f) + pts[k] * f;
+		tangent = pts[k] - pts[k - 1];
+		normal = vec2f(tangent.y, 0.0 - tangent.x);
+		if(normal.length() > 0.0)
+			normal.normalize();
+		list.push_back([p = p, n = normal]);
+	}
+	return list;
+}
+
+//Length of the straight line from start to end (the rows of a matrix span as far as the segment is long)
+ledmap_chord(seg) {
+	return (ledmap_vec(seg.end_pos) - ledmap_vec(seg.start_pos)).length();
+}
+
+//The LED positions of a segment in its own coordinates (0..1 of the picture, before the transform of its group), in
+//the order the data runs: rows (height) side by side, every second row back (serpentine), reversed if reversed
+ledmap_segment_leds(seg) {
+	w = math.max(1, std.int(seg.width));
+	h = math.max(1, std.int(seg.height));
+	path = ledmap_path_even(seg, w);
+	leds = [];
+	span = ledmap_chord(seg);
+	for(j = 0; j < h; j++) {
+		off = h == 1 ? 0.0 : (j / std.float(h - 1) - 0.5) * span;
+		back = seg.serpentine && j % 2 == 1;
+		for(i = 0; i < w; i++) {
+			e = path[back ? w - 1 - i : i];
+			leds.push_back(e.p + e.n * off);
+		}
+	}
+	if(seg.reversed) {
+		back = [];
+		for(i = leds.size() - 1; i >= 0; i--)
+			back.push_back(leds[i]);
+		return back;
+	}
+	return leds;
+}
+
+//Into the transform rectangle of the group, turned by its angle around the middle of the rectangle
+ledmap_transform(group, p) {
+	u_min = group.transform_uv[0].x;
+	v_min = group.transform_uv[0].y;
+	u_max = group.transform_uv[2].x;
+	v_max = group.transform_uv[2].y;
+	a = group.transform_angle * math.PI / 180.0;
+	cx = (u_min + u_max) * 0.5;
+	cy = (v_min + v_max) * 0.5;
+	u = u_min + p.x * (u_max - u_min);
+	v = v_min + p.y * (v_max - v_min);
+	dx = u - cx;
+	dy = v - cy;
+	return vec2f(cx + dx * math.cos(a) - dy * math.sin(a), cy + dx * math.sin(a) + dy * math.cos(a));
+}
+
+//Distance from point p to the segment a-b
+ledmap_point_line_distance(a, b, p) {
+	ab = b - a;
+	l2 = ab.x * ab.x + ab.y * ab.y;
+	t = l2 > 0.0 ? math.clamp(((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2, 0.0, 1.0) : 0.0;
+	return (p - (a + ab * t)).length();
+}
+
+// =========================================================================
+// Addresses
+// =========================================================================
+
+//Channels of one LED
+ledmap_led_channels(seg) {
+	if(seg.rgb_type == 0)
+		return 1;
+	return seg.is_rgbw ? 4 : 3;
+}
+
+//Channels of a universe that are used for pixels: with wrap, whole pixels only (512 / 3 -> 170 pixels, 510 channels)
+ledmap_universe_limit(out, wrap) {
+	return wrap ? std.int(512 / out) * out : 512;
+}
+
+//An address [universe, channel (0-based)] as shizonet's set_artnet_buffer() starts writing at it
+ledmap_normalize_address(u, c, out, wrap) {
+	limit = ledmap_universe_limit(out, wrap);
+	return [universe = u + std.int(c / limit), channel = c % limit];
+}
+
+//The address after n LEDs of out channels from (u, c), as set_artnet_buffer() writes them (a pixel that does not fit
+//goes to the next universe when wrap is on)
+ledmap_advance(u, c, n, out, wrap) {
+	a = ledmap_normalize_address(u, c, out, wrap);
+	if(n <= 0)
+		return a;
+	if(!wrap) {
+		total = a.channel + n * out;
+		return [universe = a.universe + std.int(total / 512), channel = total % 512];
+	}
+	limit = ledmap_universe_limit(out, wrap);
+	per = std.int(limit / out);
+	first = std.int((limit - a.channel) / out);
+	if(n <= first)
+		return [universe = a.universe, channel = a.channel + n * out];
+	rest = n - first;
+	full = std.int((rest - 1) / per);
+	last = rest - full * per;
+	return [universe = a.universe + 1 + full, channel = last * out];
+}
+
+//Address of the last channel of n LEDs from (u, c)
+ledmap_last_channel(u, c, n, out, wrap) {
+	start = ledmap_normalize_address(u, c, out, wrap);
+	if(n <= 0)
+		return start;
+	before = ledmap_advance(start.universe, start.channel, n - 1, out, wrap);
+	//the last LED itself starts in a new universe when it does not fit
+	limit = ledmap_universe_limit(out, wrap);
+	if(wrap && before.channel + out > limit)
+		before = [universe = before.universe + 1, channel = 0];
+	return [universe = before.universe, channel = before.channel + out - 1];
+}
+
+//"U0 · 1" (1-based channel as on a node)
+ledmap_address_text(a) {
+	return "U" + a.universe + " · " + (a.channel + 1);
+}
+
+//Where a lamp of the patch starts its pixels: [node, universe, channel (0-based)], None if it is gone or has no colour
+ledmap_fixture_address(patch, target) {
+	if(!patch || !target || !std.string(target).starts("fixture:"))
+		return None;
+	f = patch_find(patch, std.string(target).substr(8));
+	if(!f)
+		return None;
+	slots = patch_pixel_slots(f.type);
+	offset = slots.size() ? slots[0].offset : 0;
+	return [node = f.node, universe = f.universe, channel = f.address - 1 + offset, fixture = f,
+		pixels = slots.size(), rgbw = slots.size() && slots[0].kind == "RGBW"];
+}
+
+// =========================================================================
+// Build
+// =========================================================================
+
+//Everything the LEDMapper needs for a frame, from the layout:
+//  coords = 4 floats per LED (x, y, rgb_type, slot) for the LED shader, in the order of the pixel buffer
+//  runs   = what goes to which node: [node, universe, channel, rgb_type, out, offset (LED), count, wrap, slot]
+//  slots  = one per segment that is sent: [scene, group, segment (indices), id, offset, count, start, last (addresses),
+//           node, gain, leds (positions after the transform, for drawing), out (channels per LED), wrap, lamp (id of the
+//           lamp of the patch the segment or its group is on, "")]
+//  total  = LEDs
+//patch: engine.patch for lamp targets (None in tests without lamps)
+ledmap_build(scenes, patch) {
+	coords = [];
+	runs = [];
+	slots = [];
+	led_offset = 0;
+	for(si = 0; si < scenes.size(); si++) {
+		scene = scenes[si];
+		if(!scene.enabled)
+			continue;
+		for(gi = 0; gi < scene.groups.size(); gi++) {
+			group = scene.groups[gi];
+			if(!group.enabled)
+				continue;
+			node = group.device_mac;
+			u = group.start_universe;
+			c = group.start_channel;
+			lamp = ledmap_fixture_address(patch, group.target);
+			if(lamp) {
+				node = lamp.node;
+				u = lamp.universe;
+				c = lamp.channel;
+			}
+			for(k = 0; k < group.segments.size(); k++) {
+				seg = group.segments[k];
+				out = ledmap_led_channels(seg);
+				seg_node = seg.has("custom_device_mac") && seg.custom_device_mac ? seg.custom_device_mac : node;
+				seg_lamp = ledmap_fixture_address(patch, seg.target);
+				if(seg_lamp) {
+					seg_node = seg_lamp.node;
+					u = seg_lamp.universe;
+					c = seg_lamp.channel;
+				}
+				else {
+					if(seg.universe >= 0)
+						u = seg.universe;
+					if(seg.channel >= 0)
+						c = seg.channel;
+				}
+				start = ledmap_normalize_address(u, c, out, group.wrap_leds);
+				leds = ledmap_segment_leds(seg);
+				n = leds.size();
+				slot = slots.size();
+				placed = [];
+				for(i = 0; i < n; i++) {
+					p = ledmap_transform(group, leds[i]);
+					placed.push_back(p);
+					coords.push_back(p.x);
+					coords.push_back(p.y);
+					coords.push_back(seg.rgb_type);
+					coords.push_back(slot);
+				}
+				runs.push_back([node = seg_node, universe = start.universe, channel = start.channel, rgb_type = seg.rgb_type,
+					out = out, offset = led_offset, count = n, wrap = group.wrap_leds, slot = slot]);
+				meant_for = "";
+				if(seg_lamp)
+					meant_for = seg_lamp.fixture.id;
+				else if(lamp)
+					meant_for = lamp.fixture.id;
+				slots.push_back([scene = si, group = gi, segment = k, id = seg.id, offset = led_offset, count = n, start = start,
+					last = ledmap_last_channel(start.universe, start.channel, n, out, group.wrap_leds), node = seg_node,
+					gain = scene.master * group.max_brightness, leds = placed, out = out, wrap = group.wrap_leds,
+					lamp = meant_for]);
+				led_offset += n;
+				next = None;
+				if(group.channel_gap > 0)
+					next = [universe = start.universe, channel = start.channel + group.channel_gap];
+				else
+					next = ledmap_advance(start.universe, start.channel, n, out, group.wrap_leds);
+				u = next.universe;
+				c = next.channel;
+			}
+		}
+	}
+	return [coords = coords, runs = runs, slots = slots, total = led_offset];
+}
+
+//Two segments that send to the same channels of the same node: [[slot a, slot b], ...]
+ledmap_overlaps(build) {
+	list = [];
+	for(i = 0; i < build.slots.size(); i++) {
+		a = build.slots[i];
+		for(j = i + 1; j < build.slots.size(); j++) {
+			b = build.slots[j];
+			if(!a.node || a.node != b.node)
+				continue;
+			a0 = a.start.universe * 512 + a.start.channel;
+			a1 = a.last.universe * 512 + a.last.channel;
+			b0 = b.start.universe * 512 + b.start.channel;
+			b1 = b.last.universe * 512 + b.last.channel;
+			if(a0 <= b1 && b0 <= a1)
+				list.push_back([a = i, b = j]);
+		}
+	}
+	return list;
+}
+
+//The channels a sent segment writes, per universe: [[universe, first, last (1-based)], ...]. With whole pixels per
+//universe (wrap) the channels after the last whole pixel of a universe stay free.
+ledmap_slot_ranges(slot) {
+	list = [];
+	if(slot.count <= 0)
+		return list;
+	limit = ledmap_universe_limit(slot.out, slot.wrap);
+	a = slot.start;
+	b = slot.last;
+	for(u = a.universe; u <= b.universe; u++) {
+		first = u == a.universe ? a.channel + 1 : 1;
+		last = limit;
+		//with wrap the first universe ends after the last whole pixel from the start on (as ledmap_advance)
+		if(u == a.universe && slot.wrap)
+			last = a.channel + std.int((limit - a.channel) / slot.out) * slot.out;
+		if(u == b.universe)
+			last = b.channel + 1;
+		if(last >= first)
+			list.push_back([universe = u, first = first, last = last]);
+	}
+	return list;
+}
+
+//What a build sends, as ranges for the DMX registry (engine/patch/dmx.shio): label "Scene › Group › Segment", ref the
+//index of the slot, lamp the lamp of the patch it is meant for
+ledmap_dmx_ranges(scenes, build) {
+	list = [];
+	for(i = 0; i < build.slots.size(); i++) {
+		s = build.slots[i];
+		if(!s.node)
+			continue;
+		label = "Segment";
+		if(s.scene < scenes.size() && s.group < scenes[s.scene].groups.size() && s.segment < scenes[s.scene].groups[s.group].segments.size()) {
+			g = scenes[s.scene].groups[s.group];
+			label = scenes[s.scene].name + " › " + g.name + " › " + g.segments[s.segment].name;
+		}
+		parts = ledmap_slot_ranges(s);
+		for(k = 0; k < parts.size(); k++)
+			list.push_back([node = s.node, universe = parts[k].universe, first = parts[k].first, last = parts[k].last,
+				label = label, ref = i, lamp = s.lamp]);
+	}
+	return list;
+}

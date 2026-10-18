@@ -1,0 +1,268 @@
+//Who sends to which DMX channels (#440): the lamps of the fixture setup and everything that writes Art-Net by itself
+//(the segments of every LEDMapper). Finds the channels of a node that two of them write, so the fixture setup, the
+//LEDMappers and the AI interface (engine/patch/patch_ai.shio) can warn about it. No UI; tested in _testing/dmx_usage.shio.
+//
+//Needs engine/patch/patch.shio included before it.
+//
+//The registry lives on the engine (asset modules include this file into their own std.module(), so it is not a global
+//of this file):
+//  holder.dmx_users    = [id -> [id, name, ranges, interface, generator]]   every sender but the lamps of the setup
+//  holder.dmx_revision = goes up when a sender publishes other ranges or goes away
+//  range = [node, universe, first, last (1-based channels of that universe), label (what writes there), ref (what the
+//           sender calls it: the slot of a LEDMapper, the id of a lamp), lamp (the lamp of the setup it is meant for:
+//           its id, or "")]
+//A sender whose generator was closed (its AIInterface is gone) or is switched off sends nothing and is left out.
+
+DMX_SETUP = "setup"; //source of the lamps of the fixture setup
+DMX_UNIVERSE_SIZE = 512;
+
+// =========================================================================
+// Senders
+// =========================================================================
+
+//The lamps of the patch as ranges (a lamp without a node sends nothing, channels past 512 go nowhere)
+dmx_patch_ranges(p) {
+	list = [];
+	for(i = 0; i < p.fixtures.size(); i++) {
+		f = p.fixtures[i];
+		if(!f.node)
+			continue;
+		first = math.max(1, std.int(f.address));
+		last = math.min(DMX_UNIVERSE_SIZE, patch_end(f));
+		if(last < first)
+			continue;
+		list.push_back([node = f.node, universe = std.int(f.universe), first = first, last = last, label = f.name, ref = f.id,
+			lamp = ""]);
+	}
+	return list;
+}
+
+//A sender tells what it writes now (the same ranges again change nothing). interface_id: registry id of the AIInterface
+//of its generator, the sender is gone when that is gone. generator: is_active() false leaves it out.
+//Returns true when the ranges changed.
+dmx_publish(holder, id, name, ranges, interface_id = "", generator = None) {
+	users = holder.dmx_users;
+	if(users.has(id)) {
+		old = users[id];
+		if(old.name == name && old.ranges.compact_string() == ranges.compact_string())
+			return false;
+	}
+	users[id] = [id = id, name = name, ranges = ranges, interface = interface_id, generator = generator];
+	holder.dmx_revision++;
+	return true;
+}
+
+dmx_withdraw(holder, id) {
+	users = holder.dmx_users;
+	if(!users.has(id))
+		return false;
+	users.erase(id);
+	holder.dmx_revision++;
+	return true;
+}
+
+//False when its generator was closed or is switched off
+dmx_user_alive(holder, u) {
+	if(u.interface) {
+		ifaces = holder.ai_interfaces;
+		if(std.is_none(ifaces) || !ifaces.has(u.interface))
+			return false;
+	}
+	if(!std.is_none(u.generator)) {
+		try {
+			if(!u.generator.is_active())
+				return false;
+		}
+		catch(e) {}
+	}
+	return true;
+}
+
+//The senders that send now. Senders whose generator is gone are dropped from the registry.
+dmx_live_users(holder) {
+	list = [];
+	gone = [];
+	users = holder.dmx_users;
+	for(i = 0; i < users.size(); i++) {
+		u = users[i];
+		if(u.interface && (std.is_none(holder.ai_interfaces) || !holder.ai_interfaces.has(u.interface))) {
+			gone.push_back(users.key(i));
+			continue;
+		}
+		if(dmx_user_alive(holder, u))
+			list.push_back(u);
+	}
+	for(i = 0; i < gone.size(); i++)
+		dmx_withdraw(holder, gone[i]);
+	return list;
+}
+
+//Changes when what is sent may have changed: a sender published, went away, or was switched on or off. Cheap: the
+//fixture setup and the LEDMappers compare it every frame and only then look for conflicts again.
+dmx_state(holder) {
+	s = std.string(holder.dmx_revision);
+	users = holder.dmx_users;
+	for(i = 0; i < users.size(); i++)
+		s += dmx_user_alive(holder, users[i]) ? "1" : "0";
+	return s;
+}
+
+//Everything that sends: [[source, name, ranges]], the lamps of the setup first. Senders of the same name get a number
+//("LEDMapper 2").
+dmx_sources(holder, p) {
+	list = [[source = DMX_SETUP, name = "Fixture setup", ranges = dmx_patch_ranges(p)]];
+	users = dmx_live_users(holder);
+	count = [];
+	for(i = 0; i < users.size(); i++)
+		count[users[i].name] = (count[users[i].name] ?? 0) + 1;
+	seen = [];
+	for(i = 0; i < users.size(); i++) {
+		u = users[i];
+		name = u.name;
+		if(count[u.name] > 1) {
+			seen[u.name] = (seen[u.name] ?? 0) + 1;
+			name += " " + std.string(seen[u.name]);
+		}
+		list.push_back([source = u.id, name = name, ranges = u.ranges]);
+	}
+	return list;
+}
+
+//"Par 3 (fixture setup)", "Scene 1 › Group 1 › Segment 2 (LEDMapper)"
+dmx_who(e) {
+	if(e.source == DMX_SETUP)
+		return e.label + " (fixture setup)";
+	return e.label + " (" + e.source_name + ")";
+}
+
+// =========================================================================
+// Conflicts
+// =========================================================================
+
+//Places where two senders write the same channels of a node:
+//  [[a, b, node, universe, first, last (the channels both write)], ...]
+//  a, b = [source, source_name, label, ref, lamp, node, universe, first, last]
+//Left out: two lamps of the setup (patch_problems() has them) unless with_lamp_pairs, and a segment on the lamp it is
+//meant for (a LEDMapper group or segment on a lamp of the setup).
+dmx_conflicts(holder, p, with_lamp_pairs = false) {
+	sources = dmx_sources(holder, p);
+	buckets = []; //"node|universe" -> entries
+	for(s = 0; s < sources.size(); s++) {
+		src = sources[s];
+		for(i = 0; i < src.ranges.size(); i++) {
+			r = src.ranges[i];
+			if(!r.node || r.last < r.first)
+				continue;
+			key = r.node + "|" + std.string(std.int(r.universe));
+			if(!buckets.has(key))
+				buckets[key] = [];
+			buckets[key].push_back([source = src.source, source_name = src.name, label = r.label, ref = r.ref, lamp = r.lamp ?? "",
+				node = r.node, universe = std.int(r.universe), first = r.first, last = r.last]);
+		}
+	}
+	list = [];
+	for(k = 0; k < buckets.size(); k++) {
+		entries = buckets[k];
+		for(i = 0; i < entries.size(); i++) {
+			a = entries[i];
+			for(j = i + 1; j < entries.size(); j++) {
+				b = entries[j];
+				if(a.first > b.last || b.first > a.last)
+					continue;
+				if(a.source == DMX_SETUP && b.source == DMX_SETUP && !with_lamp_pairs)
+					continue;
+				if(a.source == DMX_SETUP && b.lamp && b.lamp == a.ref)
+					continue;
+				if(b.source == DMX_SETUP && a.lamp && a.lamp == b.ref)
+					continue;
+				list.push_back([a = a, b = b, node = a.node, universe = a.universe, first = math.max(a.first, b.first),
+					last = math.min(a.last, b.last)]);
+			}
+		}
+	}
+	return list;
+}
+
+//"U0 · 10–12"
+dmx_channels_text(c) {
+	text = "U" + std.string(c.universe) + " · " + std.string(c.first);
+	if(c.last != c.first)
+		text += "–" + std.string(c.last);
+	return text;
+}
+
+//What a sender (source) writes over something else: [ref -> [text, ...]] ("Same channels as Par 3 (fixture setup)"),
+//refs as strings. conflicts: from dmx_conflicts(), None = look for them now
+dmx_problems_of(holder, p, source, conflicts = None) {
+	if(std.is_none(conflicts))
+		conflicts = dmx_conflicts(holder, p);
+	out = [];
+	for(i = 0; i < conflicts.size(); i++) {
+		c = conflicts[i];
+		pairs = [[c.a, c.b], [c.b, c.a]];
+		for(k = 0; k < 2; k++) {
+			mine = pairs[k][0];
+			other = pairs[k][1];
+			if(mine.source != source || other.source == source)
+				continue;
+			key = std.string(mine.ref);
+			if(!out.has(key))
+				out[key] = [];
+			text = "Same channels as " + dmx_who(other);
+			if(!out[key].has_value(text))
+				out[key].push_back(text);
+		}
+	}
+	return out;
+}
+
+//patch_problems() and the lamps an LED segment writes over: [lamp id -> [text, ...]]
+dmx_lamp_problems(holder, p, conflicts = None) {
+	problems = patch_problems(p);
+	extra = dmx_problems_of(holder, p, DMX_SETUP, conflicts);
+	for(i = 0; i < extra.size(); i++) {
+		id = extra.key(i);
+		if(!problems.has(id))
+			problems[id] = [];
+		for(k = 0; k < extra[i].size(); k++)
+			problems[id].push_back(extra[i][k]);
+	}
+	return problems;
+}
+
+//The channels of a universe of a node as the other senders use them, for the universe map of the fixture setup:
+//one entry per channel [state, names]: state "" (none of them), "led" (one sender), "lamp" (one sender on the lamp it
+//is meant for) or "!" (two senders, or a sender over a lamp it is not meant for); names: what writes there
+dmx_universe_cells(holder, p, node, universe) {
+	lamps = patch_universe_map(p, node, universe);
+	cells = [];
+	cells.resize(DMX_UNIVERSE_SIZE);
+	for(c = 0; c < DMX_UNIVERSE_SIZE; c++)
+		cells[c] = [state = "", names = []];
+	if(!node)
+		return cells;
+	sources = dmx_sources(holder, p);
+	for(s = 1; s < sources.size(); s++) {
+		src = sources[s];
+		for(i = 0; i < src.ranges.size(); i++) {
+			r = src.ranges[i];
+			if(r.node != node || std.int(r.universe) != std.int(universe))
+				continue;
+			name = r.label + " (" + src.name + ")";
+			last = math.min(DMX_UNIVERSE_SIZE, r.last);
+			for(c = math.max(1, r.first); c <= last; c++) {
+				cell = cells[c - 1];
+				lamp = lamps[c - 1];
+				if(!cell.names.has_value(name))
+					cell.names.push_back(name);
+				if(cell.state)
+					cell.state = "!";
+				else if(lamp && lamp != (r.lamp ?? ""))
+					cell.state = "!";
+				else
+					cell.state = lamp ? "lamp" : "led";
+			}
+		}
+	}
+	return cells;
+}

@@ -1,411 +1,1275 @@
+//The fixture setup (#439): Setup.menu in assets/Fixtures opens it in a tab.
+//
+//  +---------------------------------------------------------------------------------------------+
+//  | toolbar: Highlight | Duplicate  Remove | Row  Grid  Circle | Snap  Fit |            status    |
+//  +----------------+-------------------------------------------------------+--------------------+
+//  | Fixture types  |                                                       | Lamp / selection   |
+//  |  (add, drag)   |                 stage plan (metres)                   |  name, node,       |
+//  | Lamps          |                                                       |  universe, address |
+//  | Groups         +-------------------------------------------------------+ Nodes              |
+//  |                | universe map: the 512 channels of a node's universe   |  (add by IP)       |
+//  +----------------+-------------------------------------------------------+--------------------+
+//
+//Everything it changes is in engine.patch (engine/patch/patch.shio); engine.patch_changed() tells the others.
+//LEDMappers that write the channels of a lamp (one they are not meant for) count as problems of that lamp, and their
+//channels are in the universe map (engine/patch/dmx.shio).
 
 import nanogui;
 
 using eigen;
+using nanogui;
 
-#include "shared"
+#include "engine/patch/patch"
+#include "engine/patch/dmx"
+#include "engine/patch/palette"
+
+SETUP_ROW = 28;
+SETUP_LEFT_W = 260;
+SETUP_RIGHT_W = 280;
+SETUP_TOOLBAR_H = 32;
+SETUP_MAP_H = 176;
+SETUP_MAP_COLS = 64;
+SETUP_MAP_ROWS = 8;
+SETUP_MAP_LEFT = 34; //room for the channel numbers
+SETUP_SNAP = 0.25; //metres
+
+//GLFW
+SETUP_KEY_DELETE = 261;
+SETUP_KEY_BACKSPACE = 259;
+SETUP_KEY_ESCAPE = 256;
+SETUP_KEY_A = 65;
+SETUP_KEY_D = 68;
+SETUP_MOD_SHIFT = 1;
+SETUP_MOD_CTRL = 2;
 
 class fixture_arranger {
-	
+
 	engine = None;
-	managed fixture_list = None;
-	managed fixture_settings = None;
-	managed fixture_area = None;
-	managed spatial_fixtures = [];
-	
-	fixture_types = []; //Should not be managed
-	active_fixture_settings = None;
-	
-	device_list = [];
-	
+
+	managed root = None;
+	managed toolbar = None;
+	managed status_label = None;
+	managed highlight_btn = None;
+	managed snap_btn = None;
+
+	managed left_content = None;
+	managed lamp_holder = None;
+	managed group_holder = None;
+	lamp_list = None; //rebuilt with fresh_box (not managed: fresh_box frees the old one)
+	group_list = None;
+	managed lamp_count_label = None;
+	managed type_browser = None;
+	managed add_count = None;
+	managed add_type_label = None;
+
+	managed stage = None;
+	managed map_area = None;
+	managed map_title = None;
+
+	managed inspector_holder = None;
+	range_label = None; //"U0 · 1–4" of the lamp in the inspector
+	problem_label = None;
+	managed node_holder = None;
+	inspector = None;
+	node_list = None;
+
+	selected = []; //ids of the selected lamps, in the order they were picked
+	add_type = ""; //fixture type picked in the list on the left
+	drop_node = ""; //node and universe new lamps go to (the last one picked in the inspector)
+	drop_universe = 0;
+	multi_node_mac = ""; //node picked for several lamps in the inspector
+
+	view_scale = 40.0; //pixels per metre
+	view_x = 0.0; //where the middle of the stage is, from the middle of the plan widget
+	view_y = 0.0;
+
+	drag_mode = ""; //"move", "box", "pan"
+	drag_start = None;
+	drag_now = None;
+	drag_moved = false;
+	drag_origin = []; //id -> [x, y] when a move started
+
+	seen_revision = -1;
+	seen_dmx_state = ""; //what the LEDMappers send (dmx_state): their channels are problems and in the map
+	problems = [];
+	map_cells = None; //dmx_universe_cells() of the universe in the map, cached
+	map_cells_key = "";
+	node_count = -1;
+	frame_counter = 0;
+	map_hover = "";
+
 	__init__(parent) {
-		
 		engine = std.global("engine");
-		
-		fixture_list = parent.widget().anchor(0).anchor_left(0).clear_anchor_right().fixed_width(150).layout(nanogui.layout_vertical());
-		fixture_list.label("Drop fixtures here");
-		fixture_list.on_dragdrop_hover([this](payload, pos) {
-			return true;
-		});
-		
-		fixture_list.on_dragdrop([this](payload, pos) {
-			path = fileio.relative_path_cwd(payload.path);	
-			this.add_fixture(path);
-			//Handle payload.paths for multi-file later...
-			
-			return true;
-		});
-	
-		fixture_settings = parent.widget().anchor(0).anchor_right(0).clear_anchor_left().fixed_width(200);
-	
-		fixture_area = parent.scrollarea().anchor(0).anchor_left(150).anchor_right(200);
-		fixture_area.fit_content();
-		
-		fixture_area_content = fixture_area.content();
-		
-		fixture_area_content.fixed_size(vec2f(2200,2200));
-		
-		fixture_area_content.on_dragdrop_hover([this](payload, pos) {
-			return true;
-		});
-		
-		fixture_area_content.on_dragdrop([this](payload, pos) {
-			path = fileio.relative_path_cwd(payload.path);	
-			//add_spatial_fixture takes the fixture object and the instance index (see below), not a path.
-			//A new fixture is registered first (add_fixture creates its first instance), every further
-			//drop of the same fixture adds one more instance. The new window is placed at the drop position.
-			new_fixture = this.fixture_types.has(path) == false;
-			if(new_fixture)
-				this.add_fixture(path);
-			engine_fixture = this.engine.fixtures[path];
-			new_instance = [
-				name = "",
-				device_mac = "",
-				device_ip = "",
-				universe=0,
-				start_channel=0,
-				batch_count=1,
-			];
-			if(engine_fixture.instances.size() < 1)
-				engine_fixture.instances.push_back(new_instance);
-			index = 0;
-			if(!new_fixture) {
-				index = engine_fixture.instances.size();
-				engine_fixture.instances.push_back(new_instance);
-			}
-			this.add_spatial_fixture(engine_fixture, index, pos);
-			//Handle payload.paths for multi-file later...
+		patch_reload_types(); //fixture files may have changed since they were read
+		engine.patch_changed();
+		root = parent.widget().anchor(0);
 
-			return true;
+		build_toolbar();
+		build_left();
+		build_right();
+		build_center();
+
+		seen_revision = engine.patch_revision;
+		pick_default_node();
+		refresh_all();
+		fit_view();
+
+		//Closing the tab ends a highlight: the lamps go back to their values
+		//(the engine, not this: the menu may be freed before its widgets)
+		eng = engine;
+		root.on_destroy([eng]() {
+			if(eng.fixture_menu)
+				eng.fixture_menu.set_highlight([]);
 		});
-		
-		fixture_area_content.on_draw([fixture_area_content](){
-				nvgBeginPath();
-				nvgMoveTo(vec2f(fixture_area_content.width()/2,0));
-				nvgLineTo(vec2f(fixture_area_content.width()/2, fixture_area_content.height()));
-				nvgMoveTo(vec2f(0,fixture_area_content.height()/2));
-				nvgLineTo(vec2f(fixture_area_content.width(), fixture_area_content.height()/2));
-				nvgStrokeColor(vec4f(0.8,0.65,0.34,1));
-				nvgStrokeWidth(4);
-				nvgStroke();
-			
-				gs = 100;
-				w = fixture_area_content.width();
-				h = fixture_area_content.height();
-
-				nvgBeginPath();
-
-				// Vertical grid lines
-				for (x = 0; x <= w; x += gs) {
-					nvgMoveTo(vec2f(x, 0));
-					nvgLineTo(vec2f(x, h));
-				}
-
-				// Horizontal grid lines
-				for (y = 0; y <= h; y += gs) {
-					nvgMoveTo(vec2f(0, y));
-					nvgLineTo(vec2f(w, y));
-				}
-
-				nvgStrokeColor(vec4f(0.3, 0.3, 0.3, 1));
-				nvgStrokeWidth(1);
-				nvgStroke();
-			
-		});
-		
-		for(i = 0; i < engine.fixtures.size(); i++) {
-			add_fixture(engine.fixtures[i].path);
-		}
 	}
-	
-	add_fixture(path) {
-		
-		if(fixture_types.has(path))
-			fixture_types[path].btn.pushed(true);
+
+	patch() {
+		return engine.patch;
+	}
+
+	//A new empty box in holder for content that is built again: the old one is freed (later, by the screen), so a button
+	//of the old content can rebuild it from its own click (clear_children() would delete the button under its click)
+	fresh_box(holder, old) {
+		if(old)
+			std.free(old);
+		return holder.widget().layout(nanogui.layout_vertical());
+	}
+
+	//After a change of the patch from here: the others rebuild, the lists here follow
+	changed(rebuild_inspector = false) {
+		engine.patch_changed();
+		seen_revision = engine.patch_revision;
+		refresh_lists();
+		if(rebuild_inspector)
+			build_inspector();
+		update_status();
+		update_inspector_info();
+	}
+
+	//The channels and problems of the lamp in the inspector, after its address changed
+	update_inspector_info() {
+		lamps = selected_lamps();
+		if(lamps.size() != 1 || !range_label || !problem_label)
 			return;
-		
-		splitter = fixture_list.widget().fixed_height(25).layout(nanogui.layout_horizontal());		
-		btn = splitter.pushbutton(fileio.pure_name(path) + " >").fixed_height(25).anchor_right(25).anchor_left(0);
-		del_btn = splitter.button("").icon(nanogui.icon("times")).anchor_right(0).fixed_width(25);
-		
-		del_btn.on_click([this, path, splitter, btn](){
-			
-			if(btn.pushed) {
-				spatial_fixtures = [];
-			}
-			
-			engine.fixtures.erase(path);
-			fixture_types.erase(path);
-			
-			if(this.active_fixture_settings.btn == btn)
-				std.free(this.active_fixture_settings.cnt);
-				this.active_fixture_settings = [];
-				
-			std.free(splitter);
-			engine.fixture_menu.build_fixture_menu();
+		range_label.caption(patch_address_text(lamps[0]));
+		problem_label.caption(problems.has(lamps[0].id) ? problems[lamps[0].id].combine_string("\n") : "");
+	}
+
+	refresh_all() {
+		refresh_lists();
+		build_inspector();
+		build_nodes();
+		update_status();
+	}
+
+	// =========================================================================
+	// Nodes
+	// =========================================================================
+
+	known_nodes() {
+		return patch_known_nodes(engine.net, patch());
+	}
+
+	node_name(mac) {
+		return patch_node_name(engine.net, patch(), mac);
+	}
+
+	pick_default_node() {
+		p = patch();
+		if(p.fixtures.size()) {
+			drop_node = p.fixtures[-1].node;
+			drop_universe = p.fixtures[-1].universe;
+			return;
+		}
+		nodes = known_nodes();
+		if(nodes.size())
+			drop_node = nodes[0].mac;
+	}
+
+	//A combobox of the nodes; on_pick(mac) when one is picked
+	node_combo(parent, current, on_pick) {
+		nodes = known_nodes();
+		items = ["No node"];
+		macs = [""];
+		sel = 0;
+		for(i = 0; i < nodes.size(); i++) {
+			items.push_back(nodes[i].name + (nodes[i].online ? "" : " (offline)"));
+			macs.push_back(nodes[i].mac);
+			if(nodes[i].mac == current)
+				sel = i + 1;
+		}
+		if(current && sel == 0) {
+			items.push_back(current + " (not found)");
+			macs.push_back(current);
+			sel = items.size() - 1;
+		}
+		combo = parent.combobox().items(items).selected(sel).fixed_height(SETUP_ROW);
+		combo.tooltip("The Art-Net node the lamp is connected to. Nodes on the network show up by themselves; add others by their IP below.");
+		combo.on_change([macs, on_pick](index, text) {
+			if(index >= 0 && index < macs.size())
+				on_pick(macs[index]);
 		});
-		
-		if(!engine.fixtures.has(path)) {
-			engine.fixtures[path] = [
-				path=path,
-				instances=[
-					[
-						name = "",
-						device_mac = "",
-						device_ip = "",
-						universe=0,
-						start_channel=0,
-						batch_count=1,
-					],
-				],
+		return combo;
+	}
+
+	// =========================================================================
+	// Toolbar
+	// =========================================================================
+
+	build_toolbar() {
+		toolbar = root.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(SETUP_TOOLBAR_H);
+		x = 4;
+
+		highlight_btn = toolbar.pushbutton("Highlight").icon(nanogui.icon("crosshairs")).latched_style("cue")
+			.anchor_left(x).anchor_top(2).fixed_width(110).fixed_height(SETUP_ROW);
+		highlight_btn.tooltip("The selected lamps go to full (white, intensity full) so you find them in the rig. Off: back to their values.\n[[wiki:Output-and-Devices#set-up-your-lamps]]");
+		highlight_btn.on_change([this](v) {
+			this.apply_highlight();
+		});
+		x += 118;
+
+		dup = toolbar.button("").icon(nanogui.icon("copy")).anchor_left(x).anchor_top(2).fixed_width(SETUP_ROW).fixed_height(SETUP_ROW);
+		dup.tooltip("Duplicate the selected lamps, at the next free addresses (Ctrl+D)");
+		dup.on_click([this]() { this.duplicate_selected(); });
+		x += 32;
+		rem = toolbar.button("").icon(nanogui.icon("trash")).anchor_left(x).anchor_top(2).fixed_width(SETUP_ROW).fixed_height(SETUP_ROW);
+		rem.tooltip("Remove the selected lamps (Delete)");
+		rem.on_click([this]() { this.remove_selected(); });
+		x += 40;
+
+		shapes = [["Row", "ellipsis_h", "row", "In a row, one metre apart, in the order you picked them"],
+			["Grid", "th_large", "grid", "In rows of four"],
+			["Circle", "sync", "circle", "In a circle, facing out"]];
+		for(i = 0; i < shapes.size(); i++) {
+			shape = shapes[i][2];
+			b = toolbar.button(shapes[i][0]).icon(nanogui.icon(shapes[i][1])).anchor_left(x).anchor_top(2).fixed_width(82).fixed_height(SETUP_ROW);
+			b.tooltip("Arrange the selected lamps: " + shapes[i][3]);
+			b.on_click([this, shape]() { this.arrange_selected(shape); });
+			x += 86;
+		}
+		x += 8;
+
+		snap_btn = toolbar.pushbutton("Snap").icon(nanogui.icon("th")).anchor_left(x).anchor_top(2).fixed_width(80).fixed_height(SETUP_ROW).pushed(true);
+		snap_btn.tooltip("Lamps you move snap to a quarter metre");
+		x += 84;
+		fit = toolbar.button("Fit").icon(nanogui.icon("expand")).anchor_left(x).anchor_top(2).fixed_width(70).fixed_height(SETUP_ROW);
+		fit.tooltip("Show all lamps (scroll to zoom, drag with the right mouse button to move the plan)");
+		fit.on_click([this]() { this.fit_view(); });
+
+		status_label = toolbar.label("").anchor_right(8).anchor_top(0).fixed_height(SETUP_TOOLBAR_H).fixed_width(420).alignment("right");
+	}
+
+	//Problems of the lamps: patch_problems() and the LEDMappers that write their channels
+	compute_problems() {
+		seen_dmx_state = dmx_state(engine);
+		map_cells_key = "";
+		problems = dmx_lamp_problems(engine, patch());
+		return problems;
+	}
+
+	update_status() {
+		p = patch();
+		compute_problems();
+		text = p.fixtures.size() + " lamps";
+		if(p.groups.size())
+			text += " · " + p.groups.size() + (p.groups.size() == 1 ? " group" : " groups");
+		if(problems.size()) {
+			text += " · " + problems.size() + (problems.size() == 1 ? " lamp needs" : " lamps need") + " attention";
+			status_label.text_color(PAL_DANGER);
+		}
+		else
+			status_label.text_color(PAL_TEXT_2);
+		status_label.caption(text);
+	}
+
+	// =========================================================================
+	// Left: fixture types, lamps, groups
+	// =========================================================================
+
+	section_title(parent, text) {
+		return parent.label(text).fixed_height(SETUP_ROW).bold(true);
+	}
+
+	build_left() {
+		left = root.widget().anchor_left(0).anchor_top(SETUP_TOOLBAR_H).anchor_bottom(0).fixed_width(SETUP_LEFT_W);
+		left_content = left.vscroll().anchor(0).content().layout(nanogui.layout_vertical()).fixed_width(SETUP_LEFT_W - 12);
+
+		section_title(left_content, "Fixture types");
+		type_browser = left_content.filebrowser("assets/Fixtures").fixed_height(200);
+		type_browser.extensions([".json"]);
+		type_browser.tooltip("Click a type, then Add. Or drag it onto the plan. The Fixture editor (Editor.menu) makes new types.");
+		type_browser.on_click([this](path) {
+			rel = fileio.relative_path_cwd(path);
+			if(fileio.is_file(rel) && patch_type(rel).valid) {
+				this.add_type = patch_norm_path(rel);
+				this.add_type_label.caption(patch_type(rel).name + " · " + patch_footprint(rel) + " channels");
+			}
+		});
+		type_browser.on_double_click([this](path) {
+			rel = fileio.relative_path_cwd(path);
+			if(fileio.is_file(rel) && patch_type(rel).valid) {
+				this.add_type = patch_norm_path(rel);
+				this.add_lamps(1);
+			}
+		});
+
+		add_type_label = left_content.label("Pick a fixture type").fixed_height(22).text_color(PAL_TEXT_3);
+		add_row = left_content.widget().fixed_height(SETUP_ROW + 4);
+		add_row.label("Count").anchor_left(0).fixed_width(50).fixed_height(SETUP_ROW);
+		add_count = add_row.intbox().anchor_left(50).fixed_width(70).fixed_height(SETUP_ROW).min_value(1).max_value(512).value(1);
+		add_btn = add_row.button("Add lamps").icon(nanogui.icon("plus")).anchor_left(126).anchor_right(0).fixed_height(SETUP_ROW);
+		add_btn.tooltip("Adds this many lamps of the type, at the next free addresses of the node you picked last");
+		add_btn.on_click([this]() {
+			this.add_lamps(this.add_count.value());
+		});
+
+		lamp_count_label = section_title(left_content, "Lamps");
+		lamp_holder = left_content.widget().layout(nanogui.layout_vertical());
+
+		section_title(left_content, "Groups");
+		new_group = left_content.button("New group from selection").icon(nanogui.icon("object_group")).fixed_height(SETUP_ROW);
+		new_group.tooltip("A group keeps lamps in an order: the order of a [[phaser|Phaser]]. The lamps in the order you picked them.\n[[wiki:Output-and-Devices#set-up-your-lamps]]");
+		new_group.on_click([this]() { this.group_from_selection(); });
+		group_holder = left_content.widget().layout(nanogui.layout_vertical());
+	}
+
+	refresh_lists() {
+		p = patch();
+		compute_problems();
+
+		lamp_list = fresh_box(lamp_holder, lamp_list);
+		lamp_count_label.caption("Lamps (" + p.fixtures.size() + ")");
+		if(!p.fixtures.size())
+			lamp_list.label("None yet. Add some above.").fixed_height(SETUP_ROW).text_color(PAL_TEXT_3);
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			id = f.id;
+			row = lamp_list.widget().fixed_height(SETUP_ROW);
+			btn = row.pushbutton(f.name).alignment("left").anchor_left(0).anchor_right(0).fixed_height(SETUP_ROW).latched_style("selection");
+			btn.pushed(selected.has_value(id));
+			addr = row.label(f.node ? patch_address_text(f) : "no node").anchor_right(6).fixed_width(90).fixed_height(SETUP_ROW).alignment("right");
+			addr.text_color(selected.has_value(id) ? PAL_TEXT : PAL_TEXT_3);
+			if(problems.has(id)) {
+				btn.text_color(PAL_DANGER);
+				btn.tooltip(problems[id].combine_string("\n"));
+			}
+			else
+				btn.tooltip(patch_type(f.type).name + " · " + node_name(f.node) + " · " + patch_address_text(f));
+			btn.on_change([this, id](v) {
+				add = this.engine.screen.modifier_shift() || this.engine.screen.modifier_ctrl();
+				this.select_ids([id], add, true);
+			});
+		}
+
+		group_list = fresh_box(group_holder, group_list);
+		for(i = 0; i < p.groups.size(); i++) {
+			g = p.groups[i];
+			gid = g.id;
+			row = group_list.widget().fixed_height(SETUP_ROW);
+			pick = row.button("").icon(nanogui.icon("check")).anchor_left(0).fixed_width(SETUP_ROW).fixed_height(SETUP_ROW).transparent(true);
+			pick.tooltip("Select the " + g.fixtures.size() + " lamps of this group");
+			name = row.textbox(g.name).anchor_left(SETUP_ROW).anchor_right(SETUP_ROW * 2).fixed_height(SETUP_ROW);
+			set_btn = row.button("").icon(nanogui.icon("sync")).anchor_right(SETUP_ROW).fixed_width(SETUP_ROW).fixed_height(SETUP_ROW).transparent(true);
+			set_btn.tooltip("Make the selected lamps (in the order you picked them) the lamps of this group");
+			del = row.button("").icon(nanogui.icon("times")).anchor_right(0).fixed_width(SETUP_ROW).fixed_height(SETUP_ROW).transparent(true);
+			del.tooltip("Delete this group (the lamps stay)");
+			pick.on_click([this, gid]() {
+				g = patch_group(this.patch(), gid);
+				if(g)
+					this.select_ids(g.fixtures, false, true);
+			});
+			name.on_change([this, gid](text) {
+				g = patch_group(this.patch(), gid);
+				if(g) {
+					g.name = text;
+					this.engine.patch_changed();
+					this.seen_revision = this.engine.patch_revision;
+				}
+			});
+			set_btn.on_click([this, gid]() {
+				g = patch_group(this.patch(), gid);
+				if(g && this.selected.size()) {
+					g.fixtures = this.selected.copy();
+					this.changed();
+				}
+			});
+			del.on_click([this, gid]() {
+				patch_group_remove(this.patch(), gid);
+				this.changed();
+			});
+		}
+		left_content.refresh_layout();
+	}
+
+	// =========================================================================
+	// Right: inspector and nodes
+	// =========================================================================
+
+	build_right() {
+		right = root.widget().anchor_right(0).anchor_top(SETUP_TOOLBAR_H).anchor_bottom(0).fixed_width(SETUP_RIGHT_W);
+		content = right.vscroll().anchor(0).content().layout(nanogui.layout_vertical()).fixed_width(SETUP_RIGHT_W - 12);
+		inspector_holder = content.widget().layout(nanogui.layout_vertical());
+		node_holder = content.widget().layout(nanogui.layout_vertical());
+	}
+
+	//A row with a caption on the left half
+	field_row(parent, caption) {
+		row = parent.widget().fixed_height(SETUP_ROW + 2);
+		row.label(caption).anchor_left(0).fixed_width(96).fixed_height(SETUP_ROW).text_color(PAL_TEXT_2);
+		return row.widget().anchor_left(96).anchor_right(0).fixed_height(SETUP_ROW);
+	}
+
+	selected_lamps() {
+		list = [];
+		p = patch();
+		for(i = 0; i < selected.size(); i++) {
+			f = patch_find(p, selected[i]);
+			if(f)
+				list.push_back(f);
+		}
+		return list;
+	}
+
+	build_inspector() {
+		inspector = fresh_box(inspector_holder, inspector);
+		range_label = None;
+		problem_label = None;
+		lamps = selected_lamps();
+		p = patch();
+
+		if(lamps.size() == 0) {
+			section_title(inspector, "Fixture setup");
+			hints = [
+				"1. Pick a fixture type on the left and click Add lamps, or drag the type onto the plan.",
+				"2. Click a lamp to set its node, universe and address. New lamps get the next free channels.",
+				"3. Move the lamps on the plan to where they hang. Shift+click or drag a box to select more.",
+				"4. Groups keep lamps in an order for the Phaser.",
 			];
+			for(i = 0; i < hints.size(); i++)
+				inspector.label(hints[i]).wrap(true).fixed_width(SETUP_RIGHT_W - 16).text_color(PAL_TEXT_2);
+			inspector_holder.refresh_layout();
+			return;
 		}
-		
-		engine_fixture = engine.fixtures[path];
-				
-		btn.on_change([this, path, btn, engine_fixture](v){
-			if(this.active_fixture_settings.cnt)
-				std.free(this.active_fixture_settings.cnt);
-			if(this.active_fixture_settings.btn && this.active_fixture_settings.btn != btn)
-				this.active_fixture_settings.btn.pushed(false);
-			
-			if(v) {
-				cnt = fixture_settings.widget().anchor(0).layout(nanogui.layout_vertical());
-				
-				add_new_type = cnt.button("Add New Instance");
-				add_new_type.fixed_height(25);
-				
-				splitter = cnt.widget().fixed_height(25);
-				splitter.label("Total count:").anchor_left(0).fixed_width(100);
-				total_count = splitter.intbox().anchor(0).anchor_left(100).min_value(1).max_value(9999).value(1);
-				total_count.value(engine_fixture.instances.size());
-				
-				cnt_items = cnt.vscroll().anchor(0).anchor_top(50).content().layout(nanogui.layout_vertical());
-				
-				add_instance_ctrls = [this, cnt_items, engine_fixture](num) {
-					
-					pad = cnt_items.widget().fixed_height(25);
-					
-					dev_name = engine_fixture.instances[num-1].name ?? "Device #"+num;
-					engine_fixture.instances[num-1].name = dev_name;
-					name_label = cnt_items.textbox(dev_name).fixed_height(30).font_size(28);
-					selector = cnt_items.combobox().fixed_height(20).items(["Select Target"]);
-					
-					splitter = cnt_items.widget().fixed_height(25);
-					splitter.label("IP:").anchor_left(0).fixed_width(50);	
-					dev_ip = splitter.textbox(engine_fixture.instances[num-1].device_ip ?? "<none>").anchor(0).anchor_left(50);
-					
-					splitter = cnt_items.widget().fixed_height(25);
-					splitter.label("MAC:").anchor_left(0).fixed_width(50);
-					dev_mac = splitter.textbox(engine_fixture.instances[num-1].device_mac ?? "<none>").anchor(0).anchor_left(50);
-					
-					splitter = cnt_items.widget().fixed_height(25);
-					splitter.label("Uni:").anchor_left(0).fixed_width(50);	
-					dev_uni = splitter.intbox().anchor(0).anchor_left(50).min_value(0).max_value(32767).value(engine_fixture.instances[num-1].universe);
-					
-					splitter = cnt_items.widget().fixed_height(25);
-					splitter.label("Adr:").anchor_left(0).fixed_width(50);
-					dev_adr = splitter.intbox().anchor(0).anchor_left(50).min_value(1).max_value(512).value(engine_fixture.instances[num-1].start_channel+1);				
-					
-					splitter = cnt_items.widget().fixed_height(25);
-					splitter.label("Count:").anchor_left(0).fixed_width(50);
-					dev_count = splitter.intbox().anchor(0).anchor_left(50).min_value(1).max_value(9999).value(engine_fixture.instances[num-1].batch_count);
-					
-					name_label.on_change([this, engine_fixture, num](txt){
-						engine_fixture.instances[num-1].name = txt;
-						engine.fixture_menu.build_fixture_menu();
-					});			
-					dev_uni.value_callback([this, engine_fixture, num](v){
-						engine_fixture.instances[num-1].universe = v;
-					});
-					dev_adr.value_callback([this, engine_fixture, num](v){
-						engine_fixture.instances[num-1].start_channel = v-1;
-					});
-					dev_count.value_callback([this, engine_fixture, num](v){
-						engine_fixture.instances[num-1].batch_count = v;
-						engine.fixture_menu.build_fixture_menu();
-					});
-					
-					net = this.engine.net;
-					
-					selector.on_open([this, net, selector](){
-						devs = net.artnet_devices();
-						this.device_list.items = ["Select Target"];
-						this.device_list.devs = [];
-						for(i = 0; i < devs.size(); i++)
-							this.device_list.items.push_back(devs[i].name());
-							this.device_list.devs.push_back(devs[i]);
-						selector.items(this.device_list.items);
-					});
-					selector.on_change([this, dev_mac, dev_ip, num, engine_fixture](v, text){
-						if(v == 0) 
-							dev_ip.value("<none>");
-							dev_mac.value("<none>");
-							engine_fixture.instances[num-1].device_mac = "";
-							engine_fixture.instances[num-1].device_ip = "";
-							engine_fixture.instances[num-1].device = None;
-							return;
-						
-						v--;
-						
-						if(v < 0 || v >= this.device_list.devs.size())
-							return;
-						
-						dev = this.device_list.devs[v];
-						dev_ip.value(dev.ip());
-						dev_mac.value(dev.mac());
-						
-						engine_fixture.instances[num-1].device_mac = dev.mac();
-						engine_fixture.instances[num-1].device_ip = dev.ip();
-						engine_fixture.instances[num-1].device = dev;
-					});
-				};
-				
-				build_items = [this, engine_fixture, cnt_items, add_instance_ctrls]() {
-					cnt_items.clear_children();
-					
-					spatial_fixtures = [];
-					
-					for(i = 0; i < engine_fixture.instances.size(); i++) {
-						add_instance_ctrls(i+1);
-						add_spatial_fixture(engine_fixture, i);
-					}
-					
-					engine.fixture_menu.build_fixture_menu();
-				};
-				
-				add_new_type.on_click([this,engine,engine_fixture,build_items,total_count](){
 
-					engine_fixture.instances.push_back(
-					[
-						name = "",
-						device_mac = "",
-						device_ip = "",
-						universe=0,
-						start_channel=0,
-						batch_count=1,
-					]);
-					
-					total_count.value(total_count.value()+1);
-					
-					build_items();
-				});
+		if(lamps.size() == 1) {
+			f = lamps[0];
+			id = f.id;
+			t = patch_type(f.type);
+			section_title(inspector, "Lamp");
 
-				total_count.value_callback([this, total_count, engine_fixture, build_items](v){
-					for(engine_fixture.instances.size() > total_count.value()) {
-						engine_fixture.instances.erase(-1);
-					}
-					for(engine_fixture.instances.size() < total_count.value()) {
-						engine_fixture.instances.push_back(
-						[
-							device_mac = "",
-							device_ip = "",
-							universe=0,
-							start_channel=0,
-							batch_count=1,
-						]);
-					}
-					build_items();
-				});
+			name_box = field_row(inspector, "Name").textbox(f.name).anchor(0);
+			name_box.on_change([this, id](text) {
+				f = patch_find(this.patch(), id);
+				if(f && text) {
+					f.name = text;
+					this.changed();
+				}
+			});
+			type_label = field_row(inspector, "Type").label(t.valid ? t.name + " · " + t.footprint + " ch" : t.name + " (file missing)").anchor(0);
+			if(!t.valid)
+				type_label.text_color(PAL_DANGER);
 
-				build_items();
+			node_combo(field_row(inspector, "Node"), f.node, [this, id](mac) {
+				f = patch_find(this.patch(), id);
+				if(!f)
+					return;
+				f.node = mac;
+				this.drop_node = mac;
+				this.changed(true);
+			}).anchor(0);
 
-				this.active_fixture_settings = [
-					btn=btn,
-					cnt=cnt,
-				];
+			uni = field_row(inspector, "Universe").intbox().anchor(0).min_value(0).max_value(PATCH_MAX_UNIVERSE).value(f.universe);
+			uni.tooltip("Art-Net universe (port-address) 0–32767, as set on the node");
+			uni.value_callback([this, id](v) {
+				f = patch_find(this.patch(), id);
+				if(f) {
+					f.universe = v;
+					this.drop_universe = v;
+					this.changed();
+				}
+			});
+			adr = field_row(inspector, "Address").intbox().anchor(0).min_value(1).max_value(PATCH_UNIVERSE_SIZE).value(f.address);
+			adr.tooltip("DMX start address 1–512, as set on the lamp. It takes " + patch_footprint(f.type) + " channels.");
+			adr.value_callback([this, id](v) {
+				f = patch_find(this.patch(), id);
+				if(f) {
+					f.address = v;
+					this.changed();
+				}
+			});
+			range_label = field_row(inspector, "Channels").label(patch_address_text(f)).anchor(0);
+			free_btn = inspector.button("Next free address").icon(nanogui.icon("search")).fixed_height(SETUP_ROW);
+			free_btn.tooltip("Moves the lamp to the first channels of its universe that no other lamp uses");
+			free_btn.on_click([this, id]() {
+				f = patch_find(this.patch(), id);
+				if(f) {
+					patch_readdress(this.patch(), [id], f.node, f.universe, 0);
+					this.changed(true);
+				}
+			});
+
+			pos = inspector.widget().fixed_height(SETUP_ROW + 2);
+			pos.label("Position").anchor_left(0).fixed_width(96).fixed_height(SETUP_ROW).text_color(PAL_TEXT_2);
+			px = pos.floatbox().anchor_left(96).fixed_width(84).fixed_height(SETUP_ROW).value(f.x);
+			px.tooltip("Metres right of the middle of the stage");
+			py = pos.floatbox().anchor_left(184).anchor_right(0).fixed_height(SETUP_ROW).value(f.y);
+			py.tooltip("Metres from the middle towards the audience");
+			px.value_callback([this, id](v) {
+				f = patch_find(this.patch(), id);
+				if(f)
+					f.x = v;
+			});
+			py.value_callback([this, id](v) {
+				f = patch_find(this.patch(), id);
+				if(f)
+					f.y = v;
+			});
+			rot = field_row(inspector, "Rotation").intbox().anchor(0).min_value(-360).max_value(360).value(std.int(f.rotation ?? 0));
+			rot.tooltip("Degrees, for bars: which way the pixels run");
+			rot.value_callback([this, id](v) {
+				f = patch_find(this.patch(), id);
+				if(f)
+					f.rotation = v;
+			});
+
+			problem_label = inspector.label(problems.has(id) ? problems[id].combine_string("\n") : "").wrap(true).fixed_width(SETUP_RIGHT_W - 16);
+			problem_label.text_color(PAL_DANGER);
+		}
+		else {
+			section_title(inspector, lamps.size() + " lamps");
+			inspector.label("Node, universe and address go to all of them, the addresses one after the other in the order you picked them.")
+				.wrap(true).fixed_width(SETUP_RIGHT_W - 16).text_color(PAL_TEXT_2);
+
+			first = lamps[0];
+			multi_node_mac = first.node;
+			node_combo(field_row(inspector, "Node"), first.node, [this](mac) {
+				this.multi_node_mac = mac;
+				lamps = this.selected_lamps();
+				for(i = 0; i < lamps.size(); i++)
+					lamps[i].node = mac;
+				this.drop_node = mac;
+				this.changed();
+			}).anchor(0);
+			uni = field_row(inspector, "Universe").intbox().anchor(0).min_value(0).max_value(PATCH_MAX_UNIVERSE).value(first.universe);
+			start = field_row(inspector, "Start address").intbox().anchor(0).min_value(1).max_value(PATCH_UNIVERSE_SIZE).value(first.address);
+			apply = inspector.button("Address in order").icon(nanogui.icon("list_ol")).fixed_height(SETUP_ROW);
+			apply.tooltip("From the start address on, each lamp after the one before (into the next universe when one is full)");
+			apply.on_click([this, uni, start]() {
+				patch_readdress(this.patch(), this.selected, this.multi_node_mac, uni.value(), start.value());
+				this.drop_universe = uni.value();
+				this.changed(true);
+			});
+			auto_btn = inspector.button("Next free addresses").icon(nanogui.icon("search")).fixed_height(SETUP_ROW);
+			auto_btn.tooltip("Each lamp to the first free channels of the universe, after the one before");
+			auto_btn.on_click([this, uni]() {
+				patch_readdress(this.patch(), this.selected, this.multi_node_mac, uni.value(), 0);
+				this.changed(true);
+			});
+		}
+
+		remove_btn = inspector.button(lamps.size() == 1 ? "Remove lamp" : "Remove " + lamps.size() + " lamps").icon(nanogui.icon("trash")).fixed_height(SETUP_ROW).danger(true);
+		remove_btn.on_click([this]() { this.remove_selected(); });
+		inspector_holder.refresh_layout();
+	}
+
+	build_nodes() {
+		node_list = fresh_box(node_holder, node_list);
+		section_title(node_list, "Nodes");
+		nodes = known_nodes();
+		node_count = nodes.size();
+		if(!nodes.size())
+			node_list.label("No Art-Net node found yet.").fixed_height(SETUP_ROW).text_color(PAL_TEXT_3);
+		p = patch();
+		for(i = 0; i < nodes.size(); i++) {
+			n = nodes[i];
+			used = 0;
+			for(j = 0; j < p.fixtures.size(); j++) {
+				if(p.fixtures[j].node == n.mac)
+					used++;
 			}
-		});
-	
-		fixture_types[path] = [
-			btn = btn,
-			engine_fixture = engine_fixture,
+			row = node_list.widget().fixed_height(SETUP_ROW);
+			label = row.label(n.name + "  " + n.ip).anchor_left(0).anchor_right(64).fixed_height(SETUP_ROW);
+			label.tooltip(n.mac + (used ? " · " + used + " lamps" : " · no lamps yet"));
+			state = row.label(n.online ? "online" : "offline").anchor_right(0).fixed_width(60).fixed_height(SETUP_ROW).alignment("right");
+			state.text_color(n.online ? PAL_ON : PAL_TEXT_3);
+			state.tooltip(n.online ? "Answered an ArtPoll within the last 10 seconds" : "No ArtPoll reply: data is sent to its IP anyway");
+		}
+		add_node = node_list.button("Add node by IP").icon(nanogui.icon("plus")).fixed_height(SETUP_ROW);
+		add_node.tooltip("For a node that does not answer ArtPoll, or is not on the network yet");
+		add_node.on_click([this]() { this.add_node_dialog(); });
+		node_holder.refresh_layout();
+	}
+
+	add_node_dialog() {
+		form = [
+			[id = "ip", label = "IP address", type = "text", placeholder = "2.0.0.10"],
+			[id = "name", label = "Name", type = "text", placeholder = "Truss left"],
 		];
-		
-		engine.fixture_menu.build_fixture_menu();
+		res = engine.screen.modal_form(form, "Add an Art-Net node", "Add", "Cancel");
+		if(res.choice != "submit" || !res.values.ip)
+			return;
+		node = patch_node_add(patch(), std.string(res.values.ip).trim(), std.string(res.values.name ?? "").trim());
+		changed(false);
+		//New lamps go to the node that was just added if they had none to go to
+		if(!drop_node && node.mac)
+			drop_node = node.mac;
+		build_inspector();
+		build_nodes();
 	}
-	
-	//engine_fixture: the fixture object (engine.fixtures[path]), index: the instance in engine_fixture.instances.
-	//drop_pos (optional): drop position in the grid, used by the drag&drop handler to place the new window there.
-	add_spatial_fixture(engine_fixture, index, drop_pos = None) {
-		
-		inst = engine_fixture.instances[index];
-		
-		row = index / fixture_area.content().width();
-		column = math.mod(index, fixture_area.content().width());
-		
-		window = fixture_area.window(inst.name ?? "Device #"+index)
-			.position(vec2f(column * 100,row * 100))
-			.fixed_size(vec2f(100,100))
-			.movable(true).resizable(true);
-		
-		if(drop_pos) {
-			//Dropped on the grid: start at the drop position (adjust_item snaps it to the grid below)
-			window.position(vec2f(drop_pos.x, drop_pos.y));
+
+	// =========================================================================
+	// Changes
+	// =========================================================================
+
+	add_lamps(count) {
+		if(!add_type) {
+			engine.screen.status_overlay("");
+			add_type_label.caption("Pick a fixture type first").text_color(PAL_DANGER);
+			return;
 		}
-		
-		if(inst.uv_pos ?? false) {
-			area_size = fixture_area.content().size();
+		p = patch();
+		b = patch_bounds(p.fixtures);
+		y = b ? b.max_y + 1.5 : 0.0;
+		x = -(count - 1) / 2.0;
+		added = patch_add(p, add_type, count, drop_node, drop_universe, 0, x, y);
+		ids = [];
+		for(i = 0; i < added.size(); i++)
+			ids.push_back(added[i].id);
+		select_ids(ids, false, false);
+		changed(true);
+		fit_view();
+	}
 
-			size = vec2f(inst.uv_size.w, inst.uv_size.h) * area_size;
+	add_lamp_at(type, world) {
+		p = patch();
+		added = patch_add(p, type, 1, drop_node, drop_universe, 0, world.x, world.y);
+		if(added.size())
+			select_ids([added[0].id], false, false);
+		changed(true);
+	}
 
-			pos = ((vec2f(inst.uv_pos.x, inst.uv_pos.y) + vec2f(1,1)) / 2.0) * area_size - size/2.0;
-			
-			window.position(pos).fixed_size(size);
+	duplicate_selected() {
+		if(!selected.size())
+			return;
+		added = patch_duplicate(patch(), selected);
+		ids = [];
+		for(i = 0; i < added.size(); i++)
+			ids.push_back(added[i].id);
+		select_ids(ids, false, false);
+		changed(true);
+	}
+
+	remove_selected() {
+		if(!selected.size())
+			return;
+		if(selected.size() > 1) {
+			if(!engine.screen.modal_yes_no("Remove " + selected.size() + " lamps?", "Remove lamps"))
+				return;
 		}
-		
-		adjust_item = [this, window, inst]() {	
-			gs = 100;
+		patch_remove(patch(), selected);
+		selected = [];
+		apply_highlight();
+		changed(true);
+	}
 
-			pos = window.position();
-			pos.x = math.round(pos.x / gs);
-			pos.y = math.round(pos.y / gs);
-			window.position(pos * gs);
-			
-			size = window.size();
-			size.x = math.max(1, math.round(size.x / gs));
-			size.y = math.max(1, math.round(size.y / gs));
-			window.size(size * gs);
-			
-			size = window.fixed_size();
-			size.x = math.max(1, math.round(size.x / gs));
-			size.y = math.max(1, math.round(size.y / gs));
-			window.fixed_size(size * gs);
-			
-			pos = window.position();
-			size = window.size();
-			uv_pos = (pos + size/2.0) / fixture_area.content().size();
-			uv_pos = uv_pos*2.0 - vec2f(1,1);
-			uv_size = size / fixture_area.content().size();
-			inst.uv_pos = [x=uv_pos.x, y=uv_pos.y];
-			inst.uv_size = [w=uv_size.x, h=uv_size.y];
-		};
-		
-		window.on_move_finished([adjust_item](p1,p2){
-			adjust_item();
-		});
-		window.on_resize([adjust_item](p1,p2){
-			adjust_item();
-		});
-		
-		new_fixture = fixture_instance(window);
-		spatial_fixtures.push_back(new_fixture);
-	
-		close_btn = window.button_panel().button("").icon(nanogui.icon("times")).anchor_top(0).anchor_bottom(0).anchor_right(0).fixed_width(25);
-		close_btn.on_click([this, new_fixture](){
-			for(i = 0; i < this.spatial_fixtures.size(); i++) {
-				if(this.spatial_fixtures[i] == new_fixture)
-					this.spatial_fixtures.erase(i);
-					break;
+	arrange_selected(shape) {
+		lamps = selected_lamps();
+		if(lamps.size() < 2)
+			return;
+		patch_arrange(lamps, shape, 1.0, 4);
+		changed(true);
+	}
+
+	group_from_selection() {
+		if(!selected.size())
+			return;
+		p = patch();
+		g = patch_group_add(p, "Group " + (p.groups.size() + 1), selected);
+		changed();
+	}
+
+	//add: keep the selection and add (or take out) these; toggle: a second click takes a lamp out
+	select_ids(ids, add = false, toggle = false) {
+		if(!add) {
+			if(toggle && ids.size() == 1 && selected.size() == 1 && selected[0] == ids[0])
+				selected = [];
+			else
+				selected = ids.copy();
+		}
+		else {
+			for(i = 0; i < ids.size(); i++) {
+				if(selected.has_value(ids[i])) {
+					if(toggle)
+						selected.erase_value(ids[i]);
+				}
+				else
+					selected.push_back(ids[i]);
 			}
-			
-			if(new_fixture)
-				std.free(new_fixture);
-		});
-	
-		window.button_panel().label(window.title()).anchor_top(0).anchor_bottom(0).anchor_left(0).anchor_right(25);
-	
-		adjust_item();
+		}
+		if(selected.size()) {
+			f = patch_find(patch(), selected[0]);
+			if(f) {
+				drop_node = f.node;
+				drop_universe = f.universe;
+			}
+		}
+		apply_highlight();
+		refresh_lists();
+		build_inspector();
 	}
 
+	apply_highlight() {
+		if(!engine.fixture_menu)
+			return;
+		engine.fixture_menu.set_highlight(highlight_btn.pushed() ? selected : []);
+	}
+
+	// =========================================================================
+	// The stage plan
+	// =========================================================================
+
+	build_center() {
+		center = root.widget().anchor_left(SETUP_LEFT_W).anchor_right(SETUP_RIGHT_W).anchor_top(SETUP_TOOLBAR_H).anchor_bottom(0);
+		stage = center.widget().anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(SETUP_MAP_H);
+		map_area = center.widget().anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(SETUP_MAP_H);
+
+		stage.on_draw([this]() { this.draw_stage(); });
+		stage.on_mouse_button([this](pos, button, down, mods) { return this.stage_button(pos, button, down, mods); });
+		stage.on_mouse_drag([this](pos, rel, button, mods) { return this.stage_drag(pos, rel, button, mods); });
+		stage.on_scroll([this](pos, rel) {
+			this.zoom_at(pos, rel.y);
+			return true;
+		});
+		stage.on_keyboard([this](key, scancode, action, mods) { return this.stage_key(key, action, mods); });
+		stage.on_dragdrop_hover([this](payload, pos) {
+			return this.dropped_types(payload).size() > 0;
+		});
+		stage.on_dragdrop([this](payload, pos) {
+			types = this.dropped_types(payload);
+			for(i = 0; i < types.size(); i++)
+				this.add_lamp_at(types[i], this.to_world(vec2f(pos.x + i * 20, pos.y)));
+			return types.size() > 0;
+		});
+
+		map_area.on_draw([this]() { this.draw_map(); });
+		map_area.on_mouse_button([this](pos, button, down, mods) { return this.map_button(pos, button, down, mods); });
+		map_area.on_mouse_motion([this](pos, rel, button, mods) {
+			this.map_motion(pos);
+			return false;
+		});
+	}
+
+	//The fixture types in a drop from a file browser
+	dropped_types(payload) {
+		list = [];
+		paths = [];
+		if(payload.has("paths") && payload.paths.size())
+			paths = payload.paths;
+		else if(payload.has("path"))
+			paths = [payload.path];
+		for(i = 0; i < paths.size(); i++) {
+			rel = fileio.relative_path_cwd(paths[i]);
+			if(std.string(rel).lowercase().ends(".json") && patch_type(rel).valid)
+				list.push_back(patch_norm_path(rel));
+		}
+		return list;
+	}
+
+	stage_size() {
+		return stage.size();
+	}
+
+	to_screen(x, y) {
+		s = stage_size();
+		return vec2f(s.x / 2.0 + view_x + x * view_scale, s.y / 2.0 + view_y + y * view_scale);
+	}
+
+	to_world(pos) {
+		s = stage_size();
+		return vec2f((pos.x - s.x / 2.0 - view_x) / view_scale, (pos.y - s.y / 2.0 - view_y) / view_scale);
+	}
+
+	fit_view() {
+		p = patch();
+		b = patch_bounds(p.fixtures);
+		s = stage_size();
+		if(!b || s.x < 10) {
+			view_scale = 40.0;
+			view_x = 0.0;
+			view_y = 0.0;
+			return;
+		}
+		w = math.max(4.0, b.max_x - b.min_x + 3.0);
+		h = math.max(3.0, b.max_y - b.min_y + 3.0);
+		view_scale = math.clamp(math.min(s.x / w, s.y / h), 8.0, 70.0);
+		view_x = -(b.min_x + b.max_x) / 2.0 * view_scale;
+		view_y = -(b.min_y + b.max_y) / 2.0 * view_scale;
+	}
+
+	zoom_at(pos, steps) {
+		before = to_world(pos);
+		view_scale = math.clamp(view_scale * math.pow(1.15, steps), 6.0, 240.0);
+		after = to_world(pos);
+		view_x += (after.x - before.x) * view_scale;
+		view_y += (after.y - before.y) * view_scale;
+	}
+
+	//Size of a lamp on the plan: bars (several pixels) are long, others round. [bar, length, width] in metres
+	lamp_shape(f) {
+		pixels = patch_pixel_slots(f.type).size();
+		if(pixels >= 2)
+			return [bar = true, length = math.max(0.6, pixels * 0.12), width = 0.22];
+		return [bar = false, length = 0.5, width = 0.5];
+	}
+
+	//Is pos (screen) on the lamp
+	lamp_hit(f, pos) {
+		c = to_screen(f.x, f.y);
+		shape = lamp_shape(f);
+		d = pos - c;
+		a = (f.rotation ?? 0) * math.PI / 180.0;
+		lx = d.x * math.cos(a) + d.y * math.sin(a);
+		ly = -d.x * math.sin(a) + d.y * math.cos(a);
+		hw = math.max(8.0, shape.length * view_scale / 2.0);
+		hh = math.max(8.0, shape.width * view_scale / 2.0);
+		return math.abs(lx) <= hw && math.abs(ly) <= hh;
+	}
+
+	lamp_at(pos) {
+		p = patch();
+		for(i = p.fixtures.size() - 1; i >= 0; i--) {
+			if(lamp_hit(p.fixtures[i], pos))
+				return p.fixtures[i];
+		}
+		return None;
+	}
+
+	draw_grid() {
+		s = stage_size();
+		nvgBeginPath();
+		nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
+		nvgFillColor(PAL_CANVAS);
+		nvgFill();
+
+		step = 1.0;
+		if(view_scale < 14.0)
+			step = 5.0;
+		tl = to_world(vec2f(0, 0));
+		br = to_world(vec2f(s.x, s.y));
+		nvgBeginPath();
+		for(gx = math.floor(tl.x / step) * step; gx <= br.x; gx += step) {
+			p0 = to_screen(gx, 0);
+			nvgMoveTo(vec2f(p0.x, 0));
+			nvgLineTo(vec2f(p0.x, s.y));
+		}
+		for(gy = math.floor(tl.y / step) * step; gy <= br.y; gy += step) {
+			p0 = to_screen(0, gy);
+			nvgMoveTo(vec2f(0, p0.y));
+			nvgLineTo(vec2f(s.x, p0.y));
+		}
+		nvgStrokeColor(PAL_LINE);
+		nvgStrokeWidth(1.0);
+		nvgStroke();
+
+		//The middle of the stage
+		o = to_screen(0, 0);
+		nvgBeginPath();
+		nvgMoveTo(vec2f(o.x, 0));
+		nvgLineTo(vec2f(o.x, s.y));
+		nvgMoveTo(vec2f(0, o.y));
+		nvgLineTo(vec2f(s.x, o.y));
+		nvgStrokeColor(PAL_LINE_STRONG);
+		nvgStroke();
+
+		pal_text(vec2f(s.x / 2.0, s.y - 14), "Audience", 12, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		pal_text(vec2f(8, 12), (step == 1.0 ? "Grid: 1 m" : "Grid: 5 m") + "   ·   Seen from above. Scroll: zoom · right mouse button: move the plan · Shift+click or a box: select more", 12, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+	}
+
+	draw_lamp(f, is_selected, problem) {
+		c = to_screen(f.x, f.y);
+		shape = lamp_shape(f);
+		color = engine.fixture_menu ? engine.fixture_menu.lamp_color(f) : None;
+		fill = color ? vec4f(color.r, color.g, color.b, 1.0) : PAL_RAISED;
+		if(color && color.r + color.g + color.b < 0.05)
+			fill = PAL_RAISED;
+		outline = is_selected ? PAL_ACCENT : (problem ? PAL_DANGER : PAL_LINE_STRONG);
+
+		nvgSave();
+		nvgTranslate(c);
+		nvgRotate((f.rotation ?? 0) * math.PI / 180.0);
+		nvgBeginPath();
+		if(shape.bar) {
+			l = math.max(16.0, shape.length * view_scale);
+			w = math.max(6.0, shape.width * view_scale);
+			nvgRoundedRect(vec2f(-l / 2.0, -w / 2.0), vec2f(l, w), 2);
+		}
+		else
+			nvgCircle(vec2f(0, 0), math.max(6.0, shape.length * view_scale / 2.0));
+		nvgFillColor(fill);
+		nvgFill();
+		nvgStrokeColor(outline);
+		nvgStrokeWidth(is_selected || problem ? 2.0 : 1.0);
+		nvgStroke();
+		//Pixel order of a bar: a dot on the first pixel
+		if(shape.bar) {
+			l = math.max(16.0, shape.length * view_scale);
+			nvgBeginPath();
+			nvgCircle(vec2f(-l / 2.0 + 4, 0), 2.0);
+			nvgFillColor(PAL_TEXT_2);
+			nvgFill();
+		}
+		nvgRestore();
+
+		radius = math.max(8.0, shape.width * view_scale / 2.0);
+		if(shape.bar)
+			radius = math.max(6.0, shape.width * view_scale / 2.0);
+		if(view_scale >= 18.0 || is_selected) {
+			pal_text(vec2f(c.x, c.y + radius + 9), f.name, 12, is_selected ? PAL_TEXT : PAL_TEXT_2, PAL_ALIGN_CENTER_MIDDLE);
+			if(view_scale >= 30.0)
+				pal_text(vec2f(c.x, c.y + radius + 22), f.node ? patch_address_text(f) : "no node", 11, problem ? PAL_DANGER : PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		}
+	}
+
+	draw_stage() {
+		//The patch changed elsewhere (a project was loaded, the Phaser, ...)
+		if(engine.patch_revision != seen_revision) {
+			seen_revision = engine.patch_revision;
+			p = patch();
+			still = [];
+			for(i = 0; i < selected.size(); i++) {
+				if(patch_find(p, selected[i]))
+					still.push_back(selected[i]);
+			}
+			selected = still;
+			refresh_all();
+		}
+		//A LEDMapper sends other channels now, or was switched on or off
+		else if(frame_counter % 15 == 0 && dmx_state(engine) != seen_dmx_state) {
+			refresh_lists();
+			update_status();
+			update_inspector_info();
+		}
+		frame_counter++;
+		if(frame_counter % 120 == 0 && known_nodes().size() != node_count)
+			build_nodes();
+
+		draw_grid();
+		p = patch();
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			if(!selected.has_value(f.id))
+				draw_lamp(f, false, problems.has(f.id));
+		}
+		//Selected on top, with their order for "Address in order" and groups
+		for(i = 0; i < selected.size(); i++) {
+			f = patch_find(p, selected[i]);
+			if(!f)
+				continue;
+			draw_lamp(f, true, problems.has(f.id));
+			if(selected.size() > 1) {
+				c = to_screen(f.x, f.y);
+				pal_badge(vec2f(c.x, c.y - math.max(14.0, view_scale * 0.35) - 6), std.string(i + 1), PAL_ACCENT);
+			}
+		}
+
+		if(drag_mode == "box" && drag_start && drag_now) {
+			nvgBeginPath();
+			nvgRect(vec2f(math.min(drag_start.x, drag_now.x), math.min(drag_start.y, drag_now.y)),
+				vec2f(math.abs(drag_now.x - drag_start.x), math.abs(drag_now.y - drag_start.y)));
+			nvgFillColor(pal_alpha(PAL_ACCENT, 0.1));
+			nvgFill();
+			nvgStrokeColor(pal_alpha(PAL_ACCENT, 0.7));
+			nvgStrokeWidth(1.0);
+			nvgStroke();
+		}
+
+		if(!p.fixtures.size()) {
+			s = stage_size();
+			pal_text(vec2f(s.x / 2.0, s.y / 2.0), "Drag a fixture type here", 16, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		}
+	}
+
+	stage_button(pos, button, down, mods) {
+		//(a left click already gives the plan the keyboard focus: Delete, Ctrl+A, Ctrl+D, Esc)
+		if(button == 1) {
+			drag_mode = down ? "pan" : "";
+			return true;
+		}
+		if(button != 0)
+			return false;
+		if(down) {
+			drag_start = vec2f(pos.x, pos.y);
+			drag_now = drag_start;
+			drag_moved = false;
+			hit = lamp_at(drag_start);
+			add = (mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL);
+			if(hit) {
+				if(!selected.has_value(hit.id))
+					select_ids([hit.id], add, false);
+				else if(add) {
+					select_ids([hit.id], true, true);
+					drag_mode = "";
+					return true;
+				}
+				drag_mode = "move";
+				drag_origin = [];
+				lamps = selected_lamps();
+				for(i = 0; i < lamps.size(); i++)
+					drag_origin[lamps[i].id] = [x = lamps[i].x, y = lamps[i].y];
+			}
+			else {
+				drag_mode = "box";
+				if(!add) {
+					selected = [];
+					apply_highlight();
+				}
+			}
+		}
+		else {
+			if(drag_mode == "box") {
+				if(drag_moved)
+					box_select(true);
+				else {
+					refresh_lists();
+					build_inspector();
+				}
+			}
+			else if(drag_mode == "move" && drag_moved)
+				changed(true);
+			drag_mode = "";
+			drag_start = None;
+			drag_now = None;
+		}
+		return true;
+	}
+
+	//Selects the lamps in the box, left to right
+	box_select(add_mode) {
+		x0 = math.min(drag_start.x, drag_now.x);
+		x1 = math.max(drag_start.x, drag_now.x);
+		y0 = math.min(drag_start.y, drag_now.y);
+		y1 = math.max(drag_start.y, drag_now.y);
+		p = patch();
+		found = [];
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			c = to_screen(f.x, f.y);
+			if(c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1)
+				found.push_back([id = f.id, x = f.x, y = f.y]);
+		}
+		found = patch_sort_by(found, "x");
+		ids = [];
+		for(i = 0; i < found.size(); i++)
+			ids.push_back(found[i].id);
+		select_ids(ids, true, false);
+	}
+
+	stage_drag(pos, rel, button, mods) {
+		if(drag_mode == "pan") {
+			view_x += rel.x;
+			view_y += rel.y;
+			return true;
+		}
+		if(!drag_start)
+			return false;
+		drag_now = vec2f(pos.x, pos.y);
+		if((drag_now - drag_start).length() > 3.0)
+			drag_moved = true;
+		if(drag_mode == "move" && drag_moved) {
+			d = (drag_now - drag_start) / view_scale;
+			snap = snap_btn.pushed();
+			lamps = selected_lamps();
+			for(i = 0; i < lamps.size(); i++) {
+				o = drag_origin[lamps[i].id] ?? None;
+				if(!o)
+					continue;
+				nx = o.x + d.x;
+				ny = o.y + d.y;
+				if(snap) {
+					nx = math.round(nx / SETUP_SNAP) * SETUP_SNAP;
+					ny = math.round(ny / SETUP_SNAP) * SETUP_SNAP;
+				}
+				lamps[i].x = nx;
+				lamps[i].y = ny;
+			}
+		}
+		return true;
+	}
+
+	stage_key(key, action, mods) {
+		if(action != 1)
+			return false;
+		if(key == SETUP_KEY_DELETE || key == SETUP_KEY_BACKSPACE) {
+			remove_selected();
+			return true;
+		}
+		if(key == SETUP_KEY_ESCAPE) {
+			select_ids([], false, false);
+			return true;
+		}
+		if((mods & SETUP_MOD_CTRL) && key == SETUP_KEY_A) {
+			p = patch();
+			ids = [];
+			for(i = 0; i < p.fixtures.size(); i++)
+				ids.push_back(p.fixtures[i].id);
+			select_ids(ids, false, false);
+			return true;
+		}
+		if((mods & SETUP_MOD_CTRL) && key == SETUP_KEY_D) {
+			duplicate_selected();
+			return true;
+		}
+		return false;
+	}
+
+	// =========================================================================
+	// The universe map
+	// =========================================================================
+
+	//Node and universe the map shows: of the first selected lamp, else where new lamps go
+	map_target() {
+		lamps = selected_lamps();
+		if(lamps.size())
+			return [node = lamps[0].node, universe = lamps[0].universe];
+		return [node = drop_node, universe = drop_universe];
+	}
+
+	//What the LEDMappers write in the universe of the map (dmx_universe_cells), worked out again when something changed
+	universe_cells(target) {
+		key = target.node + "|" + std.string(target.universe) + "|" + std.string(engine.patch_revision) + "|" + seen_dmx_state;
+		if(!map_cells || key != map_cells_key) {
+			map_cells = dmx_universe_cells(engine, patch(), target.node, target.universe);
+			map_cells_key = key;
+		}
+		return map_cells;
+	}
+
+	map_cell_rect(c) {
+		s = map_area.size();
+		top = 30;
+		cw = (s.x - SETUP_MAP_LEFT - 8) / SETUP_MAP_COLS;
+		ch = (s.y - top - 8) / SETUP_MAP_ROWS;
+		col = c % SETUP_MAP_COLS;
+		row = std.int(c / SETUP_MAP_COLS);
+		return [x = SETUP_MAP_LEFT + col * cw, y = top + row * ch, w = cw, h = ch];
+	}
+
+	map_cell_at(pos) {
+		s = map_area.size();
+		top = 30;
+		cw = (s.x - SETUP_MAP_LEFT - 8) / SETUP_MAP_COLS;
+		ch = (s.y - top - 8) / SETUP_MAP_ROWS;
+		col = std.int((pos.x - SETUP_MAP_LEFT) / cw);
+		row = std.int((pos.y - top) / ch);
+		if(pos.x < SETUP_MAP_LEFT || pos.y < top || col < 0 || col >= SETUP_MAP_COLS || row < 0 || row >= SETUP_MAP_ROWS)
+			return -1;
+		return row * SETUP_MAP_COLS + col;
+	}
+
+	draw_map() {
+		s = map_area.size();
+		nvgBeginPath();
+		nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
+		nvgFillColor(PAL_FIELD);
+		nvgFill();
+
+		target = map_target();
+		p = patch();
+		if(!target.node) {
+			pal_text(vec2f(8, 15), "Universe map: pick a node for a lamp to see its universe", 12, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+			return;
+		}
+		map = patch_universe_map(p, target.node, target.universe);
+		cells = universe_cells(target);
+		used = 0;
+		by_leds = 0;
+		for(c = 0; c < PATCH_UNIVERSE_SIZE; c++) {
+			if(map[c] || cells[c].state)
+				used++;
+			if(cells[c].state)
+				by_leds++;
+		}
+		title = node_name(target.node) + " · Universe " + target.universe + " · " + used + " of 512 channels used";
+		if(by_leds)
+			title += " (" + by_leds + " by LEDMappers, grey)";
+		if(map_hover)
+			title += "   —   " + map_hover;
+		pal_text(vec2f(8, 15), title, 12, PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE);
+
+		//Index of each lamp for its colour
+		index_of = [];
+		for(i = 0; i < p.fixtures.size(); i++)
+			index_of[p.fixtures[i].id] = i;
+
+		for(c = 0; c < PATCH_UNIVERSE_SIZE; c++) {
+			r = map_cell_rect(c);
+			id = map[c];
+			nvgBeginPath();
+			nvgRect(vec2f(r.x + 0.5, r.y + 0.5), vec2f(r.w - 1, r.h - 1));
+			led = cells[c].state;
+			if(id == "!" || led == "!")
+				nvgFillColor(PAL_DANGER);
+			else if(!id && led)
+				nvgFillColor(pal_alpha(PAL_TEXT_2, 0.55)); //a LEDMapper writes here
+			else if(!id)
+				nvgFillColor(PAL_CONTROL);
+			else if(selected.has_value(id))
+				nvgFillColor(PAL_ACCENT);
+			else
+				nvgFillColor(pal_hue(index_of[id] ?? 0, 0.8));
+			nvgFill();
+		}
+		//Channel numbers at the start of each row
+		for(row = 0; row < SETUP_MAP_ROWS; row++) {
+			r = map_cell_rect(row * SETUP_MAP_COLS);
+			pal_text(vec2f(r.x - 4, r.y + r.h / 2.0), std.string(row * SETUP_MAP_COLS + 1), 10, PAL_TEXT_3, PAL_ALIGN_RIGHT_MIDDLE);
+		}
+	}
+
+	map_motion(pos) {
+		c = map_cell_at(pos);
+		if(c < 0) {
+			map_hover = "";
+			return;
+		}
+		target = map_target();
+		if(!target.node) {
+			map_hover = "";
+			return;
+		}
+		p = patch();
+		names = [];
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			if(f.node == target.node && f.universe == target.universe && c + 1 >= f.address && c + 1 <= patch_end(f))
+				names.push_back(f.name + " (+" + (c + 1 - f.address) + ")");
+		}
+		cells = universe_cells(target);
+		led_names = cells[c].names;
+		for(i = 0; i < led_names.size(); i++)
+			names.push_back(led_names[i]);
+		//(not combine_string(): it puts the separator after the last one too)
+		text = "";
+		for(i = 0; i < names.size(); i++)
+			text += (i ? ", " : "") + names[i];
+		map_hover = "Channel " + (c + 1) + ": " + (names.size() ? text : "free");
+	}
+
+	map_button(pos, button, down, mods) {
+		if(button != 0 || !down)
+			return true;
+		c = map_cell_at(pos);
+		target = map_target();
+		if(c < 0 || !target.node)
+			return true;
+		p = patch();
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			if(f.node == target.node && f.universe == target.universe && c + 1 >= f.address && c + 1 <= patch_end(f)) {
+				select_ids([f.id], (mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL), true);
+				return true;
+			}
+		}
+		return true;
+	}
 }

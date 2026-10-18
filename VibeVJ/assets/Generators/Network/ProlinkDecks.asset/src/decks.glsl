@@ -5,6 +5,18 @@
 //   mode 1: lanes only, each with an info column on the left and an optional overview bar at the bottom
 // Texts are drawn by the generator with nanovg. All layout numbers come from layout() in __init__.shio,
 // so text and graphics always match. Texture layout per deck: see shzmodule_prolink/README.md.
+//
+// The view is content (Shizo UI principle 1): waveforms, beat grid, cues, loops and phrases keep the colours of the
+// STYLE. Its chrome (background, panels, lanes, the state stripe) uses the Shizo UI tokens below in both styles.
+
+// Shizo UI tokens (design/tokens.json, version 0.3.0). The overlay in __init__.shio uses the same values (UI_*).
+const vec3 UI_CANVAS  = vec3(11.0, 11.0, 12.0) / 255.0;    // canvas: behind everything, gaps between panels and lanes
+const vec3 UI_FIELD   = vec3(14.0, 14.0, 15.0) / 255.0;    // field: behind the waveforms (lanes, previews)
+const vec3 UI_SURFACE = vec3(19.0, 19.0, 20.0) / 255.0;    // surface: deck panels, info columns, history column
+const vec3 UI_CONTROL = vec3(37.0, 37.0, 40.0) / 255.0;    // control: stripe of a deck that is neither on air nor master
+const vec3 UI_TEXT    = vec3(237.0, 237.0, 237.0) / 255.0; // text: stripe of the tempo master, progress line
+const vec3 UI_LIVE    = vec3(63.0, 207.0, 142.0) / 255.0;  // live (= on): stripe of a deck that is on air
+const vec4 UI_LINE    = vec4(1.0, 1.0, 1.0, 0.07);         // line: white 7 %, bar lines through the lane
 
 uniform sampler2D deck1;
 uniform sampler2D deck2;
@@ -22,48 +34,41 @@ uniform vec4 pstyle;  // style of the preview waveform per deck (x = deck 1 ...)
 
 uniform vec4 lanes;     // deck (0..3) shown in lane 1..4, -1 = none
 uniform float nlanes;   // 1..4
-uniform float zoom;     // detail columns across the waveform area (150 per second)
+uniform float zoom;     // detail columns across the waveform area (150 per second; more seconds on wide outputs)
 uniform float playhead; // position of the playhead in the waveform area, 0..1 (0.5 = centre)
 uniform float top;      // height of the panel row (fraction of the output), 0 = no panels
+uniform float head;     // text part of a panel (fraction of the panel height; 0.42, more in flat strips)
 uniform float info_w;   // width of the info column left of each lane (fraction of the output width)
 uniform float right_w;  // free margin right of each lane (fraction of the output width)
 uniform float pbar;     // overview bar at the bottom of each lane (fraction of the lane height), 0 = off
 uniform float hist_w;   // history column at the right (fraction of the output width), 0 = off
+uniform float pad_w;    // outer margin left and right (fraction of the output width; PAD of the height at 1920 x 1080)
 
-// Colors of the STYLE (CDJ or VibeVJ), set by the generator every frame
-uniform vec3 c_bg;        // behind everything
-uniform vec3 c_panel;     // deck panels, info columns, history column
-uniform vec3 c_lane;      // behind the detail waveform
+// Content colours of the STYLE (CDJ or VibeVJ), set by the generator every frame
 uniform vec3 c_low;       // 3-band waveform: bass, mids, highs
 uniform vec3 c_mid;
 uniform vec3 c_high;
 uniform vec3 c_playhead;
-uniform vec3 c_master;    // stripe of the tempo master
-uniform vec3 c_on_air;    // stripe of a channel that is open on the mixer
-uniform vec3 c_idle;      // stripe otherwise
 uniform vec3 c_loop;
 uniform vec3 c_tick;      // beat ticks
 uniform vec3 c_down;      // downbeat ticks
-uniform float radius;     // corner radius of panels, lanes and the history column (pixels), 0 = square
-uniform float stripe;     // width of the stripe left of panels and lanes (line widths)
+uniform float radius;     // corner radius of panels, lanes and the history column (pixels; radius.window = 4 px at 1080)
+uniform float stripe;     // width of the state stripe left of panels and lanes (line widths)
 
 const float GAP  = 0.012;  // between panels/lanes (fraction of the output height)
-const float PAD  = 0.006;  // outer margin
-const float HEAD = 0.42;   // text part of a panel
+const float PAD  = 0.006;  // outer margin top and bottom (left and right: pad_w)
 const float ROOM = 0.84;   // the detail waveform uses this much of the half height; above it beat ticks and cue flags
 
-#define BG       c_bg
-#define PANEL    c_panel
-#define LANE     c_lane
+#define BG       UI_CANVAS
+#define PANEL    UI_SURFACE
+#define LANE     UI_FIELD
 #define LOW      c_low
 #define MID      c_mid
 #define HIGH     c_high
 #define PLAYHEAD c_playhead
-#define MASTER   c_master
-#define ON_AIR   c_on_air
 #define LOOP     c_loop
 
-float LW = 1.0; // line width in pixels, scales with the output height (set in main)
+float LW = 1.0; // line width in pixels, scales with the output height, narrow outputs with their width (set in main)
 
 vec4 fetch(int d, ivec2 p)
 {
@@ -132,9 +137,12 @@ vec4 detail_sample(int d, float col, float cols_per_px, int count)
 	return mix(p0, p1, c - float(a));
 }
 
-vec3 accent(vec4 pl)
+// State stripe left of panels and lanes: tempo master = light, else on air = live green, else quiet. Master first, so
+// the master stays visible when several channels are open (the On air badge still marks an on-air master).
+// The colour is not the only signal: the overlay writes "On air" and "Master" next to the BPM.
+vec3 stripe_color(vec4 pl)
 {
-	return pl.z > 0.5 ? MASTER : pl.w > 0.5 ? ON_AIR : c_idle;
+	return pl.z > 0.5 ? UI_TEXT : pl.w > 0.5 ? UI_LIVE : UI_CONTROL;
 }
 
 // Inside a rectangle of `size` with rounded corners (radius r)? p from its top left corner
@@ -188,7 +196,7 @@ vec3 draw_detail(int d, vec2 p, vec2 size)
 			}
 		}
 		if (tick > 0.0 && down)
-			color = mix(color, vec3(1.0), 0.09);
+			color = mix(color, UI_LINE.rgb, UI_LINE.a);
 
 		vec4 w = wave(detail_sample(d, col, cols_per_px, count), inf.w, h, aa);
 		color = mix(color, w.rgb, w.a);
@@ -242,7 +250,7 @@ vec3 draw_preview(int d, vec2 p, vec2 size, vec3 base)
 	if (bit(m, 0x10) && q.y < 3.0 * LW / size.y)
 		color = LOOP;
 	if (abs(q.x - pl.y) * size.x < LW)
-		color = vec3(1.0);
+		color = UI_TEXT;
 	return color;
 }
 
@@ -250,12 +258,12 @@ vec3 draw_preview(int d, vec2 p, vec2 size, vec3 base)
 vec3 draw_panel(int d, vec2 p, vec2 size)
 {
 	vec4 pl = play(d);
-	float head = size.y * HEAD;
+	float hy = size.y * head;
 	if (p.x < stripe * LW)
-		return accent(pl);
-	if (p.y < head || d < 0)
+		return stripe_color(pl);
+	if (p.y < hy || d < 0)
 		return PANEL;
-	return draw_preview(d, vec2(p.x, p.y - head), vec2(size.x, size.y - head), PANEL * 0.8);
+	return draw_preview(d, vec2(p.x, p.y - hy), vec2(size.x, size.y - hy), UI_FIELD);
 }
 
 void main()
@@ -263,10 +271,10 @@ void main()
 	vec2 res = u_resolution;
 	vec2 px = vec2(v_uv.x, 1.0 - v_uv.y) * res; // pixels, y down (like nanovg)
 	vec3 color = BG;
-	LW = max(1.0, res.y / 540.0);
+	LW = max(1.0, min(res.y / 540.0, res.x / 960.0)); // line_width() in __init__.shio
 
 	int n = clamp(int(nlanes + 0.5), 1, 4);
-	float pad_x = PAD * res.x;
+	float pad_x = pad_w * res.x;
 	float pad_y = PAD * res.y;
 	float gap = GAP * res.y;
 	float R = radius;
@@ -315,11 +323,11 @@ void main()
 		int d = lane_deck(i);
 		vec4 pl = d < 0 ? vec4(0.0) : play(d);
 
-		// Info column (texts by the generator) with the deck's accent on the left
+		// Info column (texts by the generator) with the deck's state stripe on the left
 		if (p.x < iw)
 		{
 			if (inside(p, vec2(iw, lh), R))
-				color = p.x < stripe * LW ? accent(pl) : PANEL;
+				color = p.x < stripe * LW ? stripe_color(pl) : PANEL;
 			continue;
 		}
 		// Free margin right (pitch in the panel layout)
@@ -349,7 +357,7 @@ void main()
 			float split = lh - bar;
 			if (q.y >= split + LW)
 			{
-				color = draw_preview(d, vec2(q.x, q.y - split - LW), vec2(size.x, bar - LW), PANEL * 0.8);
+				color = draw_preview(d, vec2(q.x, q.y - split - LW), vec2(size.x, bar - LW), UI_FIELD);
 				continue;
 			}
 			if (q.y >= split)

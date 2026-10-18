@@ -282,6 +282,26 @@ std.print(result);        // 7
 shadow() { var g = 5; return g; }   // local g, the global stays 2
 ```
 
+### 4.0.1 Static Variables
+
+`static x = value;` declares a variable that keeps its value between the calls of a function. The value is assigned only
+the first time the declaration runs; later runs skip it.
+
+```
+next_id() {
+    static id = 0;        // runs once
+    id++;
+    return id;
+}
+next_id(); next_id();     // 1, 2
+```
+
+- The name is visible only in its block (like a local); a global of the same name is shadowed, not changed.
+- There is one variable per script (one per `std.module()` instance), shared by all calls, threads and, in a method,
+  by all instances of the class.
+- Strict code can annotate it: `static int n = 0;`. `static` cannot be combined with `var` / `let` / `managed`, and class
+  members (in the class body) cannot be static.
+
 ---
 
 ## 4.1 Type Conversions
@@ -340,8 +360,9 @@ Standard arithmetic, logical, comparison.
 
 ```
 + - * / %            // arithmetic, % = modulo (C semantics for ints: -7 % 3 == -1, fmod for floats: 7.5 % 2 == 1.5)
-& | ^ ~              // bitwise and, or, xor, not (~5 == -6) - binds TIGHTER than * and +, see 6.1
+& | ^ ~              // bitwise and, or, xor, not (~5 == -6), precedence as in C, see 6.1
 == != < <= > >=      // comparison
+=== !==              // equality without converting between types, see 6.2
 && || !              // logical
 a ? b : c            // ternary, right-associative: "a ? b : c ? d : e" means "a ? b : (c ? d : e)"
 a ?? b               // b if a is falsy (see Runtime Pitfalls)
@@ -354,8 +375,7 @@ a ?? b               // b if a is falsy (see Runtime Pitfalls)
 
 ### 6.1 Precedence (lowest to highest)
 
-This is the table the compiler actually uses. It is NOT the C order: the bitwise
-operators `& | ^` bind **tighter** than `* / %` and `+ -`, and all three share one level.
+The order of C (and JS / Python for these operators):
 
 | Level | Operators | Notes |
 |---|---|---|
@@ -363,28 +383,30 @@ operators `& | ^` bind **tighter** than `* / %` and `+ -`, and all three share o
 | 2 | `??` | |
 | 3 | `\|\|` | |
 | 4 | `&&` | |
-| 5 | `==` `!=` | |
-| 6 | `<` `>` `<=` `>=` | |
-| 7 | `+` `-` | |
-| 8 | `*` `/` `%` | |
-| 9 | `&` `\|` `^` | all three on the SAME level, left to right |
-| 10 | unary `! ~ & * + -` | prefix, binds tighter than any binary operator |
-| 11 | `++` `--` | postfix |
+| 5 | `\|` | bitwise or |
+| 6 | `^` | bitwise xor |
+| 7 | `&` | bitwise and |
+| 8 | `==` `!=` `===` `!==` | |
+| 9 | `<` `>` `<=` `>=` | |
+| 10 | `+` `-` | |
+| 11 | `*` `/` `%` | |
+| 12 | unary `! ~ & * + -` | prefix, binds tighter than any binary operator |
+| 13 | `++` `--` | |
 
-Member access / indexing (`a.b`, `a[i]`) and calls are handled before all operators, so
-`-a.b` is `-(a.b)`.
-
-Consequences to remember (a=3, b=5, c=2, d=7):
+Binary operators of one level go left to right. Member access / indexing (`a.b`, `a[i]`) and calls are handled
+before all operators, so `-a.b` is `-(a.b)`.
 
 ```
-a & b | c ^ d     // 4  -> ((a & b) | c) ^ d   (C/JS/Python would give 5)
-c * a & 1         // 2  -> c * (a & 1)         (C would give 0)
-1 + c & 255       // 3  -> 1 + (c & 255)
-a & b == 1        // 1  -> (a & b) == 1        (bitwise binds tighter than ==)
+a & b | c ^ d     // (a & b) | (c ^ d)
+c * a & 1         // (c * a) & 1
+x & 1 == 1        // x & (1 == 1)  - as in C: write (x & 1) == 1
 ```
 
-Use parentheses when porting bit masks, colour packing or DMX/Art-Net byte maths from
-C/JS/Python — the results differ silently otherwise.
+### 6.2 Equality
+
+`==` converts between types like the other comparisons (`"1" == 1` is true, `"10" < 9` compares numbers).
+`===` / `!==` do not convert: values of different types are never equal (`"1" === 1` is false); int and float are
+both numbers (`1 === 1.0` is true). `None` equals only `None` with both.
 
 NOT AVAILABLE:
 ```
@@ -411,7 +433,18 @@ ONLY loop keyword:
 for(i = 0; i < 10; i++) { }   // classic loop
 for(i < 10) { }               // condition only, replaces while
 for(1) { }                    // endless loop, leave with break
+for(x : list) { }             // each element of a list
+for(i, x : list) { }          // index and element
+for(k, v : json) { }          // key and value of a JSON object
+for(c : "text") { }           // each character of a string (UTF-8), for(i, c : s) with the character index
 ```
+
+- `for(x : expr)`: `x` (and the key) are new variables of the loop, also when an outer variable has the same name; they
+  do not exist after the loop. `expr` is evaluated once. `break`, `continue` and `return` work as in every loop.
+- A list gives its elements (key: the index), a JSON object its values (key: the key), a string its characters (key:
+  the character index). Any other value (None, numbers, class instances) is a runtime error.
+- Changing members of an element (`o.n += 1`) changes the element in the list; assigning the loop variable does not.
+- Prefer it over `for(i = 0; i < l.size(); i++) { x = l[i]; }`: shorter and about twice as fast.
 
 ```
 if(a) { } else if(b) { } else { }
@@ -547,7 +580,7 @@ Classes overload operators with dunder methods:
 | `== != < <= > >=` | `__eq__ __ne__ __lt__ __le__ __gt__ __ge__` | |
 | unary `-` | `__neg__` | |
 | `obj[key]` | `__getitem__(key)` | |
-| `obj[key] = value` | `__setitem__(key, value)` | |
+| `obj[key] = value`, `obj[key] += x`, `obj[key]++` | `__setitem__(key, value)` (after `__getitem__` for `+=` / `++`) | |
 
 ```
 class Vec2
@@ -567,7 +600,7 @@ v += Vec2(1, 1);                       // compound assignments use the binary me
 
 - Comparison results are normalized to `0` / `1`. `!=` falls back to the negated `__eq__`, `a > b` to `b.__lt__(a)`.
 - Without operator methods `==` compares identity and arithmetic is a runtime error naming the missing method.
-- `obj[key]` / `obj[key] = value` (also `+=` etc.): keys that name a member of the class still access that member. For any other key, and for `obj.name` when `name` is not a member, `__getitem__` is called (only if the class defines it). `this[i]` works inside the class.
+- `obj[key]` / `obj[key] = value` (also `+=` etc.): keys that name a member of the class still access that member. For any other key, and for `obj.name` when `name` is not a member, `__getitem__` is called (only if the class defines it). `obj.name++` and `obj.name += x` on such a name write the result back with `__setitem__`; a plain `obj.name = x` stays a member assignment. `this[i]` works inside the class.
 
 ---
 
