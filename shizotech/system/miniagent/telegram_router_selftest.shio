@@ -18,6 +18,9 @@
 //      progress streams as a draft
 //    * a task finished on ANY node is a notification in EVERY trusted chat,
 //      carrying the report, exactly once per chat (the Router de-duplicates)
+//    * one routed goal = ONE task, named by the NODE: the router announces no
+//      name of its own, the node's receptionist acknowledgement is never sent,
+//      and the completion arrives exactly once with the node's task name
 //    * node notify + node online/offline are forwarded
 //    * a reload reads the trust file from disk
 //
@@ -182,6 +185,20 @@ class tg_fake_bot {
         return n;
     }
 
+    // one broadcast reaches every trusted chat, so "exactly once" is per chat
+    count_with_for(chatid, needle) {
+        want = std.int(chatid);
+        n = 0;
+
+        for(i = 0; i < sent.size(); i++) {
+            if(std.int(sent[i].chatid) == want && std.string(sent[i].text).contains(needle)) {
+                n++;
+            }
+        }
+
+        return n;
+    }
+
     last_for(chatid) {
         want = std.int(chatid);
         out = "";
@@ -244,9 +261,11 @@ class tg_stub_host {
 
     _notify_cb = None;
     _task_finish_cb = None;
+    _task_start_cb = None;
 
     on_notify(cb) { _notify_cb = cb; }
     on_task_finished(cb) { _task_finish_cb = cb; }
+    on_task_started(cb) { _task_start_cb = cb; }
     on_action(cb) { }
 
     notify_user(msg) {
@@ -254,8 +273,13 @@ class tg_stub_host {
             _notify_cb(std.string(msg));
     }
 
+    // HANDOFF makes the stub receptionist create a task for the goal it was
+    // delegated, exactly like the real receptionist role does inside its turn.
     request(prompt, on_finish_cb = None, on_action_cb = None) {
         _receptionist_active = true;
+
+        if(prompt.starts("HANDOFF"))
+            add_task("Sushi-Goal", std.string(prompt));
 
         result = [
             ok = true,
@@ -282,7 +306,12 @@ class tg_stub_host {
 
     add_task(name, goal) {
         taskid = std.random_hash(16);
-        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+        task = [name = name, task = goal, taskid = taskid, state = "planned"];
+        tasks_scheduled.push_back(task);
+
+        if(_task_start_cb)
+            _task_start_cb(task);
+
         return taskid;
     }
 
@@ -491,6 +520,7 @@ rtr = TelegramRouter(
         trusted_chats = TRUSTED_FILE,
         poll_ms = 100,
         draft_ms = 0,
+        handoff_settle_ms = 500,
     ]
 );
 
@@ -697,6 +727,85 @@ bot.on_any_message([chatid = CHAT_A, text = dup_text]);
 
 after_window = wait_for([stub_agent]() { return stub_agent.turns == turns_pre + 2; }, 8000);
 check("the same text after the dedup window is a new turn", after_window, std.string(stub_agent.turns - turns_pre));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4e. One routed goal = ONE task, and the task is the NODE's.
+//
+//  The owner's complaint: routing one goal produced two "Task X started" messages
+//  with two different names — the label the router agent invented and the node's
+//  real task. The router names nothing and never renders the node's receptionist
+//  acknowledgement as news; the node's task is the task, announced once, by the node.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The previous section left a turn in flight, and its handoff records settle a moment
+// later: let them land, clear the chat, and synchronise on the AGENT turn count -
+// "picked GPUBox" is already in the history, so the chat text cannot be the signal.
+//
+// The goal text is unique: the settle of an older handoff record lands in this chat
+// mid-section, and a needle shared with those answers would make the checks race.
+std.sleep(1200);
+bot.clear();
+
+hand_turns = stub_agent.turns;
+hand_goal = "HANDOFF train the sushi model with cuda";
+
+bot.on_any_message([chatid = CHAT_A, text = hand_goal]);
+
+hand_turn = wait_for([stub_agent, hand_turns]() { return stub_agent.turns >= hand_turns + 1; }, 8000);
+check("the goal ran its own router-agent turn", hand_turn, std.string(stub_agent.turns - hand_turns));
+
+hand_answered = wait_for([bot]() { return bot.count_for(CHAT_A) > 0; }, 8000);
+check("the routed goal is answered", hand_answered, bot.last_for(CHAT_A));
+
+answer = bot.last_for(CHAT_A);
+check("the answer names no task", !answer.contains("AgentPick") && !answer.contains("Sushi-Goal"), answer);
+check("the answer says which node took the goal", answer.contains(GPU_NAME), answer);
+check("the answer promises the notification", answer.lowercase().contains("when it is done"), answer);
+check("the receptionist ack is not sent as news", !answer.contains("stub answer:"), answer);
+
+goal_taskid = "";
+find_goal = wait_for([rtr, hand_goal]() {
+		list = rtr.tasks_summary();
+		for(i = 0; i < list.size(); i++) {
+			if(std.string(list[i].goal) == hand_goal) {
+				return true;
+			}
+		}
+		return false;
+	}, 8000);
+
+if(find_goal) {
+	glist = rtr.tasks_summary();
+	for(i = 0; i < glist.size(); i++) {
+		if(std.string(glist[i].goal) == hand_goal) {
+			goal_taskid = std.string(glist[i].taskid);
+		}
+	}
+}
+check("the goal is mirrored exactly once", find_goal && goal_taskid.length() > 0, std.string(goal_taskid));
+
+bound = wait_for([rtr, goal_taskid]() {
+		t = rtr.inspect_task(goal_taskid);
+		return std.is_json(t) && std.string(t.remote_taskid).length() > 0;
+	}, 8000);
+
+gr = rtr.inspect_task(goal_taskid);
+check("the node's task_started bound the record", bound, std.string(gr));
+check("the record took the NODE's task name", std.is_json(gr) && std.string(gr.name) == "Sushi-Goal", std.string(gr));
+
+grtid = "";
+if(std.is_json(gr))
+	grtid = std.string(gr.remote_taskid);
+
+check("the node finishes its task", hostA.finish_task(grtid, "finished", "the sushi model is trained"), grtid);
+
+done_msg = wait_for([bot]() { return bot.has_for(CHAT_A, "[done] " + GPU_NAME + ": task Sushi-Goal"); }, 8000);
+check("the completion names the NODE's task", done_msg, bot.last_for(CHAT_A));
+check("the completion carries the node's report", bot.has_for(CHAT_A, "the sushi model is trained"), bot.last_for(CHAT_A));
+check("one routed goal is announced once per chat",
+	bot.count_with_for(CHAT_A, "Sushi-Goal") == 1 && bot.count_with_for(CHAT_B, "Sushi-Goal") == 1,
+	std.string(bot.count_with_for(CHAT_A, "Sushi-Goal")) + "/" + std.string(bot.count_with_for(CHAT_B, "Sushi-Goal")));
+check("no lost is announced for a goal that is simply running", !bot.has_for(CHAT_A, "[lost]"), std.string(bot.sent));
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  5. A task finished on ANY node is a notification in EVERY trusted chat

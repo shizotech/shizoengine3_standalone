@@ -4,20 +4,37 @@ managed video_router = None;
 
 video = None;
 output = None;
+engine = None;
 
 play_ctrl = None;
 speed_ctrl = None;
 loop_ctrl = None;
 flip_ctrl = None;
 hw_ctrl = None;
+audio_ctrl = None;
+volume_ctrl = None;
 position_ctrl = None;
+convert_ctrl = None;
 info_label = None;
 info_text = "";
+
+// When Position was last moved by hand, MIDI or a link: update() leaves the
+// slider alone for a moment, so it does not fight the hand or the modulation.
+scrub_ms = 0;
+
+// Set while update() moves the slider to where playback is: value(v, false)
+// still calls the callback (shz_slider::set_value notifies), which would seek
+// every clip to where it already is four times a second.
+showing_position = false;
+
+// "Convert to HAP" job (nanogui.video_convert) and what it said when it ended
+convert_job = None;
+convert_note = "";
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "get_default_output")
 		return output;
-	
+
 	// ACT off stops decoding, ACT on resumes when Play is on.
 	if(cmd == "active") {
 		if(generator.is_active() && play_ctrl.value())
@@ -25,7 +42,7 @@ dispatcher(generator, cmd, value) {
 		else
 			video.pause();
 	}
-	
+
 	return None;
 }
 
@@ -33,7 +50,7 @@ dispatcher(generator, cmd, value) {
 // once frames arrive, so this is refreshed from update().
 update_info() {
 	text = "";
-	
+
 	if(!video.is_open()) {
 		text = video.error();
 		if(!text)
@@ -45,38 +62,98 @@ update_info() {
 			decoder = "software";
 		else if(video.zero_copy())
 			decoder = decoder + ", zero-copy"; // frames stay on the GPU
+		if(video.dxt())
+			decoder = "DXT on the GPU"; // HAP: the graphics card unpacks the frames
 
 		// 29.97, 25, 23.98, ...
 		fps_text = std.string(math.round(video.fps() * 100) / 100.0);
 		dot = fps_text.find(".");
 		if(dot >= 0)
 			fps_text = fps_text.substr(0, dot + 3).removesuffix("0").removesuffix("0").removesuffix(".");
-		
+
 		text = video.codec() + " " + video.width() + "x" + video.height() + " " + fps_text + " fps, " + decoder;
-		
+
+		// What the Position and Speed controls can do with this file
+		if(video.reversible())
+			text = text + ", backwards";
+
+		// Sound: only when the file has some
+		if(video.has_audio()) {
+			if(!video.audio())
+				text = text + ", sound off";
+			else if(video.audio_error())
+				text = text + ", sound: " + video.audio_error();
+			else
+				text = text + ", sound";
+		}
+		else if(!video.seekable())
+			text = text + ", no position control";
+
 		error = video.error();
 		if(error)
 			text = text + " - " + error;
 	}
-	
+
+	if(convert_job) {
+		if(convert_job.finished()) {
+			if(convert_job.ok()) {
+				convert_note = "HAP copy ready: " + fileio.file_name(convert_job.target()) + " (in Assets, next to this file)";
+				if(engine && engine.filebrowser)
+					engine.filebrowser.refresh();
+			}
+			else
+				convert_note = "Convert failed: " + convert_job.error();
+			convert_job = None;
+			convert_ctrl.caption("Convert to HAP");
+		}
+		else
+			text = text + " - converting to HAP: " + std.string(std.int(math.round(convert_job.progress() * 100))) + " %";
+	}
+	if(convert_note)
+		text = text + " - " + convert_note;
+
 	if(text != info_text) {
 		info_text = text;
 		info_label.caption(text);
 	}
 }
 
+// A copy every frame of which is a key frame, so it can be positioned and
+// played backwards: <name>_hap.mov next to the file.
+start_convert(generator) {
+	if(convert_job) {
+		convert_job.cancel();
+		return;
+	}
+
+	source = generator.path;
+	target = fileio.file_dir(source) + "/" + fileio.pure_name(source) + "_hap.mov";
+	if(fileio.exists(target)) {
+		convert_note = "There is a HAP copy already: " + fileio.file_name(target);
+		update_info();
+		return;
+	}
+
+	convert_note = "";
+	convert_job = nanogui.video_convert(source, target, "hap");
+	if(convert_job)
+		convert_ctrl.caption("Cancel convert");
+	update_info();
+}
+
 entry(generator, area) {
+	engine = generator.engine;
 	area.layout(None);
-	
+
 	control_tabs = area.vscroll().anchor_left(0).anchor_top(0).anchor_bottom(25).fixed_width(250)
 		.content().layout(nanogui.layout_vertical());
-	
+
 	video = area.video(generator.path);
-	
+
 	video.anchor_left(250).anchor_top(0).anchor_bottom(25).anchor_right(0);
-	
+
 	output = control_tabs.control("OUT").as_output(true);
-	
+
 	play_ctrl = control_tabs.controlbutton("Play").push(1).value(1);
 	play_ctrl.callback([generator](v){
 		if(v && generator.is_active())
@@ -84,51 +161,100 @@ entry(generator, area) {
 		else
 			video.pause();
 	});
-	
+
+	// The buttons below act on a click (v = 1) only: loading a project
+	// (nanogui.deserialize_controls) calls every callback with the saved value
+	// 0, which restarted every clip, stepped it and started a conversion.
 	restart_ctrl = control_tabs.controlbutton("Restart");
 	restart_ctrl.callback([](v){
+		if(!v)
+			return;
 		video.stop();
 		if(play_ctrl.value())
 			video.play();
 	});
-	
-	speed_ctrl = control_tabs.controlslider("Speed").min(0).max(4).value(1);
+
+	// Backwards (negative) only where every frame is a key frame (HAP, ProRes,
+	// DNxHR, ...); "Convert to HAP" in the options makes such a copy.
+	speed_ctrl = control_tabs.controlslider("Speed").min(video.reversible() ? -4 : 0).max(4).value(1);
 	speed_ctrl.callback([](v){
+		if(v < 0 && !video.reversible())
+			v = 0;
 		video.speed(v);
 	});
-	
+
 	loop_ctrl = control_tabs.controlbutton("Loop").push(1).value(1);
 	loop_ctrl.callback([](v){
 		video.loop(v);
 	});
-	
-	// Output only for now: 0..1 through the clip. Becomes a scrub control with
-	// position control (#278 Phase 2, needs video.seekable()).
+
+	// 0..1 through the clip: shows where playback is, and moving it (by hand,
+	// MIDI or a link) jumps there. Moved every frame it scrubs.
 	position_ctrl = control_tabs.controlslider("Position").min(0).max(1).value(0);
-	
+	position_ctrl.callback([](v){
+		if(showing_position || !video.seekable())
+			return;
+		scrub_ms = std.millis();
+		video.position(v * video.duration());
+	});
+
+	step_back_ctrl = control_tabs.controlbutton("Frame back");
+	step_back_ctrl.callback([](v){
+		if(!v)
+			return;
+		play_ctrl.value(0);
+		video.step(-1);
+	});
+
+	step_ctrl = control_tabs.controlbutton("Frame forward");
+	step_ctrl.callback([](v){
+		if(!v)
+			return;
+		play_ctrl.value(0);
+		video.step(1);
+	});
+
 	size_vec = control_tabs.controlvector("Size");
 	width = size_vec.controlint("Width").value(video.width());
 	height = size_vec.controlint("Height").value(video.height());
-	
+
 	options_vec = control_tabs.controlvector("Options").expanded(false);
-	
+
 	flip_ctrl = options_vec.controlbutton("Flip Y").push(1).value(0);
 	flip_ctrl.callback([](v){
 		video.flip_y(v);
 	});
-	
+
 	hw_ctrl = options_vec.controlbutton("HW Decode").push(1).value(1);
 	hw_ctrl.callback([](v){
 		video.hardware(v);
 	});
-	
-	info_label = control_tabs.label("");
+
+	// Sound of the clip: off at the start, plays at speed 1 forward (silent paused, at other speeds and backwards)
+	audio_ctrl = options_vec.controlbutton("Audio").push(1).value(0);
+	audio_ctrl.callback([](v){
+		video.audio(v);
+	});
+
+	volume_ctrl = options_vec.controlslider("Volume").min(0).max(1).value(1);
+	volume_ctrl.callback([](v){
+		video.volume(v);
+	});
+
+	convert_ctrl = options_vec.controlbutton("Convert to HAP");
+	convert_ctrl.callback([generator](v){
+		if(!v)
+			return;
+		start_convert(generator);
+	});
+
+	info_label = control_tabs.label("").wrap(true);
 	update_info();
-	
+
 	videorouter_vec = control_tabs.controlvector("VideoRouter", "video_router").expanded(false);
 	videorouter_enable = videorouter_vec.controlbutton("Enable Router").push(1);
 	videorouter_name = videorouter_vec.controltext("VideoRouterName").hide_config_menu();
-	
+
 	videorouter_enable.callback([videorouter_name, output](v){
 		if(v)
 			if(!video_router)
@@ -136,14 +262,14 @@ entry(generator, area) {
 		else
 			video_router = None;
 	});
-	
+
 	videorouter_name.callback([videorouter_name](v){
 		if(video_router)
 			video_router.name = v;
 	});
-	
+
 	videorouter_name.value(fileio.pure_name(generator.path));
-	
+
 	output.value(video);
 	output.callback([output](v){
 		output.value(video);
@@ -151,14 +277,17 @@ entry(generator, area) {
 }
 
 update(generator, tl_pos, pos_delta) {
-	if(video.duration() > 0)
-		position_ctrl.value(video.position() / video.duration());
-	
+	// No callback: that would seek to where playback already is.
+	if(video.duration() > 0 && std.millis() - scrub_ms > 250) {
+		showing_position = true;
+		position_ctrl.value(video.position() / video.duration(), false);
+		showing_position = false;
+	}
+
 	update_info();
 }
 
-// The file itself is remembered by the generator (state.path). position is
-// stored already so Phase 2 can restore it.
+// The file itself is remembered by the generator (state.path).
 save_state() {
 	return [
 		playing = play_ctrl.value(),
@@ -166,6 +295,8 @@ save_state() {
 		loop = loop_ctrl.value(),
 		flip_y = flip_ctrl.value(),
 		hardware = hw_ctrl.value(),
+		audio = audio_ctrl.value(),
+		volume = volume_ctrl.value(),
 		position = video.position(),
 	];
 }
@@ -173,7 +304,7 @@ save_state() {
 load_state(state) {
 	if(!state)
 		return;
-	
+
 	if(state.has("speed"))
 		speed_ctrl.value(state.speed);
 	if(state.has("loop"))
@@ -182,6 +313,12 @@ load_state(state) {
 		flip_ctrl.value(state.flip_y);
 	if(state.has("hardware"))
 		hw_ctrl.value(state.hardware);
+	if(state.has("volume"))
+		volume_ctrl.value(state.volume);
+	if(state.has("audio"))
+		audio_ctrl.value(state.audio);
 	if(state.has("playing"))
 		play_ctrl.value(state.playing);
+	if(state.has("position") && video.seekable())
+		video.position(state.position);
 }

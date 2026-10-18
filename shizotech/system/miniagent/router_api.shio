@@ -10,6 +10,14 @@
 //  AI nodes over ShizoNet, delegates tasks to the right node's receptionist, mirrors
 //  their task state into a local table and forwards every node event to its owner.
 //
+//  One user goal is ONE task, and that task belongs to the NODE. A delegated goal is
+//  a handoff: the node's receptionist answering is the node ACCEPTING the work, not
+//  the work being done. The node announces the task it created (its own name and
+//  taskid) with a task_started push, the mirror record adopts that identity, and the
+//  node's task_finished push settles it. The Router announces no task name of its own
+//  and never renders the receptionist's acknowledgement as a completion — that is
+//  what made one routed goal show up in the chat twice, under two different names.
+//
 //      #include "router_api"
 //
 //      r = Router(cfg);                                   // role "router"
@@ -51,6 +59,14 @@ ROUTER_MAX_ACTIONS_KEPT = 50;
 ROUTER_MAX_OUTPUT_CHARS = 2000;
 ROUTER_INFO_REFRESH_MS = 5000;
 ROUTER_MAX_POLL_FAILS = 3;
+
+// A delegated goal is a HANDOFF: the node's receptionist turn answering is the node
+// ACCEPTING the work, not the work being done. The node announces the task it created
+// for the goal with a task_started push (before the ack, because the receptionist
+// creates it during that turn), and settles it with task_finished. Only when the node
+// answered and announced NO task (a plain question) must the router close the record
+// itself — this is how long it waits for a task_started to arrive after the ack.
+ROUTER_HANDOFF_SETTLE_MS = 15000;
 
 // remote task states (router_api.md): queued | generating | finished | failed | stopped | lost
 router_is_open_state(state) {
@@ -174,9 +190,10 @@ class Router {
 	// transport
 	server = None;
 	service = None;			// the AiService handle from ai_router_attach: it owns
-								// the wire threads and dies with this Router, so the
-								// reference must be kept (its __deinit__ stops them)
+							// the wire threads and dies with this Router, so the
+							// reference must be kept (its __deinit__ stops them)
 	poll_ms = 1000;
+	handoff_settle_ms = ROUTER_HANDOFF_SETTLE_MS;
 
 	// state
 	_nodes = [];				// node records, keyed by mac (device object in .dev)
@@ -198,7 +215,7 @@ class Router {
 	// ─────────────────────────────────────────────────────────────────────────
 	//  cfg:  ModelConfig
 	//  opts: [name, description, capabilities, tags, role, on_event, on_notify,
-	//         on_action, poll_ms]
+	//         on_action, poll_ms, handoff_settle_ms]
 	//
 	//  opts.role defaults to "router". Override it to reuse an existing role
 	//  (e.g. "receptionist") while roles/router/ is being written, or to run a
@@ -225,6 +242,9 @@ class Router {
 			}
 			if(opts.has("poll_ms") && opts.poll_ms > 0) {
 				poll_ms = std.int(opts.poll_ms);
+			}
+			if(opts.has("handoff_settle_ms") && opts.handoff_settle_ms >= 0) {
+				handoff_settle_ms = std.int(opts.handoff_settle_ms);
 			}
 			if(opts.has("on_event")) {
 				_event_cb = opts.on_event;
@@ -501,6 +521,11 @@ class Router {
 	// The target node is the AGENT's decision (it picks it from get_nodes() and
 	// passes it here). An empty node is a routing error, not something this class
 	// guesses. -> taskid, None on failure.
+	//
+	// `name` is local bookkeeping. The node names its own task; when the node
+	// announces it (task_started) the mirror record adopts the node's name, so the
+	// user, /tasks and the completion all speak about the node's task, never about
+	// a name the router invented.
 	add_task(name, goal, node_name = None, mode = "receptionist") {
 		target = std.string(node_name ?? "").strip();
 
@@ -778,6 +803,7 @@ class Router {
 			name = std.string(rec.name ?? ""),
 			state = st,
 			open = router_is_open_state(st),
+			handoff = rec.handoff ? true : false,
 			goal = router_first_line(rec.goal ?? ""),
 			report = router_first_line(rec.report ?? ""),
 			last_error = std.string(rec.last_error ?? ""),
@@ -850,6 +876,8 @@ class Router {
 		//     same fact over ai_event a moment later.
 		//   task_finished — the poller already moved the mirror into that terminal
 		//     state and emitted task_state with the report.
+		//   task_started  — binding the node's task to a delegated record emits the
+		//     task_state transition under the node's task name itself.
 		// The mirror is updated in every case, only the callback is skipped.
 		dup = false;
 
@@ -863,6 +891,13 @@ class Router {
 		_mirror_event(ev);
 
 		if(dup) {
+			return "ok";
+		}
+
+		// A task_started that bound a delegated record is already announced: the
+		// binding emitted the task_state transition carrying the node's task name.
+		// One event per fact.
+		if(ev.bound) {
 			return "ok";
 		}
 
@@ -1239,6 +1274,9 @@ class Router {
 			goal = prompt,
 			state = router_map_request_status(std.string(reply.status ?? "queued")),
 			report = "",
+			// the node's receptionist owns this goal: the record is a handoff, and
+			// the node's task_started push gives it the task's real name + taskid.
+			handoff = true,
 		]);
 
 		_note_action("delegate", [node = rec.name, taskid = taskid, task_name = task_name]);
@@ -1259,6 +1297,21 @@ class Router {
 		}
 		if(!rec.has("user_updates")) {
 			rec.user_updates = [];
+		}
+
+		// handoff bookkeeping (router_api.md "Mirror rules"): a delegated ai_request
+		// is settled by the node's task, never by the receptionist's own answer.
+		if(!rec.has("handoff")) {
+			rec.handoff = false;
+		}
+		if(!rec.has("acked")) {
+			rec.acked = false;
+		}
+		if(!rec.has("ack")) {
+			rec.ack = "";
+		}
+		if(!rec.has("acked_at")) {
+			rec.acked_at = 0;
 		}
 
 		cs = std.critical_section_named(_lock);
@@ -1317,31 +1370,110 @@ class Router {
 		return match;
 	}
 
-	// True while the router is still waiting for a delegated ai_request on that
-	// node. The node runs such a request in its own receptionist, and the worker
-	// task it finishes is that request - not extra work.
-	_node_has_open_request(node_name) {
+	// The open delegated goal the router is still waiting for at that node.
+	// The node runs such a request in its own receptionist, and the task that
+	// receptionist creates IS the goal - not extra work.
+	_find_open_handoff(node_name) {
 		want_node = std.string(node_name ?? "").lowercase();
-		found = false;
+		match = None;
+
+		if(!want_node) {
+			return None;
+		}
 
 		cs = std.critical_section_named(_lock);
-		for(i = 0; i < remote_tasks.size(); i++) {
+		// newest first: the node announces a task it created for a goal the router
+		// delegated, and the router's newest record is the one that goal became
+		for(i = remote_tasks.size() - 1; i >= 0; i--) {
 			t = remote_tasks[i];
-			if(std.string(t.node).lowercase() != want_node) {
+			if(!t.handoff) {
 				continue;
 			}
-			if(std.string(t.remote_request_id ?? "").length() == 0) {
+			if(std.string(t.node).lowercase() != want_node) {
 				continue;
 			}
 			if(!router_is_open_state(std.string(t.state ?? ""))) {
 				continue;
 			}
-			found = true;
+			match = t;
 			break;
 		}
 		cs.release();
 
-		return found;
+		return match;
+	}
+
+	// The node named the task it created for a delegated goal. Bind the mirror record
+	// to it: the record takes the NODE's task name and taskid, so the user, /tasks,
+	// update_task and the completion all talk about one task with one name. No second
+	// mirror entry - one goal, one task.
+	_bind_handoff_task(ev) {
+		rid = std.string(ev.request_id ?? "");
+
+		// work the node started on its own (its own receptionist, the CLI, the web
+		// API) names no request: the router adopts it when it finishes, as before.
+		if(!rid) {
+			return;
+		}
+
+		rec = _find_task(rid);
+
+		if(!rec) {
+			return;
+		}
+
+		cs = std.critical_section_named(_lock);
+		rec.remote_taskid = std.string(ev.taskid ?? "");
+		if(ev.has("name") && ev.name) {
+			rec.name = std.string(ev.name);
+		}
+		rec.updated = std.millis();
+		open = router_is_open_state(std.string(rec.state ?? ""));
+		cs.release();
+
+		if(open) {
+			_set_task_state(rec, "generating", "");
+		}
+
+		// handle_event must not deliver the raw push on top of that transition
+		ev.bound = true;
+	}
+
+	// The node finished a task the mirror does not know while the router waits on a
+	// delegated goal at that node: that task IS the goal. Settle the existing record
+	// with the node's name and report instead of adopting a second task for one goal.
+	_adopt_into_handoff(rec, ev) {
+		cs = std.critical_section_named(_lock);
+		if(ev.has("taskid")) {
+			rec.remote_taskid = std.string(ev.taskid);
+		}
+		if(ev.has("name") && ev.name) {
+			rec.name = std.string(ev.name);
+		}
+		cs.release();
+
+		_settle_handoff(
+			rec,
+			router_map_task_state(std.string(ev.state ?? "finished")),
+			std.string(ev.report ?? ""),
+			""
+		);
+	}
+
+	// Close a handoff record with a report the node actually produced.
+	_settle_handoff(rec, state, report, note = "") {
+		if(!rec) {
+			return false;
+		}
+
+		cs = std.critical_section_named(_lock);
+		if(report) {
+			rec.report = std.string(report);
+		}
+		rec.updated = std.millis();
+		cs.release();
+
+		return _set_task_state(rec, state, note);
 	}
 
 	_find_task(taskid) {
@@ -1497,6 +1629,11 @@ class Router {
 			return;
 		}
 
+		if(ev.kind == AI_EVENT_TASK_STARTED) {
+			_bind_handoff_task(ev);
+			return;
+		}
+
 		if(!ev.has("taskid")) {
 			return;
 		}
@@ -1508,15 +1645,18 @@ class Router {
 			// mirror.
 			//
 			// One exception: a delegated ai_request is executed by the node's own
-			// receptionist, and the worker task it finishes is unknown to the
-			// router. That task IS the open request - adopting it would show the
-			// user two tasks for one goal and notify twice. The request record is
-			// settled by ai_request_poll (state + report), so the push is dropped.
+			// receptionist, and the task it creates is the goal itself. Adopting it
+			// would show the user two tasks for one goal and notify twice, so the
+			// push settles the open handoff record instead - that record takes the
+			// node's task name and report and stays the single entry for the goal.
 			if(ev.kind != "task_finished") {
 				return;
 			}
 
-			if(_node_has_open_request(std.string(ev.node ?? ""))) {
+			handoff = _find_open_handoff(std.string(ev.node ?? ""));
+
+			if(handoff) {
+				_adopt_into_handoff(handoff, ev);
 				return;
 			}
 
@@ -1697,6 +1837,15 @@ class Router {
 	}
 
 	_poll_task(rec) {
+		// After the node acknowledged a delegated goal the request id is never
+		// polled again: the node reaps a finished request AI_REQUEST_TTL_MS after
+		// its LAST poll, and the "not found" that follows would announce a node
+		// task that runs for hours as "lost".
+		if(rec.handoff && rec.acked) {
+			_poll_handoff(rec);
+			return;
+		}
+
 		dev = _task_device(rec);
 
 		if(!dev) {
@@ -1750,6 +1899,13 @@ class Router {
 
 		if(!reply.ok) {
 			if(std.string(reply.error ?? "") == "not found") {
+				// A handoff record is settled by the node's task_finished push. The
+				// node forgetting the request (or the task record leaving its small
+				// finished ring) says nothing about the work, so it must not become
+				// a "lost" announcement.
+				if(rec.handoff) {
+					return;
+				}
 				_set_task_state(rec, "lost", "unknown remote id");
 				return;
 			}
@@ -1776,6 +1932,17 @@ class Router {
 				if(reply.has("result")) {
 					report = router_report_text(reply.result);
 				}
+
+				// THE HANDOFF: the node's receptionist answered. That is the node
+				// ACCEPTING the goal, not the goal being done - the work runs on the
+				// node's task and is announced by its task_finished push. Rendering
+				// this answer as a completion is what put one routed goal in the chat
+				// twice, under two different task names.
+				if(rec.handoff) {
+					_ack_handoff(rec, report);
+					return;
+				}
+
 				cs = std.critical_section_named(_lock);
 				rec.report = report;
 				cs.release();
@@ -1787,6 +1954,84 @@ class Router {
 			}
 
 			_set_task_state(rec, new_state, "");
+		}
+	}
+
+	// The node's receptionist turn ended: the goal is accepted. The node's
+	// task_started push normally arrived during that turn and already bound the
+	// task, so this record stays open and is settled by the node's task_finished.
+	_ack_handoff(rec, report) {
+		cs = std.critical_section_named(_lock);
+		rec.ack = std.string(report ?? "");
+		rec.acked = true;
+		rec.acked_at = std.millis();
+		bound = std.string(rec.remote_taskid ?? "");
+		cs.release();
+
+		return bound.length() > 0;
+	}
+
+	// Poll a handoff record after the node acknowledged it.
+	_poll_handoff(rec) {
+		cs = std.critical_section_named(_lock);
+		taskid = std.string(rec.remote_taskid ?? "");
+		acked_at = std.int(rec.acked_at ?? 0);
+		cs.release();
+
+		if(!taskid) {
+			// The node answered the goal and announced no task of it: the
+			// receptionist handled the request itself (a question, a listing).
+			// The receptionist creates its task DURING the turn, so a task_started
+			// push lands before the ack - this window only covers event latency,
+			// never the runtime of the work.
+			if(std.millis() - acked_at < handoff_settle_ms) {
+				return;
+			}
+
+			_settle_handoff(rec, "finished", std.string(rec.ack ?? ""), "");
+			return;
+		}
+
+		dev = _task_device(rec);
+
+		if(!dev) {
+			rec.poll_fails += 1;
+			if(rec.poll_fails >= ROUTER_MAX_POLL_FAILS) {
+				_set_task_state(rec, "lost", "node offline");
+			}
+			return;
+		}
+
+		reply = None;
+		try {
+			reply = dev.get(AI_CMD_TASK, [taskid = taskid], AI_TIMEOUT_POLL);
+		}
+		catch(e) {
+			rec.poll_fails += 1;
+			rec.last_error = std.string(e);
+			if(rec.poll_fails >= ROUTER_MAX_POLL_FAILS) {
+				_set_task_state(rec, "lost", rec.last_error);
+			}
+			return;
+		}
+
+		rec.last_poll = std.millis();
+
+		if(!std.is_json(reply)) {
+			rec.poll_fails += 1;
+			return;
+		}
+
+		rec.poll_fails = 0;
+
+		// the node forgot the task record (its finished ring is small): the
+		// task_finished push is the authority, so stay quiet and stay open.
+		if(!reply.ok) {
+			return;
+		}
+
+		if(reply.has("task") && std.is_json(reply.task)) {
+			_apply_task_record(rec, reply.task);
 		}
 	}
 

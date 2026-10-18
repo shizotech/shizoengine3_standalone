@@ -1,0 +1,1 @@
+powershell -NoProfile -Command "Select-String -Path *.shio,roles/router/*.shio,roles/router/*.md -Pattern 'started' | Select-Object -First 60 | ForEach-Object { $_.Path + ':' + $_.LineNumber + ':' + $_.Line }"

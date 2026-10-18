@@ -19,18 +19,35 @@ Hardware-accelerated video playback for VibeVJ, tracked in
   as separate, replaceable files. Headers: `shzmodule_nanogui/libraries/ffmpeg/`
   (see its README for versions, file names and search paths).
 
-### FFmpeg on Windows
+### FFmpeg libraries
 
-Tested with the BtbN build `ffmpeg-n6.1.3-win64-lgpl-shared-6.1.zip` (release
-`autobuild-2025-08-31-13-00`, the last 6.1 build of
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)). It is
-configured without `--enable-gpl` / `--enable-nonfree`, but with
-`--enable-version3`, so it is **LGPL v3**. Needed are `avformat-60.dll`,
-`avcodec-60.dll`, `avutil-58.dll`, `swscale-7.dll` and `swresample-4.dll`
-(78 MB together), next to `shzmodule_nanogui.dll`, in its `ffmpeg\` folder, or
-in the folder `SHZ_FFMPEG_DIR` points to. `nanogui.video_available()` and
-`nanogui.video_version()` tell whether they were found. Shipping them in the
-bundles is still open (#263).
+FFmpeg 9.0.2 (libavformat / libavcodec 63, libavutil 61, libswscale 10,
+libswresample 7), the LGPL shared builds of
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (release
+`autobuild-2026-10-17-20-51`, `ffmpeg-n9.0.2-28-g669f5ab083-<platform>-lgpl-shared-9.0`).
+They are configured without `--enable-gpl` / `--enable-nonfree`, but with
+`--enable-version3`, so they are **LGPL v3**.
+
+- Windows x64, Linux x64, Linux arm64: the release ships them in
+  `packages/nanogui/native/<platform>/ffmpeg/` (#327).
+  `compile_scripts/fetch_ffmpeg.shio` (functions in `ffmpeg_fetch.shio`)
+  downloads the pinned archive, checks its SHA-256 and unpacks only
+  `avformat-63.dll`, `avcodec-63.dll`, `avutil-61.dll`, `swscale-10.dll`,
+  `swresample-7.dll` (Linux: `libavformat.so.63`, ... under their soname, 120 MB
+  on Windows, 130 MB on Linux x64) with `LICENSE.txt` and a `README.txt` (build,
+  hash, source, "may be replaced"). `git_commit.shio` and `create_bundles_*.shio`
+  call it before the bundles are made; a wrong hash stops the release. Nothing
+  is downloaded again while `README.txt` names the same hash. The binaries are
+  never committed to this repository.
+- macOS: `brew install ffmpeg` (Homebrew's `ffmpeg` is 9.x; once it moves on,
+  `brew install ffmpeg@9`, both are searched).
+- Anywhere: `SHZ_FFMPEG_DIR` points nanogui at another folder with the same
+  major versions. `nanogui.video_available()` and `nanogui.video_version()` tell
+  whether they were found.
+
+The Linux builds of BtbN have no RPATH: `libavcodec.so.63` finds
+`libswresample.so.7` only because the loader opens that one first from the same
+folder.
 
 ## Architecture
 
@@ -139,20 +156,34 @@ like `image` / `ndi_receiver`:
 v = area.video(path);           // check v.is_open() / v.error()
 v.play(); v.pause(); v.stop();  // stop = pause + back to the first frame
 v.playing(true);
-v.speed(1.0);                   // 0..4, negative is an error until Phase 2
+v.speed(1.0);                   // -4..4; negative plays backwards (reversible() files, else an error and forward)
 v.loop(true);
-v.position();                   // seconds of the frame on screen (read-only in Phase 1)
+v.position();                   // seconds of the frame on screen (or of a seek still decoding)
+v.position(12.5);               // jump there, playing or paused; every frame = scrubbing
+v.seek(12.5);                   // the same, returns false when not seekable
+v.step(1); v.step(-1);          // pause and move by whole frames
+v.frame(); v.frame(300);        // frame number on screen / jump to a frame; v.frames() = how many
+v.reverse();                    // frames are delivered backwards
+v.cache_mb(256); v.cache_used(); // decoded frame cache of intra-only files: size, [bytes, hits]
+v.dxt();                        // HAP frames go to the GPU as DXT textures (dxt(false): FFmpeg decodes to RGBA)
+v.audio(true); v.volume(0.8);   // play the sound (off by default), 0..2
+v.has_audio(); v.audio_level(); v.audio_error();
 v.duration(); v.fps(); v.width(); v.height();
 v.codec(); v.container(); v.has_alpha(); v.intra_only();
 v.hw_decoder();                 // "d3d11va", "vaapi", "videotoolbox", "cuda", ... or "" for software
 v.zero_copy();                  // true while frames reach the texture without a copy through system memory
 v.hardware(false);              // force software decoding (reopens)
-v.seekable();                   // false until Phase 2, so UIs can grey out position control
+v.seekable();                   // position control works (seekable input, known duration)
+v.reversible();                 // backwards works: intra-only codec in a container with an index
 v.texture();                    // same texture object for the lifetime of the widget
 v.frame_event([](){ ... });     // after a new frame was uploaded (render loop)
 v.flip_y(true);
 v.save() / v.load(json);
 nanogui.video_available(); nanogui.video_version(); nanogui.video_error();
+
+c = nanogui.video_convert(src, dst, "hap");  // hap (HAP Alpha with alpha), hap_alpha, hap_q, prores, dnxhr
+c.progress(); c.finished(); c.ok(); c.error(); c.frames(); c.cancel();  // poll it; dropping c cancels
+nanogui.video_formats();
 ```
 
 `output.value(v)` / shader inputs work like with `image`, since the widget is a
@@ -162,9 +193,17 @@ nanogui.video_available(); nanogui.video_version(); nanogui.video_error();
 
 `engine/generators/extensions/video/` loads `.mp4 .mov .m4v .mkv .webm .avi
 .mxf .mpg .mpeg .ts .wmv` (mapped in `generatoritem.shio`): preview, OUT,
-Play, Restart, Speed, Loop, a Position output (0..1), size, Flip Y, HW Decode,
-an info line (codec, size, fps, decoder) and the VideoRouter. ACT off pauses
-decoding. State saves play / speed / loop / flip / hardware / position.
+Play, Restart, Speed (-4..4 on reversible files, 0..4 otherwise), Loop,
+Position (0..1: shows the playhead; moved by hand, MIDI or a link it jumps /
+scrubs, the slider is left alone for 250 ms after such a move), Frame back /
+Frame forward, size, Flip Y, HW Decode, Convert to HAP (`<name>_hap.mov` next
+to the file, progress in the info line, refreshes the asset browser), an info
+line (codec, size, fps, decoder or "DXT on the GPU", "backwards") and the
+VideoRouter. A right click on a video in *Assets* offers *Convert to HAP* too
+(`assetbrowser.shio`, `filebrowser.path_at`); a line at the bottom of the list
+shows the running jobs. ACT off
+pauses decoding. State saves play / speed / loop / flip / hardware / position
+and restores the position.
 
 ## Tests
 
@@ -183,7 +222,17 @@ decoding. State saves play / speed / loop / flip / hardware / position.
   (H.264, HEVC 8 / 10 bit, HAP, ProRes, DNxHR; commands in the clips README):
   decoder in use, colours and padded surfaces through the GPU decoder, speed
   0.25x..4x, pause, loop, and a `stress` mode that plays N instances of a clip
-  for the decoder budget.
+  for the decoder budget. `random` mode: Phase 2 (below).
+- Phase 2 in `decoder_test.cpp` (headless, `counter_*` clips whose frame N is
+  gray N * 8): accurate seeks also between key frames (H.264 / MPEG-2 with GOP
+  12 and B-frames), the last of 21 seeks in a row wins, backwards 29..0 and
+  around the loop, loop off stops on frame 0, cache hits, forward seek from the
+  cache, frame skipping only when the decoder cannot keep up, cache off;
+  conversion of long-GOP clips to HAP / HAP Q / ProRes / DNxHR (every frame
+  kept, the result reversible), errors, cancel. In `video_playback.shio`:
+  position / step / frame through GL, backwards with loop, turning around,
+  save / load with position and negative speed, long-GOP seek and scrubbing,
+  `video_convert` from script.
 
 - VibeVJ by hand (real mouse input, RTX 4080): `.mp4` dragged into a Patchview
   and `.mov` into a Clipview cell; preview; OUT linked to a shader input;
@@ -193,9 +242,11 @@ decoding. State saves play / speed / loop / flip / hardware / position.
   pauses; save, exit, start: Speed, Loop, the options, the router and the links
   are back. User page: `_shizoengine3/wiki/Video.md`.
 
-State: Linux passes with software decoding (Mesa llvmpipe, FFmpeg 6.1).
-Windows 11, MSVC (VS Build Tools v145), FFmpeg n6.1.3, RTX 4080 (driver
-617.14): all three pass, D3D11VA with zero-copy. Intel UHD 770 (driver
+State: Linux passed with software decoding (Mesa llvmpipe, FFmpeg 6.1; not
+run again with FFmpeg 9). Windows 11, MSVC (VS Build Tools v145), FFmpeg n6.1.3
+and again with n9.0.2 (2026-10-18), RTX 4080 (driver 617.14): all three pass,
+D3D11VA with zero-copy, with FFmpeg 9 loaded from the `ffmpeg\` folder next to
+the module. Intel UHD 770 (driver
 32.0.101.7088): `decoder_test` passes (decode + video processor, also with the
 forced surface copy); the GL half was not run there, GL uses the NVIDIA card on
 that machine. Not tested: AMD, VAAPI, VideoToolbox, CUDA.
@@ -265,17 +316,131 @@ comparison: 1 x H.264 1080p60 49 %, 4 x 187 %, 1 x HEVC 2160p60 168 %.)
 
 ## Open questions (from #278)
 
-- Audio: video stays silent; carrying audio into `audio_process.shio` needs a decision.
-- Sidecar index files for Phase 2: next to the media or in a project cache.
+- Audio: decided and built, see "Sound" below. Not done: the sound of a clip as
+  input of the audio analysis (`audio_process.shio`), choosing the output device.
+- Sidecar index files: not needed. MOV / MP4 (sample tables), MKV (cues) and AVI
+  (idx1) carry an index the demuxer seeks with; `reversible()` requires it.
+  Containers without one (MPEG-TS, MPEG-PS) are seekable but slow and not
+  reversible.
 - AMD: nothing was tested on AMD hardware. The fallbacks are in place
   (surface copy in front of the video processor, copy through system memory
   when the interop fails), and the first run should be
   `video_decoder_test.exe <clips> amd` followed by `video_playback.shio`.
 
-## Phase 2 (next)
+## Phase 2: position control and backwards playback
 
-HAP / HAP Alpha first (DNxHR, ProRes as fallbacks): frame index at open,
-`position(t)` / `seek` / `step_frames(n)`, negative speed, LRU cache of decoded
-frames in both directions, and a "convert to VJ format" job (ffmpeg CLI) in the
-asset browser. HAP frames are DXT textures, so uploading them compressed
-(skipping FFmpeg's CPU DXT decode) is part of that work.
+- **Seek** (`shz_video_decoder::seek(position, reverse)`): every file that is
+  seekable. The demuxer goes to the key frame at or before the target
+  (`AVSEEK_FLAG_BACKWARD`), the decoder runs up to the target and the frames
+  in between are dropped in `deliver()` before they are converted or
+  downloaded, so the first frame shown is the one at the target. Seeks are
+  generations like `restart()`: a newer one replaces one that is running.
+- **Scrubbing** (widget): the seek the decoder works on finishes and is shown
+  before the newest target is passed on (`issue_seek`), otherwise a position
+  that changes every render frame never shows a picture. `position()` reports
+  the target meanwhile, so sliders do not jump back.
+- **Backwards** (`reverse_step`): only for `reversible()` files, i.e. an
+  intra-only codec (HAP, ProRes, DNxHR, MJPEG, ...) in a container with an
+  index. Each frame is one seek plus one decode (one packet in, then drain, so
+  frame threading does not hold it back). Frame times count up like forward
+  playback, so the clock and `shz_video_select_frame` are the same for both
+  directions; after frame 0 comes the last frame (loop) or the end. Frames are
+  skipped only as far as the measured decode time requires (frames needed per
+  second against the average decode time, 85 % headroom): HAP 1080p shows every
+  frame at -4x, 4K ProRes keeps the speed with fewer pictures. Long-GOP files
+  would need the whole GOP decoded per step; they are refused (`speed(-1)` is
+  an error, the clip plays forward) and *Convert to HAP* is the way.
+- **Cache**: decoded software frames of intra-only files (references to the
+  decoder's buffers, no copy), least recently used out, 256 MB per player by
+  default (`cache_mb`). Filled by forward and backwards playback; used by
+  backwards playback and by forward seeks (the target frame is shown at once,
+  decoding goes on behind it). 256 MB are about 30 frames of 1080p RGBA / 4:2:2
+  10 bit and 7 of 4K. GPU frames (zero-copy) are never cached.
+- **Converter** (`video_convert.cpp`, `nanogui.video_convert`): decodes with
+  `shz_video_decoder` (GPU decoder when there is one), swscale with the
+  source's colour matrix and range, encodes with the encoders of the same LGPL
+  FFmpeg (`hap` with 1 / 4 / 8 chunks by size, `prores_ks` HQ / 4444,
+  `dnxhd` DNxHR HQ, needs 256x120), constant frame rate, MOV. Writes
+  `<target>.part` and renames it at the end; a failure or cancel leaves
+  nothing. HAP needs sizes in multiples of 4 (cut down to them), the others
+  even sizes. No ffmpeg executable is shipped for it.
+
+Measured (`video_hardware.shio <media> random`, Windows, RTX 4080 +
+i5-13600K, 144 Hz):
+
+| Clip | Jump (paused) | Scrub, pictures/s | -1x / -2x / -4x, pictures/s |
+|---|---|---|---|
+| H.264 1080p60 (d3d11va) | 71 ms (max 125) | 19 | refused |
+| H.264 1080p30 B-frames | 126 ms (max 272) | 15 | refused |
+| HEVC 2160p60 (d3d11va) | 122 ms (max 220) | 7.5 | refused |
+| HAP 1080p30 | 15 ms | 99 | 30 / 60 / 120 |
+| HAP Q 1080p30 | 34 ms | 32 | 30 / 60 / 60 |
+| ProRes 422 HQ 1080p30 | 40 ms | 27 | 30 / 30 / 40 |
+| DNxHR HQ 1080p30 | 32 ms | 42 | 30 / 40 / 55 |
+| HAP 2160p30 | 66 ms | 17 | 30 / 60 / 60 |
+| ProRes 422 2160p30 | 103 ms | 9 | 15 / 15 / 17 |
+| DNxHR SQ 2160p30 | 84 ms | 11.5 | 15 / 20 / 20 |
+
+Every speed is reached (within 10 %), every jump lands on its frame.
+
+- **HAP as DXT** (`video_hap.cpp`): FFmpeg's HAP decoder unpacks the frame and
+  then decodes the DXT blocks to RGBA on the CPU. Instead, the decoder passes
+  HAP packets through: `video_hap.cpp` undoes only the second stage (section
+  headers, Snappy, chunked "complex" frames) into an `AVFrame` with format
+  `AV_PIX_FMT_NONE` and a tag in `opaque` (`shz_video_decoder::dxt_format`), and
+  the widget uploads it with `glCompressedTexImage2D` (DXT1 for HAP, DXT5 for HAP
+  Alpha, DXT5 with the scaled YCoCg conversion in the shader for HAP Q; the
+  texture is padded to whole 4x4 blocks and cropped by `u_uv_scale`). Queue,
+  seek, backwards and cache are the same; the cache holds 4 to 8 times more
+  frames. HAP R, HAP Alpha-Only, HAP Q Alpha and drivers without
+  `GL_EXT_texture_compression_s3tc` go through FFmpeg as before.
+
+HAP as DXT, measured the same way:
+
+| Clip | Jump | Scrub, pictures/s | -1x / -2x / -4x |
+|---|---|---|---|
+| HAP 1080p30 | 6 ms | 144 (render rate) | 30 / 60 / 120 |
+| HAP Q 1080p30 | 7 ms | 144 | 30 / 60 / 120 |
+| HAP 2160p30 | 9 ms | 143.5 | 30 / 60 / 119 |
+
+| Streams (`stress`, 8 s) | FFmpeg RGBA (`nodxt`) | DXT |
+|---|---|---|
+| 4 x HAP 2160p30 | 19.9 fps, render loop 20 fps | 30 fps, render loop 144 fps |
+| 16 x HAP 2160p30 | - | 30 fps, 144 fps |
+| 16 x HAP 1080p30 | 22 fps, render loop 23 fps | 30 fps, 144 fps |
+| 48 x HAP 1080p30 | - | 30 fps, 144 fps |
+| 8 x HAP Q 1080p30 | 29.7 fps, render loop 141 fps | 30 fps, 144 fps |
+
+## Sound
+
+`video_audio.*`, `video_audio_device.cpp`. Off by default (`audio(true)`, in
+VibeVJ *Options › Audio* and *Volume*).
+
+- The decoder decodes the sound track that belongs to the video stream
+  (`av_find_best_stream`) in its worker, next to the video packets, converts it
+  with libswresample to 48 kHz stereo float and pushes it into a
+  `shz_video_audio_source` on the playback time axis of the frames (seconds
+  since the start of the video stream, plus the loops). A seek clears it and
+  drops the sound before the target. Paused, backwards and at a speed other
+  than 1 nothing is decoded.
+- The render thread passes the clock to the source once per frame
+  (`set_clock`). One output device for all clips (miniaudio, the default
+  output, 48 kHz stereo, 10 ms periods) mixes every source at the clock
+  extrapolated to now: sound more than 45 ms behind the picture is skipped,
+  sound ahead of it waits (silence). The device is open only while a clip
+  with sound is switched on.
+- libswresample is optional: without it `nanogui.video_audio_available()` is false
+  and video plays silent. miniaudio is compiled into nanogui with WASAPI /
+  PulseAudio + ALSA / CoreAudio (runtime loaded); simpleaudio has its own copy
+  in its own module.
+- The converter keeps the sound: 16 bit PCM, 48 kHz stereo, as a second stream
+  of the MOV.
+- Tests: `decoder_test` (AAC 44.1 kHz mono and PCM 48 kHz clips: decoded with
+  the frames, no gaps, starts with the first frame, after a seek at the
+  target, silent at 2x and backwards; the skip / wait / drop logic of the
+  source; the HAP copy keeps the sound), `video_playback.shio` (plays through
+  the real device, level of the test tone, silent paused and at 2x).
+
+Open (needs the hardware, see the Linux / macOS hand-over issue): zero-copy for
+VAAPI (dma-buf) and VideoToolbox (IOSurface), AMD, the decoder budget on those
+machines.

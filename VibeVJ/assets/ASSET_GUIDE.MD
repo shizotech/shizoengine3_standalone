@@ -352,3 +352,8 @@ If script files include other script files, it is enough to just check the main 
 # Examples
 
 Check out `assets/Generators/ExampleBasics` to get a grip of the general structure for an asset (ground of truth)
+
+A generator can also be written as a class: `assets/Generators/ExampleBasics/class_module.asset` derives from
+`GeneratorModule` (`engine/contracts/generator_module.shio`) and exports `create(generator, node)` instead of `entry`.
+The engine checks it against the contract when it loads, so a missing method is an error in the log at once, not in a
+frame. See `engine/contracts/README.md` (#202).

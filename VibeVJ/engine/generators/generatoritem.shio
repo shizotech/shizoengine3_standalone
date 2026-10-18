@@ -1,6 +1,8 @@
 
 #include "engine/interfaces/aiinterface"
 #include "engine/migrate/migrate"
+#include "engine/contracts/contract"
+#include "engine/contracts/legacy_module"
 
 import nanogui;
 
@@ -40,7 +42,9 @@ class generator {
 	smaller_btn = None; //minimize (Windows order: minimize, maximize, close), the same switch as the chevron
 	is_collapsed = false;
 	
-	dispatcher = None;
+	//The module behind the contract GeneratorModule (engine/contracts, #202): the object a class asset made with
+	//create(), or a LegacyModule around module. The engine calls the module only through it
+	impl = None;
 	
 	__init__(parent, path, pos, init_guid = "", options_kw=[]) {
 		//Check file extension, then use engine/loaders/ext.shio to load the file / folder ?
@@ -366,6 +370,7 @@ class generator {
 				old_state = this.save_state();
 				old_node_state = this.node.serialize_json(true); //Serialize all links (even global ones)
 				this.free_module_content();
+				this.impl = None;
 				std.free(this.module);
 				this.node.clear_children();
 				
@@ -389,9 +394,8 @@ class generator {
 			if(loader_module.call_error() || !this.module || !is_loaded())
 				return false;
 			
-			if(this.module.has("dispatcher")) {
-				this.dispatcher = this.module.get("dispatcher");
-			}
+			if(!attach_module())
+				return false;
 			
 			this.active_btn.callback([this](v){
 				this.dispatch("active", v);
@@ -406,8 +410,7 @@ class generator {
 			catch(e) {}
 			
 			//For reloads
-			if(this.dispatcher)
-				this.dispatcher(this, "active", this.active_btn.value());
+			this.dispatch_to_module("active", this.active_btn.value());
 			//else
 			//	std.verbose("Module has no dispatcher.");
 			
@@ -531,13 +534,17 @@ class generator {
 			return status;
 		});
 		
+		//On a failure the object lives on without its window (the constructor only returns early). A loader may have
+		//set _was_loaded before it failed (call_error), so it is reset: is_loaded() tells add_generator (#202)
 		try {
 			if(!loader()) {
+				_was_loaded = false;
 				std.free(window);
 				return None;
 			}
 		}
 		catch(e) {
+			_was_loaded = false;
 			std.free(window);
 			return None;
 		}
@@ -574,12 +581,56 @@ class generator {
 	//the views and generators in it stayed alive without a window (#361). A module that holds other generators
 	//or views in managed globals needs an on_free() that sets them to None
 	free_module_content() {
-		if(!module || !module.has("on_free"))
+		if(!impl)
 			return;
 		try {
-			module.call("on_free");
+			impl.on_free();
 		}
 		catch(e) {}
+	}
+
+	//After the extension loader: the module behind the contract (#202). A class asset set impl in its loader (its
+	//create()); it is checked by the names of its methods, gets generator and node, builds its controls and names the
+	//hooks it wants every frame. Every other module is wrapped in a LegacyModule. False: the asset does not load
+	attach_module() {
+		if(!impl) {
+			impl = LegacyModule(module, this);
+			return true;
+		}
+		error = contract_error(impl, "GeneratorModule", GENERATOR_MODULE_METHODS, get_relative_path());
+		if(error) {
+			std.error(error);
+			impl = None;
+			return false;
+		}
+		impl.generator = this;
+		impl.node = node;
+		impl.build(this, node);
+		hooks = impl.hooks();
+		pre = hooks.has_value("update");
+		pre_early = hooks.has_value("update_pre");
+		//One slot per generator for each: update and update_pre run in the one of the frame start
+		if(pre || pre_early) {
+			pre_callback([pre, pre_early](generator, tl_pos, pos_delta){
+				if(pre_early)
+					generator.impl.update_pre(tl_pos, pos_delta);
+				if(pre)
+					generator.impl.update(tl_pos, pos_delta);
+			});
+		}
+		if(hooks.has_value("update_post")) {
+			post_callback([](generator){
+				generator.impl.update_post();
+			});
+		}
+		return true;
+	}
+
+	//The module's dispatch(); None without a module
+	dispatch_to_module(cmd, value) {
+		if(!impl)
+			return None;
+		return impl.dispatch(cmd, value);
 	}
 	
 	release() {
@@ -620,9 +671,7 @@ class generator {
 					_post_callback = None;
 			}
 		}
-		if(!dispatcher)
-			return None;
-		return dispatcher(this, cmd, value);
+		return dispatch_to_module(cmd, value);
 	}
 	
 	is_loaded() {
@@ -693,11 +742,16 @@ class generator {
 		}
 		
 		try {
-			if(module.has("save_state"))
-				state.data = module.call("save_state");
+			//None: the module keeps no data of its own (no key, as before #202)
+			data = impl.save_state();
+			if(!std.is_none(data))
+				state.data = data;
 			//A view that is a canvas keeps its zoom and pan (Patchview)
-			if(save_window_state && module.has("save_view"))
-				state.view = module.call("save_view");
+			if(save_window_state) {
+				view = impl.save_view();
+				if(!std.is_none(view))
+					state.view = view;
+			}
 		}
 		catch(e) {
 			
@@ -715,10 +769,9 @@ class generator {
 			window.fixed_size(vec2f(state.fw, state.fh));
 		
 		try {
-			if(module.has("load_state"))
-				module.call("load_state", state.data);
-			if(state.has("view") && module.has("load_view"))
-				module.call("load_view", state.view);
+			impl.load_state(state.data);
+			if(state.has("view"))
+				impl.load_view(state.view);
 		}
 		catch(e) {}
 		

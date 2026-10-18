@@ -243,6 +243,11 @@ R"(raw string)"
 
 EVERY statement ends with `;`
 
+Several statements can be joined with `,` (as in C): `a = 1, b = 2;`, `f(), g();`,
+`for (i = 0, j = 4; i < j; i++, j--) { }`. Keywords of the first assignment apply to all parts:
+`var a = 1, b = 2;` creates two new locals, `static n = 0, m = 0;` two static variables.
+`,` is not an operator: `x = (1, 2);`, `return 1, 2;` and `if (a, b)` are syntax errors (use a list `[1, 2]`).
+
 ---
 
 ## 4. Variables
@@ -651,8 +656,10 @@ math.sqrt(2);
 
 using std;          // import the symbols of a namespace
 print("Hello");
+using std, math;    // several at once
 
 import nanogui;     // load a native module
+import curl, zip;   // several at once
 ```
 
 ---
@@ -665,6 +672,7 @@ import nanogui;     // load a native module
 def later(x);       // forward declaration of a function defined further down
 ```
 
+- `#define` also works inside a block (function, `if`, loop); as in C it is valid from that line on, also after the block.
 - `__FILE__` and `__DIR__` are replaced at compile time (as strings), `__LINE__` is replaced by an **integer** literal (`x = __LINE__ + 1;` gives a number, `std.type(x)` is `int`).
 
 - A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.

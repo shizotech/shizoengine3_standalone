@@ -1,0 +1,132 @@
+// testbench/fixing_duplicate_task_announcements/probe.shio
+// Repro of the handoff path, no LLM: delegate -> ack -> task_started binds the node's
+// task name -> task_finished settles. Run from the repo root:
+//   shz testbench/fixing_duplicate_task_announcements/probe.shio
+// It needs UDP 6454 free (no other selftest running).
+#include "../../telegram_router"
+
+GPU_NAME = "ProbeGPU";
+ROUTER_WIRE = "SHZ_PROBE_R";
+NODE_WIRE = "SHZ_PROBE_N";
+
+class p_recep {
+	send_prompt(m) { return [ok = true]; }
+	stop() { }
+}
+
+class p_host {
+	running = true;
+	_receptionist_active = false;
+	request_queue = [];
+	worker_threads = [[]];
+	receptionist = p_recep();
+	tasks = [];
+	tasks_scheduled = [];
+	tasks_finished = [];
+	tasks_failed = [];
+	_notify_cb = None;
+	_task_finish_cb = None;
+	_task_start_cb = None;
+
+	on_notify(cb) { _notify_cb = cb; }
+	on_task_finished(cb) { _task_finish_cb = cb; }
+	on_task_started(cb) { _task_start_cb = cb; }
+	on_action(cb) { }
+
+	notify_user(msg) { if(_notify_cb) _notify_cb(std.string(msg)); }
+
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		_receptionist_active = true;
+		if(prompt.starts("HANDOFF"))
+			add_task("Sushi-Goal", std.string(prompt));
+		result = [ok = true, reports = [[report = "stub answer: " + std.string(prompt)]], execution_time_ms = 1];
+		_receptionist_active = false;
+		if(on_finish_cb) on_finish_cb(result);
+		return result;
+	}
+
+	get_overview() { return [tasks = tasks, tasks_scheduled = tasks_scheduled, tasks_finished = tasks_finished, tasks_failed = tasks_failed]; }
+
+	add_task(name, goal) {
+		taskid = std.random_hash(16);
+		task = [name = name, task = goal, taskid = taskid, state = "planned"];
+		tasks_scheduled.push_back(task);
+		if(_task_start_cb) _task_start_cb(task);
+		return taskid;
+	}
+
+	stop_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) { tasks_scheduled.erase(i); return true; }
+		}
+		return false;
+	}
+
+	update_task(taskid, message) { return false; }
+	inspect_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) if(tasks_scheduled[i].taskid == taskid) return tasks_scheduled[i];
+		for(i = 0; i < tasks_finished.size(); i++) if(tasks_finished[i].taskid == taskid) return tasks_finished[i];
+		return "Not found.";
+	}
+
+	find_scheduled(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) if(tasks_scheduled[i].taskid == taskid) return tasks_scheduled[i];
+		return None;
+	}
+}
+
+events = [];
+rtr = Router(ModelConfig(), [
+	name = ROUTER_WIRE,
+	role = "receptionist",
+	poll_ms = 100,
+	handoff_settle_ms = 2000,
+	on_event = [events](e) { events.push_back(e); },
+]);
+
+hostA = p_host();
+nodeA = shizonet.server(NODE_WIRE, 6461);
+svcA = ai_node_attach(nodeA, hostA, [name = GPU_NAME, description = "probe node", capabilities = ["gpu"]]);
+
+for(w = 0; w < 400; w++) {
+	seen = false;
+	sum = rtr.nodes_summary();
+	for(i = 0; i < sum.size(); i++) {
+		if(std.string(sum[i].name) == GPU_NAME) {
+			seen = true;
+		}
+	}
+	if(seen) {
+		break;
+	}
+	std.sleep(10);
+}
+std.print("nodes: " + std.string(rtr.nodes().size()) + " named: " + GPU_NAME + "\n");
+
+res = rtr.delegate(GPU_NAME, "HANDOFF train the sushi model");
+std.print("delegate -> " + std.string(res) + "\n");
+
+tid = std.string(res.taskid ?? "");
+
+// ack -> bind -> settle
+for(w = 0; w < 100; w++) {
+	std.sleep(50);
+	t = rtr.inspect_task(tid);
+	if(std.is_json(t) && std.string(t.remote_taskid).length() > 0) {
+		break;
+	}
+}
+std.print("bound -> " + std.string(rtr.inspect_task(tid)) + "\n");
+
+for(w = 0; w < 100; w++) {
+	std.sleep(50);
+}
+
+std.print("mirror -> " + std.string(rtr.tasks_summary()) + "\n");
+std.print("events -> " + std.string(events) + "\n");
+
+rtr.running = false;
+rtr.stop();
+if(rtr.service) rtr.service.stop();
+svcA.stop();
+std.exitprocess(0);
