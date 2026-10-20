@@ -187,6 +187,7 @@ class Router {
 	// state
 	_nodes = [];				// node records, keyed by mac (device object in .dev)
 	remote_tasks = [];			// mirrored remote task records
+	_task_seq = 0;				// number of the last record added to remote_tasks (rec.seq)
 	events = [];				// newest last, capped at AI_MAX_KEPT
 	request_queue = [];			// router-agent turns, Megamind.request style
 	turn_attachments = [];		// files of the current turn ([name, content]): appended
@@ -200,6 +201,15 @@ class Router {
 	_last_refresh = 0;
 	_turn_active = false;
 	_lock = "router:global";
+
+	// One node_state event per fact (#513). A node coming online reaches the owner on two paths: the router's own
+	// announcement (_on_connect / refresh_nodes -> _announce_node_online) and the node's node_state push over ai_event
+	// (handle_event -> _node_state_transition), in any order.
+	_announce_seq = 0;			// owner tokens: only the call that registered a transition announces it
+	_pushed_online = [];		// lowercase node name -> true: the node's online push was passed on while the router had
+								// no record under that name (not registered yet, or AINodeInfo not fetched yet)
+	state_pushes = [];			// lowercase node name -> node_state pushes received from that node (the self-test waits
+								// for them instead of sleeping)
 
 	_notify_cb = None;
 	_event_cb = None;
@@ -467,9 +477,11 @@ class Router {
 			}
 			// register WITHOUT announcing, fetch AINodeInfo, THEN announce: the one
 			// node_state event carries the node's display name, not the wire name.
-			rec = _register_node(dev, std.string(ver), false);
+			// The token: a connect running at the same time announces its own transition.
+			tok = _next_announce_token();
+			rec = _register_node(dev, std.string(ver), false, tok);
 			_fetch_node_info(rec);
-			_announce_node_online(rec);
+			_announce_node_online(rec, false, tok);
 		}
 
 		// drop the online flag of records no device answers anymore
@@ -545,11 +557,16 @@ class Router {
 			return delegate(std.string(node_name), prompt);
 		}
 
-		t0 = std.millis();
+		// the records this turn adds: by number, not by time (#513: the task of the
+		// previous turn is often added in the same millisecond this turn starts)
+		cs = std.critical_section_named(_lock);
+		seq0 = _task_seq;
+		cs.release();
+
 		res = request(std.string(prompt));
 
 		answer = router_report_text(res);
-		rec = _task_created_since(t0);
+		rec = _task_added_after(seq0);
 
 		if(rec) {
 			return [ok = true, routed = true, taskid = rec.taskid, node = rec.node, name = rec.name, answer = answer, error = ""];
@@ -1025,9 +1042,10 @@ class Router {
 
 		// register WITHOUT announcing, fetch AINodeInfo, THEN announce: the one
 		// node_state event carries the node's display name, not the wire name.
-		rec = _register_node(dev, std.string(ver), false);
+		tok = _next_announce_token();
+		rec = _register_node(dev, std.string(ver), false, tok);
 		_fetch_node_info(rec);
-		_announce_node_online(rec);
+		_announce_node_online(rec, false, tok);
 	}
 
 	_on_disconnect(dev) {
@@ -1043,6 +1061,7 @@ class Router {
 				node_name = _nodes[i].name;
 			}
 		}
+		_pushed_online[std.string(node_name).lowercase()] = false;
 		for(i = 0; i < remote_tasks.size(); i++) {
 			if(remote_tasks[i].node == node_name && router_is_open_state(remote_tasks[i].state)) {
 				remote_tasks[i].state = "lost";
@@ -1070,11 +1089,23 @@ class Router {
 		return std.string(dev.mac()) + ":" + std.string(dev.name());
 	}
 
+	// owner token of a deferred node_state announcement (_register_node)
+	_next_announce_token() {
+		cs = std.critical_section_named(_lock);
+		_announce_seq++;
+		tok = _announce_seq;
+		cs.release();
+		return tok;
+	}
+
 	// Register / refresh a node record. announce = false defers the node_state
 	// event to _announce_node_online() (the caller fetches AINodeInfo first, so the
 	// single event carries the node's display name instead of the 16-char shizonet
-	// wire name).
-	_register_node(dev, ver, announce = true) {
+	// wire name). owner (_next_announce_token) marks the deferred announcement as the
+	// caller's: refresh_nodes() and _on_connect() can register the same node at the
+	// same time, and only the one that saw the transition announces it (#513: the
+	// other one announced it too, with the wire name when its AINodeInfo fetch failed).
+	_register_node(dev, ver, announce = true, owner = 0) {
 		mac = dev.mac();
 		nkey = _node_key(dev);
 		found = None;
@@ -1135,7 +1166,7 @@ class Router {
 
 		if(!announce) {
 			cs = std.critical_section_named(_lock);
-			found.announce_pending = true;
+			found.announce_pending = owner ? owner : -1;
 			cs.release();
 			return found;
 		}
@@ -1150,16 +1181,33 @@ class Router {
 	// the callback is what made "device connected" show up twice.
 	// force = the caller (_register_node) already proved this is a real transition.
 	// Without force this is the deferred path: emit only when _register_node left
-	// announce_pending, i.e. only for a transition, never for a re-connect.
-	_announce_node_online(rec, force = false) {
+	// announce_pending for this owner, i.e. only for a transition, never for a
+	// re-connect, and only once (owner = the token given to _register_node; 0 = any).
+	_announce_node_online(rec, force = false, owner = 0) {
 		if(!rec) {
 			return;
 		}
 
 		cs = std.critical_section_named(_lock);
-		pending = rec.announce_pending ? true : false;
-		rec.announce_pending = false;
+		pending = rec.announce_pending;
+		mine = force;
+		if(!mine && pending) {
+			mine = owner ? pending == owner : true;
+		}
+		// deferred path: only announce what _register_node proved to be a transition
+		// (a concurrent register of the same node leaves it to the call that saw it)
+		if(!mine) {
+			cs.release();
+			return;
+		}
+		rec.announce_pending = 0;
 		already = rec.online_announced ? true : false;
+		// the node's own push got through before the record had this name
+		key = std.string(rec.name).lowercase();
+		if(_pushed_online.has(key) && _pushed_online[key]) {
+			already = true;
+			_pushed_online[key] = false;
+		}
 		rec.online_announced = true;
 		nm = rec.name;
 		cs.release();
@@ -1167,11 +1215,6 @@ class Router {
 		// the owner has already heard this node online (its own push, deduplicated
 		// in handle_event) — one event per fact
 		if(already) {
-			return;
-		}
-
-		// deferred path: only announce what _register_node proved to be a transition
-		if(!force && !pending) {
 			return;
 		}
 
@@ -1402,6 +1445,8 @@ class Router {
 		}
 
 		cs = std.critical_section_named(_lock);
+		_task_seq++;
+		rec.seq = _task_seq;
 		remote_tasks.push_back(rec);
 		count = remote_tasks.size();
 		cs.release();
@@ -1642,15 +1687,15 @@ class Router {
 		return n;
 	}
 
-	// The newest mirrored task created at or after t0 (the router-agent turn
+	// The newest mirrored task added after record number seq0 (the router-agent turn
 	// created it through its start_task tool). None when the turn routed nothing.
-	_task_created_since(t0) {
+	_task_added_after(seq0) {
 		cs = std.critical_section_named(_lock);
 		best = None;
 		for(i = 0; i < remote_tasks.size(); i++) {
 			t = remote_tasks[i];
-			if(std.int(t.created ?? 0) >= t0) {
-				if(!best || std.int(t.created) >= std.int(best.created)) {
+			if(std.int(t.seq ?? 0) > seq0) {
+				if(!best || std.int(t.seq) > std.int(best.seq)) {
 					best = t;
 				}
 			}
@@ -1665,16 +1710,31 @@ class Router {
 	// The router announces node transitions itself (_register_node / _on_disconnect)
 	// and records what it announced in rec.online_announced, so the node's own
 	// ai_event push of the same state is the same fact, not a second event.
+	// The record is looked up inside the lock: _apply_node_info renames it and
+	// _announce_node_online reads the flags under the same lock, so a push and the
+	// router's announcement are ordered (#513).
 	_node_state_transition(ev) {
+		online = ev.online ? true : false;
+		key = std.string(ev.node).lowercase();
+
+		cs = std.critical_section_named(_lock);
+		state_pushes[key] = (state_pushes.has(key) ? state_pushes[key] : 0) + 1;
 		rec = _find_node(ev.node);
 
 		if(!rec) {
-			return true;
+			// No record under this name: the router has not registered the node yet,
+			// or not fetched its AINodeInfo (the record still has the wire name). Pass
+			// the push on and remember it, so the router's own announcement of the
+			// same fact is skipped (_announce_node_online).
+			news = true;
+			if(online) {
+				news = !(_pushed_online.has(key) && _pushed_online[key]);
+			}
+			_pushed_online[key] = online;
+			cs.release();
+			return news;
 		}
 
-		online = ev.online ? true : false;
-
-		cs = std.critical_section_named(_lock);
 		announced = rec.online_announced ? true : false;
 		rec.online_announced = online;
 		cs.release();

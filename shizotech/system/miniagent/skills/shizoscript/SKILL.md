@@ -206,7 +206,11 @@ Shizoscript ist mostly garbage collected.
 
 - Objects are auto-destroyed when references go out of scope
 - 'managed' forces destruction when owner goes out of scope
-- std.free() invalidates all references
+- std.free(x) destroys a class instance, module or native object for every reference at once. A class instance: its
+  __deinit__ runs then (once), every other variable / list element / capture that held it reads as None afterwards
+  (`b == None`, `if(b)` is false, `b.method()` is a catchable error, no crash). Other references to a freed module or
+  native object are invalid (false in a condition).
+  On a string, buffer or json, std.free only resets that variable to None (other references keep the value).
 
 ---
 
@@ -733,6 +737,55 @@ t = std.thread(fn);
 t.run();
 t.join();
 ```
+
+`std.thread` runs script tasks cooperatively on the script thread: a task runs until it waits (`std.sleep`,
+`join()`, a lock or one of the primitives below), then the next one continues. A waiting task holds no script
+lock and costs no CPU time, so never busy-wait (`for(!ready) std.sleep(0);`), wait on one of these instead:
+
+```
+c = std.critical_section();          // held until c goes out of scope or c.release(); re-entrant per task
+c = std.critical_section("name");    // shared by every place that uses the same name
+
+ev = std.event();                    // auto-reset; std.event(true) = manual-reset, std.event(false, true) = starts set
+ev.wait();                           // true when set; ev.wait(100) -> false after 100 ms
+ev.signal();                         // auto: wakes one waiter, or is remembered for the next wait(); manual: wakes all, stays set
+ev.reset();  ev.is_set();
+
+sem = std.semaphore(2);              // 2 free permits; std.semaphore(0, 4) = none free, at most 4
+sem.acquire();                       // waits while there is none; sem.acquire(100) -> false after 100 ms
+sem.try_acquire();                   // never waits
+sem.release();  sem.release(3);  sem.count();
+
+cv = std.condition_variable();
+cv.wait();                           // until notify_one() / notify_all(); cv.wait(100) -> false after 100 ms
+cv.wait_for([&ready]() { return ready; });   // until the predicate is true; checks it first
+cv.notify_one();  cv.notify_all();
+
+r = std.oneshot();                   // a value set once, read by any number of tasks
+t = std.thread([&r]() { r.set(compute()); });
+t.run();
+v = r.get();                         // waits until set; r.get(100) -> None after 100 ms
+r.is_set();                          // a second r.set(x) keeps the first value and returns false
+r.reset();                           // forget the value, the next get() waits for the next set()
+```
+
+Rules:
+
+- A timeout is in milliseconds: missing or negative = wait forever, `0` = only check. Every waiting call returns
+  true when it got what it waited for and false when the timeout ran out (`oneshot.get()` returns the value, None
+  when the timeout ran out: `is_set()` tells that apart from a None that was set).
+- Waiters are woken in the order they started waiting.
+- A `notify_one()` / `notify_all()` while no task waits is lost (like C++): wait with `wait_for(predicate)` or check
+  the condition in a loop (`for(!ready) cv.wait();`). For a signal that must not get lost use `std.event`.
+- Release a critical section before waiting (`c.release();`): a suspended task keeps it, and the task that would
+  wake it may need it.
+- If the event / semaphore / condition variable / oneshot is destroyed while tasks wait (its last variable reassigned), they
+  return false instead of waiting forever. Keep it in a variable: `std.event().wait(100)` waits on a temporary that
+  is gone right after the call.
+- An error in the predicate of `wait_for()` ends the wait with false.
+- A task that waits without a timeout keeps the script alive, like `std.sleep(-1)`.
+- Native modules can wake waiting tasks from their own threads (`shz_std_sync.h`, example
+  `shzmodule_base/sync_example.cpp`: `base.signal_later(obj, delay_ms, value)`).
 
 ---
 

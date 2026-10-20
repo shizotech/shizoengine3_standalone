@@ -22,6 +22,7 @@ engine/
 │   ├── clipview.shio             # Clip view
 │   ├── clipstackview.shio        # Clip stack view
 │   ├── singleview.shio           # Single-view container
+│   ├── asset_resolver.shio       # Asset ids (asset.json): finds the asset of a saved generator after a move (#202)
 │   └── extensions/               # Per-extension "loaders" (each exports load_extension(generator))
 │       ├── asset/__init__.shio   # Loader for .asset generators (src/__init__.shio entry point)
 │       ├── glsl/

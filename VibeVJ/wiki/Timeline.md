@@ -76,7 +76,8 @@ The timeline has no clips or lanes of its own yet: it is the clock of the progra
 | *Patch* | Today the same area as *Loops*. |
 
 - The generators in this area are saved with the project.
-- Windows there snap to a grid of 32 px when you move or resize them.
+- Windows there snap to a grid of 16 px when you move or resize them, as in a Patchview: see
+  [Zoom and the grid of a Patchview](The-Screen.md#zoom-and-the-grid-of-a-patchview).
 - You can select and move them as in a Patchview: see [Select and move generators](Generators.md#select-and-move-generators).
 
 ## Snap windows

@@ -4,6 +4,9 @@ using eigen;
 HELP_DIR = "wiki";
 HELP_GLOSSARY = "wiki/glossary.json";
 HELP_GLOSSARY_PAGE = "Glossary"; //a page that is built from the glossary, not read from a file
+HELP_SEARCH_PAGE = "Search";     //the results of the search field, built for each search
+HELP_SEARCH_MAX = 40;            //results a search shows
+HELP_SNIPPET = 150;              //letters of the text around a hit
 HELP_WHEEL = 96;                 //pixels a page moves per notch of the mouse wheel
 HELP_TIP_DELAY = 0.15;           //seconds the mouse rests on a link before its tooltip shows
 HELP_TIP_LENGTH = 260;           //letters of a part of the wiki that the tooltip of a link shows
@@ -253,6 +256,9 @@ help_blocks(markdown) {
 //  first lines of the part it leads to.
 //- The page "Glossary" is built from wiki/glossary.json, the terms of the tooltips.
 //- Tooltips lead here: [[wiki:Page#heading]] in a tooltip is a link, and F1 follows it (screen.on_tooltip_link).
+//- The field above the list searches every page and the glossary; the page "Search" lists the parts that have all
+//  the words (#378).
+//- The arrows button in the header reads the page again; a page whose file changed is read again when it shows (#378).
 class helpwindow
 {
 	managed tool = None;
@@ -261,6 +267,9 @@ class helpwindow
 	trail = [];      //where the links that were followed left from: [index=, pos=], for "back"
 	summaries = None; //"Page" or "Page#heading" -> its heading and first lines, for the tooltips of links
 	back_btn = None;
+	search_box = None;
+	search_index = None; //the parts of every page: [place=, page=, title=, text=, low=] (low: title and text in small letters)
+	search_query = "";
 
 	//A click on a picture shows it big, in a window of its own
 	managed viewer = None;
@@ -279,6 +288,21 @@ class helpwindow
 		back_btn.on_click([this](){
 			this.back();
 		});
+
+		reload_btn = tool.window.button_panel().button("").icon(nanogui.icon("sync"))
+			.tooltip("Read the page again (after its file was changed)")
+			.anchor_top(0).anchor_bottom(0).anchor_left(25).fixed_width(25);
+		reload_btn.on_click([this](){
+			this.reload(this.tool.shown_page);
+		});
+
+		//The search above the list of pages: Enter shows the results
+		search_box = tool.nav.textbox("").placeholder("Search the wiki").anchor_left(6).anchor_right(6).fixed_height(26)
+			.tooltip("Finds the parts of the wiki that have all the words. Enter shows them on the page Search.");
+		search_box.on_change([this](v){
+			this.search(v);
+		});
+		tool.nav.label("").fixed_height(6);
 
 		load_glossary();
 
@@ -306,11 +330,12 @@ class helpwindow
 		catch(e) {}
 		if(glossary)
 			names.push_back(HELP_GLOSSARY_PAGE);
+		names.push_back(HELP_SEARCH_PAGE);
 
 		for(i = 0; i < names.size(); i++) {
 			content = tool.add_page(names[i].replace("-", " "));
 			tool.pages[i].outer.scroll_step_pixels(HELP_WHEEL);
-			entries.push_back([name = names[i], content = content, loaded = false, anchors = []]);
+			entries.push_back([name = names[i], content = content, loaded = false, anchors = [], changed = 0]);
 		}
 
 		//A page is built when it first shows (open builds the first one)
@@ -352,17 +377,44 @@ class helpwindow
 		}
 	}
 
+	page_file(index) {
+		return HELP_DIR + "/" + entries[index].name + ".md";
+	}
+
+	//When the file of a page was written last (0 for the pages that are not files)
+	page_changed(index) {
+		name = entries[index].name;
+		if(name == HELP_GLOSSARY_PAGE || name == HELP_SEARCH_PAGE)
+			return 0;
+		try {
+			return fileio.file_info(page_file(index)).last_write_time;
+		}
+		catch(e) {}
+		return 0;
+	}
+
 	load(index) {
-		if(index < 0 || index >= entries.size() || entries[index].loaded)
+		if(index < 0 || index >= entries.size())
 			return;
+		if(entries[index].loaded) {
+			//A page whose file changed since it was read is read again (writing the wiki with the window open)
+			if(entries[index].changed && page_changed(index) > entries[index].changed)
+				reload(index);
+			return;
+		}
 		entries[index].loaded = true;
 		content = entries[index].content;
 		if(entries[index].name == HELP_GLOSSARY_PAGE) {
 			build_glossary(index);
 			return;
 		}
+		if(entries[index].name == HELP_SEARCH_PAGE) {
+			build_search(index);
+			return;
+		}
+		entries[index].changed = page_changed(index);
 		try {
-			blocks = help_blocks(fileio.read_string(HELP_DIR + "/" + entries[index].name + ".md"));
+			blocks = help_blocks(fileio.read_string(page_file(index)));
 			for(i = 0; i < blocks.size(); i++)
 				add_block(index, blocks[i]);
 			content.label("").fixed_height(24);
@@ -370,6 +422,26 @@ class helpwindow
 		catch(e) {
 			content.label("This page could not be read.").text_color(HELP_TEXT_DIM);
 		}
+	}
+
+	//Builds the page again from its file, where it was scrolled to. The tooltips of links and the search read the
+	//files again too
+	reload(index) {
+		if(index < 0 || index >= entries.size())
+			return;
+		summaries = None;
+		search_index = None;
+		outer = tool.pages[index].outer;
+		pos = outer.scroll_pixels();
+		content = entries[index].content;
+		content.clear_children();
+		content.label("").fixed_height(8);
+		entries[index].anchors = [];
+		entries[index].loaded = false;
+		load(index);
+		std.sleep(0);
+		std.sleep(0);
+		outer.scroll_pixels(pos);
 	}
 
 	index_of(page) {
@@ -538,6 +610,172 @@ class helpwindow
 		if(hash < 0)
 			return target.replace("-", " ");
 		return target.substr(0, hash).replace("-", " ") + ": " + target.substr(hash + 1).replace("-", " ");
+	}
+
+	// =========================================================================
+	// Search
+	// =========================================================================
+
+	//Every part of every page (the text under a heading up to the next one) and every term of the glossary,
+	//as plain text. Read once, again after reload()
+	build_search_index() {
+		if(search_index)
+			return;
+		search_index = [];
+		for(n = 0; n < entries.size(); n++) {
+			name = entries[n].name;
+			if(name == HELP_GLOSSARY_PAGE || name == HELP_SEARCH_PAGE)
+				continue;
+			try {
+				blocks = help_blocks(fileio.read_string(page_file(n)));
+				part = [place = name, page = name, title = name.replace("-", " "), text = ""];
+				for(i = 0; i < blocks.size(); i++) {
+					b = blocks[i];
+					if(b.kind == "h") {
+						if(b.level == 1) {
+							part.title = b.text;
+							continue;
+						}
+						add_search_part(part);
+						part = [place = name + "#" + b.slug, page = name, title = b.text, text = ""];
+						continue;
+					}
+					words = "";
+					if(b.kind == "table") {
+						for(r = 0; r < b.rows.size(); r++) {
+							for(c = 0; c < b.rows[r].size(); c++)
+								words += " " + b.rows[r][c];
+						}
+					}
+					else if(b.kind == "img")
+						words = b.alt;
+					else if(b.kind != "rule")
+						words = b.text;
+					if(words != "")
+						part.text += (part.text == "" ? "" : " ") + help_plain(words).trim();
+				}
+				add_search_part(part);
+			}
+			catch(e) {}
+		}
+		if(glossary) {
+			for(i = 0; i < glossary.size(); i++) {
+				key = glossary.key(i);
+				term = glossary[i];
+				add_search_part([place = key, page = HELP_GLOSSARY_PAGE, title = term.title ?? key, text = help_glyphs(term.text)]);
+			}
+		}
+	}
+
+	add_search_part(part) {
+		if(part.text == "" && part.title == "")
+			return;
+		part.low = (part.title + " " + part.text).lowercase();
+		search_index.push_back(part);
+	}
+
+	//Shows the parts that have every word of the query on the page Search
+	search(query) {
+		search_query = query.trim();
+		index = index_of(HELP_SEARCH_PAGE);
+		if(index < 0)
+			return;
+		content = entries[index].content;
+		content.clear_children();
+		content.label("").fixed_height(8);
+		entries[index].loaded = true;
+		build_search(index);
+		follow(HELP_SEARCH_PAGE, "", true);
+	}
+
+	build_search(index) {
+		content = entries[index].content;
+		content.label("Search").font_size(26).bold(true).wrap(true).text_color(HELP_TITLE);
+		space(content, 8);
+		words = search_query.lowercase().split_words();
+		if(words.size() == 0) {
+			add_text(index, content, "Type one or more words into the field above the list of pages and press Enter.", 15, HELP_TEXT_DIM);
+			return;
+		}
+		build_search_index();
+
+		//Parts whose heading has a word first, then the others, each in the order of the wiki
+		in_title = [];
+		in_text = [];
+		for(i = 0; i < search_index.size(); i++) {
+			part = search_index[i];
+			all = true;
+			for(w = 0; w < words.size() && all; w++) {
+				if(!part.low.contains(words[w]))
+					all = false;
+			}
+			if(!all)
+				continue;
+			title_low = part.title.lowercase();
+			titled = false;
+			for(w = 0; w < words.size(); w++) {
+				if(title_low.contains(words[w]))
+					titled = true;
+			}
+			if(titled)
+				in_title.push_back(part);
+			else
+				in_text.push_back(part);
+		}
+		found = in_title;
+		for(i = 0; i < in_text.size(); i++)
+			found.push_back(in_text[i]);
+
+		if(found.size() == 0) {
+			add_text(index, content, "Nothing found for \"" + search_query + "\".", 15, HELP_TEXT_DIM);
+			return;
+		}
+		count = found.size() > HELP_SEARCH_MAX ? "The first " + HELP_SEARCH_MAX + " of " + found.size() : "" + found.size();
+		add_text(index, content, count + (found.size() == 1 ? " part" : " parts") + " with \"" + search_query + "\":", 15, HELP_TEXT_DIM);
+		space(content, 6);
+
+		for(i = 0; i < found.size() && i < HELP_SEARCH_MAX; i++) {
+			part = found[i];
+			where = part.page == HELP_GLOSSARY_PAGE ? "Glossary" : part.page.replace("-", " ");
+			shown = part.title == where ? where : where + ": " + part.title;
+			target = part.place;
+			btn = content.button(shown).icon(nanogui.icon("arrow_right")).alignment("left").transparent(true).fixed_height(26);
+			btn.on_click([this, target](){
+				this.follow(target, "");
+			});
+			snippet = search_snippet(part, words[0]);
+			if(snippet != "")
+				content.label(snippet).font_size(13).wrap(true).text_color(HELP_TEXT_DIM);
+			space(content, 6);
+		}
+		content.label("").fixed_height(24);
+	}
+
+	//The text of a part around the first place a word is in, "… text …"
+	search_snippet(part, word) {
+		text = part.text;
+		if(text == "")
+			return "";
+		at = text.lowercase().find(word);
+		if(at < 0)
+			at = 0;
+		start = at - HELP_SNIPPET / 3;
+		if(start < 0)
+			start = 0;
+		//Start and end at a blank, not inside a word
+		if(start > 0) {
+			blank = text.find(" ", start);
+			if(blank > 0 && blank < at)
+				start = blank + 1;
+		}
+		piece = text.substr(start, HELP_SNIPPET);
+		if(start + HELP_SNIPPET < text.size()) {
+			cut = piece.rfind(" ");
+			if(cut > HELP_SNIPPET / 2)
+				piece = piece.substr(0, cut);
+			piece += " …";
+		}
+		return (start > 0 ? "… " : "") + piece;
 	}
 
 	//The page "Glossary": every term of the tooltips with its text, and where the wiki says more about it

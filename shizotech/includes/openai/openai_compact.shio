@@ -1,0 +1,252 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  openai_compact.shio — context compaction for openai_api (openai.shio)
+//
+//  When a conversation passes half of the model's context, the old messages are
+//  not cut away: the model writes a HANDOFF SUMMARY of them and the summary
+//  takes their place. What stays verbatim:
+//
+//    * the system prompt,
+//    * the current request (the last user message) - the summary is put in
+//      front of it, or after it when the compacted part is the progress on it,
+//    * the tool round in flight (the last assistant message with tool_calls and
+//      its tool results), so a tool call is never separated from its result.
+//
+//  The plain functions here only reshape message lists; openai_api does the
+//  model calls (openai_api.compact_history). Cutting the oldest messages stays
+//  as the fallback when no summary can be produced.
+// ═════════════════════════════════════════════════════════════════════════════
+
+OPENAI_COMPACT_MSG_CHARS = 6000;		// one message in the transcript (tool results get long)
+OPENAI_COMPACT_CHARS_PER_TOKEN = 3;		// rough estimate, only used to size chunks
+OPENAI_COMPACT_SUMMARY_TOKENS = 3000;	// upper bound of one summary
+OPENAI_COMPACT_MARKER = "## Handoff summary";
+
+OPENAI_COMPACT_PROMPT = R"(You compact the working context of an AI agent. The agent will continue with NO memory of the conversation below except your summary, so write the handoff it needs to go on without repeating work.
+
+Write in this structure (Markdown, dense, concrete; omit a section only when it is empty):
+
+### Task
+The goal, the constraints and the owner's instructions, as given (keep exact wording where it matters).
+
+### Done
+What was completed, with evidence (commands run, test results, files written).
+
+### Facts
+Everything the agent will need again: file paths, symbols, ids, URLs, command lines, configuration values, decisions and their reasons, exact error messages that are still relevant.
+
+### In progress
+What was being worked on at the end and its state.
+
+### Next
+The next concrete steps.
+
+### Avoid
+What failed or was ruled out, so it is not retried.
+
+Rules: do not invent anything; keep identifiers and numbers exact; no pleasantries; merge an earlier handoff summary into yours instead of nesting it.)";
+
+// text of a message (content is a string or a list of parts)
+openai_msg_text(m) {
+	if(!std.is_json(m) || !m.has("content") || std.is_none(m.content))
+		return "";
+
+	c = m.content;
+
+	if(std.is_string(c))
+		return c;
+
+	if(std.is_json(c)) {
+		out = "";
+		for(p : c) {
+			if(std.is_json(p) && p.has("type") && p.type == "text" && p.has("text"))
+				out += std.string(p.text);
+			else if(std.is_json(p) && p.has("type") && p.type == "image_url")
+				out += "[image]";
+		}
+		return out;
+	}
+
+	return std.string(c);
+}
+
+openai_compact_clip(text, n) {
+	t = std.string(text ?? "");
+	if(t.length() <= n)
+		return t;
+	half = n / 2;
+	return t.substr(0, half) + "\n[... " + std.string(t.length() - n) + " characters left out ...]\n" + t.substr(t.length() - half);
+}
+
+// one message as transcript text
+openai_render_message(m) {
+	role = std.is_json(m) && m.has("role") ? std.string(m.role) : "?";
+	out = "";
+
+	if(role == "tool") {
+		out = "[tool result]\n" + openai_compact_clip(openai_msg_text(m), OPENAI_COMPACT_MSG_CHARS);
+		return out;
+	}
+
+	text = openai_msg_text(m);
+	out = "[" + role + "]\n" + openai_compact_clip(text, OPENAI_COMPACT_MSG_CHARS);
+
+	if(m.has("tool_calls") && std.is_json(m.tool_calls)) {
+		for(tc : m.tool_calls) {
+			name = "";
+			args = "";
+			if(std.is_json(tc) && tc.has("function")) {
+				name = std.string(tc.function.name ?? "");
+				args = std.string(tc.function.arguments ?? "");
+			}
+			out += "\n[tool call] " + name + " " + openai_compact_clip(args, 1500);
+		}
+	}
+
+	return out;
+}
+
+// Where to cut. -> [ok, sys, anchor, tail, before = [from, to), after = [from, to)]
+//   sys     index of the system prompt or -1
+//   anchor  the last user message (kept verbatim)
+//   tail    first message of the tool round in flight (kept), == size when none
+//   before  compacted messages between the system prompt and the anchor
+//   after   compacted messages between the anchor and the tail
+openai_compact_plan(messages) {
+	n = messages.size();
+	sys = (n > 0 && std.string(messages[0].role ?? "") == "system") ? 0 : -1;
+
+	anchor = -1;
+	for(i = n - 1; i > sys; i--) {
+		if(std.string(messages[i].role ?? "") == "user") {
+			anchor = i;
+			break;
+		}
+	}
+
+	if(anchor < 0)
+		return [ok = false, reason = "no user message"];
+
+	// the tool round in flight: the last assistant message with tool_calls after
+	// the anchor, plus every message after it (its tool results)
+	tail = n;
+	for(i = n - 1; i > anchor; i--) {
+		m = messages[i];
+		if(std.string(m.role ?? "") == "assistant" && m.has("tool_calls") && std.is_json(m.tool_calls) && m.tool_calls.size()) {
+			tail = i;
+			break;
+		}
+	}
+
+	before_from = sys + 1;
+	after_from = anchor + 1;
+
+	count = (anchor - before_from) + (tail - after_from);
+
+	if(count < 2)
+		return [ok = false, reason = "nothing old enough to compact"];
+
+	return [
+		ok = true,
+		sys = sys,
+		anchor = anchor,
+		tail = tail,
+		before = [before_from, anchor],
+		after = [after_from, tail],
+		count = count,
+	];
+}
+
+// transcript chunks of the compacted messages, each <= max_chars
+openai_compact_chunks(messages, plan, max_chars) {
+	chunks = [];
+	chunks.clear();
+	cur = "";
+
+	ranges = [plan.before, plan.after];
+
+	for(r : ranges) {
+		for(i = r[0]; i < r[1]; i++) {
+			piece = openai_render_message(messages[i]) + "\n\n";
+
+			if(cur.length() + piece.length() > max_chars && cur.length() > 0) {
+				chunks.push_back(cur);
+				cur = "";
+			}
+
+			// a single huge message is clipped to the chunk size
+			if(piece.length() > max_chars)
+				piece = openai_compact_clip(piece, max_chars);
+
+			cur += piece;
+		}
+
+		// between the two ranges sits the anchor: mark where it was
+		if(r[0] == plan.before[0] && plan.after[1] > plan.after[0])
+			cur += "[the current request was given here; it stays in the conversation]\n\n";
+	}
+
+	if(cur.length() > 0)
+		chunks.push_back(cur);
+
+	return chunks;
+}
+
+// the anchor message with the summary put in front of it (only older turns
+// were compacted) or after it (progress on the current request was compacted)
+openai_compact_anchor(anchor_msg, summary, progress_compacted) {
+	m = anchor_msg.copy();
+	note = OPENAI_COMPACT_MARKER + " (the earlier conversation was compacted to save context)\n\n" + std.string(summary).strip();
+
+	if(std.is_json(m.content)) {
+		// multimodal content: the summary is one more text part
+		part = [type = "text", text = "\n\n" + note];
+		if(progress_compacted)
+			m.content.push_back(part);
+		else
+			m.content.insert(0, [type = "text", text = note + "\n\n---\n\n"]);
+		return m;
+	}
+
+	text = openai_msg_text(m);
+
+	if(progress_compacted)
+		m.content = text + "\n\n---\n\n" + note + "\n\nContinue the request above from this state.";
+	else
+		m.content = note + "\n\n---\n\n# Current request\n\n" + text;
+
+	return m;
+}
+
+// the compacted message list
+openai_compact_apply(messages, plan, summary) {
+	out = [];
+	out.clear();
+
+	if(plan.sys >= 0)
+		out.push_back(messages[plan.sys]);
+
+	progress = plan.after[1] > plan.after[0];
+	out.push_back(openai_compact_anchor(messages[plan.anchor], summary, progress));
+
+	for(i = plan.tail; i < messages.size(); i++)
+		out.push_back(messages[i]);
+
+	return out;
+}
+
+// rough token estimate of a request body (no request to the server)
+openai_estimate_tokens(body) {
+	chars = 0;
+	if(body.has("messages")) {
+		for(m : body.messages) {
+			chars += openai_msg_text(m).length() + 16;
+			if(m.has("tool_calls") && std.is_json(m.tool_calls))
+				chars += m.tool_calls.compact_string().length();
+			if(m.has("reasoning_content") && std.is_string(m.reasoning_content))
+				chars += m.reasoning_content.length();
+		}
+	}
+	if(body.has("tools") && std.is_json(body.tools))
+		chars += body.tools.compact_string().length();
+	return chars / OPENAI_COMPACT_CHARS_PER_TOKEN;
+}

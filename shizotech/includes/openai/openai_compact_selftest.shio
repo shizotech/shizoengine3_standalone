@@ -1,0 +1,251 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  openai_compact_selftest.shio — context compaction of openai_api
+//
+//  Usage:  shz openai_compact_selftest.shio
+//
+//  Part 1: the message surgery (openai_compact.shio), no network.
+//  Part 2: a real openai_api against a fake OpenAI server (webserver module,
+//          a 2000 token context): a long ask() history (past half the context)
+//          and a long tool loop inside ONE task() (past 80% of the context) are
+//          compacted into a handoff summary, tool calls stay next to their
+//          results, nothing is cut.
+// ═════════════════════════════════════════════════════════════════════════════
+
+import webserver;
+
+#include "openai"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+// every tool message must directly follow an assistant message with tool_calls
+// (or another tool message of the same round)
+tool_order_ok(messages) {
+	for(i = 0; i < messages.size(); i++) {
+		if(messages[i].role != "tool")
+			continue;
+		j = i - 1;
+		for(j >= 0 && messages[j].role == "tool")
+			j--;
+		if(j < 0 || messages[j].role != "assistant" || !messages[j].has("tool_calls"))
+			return false;
+	}
+	return true;
+}
+
+roles(messages) {
+	out = "";
+	for(m : messages)
+		out += std.string(m.role).substr(0, 1);
+	return out;
+}
+
+std.print("openai_compact_selftest\n");
+
+// ─────────────────────────────────────────────────────────────────────────────
+std.print("── message surgery");
+
+tc1 = [[id = "c1", type = "function", "function" = [name = "read", arguments = "{\"path\":\"a.txt\"}"]]];
+tc2 = [[id = "c2", type = "function", "function" = [name = "write", arguments = "{\"path\":\"b.txt\"}"]]];
+
+// a new request after older turns: everything old goes into the summary,
+// the summary is put in FRONT of the new request
+msgs = [
+	[role = "system", content = "SYS"],
+	[role = "user", content = "old question"],
+	[role = "assistant", content = "", tool_calls = tc1],
+	[role = "tool", tool_call_id = "c1", content = "file a"],
+	[role = "assistant", content = "old answer"],
+	[role = "user", content = "NEW REQUEST"],
+];
+plan = openai_compact_plan(msgs);
+check("plan: the new request is the anchor", plan.ok && plan.anchor == 5 && plan.tail == 6 && plan.count == 4, std.string(plan));
+out = openai_compact_apply(msgs, plan, "SUMMARY-1");
+check("start of a task: [system, user(summary + request)]", roles(out) == "su" && out[1].content.contains("SUMMARY-1") && out[1].content.contains("NEW REQUEST"), roles(out));
+check("the summary comes before the request", out[1].content.find("SUMMARY-1") < out[1].content.find("NEW REQUEST"), out[1].content);
+check("the system prompt is kept", out[0].content == "SYS", "");
+
+// inside a tool loop: the progress after the request is compacted, the round
+// in flight (assistant tool_calls + its results) stays
+msgs = [
+	[role = "system", content = "SYS"],
+	[role = "user", content = "THE TASK"],
+	[role = "assistant", content = "step 1", tool_calls = tc1],
+	[role = "tool", tool_call_id = "c1", content = "result 1"],
+	[role = "assistant", content = "step 2", tool_calls = tc2],
+	[role = "tool", tool_call_id = "c2", content = "result 2"],
+];
+plan = openai_compact_plan(msgs);
+check("plan: the round in flight is the tail", plan.ok && plan.anchor == 1 && plan.tail == 4 && plan.count == 2, std.string(plan));
+out = openai_compact_apply(msgs, plan, "SUMMARY-2");
+check("tool loop: [system, user(task + summary), assistant(tool_calls), tool]", roles(out) == "suat" && out[2].tool_calls[0].id == "c2" && out[3].content == "result 2", roles(out));
+check("the task stays first, the summary after it", out[1].content.find("THE TASK") < out[1].content.find("SUMMARY-2"), out[1].content);
+check("tool calls stay next to their results", tool_order_ok(out), roles(out));
+
+too_small = openai_compact_plan([[role = "system", content = "S"], [role = "user", content = "u"]]);
+check("nothing to compact: no plan", !too_small.ok, std.string(too_small));
+
+chunks = openai_compact_chunks(msgs, openai_compact_plan(msgs), 60);
+check("long transcripts are split into chunks", chunks.size() >= 2, std.string(chunks.size()));
+check("the transcript shows tool calls", openai_compact_chunks(msgs, openai_compact_plan(msgs), 100000)[0].contains("[tool call] read"), "");
+
+mm = [role = "user", content = [[type = "text", text = "look at this"], [type = "image_url", image_url = [url = "data:x"]]]];
+mo = openai_compact_anchor(mm, "SUM", false);
+check("multimodal request: the summary is an extra text part, the image stays", mo.content.size() == 3 && mo.content[0].text.contains("SUM") && mo.content[2].type == "image_url", std.string(mo));
+
+// ─────────────────────────────────────────────────────────────────────────────
+std.print("\n── a real openai_api against a fake server (2000 token context)");
+
+PORT = 18765;
+MAX_LEN = 2000;
+stats = [summaries = 0, chats = 0, max_seen = 0];
+
+fake_count(raw) {
+	return raw.length() / 3;
+}
+
+sse(chunks) {
+	out = "";
+	for(c : chunks)
+		out += "data: " + c.compact_string() + "\n\n";
+	return out + "data: [DONE]\n\n";
+}
+
+server = webserver.http_server(PORT);
+
+server.route("POST", "^/tokenize$", [](req, writer) {
+	raw = std.string(req.body);
+	return [status_code = 200, headers = ["Content-Type" = "application/json"], body = [count = fake_count(raw), max_model_len = MAX_LEN].compact_string()];
+});
+
+server.route("POST", "^/v1/chat/completions$", [stats](req, writer) {
+	raw = std.string(req.body);
+	b = std.json(raw);
+	tokens = fake_count(raw);
+	usage = [prompt_tokens = tokens, completion_tokens = 5, total_tokens = tokens + 5];
+	is_summary = raw.contains("You compact the working context");
+
+	if(tokens > stats.max_seen && !is_summary)
+		stats.max_seen = tokens;
+
+	if(is_summary) {
+		stats.summaries++;
+		return [status_code = 200, headers = ["Content-Type" = "text/event-stream"], body = sse([
+			[choices = [[index = 0, delta = [content = "### Task\nSUMMARY-OK " + std.string(stats.summaries)]]], usage = usage],
+			[choices = [[index = 0, delta = std.json(), finish_reason = "stop"]], usage = usage],
+		])];
+	}
+
+	stats.chats++;
+
+	// the agent works: a tool call per round until 8 tool results are in the context
+	// (or a handoff summary says the work is done)
+	tools_seen = 0;
+	for(m : b.messages) {
+		if(m.role == "tool")
+			tools_seen++;
+	}
+
+	work_left = b.has("tools") && std.is_json(b.tools) && b.tools.size() > 0 && stats.chats < 12;
+
+	if(work_left) {
+		call = [index = 0, id = "call" + std.string(stats.chats), type = "function", "function" = [name = "work", arguments = "{\"step\":" + std.string(stats.chats) + "}"]];
+		return [status_code = 200, headers = ["Content-Type" = "text/event-stream"], body = sse([
+			[choices = [[index = 0, delta = [content = "working ", tool_calls = [call]]]], usage = usage],
+			[choices = [[index = 0, delta = std.json(), finish_reason = "tool_calls"]], usage = usage],
+		])];
+	}
+
+	return [status_code = 200, headers = ["Content-Type" = "text/event-stream"], body = sse([
+		[choices = [[index = 0, delta = [content = "done"]]], usage = usage],
+		[choices = [[index = 0, delta = std.json(), finish_reason = "stop"]], usage = usage],
+	])];
+});
+
+check("the fake server starts", server.start() ? true : false, "port " + std.string(PORT));
+std.sleep(200);
+
+// openai_stream polls in a tight loop: the client runs on its own thread, this
+// thread keeps serving the fake server's routes
+client_done = [done = false];
+
+run_client() {
+	// ask(): a long history, the next question compacts it at the start
+	api = openai_api("http://127.0.0.1:" + std.string(PORT), "fake", "You are a test agent.");
+	for(i = 0; i < 6; i++) {
+		api.body.messages.push_back([role = "user", content = "question " + std.string(i) + " " + std.string("x").ljust(300, "q")]);
+		api.body.messages.push_back([role = "assistant", content = "answer " + std.string(i) + " " + std.string("y").ljust(300, "a")]);
+	}
+	answer = api.ask("THE NEW QUESTION");
+	check("ask(): a long history is compacted, not cut", api.compactions == 1 && stats.summaries >= 1, std.string(api.compactions));
+	check("ask(): [system, user(summary + question), assistant]", roles(api.body.messages) == "sua" && api.body.messages[1].content.contains("SUMMARY-OK") && api.body.messages[1].content.contains("THE NEW QUESTION"), roles(api.body.messages));
+	check("ask(): the answer still comes", std.string(answer).contains("hello") || std.string(answer).contains("done"), std.string(answer));
+
+	// task(): one long tool loop grows past half the context and is compacted
+	// between rounds
+	stats.chats = 0;
+	api2 = openai_api("http://127.0.0.1:" + std.string(PORT), "fake", "You are a test agent.");
+	events = [];
+	api2.on_compact = [events](info) { events.push_back(info); };
+	ts = toolset();
+	ts.add_tool("work", "does work", [step = "int(): the step"], [](args) {
+		return "work result " + std.string(args.step) + ": " + std.string("r").ljust(450, "z");
+	});
+	res = api2.task("THE TASK: do all the steps", ts);
+	check("task(): the tool loop ran to the end", std.string(res).contains("done"), std.string(res));
+	check("task(): compacted inside the loop", api2.compactions >= 1 && events.size() >= 1, std.string(api2.compactions));
+	check("task(): the server never saw more than the context", stats.max_seen < MAX_LEN, std.string(stats.max_seen));
+	check("task(): the task text is kept verbatim", api2.body.messages[1].content.starts("THE TASK: do all the steps"), api2.body.messages[1].content.substr(0, 80));
+	check("task(): the summary is in the conversation", std.string(api2.body.messages).contains("## Handoff summary") && std.string(api2.body.messages).contains("SUMMARY-OK"), "");
+	check("task(): tool calls stay next to their results", tool_order_ok(api2.body.messages), roles(api2.body.messages));
+	check("on_compact reports the summary", events.size() >= 1 && std.string(events[0].summary).contains("SUMMARY-OK"), std.string(events));
+	check("task(): inside the run only past 80% of the context (not past half)", events.size() >= 1 && events[0].tokens_before > MAX_LEN * 0.8, events.size() >= 1 ? std.string(events[0].tokens_before) : "no event");
+	check("task(): a long run is not compacted every round", api2.compactions <= 3, std.string(api2.compactions));
+
+	// compaction off: the old behaviour (cut the oldest messages)
+	api3 = openai_api("http://127.0.0.1:" + std.string(PORT), "fake", "You are a test agent.");
+	api3.compaction = false;
+	for(i = 0; i < 6; i++) {
+		api3.body.messages.push_back([role = "user", content = "question " + std.string(i) + " " + std.string("x").ljust(300, "q")]);
+		api3.body.messages.push_back([role = "assistant", content = "answer " + std.string(i) + " " + std.string("y").ljust(300, "a")]);
+	}
+	summaries_before = stats.summaries;
+	api3.ask("ANOTHER QUESTION");
+	check("compaction = false: no summary request, the oldest messages are cut", stats.summaries == summaries_before && api3.compactions == 0 && api3.body.messages.size() < 14, std.string(api3.body.messages.size()));
+}
+
+client = std.thread([client_done]() {
+	try {
+		run_client();
+	}
+	catch(e) {
+		std.print("client failed: ", e);
+	}
+	client_done.done = true;
+});
+client.run();
+
+for(w = 0; w < 6000 && !client_done.done; w++)
+	std.sleep(20);
+
+check("the client finished", client_done.done, "timeout");
+
+try { server.stop(); } catch(e) {}
+
+std.print("\n ", passed, " passed, ", failed, " failed");
+
+if(failed == 0)
+	std.print("\nALL PASSED");
+else
+	std.exitprocess(1);

@@ -227,8 +227,9 @@ receiver with its router on.
 
 ### The outputs of MapLab
 
-Open an output with its arrow (right column of MapLab). Besides *Width*, *Height* and *Edge Smooth* it sends its picture
-on, without a shader generator in between:
+Under its name each output shows a small live picture of what goes out of it (after its effects); a click on it opens
+the output like its arrow does. Open an output with its arrow (right column of MapLab). Besides *Width*, *Height* and
+*Edge Smooth* it sends its picture on, without a shader generator in between:
 
 | Section | What it does |
 |---|---|
@@ -335,8 +336,61 @@ Two generators in `Generators` › `Network` read the CDJs through **DJ Watch**,
     most of them ahead of the playhead. The zoom bar under the picture shows the seconds you see.
 
 *Source* (in the section *Settings*) is *USB* (finds DJ Watch by itself, or set *Port*), *Demo* (plays a recorded
-set, no hardware) or *Network* (a relay ESP32 over ShizoNet). The line at the top shows the connection ("DJ Watch
+set, no hardware), *Network* (a relay ESP32 over ShizoNet) or *Network card* (no DJ Watch, see
+[Without DJ Watch](#without-dj-watch-network-card)). The line at the top shows the connection ("DJ Watch
 connected") or what is wrong: the messages are on [Troubleshooting](Troubleshooting.md#esp32-not-found).
+
+### Without DJ Watch (network card)
+
+With the source *Network card* VibeVJ needs no DJ Watch: this computer joins the DJ network itself, through one of its
+network cards, and does what DJ Watch does. It shows up there as one more player (like ShowKontrol or Beat Link),
+gets the status of the players and fetches titles, waveforms, cues and artwork from them. Everything else works the
+same: both generators, the history, *Sync timeline*.
+
+Use a network card of its own for the DJ network: a second Ethernet port on the board, a PCIe card or a USB Ethernet
+adapter.
+
+- **Why a card of its own?** CDJs and mixers are made for a small, quiet network. Art-Net (often many universes, 40
+  times a second, as broadcast) and ShizoNet in the same network can disturb them, and with two networks on one card
+  the computer does not know which way a broadcast should go. With two cards the DJ network stays as the DJ set it up.
+- VibeVJ sends Pro DJ Link only through the card it uses for the DJ network. Art-Net and ShizoNet keep using the
+  other card. When the computer would send its own broadcasts (ShizoNet, Art-Net to broadcast) through the DJ card,
+  VibeVJ warns: give the light/VJ card priority (below).
+- Do not run rekordbox, Beat Link or ShowKontrol on the same computer: they need the same ports (UDP 50000 to 50002).
+
+**Set it up**
+
+1. Plug the card into the switch of the players. Not into a numbered channel port of a mixer: there the mixer wants to
+   give out player numbers itself.
+2. Set the card to *automatic* (DHCP). Without a router in the DJ network, Windows and macOS then take an address
+   169.254.x.y by themselves, like the CDJs. Linux: set the connection to *Link-local only* (NetworkManager:
+   `nmcli connection modify <name> ipv4.method link-local`). A fixed address works too, in the same subnet as the
+   players.
+3. Windows: allow VibeVJ through the firewall for this network (the first start asks; tick *Private* and *Public*,
+   the DJ network has no internet and counts as *Public*).
+4. In *Prolink Bridge* or *Prolink Decks*: *Settings* › *Source* › *Network card*. Leave *Network card (empty = auto)*
+   empty: VibeVJ listens on all cards, sends nothing, and takes the card on which the first CDJ shows up. Or type the
+   name of the card (Windows: "Ethernet 2" as in the network settings; Linux: eth1; macOS: en7) or its address.
+5. The line at the top shows "Looking for CDJs on all network cards…", then "Network card Ethernet 2: joining the DJ
+   network…" (about 6 seconds), then the decks.
+
+| Control | What it does |
+|---|---|
+| *Network card (empty = auto)* | The card in the DJ network: name or address. Empty: the card on which CDJs show up. |
+| *Listen only* | Send nothing into the DJ network. VibeVJ then gets only tempo and beats (and the mixer's on air), no titles, waveforms, cues or play state. For setups where a DJ does not want anything new in the network. |
+
+Both generators share one connection: a different card in one of them switches it for both.
+
+To keep the light/VJ card first for the computer's own broadcasts:
+
+- Windows: *Control Panel* › *Network Connections* › the light/VJ card › *Properties* › *Internet Protocol Version 4* ›
+  *Advanced* › untick *Automatic metric* and give it a lower *Interface metric* (for example 5) than the DJ card
+  (for example 50).
+- macOS: *System Settings* › *Network* › *…* › *Set Service Order*: the light/VJ card above the DJ card.
+- Linux: the default route on the light/VJ card (the DJ card without a gateway).
+
+> Screenshot to add: Prolink Decks with *Source* › *Network card*, the line at the top "Network card Ethernet 2", two
+> decks with waveforms.
 
 ## Shizonet
 

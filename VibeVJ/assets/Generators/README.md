@@ -56,7 +56,7 @@ Process audio input and generate reactive visual output based on audio analysis.
 Handle network-based input/output:
 - **ArtnetReceiver / ArtnetSender**: DMX512 over Ethernet (Art-Net) in and out
 - **NDIReceiver / SpoutReceiver**: video from other programs (NDI on every system, Spout on Windows)
-- **ProlinkBridge / ProlinkDecks**: CDJ data (Pioneer Pro DJ Link) from DJ Watch (the ESP32 formerly called prolink-bridge), and a deck view of it
+- **ProlinkBridge / ProlinkDecks**: CDJ data (Pioneer Pro DJ Link) from DJ Watch (the ESP32 formerly called prolink-bridge) or, without it, through a network card of this computer, and a deck view of it
 
 ### Output Generators
 - **RGBMask**: shapes that mask an output. The LED mapping lives in `assets/Mapping/` (LEDMapper, MapLab).

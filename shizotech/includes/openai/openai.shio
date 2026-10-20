@@ -1,6 +1,7 @@
 
 #include "loop_detect"
 #include "simple_json"
+#include "openai_compact"
 
 import curl;
 
@@ -325,6 +326,19 @@ class openai_api
 	on_text = None;
 	on_tool = None;
 	
+	//Context compaction (openai_compact.shio): the model writes a handoff summary
+	//that replaces the old messages. false = cut the oldest messages instead (the
+	//old behaviour, also the fallback).
+	//  - before a request (a continued conversation): past half of the context,
+	//    so the model has at least half of it free to answer
+	//  - between the rounds of one task()'s tool loop: past compact_run_threshold
+	//    of the context (not every round above half)
+	compaction = true;
+	compact_run_threshold = 0.8;
+	on_compact = None;		//cb([messages, tokens_before, max_tokens, summary])
+	compactions = 0;
+	_compact_stream = None;
+	
 	__init__(
 		api_url, 
 		model = None,
@@ -435,35 +449,8 @@ class openai_api
 			);
 			return None;
 		
-		//Truncate history if necessary
-		//Only triggers after half the context is overshoot, but reduces it to 1/3 so it doesnt instantly trigger again...
-		max_iter = 100;
-		if(current_tokens > max_total_tokens/2) {
-			for(current_tokens > max_total_tokens/3 &&
-				body.messages.size() > 1 && max_iter)
-			{
-				std.warn("Truncating history...");
-				if(body.messages[0].role == "system")
-				{
-					body.messages.remove(1);
-					for(body.messages[1].role != "user")
-						body.messages.remove(1);
-				}
-				else
-				{
-					body.messages.remove(0);
-					for(body.messages[0].role != "user")
-						body.messages.remove(0);
-				}
-				
-				token_count_info = token_count_body(body);
-				current_tokens = token_count_info.tokens;
-
-				max_iter--;
-			}
-		}
-		
-		if(max_iter == 0 || body.messages.size() == 0 || (body.messages.size() == 1 && body.messages[0].role != "user"))
+		//Past half the context: compact into a handoff summary (cut as fallback)
+		if(!fit_context(current_tokens, max_total_tokens))
 			std.error("Prompt too long.");
 			return None;
 		
@@ -570,35 +557,8 @@ class openai_api
 			);
 			return None;
 		
-		//Truncate history if necessary
-		//Only triggers after half the context is overshoot, but reduces it to 1/3 so it doesnt instantly trigger again...
-		max_iter = 100;
-		if(current_tokens > max_total_tokens/2) {
-			for(current_tokens > max_total_tokens/3 &&
-				body.messages.size() > 1 && max_iter)
-			{
-				std.warn("Truncating history...");
-				if(body.messages[0].role == "system")
-				{
-					body.messages.remove(1);
-					for(body.messages[1].role != "user")
-						body.messages.remove(1);
-				}
-				else
-				{
-					body.messages.remove(0);
-					for(body.messages[0].role != "user")
-						body.messages.remove(0);
-				}
-				
-				token_count_info = token_count_body(body);
-				current_tokens = token_count_info.tokens;
-
-				max_iter--;
-			}
-		}
-		
-		if(max_iter == 0 || body.messages.size() == 0 || (body.messages.size() == 1 && body.messages[0].role != "user"))
+		//Past half the context: compact into a handoff summary (cut as fallback)
+		if(!fit_context(current_tokens, max_total_tokens))
 			std.error("Prompt too long.");
 			return None;
 		
@@ -624,6 +584,7 @@ class openai_api
 		full_answer = "";
 		
 		elapsed_ms = std.millis();
+		last_total_tokens = 0;
 		
 		for(!completion_finished) {
 			
@@ -643,6 +604,10 @@ class openai_api
 			
 			for (chunk = stream.poll()) {
 			
+				//the size of the conversation as the server counted it
+				if(chunk.has("usage") && std.is_json(chunk.usage) && chunk.usage.has("total_tokens"))
+					last_total_tokens = std.int(chunk.usage.total_tokens);
+				
 				delta = chunk.choices[0].delta;
 				finish_reason = chunk.choices[0].finish_reason ?? "";
 				streamed_response += delta.content ?? "";
@@ -829,6 +794,26 @@ class openai_api
 					if(stream._stop_stream)
 						break;
 					
+					//A long tool loop grows past the context inside ONE task: compact
+					//between rounds once it is past compact_run_threshold (80%) of the
+					//context. No token_count_body() here (its fallback stops the
+					//task stream): the server's usage of the last round + the new results.
+					if(compaction && max_total_tokens > 0) {
+						added_chars = 0;
+						for(i = 0; i < tool_results.size(); i++)
+							added_chars += std.string(tool_results[i].result).length();
+						
+						estimate = last_total_tokens > 0 ? last_total_tokens + added_chars / OPENAI_COMPACT_CHARS_PER_TOKEN : openai_estimate_tokens(body);
+						
+						if(estimate > max_total_tokens * compact_run_threshold) {
+							if(compact_history(max_total_tokens, estimate))
+								last_total_tokens = 0;
+						}
+					}
+					
+					if(stream._stop_stream)
+						break;
+					
 					stream.start("/v1/chat/completions", body, "POST", false);
 					
 					continue;
@@ -881,23 +866,10 @@ class openai_api
 		current_tokens = token_count_info.tokens;
 		max_total_tokens = token_count_info.max_tokens;
 		
-		// Truncate history if necessary
-		for(current_tokens > max_total_tokens/2 &&
-			body.messages.size() > 1)
-		{
-			if(body.messages[0].role == "system")
-			{
-				body.messages.remove(1);
-				for(body.messages[1].role != "user")
-					body.messages.remove(1);
-			}
-			else
-			{
-				body.messages.remove(0);
-				for(body.messages[0].role != "user")
-					body.messages.remove(0);
-			}
-		}
+		// Past half the context: compact (the old loop here never recounted the
+		// tokens and removed every message but one)
+		if(max_total_tokens > 0)
+			fit_context(current_tokens, max_total_tokens);
 		
 		// Try up to 2 times without structured output
 		temperature = 0.0;
@@ -1019,6 +991,11 @@ class openai_api
 		stream.start("/tokenize", _body);
 		token_count_info = stream.poll();
 		res = stream.answer();
+		//poll() only hands out chunks with "choices": the /tokenize answer
+		//([count, max_model_len, ...]) has none, so it is read from the raw text
+		//(without this the context size of a vLLM endpoint was never seen)
+		if(!token_count_info || !token_count_info.max_model_len)
+			token_count_info = std.json(res.raw, true);
 		
 		if(!token_count_info.max_model_len) {
 			
@@ -1138,6 +1115,136 @@ class openai_api
 	
 	stop() {
 		stream.stop();
+		if(_compact_stream)
+			_compact_stream.stop();
+	}
+	
+	// ── context compaction ──────────────────────────────────────────────────
+	
+	// one summary request (its own stream: the task stream is not touched)
+	_summarize_chunk(previous, chunk, max_tokens) {
+		intro = "";
+		if(previous)
+			intro = "Earlier handoff summary (merge it into yours):\n\n" + previous + "\n\n---\n\n";
+		
+		sum_body = [stream = json.bool(true)];
+		if(body.has("model"))
+			sum_body.model = body.model;
+		sum_body.messages = [
+			[role = "system", content = OPENAI_COMPACT_PROMPT],
+			[role = "user", content = intro + "Conversation to compact:\n\n" + chunk + "\n\nWrite the handoff summary now."],
+		];
+		sum_body.max_tokens = max_tokens;
+		sum_body.temperature = 0.2;
+		sum_body.reasoning_effort = "low";
+		
+		_compact_stream = openai_stream(stream.api_url, stream.auth_token);
+		_compact_stream.start("/v1/chat/completions", sum_body);
+		ans = _compact_stream.answer();
+		_compact_stream = None;
+		
+		if(!ans)
+			return "";
+		
+		return std.string(ans.content ?? "").strip();
+	}
+	
+	// Replace the old messages with a handoff summary written by the model.
+	// true when the history was compacted.
+	compact_history(max_total_tokens, current_tokens = 0) {
+		if(!compaction || max_total_tokens <= 0)
+			return false;
+		
+		plan = openai_compact_plan(body.messages);
+		
+		if(!plan.ok)
+			return false;
+		
+		// each summary request must fit: half the context for the transcript
+		chunk_chars = math.max(4000, (max_total_tokens / 2) * OPENAI_COMPACT_CHARS_PER_TOKEN);
+		summary_tokens = math.min(OPENAI_COMPACT_SUMMARY_TOKENS, math.max(512, max_total_tokens / 8));
+		chunks = openai_compact_chunks(body.messages, plan, chunk_chars);
+		
+		std.print("[context] " + current_tokens + " / " + max_total_tokens + " tokens: writing a handoff summary of " + plan.count + " messages (" + chunks.size() + " part(s))");
+		
+		summary = "";
+		
+		for(c : chunks) {
+			if(stream._stop_stream)
+				return false;
+			
+			part = "";
+			try {
+				part = _summarize_chunk(summary, c, summary_tokens);
+			}
+			catch(e) {
+				part = "";
+			}
+			
+			if(!part) {
+				std.warn("[context] no handoff summary from the model");
+				return false;
+			}
+			
+			summary = part;
+		}
+		
+		body.messages = openai_compact_apply(body.messages, plan, summary);
+		compactions++;
+		
+		if(std.is_function(on_compact)) {
+			try {
+				on_compact([messages = plan.count, tokens_before = current_tokens, max_tokens = max_total_tokens, summary = summary]);
+			}
+			catch(e) {}
+		}
+		
+		return true;
+	}
+	
+	// Before a request: past half the context compact, and if that is not
+	// possible (or not enough) cut the oldest messages down to a third.
+	// false when the prompt cannot be made to fit.
+	fit_context(current_tokens, max_total_tokens) {
+		if(current_tokens <= max_total_tokens / 2)
+			return true;
+		
+		if(compact_history(max_total_tokens, current_tokens)) {
+			token_count_info = token_count_body(body);
+			current_tokens = token_count_info.tokens;
+			
+			if(current_tokens <= max_total_tokens / 2)
+				return true;
+		}
+		
+		max_iter = 100;
+		
+		for(current_tokens > max_total_tokens / 3 && body.messages.size() > 1 && max_iter)
+		{
+			std.warn(compaction ? "Truncating history (no handoff summary possible)..." : "Truncating history (compaction is off)...");
+			if(body.messages[0].role == "system")
+			{
+				body.messages.remove(1);
+				for(body.messages.size() > 1 && body.messages[1].role != "user")
+					body.messages.remove(1);
+			}
+			else
+			{
+				body.messages.remove(0);
+				for(body.messages.size() > 0 && body.messages[0].role != "user")
+					body.messages.remove(0);
+			}
+			
+			token_count_info = token_count_body(body);
+			current_tokens = token_count_info.tokens;
+			
+			max_iter--;
+		}
+		
+		if(max_iter == 0 || body.messages.size() == 0 || (body.messages.size() == 1 && body.messages[0].role != "user"))
+			return false;
+		
+		return true;
 	}
 	
 	streamed_response = "";

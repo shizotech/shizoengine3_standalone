@@ -1,0 +1,294 @@
+#strict
+//Asset identity (#202, _shizoengine3/REWRITE_PLAN.md §2 "Asset identity", PR 1.4): finds the asset of a saved
+//generator again after its folder was moved or renamed.
+//
+//	asset_id_of(path)           the id saved next to `path` (generatoritem.save_state: `asset_id`); a new asset folder
+//	                            gets its asset.json here, a moved or copied one is sorted out
+//	asset_resolve(path, id)     the path to load a saved generator from (singleview, generatorview, the clip views)
+//
+//The ids:
+//- A folder asset (a folder with src/__init__.shio or src/__init__.glsl) has an asset.json {id, home}: `id` is random,
+//  `home` the path of the folder when the id was made (relative to the working directory). An asset under the asset
+//  root ("assets") without one gets one the first time a generator of it is saved. Nothing is written anywhere else (read-only
+//  installs, engine/assets): such assets are found by their path only.
+//- A single file (.png, .txt, video, FFGL) has no folder for asset.json: its id is "file:<size>:<content hash>", the
+//  hash only up to ASSET_HASH_LIMIT bytes (a larger file is found by its size and extension).
+//
+//The lookup: the path first (so a copy never takes the place of its original), then the id in an index of the asset
+//root, which a scan for asset.json builds. The scan also decides moves and copies (decision 6 of the plan): one folder
+//with an id is the asset, its `home` follows it; of several folders with one id, the one at `home` (else the one with
+//the oldest asset.json) keeps it, every other one is a copy and gets an id of its own.
+//
+//Every asset is its own std.module: the index is plain data in std.global("asset_resolver"), shared by all of them.
+//It is changed only by replacing the index as a whole (asset_scan) and by the cache of file ids.
+
+ASSET_FILE = "asset.json";
+ASSET_HASH_LIMIT = 67108864; //64 MB
+
+//A path as the engine saves it: relative to the working directory, with "/". Only an absolute path asks the file
+//system: each fileio call is a thread function, and in the load threads of a view they add up
+string asset_norm(string path) {
+	if(!path)
+		return "";
+	p = path.replace("\\", "/");
+	if(p.starts("/") || p.contains(":/"))
+		p = fileio.relative_path_cwd(p).replace("\\", "/");
+	return p;
+}
+
+bool asset_is_folder(string dir) {
+	return fileio.exists(dir + "/src/__init__.shio") || fileio.exists(dir + "/src/__init__.glsl");
+}
+
+//The shared state: [root, index = [id = folder], no_write = [folder = 1], file_ids = [path = [bytes, time, id]]]
+any asset_resolver_state() {
+	g = std.global("asset_resolver");
+	state = g.get();
+	if(std.is_none(state) || !state.has("index")) {
+		g.set([root = "assets", index = [], no_write = [], file_ids = []]);
+		state = g.get();
+	}
+	return state;
+}
+
+//Starts over with another asset root (the tests)
+asset_resolver_reset(string root) {
+	std.global("asset_resolver").set([root = asset_norm(root), index = [], no_write = [], file_ids = []]);
+}
+
+//asset.json of a folder, None when it has none (or one without an id)
+any asset_read_meta(string dir) {
+	meta = None; //read_json of a file that is not there is {}: one fileio call
+	try {
+		meta = fileio.read_json(dir + "/" + ASSET_FILE);
+	}
+	catch(e) {
+		return None;
+	}
+	if(!meta || !meta.has("id") || !meta.id)
+		return None;
+	return meta;
+}
+
+//Writes asset.json, only under the asset root; a folder that could not be written is not tried again
+bool asset_write_meta(string dir, any meta) {
+	state = asset_resolver_state();
+	if(!dir.starts(state.root + "/") || state.no_write.has(dir))
+		return false;
+	if(fileio.write_json(dir + "/" + ASSET_FILE, meta))
+		return true;
+	state.no_write[dir] = 1;
+	return false;
+}
+
+//The id of a single file, kept per path while its size and time stay the same (a video in many clips is read once).
+//Called when a generator is saved, not from the load threads
+string asset_file_id(string path) {
+	state = asset_resolver_state();
+	info = fileio.file_info(path);
+	size = info["size"]; //info.size would be the size() of the JSON
+	time = info.last_write_time;
+	if(state.file_ids.has(path)) {
+		known = state.file_ids[path];
+		if(known.bytes == size && known.time == time)
+			return known.id;
+	}
+	id = "file:" + size + ":";
+	if(size <= ASSET_HASH_LIMIT)
+		id += fileio.hash(path);
+	state.file_ids[path] = [bytes = size, time = time, id = id];
+	return id;
+}
+
+//The folder of an id in the index, if it is still there with that id
+string asset_index_hit(string id) {
+	state = asset_resolver_state();
+	if(!state.index.has(id))
+		return "";
+	dir = state.index[id];
+	meta = asset_read_meta(dir);
+	if(!meta || meta.id != id)
+		return "";
+	return dir;
+}
+
+//Builds the index of the asset root and decides moves and copies by `home`
+asset_scan() {
+	state = asset_resolver_state();
+	root = state.root;
+	if(!fileio.exists(root))
+		return;
+	//id = [[dir, meta, time]]
+	groups = [];
+	files = fileio.files(root, true);
+	for(i = 0; i < files.size(); i++) {
+		rel = files[i].replace("\\", "/");
+		if(fileio.file_name(rel) != ASSET_FILE)
+			continue;
+		dir = root + "/" + fileio.file_dir(rel).replace("\\", "/");
+		if(!asset_is_folder(dir))
+			continue;
+		meta = asset_read_meta(dir);
+		if(!meta)
+			continue;
+		if(!groups.has(meta.id))
+			groups[meta.id] = [];
+		groups[meta.id].push_back([dir = dir, meta = meta, time = fileio.file_info(dir + "/" + ASSET_FILE).last_write_time]);
+	}
+	index = [];
+	for(g = 0; g < groups.size(); g++) {
+		id = groups.key(g);
+		entries = groups[g];
+		//The original: the one at home, else the oldest asset.json (a move keeps the file time, a copy usually not)
+		keep = -1;
+		for(i = 0; i < entries.size(); i++) {
+			if(entries[i].meta.has("home") && entries[i].meta.home == entries[i].dir)
+				keep = i;
+		}
+		if(keep < 0) {
+			keep = 0;
+			for(i = 1; i < entries.size(); i++) {
+				if(entries[i].time < entries[keep].time)
+					keep = i;
+			}
+			if(entries.size() > 1) {
+				names = "";
+				for(i = 0; i < entries.size(); i++) {
+					if(i != keep)
+						names += " " + entries[i].dir;
+				}
+				std.warn("Asset id " + id + " in several folders, none at its home: " + entries[keep].dir +
+					" keeps it (the oldest asset.json), the others are copies:" + names);
+			}
+		}
+		for(i = 0; i < entries.size(); i++) {
+			dir = entries[i].dir;
+			meta = entries[i].meta;
+			if(i == keep) {
+				if(!meta.has("home") || meta.home != dir) {
+					meta.home = dir;
+					asset_write_meta(dir, meta);
+				}
+				index[id] = dir;
+				continue;
+			}
+			//A copy: an asset of its own from now on
+			meta.id = std.random_hash();
+			meta.home = dir;
+			asset_write_meta(dir, meta);
+			index[meta.id] = dir;
+			std.print("Asset copied: " + dir + " gets its own id (a copy of " + entries[keep].dir + ")");
+		}
+	}
+	state.index = index;
+}
+
+//A single file by its id: the files of the asset root with the same extension and size, then the same hash
+string asset_find_file(string p, string id) {
+	parts = id.split(":");
+	if(parts.size() < 2)
+		return "";
+	size = parts[1];
+	hash = parts.size() > 2 ? parts[2] : "";
+	ext = fileio.file_ext(p).lowercase();
+	name = fileio.file_name(p);
+	root = asset_resolver_state().root;
+	if(!fileio.exists(root))
+		return "";
+	files = fileio.files(root, true);
+	list<string> candidates = [];
+	for(i = 0; i < files.size(); i++) {
+		f = root + "/" + files[i].replace("\\", "/");
+		if(fileio.file_ext(f).lowercase() != ext || ("" + fileio.size(f)) != size)
+			continue;
+		if(hash && ("" + fileio.hash(f)) != hash)
+			continue;
+		candidates.push_back(f);
+	}
+	if(candidates.size() == 0)
+		return "";
+	//Equal files: the one with the old name, else the first
+	for(i = 0; i < candidates.size(); i++) {
+		if(fileio.file_name(candidates[i]) == name)
+			return candidates[i];
+	}
+	return candidates[0];
+}
+
+//The id to save with a generator of this asset, "" when it has none. Called when the generator is saved, not when it
+//is loaded: in the load threads of a view (193 generators in test9) every fileio call adds up, and the id only counts
+//once it is saved. The usual case is one call (asset.json). Besides:
+//- asset.json not at its home: the folder was moved or copied, the scan decides which (a copy gets its own id here)
+//- an asset folder under the asset root without asset.json gets one: its id from the first save of a project with it
+//- outside the asset root (engine/assets, a folder of a pack) the index does not look: an id only where it was made,
+//  so a copied asset.json there never stands for its original
+//- a single file: file:<size>:<hash>
+//No lock: a std.critical_section held across fileio calls deadlocks a view that saves or loads in threads. Two threads
+//that make the asset.json of one new folder at once both write a valid one; each returns what is on the disk after
+string asset_id_of(string path) {
+	p = asset_norm(path);
+	if(!p)
+		return "";
+	under_root = p.starts(asset_resolver_state().root + "/");
+	meta = asset_read_meta(p);
+	if(meta) {
+		if(meta.has("home") && meta.home == p)
+			return meta.id;
+		if(!under_root)
+			return "";
+		asset_scan();
+		meta = asset_read_meta(p);
+		return meta ? meta.id : "";
+	}
+	if(!fileio.exists(p))
+		return "";
+	if(fileio.is_file(p))
+		return asset_file_id(p);
+	if(!under_root || !asset_is_folder(p))
+		return "";
+	asset_write_meta(p, [id = std.random_hash(), home = p]);
+	meta = asset_read_meta(p);
+	return meta ? meta.id : "";
+}
+
+//An id in the index, the scan again when it is not there (any more)
+string asset_find_folder(string id) {
+	hit = asset_index_hit(id);
+	if(hit)
+		return hit;
+	asset_scan();
+	return asset_index_hit(id);
+}
+
+//The path to load a saved generator from: `path` when it is still there (and is the same asset), else where the id
+//is now. `path` itself when the asset is not found, the view keeps the saved state then
+string asset_resolve(string path, string id) {
+	if(!path || !id)
+		return path;
+	p = asset_norm(path);
+	if(id.starts("file:")) {
+		if(fileio.exists(p))
+			return path;
+		found = asset_find_file(p, id);
+		if(found) {
+			std.print("Asset moved: " + p + " is now " + found);
+			return found;
+		}
+		return path;
+	}
+	//The usual case: asset.json at path with this id, one fileio call
+	meta = asset_read_meta(p);
+	if(meta) {
+		if(meta.id == id)
+			return path;
+	}
+	else if(fileio.exists(p) && asset_is_folder(p))
+		return path; //an asset folder without asset.json: what is at path is loaded, as before
+	found = asset_find_folder(id);
+	if(!found)
+		return path;
+	if(found == p)
+		return path;
+	std.print("Asset moved: " + p + " is now " + found);
+	return found;
+}

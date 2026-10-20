@@ -197,9 +197,13 @@ That is the telegram hook: a bot subclass does `router.on_event([](e) { send_to_
 
 **One event per fact.** A node coming online is visible on two channels: the router
 discovers it (`shizonet on_connect` → `_register_node`, which emits `node_state`) and the
-node pushes `node_state` over `ai_event`. The router announces the transition itself and
-drops the node's push of a state it has already announced (per node record
-`online_announced`). Same rule for a finished task: when the poller already moved the
+node pushes `node_state` over `ai_event`, in either order. The router announces the
+transition itself and drops the node's push of a state it has already announced (per node
+record `online_announced`). A push that arrives first, before the router has a record under
+the node's display name (not registered yet, or its AINodeInfo not fetched yet), is passed
+on and remembered (`_pushed_online`), and the router's own announcement is skipped then.
+When `refresh_nodes()` and `on_connect` register the same node at the same time, only the
+call that saw the transition announces it (an owner token, #513). Same rule for a finished task: when the poller already moved the
 mirror into that terminal state (its `task_state` event carries the report), the node's
 `task_finished` push is mirrored but not delivered again. The mirror is updated in every
 case — only the owner callback is skipped. The `Router` class never prints: rendering

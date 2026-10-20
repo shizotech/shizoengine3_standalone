@@ -1,0 +1,782 @@
+// ============================================================================
+// console.shio — eye candy for console programs: colours, boxes, tables,
+// progress bars, spinners, banners, trees
+//
+//   #include "console/console"
+//
+//   console.title("My tool", "Version 1.0");
+//   console.success("Connected");
+//   console.box("Line one\nLine two", [title = "Info", color = "cyan"]);
+//   console.table([[name = "a", size = 12], [name = "b", size = 7]]);
+//
+//   bar = console.progress("Loading", 100);
+//   for (i = 0; i <= 100; i++) { bar.update(i); std.sleep(10); }
+//   bar.done();
+//
+// Plain ANSI escape sequences, no module. Colours and unicode frames can be
+// switched off (console.colors(false), console.unicode(false)) for log files,
+// pipes and consoles that do not understand them. See README.md.
+// ============================================================================
+
+class shz_console_progress
+{
+	con = None;
+	label = "";
+	total = 100;
+	value = 0;
+	bar_width = 30;
+	color = "cyan";
+	start_ms = 0;
+	finished = false;
+
+	__init__(con, label, total, opts) {
+		this.con = con;
+		this.label = label;
+		this.total = total > 0 ? total : 1;
+		this.bar_width = con.opt(opts, "width", 30);
+		this.color = con.opt(opts, "color", "cyan");
+		this.start_ms = std.millis();
+		con.cursor_hide();
+		draw();
+	}
+
+	// Set the current value (0 ... total), optionally a new label
+	update(v, new_label = None) {
+		this.value = math.max(0, math.min(v, total));
+		if (new_label != None)
+			this.label = new_label;
+		draw();
+		return this;
+	}
+
+	step(n = 1) {
+		return update(value + n);
+	}
+
+	// The line as it is drawn (without the leading carriage return)
+	line() {
+		var frac = value / (total * 1.0);
+		var filled = std.int(frac * bar_width);
+		var full = con.symbol("bar_full");
+		var empty = con.symbol("bar_empty");
+		var bar = con.style(con.repeat(full, filled), color) + con.style(con.repeat(empty, bar_width - filled), "gray");
+		var percent = std.string(std.int(frac * 100)).rjust(3) + "%";
+		var text = label + " " + bar + " " + con.style(percent, "bold");
+		var elapsed = std.millis() - start_ms;
+		if (value > 0 && value < total) {
+			var eta = std.int(elapsed * (total - value) / (value * 1000.0));
+			text += con.style("  ETA " + con.duration(eta), "gray");
+		}
+		return text;
+	}
+
+	draw() {
+		if (finished)
+			return;
+		con.write("\r" + con.erase_line() + line());
+	}
+
+	// Ends the bar: draws it full and goes to the next line (or replaces it with a message)
+	done(message = None) {
+		if (finished)
+			return this;
+		this.value = total;
+		draw();
+		this.finished = true;
+		if (message != None)
+			con.write("\r" + con.erase_line() + con.symbol_text("success", message, "green"));
+		con.write("\n");
+		con.cursor_show();
+		return this;
+	}
+}
+
+class shz_console_spinner
+{
+	con = None;
+	label = "";
+	color = "magenta";
+	frame = 0;
+	finished = false;
+	running = false;
+	interval_ms = 80;
+
+	__init__(con, label, opts) {
+		this.con = con;
+		this.label = label;
+		this.color = con.opt(opts, "color", "magenta");
+		this.interval_ms = con.opt(opts, "interval", 80);
+		con.cursor_hide();
+		draw();
+	}
+
+	frames() {
+		return con.unicode_enabled ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] : ["|", "/", "-", "\\"];
+	}
+
+	draw() {
+		if (finished)
+			return;
+		var f = frames();
+		con.write("\r" + con.erase_line() + con.style(f[frame % f.size()], color) + " " + label);
+	}
+
+	// Next frame. Call it in your work loop, or let start() do it
+	tick(new_label = None) {
+		if (new_label != None)
+			this.label = new_label;
+		this.frame++;
+		draw();
+		return this;
+	}
+
+	text(new_label) {
+		this.label = new_label;
+		draw();
+		return this;
+	}
+
+	// Animates in a task of its own while this task waits (network, std.sleep, a join ...).
+	// A long loop without waiting does not let it run: call tick() there.
+	start() {
+		if (running)
+			return this;
+		this.running = true;
+		var t = std.thread([this]() {
+			for (running && !finished) {
+				tick();
+				std.sleep(interval_ms);
+			}
+		});
+		t.run();
+		return this;
+	}
+
+	// Ends the spinner with a success (ok = true) or failure mark
+	done(message = None, ok = true) {
+		if (finished)
+			return this;
+		this.finished = true;
+		this.running = false;
+		var msg = message != None ? message : label;
+		con.write("\r" + con.erase_line() + (ok ? con.symbol_text("success", msg, "green") : con.symbol_text("error", msg, "red")) + "\n");
+		con.cursor_show();
+		return this;
+	}
+
+	fail(message = None) {
+		return done(message, false);
+	}
+}
+
+class shz_console
+{
+	colors_enabled = true;
+	unicode_enabled = true;
+	term_width = 80;
+
+	ESC = "\x1b[";
+	csi_final = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
+	// SGR codes of the named colours (foreground; background is +10)
+	color_codes = [
+		black = 30, red = 31, green = 32, yellow = 33, blue = 34, magenta = 35, cyan = 36, white = 37,
+		gray = 90, grey = 90, bright_red = 91, bright_green = 92, bright_yellow = 93, bright_blue = 94,
+		bright_magenta = 95, bright_cyan = 96, bright_white = 97,
+	];
+	attr_codes = [bold = 1, dim = 2, italic = 3, underline = 4, blink = 5, reverse = 7, strike = 9];
+
+	// Frames: top-left, top, top-right, left, right, bottom-left, bottom, bottom-right, tee-left, tee-right, cross, tee-top, tee-bottom
+	frames_unicode = [
+		round = ["╭", "─", "╮", "│", "│", "╰", "─", "╯", "├", "┤", "┼", "┬", "┴"],
+		single = ["┌", "─", "┐", "│", "│", "└", "─", "┘", "├", "┤", "┼", "┬", "┴"],
+		double = ["╔", "═", "╗", "║", "║", "╚", "═", "╝", "╠", "╣", "╬", "╦", "╩"],
+		heavy = ["┏", "━", "┓", "┃", "┃", "┗", "━", "┛", "┣", "┫", "╋", "┳", "┻"],
+	];
+	frame_ascii = ["+", "-", "+", "|", "|", "+", "-", "+", "+", "+", "+", "+", "+"];
+
+	// Status symbols without an emoji form: Windows Terminal draws ✔ ✖ ⚠ ℹ as coloured emoji two columns wide (over
+	// the space after them, in their own colours), the classic console cuts them off. U+FE0E does not help there.
+	symbols_unicode = [
+		success = "✓", error = "✗", warn = "▲", info = "i", arrow = "➜", bullet = "•",
+		bar_full = "█", bar_empty = "░", rule = "─",
+		tree_mid = "├── ", tree_last = "└── ", tree_pipe = "│   ", tree_space = "    ",
+	];
+	symbols_ascii = [
+		success = "+", error = "x", warn = "!", info = "i", arrow = ">", bullet = "*",
+		bar_full = "#", bar_empty = ".", rule = "-",
+		tree_mid = "|-- ", tree_last = "`-- ", tree_pipe = "|   ", tree_space = "    ",
+	];
+
+	// ------------------------------------------------------------------------
+	// Settings
+	// ------------------------------------------------------------------------
+
+	// colors(false): plain text without escape sequences (log files, pipes)
+	colors(on = None) {
+		if (on == None)
+			return colors_enabled;
+		this.colors_enabled = on ? true : false;
+		return this;
+	}
+
+	// unicode(false): ASCII frames and symbols (+-| instead of ╭─╮)
+	unicode(on = None) {
+		if (on == None)
+			return unicode_enabled;
+		this.unicode_enabled = on ? true : false;
+		return this;
+	}
+
+	// Width used by rule(), title() and full width boxes (default 80)
+	width(w = None) {
+		if (w == None)
+			return term_width;
+		this.term_width = math.max(10, w);
+		return this;
+	}
+
+	// ------------------------------------------------------------------------
+	// Output
+	// ------------------------------------------------------------------------
+
+	// Without a line end, flushed at once
+	write(text) {
+		std.cout(std.string(text));
+		return this;
+	}
+
+	print(text = "") {
+		std.cout(std.string(text) + "\n");
+		return this;
+	}
+
+	newline(n = 1) {
+		return write(repeat("\n", n));
+	}
+
+	clear() {
+		if (colors_enabled)
+			write(ESC + "2J" + ESC + "H");
+		return this;
+	}
+
+	cursor_hide() {
+		if (colors_enabled)
+			write(ESC + "?25l");
+		return this;
+	}
+
+	cursor_show() {
+		if (colors_enabled)
+			write(ESC + "?25h");
+		return this;
+	}
+
+	// Column and row start at 1
+	move_to(col, row) {
+		if (colors_enabled)
+			write(ESC + row + ";" + col + "H");
+		return this;
+	}
+
+	up(n = 1) {
+		if (colors_enabled && n > 0)
+			write(ESC + n + "A");
+		return this;
+	}
+
+	// Escape sequence that clears the current line ("" without colours)
+	erase_line() {
+		return colors_enabled ? ESC + "2K" : "";
+	}
+
+	// ------------------------------------------------------------------------
+	// Styles
+	// ------------------------------------------------------------------------
+
+	// style("text", "bold red on_blue underline"), colours: the names of
+	// color_codes, "#rrggbb" or "on_#rrggbb" (24 bit). Ends with a reset.
+	style(text, spec) {
+		text = std.string(text);
+		if (!colors_enabled || !spec)
+			return text;
+		var codes = sgr(spec);
+		if (!codes)
+			return text;
+		return ESC + codes + "m" + text + ESC + "0m";
+	}
+
+	// The SGR parameters of a style spec ("1;31;44"), "" if there are none
+	sgr(spec) {
+		var parts = [];
+		for (word : std.string(spec).split_words()) {
+			var w = word.lowercase();
+			var bg = false;
+			if (w.starts("on_")) {
+				bg = true;
+				w = w.substr(3);
+			}
+			if (w.starts("#")) {
+				var c = hex_color(w);
+				if (c)
+					parts.push_back((bg ? "48;2;" : "38;2;") + c[0] + ";" + c[1] + ";" + c[2]);
+			}
+			else if (color_codes.has(w))
+				parts.push_back(std.string(color_codes[w] + (bg ? 10 : 0)));
+			else if (attr_codes.has(w) && !bg)
+				parts.push_back(std.string(attr_codes[w]));
+		}
+		return join(parts, ";");
+	}
+
+	bold(t) { return style(t, "bold"); }
+	dim(t) { return style(t, "dim"); }
+	italic(t) { return style(t, "italic"); }
+	underline(t) { return style(t, "underline"); }
+	red(t) { return style(t, "red"); }
+	green(t) { return style(t, "green"); }
+	yellow(t) { return style(t, "yellow"); }
+	blue(t) { return style(t, "blue"); }
+	magenta(t) { return style(t, "magenta"); }
+	cyan(t) { return style(t, "cyan"); }
+	gray(t) { return style(t, "gray"); }
+
+	// 24 bit colour
+	rgb(text, r, g, b) {
+		if (!colors_enabled)
+			return std.string(text);
+		return ESC + "38;2;" + clamp_byte(r) + ";" + clamp_byte(g) + ";" + clamp_byte(b) + "m" + text + ESC + "0m";
+	}
+
+	// Each character a colour between from and to ("#rrggbb" or [r, g, b])
+	gradient(text, from = "#ff0080", to = "#00c0ff") {
+		text = std.string(text);
+		if (!colors_enabled)
+			return text;
+		var a = to_rgb(from);
+		var b = to_rgb(to);
+		var chars = characters(text);
+		var n = chars.size();
+		var out = "";
+		for (i, ch : chars) {
+			var t = n > 1 ? i / ((n - 1) * 1.0) : 0.0;
+			out += ESC + "38;2;" + mix(a[0], b[0], t) + ";" + mix(a[1], b[1], t) + ";" + mix(a[2], b[2], t) + "m" + ch;
+		}
+		return out + ESC + "0m";
+	}
+
+	rainbow(text) {
+		text = std.string(text);
+		if (!colors_enabled)
+			return text;
+		var hues = [[255, 64, 64], [255, 160, 0], [240, 230, 0], [64, 220, 64], [0, 190, 255], [110, 90, 255], [220, 80, 255]];
+		var out = "";
+		var k = 0;
+		for (ch : characters(text)) {
+			var c = hues[k % hues.size()];
+			if (ch != " ")
+				k++;
+			out += ESC + "38;2;" + c[0] + ";" + c[1] + ";" + c[2] + "m" + ch;
+		}
+		return out + ESC + "0m";
+	}
+
+	// ------------------------------------------------------------------------
+	// Text helpers
+	// ------------------------------------------------------------------------
+
+	// The text without escape sequences
+	strip(text) {
+		text = std.string(text);
+		var out = "";
+		var in_escape = false;
+		for (ch : text) {
+			if (in_escape) {
+				//A CSI sequence (ESC [ parameters) ends with a letter or one of @`{|}~
+				if (ch != "[" && csi_final.contains(ch))
+					in_escape = false;
+				continue;
+			}
+			if (ch == "\x1b") {
+				in_escape = true;
+				continue;
+			}
+			out += ch;
+		}
+		return out;
+	}
+
+	// Number of characters as they show (escape sequences left out, a UTF-8 character counts once)
+	visible_length(text) {
+		var n = 0;
+		for (ch : strip(text))
+			n++;
+		return n;
+	}
+
+	// align: "left", "right", "center"
+	pad(text, w, align = "left") {
+		text = std.string(text);
+		var gap = w - visible_length(text);
+		if (gap <= 0)
+			return text;
+		if (align == "right")
+			return repeat(" ", gap) + text;
+		if (align == "center") {
+			var left = std.int(gap / 2);
+			return repeat(" ", left) + text + repeat(" ", gap - left);
+		}
+		return text + repeat(" ", gap);
+	}
+
+	// Cut to w visible characters (with "…" at the end); escape sequences are dropped when it is cut
+	truncate(text, w) {
+		text = std.string(text);
+		if (visible_length(text) <= w)
+			return text;
+		var ell = unicode_enabled ? "…" : ".";
+		var out = "";
+		var k = 0;
+		for (ch : strip(text)) {
+			if (k >= w - 1)
+				break;
+			out += ch;
+			k++;
+		}
+		return out + ell;
+	}
+
+	repeat(s, n) {
+		var out = "";
+		for (var i = 0; i < n; i++)
+			out += s;
+		return out;
+	}
+
+	// "1h 02m", "3m 05s", "12s"
+	duration(seconds) {
+		var s = std.int(math.max(0, seconds));
+		if (s >= 3600)
+			return std.int(s / 3600) + "h " + std.string(std.int((s % 3600) / 60)).rjust(2, "0") + "m";
+		if (s >= 60)
+			return std.int(s / 60) + "m " + std.string(s % 60).rjust(2, "0") + "s";
+		return s + "s";
+	}
+
+	symbol(name) {
+		return unicode_enabled ? symbols_unicode[name] : symbols_ascii[name];
+	}
+
+	symbol_text(name, text, color) {
+		return style(symbol(name), color + " bold") + " " + text;
+	}
+
+	// ------------------------------------------------------------------------
+	// Status lines
+	// ------------------------------------------------------------------------
+
+	success(text) { return print(symbol_text("success", text, "green")); }
+	error(text) { return print(symbol_text("error", text, "red")); }
+	warn(text) { return print(symbol_text("warn", text, "yellow")); }
+	info(text) { return print(symbol_text("info", text, "cyan")); }
+	bullet(text) { return print("  " + style(symbol("bullet"), "gray") + " " + text); }
+
+	// [2/5] text
+	step(i, n, text) {
+		return print(style("[" + i + "/" + n + "]", "bold blue") + " " + text);
+	}
+
+	// ------------------------------------------------------------------------
+	// Blocks
+	// ------------------------------------------------------------------------
+
+	// A line over the whole width, with a title in the middle if there is one
+	rule(title = "", color = "gray") {
+		var line = symbol("rule");
+		if (!title)
+			return print(style(repeat(line, term_width), color));
+		var t = " " + title + " ";
+		var rest = term_width - visible_length(t);
+		var left = std.int(rest / 2);
+		return print(style(repeat(line, left), color) + style(t, "bold") + style(repeat(line, rest - left), color));
+	}
+
+	// Lines of a box around text. opts: title, style ("round", "single", "double", "heavy", "ascii"),
+	// color (frame), title_color, padding (spaces left and right), width (inner width, else the longest line),
+	// align ("left", "right", "center")
+	box_lines(text, opts = None) {
+		var f = frame(opt(opts, "style", "round"));
+		var color = opt(opts, "color", "gray");
+		var padding = opt(opts, "padding", 1);
+		var align = opt(opts, "align", "left");
+		var heading = opt(opts, "title", ""); //not "title": that is a method, the assignment would change it
+		var lines = std.string(text).split("\n");
+		var inner = opt(opts, "width", 0);
+		if (!inner) {
+			for (l : lines)
+				inner = math.max(inner, visible_length(l));
+			if (heading)
+				inner = math.max(inner, visible_length(heading) + 2);
+		}
+		var total = inner + padding * 2;
+		var out = [];
+		if (heading) {
+			var t = " " + heading + " ";
+			out.push_back(style(f[0] + f[1], color) + style(t, opt(opts, "title_color", "bold")) +
+				style(repeat(f[1], total - 1 - visible_length(t)) + f[2], color));
+		}
+		else
+			out.push_back(style(f[0] + repeat(f[1], total) + f[2], color));
+		var sp = repeat(" ", padding);
+		for (l : lines)
+			out.push_back(style(f[3], color) + sp + pad(truncate(l, inner), inner, align) + sp + style(f[4], color));
+		out.push_back(style(f[5] + repeat(f[6], total) + f[7], color));
+		return out;
+	}
+
+	box(text, opts = None) {
+		for (l : box_lines(text, opts))
+			print(l);
+		return this;
+	}
+
+	// A big title: the text in a gradient inside a double frame over the whole width, a subtitle under it
+	title(text, subtitle = "", opts = None) {
+		var w = term_width - 2;
+		var body = pad(gradient(text, opt(opts, "from", "#ff4fa0"), opt(opts, "to", "#4fc3ff")), w, "center");
+		if (subtitle)
+			body += "\n" + pad(style(subtitle, "gray"), w, "center");
+		return box(body, [style = opt(opts, "style", "double"), color = opt(opts, "color", "magenta"), padding = 0, width = w]);
+	}
+
+	// Lines of a table. rows: a list of lists, or a list of objects (the keys of the first one are the columns).
+	// opts: header (list of column titles), style (frame), color (frame), header_style, align (list: "left",
+	// "right", "center" per column; numbers are right aligned by default), max_width (per column)
+	table_lines(rows, opts = None) {
+		var header = opt(opts, "header", None);
+		var data = [];
+		if (rows.size() > 0 && !std.is_list(rows[0])) {
+			var keys = [];
+			for (k, v : rows[0])
+				keys.push_back(k);
+			if (header == None)
+				header = keys;
+			for (r : rows) {
+				var cells = [];
+				for (k : keys)
+					cells.push_back(r.has(k) ? r[k] : "");
+				data.push_back(cells);
+			}
+		}
+		else {
+			for (r : rows)
+				data.push_back(r);
+		}
+
+		var cols = header != None ? header.size() : 0;
+		for (r : data)
+			cols = math.max(cols, r.size());
+		if (cols == 0)
+			return [];
+
+		var max_width = opt(opts, "max_width", 40);
+		var widths = [];
+		var numeric = [];
+		for (var c = 0; c < cols; c++) {
+			widths.push_back(header != None && c < header.size() ? visible_length(header[c]) : 0);
+			numeric.push_back(data.size() > 0);
+		}
+		for (r : data) {
+			for (var c = 0; c < cols; c++) {
+				var v = c < r.size() ? r[c] : "";
+				widths[c] = math.min(max_width, math.max(widths[c], visible_length(v)));
+				var type = std.type(v);
+				if (type != "int" && type != "float")
+					numeric[c] = false;
+			}
+		}
+		var align = opt(opts, "align", []);
+
+		var f = frame(opt(opts, "style", "round"));
+		var color = opt(opts, "color", "gray");
+		var header_style = opt(opts, "header_style", "bold cyan");
+
+		var layout = [widths = widths, numeric = numeric, align = align, frame = f, color = color];
+		var out = [];
+		out.push_back(style(table_border(f[0], f[11], f[2], f[1], widths), color));
+		if (header != None) {
+			out.push_back(table_row(header, header_style, layout));
+			out.push_back(style(table_border(f[8], f[10], f[9], f[1], widths), color));
+		}
+		for (r : data)
+			out.push_back(table_row(r, "", layout));
+		out.push_back(style(table_border(f[5], f[12], f[7], f[6], widths), color));
+		return out;
+	}
+
+	table(rows, opts = None) {
+		for (l : table_lines(rows, opts))
+			print(l);
+		return this;
+	}
+
+	// Lines of "key  value" pairs, the keys aligned
+	kv_lines(obj, key_style = "cyan") {
+		var w = 0;
+		for (k, v : obj)
+			w = math.max(w, visible_length(k));
+		var out = [];
+		for (k, v : obj)
+			out.push_back(style(pad(k, w), key_style) + "  " + v);
+		return out;
+	}
+
+	kv(obj, key_style = "cyan") {
+		for (l : kv_lines(obj, key_style))
+			print(l);
+		return this;
+	}
+
+	// Lines of a tree of a JSON value (objects and lists nest, other values are leaves)
+	tree_lines(data, root = "") {
+		var out = [];
+		if (root)
+			out.push_back(style(root, "bold"));
+		tree_walk(data, "", out);
+		return out;
+	}
+
+	tree(data, root = "") {
+		for (l : tree_lines(data, root))
+			print(l);
+		return this;
+	}
+
+	tree_walk(node, prefix, &out) {
+		var entries = [];
+		if (std.is_list(node)) {
+			for (i, v : node)
+				entries.push_back([k = "", v = v]);
+		}
+		else {
+			for (k, v : node)
+				entries.push_back([k = k, v = v]);
+		}
+		for (i, e : entries) {
+			var last = i == entries.size() - 1;
+			var branch = style(symbol(last ? "tree_last" : "tree_mid"), "gray");
+			var nested = std.is_json(e.v) && e.v.size() > 0;
+			var label = e.k ? style(e.k, "cyan") : "";
+			if (!nested)
+				label += (label ? ": " : "") + std.string(e.v);
+			out.push_back(prefix + branch + label);
+			if (nested)
+				tree_walk(e.v, prefix + style(symbol(last ? "tree_space" : "tree_pipe"), "gray"), out);
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// Live elements
+	// ------------------------------------------------------------------------
+
+	// bar = console.progress("Loading", total, [width = 30, color = "cyan"]); bar.update(v); bar.done();
+	progress(label, total = 100, opts = None) {
+		return shz_console_progress(this, label, total, opts);
+	}
+
+	// sp = console.spinner("Working", [color = "magenta"]); sp.tick(); ... sp.done("Finished");
+	spinner(label, opts = None) {
+		return shz_console_spinner(this, label, opts);
+	}
+
+	// ------------------------------------------------------------------------
+	// Internal
+	// ------------------------------------------------------------------------
+
+	table_border(l, m, r, fill, widths) {
+		var s = l;
+		for (var c = 0; c < widths.size(); c++) {
+			s += repeat(fill, widths[c] + 2);
+			s += c < widths.size() - 1 ? m : r;
+		}
+		return s;
+	}
+
+	table_row(cells, cell_style, layout) {
+		var f = layout.frame;
+		var s = style(f[3], layout.color);
+		for (var c = 0; c < layout.widths.size(); c++) {
+			var w = layout.widths[c];
+			var v = c < cells.size() ? std.string(cells[c]) : "";
+			var a = c < layout.align.size() ? layout.align[c] : (layout.numeric[c] ? "right" : "left");
+			s += " " + style(pad(truncate(v, w), w, a), cell_style) + " " + style(f[4], layout.color);
+		}
+		return s;
+	}
+
+	join(parts, sep) {
+		var out = "";
+		for (i, p : parts)
+			out += (i > 0 ? sep : "") + p;
+		return out;
+	}
+
+	opt(opts, key, fallback) {
+		if (opts == None || !std.is_json(opts))
+			return fallback;
+		if (!opts.has(key))
+			return fallback;
+		return opts[key];
+	}
+
+	frame(name) {
+		if (!unicode_enabled || name == "ascii")
+			return frame_ascii;
+		if (frames_unicode.has(name))
+			return frames_unicode[name];
+		return frames_unicode.round;
+	}
+
+	characters(text) {
+		var chars = [];
+		for (ch : std.string(text))
+			chars.push_back(ch);
+		return chars;
+	}
+
+	hex_color(h) {
+		var digits = "0123456789abcdef";
+		h = h.lowercase().removeprefix("#");
+		if (h.size() == 3)
+			h = h.substr(0, 1) + h.substr(0, 1) + h.substr(1, 1) + h.substr(1, 1) + h.substr(2, 1) + h.substr(2, 1);
+		if (h.size() != 6)
+			return None;
+		var c = [];
+		for (var i = 0; i < 6; i += 2) {
+			var hi = digits.find(h.substr(i, 1));
+			var lo = digits.find(h.substr(i + 1, 1));
+			if (hi < 0 || lo < 0)
+				return None;
+			c.push_back(hi * 16 + lo);
+		}
+		return c;
+	}
+
+	to_rgb(c) {
+		if (std.is_list(c))
+			return [clamp_byte(c[0]), clamp_byte(c[1]), clamp_byte(c[2])];
+		var v = hex_color(std.string(c));
+		return v ? v : [255, 255, 255];
+	}
+
+	mix(a, b, t) {
+		return std.int(math.round(a + (b - a) * t));
+	}
+
+	clamp_byte(v) {
+		return std.int(math.max(0, math.min(255, math.round(v))));
+	}
+}
+
+console = shz_console();

@@ -25,6 +25,7 @@ Organize new assets in logical subdirectories to keep it clean.
 
 ```
 MyAsset.asset/
+├── asset.json             # The id of the asset, made by the engine (do not copy it by hand, see below)
 └── src/
     ├── __init__.shio      # Entry point (MANDATORY)
     ├── A.shio             # Optional: additional script file
@@ -32,6 +33,22 @@ MyAsset.asset/
     └── subdirectory/      # Optional: subdirectories to keep things clean
         └── helper.shio
 ```
+
+### asset.json: the id of an asset
+
+A project saves each generator with the `path` of its asset and, next to it, its `asset_id`. When the folder was moved
+or renamed, the project finds it again by that id (`engine/generators/asset_resolver.shio`, #202).
+
+- `asset.json` is `{"id": "...", "home": "assets/..."}`: a random id and the path of the folder when the id was made.
+  The engine writes it the first time a project (or preset) with an asset under `assets/` that has none is saved. The
+  asset browser does not list it.
+- Move or rename an asset folder freely: the engine finds it by its id and sets `home` to the new place.
+- A copied folder has the id of its original at first. The engine sees that (two folders, one id) and gives the copy an
+  id of its own; the one at `home` stays the original.
+- The assets of this repository have their `asset.json` committed, so every install has the same ids. A new asset
+  folder in the repository: commit its `asset.json` too. `_testing/asset_ids.shio` checks this;
+  `cd _shizoengine3 && shz ../_testing/asset_ids.shio --stamp` makes the missing ones.
+- Single files (`.png`, `.txt`, videos, FFGL plugins) have no `asset.json`: they are found again by size and content.
 
 ### Source file structure
 

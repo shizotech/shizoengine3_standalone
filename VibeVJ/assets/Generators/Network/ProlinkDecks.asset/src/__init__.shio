@@ -20,6 +20,8 @@
 // Reads DJ Watch (the ESP32 in the DJ network, firmware repo prolink-bridge) through the native module 'prolink'
 // (shzmodule_prolink). It shares the connection with the ProlinkBridge generator when both use the same SOURCE / PORT.
 // SOURCE "NETWORK" reads a relay ESP32 in the light/VJ network over ShizoNet (prolink-bridge docs/relay-und-audio.md).
+// SOURCE "NETWORK CARD" needs no DJ Watch: this computer joins the DJ network itself through a network card
+// (device.lan(), see ProlinkBridge).
 import nanogui;
 import prolink;
 
@@ -33,6 +35,8 @@ ctrl_out = None;
 status = None;
 source = None;
 port_text = None;
+card_text = None;
+listen_only = None;
 deck_count = None;
 layout_ctrl = None;
 playhead_ctrl = None;
@@ -109,11 +113,20 @@ deck_ctrls = [];
 demo_path = "";
 open_source = -1;
 open_port = "";
+open_card = "";
+open_listen_only = -1;
 status_text = "";
+lan_status_ms = -100000.0;
+// The DJ Watch program (_djwatch_standalone) hosts this view and has its own connection settings and history:
+// standalone_ui() hides them here, and the deck values that only make sense for links in VibeVJ
+connection_ui = true;
+hist_section = None;
+deck_sections = [];
 
 SOURCE_USB = 0;
 SOURCE_DEMO = 1;
 SOURCE_NETWORK = 2;
+SOURCE_LAN = 3;
 
 LAYOUT_PANELS = 0;  // a row of deck panels on top, lanes below
 LAYOUT_LANES = 1;   // lanes only, infos in each lane
@@ -196,6 +209,12 @@ dispatcher(generator, cmd, value) {
 open_device() {
 	open_source = source.value();
 	open_port = port_text.value();
+	open_card = card_text.value();
+	open_listen_only = listen_only.value();
+	source.visible(connection_ui);
+	port_text.visible(connection_ui && open_source == SOURCE_USB);
+	card_text.visible(connection_ui && open_source == SOURCE_LAN);
+	listen_only.visible(connection_ui && open_source == SOURCE_LAN);
 
 	device.close();
 	// New source: its revisions start at 0 again, so upload every texture anew
@@ -205,8 +224,38 @@ open_device() {
 		device.replay(demo_path, 1.0, true);
 	else if(open_source == SOURCE_NETWORK)
 		device.network();
+	else if(open_source == SOURCE_LAN)
+		device.lan(open_card, open_listen_only != 0);
 	else
 		device.open(open_port);
+}
+
+source_changed() {
+	if(source.value() != open_source || port_text.value() != open_port)
+		return true;
+	return card_text.value() != open_card || listen_only.value() != open_listen_only;
+}
+
+// Status of the source "Network card" (DJ Watch without the hardware)
+lan_status() {
+	card = device.port();
+	if(!card) {
+		if(device.error())
+			return device.error();
+		return "Looking for CDJs on all network cards…";
+	}
+	esp = device.state().esp;
+	devices = esp.devices ?? 0;
+	// This computer's own broadcasts (ShizoNet, Art-Net broadcast) would land in the DJ network
+	if(esp.djBroadcasts)
+		return "Network card " + card + ": the computer's broadcasts go into the DJ network (wiki: network card)";
+	if(devices == 0)
+		return "Network card " + card + ": no CDJs yet";
+	if(open_listen_only)
+		return "Network card " + card + " (listen only)";
+	if(esp.vcdj != "active")
+		return "Network card " + card + ": joining the DJ network…";
+	return "Network card " + card;
 }
 
 set_status(text) {
@@ -1290,8 +1339,13 @@ entry(generator, area) {
 
 	settings = area.collapsable("Settings").content().layout(nanogui.layout_vertical());
 	source = settings.controlcombo("SOURCE").caption("Source");
-	source.items(["USB", "Demo", "Network"]).segmented(true); //index-based (SOURCE_USB = 0, …)
+	source.items(["USB", "Demo", "Network", "Network card"]).segmented(true); //index-based (SOURCE_USB = 0, …, SOURCE_LAN = 3)
+	source.tooltip("Where the CDJ data comes from. USB: DJ Watch on this computer. Demo: a recorded set. Network: a DJ Watch relay over ShizoNet. Network card: no DJ Watch, this computer joins the DJ network itself\n[[wiki:Output-and-Devices#prolink-cdjs]]");
 	port_text = settings.controltext("PORT (empty = auto)").caption("Port (empty = auto)").value("");
+	card_text = settings.controltext("NETWORK CARD (empty = auto)").caption("Network card (empty = auto)").value("");
+	card_text.tooltip("Network card in the DJ network: its name (Windows: \"Ethernet 2\", Linux: eth1, macOS: en7) or its address. Empty: the card on which CDJs show up\n[[wiki:Output-and-Devices#without-dj-watch-network-card]]");
+	listen_only = settings.controlbutton("LISTEN ONLY").caption("Listen only").push(1).value(0);
+	listen_only.tooltip("Send nothing into the DJ network: tempo and beats only, no track titles, waveforms or cues\n[[wiki:Output-and-Devices#without-dj-watch-network-card]]");
 	// AUTO = one lane per CDJ that is there; older projects stored 1-4 here, which still means 1-4 lanes
 	deck_count = settings.controlcombo("DECKS").caption("Decks").items(["Auto", "1", "2", "3", "4"]); //index-based (0 = auto)
 	layout_ctrl = settings.controlcombo("LAYOUT").caption("Layout").items(["Decks and lanes", "Lanes only (compact)"]); //index-based (LAYOUT_LANES = 1)
@@ -1319,7 +1373,8 @@ entry(generator, area) {
 	apply_style();
 
 	// Played tracks: the last ones here, all of them as CSV/TXT in Documents/prolink-history
-	hist = area.collapsable("History").content().layout(nanogui.layout_vertical());
+	hist_section = area.collapsable("History");
+	hist = hist_section.content().layout(nanogui.layout_vertical());
 	hist_info = hist.label("No tracks played yet");
 	hist_row = hist.widget().layout(nanogui.layout_horizontal()).fixed_height(30);
 	save_csv = hist_row.button("Save CSV").anchor_left(0).fixed_width(100);
@@ -1349,7 +1404,9 @@ entry(generator, area) {
 		marks.push_back([cues = [], phrases = [], dur = 0.0, col = 0.0, wave = false, preview = false, tid = "", trev = -1]);
 
 		group = "deck" + name;
-		cnt = area.collapsable("Deck " + name).content().layout(nanogui.layout_vertical());
+		section = area.collapsable("Deck " + name);
+		deck_sections.push_back(section);
+		cnt = section.content().layout(nanogui.layout_vertical());
 		deck_ctrls.push_back([
 			bpm = cnt.controlfloat("BPM", group).max(999).as_output(true),
 			beat = cnt.controlslider("BEAT", group).caption("Beat").as_output(true),
@@ -1377,12 +1434,26 @@ entry(generator, area) {
 	open_device();
 }
 
+// For the DJ Watch program: no Source / Port / Network card / Listen only (the program sets them through the
+// controls), no History section and no deck values here
+standalone_ui() {
+	connection_ui = false;
+	source.visible(false);
+	port_text.visible(false);
+	card_text.visible(false);
+	listen_only.visible(false);
+	hist_section.visible(false);
+	for(i = 0; i < deck_sections.size(); i++)
+		deck_sections[i].visible(false);
+	source.parent().refresh_layout();
+}
+
 update(generator, tl_pos, pos_delta) {
 	if(!device)
 		return;
 
-	// Source or port changed (also after loading a project)
-	if(source.value() != open_source || port_text.value() != open_port)
+	// Source, port or network card changed (also after loading a project)
+	if(source_changed())
 		open_device();
 
 	// Level smoothing: 0 = raw, 1 = slow
@@ -1538,7 +1609,15 @@ update(generator, tl_pos, pos_delta) {
 	shader.uniform("playhead", playhead_ctrl.value() / 100.0);
 	shader.uniform("zoom", L.span * 150.0);
 
-	if(device.connected() && open_source == SOURCE_DEMO)
+	if(open_source == SOURCE_LAN) {
+		// device.state() builds every deck: a few times a second is enough for the status line
+		now_ms = std.millis();
+		if(now_ms - lan_status_ms > 250) {
+			lan_status_ms = now_ms;
+			set_status(lan_status());
+		}
+	}
+	else if(device.connected() && open_source == SOURCE_DEMO)
 		set_status("Demo set (no DJ Watch needed)");
 	else if(device.connected())
 		set_status("DJ Watch connected: " + device.port());

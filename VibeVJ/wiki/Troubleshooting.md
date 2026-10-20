@@ -121,6 +121,23 @@ Input Analysis has its own, shorter messages (the last two rows).
 | "DJ Watch not connected" | Audio with *DJ Watch (USB)*: the board is not connected. See the first row. |
 | "No audio from DJ Watch (firmware: audio mic\|line)" | Audio: the board sends no audio. Turn audio on in the firmware (command "audio mic" or "audio line"). |
 
+## CDJs not found on the network card
+
+With the source *Network card* ([without DJ Watch](Output-and-Devices.md#without-dj-watch-network-card)) the status
+line of Prolink Bridge and Prolink Decks shows what the computer sees in the DJ network.
+
+| Message | What to do |
+|---|---|
+| "Looking for CDJs on all network cards…" | No CDJ has shown up yet. Is the card plugged into the switch of the players, and are the players on? Windows: allow VibeVJ through the firewall (also for *Public* networks). |
+| "CDJ-3000 (169.254.12.7) is in no subnet of this computer's network cards…" | The card has an address that does not match the players. Set the card to *automatic* (DHCP, then 169.254.x.y by itself) or to an address in the subnet of the players. |
+| "Network card Ethernet 2 not found, not connected or without IPv4 address" | The name in *Network card* does not match, the cable is out, or the card has no address yet. Leave the field empty to find the card by itself. |
+| "UDP ports 50000-50002 are in use (…)" | Another Pro DJ Link program runs on this computer (rekordbox, Beat Link, ShowKontrol). Close it. |
+| "Network card Ethernet 2: no CDJs yet" | The card is open, but no player is on it. Check the cable and the switch. |
+| "Network card Ethernet 2: joining the DJ network…" | VibeVJ announces itself as one more player (about 6 seconds). If it stays: another program on the network may use the same player number. |
+| "Network card Ethernet 2 (listen only)" | *Listen only* is on: tempo and beats only, no titles, waveforms or cues. |
+| "Network card Ethernet 2: the computer's broadcasts go into the DJ network…" | ShizoNet and Art-Net broadcasts of this computer would go out through the DJ card. Give the light/VJ card priority: see [Without DJ Watch](Output-and-Devices.md#without-dj-watch-network-card). |
+| "Network card Ethernet 2 lost its address (cable?)" | The cable was pulled or the card was switched off. VibeVJ opens it again by itself. |
+
 ## A video does not play
 
 - **The window says why:** the line under the controls shows "No video" or the error.

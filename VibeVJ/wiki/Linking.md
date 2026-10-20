@@ -208,6 +208,10 @@ A greyed-out control has no grip dots on its notches and takes no links.
   cables coming in, the right notch the cables going out, and the control at the other end lights up. A small number
   on the corner counts partners that are not on screen. Not while *Cable view* is on (the cables are there already) and
   not in show mode.
+- **What a control is linked to:** rest the mouse anywhere on a linked control. Its tooltip lists the links: *in* for
+  what drives it, *out* for what it drives, each with the partner, where the partner is (the area and the generator)
+  and the link type, and *not on screen* for a partner you cannot see right now. After a quarter of a second its
+  cables show faintly, as a hint; on a notch they show in full. Not in show mode.
 - **Many cables:** the small pulses on a cable run from the sender to the receiver. With more than 40 cables on screen
   the pulses stop, with more than 300 the cables are drawn in a plainer way, so the frame rate holds.
 

@@ -43,7 +43,7 @@ The buttons at the bottom of a list have notches: [link](Linking.md#make-a-link)
 |---|---|
 | *Live* | Locks the lists for playing: the × of every cue is hidden, and the Clipview behind them is locked too ([Clipview](Clipview.md#live)). |
 | *Show clipview* | Shows the Clipview behind the lists instead of the lists. The settings of a cue are only there: *Name*, *Trigger*, *Duration*, *Transition*, *Inputs*, *Macros* ([Clip settings](Clipview.md#clip-settings)). |
-| *Autoplay* | Turns *Autoplay random* on or off in every list: the cues play in random order, each for the *Duration* of its layer (64 beats at the start). It counts the beats of the [timeline](Timeline.md), so press *Play* there. |
+| *Autoplay* | Turns *Autoplay forwards* on or off in every list: the cues play in order, one after the other, each for the *Duration* of its layer (64 beats at the start); after the last cue the list starts again. It counts the beats of the [timeline](Timeline.md), so press *Play* there. |
 | *Random* | Starts one random cue in every list at once. |
 
 *Show clipview*, *Autoplay* and *Random* can be linked and mapped to MIDI.

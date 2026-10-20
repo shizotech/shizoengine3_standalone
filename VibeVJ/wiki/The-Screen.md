@@ -77,10 +77,15 @@ The Help window shows the pages of this wiki, listed at its left side. It floats
   tooltip shows what is behind it; click it to go there. The list "See also" at the end of a page is made of buttons
   that do the same.
 - **Back:** the arrow at the left of the header goes back to where you followed the last link.
+- **Search:** type words into the field above the list and press Enter. The page *Search* lists every part of the wiki
+  and every term of the glossary that has all the words, the ones with a word in their heading first; click one to go
+  there.
+- **Read again:** the arrows next to *Back* read the page from its file again. A page whose file changed is read again
+  by itself when you open it, so you can write the wiki with the window open.
 - **Pictures:** rest the mouse on a picture and a magnifier shows the part under it at full size. Click the picture
   to see it big in a window of its own; a click on the big picture closes it. Animations play by themselves.
-- **Glossary:** the last page lists the words VibeVJ uses for its parts, each with the place in the wiki that says
-  more.
+- **Glossary:** the page before *Search* lists the words VibeVJ uses for its parts, each with the place in the wiki
+  that says more.
 
 ### Tooltips
 
@@ -354,7 +359,13 @@ Every generator lives in its own window. The window header and its buttons are o
 
 ### Zoom and the grid of a Patchview
 
-A Patchview is a canvas with a faint dot grid. Windows snap to it when you let them go: to the nearest point, every 32 px.
+A Patchview is a canvas with a faint dot grid: a fine dot every 16 px, every fourth one a little stronger. Windows
+snap to the fine dots:
+
+- **Moving:** while you drag a window by its header, it glides to the grid point nearest to the cursor. Where it is
+  while you drag is where it stays when you let go.
+- **Resizing:** the edge you drag lands on the grid, the edge across from it stays where it is.
+- **New generators** land on the grid as well.
 
 ![A Patchview with seven generators placed by the AI at the same spot: each moved to a free place, sized to its controls; the zoom chip in the corner](media/patchview-canvas.png)
 
