@@ -43,6 +43,17 @@ GOAL_STOP_POLICIES = ["drain", "checkpoint", "cancel"];
 GOAL_MISFIRE = ["run_if_open", "skip", "catch_up"];
 GOAL_PLAN_UPDATES = ["allow", "propose", "deny"];
 
+// the keys a schedule/policy map may contain: an unknown key inside one of these
+// maps is reported (a top-level unknown field already is, a nested one was silent)
+GOAL_SCHEDULE_KEYS = ["type", "days", "every", "date", "window", "start", "end", "duration",
+    "timezone", "start_date", "end_date", "misfire"];
+GOAL_POLICY_KEYS = ["max_parallel_workers", "repeat_in_window", "max_runs_per_window",
+    "min_remaining", "stop_policy", "checkpoint_grace", "max_attempts", "retry_backoff",
+    "stall_timeout", "verify", "dry_run", "pause_stops", "plan_updates", "allow",
+    "require_approval", "continue_after_window"];
+
+GOAL_EVERY_MAX_DAYS = 365;
+
 GOAL_DEFAULT_APPROVALS = ["merge", "release", "deploy", "delete", "force_push"];
 
 GOAL_TICK_MS = 15000;
@@ -406,6 +417,53 @@ goal_days_list(v, errors) {
 	return out;
 }
 
+// schedule.every: an interval in whole days ("2d", "14d") -> int days, None = not set.
+// A bare number is refused on purpose: in a duration "2" means 2 minutes.
+goal_every_field(sch_in, errors) {
+	v = gj(sch_in, "every", None);
+	if(std.is_none(v))
+		return None;
+
+	text = std.string(v).strip().lowercase();
+	if(gt_is_int_text(text)) {
+		errors.push_back("schedule.every: needs a day unit (examples: 2d, 3d, 14d)");
+		return None;
+	}
+
+	secs = gt_parse_duration(text);
+	if(std.is_none(secs) || secs % GT_DAY != 0) {
+		errors.push_back("schedule.every: needs whole days (examples: 2d, 3d, 14d)");
+		return None;
+	}
+
+	days = secs / GT_DAY;
+	if(days < 1 || days > GOAL_EVERY_MAX_DAYS) {
+		errors.push_back("schedule.every: between 1d and " + std.string(GOAL_EVERY_MAX_DAYS) + "d");
+		return None;
+	}
+	return days;
+}
+
+// the phase of an interval schedule: an explicit start_date wins, else the day the
+// goal became active (the scheduler supplies it), else epoch day 0 (a stable preview)
+goal_every_anchor(sch, anchor_day = None) {
+	if(!std.is_none(gj(sch, "start_date")))
+		return sch.start_date;
+	if(!std.is_none(anchor_day))
+		return anchor_day;
+	return 0;
+}
+
+goal_warn_unknown(map, known, label, warnings) {
+	if(!gj_is_map(map))
+		return warnings;
+	for(k, v : map) {
+		if(!goal_list_has(known, k))
+			warnings.push_back("unknown field '" + label + "." + k + "' (ignored)");
+	}
+	return warnings;
+}
+
 goal_duration_field(obj, key, def_text, errors, label) {
 	v = gj(obj, key, None);
 	if(std.is_none(v))
@@ -593,12 +651,23 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 	}
 
 	days = [];
+	every = goal_every_field(sch_in, errors);
+
 	if(stype == "recurring" || stype == "windowed") {
-		n_errors = errors.size();
-		days = goal_days_list(gj(sch_in, "days", "daily"), errors);
-		if(!days.size() && errors.size() == n_errors)
-			errors.push_back("schedule.days: no weekday selected");
+		if(!std.is_none(every)) {
+			// an interval replaces the weekday set: both at once is ambiguous
+			if(gj(sch_in, "days"))
+				errors.push_back("schedule: give either days or every, not both");
+		}
+		else {
+			n_errors = errors.size();
+			days = goal_days_list(gj(sch_in, "days", "daily"), errors);
+			if(!days.size() && errors.size() == n_errors)
+				errors.push_back("schedule.days: no weekday selected");
+		}
 	}
+	else if(!std.is_none(every))
+		errors.push_back("schedule.every: only for type recurring or windowed");
 
 	start_date = None;
 	end_date = None;
@@ -626,6 +695,7 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 		duration = duration_secs,
 		date = date_days,
 		days = days,
+		every = every,
 		start_date = start_date,
 		end_date = end_date,
 		misfire = misfire,
@@ -673,6 +743,11 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 	if(std.string(body ?? "").strip().empty() && !gj(data, "objective"))
 		errors.push_back("the goal has no instructions: write the objective below the front matter");
 
+	// a key inside schedule:/policy: that the scheduler does not read used to be
+	// dropped without a word: "interval: 2d" validated fine and ran daily
+	goal_warn_unknown(sch_in, GOAL_SCHEDULE_KEYS, "schedule", warnings);
+	goal_warn_unknown(pol_in, GOAL_POLICY_KEYS, "policy", warnings);
+
 	def = [
 		id = folder_id,
 		title = title,
@@ -693,7 +768,7 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 //  Windows of a definition
 // ─────────────────────────────────────────────────────────────────────────────
 
-goal_day_matches(sch, day) {
+goal_day_matches(sch, day, anchor_day = None) {
 	if(!std.is_none(sch.start_date) && day < sch.start_date)
 		return false;
 	if(!std.is_none(sch.end_date) && day > sch.end_date)
@@ -702,17 +777,20 @@ goal_day_matches(sch, day) {
 	if(sch.type == "once")
 		return day == sch.date;
 
-	if(sch.type == "recurring" || sch.type == "windowed")
+	if(sch.type == "recurring" || sch.type == "windowed") {
+		if(!std.is_none(sch.every))
+			return gt_mod(day - goal_every_anchor(sch, anchor_day), sch.every) == 0;
 		return goal_list_has(sch.days, gt_weekday(day));
+	}
 
 	return false;
 }
 
 // the window that starts on local day `day` (None if the schedule has none)
-goal_window_for_day(def, zone, day) {
+goal_window_for_day(def, zone, day, anchor_day = None) {
 	sch = def.schedule;
 
-	if(!goal_day_matches(sch, day))
+	if(!goal_day_matches(sch, day, anchor_day))
 		return None;
 
 	w = gt_window_on(zone, day, sch.start, sch.end, sch.duration);
@@ -721,7 +799,7 @@ goal_window_for_day(def, zone, day) {
 }
 
 // windows overlapping [from, to] (UTC secs), oldest first
-goal_windows_between(def, from, to) {
+goal_windows_between(def, from, to, anchor_day = None) {
 	out = [];
 	out.clear();
 	sch = def.schedule;
@@ -742,7 +820,7 @@ goal_windows_between(def, from, to) {
 	}
 
 	for(day = first_day; day <= last_day; day++) {
-		w = goal_window_for_day(def, zone, day);
+		w = goal_window_for_day(def, zone, day, anchor_day);
 		if(std.is_none(w))
 			continue;
 		if(w.end > from && w.start <= to)
@@ -753,7 +831,7 @@ goal_windows_between(def, from, to) {
 }
 
 // the next `count` windows that end after `now`
-goal_next_windows(def, now, count = 5) {
+goal_next_windows(def, now, count = 5, anchor_day = None) {
 	out = [];
 	out.clear();
 	sch = def.schedule;
@@ -776,7 +854,7 @@ goal_next_windows(def, now, count = 5) {
 		if(!std.is_none(sch.end_date) && day > sch.end_date)
 			break;
 
-		w = goal_window_for_day(def, zone, day);
+		w = goal_window_for_day(def, zone, day, anchor_day);
 		if(!std.is_none(w) && w.end > now)
 			out.push_back(w);
 		day++;
@@ -806,6 +884,13 @@ goal_schedule_text(def) {
 
 	if(sch.type == "once")
 		return "once on " + gt_format_date(sch.date) + " " + times + where;
+
+	if(!std.is_none(sch.every)) {
+		what = "every " + std.string(sch.every) + "d";
+		if(!std.is_none(sch.start_date))
+			what += " from " + gt_format_date(sch.start_date);
+		return sch.type + " " + what + " " + times + where;
+	}
 
 	names = [];
 	for(d : sch.days)
@@ -1203,6 +1288,21 @@ class GoalScheduler {
 		if(clock)
 			return clock();
 		return gt_now();
+	}
+
+	// the phase day of an interval schedule ("every 2d"): the local day the goal
+	// became active, so the cadence starts where the owner created it.
+	// An explicit schedule.start_date wins (goal_every_anchor).
+	interval_anchor(def) {
+		since = 0;
+		try {
+			since = gj(ledger.goal(def.id), "active_since", 0);
+		}
+		catch(e) {}
+		if(!since)
+			since = clock_now();
+		zone = gt_zone(def.schedule.timezone);
+		return gt_floor_div(since + gt_offset_at(zone, since), GT_DAY);
 	}
 
 	start() {
@@ -1682,7 +1782,7 @@ class GoalScheduler {
 			since = gj(g, "active_since", t_now);
 			lookback_from = math.max(since, t_now - 8 * GT_DAY);
 
-			windows = goal_windows_between(def, lookback_from, t_now);
+			windows = goal_windows_between(def, lookback_from, t_now, interval_anchor(def));
 			missed_latest = None;
 
 			for(w : windows) {
@@ -2145,7 +2245,7 @@ class GoalScheduler {
 	goal_summary(id, def) {
 		g = ledger.goal(id);
 		t_now = clock_now();
-		nxt = goal_next_windows(def, t_now, 1);
+		nxt = goal_next_windows(def, t_now, 1, interval_anchor(def));
 		last = None;
 		open = None;
 

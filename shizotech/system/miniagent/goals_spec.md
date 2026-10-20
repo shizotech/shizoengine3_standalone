@@ -1,7 +1,8 @@
 # Goals: scheduled autonomous work (`goal_engine.shio`)
 
 A **goal** is work a node does on its own at set times: "tonight, explore a new app idea",
-"every Sunday clean up the repository", "fix GitHub issues from 05:00 to 10:00". Goals are
+"every Sunday clean up the repository", "check the server logs every 2 days at 06:00",
+"fix GitHub issues from 05:00 to 10:00". Goals are
 Markdown files a person can read, edit, diff and version; the node's scheduler (plain code, no
 LLM) decides when they run.
 
@@ -23,7 +24,7 @@ GoalScheduler.tick()  ── windows, misfires, retries, stop policy, limits ─
 | `goal_tools.shio` | the agent operations: `get_goals`, `create_goal`, `update_goal`, `set_goal_status`, `run_goal_now` |
 | `goals.shio` | the CLI: `shz miniagent.goals ...` |
 | `agentspace_template/` | what `goals init` creates |
-| `goals_selftest.shio` | 127 checks, fake host + fake clock, no LLM |
+| `goals_selftest.shio` | 161 checks, fake host + fake clock, no LLM |
 
 ## The tree
 
@@ -59,12 +60,13 @@ priority: normal                   # low | normal | high | urgent (urgent ignore
 schedule:
   type: windowed                   # once | recurring | windowed | manual
   days: weekdays                   # recurring/windowed: [monday, ...] | daily | weekdays | weekends
+  every: 2d                        # recurring/windowed: an interval in whole days, INSTEAD of days
   date: 2026-10-20                 # once only
   window: tonight                  # a named window from preferences/scheduling.md, or:
   start: "05:00"                   #   local wall time (quote it)
   end: "10:00"                     #   end <= start crosses midnight; or duration: 2h
   timezone: Europe/Berlin          # default: preferences timezone
-  start_date: 2026-10-01           # optional bounds
+  start_date: 2026-10-01           # optional bounds; with `every` it is also the phase
   end_date: 2026-12-31
   misfire: run_if_open             # run_if_open | skip | catch_up
 policy:
@@ -90,7 +92,9 @@ policy:
 
 Scalars: `yes/no/true/false/on/off`, integers, `null`, everything else is a string. Times
 must be quoted (`"05:00"`) to stay YAML-portable; unquoted works here too. Unknown fields are
-a warning, not an error.
+a warning, not an error — **including keys inside `schedule:` / `policy:`**, so a
+`schedule.interval: 2d` (a key the scheduler does not read) is reported as
+`unknown field 'schedule.interval' (ignored)` instead of silently running daily.
 
 ### Validation
 
@@ -113,7 +117,18 @@ revision stays active**. `shz miniagent.goals validate` runs the same checks.
 ## Windows
 
 A window starts on a local day at `start` and ends at `end` (next day when `end <= start`) or
-after `duration`. Daylight saving time:
+after `duration`.
+
+Which days: `days` is a weekday set (`[monday, ...]`, `daily`, `weekdays`, `weekends`), and
+`every: 2d` is an **interval in whole days** that replaces it. `days` + `every` together is an
+error, `every` on `once`/`manual` is an error, a bare `2` (it would mean minutes in a duration)
+and a part-day `36h` are errors, `365d` is the maximum. The **phase** of an interval is
+`start_date` when given, else the local day the goal became active (`active_since` in the
+ledger — a plain edit does not slide the cadence, moving the folder into `active/` re-anchors it
+to that day), else epoch day 0 for a preview without a ledger. `every: 2d` + `start: "06:00"` is "every 2 days at 6:00 in the morning": gaps of exactly
+2 days, across month boundaries and DST.
+
+Daylight saving time:
 
 - a start inside the spring gap moves forward (02:30 → 03:30 CEST), it is never skipped;
 - a start inside the autumn overlap takes the first occurrence, it never runs twice;
@@ -187,7 +202,7 @@ structured calls; code validates them.
 | Tool | Does |
 |---|---|
 | `get_goals()` | local time, time zone, named windows, defaults, precedence rules, the goals |
-| `create_goal(title, instructions, schedule_type, date?, days?, window?, start?, end?, duration?, timezone?, ..., activate?)` | validated create; refuses the same id and near duplicates (`allow_duplicate=yes` overrides); `activate` missing → `proposed`; goals that allow merge/release/deploy/delete stay `proposed` |
+| `create_goal(title, instructions, schedule_type, date?, days?, every?, window?, start?, end?, duration?, timezone?, ..., activate?)` | validated create; refuses the same id and near duplicates (`allow_duplicate=yes` overrides); `activate` missing → `proposed`; goals that allow merge/release/deploy/delete stay `proposed` |
 | `update_goal(id, revision, ...)` | changes only the given fields; refuses a stale revision |
 | `set_goal_status(id, status)` | the folder move |
 | `run_goal_now(id)` | queues a run (the tick thread starts it) |

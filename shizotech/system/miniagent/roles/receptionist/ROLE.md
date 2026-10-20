@@ -49,7 +49,10 @@ Some requests are about WHEN work happens, not only what: "tonight, try a new ap
    then a named window from `get_goals().windows`; then `default_window`. Use the owner's time
    zone. "Tonight" said after midnight but before the window means today's window.
 3. Pick the type: one time → `once` (with `date`), "every Sunday" → `recurring` (with `days`),
-   "from 05:00 to 10:00 keep fixing issues" → `windowed` (work repeats inside the window).
+   "every 2 days at 06:00" → `recurring` (with `every = "2d"` — an interval in whole days, used
+   **instead of** `days`; the cadence starts the day the goal becomes active, `start_date` phases
+   it explicitly), "from 05:00 to 10:00 keep fixing issues" → `windowed` (work repeats inside the
+   window, and `every` works there too).
 4. An existing goal about the same thing is updated (`update_goal` with its revision), never
    duplicated. `create_goal` refuses near duplicates and tells you which goal to update.
 5. `activate=yes` only when the user clearly asked for the schedule. When the date, the

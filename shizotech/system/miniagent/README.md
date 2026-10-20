@@ -116,7 +116,8 @@ shz node.shio --config ./endpoints.json#default --worker-config ./endpoints.json
 ## Goals (scheduled autonomous work)
 
 A node can run work on its own at set times: "tonight, explore a new app idea", "every Sunday
-clean up the repository", "fix GitHub issues from 05:00 to 10:00". Goals are Markdown files in
+clean up the repository", "check the server logs every 2 days at 06:00" (`schedule.every: 2d`),
+"fix GitHub issues from 05:00 to 10:00". Goals are Markdown files in
 `.agentspace/goals/<status>/<id>/goal.md` (front matter = schedule + policy, body = the
 instructions); the node's scheduler — plain code — activates each window exactly once, applies
 the stop policy at the window end, retries, verifies and reports. Contract: `goals_spec.md`.
@@ -360,9 +361,10 @@ shz goals_selftest.shio         time zones / DST, front matter, validation, the 
                                  (activation once per window, restart recovery, misfire
                                  policies, retries, stop policy, invalid edits, conflicts,
                                  pause, dry run, verification, capacity, a refused dispatch
-                                 is notified) and the agent goal
+                                 is notified, the `every: 2d` interval schedules and the
+                                 agent goal
                                  tools, stall watchdog, state/overview.md, fake host +
-                                 fake clock -> 127 checks, ALL PASSED
+                                 fake clock -> 161 checks, ALL PASSED
 shz tests/agent_slots_test.shio  max_running_agents: lending, forks, roots, stops
                                  -> 13 checks, ALL PASSED
 shz tests/stop_propagation_test.shio  miniagent.stop() across the agent tree, no LLM:
