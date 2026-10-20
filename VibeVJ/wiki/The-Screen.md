@@ -9,8 +9,8 @@ the timeline area. You design most of the screen yourself, by splitting it into 
 
 | Area | Where | What it is for |
 |---|---|---|
-| Sidebar | Left | The assets, devices and the AI chat |
-| Top bar | Top | Sidebar button, menu, settings, help, undo and redo, the view tabs with **+**, the project name and the window buttons |
+| Sidebar | Left | Your projects, the assets, devices and the AI chat |
+| Top bar | Top | Sidebar button, settings, help, undo and redo, the view tabs with **+**, the project name and the window buttons |
 | Views | Right, below the top bar | The work area: every view tab is split into areas, each with one view or generator |
 | Generator windows | Inside the views | One window per generator, with its controls |
 | Timeline | Bottom | Tempo, play position, transport and show mode |
@@ -31,7 +31,7 @@ VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it bring
   - On a Wayland desktop VibeVJ runs through XWayland, and the full screen works the same way.
   - On a Mac it is the full screen of macOS: VibeVJ moves into a Space of its own, the menu bar and the Dock hide,
     Cmd + Tab and the swipe between Spaces keep working. **Ctrl + Cmd + F** switches it too.
-- **Close** (✕) works like *Exit* in the menu: a project with a name is saved and VibeVJ quits, an unnamed project
+- **Close** (✕) works like *Exit* in the [Projects tab](#projects-tab): a project with a name is saved and VibeVJ quits, an unnamed project
   first asks "Save the new project before quitting?". In show mode it does nothing, so a stray click does not end the
   show.
 - **Move:** drag an empty part of the top bar or of the sidebar's tab bar. A plain click on it changes nothing. Tabs,
@@ -41,20 +41,16 @@ VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it bring
 
 ## Top bar
 
-![The left end of the top bar: sidebar button, menu, settings, help, undo and redo, then the view tabs and +](media/top-bar.png)
+![The left end of the top bar: sidebar button, settings, help, undo and redo, then the view tabs and +](media/top-bar.png)
 
 ```
-[sidebar] [≡] [⚙] [?] | [undo] [redo] | [Views] [View 2] [+]  … free space …  project name [window buttons]
+[sidebar] [⚙] [?] | [undo] [redo] | [back] | [Views] [View 2] [+]  … free space …  project name [window buttons]
 ```
 
 - **Sidebar button:** at the left edge. It shows or hides the sidebar; its chevron points where the sidebar goes.
-- **≡ (Menu):** all project actions: *New project*, *Open…* with the recent projects below it (newest first, at most
-  eight), *Save*, *Save as…*, *Undo* / *Redo*, *Settings…*, *Help…* and *Exit*. The list of recent projects is made every time
-  the menu opens. See [Getting started](Getting-Started.md#save).
-- **⚙ (Settings):** opens the *Settings* window, like *Settings…* in the menu. See [Settings](Settings.md).
-- **? (Help):** opens this wiki in a window of the program, where you left it; a second click closes it. *Help…* in
-  the menu does the same. F1 opens it at the part that explains what the mouse is on. See
-  [The Help window](#the-help-window).
+- **⚙ (Settings):** opens the *Settings* window. See [Settings](Settings.md).
+- **? (Help):** opens this wiki in a window of the program, where you left it; a second click closes it. F1 opens it
+  at the part that explains what the mouse is on. See [The Help window](#the-help-window).
 - **Undo, redo:** take back the last change of the layout, or do it again (Ctrl + Z, Ctrl + Y). Their tooltips name
   the step. See [Undo and redo](#undo-and-redo).
 - **View tabs:** each tab is its own work area. **+** adds an empty one. Double-click a tab to rename it, drag it to move
@@ -63,7 +59,8 @@ VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it bring
 - A tab comes to the front when you let go of it, not when you press it. So you can take a tab that is not in front and
   drag it down into an area of the tab you are looking at: see [Moving a view](#moving-a-view).
 - **Free space:** moves the window, see [The program window](#the-program-window).
-- **Project name:** at the right, left of the window buttons. An unnamed project shows *&lt;New Project&gt;*.
+- **Project name:** at the right, left of the window buttons. An unnamed project shows *&lt;New Project&gt;*. New,
+  open and save are in the [Projects tab](#projects-tab) of the sidebar.
 - **Window buttons:** see [The program window](#the-program-window).
 
 Views are not chosen in the top bar. An empty area offers them, a filled one has them in its menu: see
@@ -103,10 +100,12 @@ All gestures are on [Shortcuts and tips](Shortcuts-and-Tips.md#tooltips).
 
 ## Sidebar
 
-The sidebar has four tabs. The project actions and the settings are not here: they are in the [top bar](#top-bar).
+The sidebar has five tabs. The settings are not here: they have a window of their own, opened from the
+[top bar](#top-bar).
 
 | Tab | What you find there |
 |---|---|
+| *Projects* | New, open and save, an overview of the project you have open, and all your projects and templates. See [Projects tab](#projects-tab). |
 | *Assets* | All assets in the `assets` folder: generators, shaders, views, textures, fixtures. What comes with VibeVJ is on [Assets](Assets.md). |
 | *Devices* | *MIDI*, *Network* (*Artnet*, *Shizonet*) and *Fixtures*. See [MIDI](MIDI.md) and [Output and devices](Output-and-Devices.md). |
 | *Chat* | An AI chat that can look at and change your generators. |
@@ -116,6 +115,35 @@ The sidebar has four tabs. The project actions and the settings are not here: th
   The views and the timeline take the free space.
 - **Make it wider or narrower:** drag its right edge.
 - **Make its content bigger or smaller:** click into the sidebar, then press Page Up or Page Down.
+- VibeVJ starts with the *Assets* tab in front; it opens the project you used last by itself.
+
+### Projects tab
+
+Everything about your projects in one place: open and save them, see what is in the one you have open, and switch to
+another one.
+
+![The Projects tab: the actions, the overview of the open project and the list of projects](media/projects.png)
+
+From top to bottom:
+
+- **The name of the project** you have open. An unnamed project shows *&lt;New Project&gt;*.
+- **The actions:** *New project*, *Open…*, *Save*, *Save as…* and *Exit*. What each one does is in
+  [Getting started](Getting-Started.md#save).
+- ***Overview*:** what is in the project you have open. One section per [view tab](#top-bar), with the views in its
+  areas (with the icon they have in the picker of an empty area) and, below each view, the generators in it. A
+  generator inside another one (an effect stacked onto a clip, a shader in a Shaderstack) is indented below it. The
+  generators of the timeline's *Patch* have a section *Timeline*. Click a view or a generator: its view tab comes to
+  the front and the area shows, also inside a Tabview. The overview follows while you work: a new generator, a
+  closed view or a renamed tab shows up in it.
+- ***Projects*:** every saved project, newest first. The one you have open has a check mark. Click a project to open
+  it. A click on the open one asks first, then opens its saved state again: what you changed since the last save is
+  lost.
+- ***Templates*:** the templates, if there are any. Click one to start a new project from it. See
+  [Templates](Getting-Started.md#templates).
+
+Click the title of a section to fold it. The sections of the overview stay folded while you work.
+
+Dragging a view or a generator out of another project in the list into your project, like a preset. *(Planned.)*
 
 ### Assets tab
 
@@ -281,7 +309,7 @@ and a project saved with view windows opens their views in their tabs.
 ### Undo and redo
 
 Ctrl + Z takes back the last change of the layout or of a link, Ctrl + Y (or Ctrl + Shift + Z) does it again. The two buttons in the
-top bar and *Undo* / *Redo* in the menu do the same and name the step.
+top bar do the same; their tooltips name the step.
 
 - **What it covers:** splitting, moving, swapping, duplicating and closing areas, adding and deleting views, the
   view tabs (add, rename, delete), also the tabs of a Tabview, and generators you dragged out of a Patchview

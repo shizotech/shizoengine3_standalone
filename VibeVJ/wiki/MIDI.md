@@ -88,7 +88,7 @@ Click a notch of a control to open its options. The tab *MIDI* shows the mapping
 Every control with a notch: value fields and sliders, control buttons, lists and switches, the power button of a
 generator window, the columns, layers and transport of a Clipview, the buttons of a [CueList](CueList.md), the
 transport of the [timeline](Timeline.md#the-transport-bar), fixture channels. Plain buttons without a notch (for
-example *Save* in the menu of the top bar) cannot be mapped.
+example *Save* in the *Projects* tab of the sidebar) cannot be mapped.
 
 [Pure outputs](Linking.md#pure-outputs) (rows with only a right notch, such as *BPM* or *Low energy* of
 [Audio Input Analysis](Audio.md)) are written by their generator all the time. A MIDI mapping on them is overwritten

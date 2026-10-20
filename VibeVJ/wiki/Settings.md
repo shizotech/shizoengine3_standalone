@@ -8,8 +8,7 @@ page also explains how to scale views with Page Up and Page Down.
 
 ## Open the settings
 
-1. Click the gear button (⚙) in the top bar, between the menu (≡) and the help button (?). Or open the menu (≡) and click
-   *Settings…*.
+1. Click the gear button (⚙) in the top bar, between the sidebar button and the help button (?).
 2. Click a page in the list at the left side of the window: *Project*, *Links*, *Appearance* or *Output*.
 
 The window floats above the program.

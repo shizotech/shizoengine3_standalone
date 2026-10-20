@@ -1,0 +1,393 @@
+//The Projects tab of the sidebar (#479), before Assets, as it was until #360: the project actions, an overview of the
+//project that is open (its view tabs, the views in their areas and the generators in them) and the list of all
+//projects and templates. It replaces the menu (≡) of the top bar.
+//
+//The tab only shows and runs what the engine already has: the actions are assetbrowser.project_actions, a project
+//opens with engine.env.load_project, a template with engine.env.load_template (the functions the menu called).
+//
+//Every entry is a widget of its own (a button) that knows what it stands for (a project name, an area uid, the file
+//of a generator). Dragging a view or a generator out of another project (like the browser of Ableton) is planned:
+//it hangs on these entries (button.on_drag_start / begin_dragdrop), there is no code for it yet.
+//
+//The lists are rebuilt from the frame update of the engine (engine.env.refresh_recent, flushed when
+//engine.env.recent_dirty is set): clear_children() deletes the buttons at once, so it must never run inside the click
+//of one of them (#315). The folders of the projects and templates are read by a thread: a call of fileio waits for the
+//other threads of the program, with a project open the list of all projects took seconds on the frame.
+
+def view_assets(); //engine/generators/singleview.shio, included after the sidebar (generators.shio)
+
+PROJECTS_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0); //text_2 (design/tokens.json)
+PROJECTS_ROW = 28;
+PROJECTS_INDENT = 18;
+PROJECTS_WIKI = "\n[[wiki:The-Screen#projects-tab]]";
+
+class projects_menu
+{
+	managed area = None;
+	engine = None;
+	main_menu = None;
+	actions = None;          //assetbrowser.project_actions: [new=, load=, save=, save_as=, exit=]
+
+	name_label = None;
+	overview_box = None;     //content of the section "Overview"
+	projects_box = None;     //content of the section "Projects"
+	templates_section = None;
+	templates_box = None;
+
+	expanded = [];           //"tab:" + name of a view tab, "timeline" -> its section in the overview is open (1) or not (0)
+	sections = [];           //[remember=, widget=] the sections of the overview on screen ("key" is a method of JSON)
+	signature = "";          //what the overview was built from; another one rebuilds it
+	last_check = 0;
+
+	managed scan_thread = None; //reads the folders (start_scan); kept, a thread that goes out of scope ends with it
+	scanning = false;
+	rescan = true;           //read the folders again with the next refresh (the tab came to the front)
+	scanned = None;          //[projects=, templates=, views=]: names of the projects (newest first) and templates, view_assets()
+	scan_count = 0;          //goes up with every scan that finished
+	scan_name = "";          //the project that was open when the last scan started
+	built_count = -1;        //the scan the lists show
+	built_name = "";         //the project that was open when the lists were built (its check mark)
+
+	__init__(parent, engine, main_menu, actions) {
+		this.engine = engine;
+		this.main_menu = main_menu;
+		this.actions = actions;
+		expanded = [];
+		sections = [];
+
+		area = parent.anchor(0).vscroll().anchor(0).content().widget().layout(nanogui.layout_vertical()).anchor(0);
+
+		name_label = area.label("<New Project>").font_size(20).fixed_height(36).alignment("center");
+		name_label.tooltip("The [[project]] that is open. What is in it: the Overview below the actions." + PROJECTS_WIKI);
+
+		add_action("New project", "file", "new", "Clears all views, generators and links for a new [[project]] (it asks first).\n[[wiki:Getting-Started#save]]");
+		add_action("Open…", "folder", "load", "Opens a [[project]] by its name. The projects in the list below open with a click.\n[[wiki:Getting-Started#open-a-project]]");
+		add_action("Save", "save", "save", "Saves the [[project]]. A new project without a name asks for one first.\n[[wiki:Getting-Started#save]]");
+		add_action("Save as…", "clone", "save_as", "Saves the [[project]] under a new name and goes on in it.\n[[wiki:Getting-Started#save]]");
+		add_action("Exit", "sign_out_alt", "exit", "Saves a [[project]] with a name and closes VibeVJ. A new project is asked about first. Like the close button of the window.\n[[wiki:Getting-Started#save]]");
+
+		overview = area.collapsable("Overview").anchor_left(0).anchor_right(0);
+		overview.expanded(true);
+		overview_box = overview.content().layout(nanogui.layout_vertical());
+
+		projects_section = area.collapsable("Projects").anchor_left(0).anchor_right(0);
+		projects_section.expanded(true);
+		projects_box = projects_section.content().layout(nanogui.layout_vertical());
+
+		templates_section = area.collapsable("Templates").anchor_left(0).anchor_right(0);
+		templates_section.expanded(true);
+		templates_box = templates_section.content().layout(nanogui.layout_vertical());
+
+		//Built when the tab shows and after a project was opened or saved; while it shows, a change of the generators,
+		//the view tabs or the layout rebuilds the overview (a look twice a second)
+		area.on_draw([this](){
+			now = std.millis();
+			if(now - this.last_check < 500)
+				return;
+			this.last_check = now;
+			if(this.current_signature() != this.signature)
+				this.engine.env.recent_dirty = true;
+		});
+	}
+
+	//One button of the project actions, like the entries of the menu before (#360)
+	add_action(caption, icon, key, tip) {
+		btn = area.button(caption).alignment("left").anchor_left(0).anchor_right(0).fixed_height(PROJECTS_ROW)
+			.icon(nanogui.icon(icon)).tooltip(tip);
+		btn.on_click([this, key](){
+			if(key == "exit" && nanogui.show_mode())
+				return; //show mode (#285): a stray click must not end the show
+			if(!this.actions || !this.actions[key])
+				return;
+			action = this.actions[key];
+			action();
+		});
+		return btn;
+	}
+
+	//A row of a list: a transparent button, indented by depth
+	add_row(box, caption, icon, depth, tip) {
+		btn = box.button(caption).alignment("left").transparent(true).anchor_left(0).anchor_right(0).fixed_height(PROJECTS_ROW - 4);
+		if(icon)
+			btn.icon(nanogui.icon(icon));
+		if(depth > 0)
+			btn.padding(vec2f(20 + depth * 2 * PROJECTS_INDENT, 10)); //the text starts at half of it (20: the default)
+		if(tip)
+			btn.tooltip(tip);
+		return btn;
+	}
+
+	//What the overview shows, as text: the project, the generators (the revision of the AI interfaces goes up with every
+	//one that is made or deleted), the names of the view tabs and the last step of the layout
+	current_signature() {
+		sig = (std.global("project").name ?? "") + "|" + std.string(engine.ai_interfaces_revision);
+		views = main_menu.generators_menu;
+		if(views) {
+			for(i = 0; i < views.subviews.tab_count(); i++)
+				sig += "|" + views.subviews.tab_name(i);
+			if(views.undo_history)
+				sig += "|" + views.undo_history.undo_name() + "|" + views.undo_history.redo_name();
+		}
+		return sig;
+	}
+
+	//The tab came to the front: the folders are read again (a project copied in by hand shows up)
+	shown() {
+		rescan = true;
+		engine.env.recent_dirty = true;
+	}
+
+	//Called by the engine from its frame update (engine.env.refresh_recent), never inside a click
+	refresh() {
+		views = main_menu.generators_menu;
+		//A project is loading or a step of the layout is running: the views are half built, try again with the next frame
+		if(engine.load_in_progress || (views && (views.recording || (views.undo_history && views.undo_history.busy)))) {
+			engine.env.recent_dirty = true;
+			return;
+		}
+		name = std.global("project").name ?? "";
+		//Another project (opened, saved under a new name): it may be a new folder
+		if(rescan || name != scan_name)
+			start_scan();
+
+		signature = current_signature();
+		name_label.caption(name ? name : "<New Project>");
+		build_overview();
+		if(scanned && (built_count != scan_count || built_name != name)) {
+			built_count = scan_count;
+			built_name = name;
+			build_projects(name);
+			build_templates();
+		}
+	}
+
+	//Reads the folders projects/ and templates/ and the views of assets/Views on a thread; when it is done the next
+	//frame builds the lists (engine.env.recent_dirty)
+	start_scan() {
+		if(scanning)
+			return;
+		scanning = true;
+		rescan = false;
+		scan_name = std.global("project").name ?? "";
+		scan_thread = std.thread([this](){
+			result = [projects = [], templates = [], views = []];
+			entries = [];
+			try {
+				project_dirs = fileio.dirs("projects", false);
+				for(i = 0; i < project_dirs.size(); i++) {
+					info = fileio.file_info("projects/" + project_dirs[i]);
+					entries[project_dirs[i]] = [time = info.last_write_time ?? 0];
+				}
+			}
+			catch(e) {
+				std.error("Cannot read the project list");
+			}
+			entries.sort_by("time", true); //newest first (#315); sort_by only sorts keyed entries
+			for(i = 0; i < entries.size(); i++)
+				result.projects.push_back(entries.key(i));
+			try {
+				if(fileio.is_directory("templates"))
+					result.templates = fileio.dirs("templates", false);
+			}
+			catch(e) {
+				std.error("Cannot read the template list");
+			}
+			try {
+				result.views = view_assets(); //names and icons of the views (singleview.shio), for the overview
+			}
+			catch(e) {}
+			this.scanned = result;
+			this.scan_count = this.scan_count + 1;
+			this.scanning = false;
+			this.engine.env.recent_dirty = true;
+		});
+		scan_thread.run();
+	}
+
+	// =========================================================================
+	// Overview of the project that is open
+	// =========================================================================
+
+	//Every generator that is alive, by its place in the tree of nodes: [live=, gen=], sorted by live. Once per rebuild.
+	//gen.path, not get_relative_path(): that asks the file system and took 6 ms per generator (seconds in a big project)
+	all_generators() {
+		list = [];
+		registry = engine.ai_interfaces;
+		for(i = 0; i < registry.size(); i++) {
+			iface = registry[i];
+			if(!iface || !iface.target)
+				continue;
+			try {
+				gen = iface.target;
+				//The glue of the engine (engine/assets: the areas, the composition of a Clipview) is no generator to the user
+				if(gen.path.replace("\\", "/").contains("engine/assets/"))
+					continue;
+				list.push_back([live = gen.get_live_path(), gen = gen]);
+			}
+			catch(e) {}
+		}
+		list.sort_by("live");
+		return list;
+	}
+
+	//The generators below gen (in its view, in a clip of a Clipview, in a Shaderstack, ...): [gen=, depth=], depth 0 for
+	//the ones right in gen. alive: all_generators(), sorted, so the ones below one generator follow it
+	generators_in(gen, alive) {
+		found = [];
+		prefix = "";
+		try {
+			prefix = gen.get_live_path() + "/";
+		}
+		catch(e) {
+			return found;
+		}
+		parents = []; //live paths of the generators the current one is in
+		for(i = 0; i < alive.size(); i++) {
+			live = alive[i].live;
+			if(!live.starts(prefix))
+				continue;
+			for(parents.size() > 0 && !live.starts(parents[parents.size() - 1] + "/"))
+				parents.erase(parents.size() - 1);
+			found.push_back([gen = alive[i].gen, depth = parents.size()]);
+			parents.push_back(live);
+		}
+		return found;
+	}
+
+	//One row per generator, below the row of its view. A click shows the area it is in
+	add_generator_rows(box, list, depth, area_uid) {
+		for(i = 0; i < list.size(); i++) {
+			entry = list[i];
+			path = entry.gen.path.replace("\\", "/");
+			row = add_row(box, fileio.pure_name(path), "", depth + entry.depth, path + PROJECTS_WIKI);
+			row.text_color(PROJECTS_TEXT_2);
+			if(area_uid) {
+				row.on_click([this, area_uid](){
+					this.show_area(area_uid);
+				});
+			}
+		}
+	}
+
+	//Name and icon of what an area holds, like its header (singleview.item_meta, which reads assets/Views each time)
+	view_meta(gen) {
+		path = gen.path.replace("\\", "/");
+		views = scanned ? scanned.views : [];
+		for(i = 0; i < views.size(); i++) {
+			if(path.ends(views[i].path) || path.contains(views[i].path + "/"))
+				return [name = views[i].name, icon = views[i].icon];
+		}
+		return [name = fileio.pure_name(path), icon = ""];
+	}
+
+	show_area(uid) {
+		views = main_menu.generators_menu;
+		if(views)
+			views.reveal_area(uid);
+	}
+
+	//A section of the overview, open as it was before the rebuild (open the first time). key: what it is remembered by
+	add_section(title, key) {
+		section = overview_box.collapsable(title).anchor_left(0).anchor_right(0);
+		section.expanded(expanded.has(key) ? (expanded[key] ? true : false) : true);
+		sections.push_back([remember = key, widget = section]);
+		return section.content().layout(nanogui.layout_vertical());
+	}
+
+	build_overview() {
+		for(i = 0; i < sections.size(); i++)
+			expanded[sections[i].remember] = sections[i].widget.expanded() ? 1 : 0;
+		sections = [];
+		overview_box.clear_children();
+		views = main_menu.generators_menu;
+		if(!views)
+			return;
+
+		try {
+			alive = all_generators();
+			ordered = views.ordered_workspaces();
+			for(t = 0; t < ordered.size(); t++) {
+				ws = ordered[t];
+				tab_name = views.subviews.tab_name(ws.tab);
+				box = add_section(tab_name, "tab:" + tab_name);
+
+				leaves = [];
+				ws.view.collect_leaves(leaves);
+				if(leaves.size() == 0)
+					add_row(box, "Empty", "", 1, "This [[view tab]] has no view yet.").text_color(PROJECTS_TEXT_2).enabled(false);
+				for(i = 0; i < leaves.size(); i++) {
+					leaf = leaves[i];
+					//A view with its icon of the picker; a generator that fills an area on its own lines up with their names
+					meta = view_meta(leaf.item);
+					row = add_row(box, meta.name, meta.icon, meta.icon ? 0 : 1, "Show this [[view]]: its [[view tab]] comes to the front." + PROJECTS_WIKI);
+					uid = leaf.uid;
+					row.on_click([this, uid](){
+						this.show_area(uid);
+					});
+					add_generator_rows(box, generators_in(leaf.item, alive), meta.icon ? 1 : 2, uid);
+				}
+			}
+
+			//The generators of the patch of the timeline (its view switch Patch)
+			timeline = main_menu.timeline_menu;
+			if(timeline && timeline.timeline_generators && timeline.timeline_generators.items.size() > 0) {
+				box = add_section("Timeline", "timeline");
+				items = timeline.timeline_generators.items;
+				for(i = 0; i < items.size(); i++) {
+					gen = items[i];
+					if(!gen)
+						continue;
+					path = gen.path.replace("\\", "/");
+					add_row(box, fileio.pure_name(path), "", 1, path).text_color(PROJECTS_TEXT_2);
+					add_generator_rows(box, generators_in(gen, alive), 2, "");
+				}
+			}
+		}
+		catch(e) {
+			//A view that is freed right now (a load): the next frame builds it again
+			std.warn("Projects: cannot build the overview: " + e);
+			engine.env.recent_dirty = true;
+		}
+	}
+
+	// =========================================================================
+	// Projects and templates
+	// =========================================================================
+
+	//Every project, newest first (#315). The one that is open has a check mark
+	build_projects(current) {
+		projects_box.clear_children();
+		names = scanned.projects;
+		if(names.size() == 0)
+			add_row(projects_box, "No saved project yet", "", 1, "").text_color(PROJECTS_TEXT_2).enabled(false);
+
+		for(i = 0; i < names.size(); i++) {
+			project_name = names[i];
+			is_open = current != "" && project_name == current;
+			row = add_row(projects_box, project_name, is_open ? "check" : "folder", 0,
+				(is_open ? "The [[project]] that is open. A click opens its saved state again." : "Open the [[project]] " + project_name + ".") + PROJECTS_WIKI);
+			row.on_click([this, project_name, is_open](){
+				//The open project again: what was changed since its last save is lost, so it asks first
+				if(is_open && !this.engine.screen.modal_yes_no("Open the saved " + project_name + " again? Changes since the last save are lost.", "Open project"))
+					return;
+				if(this.engine.env.load_project)
+					this.engine.env.load_project(project_name);
+			});
+		}
+	}
+
+	//The templates in ./templates (#425): one opens as a new project without a name, Save asks for one
+	build_templates() {
+		templates_box.clear_children();
+		templates = scanned.templates;
+		templates_section.visible(templates.size() > 0);
+		for(i = 0; i < templates.size(); i++) {
+			template_name = templates[i];
+			row = add_row(templates_box, template_name, "clone", 0, "A new [[project]] from the template " + template_name + ". Save asks for a name, the template stays as it is.\n[[wiki:Getting-Started#templates]]");
+			row.on_click([this, template_name](){
+				if(this.engine.env.load_template)
+					this.engine.env.load_template(template_name);
+			});
+		}
+	}
+}
