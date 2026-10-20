@@ -1,0 +1,2278 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  goal_engine.shio — persistent goals, schedules and the deterministic scheduler
+//
+//  #include "goal_engine"
+//
+//  Contract: goals_spec.md. In short:
+//
+//    .agentspace/                      editable desired configuration (Markdown)
+//      preferences/scheduling.md       time zone, named windows ("tonight")
+//      preferences/resource-policy.md  background limits, interactive reservation
+//      goals/<status>/<id>/goal.md     one goal: front matter (parsed) + instructions
+//      goals/<status>/<id>/plan.md     the current plan (optional)
+//      goals/<status>/<id>/history.md  one short entry per run (written here)
+//      projects/<project>/*.md         project context and policy
+//      .runtime/ledger.json            runtime state: revisions, activations,
+//                                      runs, events (never edited by hand)
+//
+//  The LLM never decides WHEN work runs. GoalScheduler.tick() is plain code:
+//    1. rescan the definitions (revision = content hash; an invalid edit keeps
+//       the last valid revision active and is reported once),
+//    2. settle runs (task finished / failed / lost), retry with backoff,
+//    3. apply the window end (stop policy: drain | checkpoint | cancel),
+//    4. activate due windows exactly once (key = goal id + window start),
+//       missed windows follow the misfire policy,
+//    5. dispatch runs to the host (Megamind.add_task) within the limits.
+//  Every state change is written to the ledger before it is acted on.
+//
+//  The host is duck typed (a Megamind): add_task(name, goal) -> taskid,
+//  inspect_task(taskid), stop_task(taskid), update_task(taskid, msg),
+//  notify_user(msg) and optionally background_capacity() and
+//  add_task_finished_listener(cb).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "goal_time"
+#include "goal_frontmatter"
+
+GOAL_SCHEMA_VERSION = 1;
+
+GOAL_STATUSES = ["proposed", "active", "paused", "completed", "cancelled", "archived"];
+GOAL_TYPES = ["once", "recurring", "windowed", "manual"];
+GOAL_PRIORITIES = ["low", "normal", "high", "urgent"];
+GOAL_STOP_POLICIES = ["drain", "checkpoint", "cancel"];
+GOAL_MISFIRE = ["run_if_open", "skip", "catch_up"];
+GOAL_PLAN_UPDATES = ["allow", "propose", "deny"];
+
+GOAL_DEFAULT_APPROVALS = ["merge", "release", "deploy", "delete", "force_push"];
+
+GOAL_TICK_MS = 15000;
+GOAL_EVENTS_KEPT = 400;
+GOAL_ACTIVATIONS_KEPT = 300;
+GOAL_REPORT_CHARS = 1500;
+GOAL_PROMPT_SECTION_CHARS = 6000;
+GOAL_START_GRACE = 120;          // seconds a window start may be late and still count as on time
+
+GOAL_LOCK = "goal_engine";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Small helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+goal_list_has(list, v) {
+	for(x : list) {
+		if(x == v)
+			return true;
+	}
+	return false;
+}
+
+goal_clip(text, n) {
+	t = std.string(text ?? "");
+	if(t.length() <= n)
+		return t;
+	return t.substr(0, n) + " …";
+}
+
+goal_read(path) {
+	try {
+		if(fileio.exists(path) && fileio.is_file(path))
+			return fileio.read_string(path);
+	}
+	catch(e) {}
+	return "";
+}
+
+goal_mkdir(path) {
+	try {
+		if(!fileio.exists(path))
+			fileio.mkdir(path);
+	}
+	catch(e) {}
+	return fileio.exists(path);
+}
+
+// write tmp + rename: a reader never sees a half written file
+goal_write_atomic(path, text) {
+	dir = fileio.file_dir(path);
+	if(dir)
+		goal_mkdir(dir);
+
+	tmp = path + ".tmp-" + std.random_hash(6);
+
+	if(!fileio.write_text(tmp, text))
+		return false;
+
+	if(fileio.rename(tmp, path))
+		return true;
+
+	try { fileio.remove(tmp); } catch(e) {}
+	return false;
+}
+
+// content revision: short, stable, independent of the mtime.
+// FNV-1a style mixing over the characters (the index of a printable ASCII
+// character, the byte length of anything else), printed as 8 base-36 digits.
+GOAL_HASH_ALPHABET = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\n\t\r";
+GOAL_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+goal_text_revision(text) {
+	h = 1469598103;
+	for(c : std.string(text)) {
+		code = GOAL_HASH_ALPHABET.find(c);
+		if(code < 0)
+			code = 200 + c.length();
+		h = gt_mod((h ^ code) * 16777619 + 7, 2821109907456);
+	}
+
+	out = "";
+	for(i = 0; i < 8; i++) {
+		out = GOAL_BASE36[h % 36] + out;
+		h = h / 36;
+	}
+	return out;
+}
+
+// lowercase words for duplicate detection
+goal_words(text) {
+	out = [];
+	out.clear();
+	w = "";
+	for(c : std.string(text).lowercase() + " ") {
+		alnum = (c >= "a" && c <= "z") || gt_is_digit(c);
+		if(alnum) {
+			w += c;
+			continue;
+		}
+		if(w.length() > 2 && !goal_list_has(out, w))
+			out.push_back(w);
+		w = "";
+	}
+	return out;
+}
+
+goal_similarity(a, b) {
+	wa = goal_words(a);
+	wb = goal_words(b);
+
+	if(!wa.size() || !wb.size())
+		return 0.0;
+
+	common = 0;
+	for(w : wa) {
+		if(goal_list_has(wb, w))
+			common++;
+	}
+
+	return (common * 1.0) / (wa.size() + wb.size() - common);
+}
+
+// "Fix GitHub issues!" -> "fix-github-issues"
+goal_slug(text) {
+	out = "";
+	dash = false;
+	for(c : std.string(text).lowercase()) {
+		alnum = (c >= "a" && c <= "z") || gt_is_digit(c);
+		if(alnum) {
+			out += c;
+			dash = false;
+		}
+		else if(!dash && out.length() > 0) {
+			out += "-";
+			dash = true;
+		}
+		if(out.length() >= 48)
+			break;
+	}
+	for(out.ends("-"))
+		out = out.substr(0, out.length() - 1);
+	return out;
+}
+
+goal_valid_id(id) {
+	s = std.string(id);
+	if(s.empty() || s.length() > 64)
+		return false;
+	for(c : s) {
+		ok = (c >= "a" && c <= "z") || gt_is_digit(c) || c == "-" || c == "_";
+		if(!ok)
+			return false;
+	}
+	return !s.starts("-") && !s.starts("_");
+}
+
+// simple insertion sort of a json list by a numeric / string field
+goal_sort(list, field, desc = false) {
+	out = list.copy();
+	for(i = 1; i < out.size(); i++) {
+		cur = out[i];
+		j = i - 1;
+		for(j >= 0) {
+			a = gj(out[j], field, 0);
+			b = gj(cur, field, 0);
+			swap = desc ? a < b : a > b;
+			if(!swap)
+				break;
+			out[j + 1] = out[j];
+			j--;
+		}
+		out[j + 1] = cur;
+	}
+	return out;
+}
+
+// line diff (LCS) for "goals diff": - removed, + added, two lines of context
+goal_line_diff(old_text, new_text) {
+	a = std.string(old_text).replace("\r\n", "\n").split("\n");
+	b = std.string(new_text).replace("\r\n", "\n").split("\n");
+	n = a.size();
+	m = b.size();
+
+	if(n * m > 250000)
+		return "(files too large to diff line by line)";
+
+	// lcs[i][j] for suffixes, stored flat
+	lcs = [];
+	lcs.resize((n + 1) * (m + 1));
+	for(i = 0; i < (n + 1) * (m + 1); i++)
+		lcs[i] = 0;
+
+	for(i = n - 1; i >= 0; i--) {
+		for(j = m - 1; j >= 0; j--) {
+			if(a[i] == b[j])
+				lcs[i * (m + 1) + j] = lcs[(i + 1) * (m + 1) + j + 1] + 1;
+			else
+				lcs[i * (m + 1) + j] = math.max(lcs[(i + 1) * (m + 1) + j], lcs[i * (m + 1) + j + 1]);
+		}
+	}
+
+	ops = [];
+	i = 0;
+	j = 0;
+	for(i < n || j < m) {
+		if(i < n && j < m && a[i] == b[j]) {
+			ops.push_back([op = " ", text = a[i]]);
+			i++;
+			j++;
+		}
+		else if(j < m && (i >= n || lcs[i * (m + 1) + j + 1] >= lcs[(i + 1) * (m + 1) + j])) {
+			ops.push_back([op = "+", text = b[j]]);
+			j++;
+		}
+		else {
+			ops.push_back([op = "-", text = a[i]]);
+			i++;
+		}
+	}
+
+	out = "";
+	changed = false;
+	for(k = 0; k < ops.size(); k++) {
+		show = ops[k].op != " ";
+		if(!show) {
+			for(d = math.max(0, k - 2); d <= math.min(ops.size() - 1, k + 2); d++) {
+				if(ops[d].op != " ")
+					show = true;
+			}
+		}
+		if(ops[k].op != " ")
+			changed = true;
+		if(show)
+			out += ops[k].op + " " + ops[k].text + "\n";
+	}
+
+	return changed ? out : "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Preferences
+// ─────────────────────────────────────────────────────────────────────────────
+
+goal_default_preferences() {
+	return [
+		timezone = "local",
+		windows = [
+			tonight = [start = "04:00", end = "10:00"],
+		],
+		default_window = "tonight",
+		default_duration = "4h",
+		// resource policy
+		max_background_tasks = 1,
+		reserve_interactive_workers = 0,
+		yield_after_interactive = "10m",
+		default_stop_policy = "checkpoint",
+		default_max_attempts = 3,
+		checkpoint_grace = "15m",
+		stall_timeout = "30m",
+		errors = [],
+	];
+}
+
+// -> prefs json (always usable; errors listed in prefs.errors)
+goal_load_preferences(root) {
+	prefs = goal_default_preferences();
+	errors = [];
+
+	files = [
+		root + "/preferences/scheduling.md",
+		root + "/preferences/resource-policy.md",
+	];
+
+	for(path : files) {
+		text = goal_read(path);
+		if(!text)
+			continue;
+
+		doc = gfm_read_text(text);
+		if(!doc.ok) {
+			errors.push_back(path + ":" + std.string(doc.line) + ": " + doc.error);
+			continue;
+		}
+
+		for(k, v : doc.data) {
+			if(k == "windows" && gj_is_map(v)) {
+				for(wn, wv : v)
+					prefs.windows[std.string(wn).lowercase()] = wv;
+				continue;
+			}
+			prefs[k] = v;
+		}
+	}
+
+	// check what the scheduler relies on
+	z = gt_zone(gj_str(prefs, "timezone", "local"));
+	if(!z.ok)
+		errors.push_back("preferences: timezone: " + z.error);
+
+	for(wn, wv : prefs.windows) {
+		if(!gj_is_map(wv) || std.is_none(gt_parse_clock(gj_str(wv, "start"))))
+			errors.push_back("preferences: windows." + wn + ": needs start: \"HH:MM\"");
+		else if(gj(wv, "end") && std.is_none(gt_parse_clock(gj_str(wv, "end"))))
+			errors.push_back("preferences: windows." + wn + ".end: not a HH:MM time");
+	}
+
+	prefs.errors = errors;
+	return prefs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Validation: front matter -> normalized definition
+//
+//  def = [id, title, status, project, priority, body, schedule = [...],
+//         policy = [...], revision, path, dir]
+// ─────────────────────────────────────────────────────────────────────────────
+
+goal_days_list(v, errors) {
+	out = [];
+	out.clear();
+
+	if(std.is_none(v))
+		return out;
+
+	if(std.is_string(v)) {
+		s = v.strip().lowercase();
+		if(s == "daily" || s == "every day" || s == "all") {
+			for(i = 0; i < 7; i++)
+				out.push_back(i);
+			return out;
+		}
+		if(s == "weekdays") {
+			for(i = 1; i <= 5; i++)
+				out.push_back(i);
+			return out;
+		}
+		if(s == "weekends" || s == "weekend") {
+			out.push_back(6);
+			out.push_back(0);
+			return out;
+		}
+		v = s.split(",");
+	}
+
+	if(!std.is_json(v)) {
+		errors.push_back("schedule.days: expected a list of weekdays, 'daily', 'weekdays' or 'weekends'");
+		return out;
+	}
+
+	for(d : v) {
+		idx = gt_weekday_index(d);
+		if(idx < 0) {
+			errors.push_back("schedule.days: unknown weekday '" + std.string(d) + "'");
+			continue;
+		}
+		if(!goal_list_has(out, idx))
+			out.push_back(idx);
+	}
+
+	return out;
+}
+
+goal_duration_field(obj, key, def_text, errors, label) {
+	v = gj(obj, key, None);
+	if(std.is_none(v))
+		v = def_text;
+	if(std.is_none(v))
+		return None;
+	d = gt_parse_duration(v);
+	if(std.is_none(d)) {
+		errors.push_back(label + ": not a duration (examples: 15m, 2h, 1h30m)");
+		return None;
+	}
+	return d;
+}
+
+goal_int_field(obj, key, def, lo, hi, errors, label) {
+	v = gj(obj, key, None);
+	if(std.is_none(v))
+		return def;
+	if(!gt_is_int_text(std.string(v), true)) {
+		errors.push_back(label + ": expected a whole number");
+		return def;
+	}
+	n = std.int(v);
+	if(n < lo || n > hi) {
+		errors.push_back(label + ": must be between " + lo + " and " + hi);
+		return def;
+	}
+	return n;
+}
+
+goal_bool_field(obj, key, def) {
+	v = gj(obj, key, None);
+	if(std.is_none(v))
+		return def;
+	if(std.is_string(v)) {
+		s = v.lowercase();
+		return s == "true" || s == "yes" || s == "on" || s == "1";
+	}
+	return v ? true : false;
+}
+
+goal_enum_field(obj, key, def, allowed, errors, label) {
+	v = gj(obj, key, None);
+	if(std.is_none(v))
+		return def;
+	s = std.string(v).strip().lowercase();
+	if(!goal_list_has(allowed, s)) {
+		errors.push_back(label + ": '" + s + "' is not one of " + gfm_join(allowed, ", "));
+		return def;
+	}
+	return s;
+}
+
+goal_string_list(v) {
+	out = [];
+	out.clear();
+	if(std.is_none(v))
+		return out;
+	if(std.is_string(v)) {
+		for(p : v.split(",")) {
+			if(p.strip())
+				out.push_back(p.strip().lowercase());
+		}
+		return out;
+	}
+	if(std.is_json(v)) {
+		for(x : v)
+			out.push_back(std.string(x).strip().lowercase());
+	}
+	return out;
+}
+
+// -> [ok, def, errors, warnings]
+goal_validate(data, body, prefs, folder_id, folder_status) {
+	errors = [];
+	warnings = [];
+
+	if(!gj_is_map(data))
+		return [ok = false, def = None, errors = ["the front matter must be a map of 'key: value' lines"], warnings = warnings];
+
+	known = ["schema", "id", "title", "status", "project", "priority", "schedule", "policy", "tags", "created", "created_by", "updated", "objective"];
+	for(k, v : data) {
+		if(!goal_list_has(known, k))
+			warnings.push_back("unknown field '" + k + "' (ignored)");
+	}
+
+	schema = goal_int_field(data, "schema", GOAL_SCHEMA_VERSION, 1, 1000, errors, "schema");
+	if(schema > GOAL_SCHEMA_VERSION)
+		errors.push_back("schema " + schema + " is newer than this scheduler (" + GOAL_SCHEMA_VERSION + ")");
+
+	id = gj_str(data, "id", folder_id);
+	if(id != folder_id)
+		errors.push_back("id '" + id + "' does not match the folder name '" + folder_id + "' (rename one of them)");
+	if(!goal_valid_id(folder_id))
+		errors.push_back("the folder name '" + folder_id + "' is not a valid id (lowercase letters, digits, '-' and '_')");
+
+	title = gj_str(data, "title", "").strip();
+	if(title.empty())
+		errors.push_back("title: required");
+
+	if(data.has("status") && !std.is_none(data["status"]) && std.string(data["status"]).lowercase() != folder_status)
+		warnings.push_back("status '" + std.string(data["status"]) + "' differs from the folder goals/" + folder_status + "/ - the folder wins");
+
+	priority = goal_enum_field(data, "priority", "normal", GOAL_PRIORITIES, errors, "priority");
+	project = gj_str(data, "project", "").strip();
+	if(project && !goal_valid_id(project))
+		errors.push_back("project: '" + project + "' is not a valid project folder name");
+
+	// ── schedule ────────────────────────────────────────────────────────────
+	sch_in = gj(data, "schedule", None);
+	if(std.is_none(sch_in)) {
+		errors.push_back("schedule: required (type: once | recurring | windowed | manual)");
+		sch_in = std.json();
+	}
+	if(!gj_is_map(sch_in)) {
+		errors.push_back("schedule: expected a map");
+		sch_in = std.json();
+	}
+
+	stype = goal_enum_field(sch_in, "type", "", GOAL_TYPES, errors, "schedule.type");
+	if(!stype && !gj(sch_in, "type"))
+		errors.push_back("schedule.type: required (once | recurring | windowed | manual)");
+
+	tz_name = gj_str(sch_in, "timezone", gj_str(prefs, "timezone", "local"));
+	zone = gt_zone(tz_name);
+	if(!zone.ok)
+		errors.push_back("schedule.timezone: " + zone.error);
+
+	start_secs = None;
+	end_secs = None;
+	duration_secs = None;
+	window_name = gj_str(sch_in, "window", "").strip().lowercase();
+
+	if(window_name) {
+		windows = gj(prefs, "windows", std.json());
+		if(!windows.has(window_name)) {
+			errors.push_back("schedule.window: '" + window_name + "' is not defined in preferences/scheduling.md");
+		}
+		else {
+			w = windows[window_name];
+			start_secs = gt_parse_clock(gj_str(w, "start"));
+			end_secs = gt_parse_clock(gj_str(w, "end"));
+			if(std.is_none(end_secs))
+				duration_secs = gt_parse_duration(gj(w, "duration", gj(prefs, "default_duration", "4h")));
+		}
+	}
+
+	if(gj(sch_in, "start")) {
+		start_secs = gt_parse_clock(gj_str(sch_in, "start"));
+		if(std.is_none(start_secs))
+			errors.push_back("schedule.start: not a HH:MM time (quote it: start: \"05:00\")");
+	}
+	if(gj(sch_in, "end")) {
+		end_secs = gt_parse_clock(gj_str(sch_in, "end"));
+		if(std.is_none(end_secs))
+			errors.push_back("schedule.end: not a HH:MM time (quote it: end: \"10:00\")");
+	}
+	if(gj(sch_in, "duration")) {
+		duration_secs = gt_parse_duration(gj(sch_in, "duration"));
+		if(std.is_none(duration_secs))
+			errors.push_back("schedule.duration: not a duration (examples: 90m, 2h, 1h30m)");
+		else if(gj(sch_in, "end"))
+			errors.push_back("schedule: give either end or duration, not both");
+		else
+			end_secs = None;
+	}
+
+	if(stype && stype != "manual" && std.is_none(start_secs) && !window_name && !gj(sch_in, "start"))
+		errors.push_back("schedule.start: required (or schedule.window: a named window from the preferences)");
+
+	if(!std.is_none(start_secs) && std.is_none(end_secs) && std.is_none(duration_secs))
+		duration_secs = gt_parse_duration(gj(prefs, "default_duration", "4h")) ?? 4 * 3600;
+
+	if(!std.is_none(start_secs) && !std.is_none(end_secs) && start_secs == end_secs)
+		errors.push_back("schedule: start and end are the same time (a full day is duration: 24h)");
+
+	date_days = None;
+	if(stype == "once") {
+		date_days = gt_parse_date(gj_str(sch_in, "date"));
+		if(std.is_none(date_days))
+			errors.push_back("schedule.date: required for type once (YYYY-MM-DD)");
+	}
+	else if(gj(sch_in, "date")) {
+		warnings.push_back("schedule.date is only used by type once (use start_date / end_date for bounds)");
+	}
+
+	days = [];
+	if(stype == "recurring" || stype == "windowed") {
+		n_errors = errors.size();
+		days = goal_days_list(gj(sch_in, "days", "daily"), errors);
+		if(!days.size() && errors.size() == n_errors)
+			errors.push_back("schedule.days: no weekday selected");
+	}
+
+	start_date = None;
+	end_date = None;
+	if(gj(sch_in, "start_date")) {
+		start_date = gt_parse_date(gj_str(sch_in, "start_date"));
+		if(std.is_none(start_date))
+			errors.push_back("schedule.start_date: not a YYYY-MM-DD date");
+	}
+	if(gj(sch_in, "end_date")) {
+		end_date = gt_parse_date(gj_str(sch_in, "end_date"));
+		if(std.is_none(end_date))
+			errors.push_back("schedule.end_date: not a YYYY-MM-DD date");
+	}
+	if(!std.is_none(start_date) && !std.is_none(end_date) && end_date < start_date)
+		errors.push_back("schedule.end_date is before start_date");
+
+	misfire = goal_enum_field(sch_in, "misfire", "run_if_open", GOAL_MISFIRE, errors, "schedule.misfire");
+
+	schedule = [
+		type = stype,
+		timezone = tz_name,
+		window = window_name,
+		start = start_secs,
+		end = end_secs,
+		duration = duration_secs,
+		date = date_days,
+		days = days,
+		start_date = start_date,
+		end_date = end_date,
+		misfire = misfire,
+	];
+
+	// ── policy ──────────────────────────────────────────────────────────────
+	pol_in = gj(data, "policy", std.json());
+	if(!gj_is_map(pol_in)) {
+		errors.push_back("policy: expected a map");
+		pol_in = std.json();
+	}
+
+	windowed = stype == "windowed";
+
+	stop_default = gj_str(prefs, "default_stop_policy", "checkpoint");
+	if(goal_bool_field(pol_in, "continue_after_window", false))
+		stop_default = "drain";
+
+	policy = [
+		max_parallel_workers = goal_int_field(pol_in, "max_parallel_workers", 1, 1, 8, errors, "policy.max_parallel_workers"),
+		repeat_in_window = goal_bool_field(pol_in, "repeat_in_window", windowed),
+		max_runs_per_window = goal_int_field(pol_in, "max_runs_per_window", windowed ? 20 : 1, 1, 500, errors, "policy.max_runs_per_window"),
+		min_remaining = goal_duration_field(pol_in, "min_remaining", "20m", errors, "policy.min_remaining"),
+		stop_policy = goal_enum_field(pol_in, "stop_policy", stop_default, GOAL_STOP_POLICIES, errors, "policy.stop_policy"),
+		checkpoint_grace = goal_duration_field(pol_in, "checkpoint_grace", gj(prefs, "checkpoint_grace", "15m"), errors, "policy.checkpoint_grace"),
+		max_attempts = goal_int_field(pol_in, "max_attempts", std.int(gj(prefs, "default_max_attempts", 3)), 1, 20, errors, "policy.max_attempts"),
+		retry_backoff = goal_duration_field(pol_in, "retry_backoff", "10m", errors, "policy.retry_backoff"),
+		stall_timeout = goal_duration_field(pol_in, "stall_timeout", gj(prefs, "stall_timeout", "30m"), errors, "policy.stall_timeout"),
+		verify = goal_bool_field(pol_in, "verify", false),
+		dry_run = goal_bool_field(pol_in, "dry_run", false),
+		pause_stops = goal_bool_field(pol_in, "pause_stops", false),
+		plan_updates = goal_enum_field(pol_in, "plan_updates", "allow", GOAL_PLAN_UPDATES, errors, "policy.plan_updates"),
+		allow = goal_string_list(gj(pol_in, "allow", None)),
+		require_approval = goal_string_list(gj(pol_in, "require_approval", None)),
+	];
+
+	if(!policy.require_approval.size()) {
+		for(a : GOAL_DEFAULT_APPROVALS)
+			policy.require_approval.push_back(a);
+	}
+
+	if(!policy.repeat_in_window && policy.max_runs_per_window > 1)
+		policy.repeat_in_window = true;
+
+	if(std.string(body ?? "").strip().empty() && !gj(data, "objective"))
+		errors.push_back("the goal has no instructions: write the objective below the front matter");
+
+	def = [
+		id = folder_id,
+		title = title,
+		status = folder_status,
+		project = project,
+		priority = priority,
+		objective = gj_str(data, "objective", ""),
+		body = std.string(body ?? ""),
+		tags = goal_string_list(gj(data, "tags", None)),
+		schedule = schedule,
+		policy = policy,
+	];
+
+	return [ok = errors.size() == 0, def = def, errors = errors, warnings = warnings];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Windows of a definition
+// ─────────────────────────────────────────────────────────────────────────────
+
+goal_day_matches(sch, day) {
+	if(!std.is_none(sch.start_date) && day < sch.start_date)
+		return false;
+	if(!std.is_none(sch.end_date) && day > sch.end_date)
+		return false;
+
+	if(sch.type == "once")
+		return day == sch.date;
+
+	if(sch.type == "recurring" || sch.type == "windowed")
+		return goal_list_has(sch.days, gt_weekday(day));
+
+	return false;
+}
+
+// the window that starts on local day `day` (None if the schedule has none)
+goal_window_for_day(def, zone, day) {
+	sch = def.schedule;
+
+	if(!goal_day_matches(sch, day))
+		return None;
+
+	w = gt_window_on(zone, day, sch.start, sch.end, sch.duration);
+	w.akey = def.id + "@" + gt_format_utc(w.start);
+	return w;
+}
+
+// windows overlapping [from, to] (UTC secs), oldest first
+goal_windows_between(def, from, to) {
+	out = [];
+	out.clear();
+	sch = def.schedule;
+
+	if(sch.type == "manual" || std.is_none(sch.start))
+		return out;
+
+	zone = gt_zone(sch.timezone);
+	if(!zone.ok)
+		return out;
+
+	first_day = gt_floor_div(from + zone.std_off, GT_DAY) - 2;
+	last_day = gt_floor_div(to + zone.dst_off, GT_DAY) + 1;
+
+	if(sch.type == "once") {
+		first_day = math.max(first_day, sch.date);
+		last_day = math.min(last_day, sch.date);
+	}
+
+	for(day = first_day; day <= last_day; day++) {
+		w = goal_window_for_day(def, zone, day);
+		if(std.is_none(w))
+			continue;
+		if(w.end > from && w.start <= to)
+			out.push_back(w);
+	}
+
+	return out;
+}
+
+// the next `count` windows that end after `now`
+goal_next_windows(def, now, count = 5) {
+	out = [];
+	out.clear();
+	sch = def.schedule;
+
+	if(sch.type == "manual" || std.is_none(sch.start))
+		return out;
+
+	zone = gt_zone(sch.timezone);
+	if(!zone.ok)
+		return out;
+
+	day = gt_floor_div(now + zone.std_off, GT_DAY) - 1;
+
+	if(sch.type == "once")
+		day = math.max(day, sch.date - 1);
+
+	for(n = 0; n < 800 && out.size() < count; n++) {
+		if(sch.type == "once" && day > sch.date)
+			break;
+		if(!std.is_none(sch.end_date) && day > sch.end_date)
+			break;
+
+		w = goal_window_for_day(def, zone, day);
+		if(!std.is_none(w) && w.end > now)
+			out.push_back(w);
+		day++;
+	}
+
+	return out;
+}
+
+goal_window_text(def, w) {
+	zone = gt_zone(def.schedule.timezone);
+	return gt_format_local(zone, w.start) + " → " + gt_format_local(zone, w.end);
+}
+
+goal_schedule_text(def) {
+	sch = def.schedule;
+
+	if(sch.type == "manual")
+		return "manual (runs only when started)";
+
+	times = std.is_none(sch.start) ? "?" : gt_format_clock(sch.start);
+	if(!std.is_none(sch.end))
+		times += "-" + gt_format_clock(sch.end);
+	else if(!std.is_none(sch.duration))
+		times += " for " + std.string(sch.duration / 60) + "m";
+
+	where = " (" + sch.timezone + ")";
+
+	if(sch.type == "once")
+		return "once on " + gt_format_date(sch.date) + " " + times + where;
+
+	names = [];
+	for(d : sch.days)
+		names.push_back(GT_WEEKDAYS_SHORT[d]);
+
+	what = sch.days.size() == 7 ? "daily" : gfm_join(names, ",");
+	return sch.type + " " + what + " " + times + where;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GoalSpace — the editable tree
+// ─────────────────────────────────────────────────────────────────────────────
+
+class GoalSpace {
+	root = ".agentspace";
+
+	__init__(_root = ".agentspace") {
+		root = std.string(_root ?? ".agentspace");
+		for(root.length() > 1 && (root.ends("/") || root.ends("\\")))
+			root = root.substr(0, root.length() - 1);
+	}
+
+	exists() {
+		return fileio.is_directory(root + "/goals");
+	}
+
+	goal_dir(status, id) {
+		return root + "/goals/" + status + "/" + id;
+	}
+
+	runtime_dir() {
+		return root + "/.runtime";
+	}
+
+	// create the tree from a template directory (never overwrites files)
+	init(template_dir) {
+		created = [];
+
+		if(template_dir && fileio.is_directory(template_dir)) {
+			for(f : fileio.files(template_dir, true)) {
+				dst = root + "/" + f;
+				if(fileio.exists(dst))
+					continue;
+				goal_mkdir(fileio.file_dir(dst));
+				fileio.write_text(dst, goal_read(template_dir + "/" + f));
+				created.push_back(dst);
+			}
+		}
+
+		for(st : GOAL_STATUSES)
+			goal_mkdir(root + "/goals/" + st);
+
+		goal_mkdir(runtime_dir());
+
+		return created;
+	}
+
+	preferences() {
+		return goal_load_preferences(root);
+	}
+
+	// every goal folder: [id, status, dir, path]
+	folders() {
+		out = [];
+		out.clear();
+
+		for(st : GOAL_STATUSES) {
+			base = root + "/goals/" + st;
+			if(!fileio.is_directory(base))
+				continue;
+			for(d : fileio.dirs(base, false)) {
+				name = fileio.file_name(d);
+				if(name.starts("."))
+					continue;
+				dir = base + "/" + name;
+				out.push_back([id = name, status = st, dir = dir, path = dir + "/goal.md"]);
+			}
+		}
+
+		return out;
+	}
+
+	find(id) {
+		hits = [];
+		for(f : folders()) {
+			if(f.id == id)
+				hits.push_back(f);
+		}
+		if(!hits.size())
+			return None;
+		return hits[0];
+	}
+
+	// parse + validate one goal file -> [ok, def, errors, warnings, text, revision]
+	load(folder, prefs = None) {
+		if(!prefs)
+			prefs = preferences();
+
+		text = goal_read(folder.path);
+		rev = goal_text_revision(text);
+
+		if(!fileio.exists(folder.path))
+			return [ok = false, def = None, errors = ["goal.md is missing in " + folder.dir], warnings = [], text = "", revision = ""];
+
+		doc = gfm_read_text(text);
+
+		if(!doc.ok)
+			return [ok = false, def = None, errors = [folder.path + ":" + std.string(doc.line) + ": " + doc.error], warnings = [], text = text, revision = rev];
+
+		if(!doc.has_front)
+			return [ok = false, def = None, errors = ["goal.md has no front matter (start the file with a '---' block)"], warnings = [], text = text, revision = rev];
+
+		v = goal_validate(doc.data, doc.body, prefs, folder.id, folder.status);
+		v.text = text;
+		v.revision = rev;
+
+		if(v.def) {
+			v.def.revision = rev;
+			v.def.dir = folder.dir;
+			v.def.path = folder.path;
+		}
+
+		return v;
+	}
+
+	// move a goal to another status folder (pause / resume / archive ...)
+	move(id, new_status) {
+		if(!goal_list_has(GOAL_STATUSES, new_status))
+			return [ok = false, error = "unknown status '" + new_status + "'"];
+
+		f = find(id);
+		if(!f)
+			return [ok = false, error = "no goal '" + id + "'"];
+
+		if(f.status == new_status)
+			return [ok = true, from = f.status, to = new_status, dir = f.dir, unchanged = true];
+
+		dst = goal_dir(new_status, id);
+		if(fileio.exists(dst))
+			return [ok = false, error = "goals/" + new_status + "/" + id + " already exists"];
+
+		goal_mkdir(root + "/goals/" + new_status);
+
+		if(!fileio.rename(f.dir, dst))
+			return [ok = false, error = "could not move " + f.dir + " to " + dst];
+
+		return [ok = true, from = f.status, to = new_status, dir = dst];
+	}
+
+	// Validated write of a goal definition (the only way agents create or edit
+	// goals). expected_revision guards concurrent edits: when the file changed
+	// since the caller read it, nothing is written.
+	write_goal(id, data, body, status = "proposed", expected_revision = None) {
+		if(!goal_valid_id(id))
+			return [ok = false, errors = ["invalid id '" + id + "'"]];
+
+		f = find(id);
+
+		if(f && !std.is_none(expected_revision)) {
+			current = goal_text_revision(goal_read(f.path));
+			if(current != expected_revision)
+				return [ok = false, conflict = true, errors = ["goal '" + id + "' was changed since revision " + expected_revision + " (now " + current + "); read it again and retry"]];
+		}
+
+		if(f && std.is_none(expected_revision))
+			return [ok = false, conflict = true, errors = ["goal '" + id + "' already exists in goals/" + f.status + "/ - pass its revision to update it"]];
+
+		target_status = f ? f.status : status;
+		folder = [id = id, status = target_status, dir = goal_dir(target_status, id), path = goal_dir(target_status, id) + "/goal.md"];
+
+		// id first, then the caller's fields; the folder holds the status
+		ordered = std.json();
+		ordered["id"] = id;
+		for(k, v : data) {
+			if(k != "id" && k != "status")
+				ordered[k] = v;
+		}
+
+		text = gfm_compose(ordered, body);
+		doc = gfm_read_text(text);
+		v = goal_validate(doc.data, doc.body, preferences(), id, target_status);
+
+		if(!v.ok)
+			return [ok = false, errors = v.errors, warnings = v.warnings];
+
+		goal_mkdir(folder.dir);
+
+		if(!goal_write_atomic(folder.path, text))
+			return [ok = false, errors = ["could not write " + folder.path]];
+
+		v.def.revision = goal_text_revision(text);
+		v.def.path = folder.path;
+		v.def.dir = folder.dir;
+
+		return [ok = true, def = v.def, path = folder.path, revision = v.def.revision, warnings = v.warnings, created = !f];
+	}
+
+	append_history(def, text) {
+		path = def.dir + "/history.md";
+		old = goal_read(path);
+
+		if(!old)
+			old = "# History: " + def.title + "\n\nWritten by the scheduler, one entry per run. Details: `goals history " + def.id + "`.\n";
+
+		goal_write_atomic(path, old + "\n" + text + "\n");
+	}
+
+	read_plan(def) {
+		return goal_read(def.dir + "/plan.md");
+	}
+
+	read_project(def) {
+		if(!def.project)
+			return "";
+
+		out = "";
+		for(name : ["project.md", "policy.md"]) {
+			t = goal_read(root + "/projects/" + def.project + "/" + name);
+			if(t)
+				out += t.strip() + "\n\n";
+		}
+		return out;
+	}
+}
+
+goal_activation_closed(a) {
+	st = gj_str(a, "state", "");
+	return st == "done" || st == "missed" || st == "skipped" || st == "failed" || st == "cancelled" || st == "blocked" || st == "dry_run";
+}
+
+goal_run_open(r) {
+	st = gj_str(r, "state", "");
+	return st == "dispatching" || st == "running" || st == "checkpoint";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GoalLedger — the runtime state (one json, written atomically)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class GoalLedger {
+	path = "";
+	data = [];
+	now_fn = None;			// the scheduler's clock (tests use a fake one)
+
+	stamp() {
+		if(now_fn)
+			return now_fn();
+		return gt_now();
+	}
+
+	__init__(_path) {
+		path = _path;
+		load();
+	}
+
+	fresh() {
+		d = std.json();
+		d.version = 1;
+		d.created = gt_now();
+		d.goals = std.json();
+		d.activations = std.json();
+		d.events = [];
+		d.events.clear();
+		d.seq = 0;
+		return d;
+	}
+
+	load() {
+		data = fresh();
+
+		if(!fileio.exists(path))
+			return;
+
+		loaded = None;
+		try {
+			loaded = std.json(goal_read(path));
+		}
+		catch(e) {}
+
+		if(!gj_is_map(loaded) || !loaded.has("goals") || !loaded.has("activations")) {
+			// keep the broken file for a human, start clean
+			bad = path + ".corrupt-" + std.string(gt_now());
+			try { fileio.rename(path, bad); } catch(e) {}
+			event("ledger_reset", "", "the runtime ledger could not be read and was moved to " + bad);
+			return;
+		}
+
+		data = loaded;
+		if(!data.has("events"))
+			data.events = [];
+		if(!data.has("seq"))
+			data.seq = 0;
+	}
+
+	save() {
+		return goal_write_atomic(path, data.string());
+	}
+
+	event(kind, goal, msg, extra = None) {
+		data.seq = std.int(data.seq) + 1;
+		e = [seq = data.seq, t = stamp(), kind = kind, goal = goal, msg = msg];
+		if(gj_is_map(extra)) {
+			for(k, v : extra)
+				e[k] = v;
+		}
+		data.events.push_back(e);
+		for(data.events.size() > GOAL_EVENTS_KEPT)
+			data.events.erase(0);
+		return e;
+	}
+
+	goal(id) {
+		if(!data.goals.has(id)) {
+			g = std.json();
+			g.first_seen = stamp();
+			data.goals[id] = g;
+		}
+		return data.goals[id];
+	}
+
+	activation(akey) {
+		if(!data.activations.has(akey))
+			return None;
+		return data.activations[akey];
+	}
+
+	// drop the oldest closed activations
+	trim() {
+		if(data.activations.size() <= GOAL_ACTIVATIONS_KEPT)
+			return;
+
+		closed = [];
+		for(k, a : data.activations) {
+			if(goal_activation_closed(a))
+				closed.push_back([akey = k, t = gj(a, "created", 0)]);
+		}
+		closed = goal_sort(closed, "t");
+
+		drop = data.activations.size() - GOAL_ACTIVATIONS_KEPT;
+		for(i = 0; i < closed.size() && i < drop; i++)
+			data.activations.remove(closed[i].akey);
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GoalScheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+class GoalScheduler {
+	space = None;
+	ledger = None;
+	host = None;
+	prefs = [];
+	defs = [];				// id -> applied (valid) definition
+	running = false;
+	tick_ms = GOAL_TICK_MS;
+	thread = None;
+	notify_enabled = true;
+	last_scan = 0;
+	inbox = [];				// task_finished pushes from the host
+	clock = None;			// test hook: a function returning epoch seconds
+	last_overview = "";		// the last state/overview.md written
+
+	__init__(_space, _host = None, opts = None) {
+		space = std.is_string(_space) ? GoalSpace(_space) : _space;
+		host = _host;
+		goal_mkdir(space.runtime_dir());
+		ledger = GoalLedger(space.runtime_dir() + "/ledger.json");
+		ledger.now_fn = [this]() { return this.clock_now(); };
+		defs = std.json();
+		inbox = [];
+		inbox.clear();
+
+		if(gj_is_map(opts)) {
+			if(gj(opts, "tick_ms"))
+				tick_ms = std.int(opts.tick_ms);
+			if(opts.has("notify"))
+				notify_enabled = opts.notify ? true : false;
+		}
+
+		// optional host hook (a missing method is a runtime error, hence try)
+		if(host) {
+			try {
+				host.add_task_finished_listener([this](task) { this.on_host_task_finished(task); });
+			}
+			catch(e) {}
+		}
+	}
+
+	__deinit__() {
+		stop();
+	}
+
+	clock_now() {
+		if(clock)
+			return clock();
+		return gt_now();
+	}
+
+	start() {
+		if(running)
+			return;
+		running = true;
+		thread = std.thread([this]() { this.loop(); });
+		thread.run();
+	}
+
+	stop() {
+		running = false;
+		if(thread) {
+			try { thread.join(); } catch(e) {}
+			thread = None;
+		}
+	}
+
+	loop() {
+		for(running) {
+			try {
+				tick();
+			}
+			catch(e) {
+				std.error("[goals] tick failed: ", e);
+			}
+
+			slept = 0;
+			for(running && slept < tick_ms) {
+				std.sleep(250);
+				slept += 250;
+			}
+		}
+	}
+
+	notify(msg) {
+		if(!notify_enabled)
+			return;
+		std.print("[goals] " + msg);
+		if(!host)
+			return;
+		try {
+			host.notify_user(msg);
+		}
+		catch(e) {}
+	}
+
+	on_host_task_finished(task) {
+		cs = std.critical_section_named(GOAL_LOCK);
+		inbox.push_back([
+			taskid = gj_str(task, "taskid", ""),
+			state = gj_str(task, "state", ""),
+			report = gj_str(task, "report", ""),
+		]);
+		cs.release();
+	}
+
+	// ── 1. definitions ──────────────────────────────────────────────────────
+
+	rescan() {
+		t_now = clock_now();
+		prefs = space.preferences();
+		seen = [];
+
+		for(f : space.folders()) {
+			seen.push_back(f.id);
+			g = ledger.goal(f.id);
+			r = space.load(f, prefs);
+
+			if(r.ok) {
+				prev_rev = gj_str(g, "revision", "");
+				prev_status = gj_str(g, "status", "");
+				prev_text = gj_str(g, "text", "");
+
+				if(prev_rev != r.revision || prev_status != f.status || gj(g, "removed", false)) {
+					if(prev_rev && prev_rev != r.revision) {
+						ledger.event("definition_changed", f.id, "goal.md changed: revision " + prev_rev + " -> " + r.revision, [from = prev_rev, to = r.revision, actor = gj_str(g, "pending_actor", "file")]);
+						g.previous_text = prev_text;
+						g.previous_revision = prev_rev;
+					}
+					else if(!prev_rev) {
+						ledger.event("definition_added", f.id, "goal found in goals/" + f.status + "/ (revision " + r.revision + ")", [revision = r.revision, actor = gj_str(g, "pending_actor", "file")]);
+					}
+
+					if(prev_status && prev_status != f.status) {
+						ledger.event("status_changed", f.id, prev_status + " -> " + f.status, [from = prev_status, to = f.status]);
+						on_status_change(f.id, prev_status, f.status, r.def);
+					}
+
+					g.revision = r.revision;
+					g.status = f.status;
+					g.text = r.text;
+					g.applied_at = t_now;
+					g.removed = false;
+					g.pending_actor = "";
+					if(!gj(g, "active_since") && f.status == "active")
+						g.active_since = t_now;
+					if(f.status == "active" && prev_status != "active")
+						g.active_since = t_now;
+				}
+
+				g.invalid_revision = "";
+				g.errors = [];
+				g.warnings = r.warnings;
+				defs[f.id] = r.def;
+				continue;
+			}
+
+			// invalid: keep the last valid revision, report the error once
+			if(gj_str(g, "invalid_revision", "") != r.revision) {
+				g.invalid_revision = r.revision;
+				g.errors = r.errors;
+				msg = "goal " + f.id + ": the edit is invalid, the last valid revision stays active:\n- " + gfm_join(r.errors, "\n- ");
+				ledger.event("definition_invalid", f.id, msg, [revision = r.revision, errors = r.errors]);
+				notify(msg);
+			}
+
+			// a folder move is still a status change, even with a broken file
+			if(defs.has(f.id) && gj_str(g, "status", "") != f.status) {
+				prev_status = gj_str(g, "status", "");
+				ledger.event("status_changed", f.id, prev_status + " -> " + f.status + " (with the last valid revision)", [from = prev_status, to = f.status]);
+				g.status = f.status;
+				defs[f.id].status = f.status;
+				on_status_change(f.id, prev_status, f.status, defs[f.id]);
+			}
+		}
+
+		// removed definitions: no new activations, open runs are cancelled
+		for(id, g : ledger.data.goals) {
+			if(goal_list_has(seen, id) || gj(g, "removed", false))
+				continue;
+			g.removed = true;
+			ledger.event("definition_removed", id, "goal folder removed: no new runs, open runs are stopped");
+			if(defs.has(id)) {
+				on_status_change(id, gj_str(g, "status", ""), "removed", defs[id]);
+				defs.remove(id);
+			}
+		}
+
+		last_scan = t_now;
+	}
+
+	on_status_change(id, from, to, def) {
+		if(to == "active")
+			return;
+
+		stop_mode = "drain";
+		if(to == "cancelled" || to == "removed")
+			stop_mode = "cancel";
+		if(to == "paused" && def && def.policy.pause_stops)
+			stop_mode = def.policy.stop_policy;
+
+		for(akey, a : ledger.data.activations) {
+			if(gj_str(a, "goal", "") != id || goal_activation_closed(a))
+				continue;
+
+			a.closing = true;
+			a.close_reason = "goal " + to;
+			if(stop_mode != "drain")
+				apply_stop(a, stop_mode, "the goal was " + to);
+		}
+	}
+
+	// ── 2. runs ─────────────────────────────────────────────────────────────
+
+	// the latest record of a host task -> [state, report] (state "" = unknown)
+	poll_task(taskid) {
+		if(!host || !taskid)
+			return [state = "", report = ""];
+
+		rec = None;
+		try {
+			rec = host.inspect_task(taskid);
+		}
+		catch(e) {}
+
+		if(!gj_is_map(rec))
+			return [state = "lost", report = "", last_update_ms = 0];
+
+		return [state = gj_str(rec, "state", ""), report = gj_str(rec, "report", ""), last_update_ms = std.int(gj(rec, "last_update_ms", 0))];
+	}
+
+	settle_runs() {
+		cs = std.critical_section_named(GOAL_LOCK);
+		pushed = inbox.copy();
+		inbox.clear();
+		cs.release();
+
+		for(akey, a : ledger.data.activations) {
+			if(goal_activation_closed(a))
+				continue;
+
+			for(r : a.runs) {
+				if(!goal_run_open(r))
+					continue;
+
+				st = "";
+				report = "";
+
+				for(p : pushed) {
+					if(p.taskid && p.taskid == gj_str(r, "taskid", "")) {
+						st = p.state;
+						report = p.report;
+					}
+				}
+
+				last_ms = 0;
+
+				if(!st) {
+					pr = poll_task(gj_str(r, "taskid", ""));
+					st = pr.state;
+					report = pr.report;
+					last_ms = pr.last_update_ms;
+				}
+
+				if(st == "finished" || st == "failed" || st == "question" || st == "stopped" || st == "lost") {
+					finish_run(a, r, st, report);
+					continue;
+				}
+
+				check_stall(a, r, last_ms);
+			}
+		}
+	}
+
+	// A run that shows no progress (no agent action) for stall_timeout is stuck:
+	// deterministic watchdog, no LLM health check. It is stopped and retried.
+	check_stall(a, r, last_ms) {
+		if(last_ms <= 0 || gj(r, "stop_requested", 0) || gj_str(r, "state", "") != "running")
+			return;
+
+		limit = gj(a.policy, "stall_timeout", 1800);
+		if(limit <= 0)
+			return;
+
+		idle = (std.millis() - last_ms) / 1000;
+		if(idle < limit)
+			return;
+
+		taskid = gj_str(r, "taskid", "");
+		r.stalled = true;
+		r.stop_requested = clock_now();
+		if(host && taskid) {
+			try { host.stop_task(taskid); } catch(e) {}
+		}
+		ledger.event("run_stalled", a.goal, "run " + gj(r, "n", 0) + " made no progress for " + (idle / 60) + " min, stopped (stall_timeout)", [akey = a.akey, taskid = taskid]);
+		notify("Goal " + a.goal + ": run " + gj(r, "n", 0) + " was stuck for " + (idle / 60) + " min and was stopped; it is retried while attempts are left.");
+	}
+
+	finish_run(a, r, state, report) {
+		t_now = clock_now();
+		r.state = state;
+		r.ended = t_now;
+		r.report = goal_clip(report, GOAL_REPORT_CHARS);
+
+		def = defs.has(a.goal) ? defs[a.goal] : None;
+		is_verify = gj_str(r, "kind", "work") == "verify";
+		label = is_verify ? "verification" : "run " + gj(r, "n", 1);
+
+		ledger.event("run_" + state, a.goal, label + " " + state, [akey = a.akey, taskid = gj_str(r, "taskid", "")]);
+
+		if(def) {
+			zone = gt_zone(def.schedule.timezone);
+			entry = "## " + gt_format_local(zone, t_now) + " — " + label + ": " + state + "\n";
+			entry += "Window " + goal_window_text(def, a) + " · revision " + gj_str(r, "revision", "") + "\n\n";
+			entry += report ? goal_clip(report, 900) : "(no report)";
+			space.append_history(def, entry);
+		}
+
+		if(state == "question") {
+			a.state = "blocked";
+			a.ended = t_now;
+			notify("Goal " + a.goal + " needs you: " + goal_clip(report, 700));
+			return;
+		}
+
+		if(state == "finished") {
+			a.failures = 0;
+			a.last_report = r.report;
+
+			if(is_verify) {
+				a.verified = true;
+				a.verify_pending = false;
+			}
+			else {
+				a.successes = gj(a, "successes", 0) + 1;
+				a.verified = false;
+				if(gj(a.policy, "verify", false))
+					a.verify_pending = true;
+			}
+
+			notify("Goal " + a.goal + ": " + label + " finished.\n" + goal_clip(report, 700));
+			return;
+		}
+
+		// a stop the scheduler asked for (window end, pause, cancel) is not a failure
+		if(state == "stopped" && !gj(r, "stalled", false) && (gj(r, "stop_requested", 0) || gj(a, "closing", false) || gj(a, "window_closed", false)))
+			return;
+
+		a.failures = gj(a, "failures", 0) + 1;
+		a.failed_runs = gj(a, "failed_runs", 0) + 1;
+
+		if(is_verify) {
+			// the work is not done: the next work run gets the gaps as its input
+			a.verify_pending = false;
+			a.successes = 0;
+			a.last_report = "VERIFICATION FAILED - fix these gaps:\n" + r.report;
+			notify("Goal " + a.goal + ": verification failed.\n" + goal_clip(report, 700));
+		}
+
+		max_attempts = gj(a.policy, "max_attempts", 3);
+
+		if(a.failures < max_attempts) {
+			a.retry_at = t_now + (is_verify ? 0 : gj(a.policy, "retry_backoff", 600));
+			ledger.event("retry_scheduled", a.goal, label + " " + state + ", attempt " + (a.failures + 1) + "/" + max_attempts + " at " + gt_format_utc(a.retry_at));
+			return;
+		}
+
+		a.state = "failed";
+		a.ended = t_now;
+		notify("Goal " + a.goal + ": " + label + " " + state + " - no attempts left for this window.\n" + goal_clip(report, 700));
+	}
+
+	// ── 3. window end ───────────────────────────────────────────────────────
+
+	apply_stop(a, mode, why) {
+		t_now = clock_now();
+
+		for(r : a.runs) {
+			if(!goal_run_open(r))
+				continue;
+
+			taskid = gj_str(r, "taskid", "");
+
+			if(mode == "checkpoint" && gj_str(r, "state", "") != "checkpoint") {
+				r.state = "checkpoint";
+				r.checkpoint_at = t_now;
+				if(host && taskid) {
+					try {
+						host.update_task(taskid, "The work window of this goal ends now (" + why + "). Save your progress: commit or stash work in progress on a branch, update the plan / notes, then signal finished with what is done and what is left. Do not start anything new.");
+					}
+					catch(e) {}
+				}
+				ledger.event("checkpoint_requested", a.goal, "asked the run to checkpoint (" + why + ")", [taskid = taskid]);
+				continue;
+			}
+
+			if(mode == "cancel") {
+				if(host && taskid) {
+					try { host.stop_task(taskid); } catch(e) {}
+				}
+				// the run is settled by the host's answer; a stop request is not a stop
+				r.stop_requested = t_now;
+				ledger.event("stop_requested", a.goal, "stop requested (" + why + ")", [taskid = taskid]);
+			}
+		}
+	}
+
+	handle_window_ends() {
+		t_now = clock_now();
+
+		for(akey, a : ledger.data.activations) {
+			if(goal_activation_closed(a))
+				continue;
+
+			def = defs.has(a.goal) ? defs[a.goal] : None;
+			open_runs = 0;
+			for(r : a.runs) {
+				if(goal_run_open(r))
+					open_runs++;
+			}
+
+			if(t_now >= a.end && !gj(a, "window_closed", false)) {
+				a.window_closed = true;
+				mode = gj_str(a, "stop_policy", "checkpoint");
+				ledger.event("window_ended", a.goal, "window ended, no new runs (stop policy: " + mode + ")", [akey = akey]);
+				if(open_runs > 0 && mode != "drain")
+					apply_stop(a, mode, "window ended");
+			}
+
+			// checkpoint grace over -> cancel
+			for(r : a.runs) {
+				if(gj_str(r, "state", "") == "checkpoint" && !gj(r, "stop_requested", 0)) {
+					grace = gj(a, "checkpoint_grace", 900);
+					if(t_now - gj(r, "checkpoint_at", t_now) >= grace) {
+						if(host && gj_str(r, "taskid", "")) {
+							try { host.stop_task(r.taskid); } catch(e) {}
+						}
+						r.stop_requested = t_now;
+						ledger.event("stop_requested", a.goal, "checkpoint grace over, stop requested", [taskid = gj_str(r, "taskid", "")]);
+					}
+				}
+			}
+
+			// close the activation when nothing runs and nothing more may start
+			if(open_runs == 0) {
+				more = can_start_more(a, def, t_now);
+				if(!more) {
+					if(activation_succeeded(a))
+						a.state = "done";
+					else if(!a.runs.size())
+						a.state = "missed";
+					else
+						a.state = "failed";
+
+					if(gj(a, "closing", false) && a.state != "done")
+						a.state = "cancelled";
+
+					a.ended = t_now;
+					ledger.event("activation_closed", a.goal, "window " + a.state, [akey = akey]);
+					maybe_complete_goal(a, def);
+				}
+			}
+		}
+	}
+
+	// a once-goal whose only window is done moves to goals/completed/
+	maybe_complete_goal(a, def) {
+		if(!def || def.schedule.type != "once" || def.status != "active")
+			return;
+		if(a.state != "done")
+			return;
+		// a manual run of a once-goal does not complete it while its window is ahead
+		for(w : goal_next_windows(def, clock_now(), 3)) {
+			if(w.akey != a.akey && w.start > a.start)
+				return;
+		}
+
+		res = space.move(def.id, "completed");
+		if(res.ok) {
+			ledger.goal(def.id).pending_actor = "scheduler";
+			ledger.event("goal_completed", def.id, "the one-time goal finished and moved to goals/completed/");
+		}
+	}
+
+	// ── 4. activations ──────────────────────────────────────────────────────
+
+	new_activation(def, w, kind = "scheduled") {
+		a = std.json();
+		a.akey = w.akey;
+		a.goal = def.id;
+		a.kind = kind;
+		a.start = w.start;
+		a.end = w.end;
+		a.revision = def.revision;
+		a.created = clock_now();
+		a.state = def.policy.dry_run ? "dry_run" : "open";
+		a.runs = [];
+		a.runs.clear();
+		a.successes = 0;
+		a.failures = 0;
+		a.stop_policy = def.policy.stop_policy;
+		a.checkpoint_grace = def.policy.checkpoint_grace;
+		a.policy = def.policy.copy();
+		ledger.data.activations[w.akey] = a;
+		return a;
+	}
+
+	record_missed(def, w, why) {
+		a = new_activation(def, w, "missed");
+		a.state = why == "skip" ? "skipped" : "missed";
+		a.ended = clock_now();
+		msg = "Goal " + def.id + ": window " + goal_window_text(def, w) + " was " + (why == "skip" ? "skipped (started late, misfire: skip)" : "missed (the scheduler was not running)");
+		ledger.event("window_" + a.state, def.id, msg, [akey = w.akey]);
+		notify(msg);
+		return a;
+	}
+
+	activate_due() {
+		t_now = clock_now();
+
+		for(id, def : defs) {
+			if(def.status != "active")
+				continue;
+
+			g = ledger.goal(id);
+			since = gj(g, "active_since", t_now);
+			lookback_from = math.max(since, t_now - 8 * GT_DAY);
+
+			windows = goal_windows_between(def, lookback_from, t_now);
+			missed_latest = None;
+
+			for(w : windows) {
+				if(ledger.activation(w.akey))
+					continue;
+
+				// a window that started before the goal was active is not missed
+				if(w.end <= since)
+					continue;
+
+				open = t_now < w.end;
+
+				if(open) {
+					late = t_now - w.start;
+					if(late > GOAL_START_GRACE + tick_ms / 1000 && def.schedule.misfire == "skip" && w.start >= since) {
+						record_missed(def, w, "skip");
+						continue;
+					}
+
+					a = new_activation(def, w);
+					zone = gt_zone(def.schedule.timezone);
+					note = late > GOAL_START_GRACE + tick_ms / 1000 && w.start >= since ? " (late start)" : "";
+					ledger.event("window_activated", id, "window " + goal_window_text(def, w) + " activated" + note, [akey = w.akey]);
+					notify("Goal " + id + " starts" + (a.state == "dry_run" ? " (DRY RUN)" : "") + ": " + def.title + "\nWindow " + goal_window_text(def, w) + note);
+					continue;
+				}
+
+				if(w.start < since)
+					continue;
+
+				if(def.schedule.misfire == "catch_up") {
+					missed_latest = w;
+					continue;
+				}
+
+				record_missed(def, w, "missed");
+			}
+
+			// catch_up: ONE run for the latest missed window, now, as long as the window was
+			if(missed_latest) {
+				len = missed_latest.end - missed_latest.start;
+				cw = [start = t_now, end = t_now + len, akey = missed_latest.akey];
+				a = new_activation(def, cw, "catch_up");
+				a.missed_window = [start = missed_latest.start, end = missed_latest.end];
+				ledger.event("window_catch_up", id, "missed window " + goal_window_text(def, missed_latest) + " runs now (misfire: catch_up)", [akey = cw.akey]);
+				notify("Goal " + id + ": catching up a missed window now.");
+			}
+		}
+	}
+
+	// manual start ("goals run", goal_run_now) - its own window from now
+	run_now(id, duration_secs = None, dry_run = false) {
+		if(!defs.has(id)) {
+			rescan();
+			if(!defs.has(id))
+				return [ok = false, error = "no valid goal '" + id + "'"];
+		}
+
+		def = defs[id];
+		t_now = clock_now();
+		len = duration_secs;
+
+		if(std.is_none(len)) {
+			sch = def.schedule;
+			if(!std.is_none(sch.start) && !std.is_none(sch.end)) {
+				len = sch.end - sch.start;
+				if(len <= 0)
+					len += GT_DAY;
+			}
+			else {
+				len = sch.duration ?? (gt_parse_duration(gj(prefs, "default_duration", "4h")) ?? 4 * 3600);
+			}
+		}
+
+		w = [start = t_now, end = t_now + len, akey = id + "@manual-" + gt_format_utc(t_now)];
+		a = new_activation(def, w, "manual");
+		if(dry_run)
+			a.state = "dry_run";
+
+		ledger.event("window_activated", id, "manual run " + goal_window_text(def, w) + (dry_run ? " (dry run)" : ""), [akey = w.akey]);
+		ledger.save();
+
+		return [ok = true, akey = w.akey, start = w.start, end = w.end, prompt = build_prompt(def, a, "work")];
+	}
+
+	// ── 5. dispatch ─────────────────────────────────────────────────────────
+
+	// the window is "done" when its work succeeded (and was verified, if asked)
+	activation_succeeded(a) {
+		if(gj(a, "successes", 0) <= 0)
+			return false;
+		if(gj(a.policy, "verify", false))
+			return gj(a, "verified", false) ? true : false;
+		return true;
+	}
+
+	can_start_more(a, def, t_now) {
+		if(!def || def.status != "active" || gj(a, "closing", false))
+			return false;
+		if(a.state == "blocked" || a.state == "failed")
+			return false;
+		if(t_now >= a.end)
+			return false;
+		if(a.state == "dry_run")
+			return a.runs.size() == 0;
+		if(gj(a, "failures", 0) >= gj(a.policy, "max_attempts", 3))
+			return false;
+
+		// a verification of finished work always may run
+		if(gj(a, "verify_pending", false))
+			return true;
+
+		if(!gj(a.policy, "repeat_in_window", false))
+			return !activation_succeeded(a);
+
+		work_runs = 0;
+		for(r : a.runs) {
+			if(gj_str(r, "kind", "work") == "work")
+				work_runs++;
+		}
+
+		if(work_runs >= gj(a.policy, "max_runs_per_window", 1))
+			return false;
+
+		// no new run that could not finish before the window ends
+		if(a.end - t_now < gj(a.policy, "min_remaining", 0) && a.runs.size() > 0)
+			return false;
+
+		return true;
+	}
+
+	background_running() {
+		n = 0;
+		for(akey, a : ledger.data.activations) {
+			if(goal_activation_closed(a))
+				continue;
+			for(r : a.runs) {
+				if(goal_run_open(r))
+					n++;
+			}
+		}
+		return n;
+	}
+
+	// does the node have room for background work right now?
+	capacity_ok(def) {
+		max_bg = std.int(gj(prefs, "max_background_tasks", 1));
+		if(max_bg > 0 && background_running() >= max_bg && def.priority != "urgent")
+			return [ok = false, why = "max_background_tasks reached"];
+
+		if(!host)
+			return [ok = true, why = ""];
+
+		// optional host method: without it only max_background_tasks applies
+		cap = None;
+		try { cap = host.background_capacity(); } catch(e) {}
+		if(!gj_is_map(cap))
+			return [ok = true, why = ""];
+
+		if(def.priority == "urgent")
+			return [ok = true, why = ""];
+
+		reserve = std.int(gj(prefs, "reserve_interactive_workers", 0));
+		workers = std.int(gj(cap, "workers", 1));
+		busy = std.int(gj(cap, "busy", 0));
+		if(busy >= workers - reserve)
+			return [ok = false, why = "no free worker (" + busy + "/" + workers + " busy, " + reserve + " reserved for interactive work)"];
+
+		yield_secs = gt_parse_duration(gj(prefs, "yield_after_interactive", "0")) ?? 0;
+		idle = gj(cap, "interactive_idle_secs", 1000000000);
+		if(yield_secs > 0 && idle < yield_secs)
+			return [ok = false, why = "yielding to interactive use"];
+
+		return [ok = true, why = ""];
+	}
+
+	dispatch() {
+		t_now = clock_now();
+
+		for(akey, a : ledger.data.activations) {
+			if(goal_activation_closed(a) && a.state != "dry_run")
+				continue;
+
+			def = defs.has(a.goal) ? defs[a.goal] : None;
+			if(!can_start_more(a, def, t_now))
+				continue;
+
+			if(gj(a, "retry_at", 0) > t_now)
+				continue;
+
+			open_runs = 0;
+			for(r : a.runs) {
+				if(goal_run_open(r))
+					open_runs++;
+			}
+
+			kind = gj(a, "verify_pending", false) ? "verify" : "work";
+
+			// a verification runs alone; work runs up to max_parallel_workers
+			if(kind == "verify" && open_runs > 0)
+				continue;
+			if(kind == "work" && open_runs >= a.policy.max_parallel_workers)
+				continue;
+			// without repeat a window runs one work run at a time
+			if(kind == "work" && !a.policy.repeat_in_window && open_runs > 0)
+				continue;
+
+			if(a.state == "dry_run") {
+				r = [n = a.runs.size() + 1, kind = kind, state = "dry_run", started = t_now, ended = t_now, revision = def.revision];
+				r.prompt = build_prompt(def, a, kind);
+				a.runs.push_back(r);
+				space.append_history(def, "## DRY RUN " + gt_format_local(gt_zone(def.schedule.timezone), t_now) + "\nWindow " + goal_window_text(def, a) + " · revision " + def.revision + "\nWould dispatch:\n\n```text\n" + goal_clip(r.prompt, 4000) + "\n```");
+				ledger.event("dry_run", a.goal, "dry run: the prompt was written to history.md, nothing dispatched", [akey = akey]);
+				continue;
+			}
+
+			cap = capacity_ok(def);
+			if(!cap.ok) {
+				if(gj_str(a, "waiting_for", "") != cap.why) {
+					a.waiting_for = cap.why;
+					ledger.event("dispatch_waiting", a.goal, "waiting: " + cap.why, [akey = akey]);
+				}
+				continue;
+			}
+			a.waiting_for = "";
+
+			start_run(def, a, kind);
+		}
+	}
+
+	start_run(def, a, kind) {
+		t_now = clock_now();
+		n = a.runs.size() + 1;
+		r = [
+			n = n,
+			kind = kind,
+			state = "dispatching",
+			started = t_now,
+			attempt = gj(a, "failures", 0) + 1,
+			revision = def.revision,
+			taskid = "",
+		];
+		a.runs.push_back(r);
+		r = a.runs[a.runs.size() - 1];
+
+		// outbox: the run is on disk before the host knows it, so a crash in
+		// between is recovered as "interrupted" instead of being forgotten
+		ledger.save();
+
+		prompt = build_prompt(def, a, kind, n);
+		name = (kind == "verify" ? "Verify-" : "Goal-") + def.id;
+		taskid = "";
+
+		try {
+			// note: "obj.method(...) ?? x" does not parse as expected, hence two steps
+			added = host ? host.add_task(name, prompt) : None;
+			taskid = std.is_none(added) ? "" : std.string(added);
+		}
+		catch(e) {
+			taskid = "";
+		}
+
+		if(!taskid) {
+			r.state = "failed";
+			r.ended = t_now;
+			r.report = "the host refused the task";
+			a.failures = gj(a, "failures", 0) + 1;
+			a.retry_at = t_now + def.policy.retry_backoff;
+			ledger.event("dispatch_failed", def.id, "the host did not accept the run", [akey = a.akey]);
+			// the owner must hear about a refused dispatch now, not only when the
+			// window runs out of attempts
+			notify("Goal " + def.id + ": " + (kind == "verify" ? "the verification run" : "run " + std.string(n)) + " could not start - the host refused the task. Next attempt " + gt_format_local(gt_zone(def.schedule.timezone), a.retry_at) + ".");
+			return;
+		}
+
+		r.taskid = taskid;
+		r.state = "running";
+		ledger.event("run_started", def.id, (kind == "verify" ? "verification" : "run " + n) + " dispatched (task " + name + ")", [akey = a.akey, taskid = taskid]);
+	}
+
+	// run_n: the number of the run the prompt is for (None = the next one)
+	build_prompt(def, a, kind, run_n = None) {
+		if(std.is_none(run_n))
+			run_n = a.runs.size() + 1;
+
+		zone = gt_zone(def.schedule.timezone);
+		t_now = clock_now();
+		left_min = (a.end - t_now) / 60;
+
+		p = "# Scheduled goal: " + def.title + " (" + def.id + ")\n\n";
+		p += "You run unattended, started by the goal scheduler of this node (not by a person in a chat).\n";
+		p += "Work window: " + goal_window_text(def, a) + " — about " + left_min + " minutes left. ";
+		p += "Plan for it: at the end you are asked to checkpoint (save progress, report what is left).\n";
+		p += "Definition revision " + def.revision + " · " + (kind == "verify" ? "verification run " + run_n : "run " + run_n + " of this window") + " · goal file: " + def.path + "\n\n";
+
+		if(kind == "verify") {
+			p += "## Your job: verify\n\nCheck the acceptance criteria below against the actual state of the work (files, tests, branches), not against the report. ";
+			p += "Signal finished when they are met. Signal failed with the concrete gaps when they are not — the next run gets your list.\n\n";
+			p += "## Report of the last run\n\n" + goal_clip(gj_str(a, "last_report", ""), 3000) + "\n\n";
+		}
+
+		p += "## Instructions (goal.md)\n\n";
+		if(def.objective)
+			p += def.objective + "\n\n";
+		p += goal_clip(def.body.strip(), GOAL_PROMPT_SECTION_CHARS) + "\n\n";
+
+		plan = space.read_plan(def);
+		if(plan.strip()) {
+			p += "## Current plan (" + def.dir + "/plan.md)\n\n" + goal_clip(plan.strip(), GOAL_PROMPT_SECTION_CHARS) + "\n\n";
+		}
+
+		proj = space.read_project(def);
+		if(proj) {
+			p += "## Project: " + def.project + "\n\n" + goal_clip(proj, GOAL_PROMPT_SECTION_CHARS) + "\n\n";
+		}
+
+		if(kind == "work" && gj_str(a, "last_report", "")) {
+			p += "## Previous run in this window\n\n" + goal_clip(a.last_report, 3000) + "\n\nContinue from there; do not redo finished work.\n\n";
+		}
+		else if(kind == "work") {
+			hist = goal_read(def.dir + "/history.md");
+			if(hist.strip()) {
+				tail = hist.length() > 2500 ? hist.substr(hist.length() - 2500) : hist;
+				p += "## Recent history (" + def.dir + "/history.md)\n\n" + tail.strip() + "\n\n";
+			}
+		}
+
+		others = [];
+		for(r : a.runs) {
+			if(goal_run_open(r) && gj(r, "n", 0) != run_n)
+				others.push_back("- run " + gj(r, "n", 0) + " (" + gj_str(r, "kind", "work") + ")");
+		}
+		if(others.size()) {
+			p += "## Other runs of this goal working right now\n\n" + gfm_join(others, "\n") + "\nPick work they are not doing.\n\n";
+		}
+
+		p += "## Rules\n\n";
+		if(def.policy.allow.size())
+			p += "- Allowed actions: " + gfm_join(def.policy.allow, ", ") + ".\n";
+		p += "- Never do without the owner's explicit approval: " + gfm_join(def.policy.require_approval, ", ") + ". Ask with signal(question) instead.\n";
+		p += "- Repository edits: work on a branch / isolated worktree, never on a shared main checkout.\n";
+		if(def.policy.plan_updates == "allow")
+			p += "- Keep " + def.dir + "/plan.md current: tick off what you finished, add what you discovered (short checklist).\n";
+		else if(def.policy.plan_updates == "propose")
+			p += "- Do not edit plan.md; put plan changes you propose into your report.\n";
+		else
+			p += "- Do not edit plan.md or goal.md.\n";
+		p += "- Never edit goal.md or anything under .agentspace/.runtime/ (the scheduler owns them).\n";
+		p += "- Your memory across runs of this goal is the Mind topic .megamind/goal_" + def.id.replace("-", "_") + "/ (read its index.md first, update it before you finish).\n";
+		p += "- End with signal(): finished (what was done, what is left, evidence such as tests run), question (you need the owner), or failed (why).\n";
+
+		return p;
+	}
+
+	// ── recovery after a restart ────────────────────────────────────────────
+
+	// Runs of a previous process: the host tasks died with it. They are
+	// settled as "interrupted" and retried while their window is open.
+	recover() {
+		t_now = clock_now();
+		for(akey, a : ledger.data.activations) {
+			if(goal_activation_closed(a))
+				continue;
+			for(r : a.runs) {
+				if(!goal_run_open(r))
+					continue;
+				known = run_still_known(r);
+				if(known)
+					continue;
+				r.state = "lost";
+				r.ended = t_now;
+				r.report = "interrupted: the node restarted while the run was active";
+				a.failures = gj(a, "failures", 0) + 1;
+				ledger.event("run_interrupted", a.goal, "run " + gj(r, "n", 0) + " was interrupted by a restart", [akey = akey]);
+				def = defs.has(a.goal) ? defs[a.goal] : None;
+				if(def && a.failures < def.policy.max_attempts)
+					a.retry_at = t_now;
+			}
+		}
+	}
+
+	run_still_known(r) {
+		taskid = gj_str(r, "taskid", "");
+		if(!taskid || !host)
+			return false;
+		pr = poll_task(taskid);
+		return pr.state != "lost" && pr.state != "";
+	}
+
+	// ── requests from the CLI (another process): .runtime/requests/*.json ──
+
+	// queue a manual run; the tick thread starts it (safe from any thread)
+	request_run(id, dry_run = false) {
+		f = space.find(id);
+		if(!f)
+			return [ok = false, error = "no goal '" + id + "'"];
+		if(f.status != "active")
+			return [ok = false, error = "goal '" + id + "' is " + f.status + ", activate it first"];
+
+		dir = space.runtime_dir() + "/requests";
+		goal_mkdir(dir);
+		path = dir + "/" + std.string(gt_now()) + "-" + std.random_hash(4) + ".json";
+		ok = goal_write_atomic(path, [action = "run", goal = id, dry_run = dry_run ? 1 : 0, at = gt_now()].string());
+		return ok ? [ok = true, queued = true] : [ok = false, error = "could not write " + path];
+	}
+
+	process_requests() {
+		dir = space.runtime_dir() + "/requests";
+		if(!fileio.is_directory(dir))
+			return;
+
+		for(f : fileio.files(dir, false)) {
+			path = dir + "/" + fileio.file_name(f);
+			if(!path.ends(".json"))
+				continue;
+
+			req = None;
+			try { req = std.json(goal_read(path)); } catch(e) {}
+			try { fileio.remove(path); } catch(e) {}
+
+			if(!gj_is_map(req))
+				continue;
+
+			if(gj_str(req, "action", "") == "run") {
+				res = run_now(gj_str(req, "goal", ""), None, gj(req, "dry_run", false) ? true : false);
+				ledger.event("request", gj_str(req, "goal", ""), "run requested from the CLI: " + (res.ok ? "started" : res.error));
+			}
+		}
+	}
+
+	// ── the tick ────────────────────────────────────────────────────────────
+
+	tick() {
+		cs = std.critical_section_named(GOAL_LOCK + ":tick");
+
+		first = !gj(ledger.data, "started", 0) || last_scan == 0;
+		rescan();
+
+		if(first) {
+			ledger.data.started = clock_now();
+			recover();
+		}
+
+		process_requests();
+		settle_runs();
+		handle_window_ends();
+		activate_due();
+		dispatch();
+		handle_window_ends();
+		ledger.data.last_tick = clock_now();
+		ledger.trim();
+		ledger.save();
+		write_overview();
+
+		cs.release();
+	}
+
+	// ── overview (CLI, receptionist tools, router) ──────────────────────────
+
+	goal_summary(id, def) {
+		g = ledger.goal(id);
+		t_now = clock_now();
+		nxt = goal_next_windows(def, t_now, 1);
+		last = None;
+		open = None;
+
+		for(akey, a : ledger.data.activations) {
+			if(gj_str(a, "goal", "") != id)
+				continue;
+			if(!goal_activation_closed(a))
+				open = a;
+			else if(!last || gj(a, "created", 0) > gj(last, "created", 0))
+				last = a;
+		}
+
+		zone = gt_zone(def.schedule.timezone);
+
+		return [
+			id = id,
+			title = def.title,
+			status = def.status,
+			priority = def.priority,
+			schedule = goal_schedule_text(def),
+			next_window = nxt.size() ? goal_window_text(def, nxt[0]) : "",
+			active_window = open ? goal_window_text(def, open) : "",
+			active_state = open ? gj_str(open, "state", "") : "",
+			last_outcome = last ? gj_str(last, "state", "") + " (" + gt_format_local(zone, gj(last, "start", t_now)) + ")" : "",
+			revision = def.revision,
+			invalid_edit = gj_str(g, "invalid_revision", "") != "",
+			errors = gj(g, "errors", []),
+			dry_run = def.policy.dry_run,
+			path = def.path,
+		];
+	}
+
+	overview() {
+		out = [];
+		for(id, def : defs)
+			out.push_back(goal_summary(id, def));
+
+		// invalid goals without any valid revision
+		for(id, g : ledger.data.goals) {
+			if(defs.has(id) || gj(g, "removed", false))
+				continue;
+			if(gj_str(g, "invalid_revision", ""))
+				out.push_back([id = id, title = "(invalid)", status = gj_str(g, "status", "?"), errors = gj(g, "errors", []), invalid_edit = true]);
+		}
+
+		return out;
+	}
+
+	// state/overview.md: generated, for people (never read back). Written only
+	// when its content changes.
+	overview_text() {
+		list = goal_sort(overview(), "id");
+		out = "# Goals overview\n\nGenerated by the node's goal scheduler - do not edit (edit goals/<status>/<id>/goal.md).\n";
+
+		for(st : GOAL_STATUSES) {
+			first = true;
+			for(g : list) {
+				if(gj_str(g, "status", "") != st)
+					continue;
+				if(first) {
+					out += "\n## " + st + "\n";
+					first = false;
+				}
+				out += "\n- **" + gj_str(g, "id", "") + "** - " + gj_str(g, "title", "") + "\n";
+				if(gj_str(g, "schedule", ""))
+					out += "  - schedule: " + gj_str(g, "schedule", "") + "\n";
+				if(gj_str(g, "active_window", ""))
+					out += "  - now: " + gj_str(g, "active_window", "") + " (" + gj_str(g, "active_state", "") + ")\n";
+				else if(st == "active" && gj_str(g, "next_window", ""))
+					out += "  - next: " + gj_str(g, "next_window", "") + "\n";
+				if(gj_str(g, "last_outcome", ""))
+					out += "  - last: " + gj_str(g, "last_outcome", "") + "\n";
+				if(gj(g, "dry_run", false))
+					out += "  - dry run\n";
+				if(gj(g, "invalid_edit", false))
+					out += "  - INVALID EDIT: " + gfm_join(gj(g, "errors", []), "; ") + "\n";
+				if(gj_str(g, "path", ""))
+					out += "  - file: `" + gj_str(g, "path", "") + "`\n";
+			}
+		}
+
+		if(!list.size())
+			out += "\nNo goals yet.\n";
+
+		return out;
+	}
+
+	write_overview() {
+		text = "";
+		try {
+			text = overview_text();
+		}
+		catch(e) {
+			return false;
+		}
+
+		if(text == last_overview)
+			return true;
+
+		path = space.root + "/state/overview.md";
+		if(goal_write_atomic(path, text)) {
+			last_overview = text;
+			return true;
+		}
+		return false;
+	}
+
+	activations_of(id, limit = 20) {
+		out = [];
+		for(akey, a : ledger.data.activations) {
+			if(gj_str(a, "goal", "") == id)
+				out.push_back(a);
+		}
+		out = goal_sort(out, "created", true);
+		for(out.size() > limit)
+			out.erase(out.size() - 1);
+		return out;
+	}
+
+	events_of(id, limit = 30) {
+		out = [];
+		for(e : ledger.data.events) {
+			if(!id || gj_str(e, "goal", "") == id)
+				out.push_back(e);
+		}
+		for(out.size() > limit)
+			out.erase(0);
+		return out;
+	}
+}

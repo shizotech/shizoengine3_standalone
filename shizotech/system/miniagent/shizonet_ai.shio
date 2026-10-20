@@ -10,8 +10,8 @@
 //      ai_router_attach(server, router, [name, description])
 //
 //  Every reply is [ok = true, ...] or [ok = false, error = "..."]. ok / busy /
-//  online travel as 1/0 (shizoscript has no bool type), so the receiver tests
-//  them for truthiness and never compares them to a JSON literal true.
+//  online / goals travel as 1/0 (shizoscript has no bool type), so the receiver
+//  tests them for truthiness and never compares them to a JSON literal true.
 //
 //  on_get handlers run on the ShizoNet script thread: they only touch the
 //  request table and return. They never block and never call device.get().
@@ -41,6 +41,7 @@ AI_CMD_TASK = "ai_task";
 AI_CMD_TASK_ADD = "ai_task_add";
 AI_CMD_TASK_UPDATE = "ai_task_update";
 AI_CMD_TASK_STOP = "ai_task_stop";
+AI_CMD_GOALS = "ai_goals";					// scheduled goals: list / pause / resume / cancel / run
 
 // node pushes to routers (broadcast, fire and forget)
 AI_CMD_EVENT = "ai_event";
@@ -199,6 +200,8 @@ ai_task_list(ov) {
 }
 
 // Node info json for the AINodeInfo prop / ai_info reply (see router_api.md).
+// Every host read is defensive: this runs on the refresh thread every
+// AI_REFRESH_MS, so a host missing a member must never take the transport down.
 ai_node_info(host, opts = None) {
 	ov = ai_host_overview(host);
 
@@ -242,6 +245,27 @@ ai_node_info(host, opts = None) {
 		active = false;
 	}
 
+	// Does this node run a goal scheduler at all? Megamind.goals (goal_engine.shio)
+	// is set by node.shio only for an .agentspace node, so the presence of the
+	// member IS the answer: no file scan, no call into the scheduler (this runs on
+	// the refresh thread). The router needs it to tell the user "node Z has no
+	// goal system" before it delegates a scheduling request.
+	//
+	// host["goals"], not host.goals: this runs with every host shape (a Megamind,
+	// a stub host class, a plain json in the selftest, None on a router service)
+	// and a member access that mixes those shapes resolves to the wrong one (the
+	// access is resolved per site). The index access hits the class member, the
+	// json key and None alike; a host without a goals member raises there, which is
+	// exactly the "no goal system" answer.
+	has_goals = false;
+
+	try {
+		has_goals = !std.is_none(host["goals"]) ? true : false;
+	}
+	catch(e) {
+		has_goals = false;
+	}
+
 	running = ov.tasks.size();
 	planned = ov.tasks_scheduled.size();
 
@@ -256,6 +280,7 @@ ai_node_info(host, opts = None) {
 		busy = (active || queued > 0 || running > 0) ? true : false,
 		tasks_running = running,
 		tasks_planned = planned,
+		goals = has_goals ? 1 : 0,
 		uptime_ms = std.millis() - AI_STARTED_AT,
 	];
 }
@@ -428,6 +453,7 @@ class AiService {
 		server.on_get(AI_CMD_TASK_ADD, [this](dev, data) { return handle_task_add(dev, data); });
 		server.on_get(AI_CMD_TASK_UPDATE, [this](dev, data) { return handle_task_update(dev, data); });
 		server.on_get(AI_CMD_TASK_STOP, [this](dev, data) { return handle_task_stop(dev, data); });
+		server.on_get(AI_CMD_GOALS, [this](dev, data) { return handle_goals(dev, data); });
 
 		server.on_connect([this](dev) { node_connected(dev); });
 
@@ -849,6 +875,60 @@ class AiService {
 
 	handle_overview(dev, data) {
 		return [ok = true, overview = ai_host_overview(host)];
+	}
+
+	// The node's goal scheduler (Megamind.goals, goal_engine.shio). A run is
+	// queued for the scheduler's own thread; a status change is a folder move.
+	handle_goals(dev, data) {
+		sch = None;
+		try {
+			sch = host.goals;
+		}
+		catch(e) {}
+
+		if(!sch)
+			return [ok = false, error = "this node has no .agentspace (start it with --agentspace or create one: shz miniagent.goals init)"];
+
+		action = ai_field(data, "action", "list").strip().lowercase();
+		goal = ai_field(data, "goal", "").strip();
+
+		if(action == "list") {
+			list = [];
+			try {
+				list = sch.overview();
+			}
+			catch(e) {
+				return [ok = false, error = "goal overview failed: " + ai_str(e)];
+			}
+			return [ok = true, goals = list];
+		}
+
+		if(!goal)
+			return [ok = false, error = "goal id missing"];
+
+		if(action == "run") {
+			res = sch.request_run(goal, false);
+			return res;
+		}
+
+		moves = [
+			pause = "paused",
+			resume = "active",
+			activate = "active",
+			cancel = "cancelled",
+			archive = "archived",
+			complete = "completed",
+		];
+
+		if(!moves.has(action))
+			return [ok = false, error = "unknown goal action '" + action + "' (list, run, pause, resume, activate, cancel, archive, complete)"];
+
+		res = sch.space.move(goal, moves[action]);
+
+		if(!res.ok)
+			return [ok = false, error = ai_str(res.error)];
+
+		return [ok = true, goal = goal, from = ai_str(res.from), to = ai_str(res.to)];
 	}
 
 	handle_tasks(dev, data) {

@@ -22,7 +22,12 @@
 //  event de-duplication (one connect = one node_state, one finish = one event,
 //  one node notify = one notify), the ten role tools (incl. the fleet-wide
 //  get_tasks listing + lifecycle from a listed taskid), and the offline -> lost
-//  mirror rule.
+//  mirror rule. Section 10 covers the failure visibility contract: the error
+//  field on every task_state event (C1), a node-side crash landing in report AND
+//  last_error and a node-side stop mirroring as stopped (C3), the open-task
+//  stall watchdog with its one-event-per-episode rule (C2), the reason of every
+//  add_task refusal through add_task_error() (C4) and the node goals flag in
+//  the routing table (C5).
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "router_api"
@@ -36,6 +41,12 @@ NODE_B_PORT = 6456;
 
 GPU_NAME = "GPUBox";
 WEB_NAME = "WebBox";
+
+// node records injected into the mirror for the C4 failure paths: they never
+// touch the wire, they only exist so add_task can meet an offline node and a
+// device handle that raises.
+DEAD_NAME = "DeadBox";
+BOOM_NAME = "BoomBox";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Harness
@@ -128,17 +139,29 @@ class rt_stub_host {
 	}
 
 	// VERYSLOW keeps the turn busy long enough to inject a follow-up into it.
+	// STUBERROR makes the receptionist turn die: the node service records
+	// status="error" + the exception text, which is the C3 failure path.
+	// STUBQUIET <ms> says NOTHING at all (no deltas) for <ms>: the stall
+	// watchdog's clean room — the whole turn is exactly one silent episode.
 	request(prompt, on_finish_cb = None, on_action_cb = None) {
 		_receptionist_active = true;
 
-		if(on_action_cb) {
+		if(on_action_cb && !prompt.starts("STUBQUIET")) {
 			on_action_cb([text = "thinking: "]);
 			on_action_cb([tool_start = [id = "t1", name = "get_overview", args = []]]);
 			on_action_cb([milestone = "stub milestone"]);
 		}
 
+		if(prompt.starts("STUBERROR"))
+			std.runtime_error("the receptionist exploded: no goal system on this node");
+
 		if(prompt.starts("VERYSLOW"))
 			std.sleep(1500);
+
+		if(prompt.starts("STUBQUIET")) {
+			qparts = prompt.split(" ");
+			std.sleep(std.int(qparts[1] ?? "1200"));
+		}
 
 		result = [
 			ok = true,
@@ -347,6 +370,80 @@ class rt_stub_agent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  rt_boom_dev + node injection — the C4 failure paths the network cannot
+//  produce: a node record that is offline, and a device handle that raises.
+//  The records are injected into the Router's node table through its own
+//  critical section and dropped right after the check, so the fleet the later
+//  sections see stays exactly the two stub nodes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class rt_boom_dev {
+	online() { std.runtime_error("device handle is broken"); }
+	get(cmd, payload, timeout) { return []; }
+	mac() { return "BOOM:00"; }
+	name() { return BOOM_NAME; }
+	ip() { return ""; }
+}
+
+rt_node_record(node_name, mac, online_flag, dev) {
+	return [
+		name = node_name,
+		mac = mac,
+		nodekey = mac + ":" + node_name,
+		ip = "",
+		version = AI_NET_VERSION,
+		online = online_flag,
+		online_announced = online_flag,
+		announce_pending = false,
+		description = "injected by the selftest",
+		capabilities = [],
+		tags = [],
+		model = "",
+		max_workers = 0,
+		busy = false,
+		tasks_running = 0,
+		tasks_planned = 0,
+		uptime_ms = 0,
+		goals = false,
+		seen = std.millis(),
+		last_info = 0,
+		dev = dev,
+	];
+}
+
+rt_inject_node(router, rec) {
+	cs = std.critical_section_named(router._lock);
+	router._nodes.push_back(rec);
+	cs.release();
+}
+
+rt_drop_node(router, node_name) {
+	cs = std.critical_section_named(router._lock);
+	for(i = router._nodes.size() - 1; i >= 0; i--) {
+		if(std.string(router._nodes[i].name) == node_name) {
+			router._nodes.erase(i);
+		}
+	}
+	cs.release();
+}
+
+// the owner's event stream, filtered by kind + taskid
+rt_events_of(seen, kind, taskid = "") {
+	out = [];
+	for(i = 0; i < seen.size(); i++) {
+		e = seen[i];
+		if(std.string(e.kind ?? "") != kind) {
+			continue;
+		}
+		if(taskid && std.string(e.taskid ?? "") != taskid) {
+			continue;
+		}
+		out.push_back(e);
+	}
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Fixture: Router first (it takes UDP 6454), then the two stub nodes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -437,7 +534,11 @@ for(i = 0; i < seen_events.size(); i++) {
     ns_names += n + ",";
 }
 
-check("one connect is exactly one node_state event per node", ns_total == 2 && !ns_dup, ns_names);
+// The assertion is PER NODE: one connect must be one event, never two. The
+// machine running this suite is a ShizoNet network like any other — real AI
+// nodes on the LAN (a Pi, a backend server) join the discovery and add their
+// own node_state events, so the count is not pinned to the two stubs.
+check("one connect is exactly one node_state event per node", !ns_dup && ns_names.contains(GPU_NAME + ",") && ns_names.contains(WEB_NAME + ","), ns_names);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  2. Routing: the ROUTER AGENT picks the node.
@@ -691,6 +792,10 @@ for(i = 0; i < need.size(); i++) {
 
 check("the router role registers all ten tools", all_tools, tool_names);
 
+check("the router role offers get_goals", callbacks.has("get_goals"), "");
+goals_res = callbacks["get_goals"]([]);
+check("get_goals asks every node (stub nodes have no .agentspace)", std.string(goals_res).contains(GPU_NAME) && std.string(goals_res).contains("no .agentspace"), std.string(goals_res));
+
 // tool_callbacks[name](args): the registered callback takes the args json only.
 nodes_res = callbacks["get_nodes"]([]);
 check("get_nodes lists the fleet", std.string(nodes_res).contains(GPU_NAME) && std.string(nodes_res).contains(WEB_NAME), std.string(nodes_res));
@@ -895,6 +1000,216 @@ adopted = wait_for([rtr]() {
 	}, 4000);
 
 check("work of a node with nothing open is adopted", adopted && rtr.tasks_summary().size() == before_legit + 1, std.string(rtr.tasks_summary().size()) + " vs " + std.string(before_legit));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  10. Failure visibility: the REASON of every remote failure reaches the owner.
+//
+//  The user asks "run this on node Z". When the node refuses, crashes, stops,
+//  hangs or has no goal system, the chat must say so — not show a bare word.
+//  C1: every task_state event carries `error`.  C3: a node error lands in
+//  report AND last_error, a node-side stop mirrors as `stopped`.  C2: a task
+//  that goes quiet emits ONE task_stalled.  C4: add_task names why it failed.
+//  C5: the routing table says whether a node runs goals at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// C1: the field exists on EVERY task_state event the owner saw (sections 1..9)
+c1_total = 0;
+c1_missing = 0;
+for(i = 0; i < seen_events.size(); i++) {
+	e = seen_events[i];
+	if(std.string(e.kind ?? "") != "task_state") {
+		continue;
+	}
+	c1_total++;
+	if(!e.has("error")) {
+		c1_missing++;
+	}
+}
+check("every task_state event carries the error field (C1)", c1_total > 0 && c1_missing == 0, std.string(c1_missing) + " of " + std.string(c1_total));
+
+// C5: the node's goals flag reaches the record and the routing table. The node
+// side is shizonet_ai.shio's job (WS2), so the router side is driven straight
+// from the info json it receives.
+gpu_rec = rtr._find_node(GPU_NAME);
+rtr._apply_node_info(gpu_rec, [name = GPU_NAME, goals = 1]);
+gpu_sum = rtr._node_summary(gpu_rec);
+check("node info goals=1 reaches the record (C5)", gpu_rec.goals == true, std.string(gpu_rec.goals));
+check("the routing table exposes goals (C5)", gpu_sum.has("goals") && gpu_sum.goals, std.string(gpu_sum));
+rtr._apply_node_info(gpu_rec, [name = GPU_NAME, goals = 0]);
+check("node info goals=0 reads as false (C5)", !rtr._node_summary(gpu_rec).goals, std.string(rtr._node_summary(gpu_rec).goals));
+check("every node summary carries goals (C5)", rtr.nodes_summary().size() > 0 && rtr.nodes_summary()[0].has("goals"), std.string(rtr.nodes_summary()));
+
+// C3 + C1: a node-side crash mirrors as failed, with the reason in the record
+// AND riding the event.
+err_res = rtr.delegate(GPU_NAME, "STUBERROR the receptionist dies on the goal");
+check("delegate accepts the crashing job", err_res.ok, std.string(err_res));
+
+err_failed = wait_for([rtr, err_res]() {
+		t = rtr.inspect_task(err_res.taskid);
+		return std.is_json(t) && t.state == "failed";
+	}, 8000);
+
+err_rec = rtr.inspect_task(err_res.taskid);
+check("a node-side crash mirrors as failed (C3)", err_failed, std.string(err_rec));
+check("the node's error text reaches last_error (C3)", std.is_json(err_rec) && std.string(err_rec.last_error ?? "").contains("the receptionist exploded"), std.string(err_rec));
+check("the node's error text reaches report (C3)", std.is_json(err_rec) && std.string(err_rec.report ?? "").contains("the receptionist exploded"), std.string(err_rec));
+
+err_ev = rt_events_of(seen_events, "task_state", std.string(err_res.taskid));
+err_reason = "";
+for(i = 0; i < err_ev.size(); i++) {
+	if(std.string(err_ev[i].state ?? "") == "failed") {
+		err_reason = std.string(err_ev[i].error ?? "");
+	}
+}
+check("the failed task_state event carries the reason (C1)", err_reason.contains("the receptionist exploded"), err_reason);
+
+// C3: the node answers a stopped request as done + note="stopped"
+// (shizonet_ai.shio handle_poll). That is a STOPPED task, not a finished one.
+// The stop comes from the node's own owner, not from Router.stop_task, so the
+// router learns it from the poll.
+node_stop_res = rtr.delegate(GPU_NAME, "VERYSLOW the node stops this itself");
+node_stop_gen = false;
+node_stop_rid = "";
+
+if(node_stop_res.ok) {
+	node_stop_gen = wait_for([rtr, node_stop_res]() {
+			t = rtr.inspect_task(node_stop_res.taskid);
+			return std.is_json(t) && t.state == "generating";
+		}, 8000);
+
+	running_rec = rtr.inspect_task(node_stop_res.taskid);
+	if(std.is_json(running_rec)) {
+		node_stop_rid = std.string(running_rec.remote_request_id);
+	}
+
+	svcA.handle_request_stop(None, [request_id = node_stop_rid]);
+}
+
+node_stop_seen = wait_for([rtr, node_stop_res]() {
+		t = rtr.inspect_task(node_stop_res.taskid);
+		return std.is_json(t) && t.state == "stopped";
+	}, 8000);
+
+node_stop_rec = rtr.inspect_task(node_stop_res.taskid);
+check("a request stopped on the node mirrors as stopped, not finished (C3)",
+	node_stop_gen && node_stop_seen && std.is_json(node_stop_rec) && std.string(node_stop_rec.state ?? "") == "stopped",
+	std.string(node_stop_rec));
+
+// C2: the stall watchdog. STUBQUIET 1200 is one unbroken silent episode: the
+// first poll starts the clock, the node says nothing for 1.2s, so exactly one
+// 400ms window opens before the turn ends — one episode, one event. The default
+// (15 min) never fires inside a selftest.
+rtr.stall_ms = 400;
+
+stall_res = rtr.delegate(GPU_NAME, "STUBQUIET 1200 the node goes quiet");
+
+stall_seen = wait_for([seen_events, stall_res]() {
+		return rt_events_of(seen_events, "task_stalled", std.string(stall_res.taskid)).size() > 0;
+	}, 8000);
+
+stall_list = rt_events_of(seen_events, "task_stalled", std.string(stall_res.taskid));
+stall_first = stall_list.size() ? stall_list[0] : None;
+
+check("an open task that stops making progress emits task_stalled (C2)", stall_seen, std.string(stall_res));
+check("the stall event carries the payload (C2)",
+	std.is_json(stall_first) && stall_first.has("idle_ms") && stall_first.has("state") && stall_first.has("error") &&
+	std.string(stall_first.node ?? "") == GPU_NAME && std.string(stall_first.name ?? "").length() > 0,
+	std.string(stall_first));
+check("the stall event reports the open state and the idle time (C2)",
+	std.is_json(stall_first) && router_is_open_state(std.string(stall_first.state ?? "")) && std.int(stall_first.idle_ms ?? 0) >= 400,
+	std.string(stall_first));
+
+stall_err = std.is_json(stall_first) ? std.string(stall_first.error) : "no event";
+check("the stall event carries an empty error (C2)", std.is_json(stall_first) && stall_first.has("error") && stall_err == "", stall_err);
+
+stall_done = wait_for([rtr, stall_res]() {
+		t = rtr.inspect_task(stall_res.taskid);
+		return std.is_json(t) && !router_is_open_state(t.state);
+	}, 8000);
+
+stall_rec = rtr.inspect_task(stall_res.taskid);
+check("the stalled task finishes after the stall", stall_done && std.is_json(stall_rec) && std.string(stall_rec.state ?? "") == "finished", std.string(stall_rec));
+
+stall_list2 = rt_events_of(seen_events, "task_stalled", std.string(stall_res.taskid));
+stall_again = stall_list2.size();
+stall_dump = "";
+for(i = 0; i < stall_list2.size(); i++) {
+	stall_dump += "idle=" + std.string(stall_list2[i].idle_ms ?? 0) + " state=" + std.string(stall_list2[i].state ?? "") + " | ";
+}
+stall_states = rt_events_of(seen_events, "task_state", std.string(stall_res.taskid));
+stall_state_dump = "";
+for(i = 0; i < stall_states.size(); i++) {
+	stall_state_dump += std.string(stall_states[i].state ?? "?") + "@" + std.string(stall_states[i].time ?? 0) + " ";
+}
+check("one stall episode is exactly one task_stalled event (C2)", stall_again == 1, std.string(stall_again) + ": " + stall_dump + " states: " + stall_state_dump);
+check("progress resets the stall clock and the episode flag (C2)",
+	std.is_json(stall_rec) && std.int(stall_rec.last_progress ?? 0) > 0 && !stall_rec.stall_announced,
+	std.string(stall_rec));
+
+// stall_ms = 0: the watchdog is off, a quiet task stays quiet
+rtr.stall_ms = 0;
+
+off_res = rtr.delegate(GPU_NAME, "STUBQUIET 1200 nobody watches this one");
+off_done = wait_for([rtr, off_res]() {
+		t = rtr.inspect_task(off_res.taskid);
+		return std.is_json(t) && !router_is_open_state(t.state);
+	}, 8000);
+
+off_stalls = rt_events_of(seen_events, "task_stalled", std.string(off_res.taskid)).size();
+check("stall_ms = 0 turns the watchdog off (C2)", off_done && off_stalls == 0, std.string(off_stalls));
+
+rtr.stall_ms = ROUTER_TASK_STALL_MS;
+check("the default stall period is 15 minutes (C2)", rtr.stall_ms == 900000, std.string(rtr.stall_ms));
+
+// C4: add_task names the reason of its last failure, so the router agent can
+// tell the user WHY instead of "offline, unreachable or it refused".
+check("add_task without a node reports why (C4)",
+	std.is_none(rtr.add_task("NoTarget", "a goal that needs a node", "")) && std.string(rtr.add_task_error()).contains("no target node"),
+	std.string(rtr.add_task_error()));
+check("add_task on an unknown node reports why (C4)",
+	std.is_none(rtr.add_task("Ghost", "a goal for a ghost", "NoSuchNode")) &&
+	std.string(rtr.add_task_error()).contains("unknown node") && std.string(rtr.add_task_error()).contains("NoSuchNode"),
+	std.string(rtr.add_task_error()));
+
+rt_inject_node(rtr, rt_node_record(DEAD_NAME, "DEAD:00", false, None));
+check("add_task on an offline node reports why (C4)",
+	std.is_none(rtr.add_task("Dead", "a goal for a dead node", DEAD_NAME)) &&
+	std.string(rtr.add_task_error()).contains("offline") && std.string(rtr.add_task_error()).contains(DEAD_NAME),
+	std.string(rtr.add_task_error()));
+rt_drop_node(rtr, DEAD_NAME);
+
+// the node refuses the delegation on the wire: an empty prompt
+check("a delegation refusal reports the node's reason (C4)",
+	std.is_none(rtr.add_task("Empty", "", GPU_NAME)) && std.string(rtr.add_task_error()).contains("missing 'prompt'"),
+	std.string(rtr.add_task_error()));
+
+// the node refuses the worker task: an empty goal
+check("a worker-pool refusal reports the node's reason (C4)",
+	std.is_none(rtr.add_task("NoGoal", "", GPU_NAME, "worker")) && std.string(rtr.add_task_error()).contains("missing 'goal'"),
+	std.string(rtr.add_task_error()));
+
+// an exception inside the routing must not escape as a bare None
+rt_inject_node(rtr, rt_node_record(BOOM_NAME, "BOOM:00", true, rt_boom_dev()));
+boom_id = rtr.add_task("Boom", "explode on the way out", BOOM_NAME);
+rt_drop_node(rtr, BOOM_NAME);
+check("add_task survives a device handle that raises (C4)", std.is_none(boom_id), std.string(boom_id));
+check("the exception reason reaches add_task_error (C4)", std.string(rtr.add_task_error()).contains("device handle is broken"), std.string(rtr.add_task_error()));
+
+// a success clears the reason again
+clean_id = rtr.add_task("Clean", "a goal the node takes", GPU_NAME, "worker");
+check("a successful add_task clears the reason (C4)", std.string(clean_id).length() > 0 && std.string(rtr.add_task_error()).empty(), std.string(rtr.add_task_error()));
+check("add_task_error() is a plain string (C4)", std.is_string(rtr.add_task_error()), std.type(rtr.add_task_error()));
+
+// C1 on the creation event: the field is there, and empty
+create_ev = None;
+for(i = 0; i < seen_events.size(); i++) {
+	e = seen_events[i];
+	if(std.string(e.kind ?? "") == "task_state" && std.string(e.taskid ?? "") == std.string(clean_id) && !e.has("prev")) {
+		create_ev = e;
+	}
+}
+create_err = std.is_json(create_ev) ? std.string(create_ev.error) : "no event";
+check("the creation task_state event carries an empty error (C1)", std.is_json(create_ev) && create_ev.has("error") && create_err == "", create_err);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Teardown

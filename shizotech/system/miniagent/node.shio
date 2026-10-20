@@ -7,6 +7,12 @@
 //           shz node.shio --name Box --description "GPU box"   headless AI node
 //           shz node.shio --webserver --port 13337             + JSON web API
 //           shz node.shio --port 13337 --api-token secret
+//           shz node.shio --agentspace .agentspace             scheduled goals
+//
+//  Goals: when the working directory has an .agentspace/ (shz miniagent.goals init)
+//  or --agentspace <dir> is given, the node runs the goal scheduler
+//  (goal_engine.shio, goals_spec.md): scheduled work starts on its own, in its
+//  window, through the same worker pool. --no-goals turns it off.
 //
 //  Model configs:
 //           --config <name|path[#profile]>
@@ -45,6 +51,7 @@
 //    /message <id> <text> enqueue a message into a Mind's mailbox
 //    /stop <id>           request a Mind to stop
 //    /notify [level]      show/set event notification level: all | notify | off
+//    /goals               scheduled goals (next window, last outcome)
 //    /config              show receptionist + worker config paths
 //    /configs             list model configs
 //    /clear               clear the receptionist transcript
@@ -57,6 +64,7 @@
 #include "node_api"
 #include "shizonet_ai"
 #include "model_config_cli"
+#include "goal_engine"
 
 node_value_flags() {
 	return [
@@ -66,6 +74,7 @@ node_value_flags() {
 		"--api-token",
 		"--max-workers",
 		"--workers",
+		"--agentspace",
 	];
 }
 
@@ -170,9 +179,55 @@ mind_host_report(agt) {
 	std.cout(token_usage_global["usage"]);
 }
 
+// the .agentspace this node schedules goals from ("" = goals off)
+node_goals_root() {
+	if(model_config_cli_has_flag("--no-goals"))
+		return "";
+
+	r = std.argvoption("--agentspace");
+
+	if(r)
+		return std.string(r);
+
+	if(fileio.is_directory(".agentspace/goals"))
+		return ".agentspace";
+
+	return "";
+}
+
+node_print_goals(sch) {
+	if(!sch) {
+		std.cout("Goals are off. Create them with: shz miniagent.goals init (then restart the node)\n");
+		return;
+	}
+
+	list = sch.overview();
+
+	if(!list.size()) {
+		std.cout("No goals in " + sch.space.root + "/goals/.\n");
+		return;
+	}
+
+	for(g : list) {
+		line = "[" + gj_str(g, "status", "") + "] " + gj_str(g, "id", "") + " - " + gj_str(g, "title", "");
+		if(gj_str(g, "schedule", ""))
+			line += "\n    " + g.schedule;
+		if(gj_str(g, "active_window", ""))
+			line += "\n    now: " + g.active_window + " (" + gj_str(g, "active_state", "") + ")";
+		else if(gj_str(g, "next_window", "") && gj_str(g, "status", "") == "active")
+			line += "\n    next: " + g.next_window;
+		if(gj_str(g, "last_outcome", ""))
+			line += "\n    last: " + g.last_outcome;
+		if(gj(g, "invalid_edit", false))
+			line += "\n    ! the file has an invalid edit: " + gfm_join(gj(g, "errors", []), "; ");
+		std.cout(line + "\n");
+	}
+}
+
 node_host_help() {
 	std.cout(
 		"\n/config                show receptionist + worker config paths\n" +
+		"/goals                scheduled goals\n" +
 		"/configs               list model configs\n" +
 		"/overview              all Minds and their lifecycle states\n" +
 		"/status                dispatcher + store statistics\n" +
@@ -259,6 +314,22 @@ ai = ai_node_attach(node, host, [
 
 std.print("Shizonet AI node online: " + ai.node_name());
 
+// ── scheduled goals (.agentspace) ────────────────────────────────────────────
+goals_root = node_goals_root();
+
+if(goals_root) {
+	goal_space = GoalSpace(goals_root);
+
+	if(!goal_space.exists()) {
+		created = goal_space.init(__DIR__ + "/agentspace_template");
+		std.print("Created " + goals_root + "/ (" + created.size() + " files) from the template.");
+	}
+
+	host.goals = GoalScheduler(goal_space, host);
+	host.goals.start();
+	std.print("Goal scheduler on " + goals_root + "/ - shz miniagent.goals list");
+}
+
 interactive_mode = node_is_interactive_mode();
 web_mode = node_is_web_mode();
 prompt = model_config_cli_positional_prompt(node_value_flags());
@@ -295,6 +366,11 @@ if(interactive_mode) {
 
 		if(cmd == "/help") {
 			node_host_help();
+			continue;
+		}
+
+		if(cmd == "/goals") {
+			node_print_goals(host.goals);
 			continue;
 		}
 
@@ -363,6 +439,9 @@ else {
 	std.print("Headless AI node. Ctrl+C to stop.\n");
 	std.sleep(-1);
 }
+
+if(host.goals)
+	host.goals.stop();
 
 ai.stop();
 std.cout("\nHost stopped.\n");

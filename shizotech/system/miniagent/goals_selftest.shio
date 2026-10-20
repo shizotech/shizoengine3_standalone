@@ -1,0 +1,839 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  goals_selftest.shio — time zones, goal files and the scheduler, no LLM
+//
+//  Usage:  shz goals_selftest.shio
+//
+//  The scheduler runs against a fake host (records add_task / stop_task /
+//  update_task, finishes tasks on demand) and a fake clock, in a throw-away
+//  .agentspace under the current directory.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "goal_tools"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+section(name) {
+	std.print("\n── ", name);
+}
+
+// local wall time in a zone -> UTC seconds
+at(zone, date, clock) {
+	return gt_local_to_utc(zone, gt_parse_date(date) * GT_DAY + gt_parse_clock(clock));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Fakes
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FakeClock {
+	t = 0;
+}
+
+class FakeHost {
+	tasks = [];
+	stops = [];
+	updates = [];
+	notes = [];
+	listeners = [];
+	busy = 0;
+	workers = 2;
+	idle = 100000;
+	refuse = false;
+
+	add_task(name, goal) {
+		if(refuse)
+			return None;
+		id = "t" + std.string(tasks.size() + 1);
+		tasks.push_back([taskid = id, name = name, task = goal, state = "research", report = "", last_update_ms = std.millis()]);
+		return id;
+	}
+
+	find(taskid) {
+		for(t : tasks) {
+			if(t.taskid == taskid)
+				return t;
+		}
+		return None;
+	}
+
+	inspect_task(taskid) {
+		t = find(taskid);
+		if(!t)
+			return "Not found.";
+		return t;
+	}
+
+	stop_task(taskid) {
+		stops.push_back(taskid);
+		return true;
+	}
+
+	update_task(taskid, msg) {
+		updates.push_back([taskid = taskid, message = msg]);
+		return true;
+	}
+
+	notify_user(msg) {
+		notes.push_back(msg);
+	}
+
+	add_task_finished_listener(cb) {
+		listeners.push_back(cb);
+	}
+
+	background_capacity() {
+		return [workers = workers, busy = busy, interactive_idle_secs = idle];
+	}
+
+	// the worker ends a task
+	finish(taskid, state, report) {
+		t = find(taskid);
+		t.state = state;
+		t.report = report;
+		for(cb : listeners)
+			cb(t);
+	}
+
+	open_tasks() {
+		n = 0;
+		for(t : tasks) {
+			if(t.state == "research" || t.state == "implement")
+				n++;
+		}
+		return n;
+	}
+}
+
+ROOT = "goals_selftest_tmp_" + std.random_hash(6);
+TEMPLATE = __DIR__ + "/agentspace_template";
+
+write_goal_file(status, id, text) {
+	dir = ROOT + "/goals/" + status + "/" + id;
+	goal_mkdir(dir);
+	fileio.write_text(dir + "/goal.md", text);
+}
+
+count_activations(sch, goal) {
+	n = 0;
+	for(k, a : sch.ledger.data.activations) {
+		if(a.goal == goal)
+			n++;
+	}
+	return n;
+}
+
+has_event(sch, kind, goal) {
+	for(e : sch.ledger.data.events) {
+		if(e.kind == kind && e.goal == goal)
+			return true;
+	}
+	return false;
+}
+
+notes_with(host, needle) {
+	n = 0;
+	for(m : host.notes) {
+		if(std.string(m).contains(needle))
+			n++;
+	}
+	return n;
+}
+
+// the workers end every task that is still running
+finish_open(host, sch) {
+	for(t : host.tasks) {
+		if(t.state == "research")
+			host.finish(t.taskid, "finished", "done");
+	}
+	sch.tick();
+}
+
+std.print("goals_selftest\n");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("time zones");
+
+ber = gt_zone("Europe/Berlin");
+check("Europe/Berlin resolves", ber.ok && ber.has_dst, ber.error);
+
+ber_builtin = gt_tz_parse_posix(GT_ZONES["Europe/Berlin"]);
+check("built-in Berlin rule matches", ber_builtin.ok && ber_builtin.std_off == 3600 && ber_builtin.dst_off == 7200, ber_builtin.spec);
+
+u = at(ber, "2026-03-29", "02:30");
+check("spring gap 02:30 moves forward to 03:30 CEST", gt_format_local(ber, u).starts("2026-03-29 03:30 CEST"), gt_format_local(ber, u));
+
+u = at(ber, "2026-10-25", "02:30");
+check("autumn overlap takes the first 02:30 (CEST)", gt_format_utc(u) == "2026-10-25T00:30:00Z", gt_format_utc(u));
+
+w = gt_window_on(ber, gt_parse_date("2026-10-24"), gt_parse_clock("22:00"), gt_parse_clock("06:00"));
+check("22:00-06:00 across the fall back is 9 hours", w.end - w.start == 9 * 3600, std.string((w.end - w.start) / 3600));
+
+w = gt_window_on(ber, gt_parse_date("2026-03-28"), gt_parse_clock("22:00"), gt_parse_clock("06:00"));
+check("22:00-06:00 across the spring forward is 7 hours", w.end - w.start == 7 * 3600, std.string((w.end - w.start) / 3600));
+
+w = gt_window_on(ber, gt_parse_date("2026-07-01"), gt_parse_clock("04:00"), gt_parse_clock("10:00"));
+check("summer 04:00 Berlin is 02:00 UTC", gt_format_utc(w.start) == "2026-07-01T02:00:00Z", gt_format_utc(w.start));
+
+syd = gt_tz_parse_posix(GT_ZONES["Australia/Sydney"]);
+check("Sydney: January is daylight time (+11)", gt_offset_at(syd, at(ber, "2026-01-15", "12:00")) == 11 * 3600, "");
+check("Sydney: July is standard time (+10)", gt_offset_at(syd, at(ber, "2026-07-15", "12:00")) == 10 * 3600, "");
+
+ny = gt_tz_parse_posix(GT_ZONES["America/New_York"]);
+check("New York switches on the 2nd Sunday of March", gt_is_dst(ny, gt_parse_date("2026-03-08") * GT_DAY + 8 * 3600) && !gt_is_dst(ny, gt_parse_date("2026-03-08") * GT_DAY + 6 * 3600), "");
+
+check("half hour zone (Kolkata +05:30)", gt_tz_parse_posix(GT_ZONES["Asia/Kolkata"]).std_off == 19800, "");
+check("unknown zone is an error", !gt_zone("Mars/Olympus").ok, "");
+check("a POSIX rule is accepted directly", gt_zone("CET-1CEST,M3.5.0,M10.5.0/3").ok, "");
+check("weekday of 2026-10-19 is Monday", gt_weekday(gt_parse_date("2026-10-19")) == 1, "");
+check("weekday names (de/en)", gt_weekday_index("So") == 0 && gt_weekday_index("thursday") == 4 && gt_weekday_index("x") == -1, "");
+check("durations", gt_parse_duration("1h30m") == 5400 && gt_parse_duration("45") == 2700 && std.is_none(gt_parse_duration("abc")), "");
+check("clock 24:00 ok, 25:00 rejected", gt_parse_clock("24:00") == GT_DAY && std.is_none(gt_parse_clock("25:00")), "");
+check("invalid date rejected", std.is_none(gt_parse_date("2026-02-30")), "");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("front matter");
+
+doc = gfm_read_text("---\nid: a\nschedule:\n  type: recurring\n  days: [mon, \"tue\"]\n  start: \"05:00\"\nlist:\n  - x\n  - y: 1\n    z: 2\n---\n\n# Body\n");
+check("parses nested maps and lists", doc.ok && doc.data.schedule.type == "recurring" && doc.data.schedule.days.size() == 2, doc.error);
+check("parses list of maps", doc.ok && doc.data.list[1].z == 2, doc.error);
+check("body follows the front matter", doc.body.starts("# Body"), doc.body);
+
+bad = gfm_read_text("---\nid: a\n  oops: 1\n---\n");
+check("bad indentation is an error with its file line", !bad.ok && bad.line == 3, bad.error + " line " + bad.line);
+
+bad = gfm_read_text("---\nid: a\nid: b\n---\n");
+check("duplicate keys are an error", !bad.ok && bad.error.contains("duplicate"), bad.error);
+
+bad = gfm_read_text("---\nid: a\n");
+check("unclosed front matter is an error", !bad.ok, "");
+
+rt = gfm_read_text(gfm_compose(doc.data, doc.body));
+check("compose -> parse round trip", rt.ok && rt.data.compact_string() == doc.data.compact_string(), rt.error);
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("agentspace + validation");
+
+space = GoalSpace(ROOT);
+created = space.init(TEMPLATE);
+check("init creates the tree from the template", fileio.exists(ROOT + "/preferences/scheduling.md") && fileio.is_directory(ROOT + "/goals/active") && created.size() > 3, std.string(created.size()));
+check("init never overwrites", space.init(TEMPLATE).size() == 0, "");
+
+prefs = space.preferences();
+check("template preferences are valid", prefs.errors.size() == 0, gfm_join(prefs.errors, "; "));
+// the tests pin the zone: the template says Europe/Berlin
+check("template time zone is Europe/Berlin", gj_str(prefs, "timezone") == "Europe/Berlin", gj_str(prefs, "timezone"));
+check("'tonight' means 04:00-10:00", gj_str(prefs.windows.tonight, "start") == "04:00" && gj_str(prefs.windows.tonight, "end") == "10:00", "");
+
+for(f : space.folders()) {
+	r = space.load(f, prefs);
+	check("example goal " + f.id + " is valid", r.ok, gfm_join(r.errors, "; "));
+}
+
+v = goal_validate(std.json(), "", prefs, "x", "active");
+check("empty front matter: title + schedule errors", !v.ok && v.errors.size() >= 2, gfm_join(v.errors, "; "));
+
+v = goal_validate(gfm_read_text("---\ntitle: T\nschedule:\n  type: recurring\n  days: [funday]\n  start: \"25:00\"\n  timezone: Mars/X\npolicy:\n  stop_policy: explode\n---\nDo it\n").data, "Do it", prefs, "x", "active");
+check("bad weekday / clock / zone / enum are all reported", !v.ok && v.errors.size() == 4, gfm_join(v.errors, "; "));
+
+// The three requests of issue #477 as the interpreter would write them
+tonight = goal_validate(gfm_read_text("---\ntitle: Explore a new app idea\nschedule:\n  type: once\n  date: 2026-10-20\n  window: tonight\n---\nExplore.\n").data, "Explore.", prefs, "app-idea", "active");
+check("'tonight' goal: once, 04:00-10:00 from the preferences", tonight.ok && tonight.def.schedule.start == 4 * 3600 && tonight.def.schedule.end == 10 * 3600 && tonight.def.schedule.type == "once", gfm_join(tonight.errors, "; "));
+tw = goal_next_windows(tonight.def, at(ber, "2026-10-19", "20:00"), 3);
+check("'tonight' goal has exactly one window, 2026-10-20 04:00 CEST", tw.size() == 1 && gt_format_local(ber, tw[0].start).starts("2026-10-20 04:00"), tw.size() ? goal_window_text(tonight.def, tw[0]) : "none");
+
+sunday = goal_validate(gfm_read_text("---\ntitle: Weekly repository maintenance\nschedule:\n  type: recurring\n  days: [sunday]\n  window: tonight\n---\nClean up.\n").data, "Clean up.", prefs, "weekly", "active");
+sw = goal_next_windows(sunday.def, at(ber, "2026-10-19", "12:00"), 3);
+check("'each Sunday' goal: weekly windows on Sundays", sunday.ok && sw.size() == 3 && gt_weekday(sw[0].day) == 0 && sw[1].day - sw[0].day == 7, "");
+
+issues = goal_validate(gfm_read_text("---\ntitle: Fix GitHub issues\nschedule:\n  type: windowed\n  days: weekdays\n  window: tonight\n  start: \"05:00\"\n  end: \"10:00\"\n---\nFix.\n").data, "Fix.", prefs, "gh", "active");
+check("'from 05:00 to 10:00' overrides the default window", issues.ok && issues.def.schedule.start == 5 * 3600 && issues.def.schedule.end == 10 * 3600, "");
+check("windowed goals repeat inside their window", issues.def.policy.repeat_in_window && issues.def.policy.max_runs_per_window > 1, "");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("scheduler: activation, idempotency, restart");
+
+GH = R"(---
+id: gh-issues
+title: Resolve eligible GitHub issues
+schedule:
+  type: recurring
+  days: weekdays
+  start: "05:00"
+  end: "10:00"
+  timezone: Europe/Berlin
+policy:
+  max_attempts: 3
+  retry_backoff: 5m
+---
+
+# Objective
+
+Resolve eligible issues.
+)";
+
+write_goal_file("active", "gh-issues", GH);
+
+clk = FakeClock();
+clk.t = at(ber, "2026-10-19", "04:59");
+
+host = FakeHost();
+sch = GoalScheduler(ROOT, host, [notify = true]);
+sch.clock = [clk]() { return clk.t; };
+
+sch.tick();
+check("before the window: nothing activated", count_activations(sch, "gh-issues") == 0 && host.tasks.size() == 0, "");
+
+clk.t = at(ber, "2026-10-19", "05:00") + 20;
+sch.tick();
+check("window start: one activation", count_activations(sch, "gh-issues") == 1, "");
+check("window start: one task dispatched", host.tasks.size() == 1 && host.tasks[0].name == "Goal-gh-issues", std.string(host.tasks.size()));
+check("the prompt carries the instructions and the window", host.tasks.size() && host.tasks[0].task.contains("Resolve eligible issues.") && host.tasks[0].task.contains("05:00 CEST"), "");
+check("the start is announced", notes_with(host, "Goal gh-issues starts") == 1, std.string(host.notes));
+
+sch.tick();
+sch.tick();
+check("more ticks: still one activation, one task", count_activations(sch, "gh-issues") == 1 && host.tasks.size() == 1, "");
+
+// restart: a new process, the host lost its in-memory tasks
+clk.t = at(ber, "2026-10-19", "05:10");
+host2 = FakeHost();
+sch2 = GoalScheduler(ROOT, host2, [notify = true]);
+sch2.clock = [clk]() { return clk.t; };
+sch2.tick();
+check("restart: no second activation for the same window", count_activations(sch2, "gh-issues") == 1, "");
+check("restart: the interrupted run is recorded", has_event(sch2, "run_interrupted", "gh-issues"), "");
+check("restart: the run is retried on the new host", host2.tasks.size() == 1, std.string(host2.tasks.size()));
+
+sch2.tick();
+check("restart: no duplicate retry", host2.tasks.size() == 1, std.string(host2.tasks.size()));
+
+host2.finish("t1", "finished", "Fixed issue #12, tests pass.");
+sch2.tick();
+akey = "";
+for(k, a : sch2.ledger.data.activations)
+	akey = k;
+act = sch2.ledger.data.activations[akey];
+check("finished run closes the window (no repeat)", act.state == "done", act.state);
+check("no new run after success", host2.tasks.size() == 1, "");
+check("history.md got an entry", goal_read(ROOT + "/goals/active/gh-issues/history.md").contains("Fixed issue #12"), "");
+check("the run records the definition revision", act.runs[act.runs.size() - 1].revision == act.revision && act.revision != "", "");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("scheduler: failures and retries");
+
+clk.t = at(ber, "2026-10-20", "05:00") + 5;
+sch2.tick();
+check("next weekday: new activation", count_activations(sch2, "gh-issues") == 2 && host2.tasks.size() == 2, "");
+
+host2.finish("t2", "failed", "build broke");
+clk.t += 60;
+sch2.tick();
+check("a failure schedules a retry, not an immediate run", host2.tasks.size() == 2 && has_event(sch2, "retry_scheduled", "gh-issues"), "");
+clk.t += 5 * 60;
+sch2.tick();
+check("the retry runs after the backoff", host2.tasks.size() == 3, std.string(host2.tasks.size()));
+host2.finish("t3", "failed", "still broken");
+clk.t += 60;
+sch2.tick();
+clk.t += 5 * 60;
+sch2.tick();
+check("the third attempt runs", host2.tasks.size() == 4, std.string(host2.tasks.size()));
+host2.finish("t4", "failed", "broken again");
+clk.t += 60;
+sch2.tick();
+clk.t += 10 * 60;
+sch2.tick();
+check("max_attempts ends the window as failed", host2.tasks.size() == 4 && notes_with(host2, "no attempts left") == 1, std.string(host2.tasks.size()));
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("scheduler: window end and stop policy");
+
+WIN = R"(---
+id: nightly-fixes
+title: Nightly fixes
+schedule:
+  type: windowed
+  days: daily
+  start: "22:00"
+  end: "23:00"
+  timezone: Europe/Berlin
+policy:
+  stop_policy: checkpoint
+  checkpoint_grace: 10m
+  min_remaining: 15m
+---
+
+Fix things repeatedly.
+)";
+write_goal_file("active", "nightly-fixes", WIN);
+
+clk.t = at(ber, "2026-10-20", "22:00") + 5;
+sch2.tick();
+n0 = host2.tasks.size();
+check("windowed goal dispatches", n0 == 5, std.string(n0));
+host2.finish("t5", "finished", "fixed one");
+clk.t += 60;
+sch2.tick();
+check("windowed goal repeats after a finished run", host2.tasks.size() == 6, std.string(host2.tasks.size()));
+check("the next run sees the previous report", host2.tasks[5].task.contains("fixed one"), "");
+
+clk.t = at(ber, "2026-10-20", "23:00") + 1;
+sch2.tick();
+check("window end asks the running task to checkpoint", host2.updates.size() == 1 && host2.updates[0].taskid == "t6", std.string(host2.updates.size()));
+check("window end does not stop at once", host2.stops.size() == 0, "");
+clk.t += 11 * 60;
+sch2.tick();
+check("after the grace the task is stopped", host2.stops.size() == 1 && host2.stops[0] == "t6", std.string(host2.stops));
+host2.finish("t6", "stopped", "");
+clk.t += 30;
+sch2.tick();
+nact = None;
+for(k, a : sch2.ledger.data.activations) {
+	if(a.goal == "nightly-fixes")
+		nact = a;
+}
+check("a requested stop is not a failure: the window is done", nact.state == "done", nact.state);
+check("nothing new is admitted after the window", host2.tasks.size() == 6, "");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("scheduler: misfire policies");
+
+space.move("nightly-fixes", "paused");
+space.move("gh-issues", "archived");
+
+MIS = R"(---
+id: mis-[ID]
+title: Misfire [ID]
+schedule:
+  type: recurring
+  days: daily
+  start: "06:00"
+  end: "09:00"
+  timezone: Europe/Berlin
+  misfire: [P]
+---
+
+Misfire test.
+)";
+
+// the goals exist (scheduler sees them) before their windows
+clk.t = at(ber, "2026-10-21", "01:00");
+write_goal_file("active", "mis-skip", MIS.replace("[ID]", "skip").replace("[P]", "skip"));
+write_goal_file("active", "mis-run-if-open", MIS.replace("[ID]", "run-if-open").replace("[P]", "run_if_open"));
+write_goal_file("active", "mis-catch-up", MIS.replace("[ID]", "catch-up").replace("[P]", "catch_up"));
+sch2.tick();
+
+// the scheduler is down from 01:00 until 07:00: the windows started without it
+clk.t = at(ber, "2026-10-21", "07:00");
+host3 = FakeHost();
+sch3 = GoalScheduler(ROOT, host3, [notify = true]);
+sch3.clock = [clk]() { return clk.t; };
+sch3.tick();
+check("misfire skip: a late window is skipped", has_event(sch3, "window_skipped", "mis-skip"), "");
+check("misfire run_if_open: a late window still runs", has_event(sch3, "window_activated", "mis-run-if-open"), "");
+
+// down for the whole next window
+clk.t = at(ber, "2026-10-22", "10:00");
+host4 = FakeHost();
+sch4 = GoalScheduler(ROOT, host4, [notify = true]);
+sch4.clock = [clk]() { return clk.t; };
+sch4.tick();
+check("a window missed entirely is recorded as missed", has_event(sch4, "window_missed", "mis-run-if-open"), "");
+check("misfire catch_up runs the missed window once, now", has_event(sch4, "window_catch_up", "mis-catch-up") && count_activations(sch4, "mis-catch-up") >= 1, "");
+nmissed = 0;
+for(m : host4.notes) {
+	if(std.string(m).contains("missed"))
+		nmissed++;
+}
+check("missed windows are reported to the owner", nmissed >= 1, std.string(host4.notes));
+
+for(id : ["mis-skip", "mis-run-if-open", "mis-catch-up"])
+	space.move(id, "archived");
+sch4.tick();
+check("archived goals keep their running task (drain)", host4.open_tasks() > 0 && host4.stops.size() == 0, std.string(host4.open_tasks()));
+finish_open(host4, sch4);
+check("max_background_tasks is free again", sch4.background_running() == 0, std.string(sch4.background_running()));
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("definitions: edits, invalid edits, conflicts, pause");
+
+ED = R"(---
+id: edit-me
+title: Edit me
+schedule:
+  type: recurring
+  days: daily
+  start: "12:00"
+  end: "14:00"
+  timezone: Europe/Berlin
+---
+
+Version one.
+)";
+write_goal_file("active", "edit-me", ED);
+clk.t = at(ber, "2026-10-23", "11:00");
+sch4.tick();
+rev1 = sch4.defs["edit-me"].revision;
+
+fileio.write_text(ROOT + "/goals/active/edit-me/goal.md", ED.replace("start: \"12:00\"", "start: \"99:00\""));
+sch4.tick();
+check("invalid edit: the last valid revision stays active", sch4.defs["edit-me"].revision == rev1 && sch4.defs["edit-me"].schedule.start == 12 * 3600, "");
+check("invalid edit: one clear error event", has_event(sch4, "definition_invalid", "edit-me") && notes_with(host4, "edit is invalid") == 1, std.string(host4.notes));
+sch4.tick();
+check("invalid edit: reported once, not every tick", notes_with(host4, "edit is invalid") == 1, "");
+check("overview flags the invalid edit", sch4.goal_summary("edit-me", sch4.defs["edit-me"]).invalid_edit, "");
+
+fileio.write_text(ROOT + "/goals/active/edit-me/goal.md", ED.replace("Version one.", "Version two."));
+sch4.tick();
+rev2 = sch4.defs["edit-me"].revision;
+check("valid edit applies a new revision", rev2 != rev1 && sch4.defs["edit-me"].body.contains("Version two"), "");
+check("valid edit is audited", has_event(sch4, "definition_changed", "edit-me"), "");
+check("diff shows the change", goal_line_diff(sch4.ledger.goal("edit-me").previous_text, sch4.ledger.goal("edit-me").text).contains("+ Version two."), "");
+
+clk.t = at(ber, "2026-10-23", "12:00") + 5;
+sch4.tick();
+check("edited goal activates once", count_activations(sch4, "edit-me") == 1, "");
+fileio.write_text(ROOT + "/goals/active/edit-me/goal.md", ED.replace("Version one.", "Version three."));
+sch4.tick();
+check("an edit during the window does not create a duplicate activation", count_activations(sch4, "edit-me") == 1, "");
+check("the running activation keeps the revision it started with", sch4.ledger.activation("edit-me@" + gt_format_utc(at(ber, "2026-10-23", "12:00"))).revision == rev2, "");
+
+cur = goal_text_revision(goal_read(ROOT + "/goals/active/edit-me/goal.md"));
+wr = space.write_goal("edit-me", gfm_read_text(goal_read(ROOT + "/goals/active/edit-me/goal.md")).data, "Agent version.", "active", rev1);
+check("a stale revision is refused (concurrent edit)", !wr.ok && gj(wr, "conflict", false), gfm_join(gj(wr, "errors", []), ";"));
+wr = space.write_goal("edit-me", gfm_read_text(goal_read(ROOT + "/goals/active/edit-me/goal.md")).data, "Agent version.", "active", cur);
+check("the current revision is accepted", wr.ok, gfm_join(gj(wr, "errors", []), ";"));
+wr = space.write_goal("new-goal", [title = "New", schedule = [type = "manual"]], "Do.", "proposed");
+check("write_goal creates a proposed goal", wr.ok && fileio.exists(ROOT + "/goals/proposed/new-goal/goal.md"), gfm_join(gj(wr, "errors", []), ";"));
+wr = space.write_goal("bad-goal", [title = "Bad", schedule = [type = "once"]], "Do.", "proposed");
+check("write_goal refuses an invalid goal and writes nothing", !wr.ok && !fileio.exists(ROOT + "/goals/proposed/bad-goal"), "");
+
+res = space.move("edit-me", "paused");
+sch4.tick();
+check("pause moves the folder", res.ok && fileio.exists(ROOT + "/goals/paused/edit-me/goal.md"), "");
+before = host4.tasks.size();
+clk.t = at(ber, "2026-10-24", "12:00") + 5;
+sch4.tick();
+check("a paused goal starts no new window", count_activations(sch4, "edit-me") == 1 && host4.tasks.size() == before, "");
+space.move("edit-me", "active");
+clk.t = at(ber, "2026-10-25", "12:00") + 5;
+sch4.tick();
+check("resume: the next window activates", count_activations(sch4, "edit-me") == 2, std.string(count_activations(sch4, "edit-me")));
+space.move("edit-me", "archived");
+sch4.tick();
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("dry run, verification, capacity, once goals");
+
+finish_open(host4, sch4);
+
+DRY = R"(---
+id: dry
+title: Dry
+schedule:
+  type: recurring
+  days: daily
+  start: "15:00"
+  end: "16:00"
+  timezone: Europe/Berlin
+policy:
+  dry_run: true
+---
+
+Dry instructions.
+)";
+write_goal_file("active", "dry", DRY);
+clk.t = at(ber, "2026-10-26", "14:00");
+sch4.tick();
+before = host4.tasks.size();
+clk.t = at(ber, "2026-10-26", "15:00") + 5;
+sch4.tick();
+sch4.tick();
+check("dry run dispatches nothing", host4.tasks.size() == before, "");
+check("dry run writes the prompt to history.md", goal_read(ROOT + "/goals/active/dry/history.md").contains("Dry instructions."), "");
+space.move("dry", "archived");
+
+VER = R"(---
+id: verified
+title: Verified work
+schedule:
+  type: recurring
+  days: daily
+  start: "17:00"
+  end: "20:00"
+  timezone: Europe/Berlin
+policy:
+  verify: true
+  retry_backoff: 1m
+---
+
+Do verified work.
+
+## Acceptance Criteria
+
+- tests pass
+)";
+write_goal_file("active", "verified", VER);
+clk.t = at(ber, "2026-10-26", "16:30");
+sch4.tick();
+clk.t = at(ber, "2026-10-26", "17:00") + 5;
+sch4.tick();
+wid = host4.tasks[host4.tasks.size() - 1].taskid;
+host4.finish(wid, "finished", "done, I think");
+clk.t += 30;
+sch4.tick();
+vt = host4.tasks[host4.tasks.size() - 1];
+check("a finished run triggers a verification run", vt.name == "Verify-verified" && vt.task.contains("done, I think"), vt.name);
+host4.finish(vt.taskid, "failed", "tests fail in foo");
+clk.t += 30;
+sch4.tick();
+wt = host4.tasks[host4.tasks.size() - 1];
+check("a failed verification starts another work run with the gaps", wt.name == "Goal-verified" && wt.task.contains("tests fail in foo"), wt.name);
+host4.finish(wt.taskid, "finished", "fixed foo");
+clk.t += 30;
+sch4.tick();
+vt2 = host4.tasks[host4.tasks.size() - 1];
+host4.finish(vt2.taskid, "finished", "all criteria met");
+clk.t += 30;
+sch4.tick();
+vact = sch4.ledger.activation("verified@" + gt_format_utc(at(ber, "2026-10-26", "17:00")));
+check("verified work closes the window as done", vact.state == "done", vact.state);
+space.move("verified", "archived");
+finish_open(host4, sch4);
+
+CAP = R"(---
+id: cap
+title: Capacity
+schedule:
+  type: recurring
+  days: daily
+  start: "21:00"
+  end: "23:00"
+  timezone: Europe/Berlin
+---
+
+Capacity test.
+)";
+write_goal_file("active", "cap", CAP);
+clk.t = at(ber, "2026-10-26", "20:00");
+sch4.tick();
+host4.busy = 2;
+before = host4.tasks.size();
+clk.t = at(ber, "2026-10-26", "21:00") + 5;
+sch4.tick();
+check("no free worker: the run waits", host4.tasks.size() == before && has_event(sch4, "dispatch_waiting", "cap"), "");
+host4.busy = 0;
+host4.idle = 60;
+sch4.tick();
+check("recent interactive use: background work yields", host4.tasks.size() == before, "");
+host4.idle = 100000;
+sch4.tick();
+check("capacity back: the run starts", host4.tasks.size() == before + 1, "");
+space.move("cap", "archived");
+finish_open(host4, sch4);
+
+ONCE = R"(---
+id: once-goal
+title: Once
+schedule:
+  type: once
+  date: 2026-10-27
+  window: tonight
+---
+
+Once.
+)";
+write_goal_file("active", "once-goal", ONCE);
+clk.t = at(ber, "2026-10-27", "03:00");
+sch4.tick();
+clk.t = at(ber, "2026-10-27", "04:00") + 5;
+sch4.tick();
+oid = host4.tasks[host4.tasks.size() - 1].taskid;
+check("'tonight' once goal starts at 04:00", host4.tasks[host4.tasks.size() - 1].name == "Goal-once-goal", "");
+host4.finish(oid, "finished", "explored");
+clk.t += 60;
+sch4.tick();
+sch4.tick();
+check("a finished once goal moves to goals/completed/", fileio.exists(ROOT + "/goals/completed/once-goal/goal.md"), "");
+
+DST = R"(---
+id: dst
+title: DST
+schedule:
+  type: recurring
+  days: daily
+  start: "02:30"
+  duration: 1h
+  timezone: Europe/Berlin
+---
+
+DST.
+)";
+write_goal_file("active", "dst", DST);
+d = sch4.space.load(sch4.space.find("dst"), prefs);
+wins = goal_windows_between(d.def, at(ber, "2027-03-27", "12:00"), at(ber, "2027-03-29", "12:00"));
+check("02:30 on the spring forward day exists once (03:30 CEST)", wins.size() == 2 && gt_format_local(ber, wins[0].start).starts("2027-03-28 03:30"), wins.size() ? gt_format_local(ber, wins[0].start) : "none");
+wins = goal_windows_between(d.def, at(ber, "2026-10-24", "12:00"), at(ber, "2026-10-26", "12:00"));
+check("02:30 on the fall back day runs once, not twice", wins.size() == 2, std.string(wins.size()));
+
+manual = sch4.run_now("dst", 1800, true);
+check("run_now --dry-run returns the prompt without dispatching", manual.ok && manual.prompt.contains("DST."), "");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("watchdog and overview");
+
+finish_open(host4, sch4);
+STALL = R"(---
+id: stall
+title: Stall
+schedule:
+  type: recurring
+  days: daily
+  start: "08:00"
+  end: "12:00"
+  timezone: Europe/Berlin
+policy:
+  stall_timeout: 5m
+  retry_backoff: 1m
+---
+
+Stall test.
+)";
+write_goal_file("active", "stall", STALL);
+clk.t = at(ber, "2026-10-28", "07:00");
+sch4.tick();
+clk.t = at(ber, "2026-10-28", "08:00") + 5;
+sch4.tick();
+st_task = host4.tasks[host4.tasks.size() - 1];
+check("the stall goal runs", st_task.name == "Goal-stall", st_task.name);
+sch4.tick();
+check("a task that makes progress is left alone", host4.stops.size() == 0 || host4.stops[host4.stops.size() - 1] != st_task.taskid, "");
+st_task.last_update_ms = std.millis() - 6 * 60 * 1000;
+stops_before = host4.stops.size();
+sch4.tick();
+check("no progress for stall_timeout: the task is stopped", host4.stops.size() == stops_before + 1 && host4.stops[host4.stops.size() - 1] == st_task.taskid && has_event(sch4, "run_stalled", "stall"), std.string(host4.stops));
+host4.finish(st_task.taskid, "stopped", "");
+clk.t += 30;
+sch4.tick();
+check("a stalled run counts as a failed attempt and is retried", has_event(sch4, "retry_scheduled", "stall"), "");
+before = host4.tasks.size();
+clk.t += 90;
+sch4.tick();
+check("the retry runs after the backoff", host4.tasks.size() == before + 1 && host4.tasks[host4.tasks.size() - 1].name == "Goal-stall", std.string(host4.tasks.size() - before));
+finish_open(host4, sch4);
+
+ov = goal_read(ROOT + "/state/overview.md");
+check("state/overview.md is generated", ov.contains("# Goals overview") && ov.contains("**stall**") && ov.contains("## active"), ov);
+check("the overview lists archived goals too", ov.contains("## archived") && ov.contains("**edit-me**"), "");
+space.move("stall", "archived");
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("agent tools (what the receptionist calls)");
+
+ctx = goal_tool_list(sch4);
+check("get_goals gives the time zone and the named windows", ctx.timezone == "Europe/Berlin" && ctx.windows.has("tonight") && ctx.now.length() > 0, std.string(ctx.timezone));
+
+cr = goal_tool_create(sch4, [title = "Try a new app idea", instructions = "Explore an app idea for musicians.", schedule_type = "once", date = "2026-11-02", window = "tonight"]);
+check("create_goal: 'tonight' becomes a once goal 04:00-10:00", cr.ok && cr.schedule.contains("04:00-10:00") && cr.schedule.contains("Europe/Berlin"), gj_str(cr, "error", std.string(cr)));
+check("create_goal without activate is proposed", cr.ok && cr.status == "proposed" && fileio.exists(ROOT + "/goals/proposed/try-a-new-app-idea/goal.md"), "");
+
+dup = goal_tool_create(sch4, [title = "Try a new app idea", instructions = "again", schedule_type = "once", date = "2026-11-03", window = "tonight"]);
+check("create_goal refuses the same goal twice", !dup.ok && gj_str(dup, "duplicate_of", "") == "try-a-new-app-idea", gj_str(dup, "error", ""));
+
+sim = goal_tool_create(sch4, [id = "app-idea-2", title = "Try new app idea", instructions = "Explore an app idea for musicians.", schedule_type = "once", date = "2026-11-03", window = "tonight"]);
+check("create_goal refuses a near duplicate", !sim.ok && gj_str(sim, "duplicate_of", "") == "try-a-new-app-idea", gj_str(sim, "error", ""));
+
+bad = goal_tool_create(sch4, [title = "Broken", instructions = "x", schedule_type = "recurring", days = "funday", start = "05:00"]);
+check("create_goal reports validation errors and writes nothing", !bad.ok && gj_str(bad, "error", "").contains("funday") && !sch4.space.find("broken"), gj_str(bad, "error", ""));
+
+hi = goal_tool_create(sch4, [title = "Release on Fridays", instructions = "Tag and publish a release.", schedule_type = "recurring", days = "friday", start = "16:00", end = "18:00", allow = "edit,release", activate = "yes"]);
+check("a goal that may release stays proposed even with activate=yes", hi.ok && hi.status == "proposed", std.string(hi));
+
+act = goal_tool_create(sch4, [title = "Fix GitHub issues", instructions = "Fix eligible issues.", schedule_type = "windowed", days = "weekdays", window = "tonight", start = "05:00", end = "10:00", activate = "yes"]);
+check("an explicit 05:00-10:00 wins over 'tonight' and is active", act.ok && act.status == "active" && act.schedule.contains("05:00-10:00"), std.string(act));
+
+up = goal_tool_update(sch4, [id = "fix-github-issues", revision = "stale", end = "09:00"]);
+check("update_goal with a stale revision is refused", !up.ok && gj(up, "conflict", false), gj_str(up, "error", ""));
+up = goal_tool_update(sch4, [id = "fix-github-issues", revision = act.revision, end = "09:00"]);
+check("update_goal with the current revision changes only that field", up.ok && up.schedule.contains("05:00-09:00") && goal_read(ROOT + "/goals/active/fix-github-issues/goal.md").contains("Fix eligible issues."), gj_str(up, "error", std.string(up)));
+
+st = goal_tool_set_status(sch4, [id = "fix-github-issues", status = "pause"]);
+check("set_goal_status pause moves it to paused/", st.ok && st.to == "paused" && fileio.exists(ROOT + "/goals/paused/fix-github-issues/goal.md"), std.string(st));
+rn = goal_tool_run_now(sch4, [id = "fix-github-issues"]);
+check("run_goal_now refuses a paused goal", !rn.ok, std.string(rn));
+goal_tool_set_status(sch4, [id = "fix-github-issues", status = "resume"]);
+rn = goal_tool_run_now(sch4, [id = "fix-github-issues"]);
+check("run_goal_now queues a run for the scheduler", rn.ok && fileio.files(ROOT + "/.runtime/requests", false).size() == 1, std.string(rn));
+manual_runs(sch, goal) {
+	n = 0;
+	for(k, a : sch.ledger.data.activations) {
+		if(a.goal == goal && a.kind == "manual")
+			n++;
+	}
+	return n;
+}
+before = manual_runs(sch4, "fix-github-issues");
+sch4.tick();
+check("the scheduler starts the queued run", manual_runs(sch4, "fix-github-issues") == before + 1 && fileio.files(ROOT + "/.runtime/requests", false).size() == 0, std.string(manual_runs(sch4, "fix-github-issues")));
+
+// ═════════════════════════════════════════════════════════════════════════════
+section("a refused dispatch is reported");
+
+finish_open(host4, sch4);
+
+REFUSED = R"(---
+id: refused
+title: Refused dispatch
+priority: urgent
+schedule:
+  type: recurring
+  days: daily
+  start: "19:00"
+  end: "20:00"
+  timezone: Europe/Berlin
+policy:
+  retry_backoff: 5m
+---
+
+Never runs.
+)";
+// urgent: the goals left active by the tool tests can take the single
+// max_background_tasks slot, and this one must reach the dispatch
+write_goal_file("active", "refused", REFUSED);
+clk.t = at(ber, "2026-10-29", "18:00");
+sch4.tick();
+host4.refuse = true;
+before = host4.tasks.size();
+clk.t = at(ber, "2026-10-29", "19:00") + 5;
+sch4.tick();
+check("a refused dispatch creates no task, only a dispatch_failed event", host4.tasks.size() == before && has_event(sch4, "dispatch_failed", "refused"), std.string(host4.tasks.size() - before));
+check("a refused dispatch notifies the owner with the reason", notes_with(host4, "could not start - the host refused the task") == 1, std.string(host4.notes));
+host4.refuse = false;
+clk.t += 6 * 60;
+sch4.tick();
+check("a refused dispatch is retried, not forgotten", host4.tasks.size() == before + 1, std.string(host4.tasks.size() - before));
+space.move("refused", "archived");
+finish_open(host4, sch4);
+
+// ═════════════════════════════════════════════════════════════════════════════
+
+fileio.remove(ROOT);
+
+std.print("\n ", passed, " passed, ", failed, " failed\n");
+
+if(failed == 0)
+	std.print("\nALL PASSED\n");
+else
+	std.exitprocess(1);

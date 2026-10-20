@@ -1,0 +1,719 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  goal_frontmatter.shio — Markdown files with a YAML front matter block
+//
+//  #include "goal_frontmatter"
+//
+//      doc = gfm_read_text(text)
+//          -> [ok, has_front, data, body, error, line]
+//      text = gfm_compose(data, body)        front matter + markdown body
+//
+//  The YAML subset people actually write by hand in a goal file:
+//
+//      key: value               plain, "double" or 'single' quoted scalars
+//      key: [a, b, "c d"]       inline lists (flat)
+//      key:                     nested maps and lists by indentation (spaces)
+//        sub: 1
+//        list:
+//          - monday
+//          - tuesday
+//      text: |                  literal block (|) and folded block (>)
+//        line one
+//      # comment                full-line and " # trailing" comments
+//
+//  Scalars: true/false/yes/no/on/off -> 1/0, null/~ -> None, integers -> int,
+//  everything else stays a string ("05:00" is a string). Anchors, tags, flow
+//  maps and multi-document streams are not supported and give a clear error.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// safe member read: reading a missing member of a json adds it (as null)
+gj(obj, key, def = None) {
+	if(!std.is_json(obj))
+		return def;
+
+	if(!obj.has(key))
+		return def;
+
+	v = obj[key];
+
+	if(std.is_none(v))
+		return def;
+
+	return v;
+}
+
+gj_str(obj, key, def = "") {
+	v = gj(obj, key, None);
+
+	if(std.is_none(v))
+		return def;
+
+	return std.string(v);
+}
+
+// a json object (has string keys) - an empty json counts as an object
+gj_is_map(v) {
+	if(!std.is_json(v))
+		return false;
+
+	if(v.size() == 0)
+		return true;
+
+	return !std.is_list(v);
+}
+
+gj_is_array(v) {
+	if(!std.is_json(v))
+		return false;
+
+	if(v.size() == 0)
+		return true;
+
+	return std.is_list(v);
+}
+
+// join strings with a separator between them
+gfm_join(list, sep) {
+	out = "";
+	for(i, x : list) {
+		if(i > 0)
+			out += sep;
+		out += std.string(x);
+	}
+	return out;
+}
+
+// drop leading / trailing newlines (strip() would also eat indentation)
+gfm_trim_nl_left(s) {
+	i = 0;
+	for(i < s.length() && (s[i] == "\n" || s[i] == "\r"))
+		i++;
+	return s.substr(i);
+}
+
+gfm_trim_nl_right(s) {
+	n = s.length();
+	for(n > 0 && (s[n - 1] == "\n" || s[n - 1] == "\r"))
+		n--;
+	return s.substr(0, n);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Lexing
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Strip a trailing " # comment" that is not inside quotes.
+gfm_strip_comment(s) {
+	quote = "";
+
+	for(i = 0; i < s.length(); i++) {
+		c = s[i];
+
+		if(quote) {
+			if(c == "\\" && quote == "\"") {
+				i++;
+				continue;
+			}
+			if(c == quote)
+				quote = "";
+			continue;
+		}
+
+		if(c == "\"" || c == "'") {
+			quote = c;
+			continue;
+		}
+
+		if(c == "#" && (i == 0 || s[i - 1] == " " || s[i - 1] == "\t"))
+			return s.substr(0, i);
+	}
+
+	return s;
+}
+
+// -> [ok, lines = [[indent, text, raw, no]], error, line]
+gfm_lines(text) {
+	raw_lines = std.string(text).replace("\r\n", "\n").split("\n");
+	out = [];
+
+	for(n, raw : raw_lines) {
+		indent = 0;
+
+		for(indent < raw.length() && raw[indent] == " ")
+			indent++;
+
+		if(indent < raw.length() && raw[indent] == "\t")
+			return [ok = false, lines = [], error = "tabs are not allowed for indentation", line = n + 1];
+
+		out.push_back([indent = indent, raw = raw, no = n + 1]);
+	}
+
+	return [ok = true, lines = out, error = "", line = 0];
+}
+
+// the key of "key: value" / "key:" (None if the line is no mapping entry)
+gfm_split_key(t) {
+	quote = "";
+
+	for(i = 0; i < t.length(); i++) {
+		c = t[i];
+
+		if(i == 0 && (c == "\"" || c == "'")) {
+			quote = c;
+			continue;
+		}
+
+		if(quote) {
+			if(c == quote)
+				quote = "";
+			continue;
+		}
+
+		if(c == ":" && (i + 1 == t.length() || t[i + 1] == " ")) {
+			key = t.substr(0, i).strip();
+
+			if(key.length() >= 2 && (key[0] == "\"" || key[0] == "'") && key[key.length() - 1] == key[0])
+				key = key.substr(1, key.length() - 2);
+
+			return [k = key, val = t.substr(i + 1).strip()];
+		}
+	}
+
+	return None;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Scalars
+// ─────────────────────────────────────────────────────────────────────────────
+
+gfm_unquote_double(s) {
+	out = "";
+	i = 0;
+
+	for(i < s.length()) {
+		c = s[i];
+
+		if(c == "\\" && i + 1 < s.length()) {
+			n = s[i + 1];
+			if(n == "n")
+				out += "\n";
+			else if(n == "t")
+				out += "\t";
+			else if(n == "r")
+				out += "\r";
+			else
+				out += n;
+			i += 2;
+			continue;
+		}
+
+		out += c;
+		i++;
+	}
+
+	return out;
+}
+
+// split "a, 'b, c', d" at top level commas
+gfm_split_inline(s) {
+	parts = [];
+	cur = "";
+	quote = "";
+
+	for(c : s) {
+		if(quote) {
+			cur += c;
+			if(c == quote)
+				quote = "";
+			continue;
+		}
+
+		if(c == "\"" || c == "'") {
+			quote = c;
+			cur += c;
+			continue;
+		}
+
+		if(c == ",") {
+			parts.push_back(cur.strip());
+			cur = "";
+			continue;
+		}
+
+		cur += c;
+	}
+
+	if(!cur.strip().empty() || parts.size() > 0)
+		parts.push_back(cur.strip());
+
+	return parts;
+}
+
+// -> [ok, value, error]
+gfm_scalar(text) {
+	t = std.string(text).strip();
+
+	if(t.empty())
+		return [ok = true, value = None, error = ""];
+
+	if(t[0] == "\"") {
+		if(t.length() < 2 || t[t.length() - 1] != "\"")
+			return [ok = false, value = None, error = "unterminated \"string\""];
+		return [ok = true, value = gfm_unquote_double(t.substr(1, t.length() - 2)), error = ""];
+	}
+
+	if(t[0] == "'") {
+		if(t.length() < 2 || t[t.length() - 1] != "'")
+			return [ok = false, value = None, error = "unterminated 'string'"];
+		return [ok = true, value = t.substr(1, t.length() - 2).replace("''", "'"), error = ""];
+	}
+
+	if(t[0] == "[") {
+		if(t[t.length() - 1] != "]")
+			return [ok = false, value = None, error = "unterminated [list]"];
+
+		inner = t.substr(1, t.length() - 2).strip();
+		list = [];
+		list.clear();
+
+		if(inner.empty())
+			return [ok = true, value = list, error = ""];
+
+		for(p : gfm_split_inline(inner)) {
+			if(p.starts("[") || p.starts("{"))
+				return [ok = false, value = None, error = "nested inline lists/maps are not supported, use indentation"];
+
+			sv = gfm_scalar(p);
+			if(!sv.ok)
+				return sv;
+			list.push_back(sv.value);
+		}
+
+		return [ok = true, value = list, error = ""];
+	}
+
+	if(t[0] == "{") {
+		if(t == "{}")
+			return [ok = true, value = std.json(), error = ""];
+		return [ok = false, value = None, error = "inline {maps} are not supported, use indentation"];
+	}
+
+	if(t[0] == "&" || t[0] == "*" || t[0] == "!")
+		return [ok = false, value = None, error = "YAML anchors, aliases and tags are not supported"];
+
+	low = t.lowercase();
+
+	if(low == "true" || low == "yes" || low == "on")
+		return [ok = true, value = 1, error = ""];
+	if(low == "false" || low == "no" || low == "off")
+		return [ok = true, value = 0, error = ""];
+	if(low == "null" || low == "~")
+		return [ok = true, value = None, error = ""];
+
+	if(gt_is_int_text(t, true) && t.length() < 18) {
+		// "0700" stays a string (zip codes, clock-ish values)
+		digits = (t[0] == "-" || t[0] == "+") ? t.substr(1) : t;
+		if(digits.length() == 1 || digits[0] != "0")
+			return [ok = true, value = std.int(t), error = ""];
+	}
+
+	return [ok = true, value = t, error = ""];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Blocks
+// ─────────────────────────────────────────────────────────────────────────────
+
+class gfm_parser {
+	lines = [];
+	error = "";
+	error_line = 0;
+
+	__init__(_lines) {
+		lines = _lines;
+	}
+
+	fail(msg, no) {
+		if(!error) {
+			error = msg;
+			error_line = no;
+		}
+		return None;
+	}
+
+	// next line that carries content (no blank / comment-only lines)
+	next_content(i) {
+		for(i < lines.size()) {
+			t = gfm_strip_comment(lines[i].raw).strip();
+			if(!t.empty())
+				return i;
+			i++;
+		}
+		return lines.size();
+	}
+
+	text_of(i) {
+		return gfm_strip_comment(lines[i].raw).strip();
+	}
+
+	is_item(t) {
+		return t == "-" || t.starts("- ");
+	}
+
+	// [value, next]
+	block(i, indent) {
+		i = next_content(i);
+
+		if(i >= lines.size())
+			return [value = None, next = i];
+
+		if(is_item(text_of(i)))
+			return list(i, lines[i].indent);
+
+		return map(i, indent);
+	}
+
+	// literal (|) / folded (>) block scalar under a key at `indent`
+	block_scalar(i, indent, style) {
+		collected = [];
+		block_indent = -1;
+
+		for(i < lines.size()) {
+			raw = lines[i].raw;
+
+			if(raw.strip().empty()) {
+				collected.push_back("");
+				i++;
+				continue;
+			}
+
+			if(lines[i].indent <= indent)
+				break;
+
+			if(block_indent < 0)
+				block_indent = lines[i].indent;
+
+			if(lines[i].indent < block_indent)
+				break;
+
+			collected.push_back(raw.substr(block_indent));
+			i++;
+		}
+
+		for(collected.size() && collected[collected.size() - 1] == "")
+			collected.erase(collected.size() - 1);
+
+		out = "";
+		for(k, l : collected) {
+			if(k > 0)
+				out += (style.starts(">") && l != "" && collected[k - 1] != "") ? " " : "\n";
+			out += l;
+		}
+
+		if(!style.ends("-"))
+			out += "\n";
+
+		return [value = out, next = i];
+	}
+
+	// the value after "key:" (inline scalar, block scalar, or a nested block)
+	value_after_key(kv, i, indent) {
+		v = kv.val;
+
+		if(v == "|" || v == "|-" || v == ">" || v == ">-")
+			return block_scalar(i + 1, indent, v);
+
+		if(!v.empty()) {
+			sv = gfm_scalar(v);
+			if(!sv.ok)
+				return [value = fail(sv.error, lines[i].no), next = i + 1];
+			return [value = sv.value, next = i + 1];
+		}
+
+		n = next_content(i + 1);
+
+		if(n >= lines.size())
+			return [value = None, next = n];
+
+		// a list may sit at the key's own indentation ("key:\n- a")
+		if(lines[n].indent > indent || (lines[n].indent == indent && is_item(text_of(n))))
+			return block(n, lines[n].indent);
+
+		return [value = None, next = i + 1];
+	}
+
+	map(i, indent) {
+		out = std.json();
+
+		for(1) {
+			i = next_content(i);
+
+			if(i >= lines.size() || error)
+				break;
+
+			if(lines[i].indent < indent)
+				break;
+
+			if(lines[i].indent > indent)
+				return [value = fail("unexpected indentation", lines[i].no), next = lines.size()];
+
+			t = text_of(i);
+
+			if(is_item(t))
+				return [value = fail("a list item where a 'key: value' was expected", lines[i].no), next = lines.size()];
+
+			kv = gfm_split_key(t);
+
+			if(std.is_none(kv) || kv.k.empty())
+				return [value = fail("expected 'key: value', got '" + t + "'", lines[i].no), next = lines.size()];
+
+			if(out.has(kv.k))
+				return [value = fail("duplicate key '" + kv.k + "'", lines[i].no), next = lines.size()];
+
+			r = value_after_key(kv, i, indent);
+			out[kv.k] = r.value;
+			i = r.next;
+		}
+
+		return [value = out, next = i];
+	}
+
+	list(i, indent) {
+		out = [];
+		out.clear();
+
+		for(1) {
+			i = next_content(i);
+
+			if(i >= lines.size() || error)
+				break;
+
+			if(lines[i].indent < indent)
+				break;
+
+			if(lines[i].indent > indent)
+				return [value = fail("unexpected indentation in a list", lines[i].no), next = lines.size()];
+
+			t = text_of(i);
+
+			if(!is_item(t))
+				break;
+
+			item = t.substr(1).strip();
+
+			if(item.empty()) {
+				r = block(i + 1, indent + 1);
+				out.push_back(r.value);
+				i = r.next;
+				continue;
+			}
+
+			kv = gfm_split_key(item);
+
+			if(!std.is_none(kv) && !item.starts("\"") && !item.starts("'") && !item.starts("[")) {
+				// "- key: value" starts a map item; its other keys line up with `key`
+				item_indent = indent + (t.length() - item.length());
+				lines[i] = [indent = item_indent, raw = std.string(" ").ljust(item_indent) + item, no = lines[i].no];
+				r = map(i, item_indent);
+				out.push_back(r.value);
+				i = r.next;
+				continue;
+			}
+
+			sv = gfm_scalar(item);
+			if(!sv.ok)
+				return [value = fail(sv.error, lines[i].no), next = lines.size()];
+
+			out.push_back(sv.value);
+			i++;
+		}
+
+		return [value = out, next = i];
+	}
+}
+
+// YAML text -> [ok, data, error, line]
+gfm_parse_yaml(text) {
+	lx = gfm_lines(text);
+
+	if(!lx.ok)
+		return [ok = false, data = None, error = lx.error, line = lx.line];
+
+	p = gfm_parser(lx.lines);
+	first = p.next_content(0);
+
+	if(first >= lx.lines.size())
+		return [ok = true, data = std.json(), error = "", line = 0];
+
+	if(p.is_item(p.text_of(first)))
+		return [ok = false, data = None, error = "the front matter must be a map of 'key: value' lines", line = lx.lines[first].no];
+
+	r = p.map(first, lx.lines[first].indent);
+
+	if(p.error)
+		return [ok = false, data = None, error = p.error, line = p.error_line];
+
+	if(r.next < lx.lines.size())
+		return [ok = false, data = None, error = "unexpected indentation", line = lx.lines[r.next].no];
+
+	return [ok = true, data = r.value, error = "", line = 0];
+}
+
+// Markdown text -> [ok, has_front, data, body, error, line]
+gfm_read_text(text) {
+	t = std.string(text ?? "").replace("\r\n", "\n");
+
+	// UTF-8 BOM
+	if(t.starts("\xEF\xBB\xBF"))
+		t = t.substr(3);
+
+	if(!t.starts("---\n") && t.strip() != "---")
+		return [ok = true, has_front = false, data = std.json(), body = t, error = "", line = 0];
+
+	lines = t.split("\n");
+	close = -1;
+
+	for(i = 1; i < lines.size(); i++) {
+		l = lines[i].rtrim();
+		if(l == "---" || l == "...") {
+			close = i;
+			break;
+		}
+	}
+
+	if(close < 0)
+		return [ok = false, has_front = true, data = None, body = "", error = "front matter is not closed with a '---' line", line = 1];
+
+	yaml = "";
+	for(i = 1; i < close; i++)
+		yaml += lines[i] + "\n";
+
+	body = "";
+	for(i = close + 1; i < lines.size(); i++) {
+		body += lines[i];
+		if(i + 1 < lines.size())
+			body += "\n";
+	}
+
+	y = gfm_parse_yaml(yaml);
+
+	// line numbers are reported for the file, not for the block
+	return [
+		ok = y.ok,
+		has_front = true,
+		data = y.data,
+		body = gfm_trim_nl_left(body),
+		error = y.error,
+		line = y.ok ? 0 : y.line + 1,
+	];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Writing (agents create goal files through code, never by hand-rolled YAML)
+// ─────────────────────────────────────────────────────────────────────────────
+
+gfm_needs_quotes(s) {
+	if(s.empty())
+		return true;
+
+	if(s != s.strip())
+		return true;
+
+	low = s.lowercase();
+	if(low == "true" || low == "false" || low == "yes" || low == "no" || low == "on" || low == "off" || low == "null" || low == "~")
+		return true;
+
+	if(gt_is_int_text(s, true))
+		return true;
+
+	first = s[0];
+	if("-?:,[]{}#&*!|>'\"%@`".contains(first))
+		return true;
+
+	if(s.contains(":") || s.contains(" #") || s.contains(",") || s.contains("[") || s.contains("]") || s.contains("\n") || s.contains("\t"))
+		return true;
+
+	return false;
+}
+
+gfm_quote(s) {
+	return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t") + "\"";
+}
+
+gfm_dump_scalar(v) {
+	if(std.is_none(v))
+		return "null";
+
+	if(std.is_string(v)) {
+		if(gfm_needs_quotes(v))
+			return gfm_quote(v);
+		return v;
+	}
+
+	return std.string(v);
+}
+
+gfm_is_flat_list(v) {
+	for(x : v) {
+		if(std.is_json(x))
+			return false;
+		if(std.is_string(x) && x.length() > 40)
+			return false;
+	}
+	return true;
+}
+
+gfm_dump(data, indent = 0) {
+	pad = std.string("").ljust(indent);
+	out = "";
+
+	for(k, v : data) {
+		key = gfm_needs_quotes(std.string(k)) ? gfm_quote(std.string(k)) : std.string(k);
+
+		if(std.is_json(v) && gj_is_map(v) && v.size() > 0) {
+			out += pad + key + ":\n" + gfm_dump(v, indent + 2);
+			continue;
+		}
+
+		if(std.is_json(v) && v.size() == 0) {
+			out += pad + key + ": []\n";
+			continue;
+		}
+
+		if(std.is_json(v)) {
+			if(gfm_is_flat_list(v) && v.size() <= 8) {
+				items = [];
+				for(x : v)
+					items.push_back(gfm_dump_scalar(x));
+				out += pad + key + ": [" + gfm_join(items, ", ") + "]\n";
+				continue;
+			}
+
+			out += pad + key + ":\n";
+			for(x : v) {
+				if(std.is_json(x) && gj_is_map(x)) {
+					sub = gfm_dump(x, indent + 4);
+					out += pad + "  - " + sub.substr(indent + 4);
+				}
+				else {
+					out += pad + "  - " + gfm_dump_scalar(x) + "\n";
+				}
+			}
+			continue;
+		}
+
+		if(std.is_string(v) && v.contains("\n")) {
+			out += pad + key + ": |\n";
+			for(l : gfm_trim_nl_right(v).split("\n"))
+				out += pad + "  " + l + "\n";
+			continue;
+		}
+
+		out += pad + key + ": " + gfm_dump_scalar(v) + "\n";
+	}
+
+	return out;
+}
+
+gfm_compose(data, body) {
+	return "---\n" + gfm_dump(data) + "---\n\n" + gfm_trim_nl_left(std.string(body ?? ""));
+}

@@ -1,0 +1,330 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  tests/feedback_chain_test.shio — the node → router → Telegram feedback chain
+//
+//  Usage:  shz tests/feedback_chain_test.shio
+//
+//  The regression test for one real complaint: "create a task that runs from
+//  05:00 to 10:00 on node Z", the node has no goal system, and the chat shows
+//  nothing. Every hop of that chain is real here — a stub AI node (the Megamind
+//  surface, no LLM) behind the ShizoNet node service, a real Router mirror and
+//  poller, and the real TelegramRouter rendering into a fake bot.
+//
+//  What must arrive in the chat, verbatim:
+//    * the node's report of a finished task (the receptionist's finish(summary)
+//      text, contract C6) - including "Goals are not enabled on this node ..."
+//    * the reason of a failed / lost / stopped task (contract C1/C3)
+//    * one [stalled] message for a task that makes no progress (contract C2)
+//    * a node notify
+//  and, on the router side, the reason of a refused delegation (C4) and the
+//  node's goals flag (C5).
+//
+//  ShizoNet on one machine: the server binding UDP 6454 hears every beacon, so
+//  the TelegramRouter (its Router creates the server) is built FIRST and the
+//  stub node gets the explicit port 6455 (README §Tests).
+//
+//  Scratch artifacts: testbench/telegram_feedback/out/ (the trust file).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../telegram_router"
+
+NODE_WIRE = "SHZ_FB_NODE";
+NODE_NAME = "SHZ_FB_NODE";
+ROUTER_WIRE = "SHZ_FB_ROUTER";
+NODE_PORT = 6455;
+CHAT = 777777;
+OUT_DIR = "testbench/telegram_feedback/out";
+TRUSTED_FILE = OUT_DIR + "/fb_chain_trusted.json";
+
+GOAL_DISABLED_TEXT = "Goals are not enabled on this node: start it in a folder with an .agentspace (shz miniagent.goals init) or with --agentspace <dir>.";
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name, "\n");
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info, "\n");
+	}
+}
+
+wait_for(cond, ms) {
+	for(w = 0; w < ms / 10; w++) {
+		if(cond())
+			return true;
+
+		std.sleep(10);
+	}
+
+	return cond();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  The fake transport
+// ─────────────────────────────────────────────────────────────────────────────
+
+class fb_fake_bot {
+
+	sent = [];              // [[chatid, text]]
+	on_any_message = None;
+
+	send_rich(chatdata, options) {
+		cid = 0;
+
+		if(std.is_json(chatdata))
+			cid = std.int(chatdata.chatid ?? 0);
+		else
+			cid = std.int(chatdata);
+
+		sent.push_back([chatid = cid, text = std.string(options.markdown ?? "")]);
+		return [ok = true, message_id = sent.size()];
+	}
+
+	send_rich_draft(chatdata, draft_id, options) { return [ok = true]; }
+	new_draft_id(chatid) { return 1; }
+	download_file(fileid, destination = "") { return [success = false]; }
+
+	has_for(chatid, needle) {
+		for(s : sent) {
+			if(std.int(s.chatid) == std.int(chatid) && std.string(s.text).contains(needle))
+				return true;
+		}
+
+		return false;
+	}
+
+	count_with(needle) {
+		n = 0;
+
+		for(s : sent) {
+			if(std.string(s.text).contains(needle))
+				n++;
+		}
+
+		return n;
+	}
+
+	clear() { sent = []; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  fb_stub_host — the Megamind surface (megamind.shio) without an LLM.
+//  request() answers with the shapes contract C6 defines, and the cues drive the
+//  failure paths:
+//    GOALDISABLED  the goal tools answered goal_tool_disabled() and the
+//                  receptionist put that text into finish(summary)
+//    CRASH         the receptionist turn dies (node status = "error")
+//    SILENT <ms>   no delta at all for <ms> (the stall watchdog's clean room)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class fb_stub_host {
+
+	running = true;
+	goals = None;                       // no .agentspace on this node
+
+	_receptionist_active = false;
+	request_queue = [];
+	worker_threads = [[], [], []];
+	tasks = [];
+	tasks_scheduled = [];
+	tasks_finished = [];
+	tasks_failed = [];
+
+	_notify_cb = None;
+	_task_finish_cb = None;
+
+	on_notify(cb) { _notify_cb = cb; }
+	on_task_finished(cb) { _task_finish_cb = cb; }
+	on_action(cb) { }
+
+	notify_user(msg) {
+		if(_notify_cb)
+			_notify_cb(std.string(msg));
+	}
+
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		_receptionist_active = true;
+		p = std.string(prompt);
+
+		if(p.starts("CRASH")) {
+			_receptionist_active = false;
+			std.runtime_error("the receptionist exploded: no goal system on this node");
+		}
+
+		if(p.starts("SILENT")) {
+			parts = p.split(" ");
+			std.sleep(std.int(parts[1] ?? "2000"));
+		}
+		else {
+			if(on_action_cb)
+				on_action_cb([text = "thinking: "]);
+		}
+
+		report = "stub answer: " + p;
+		if(p.starts("GOALDISABLED"))
+			report = GOAL_DISABLED_TEXT;
+
+		result = [
+			ok = true,
+			reports = [[report = report, time = std.millis(), time_str = std.timestamp()]],
+			execution_time_ms = 12,
+		];
+
+		_receptionist_active = false;
+
+		if(on_finish_cb)
+			on_finish_cb(result);
+
+		return result;
+	}
+
+	get_overview() {
+		return [
+			tasks = tasks,
+			tasks_scheduled = tasks_scheduled,
+			tasks_finished = tasks_finished,
+			tasks_failed = tasks_failed,
+		];
+	}
+
+	add_task(name, goal) {
+		taskid = std.random_hash(16);
+		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+		return taskid;
+	}
+
+	stop_task(taskid) { return false; }
+	update_task(taskid, message) { return false; }
+	inspect_task(taskid) { return "Not found."; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+std.print("feedback chain: node -> router -> telegram\n");
+
+try {
+	if(!fileio.exists(OUT_DIR))
+		fileio.mkdir(OUT_DIR);
+}
+catch(e) {}
+
+// the trust file is written before the front end starts: no bootstrap needed
+fileio.write_text(TRUSTED_FILE, std.string([chats = [[chatid = CHAT, name = "chain test", added = std.millis()]]]));
+
+bot = fb_fake_bot();
+
+// the Router's server must own the Art-Net port, so it comes first
+rtr = TelegramRouter(ModelConfig(), [
+	name = ROUTER_WIRE,
+	role = "receptionist",
+	description = "feedback chain router",
+	trusted_chats = TRUSTED_FILE,
+	poll_ms = 100,
+	draft_ms = 0,
+	stall_ms = 500,
+]);
+
+rtr.attach_bot(bot);
+
+check("the transport is attached", !std.is_none(rtr.tg_bot));
+check("the front end starts with one trusted chat", rtr.tg_chats.size() == 1, std.string(rtr.tg_chats));
+check("the stall watchdog is armed for this suite", rtr.stall_ms == 500, std.string(rtr.stall_ms));
+
+host = fb_stub_host();
+node_server = shizonet.server(NODE_WIRE, NODE_PORT);
+node = ai_node_attach(node_server, host, [name = NODE_NAME, description = "chain test node"]);
+
+check("the stub node is attached", !std.is_none(node));
+check("the router discovers the node", wait_for([rtr]() { return rtr.nodes().size() > 0; }, 12000), std.string(rtr.nodes().size()));
+
+// ── C5: the node's goals flag travels over the wire into the routing table ───
+
+summary = rtr.nodes_summary();
+check("nodes_summary carries the goals flag", std.is_json(summary) && summary.size() && summary[0].has("goals"), std.string(summary));
+check("a node without an .agentspace reports goals = false", std.is_json(summary) && summary.size() && !summary[0].goals, std.string(summary));
+
+// ── C6 + C1: the node's report reaches the chat ─────────────────────────────
+
+bot.clear();
+tid = rtr.add_task("GoalJob", "GOALDISABLED fix github issues from 05:00 to 10:00", NODE_NAME);
+check("the delegation is accepted", !std.is_none(tid), std.string(tid));
+check("the router reports no failure reason on success", rtr.add_task_error() == "", "'" + std.string(rtr.add_task_error()) + "'");
+
+arrived = wait_for([bot]() { return bot.has_for(CHAT, "[done] " + NODE_NAME + ": task GoalJob"); }, 12000);
+check("the finished task arrives in the chat", arrived, std.string(bot.sent));
+check("the chat shows the node's reason, not 'Agent was stopped.'",
+	bot.has_for(CHAT, GOAL_DISABLED_TEXT), std.string(bot.sent));
+check("the swallow-shapes never reach the chat",
+	!bot.has_for(CHAT, "Agent was stopped.") && !bot.has_for(CHAT, "Agent returned nothing"),
+	std.string(bot.sent));
+
+// ── C1 + C3: a node-side crash shows its reason ─────────────────────────────
+
+bot.clear();
+fid = rtr.add_task("CrashJob", "CRASH schedule the nightly run", NODE_NAME);
+check("the crashing delegation is accepted", !std.is_none(fid), std.string(fid));
+
+failed_ok = wait_for([bot]() { return bot.has_for(CHAT, "[failed] " + NODE_NAME + ": task CrashJob"); }, 12000);
+check("the failed task arrives in the chat", failed_ok, std.string(bot.sent));
+check("the failure reason is rendered",
+	bot.has_for(CHAT, "error: the receptionist exploded: no goal system on this node"),
+	std.string(bot.sent));
+
+// ── a node notify reaches the chat ──────────────────────────────────────────
+
+bot.clear();
+host.notify_user("which python shall I use?");
+check("a node notify reaches the chat",
+	wait_for([bot]() { return bot.has_for(CHAT, "[notify] " + NODE_NAME + ": which python shall I use?"); }, 6000),
+	std.string(bot.sent));
+
+// ── C4: a refused delegation keeps its reason on the router ─────────────────
+
+nid = rtr.add_task("GhostJob", "do the thing", "NoSuchNode");
+check("an unknown node refuses the task", std.is_none(nid), std.string(nid));
+why = rtr.add_task_error();
+check("the refusal reason is readable", std.string(why).contains("NoSuchNode"), "'" + std.string(why) + "'");
+
+// ── C2: a task that stops making progress is reported once ──────────────────
+
+bot.clear();
+sid = rtr.add_task("StallJob", "SILENT 2500 think quietly for a while", NODE_NAME);
+check("the stalling delegation is accepted", !std.is_none(sid), std.string(sid));
+
+stalled = wait_for([bot]() { return bot.has_for(CHAT, "[stalled] " + NODE_NAME + ": task StallJob"); }, 8000);
+check("the stall is announced in the chat", stalled, std.string(bot.sent));
+check("the stall names the idle time and what to do",
+	bot.has_for(CHAT, "min (state") && bot.has_for(CHAT, "/tasks"), std.string(bot.sent));
+check("the stall is announced exactly once per episode",
+	bot.count_with("[stalled] " + NODE_NAME + ": task StallJob") == 1,
+	std.string(bot.count_with("[stalled] " + NODE_NAME + ": task StallJob")));
+
+// ── teardown ────────────────────────────────────────────────────────────────
+
+check("the node service stops", node.stop());
+rtr.tg_stop_worker();
+rtr.running = false;
+
+try { rtr.stop(); } catch(e) {}
+
+if(!std.is_none(rtr.service)) {
+	try { rtr.service.stop(); } catch(e) {}
+}
+
+// the trust file is scratch: leave nothing behind outside testbench/
+try {
+	fileio.remove(TRUSTED_FILE);
+}
+catch(e) {}
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+if(failed == 0) {
+	std.print("ALL PASSED\n");
+}
+else {
+	std.runtime_error("feedback_chain_test: " + std.string(failed) + " checks failed");
+}

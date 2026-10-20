@@ -92,11 +92,63 @@ router_node_hint(router) {
 	return "Valid node names: " + list + ". Pick exactly one of them (see get_nodes()).";
 }
 
+// The concrete reason of the last Router.add_task() failure (Router.add_task_error,
+// router_api.md). Defensive: a host without that method (older Router, test stub)
+// gives "" and the caller keeps its generic wording.
+router_add_task_error(router) {
+	why = "";
+
+	if(!router) {
+		return why;
+	}
+
+	try {
+		reason = router.add_task_error();
+		if(reason) {
+			why = std.string(reason).strip();
+		}
+	}
+	catch(e) {
+		why = "";
+	}
+
+	return why;
+}
+
+// Does the node run a goal scheduler? true / false / None (None = the node did not
+// report the field: an older node, so nothing is claimed about it).
+router_node_goals(router, node) {
+	if(!router || !node) {
+		return None;
+	}
+
+	summary = None;
+	try {
+		summary = router.nodes_summary();
+	}
+	catch(e) {
+		summary = None;
+	}
+
+	if(!std.is_json(summary)) {
+		return None;
+	}
+
+	for(i = 0; i < summary.size(); i++) {
+		n = summary[i];
+		if(std.is_json(n) && n.has("name") && std.string(n.name) == std.string(node) && n.has("goals")) {
+			return n.goals ? true : false;
+		}
+	}
+
+	return None;
+}
+
 add_tools(agt)
 {
 	agt.add_tool(
 		"get_nodes",
-		"Inspect the routing table: every online AI node with name, description, capabilities, tags, model, load and open tasks.\nRead-only. Use it to pick the node for a task and to check which nodes exist at all.\nThis call never wakes, invokes or runs a node, and it does not start anything.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
+		"Inspect the routing table: every online AI node with name, description, capabilities, tags, model, load, open tasks and 'goals' (does this node run a goal scheduler, i.e. can it do work at set times?).\nRead-only. Use it to pick the node for a task and to check which nodes exist at all.\nThis call never wakes, invokes or runs a node, and it does not start anything.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
 		None,
 		[](agt, args)
 		{
@@ -180,8 +232,40 @@ add_tools(agt)
 	);
 
 	agt.add_tool(
+		"get_goals",
+		"The scheduled goals (autonomous work at set times) of every node, or of one node: id, title, status, schedule, next window, last outcome.\nRead-only. Requests that create or change a schedule are routed with start_task to the node that should do the work; its receptionist owns the goal.",
+		[
+			node = "string(): OPTIONAL node name from get_nodes (all nodes otherwise)",
+		],
+		[](agt, args)
+		{
+			if(!agt.env.router) {
+				return ROUTER_NO_ROUTER;
+			}
+
+			node = "";
+			if(args.has("node") && args.node) {
+				node = router_match_node(agt.env.router, args.node);
+				if(!node) {
+					return "Unknown node: '" + std.string(args.node) + "'. " + router_node_hint(agt.env.router);
+				}
+			}
+
+			res = None;
+			try {
+				res = agt.env.router.goals(node);
+			}
+			catch(e) {
+				return "The goal request failed: " + std.string(e);
+			}
+
+			return res;
+		}
+	);
+
+	agt.add_tool(
 		"start_task",
-		"Route a task to exactly ONE node. Forward the user's intent as given: do NOT pre-validate feasibility, do NOT research the task, do NOT inspect anything first. The node's receptionist investigates, plans, executes and reports.\n'node' must be a name from get_nodes — never invent one.\nReturns promptly with the taskid, the task name and the node. The goal is NOT executed by this call and you must not wait for it: completion arrives later as a system event.",
+		"Route a task to exactly ONE node. Forward the user's intent as given: do NOT pre-validate feasibility, do NOT research the task, do NOT inspect anything first. The node's receptionist investigates, plans, executes and reports.\n'node' must be a name from get_nodes — never invent one.\nReturns promptly with the taskid, the task name and the node. The goal is NOT executed by this call and you must not wait for it: completion arrives later as a system event.\nScheduled work ('tonight', 'every Sunday', 'from 05:00 to 10:00') needs a node with goals=true. A node with goals=false has no goal system: route the request anyway, but tell the user in finish(report) that this node cannot schedule it - do NOT silently present the job as a scheduled goal and do NOT quietly turn it into normal work.\nWhen the node refuses the task, this answer carries the concrete reason: relay that reason verbatim in finish(report).",
 		[
 			node = "&string(): Target node name, exactly as listed by get_nodes.",
 			name = "&string(): Funny short task name for the task like 'Sexy-Sushi'.",
@@ -213,6 +297,12 @@ add_tools(agt)
 			}
 
 			if(!taskid) {
+				why = router_add_task_error(agt.env.router);
+
+				if(why) {
+					return "The node '" + node + "' did not accept the task. Reason: " + why + "\nNo task was created. Put that reason into finish(report) so the user knows why; do not claim the task is running.";
+				}
+
 				return "The node '" + node + "' did not accept the task (offline, unreachable or it refused).\nNo task was created. Report that to the user; do not claim the task is running.";
 			}
 
@@ -225,7 +315,14 @@ add_tools(agt)
 				taskid=std.string(taskid),
 			]);
 
-			return [taskid=std.string(taskid), name=taskname, node=node, suggestion="Tell the user the task name and the node it runs on, keep the taskid private."];
+			suggestion = "Tell the user the task name and the node it runs on, keep the taskid private.";
+			goals = router_node_goals(agt.env.router, node);
+
+			if(goals === false) {
+				suggestion += " This node has no goal system (goals=false): if the user asked for work at set times, say in finish(report) that this node cannot schedule it (it needs an .agentspace).";
+			}
+
+			return [taskid=std.string(taskid), name=taskname, node=node, suggestion=suggestion];
 		}
 	);
 
@@ -331,7 +428,7 @@ add_tools(agt)
 
 	agt.add_tool(
 		"get_last_actions",
-		"Retrieve the compressed list of this router's recent actions, newest first.\nUse it ONLY to resolve references such as 'do that again' or 'the one from before' when the current context does not already identify the action.\nIt identifies the action, its taskid and its node; it is not a historical search and it contains no implementation logs.",
+		"Retrieve the compressed list of this router's recent actions, newest first: the user's recent messages (action 'user_message', from the chat front end), your routing actions and your turn reports.\nUse it to resolve follow-ups and corrections such as 'make it 6am instead', 'do that again' or 'the one from before' when the current message does not identify the work on its own.\nIt identifies the action, its taskid and its node; it is not a historical search and it contains no implementation logs.",
 		[
 			limit = "int(1,100): OPTIONAL number of recent actions to return (default 20)",
 		],

@@ -1,0 +1,153 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  agent_slots_test.shio — max_running_agents counts GENERATING agents
+//
+//  Usage:  shz tests/agent_slots_test.shio
+//
+//  Stand-in agents (the fields agent_slot uses), real threads, no LLM.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../agent_slots"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+class FakeAgent {
+	model_config = [max_running_agents = 0];
+	stopped = false;
+	_slot_held = false;
+	_slot_lent = false;
+	__init__(limit) { model_config = [max_running_agents = limit]; }
+	should_stop() { return stopped; }
+}
+
+// generating = holding a slot and not waiting for children
+class Meter {
+	now = 0;
+	peak = 0;
+	enter() {
+		cs = std.critical_section_named("slot_meter");
+		now++;
+		if(now > peak)
+			peak = now;
+		cs.release();
+	}
+	leave() {
+		cs = std.critical_section_named("slot_meter");
+		now--;
+		cs.release();
+	}
+}
+
+std.print("agent_slots_test\n");
+
+// ── a chain: root -> child -> grandchild uses one slot ───────────────────────
+root = FakeAgent(1);
+r = agent_slot(root, None);
+check("a root takes a pool slot", r.held && agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+child = FakeAgent(1);
+c = agent_slot(child, root);
+check("the waiting root lends its slot to the child (limit 1 is enough)", c.held && c.borrowed && agent_slots_in_use() == 1, "");
+
+grand = FakeAgent(1);
+g = agent_slot(grand, child);
+check("a grandchild borrows the child's slot", g.held && g.borrowed && agent_slots_in_use() == 1, "");
+
+g.release();
+c.release();
+check("released slots return to the parent", !root._slot_lent && root._slot_held && agent_slots_in_use() == 1, "");
+r.release();
+check("the root gives its pool slot back", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+// ── forks: the first sibling borrows, the others take pool slots ─────────────
+run_fork(limit, siblings, meter) {
+	parent = FakeAgent(limit);
+	ps = agent_slot(parent, None);
+
+	threads = [];
+	for(i = 0; i < siblings; i++) {
+		t = std.thread([parent, meter, limit]() {
+			kid = FakeAgent(limit);
+			s = agent_slot(kid, parent);
+			meter.enter();
+			std.sleep(60);
+			meter.leave();
+			s.release();
+		});
+		t.run();
+		threads.push_back(t);
+	}
+	for(t : threads)
+		t.join();
+
+	ps.release();
+}
+
+m = Meter();
+run_fork(2, 5, m);
+check("fork of 5 under limit 2: at most 2 generate at once", m.peak == 2, std.string(m.peak));
+check("fork done: no slot leaks", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+m = Meter();
+run_fork(1, 3, m);
+check("fork of 3 under limit 1 finishes (siblings reuse the parent's slot, no deadlock)", m.peak == 1, std.string(m.peak));
+
+m = Meter();
+run_fork(3, 3, m);
+check("fork of 3 under limit 3: all 3 run in parallel", m.peak == 3, std.string(m.peak));
+
+// ── two roots compete for the pool ───────────────────────────────────────────
+m = Meter();
+roots = [];
+for(i = 0; i < 4; i++) {
+	t = std.thread([m]() {
+		a = FakeAgent(2);
+		s = agent_slot(a, None);
+		m.enter();
+		std.sleep(40);
+		m.leave();
+		s.release();
+	});
+	t.run();
+	roots.push_back(t);
+}
+for(t : roots)
+	t.join();
+check("4 roots under limit 2: at most 2 at once", m.peak == 2, std.string(m.peak));
+
+// ── no cap and stops ─────────────────────────────────────────────────────────
+free_agent = FakeAgent(0);
+fs = agent_slot(free_agent, None);
+check("max_running_agents 0 = no cap, nothing counted", !fs.held && agent_slots_in_use() == 0, "");
+
+holder = FakeAgent(1);
+hs = agent_slot(holder, None);
+waiter = FakeAgent(1);
+done = [ok = false];
+wt = std.thread([waiter, done]() {
+	s = agent_slot(waiter, None);
+	done.ok = !s.held;
+});
+wt.run();
+std.sleep(50);
+waiter.stopped = true;
+wt.join();
+check("a stopped agent leaves the queue without a slot", done.ok && agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+hs.release();
+check("all slots returned", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+std.print("\npassed: ", passed, "   failed: ", failed);
+
+if(failed)
+	std.exitprocess(1);

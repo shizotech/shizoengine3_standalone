@@ -85,9 +85,16 @@ The node registers the router implicitly: routers are the only devices that answ
     busy           = bool,          # receptionist generating or workers running
     tasks_running  = int,
     tasks_planned  = int,
+    goals          = 1|0,           # the node runs a GoalScheduler (an .agentspace): it can do
+                                    # scheduled work at set times; 0 = its goal tools refuse
     uptime_ms      = int,
 ]
 ```
+
+`goals` is presence only (the node knows whether it started a scheduler), never a file scan.
+`Router._apply_node_info` mirrors it into the node record and `nodes_summary()` hands it to the
+router agent, so the agent can tell the user that a node has no goal system **before** routing
+a schedule there.
 
 ## Commands (node answers, router asks)
 
@@ -108,6 +115,12 @@ All payloads and replies are JSON objects. Every reply carries `ok = true|false`
 | `ai_task_add` | `[name, goal]` | `[ok, taskid, name, state="planned"]` |
 | `ai_task_update` | `[taskid, message]` | `[ok]` |
 | `ai_task_stop` | `[taskid]` | `[ok]` |
+| `ai_goals` | `[action="list"]` | `[ok, goals]` — the node's scheduled goals (`GoalScheduler.overview()`) |
+| `ai_goals` | `[action, goal]` | `[ok, goal, from, to]` / `[ok, queued]` — `run`, `pause`, `resume`, `activate`, `cancel`, `archive`, `complete` |
+
+`ai_goals` answers `ok = false` on a node without an `.agentspace` (goals off). A `run` is
+queued for the node's scheduler thread; a status change moves the goal folder
+(`goals_spec.md`).
 
 `ai_request_poll` status lifecycle is the node_api one, unchanged:
 `queued → generating → waiting → done | error`.
@@ -156,6 +169,28 @@ The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other dev
 ]
 ```
 
+### The `on_event` stream (node pushes + the router's own kinds)
+
+| kind | payload | source |
+|---|---|---|
+| `task_finished` | `[kind, time, node, taskid, name, state, report]` | node push |
+| `notify` | `[kind, time, node, message]` | node push (`notify_user` on the node) |
+| `node_state` | `[kind, time, node, online]` | node push + the router's own discovery |
+| `task_state` | `[kind, time, node, taskid, name, state, prev, report, error]` | the router's mirror moved a task |
+| `task_stalled` | `[kind, time, node, taskid, name, state, idle_ms, error]` | the router's stall watchdog |
+
+`task_state` gained `error`: the failure text of that transition — the node's `status="error"`
+answer, `"node offline"`, `"no reply from node"`, `"unknown remote id"`, ... — and `""` when
+there is none. A front end renders it, so the user sees **why** a task failed, not only that it
+did. `report` stays the node's report on a terminal state.
+
+`task_stalled` fires when an **open** task (`queued` / `generating`) made no progress for
+`Router.stall_ms` (default `ROUTER_TASK_STALL_MS` = 900000 = 15 min, `opts.stall_ms` overrides,
+`0` turns the watchdog off): no state change, no report/delta, no poll returning new data —
+progress is recorded in the mirror record's `last_progress`. At most one event per stall
+episode; `idle_ms` is how long the task has been silent. A task that reports again is not
+announced as stalled a second time.
+
 The router appends every event to `events` (capped at 200), mirrors task state into its
 remote task table, and calls the owner callback registered with `Router.on_event(cb)`.
 That is the telegram hook: a bot subclass does `router.on_event([](e) { send_to_telegram(e); })`.
@@ -200,7 +235,9 @@ class Router
     stop()
 
     nodes()                        # online node records
-    nodes_summary()                # routing table handed to the agent (no device objects)
+    nodes_summary()                # routing table handed to the agent (no device objects):
+                                   # name, description, capabilities, tags, model, load,
+                                   # open tasks and `goals` (does the node run a scheduler)
     refresh_nodes()                # re-discover + re-fetch ai_info
     delegate(node_name, prompt)    # explicit node, no agent turn -> [ok, taskid, node]
     route_task(prompt, node_name = None)
@@ -226,6 +263,11 @@ class Router
         # mode "receptionist": the goal goes to the node's receptionist (ai_request) —
         #   the normal path for user work, the remote receptionist decides how to execute.
         # mode "worker": drives the remote worker pool directly (ai_task_add) — CLI/admin.
+    add_task_error()               # -> string: the reason of the LAST add_task failure (""
+                                   # after a success): "node offline: X", "unknown node: X",
+                                   # "empty node name", "ai_request failed: ...", "the node did
+                                   # not answer". `add_task` returns only taskid|None, so this is
+                                   # how the role tool tells the user WHY the node refused.
     update_task(taskid, message)   # -> bool
     stop_task(taskid)              # -> bool
     inspect_task(taskid)           # -> task json | "Not found."
@@ -245,8 +287,12 @@ Remote task record (the router's mirror):
 
 ```
 [taskid, node, nodeid, remote_request_id, name, goal, state, report,
- created, updated, last_poll]
+ created, updated, last_poll, last_error, last_progress]
 ```
+
+`last_error` is the reason of the last failure/loss (rendered into the `task_state` event's
+`error`), `last_progress` the ms timestamp of the last visible progress (state change, report,
+delta, a poll with new data) — the stall watchdog measures against it.
 
 `state`: `queued | generating | finished | failed | stopped | lost`
 (`lost` = the node went offline and the request id is gone).
@@ -275,21 +321,27 @@ Exactly these tools, nothing else — the router cannot execute, only route:
 
 | Tool | Backed by |
 |---|---|
-| `get_nodes()` | `router.nodes_summary()` |
+| `get_nodes()` | `router.nodes_summary()` — includes per node `goals` (goal system available?) |
 | `get_node_overview(node)` | `router.node_overview(node)` |
 | `get_tasks(state?, node?)` | `router.tasks_summary(...)` — the fleet-wide task mirror |
-| `start_task(node, name, task, summary)` | `router.add_task(...)` |
+| `get_goals(node?)` | `router.goals(node)` — the scheduled goals of the nodes (`ai_goals`) |
+| `start_task(node, name, task, summary)` | `router.add_task(...)`; a refusal answer carries `router.add_task_error()` |
 | `update_task(taskid, message)` | `router.update_task(...)` |
 | `stop_task(taskid, reason?)` | `router.stop_task(...)` |
 | `inspect_task(taskid)` | `router.inspect_task(...)` |
 | `get_last_actions(limit?)` | `agt.env.last_actions` |
 | `notify(message)` | `router.notify_user(...)` |
-| `finish(report)` | ends the turn; `report` is the text the owner shows the user (mandatory, never empty) |
+| `finish(report)` | ends the turn; `report` is the text the owner shows the user (mandatory, never empty) — the **only** channel to the user, so every tool error belongs in it |
 
 `node` arguments are node **names** as shown by `get_nodes`; the role must pick one before
 `start_task` and must never invent one. Picking it is the **agent's** job (the model, reading
 the routing table), never the runtime's: `Router` has no scoring, no keyword matching and no
 fallback node.
+
+The role prompt (`roles/router/ROLE.md`, "Feedback to the owner") binds the agent to relay what
+the tools answered: the concrete `add_task_error()` reason of a refused delegation, and the fact
+that a node has `goals=false` when the user asked for scheduled work. A request that cannot
+become a goal on that node is **reported**, never quietly routed as plain work.
 
 ## Entry points
 

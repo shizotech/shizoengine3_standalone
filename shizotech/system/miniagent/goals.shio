@@ -1,0 +1,483 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  goals.shio — inspect and manage the goals of a node's .agentspace
+//
+//  shz miniagent.goals <command> [args] [--root <dir>]     (default root: .agentspace)
+//
+//    init                     create .agentspace/ from the template (never overwrites)
+//    list                     every goal: status, schedule, next window, last outcome
+//    show <id>                definition, next windows, recent runs, problems
+//    validate [id]            check every goal file (or one); exit code 1 on errors
+//    next <id> [n]            the next n windows (default 5)
+//    run <id> [--dry-run]     start a run now (the node picks it up within a tick);
+//                             --dry-run prints the prompt and changes nothing
+//    pause | resume | cancel | complete | archive | propose | activate <id>
+//                             move the goal folder (= change its status)
+//    history <id> [n]         history.md and the scheduler events of the goal
+//    diff <id>                goal.md against the revision the scheduler applied
+//    status                   scheduler heartbeat and open windows
+//
+//  Direct Markdown editing stays the primary way to change a goal; this tool adds
+//  validation and visibility. It never writes the runtime ledger (the node's
+//  scheduler owns it); "run" leaves a request file the scheduler consumes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "goal_engine"
+
+GOALS_TEMPLATE = __DIR__ + "/agentspace_template";
+
+goals_args() {
+	out = [];
+	skip = false;
+
+	for(i = 1; i < std.argc(); i++) {
+		a = std.string(std.argv(i) ?? "");
+
+		if(skip) {
+			skip = false;
+			continue;
+		}
+
+		if(a == "--root" || a == "--agentspace") {
+			skip = true;
+			continue;
+		}
+
+		if(a.starts("--"))
+			continue;
+
+		out.push_back(a);
+	}
+
+	return out;
+}
+
+goals_flag(name) {
+	for(i = 1; i < std.argc(); i++) {
+		if(std.string(std.argv(i) ?? "") == name)
+			return true;
+	}
+	return false;
+}
+
+goals_root() {
+	r = std.argvoption("--root");
+	if(!r)
+		r = std.argvoption("--agentspace");
+	if(!r)
+		r = ".agentspace";
+	return std.string(r);
+}
+
+goals_help() {
+	std.print(R"(shz miniagent.goals <command> [args] [--root <dir>]
+
+  init                       create .agentspace/ from the template
+  list                       all goals with status, next window, last outcome
+  show <id>                  one goal in detail
+  validate [id]              check the goal files (exit code 1 on errors)
+  next <id> [n]              the next n windows
+  run <id> [--dry-run]       run now (the node starts it) / print the prompt only
+  pause|resume|cancel|complete|archive|propose|activate <id>
+  history <id> [n]           history.md + scheduler events
+  diff <id>                  changes since the revision the scheduler applied
+  status                     scheduler heartbeat and open windows
+)");
+}
+
+goals_need_space(space) {
+	if(space.exists())
+		return true;
+	std.print("No goals folder at '" + space.root + "/goals'. Create one with: shz miniagent.goals init");
+	return false;
+}
+
+// read-only view of the runtime ledger
+goals_ledger(space) {
+	path = space.runtime_dir() + "/ledger.json";
+	data = None;
+	try {
+		if(fileio.exists(path))
+			data = std.json(goal_read(path));
+	}
+	catch(e) {}
+
+	if(!gj_is_map(data)) {
+		data = std.json();
+		data.goals = std.json();
+		data.activations = std.json();
+		data.events = [];
+	}
+	return data;
+}
+
+goals_last_activation(ledger, id, open_only) {
+	best = None;
+	for(k, a : gj(ledger, "activations", std.json())) {
+		if(gj_str(a, "goal", "") != id)
+			continue;
+		if(open_only && goal_activation_closed(a))
+			continue;
+		if(!best || gj(a, "created", 0) > gj(best, "created", 0))
+			best = a;
+	}
+	return best;
+}
+
+goals_cmd_list(space) {
+	prefs = space.preferences();
+	ledger = goals_ledger(space);
+	t_now = gt_now();
+	n = 0;
+
+	for(p : prefs.errors)
+		std.print("! " + p);
+
+	for(st : GOAL_STATUSES) {
+		for(f : space.folders()) {
+			if(f.status != st)
+				continue;
+
+			n++;
+			r = space.load(f, prefs);
+
+			if(!r.ok) {
+				std.print("[" + f.status + "] " + f.id + "  INVALID: " + gfm_join(r.errors, " | "));
+				continue;
+			}
+
+			d = r.def;
+			line = "[" + f.status + "] " + f.id + " - " + d.title + "\n    " + goal_schedule_text(d);
+
+			if(d.policy.dry_run)
+				line += "  (dry run)";
+
+			if(f.status == "active") {
+				nw = goal_next_windows(d, t_now, 1);
+				line += "\n    next: " + (nw.size() ? goal_window_text(d, nw[0]) : "-");
+			}
+
+			open = goals_last_activation(ledger, f.id, true);
+			if(open)
+				line += "\n    now: window " + goal_window_text(d, open) + " (" + gj_str(open, "state", "") + ", " + open.runs.size() + " run(s))";
+
+			last = goals_last_activation(ledger, f.id, false);
+			if(last && last != open)
+				line += "\n    last: " + gj_str(last, "state", "") + " - window " + goal_window_text(d, last);
+
+			g = gj(gj(ledger, "goals", std.json()), f.id, None);
+			if(g && gj_str(g, "revision", "") && gj_str(g, "revision", "") != r.revision)
+				line += "\n    ! the scheduler has not applied this revision yet (" + gj_str(g, "revision", "") + " -> " + r.revision + ")";
+
+			line += "\n    " + f.path;
+			std.print(line);
+		}
+	}
+
+	if(n == 0)
+		std.print("No goals yet. Copy a file from " + space.root + "/templates/ to " + space.root + "/goals/active/<id>/goal.md");
+}
+
+goals_cmd_show(space, id) {
+	f = space.find(id);
+	if(!f) {
+		std.print("No goal '" + id + "'.");
+		return 1;
+	}
+
+	prefs = space.preferences();
+	r = space.load(f, prefs);
+	ledger = goals_ledger(space);
+
+	std.print(id + "  [" + f.status + "]  " + f.path);
+
+	for(w : r.warnings)
+		std.print("  warning: " + w);
+
+	if(!r.ok) {
+		std.print("  INVALID:");
+		for(e : r.errors)
+			std.print("  - " + e);
+		g = gj(gj(ledger, "goals", std.json()), id, None);
+		if(g && gj_str(g, "revision", ""))
+			std.print("  The scheduler keeps running revision " + gj_str(g, "revision", "") + " until this is fixed.");
+		return 1;
+	}
+
+	d = r.def;
+	std.print("  title:     " + d.title);
+	std.print("  schedule:  " + goal_schedule_text(d) + " (misfire: " + d.schedule.misfire + ")");
+	std.print("  policy:    stop " + d.policy.stop_policy + ", " + (d.policy.repeat_in_window ? "repeat up to " + d.policy.max_runs_per_window + " runs" : "one run") + " per window, " + d.policy.max_parallel_workers + " parallel, " + d.policy.max_attempts + " attempts" + (d.policy.verify ? ", verified" : "") + (d.policy.dry_run ? ", DRY RUN" : ""));
+	std.print("  approval:  " + gfm_join(d.policy.require_approval, ", "));
+	std.print("  revision:  " + r.revision);
+
+	nw = goal_next_windows(d, gt_now(), 5);
+	if(nw.size()) {
+		std.print("  next windows:");
+		for(w : nw)
+			std.print("    " + goal_window_text(d, w));
+	}
+
+	acts = [];
+	for(k, a : gj(ledger, "activations", std.json())) {
+		if(gj_str(a, "goal", "") == id)
+			acts.push_back(a);
+	}
+	acts = goal_sort(acts, "created", true);
+
+	if(acts.size()) {
+		std.print("  recent windows:");
+		for(i = 0; i < acts.size() && i < 8; i++) {
+			a = acts[i];
+			std.print("    " + goal_window_text(d, a) + "  " + gj_str(a, "state", "") + "  runs: " + a.runs.size() + "  revision " + gj_str(a, "revision", ""));
+		}
+	}
+
+	return 0;
+}
+
+goals_cmd_validate(space, id) {
+	prefs = space.preferences();
+	bad = 0;
+
+	for(p : prefs.errors) {
+		std.print("ERROR " + p);
+		bad++;
+	}
+
+	for(f : space.folders()) {
+		if(id && f.id != id)
+			continue;
+		r = space.load(f, prefs);
+		if(r.ok) {
+			std.print("ok    " + f.path + "  (revision " + r.revision + ")");
+		}
+		else {
+			bad++;
+			std.print("ERROR " + f.path);
+			for(e : r.errors)
+				std.print("      - " + e);
+		}
+		for(w : r.warnings)
+			std.print("      warning: " + w);
+	}
+
+	return bad > 0 ? 1 : 0;
+}
+
+goals_cmd_run(space, id, dry) {
+	f = space.find(id);
+	if(!f) {
+		std.print("No goal '" + id + "'.");
+		return 1;
+	}
+
+	r = space.load(f);
+	if(!r.ok) {
+		std.print("The goal is invalid:\n- " + gfm_join(r.errors, "\n- "));
+		return 1;
+	}
+
+	if(dry) {
+		// a scheduler object without host only builds the prompt; nothing is saved
+		sch = GoalScheduler(space, None, [notify = false]);
+		sch.defs[id] = r.def;
+		t_now = gt_now();
+		len = r.def.schedule.duration ?? 4 * 3600;
+		if(!std.is_none(r.def.schedule.end) && !std.is_none(r.def.schedule.start)) {
+			len = r.def.schedule.end - r.def.schedule.start;
+			if(len <= 0)
+				len += GT_DAY;
+		}
+		a = [goal = id, start = t_now, end = t_now + len, runs = [], last_report = ""];
+		a.runs.clear();
+		std.print("DRY RUN - window " + goal_window_text(r.def, a) + ", nothing is dispatched.\n");
+		std.print(sch.build_prompt(r.def, a, "work"));
+		return 0;
+	}
+
+	if(f.status != "active") {
+		std.print("The goal is " + f.status + "; move it to active first (shz miniagent.goals resume " + id + ").");
+		return 1;
+	}
+
+	dir = space.runtime_dir() + "/requests";
+	goal_mkdir(dir);
+	path = dir + "/" + std.string(gt_now()) + "-" + std.random_hash(4) + ".json";
+	goal_write_atomic(path, [action = "run", goal = id, at = gt_now()].string());
+	std.print("Requested a run of " + id + ". The node's scheduler starts it within its next tick (" + (GOAL_TICK_MS / 1000) + " s) - check with: shz miniagent.goals status");
+	return 0;
+}
+
+goals_cmd_history(space, id, n) {
+	f = space.find(id);
+	if(!f) {
+		std.print("No goal '" + id + "'.");
+		return 1;
+	}
+
+	h = goal_read(f.dir + "/history.md");
+	if(h) {
+		entries = h.split("\n## ");
+		start = math.max(1, entries.size() - n);
+		for(i = start; i < entries.size(); i++)
+			std.print("## " + entries[i].strip() + "\n");
+	}
+	else {
+		std.print("(no history.md yet)");
+	}
+
+	ledger = goals_ledger(space);
+	std.print("Scheduler events:");
+	tz = gt_zone(gj_str(space.preferences(), "timezone", "local"));
+	for(e : gj(ledger, "events", [])) {
+		if(gj_str(e, "goal", "") == id)
+			std.print("  " + gt_format_local(tz, gj(e, "t", 0)) + "  " + gj_str(e, "kind", "") + "  " + gj_str(e, "msg", ""));
+	}
+	return 0;
+}
+
+goals_cmd_diff(space, id) {
+	f = space.find(id);
+	if(!f) {
+		std.print("No goal '" + id + "'.");
+		return 1;
+	}
+
+	ledger = goals_ledger(space);
+	g = gj(gj(ledger, "goals", std.json()), id, None);
+	applied = g ? gj_str(g, "text", "") : "";
+	current = goal_read(f.path);
+
+	if(!applied) {
+		std.print("The scheduler has not applied any revision of " + id + " yet (is the node running?).");
+		return 0;
+	}
+
+	d = goal_line_diff(applied, current);
+	if(!d) {
+		std.print("No changes: " + f.path + " is the applied revision " + gj_str(g, "revision", "") + ".");
+		return 0;
+	}
+
+	std.print("--- applied revision " + gj_str(g, "revision", "") + "\n+++ " + f.path + " (revision " + goal_text_revision(current) + ")");
+	std.print(d);
+	return 0;
+}
+
+goals_cmd_status(space) {
+	ledger = goals_ledger(space);
+	tz = gt_zone(gj_str(space.preferences(), "timezone", "local"));
+	last = gj(ledger, "last_tick", 0);
+
+	if(!last)
+		std.print("The scheduler has never run on this .agentspace (start a node in this directory: shz miniagent.node).");
+	else
+		std.print("Last scheduler tick: " + gt_format_local(tz, last) + " (" + (gt_now() - last) + " s ago)");
+
+	n = 0;
+	for(k, a : gj(ledger, "activations", std.json())) {
+		if(goal_activation_closed(a))
+			continue;
+		n++;
+		open_runs = 0;
+		for(r : a.runs) {
+			if(goal_run_open(r))
+				open_runs++;
+		}
+		std.print("  " + gj_str(a, "goal", "") + ": " + gt_format_local(tz, a.start) + " -> " + gt_format_local(tz, a.end) + "  " + gj_str(a, "state", "") + ", " + open_runs + " running" + (gj_str(a, "waiting_for", "") ? ", waiting: " + a.waiting_for : ""));
+	}
+	if(!n)
+		std.print("No open windows.");
+
+	dir = space.runtime_dir() + "/requests";
+	if(fileio.is_directory(dir) && fileio.files(dir, false).size())
+		std.print(std.string(fileio.files(dir, false).size()) + " run request(s) waiting for the scheduler.");
+	return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+args = goals_args();
+space = GoalSpace(goals_root());
+cmd = args.size() ? args[0].lowercase() : "help";
+id = args.size() > 1 ? args[1] : "";
+code = 0;
+
+moves = [
+	pause = "paused",
+	resume = "active",
+	activate = "active",
+	cancel = "cancelled",
+	complete = "completed",
+	archive = "archived",
+	propose = "proposed",
+];
+
+if(cmd == "help" || cmd == "-h" || cmd == "--help") {
+	goals_help();
+}
+else if(cmd == "init") {
+	created = space.init(GOALS_TEMPLATE);
+	std.print(created.size() ? "Created " + created.size() + " file(s) in " + space.root + "/" : space.root + "/ is already complete.");
+	for(c : created)
+		std.print("  " + c);
+	if(created.size())
+		std.print("\nNext: set your time zone in " + space.root + "/preferences/scheduling.md, then move an example from goals/proposed/ to goals/active/.");
+}
+else if(!goals_need_space(space)) {
+	code = 1;
+}
+else if(cmd == "list" || cmd == "ls") {
+	goals_cmd_list(space);
+}
+else if(cmd == "validate") {
+	code = goals_cmd_validate(space, id);
+}
+else if(cmd == "status") {
+	code = goals_cmd_status(space);
+}
+else if(!id) {
+	std.print("usage: shz miniagent.goals " + cmd + " <id>");
+	code = 1;
+}
+else if(cmd == "show") {
+	code = goals_cmd_show(space, id);
+}
+else if(cmd == "next") {
+	f = space.find(id);
+	r = f ? space.load(f) : None;
+	if(!r || !r.ok) {
+		std.print(f ? "The goal is invalid." : "No goal '" + id + "'.");
+		code = 1;
+	}
+	else {
+		cnt = args.size() > 2 ? std.int(args[2]) : 5;
+		for(w : goal_next_windows(r.def, gt_now(), math.max(1, cnt)))
+			std.print(goal_window_text(r.def, w));
+	}
+}
+else if(cmd == "run") {
+	code = goals_cmd_run(space, id, goals_flag("--dry-run"));
+}
+else if(cmd == "history") {
+	code = goals_cmd_history(space, id, args.size() > 2 ? std.int(args[2]) : 10);
+}
+else if(cmd == "diff") {
+	code = goals_cmd_diff(space, id);
+}
+else if(moves.has(cmd)) {
+	res = space.move(id, moves[cmd]);
+	if(res.ok)
+		std.print(gj(res, "unchanged", false) ? id + " is already " + moves[cmd] + "." : id + ": " + res.from + " -> " + res.to + " (" + res.dir + ")");
+	else
+		std.print("Failed: " + res.error);
+	code = res.ok ? 0 : 1;
+}
+else {
+	std.print("Unknown command '" + cmd + "'.\n");
+	goals_help();
+	code = 1;
+}
+
+if(code != 0)
+	std.exitprocess(code);

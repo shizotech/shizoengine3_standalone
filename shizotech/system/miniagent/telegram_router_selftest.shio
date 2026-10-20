@@ -18,9 +18,13 @@
 //      progress streams as a draft
 //    * a task finished on ANY node is a notification in EVERY trusted chat,
 //      carrying the report, exactly once per chat (the Router de-duplicates)
-//    * one routed goal = ONE task, named by the NODE: the router announces no
-//      name of its own, the node's receptionist acknowledgement is never sent,
-//      and the completion arrives exactly once with the node's task name
+//    * every terminal task state reaches the chat WITH ITS REASON: failed /
+//      lost / stopped render the task_state `error` (C1) next to the report,
+//      a question renders [question], a finished task with an empty report
+//      says "(the node reported nothing)", and a task_stalled event (C2) is
+//      announced once per episode in every trusted chat
+//    * /nodes shows per node whether it runs a goal system (goals, C5),
+//      /help describes the notifications
 //    * node notify + node online/offline are forwarded
 //    * a reload reads the trust file from disk
 //
@@ -85,6 +89,14 @@ class tg_fake_bot {
     next_draft = 1;
     draft_id_mode = "int";      // int | json | string | none | raise — the shapes
                                 // new_draft_id can hand back (undocumented return)
+    files = [];                 // fileid -> content for download_file
+
+    download_file(fileid, destination = "") {
+        if(!files.has(fileid)) {
+            return [success = false];
+        }
+        return [success = true, content = files[fileid]];
+    }
 
     send_rich(chatdata, options) {
         cid = 0;
@@ -185,20 +197,6 @@ class tg_fake_bot {
         return n;
     }
 
-    // one broadcast reaches every trusted chat, so "exactly once" is per chat
-    count_with_for(chatid, needle) {
-        want = std.int(chatid);
-        n = 0;
-
-        for(i = 0; i < sent.size(); i++) {
-            if(std.int(sent[i].chatid) == want && std.string(sent[i].text).contains(needle)) {
-                n++;
-            }
-        }
-
-        return n;
-    }
-
     last_for(chatid) {
         want = std.int(chatid);
         out = "";
@@ -249,6 +247,12 @@ class tg_stub_host {
 
     running = true;
 
+    // C5: the PRESENCE of this member is what a node advertises in ai_node_info
+    // as "I run a goal scheduler" (goals = 1/0, no file scan). The fixture gives
+    // hostA a stand-in and leaves hostB at None, so /nodes shows
+    // "goals: yes" for GPUBox and "goals: no" for WebBox.
+    goals = None;
+
     _receptionist_active = false;
     request_queue = [];
     worker_threads = [[], [], []];
@@ -261,11 +265,9 @@ class tg_stub_host {
 
     _notify_cb = None;
     _task_finish_cb = None;
-    _task_start_cb = None;
 
     on_notify(cb) { _notify_cb = cb; }
     on_task_finished(cb) { _task_finish_cb = cb; }
-    on_task_started(cb) { _task_start_cb = cb; }
     on_action(cb) { }
 
     notify_user(msg) {
@@ -273,13 +275,11 @@ class tg_stub_host {
             _notify_cb(std.string(msg));
     }
 
-    // HANDOFF makes the stub receptionist create a task for the goal it was
-    // delegated, exactly like the real receptionist role does inside its turn.
+    requests = [];
+
     request(prompt, on_finish_cb = None, on_action_cb = None) {
         _receptionist_active = true;
-
-        if(prompt.starts("HANDOFF"))
-            add_task("Sushi-Goal", std.string(prompt));
+        requests.push_back(std.string(prompt));
 
         result = [
             ok = true,
@@ -306,12 +306,7 @@ class tg_stub_host {
 
     add_task(name, goal) {
         taskid = std.random_hash(16);
-        task = [name = name, task = goal, taskid = taskid, state = "planned"];
-        tasks_scheduled.push_back(task);
-
-        if(_task_start_cb)
-            _task_start_cb(task);
-
+        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
         return taskid;
     }
 
@@ -520,7 +515,6 @@ rtr = TelegramRouter(
         trusted_chats = TRUSTED_FILE,
         poll_ms = 100,
         draft_ms = 0,
-        handoff_settle_ms = 500,
     ]
 );
 
@@ -528,6 +522,10 @@ rtr.attach_bot(bot);
 
 hostA = tg_stub_host();
 hostB = tg_stub_host();
+
+// GPUBox runs a goal system, WebBox does not (C5: ai_node_info advertises it,
+// the router mirrors it, /nodes renders it).
+hostA.goals = [stand_in = "fake GoalScheduler"];
 
 nodeA = shizonet.server(NODE_A_WIRE, NODE_A_PORT);
 svcA = ai_node_attach(nodeA, hostA, [name = GPU_NAME, description = "cuda training and gpu number crunching", capabilities = ["gpu", "cuda", "training"]]);
@@ -729,83 +727,77 @@ after_window = wait_for([stub_agent]() { return stub_agent.turns == turns_pre + 
 check("the same text after the dedup window is a new turn", after_window, std.string(stub_agent.turns - turns_pre));
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4e. One routed goal = ONE task, and the task is the NODE's.
-//
-//  The owner's complaint: routing one goal produced two "Task X started" messages
-//  with two different names — the label the router agent invented and the node's
-//  real task. The router names nothing and never renders the node's receptionist
-//  acknowledgement as news; the node's task is the task, announced once, by the node.
+//  4e. Follow-ups and files: a burst of messages is one turn, every message is
+//      in the action ring, a reply quotes its message, a text file is shown to
+//      the agent and reaches the node verbatim, a binary file is not read.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The previous section left a turn in flight, and its handoff records settle a moment
-// later: let them land, clear the chat, and synchronise on the AGENT turn count -
-// "picked GPUBox" is already in the history, so the chat text cannot be the signal.
-//
-// The goal text is unique: the settle of an older handoff record lands in this chat
-// mid-section, and a needle shared with those answers would make the checks race.
-std.sleep(1200);
-bot.clear();
-
-hand_turns = stub_agent.turns;
-hand_goal = "HANDOFF train the sushi model with cuda";
-
-bot.on_any_message([chatid = CHAT_A, text = hand_goal]);
-
-hand_turn = wait_for([stub_agent, hand_turns]() { return stub_agent.turns >= hand_turns + 1; }, 8000);
-check("the goal ran its own router-agent turn", hand_turn, std.string(stub_agent.turns - hand_turns));
-
-hand_answered = wait_for([bot]() { return bot.count_for(CHAT_A) > 0; }, 8000);
-check("the routed goal is answered", hand_answered, bot.last_for(CHAT_A));
-
-answer = bot.last_for(CHAT_A);
-check("the answer names no task", !answer.contains("AgentPick") && !answer.contains("Sushi-Goal"), answer);
-check("the answer says which node took the goal", answer.contains(GPU_NAME), answer);
-check("the answer promises the notification", answer.lowercase().contains("when it is done"), answer);
-check("the receptionist ack is not sent as news", !answer.contains("stub answer:"), answer);
-
-goal_taskid = "";
-find_goal = wait_for([rtr, hand_goal]() {
-		list = rtr.tasks_summary();
-		for(i = 0; i < list.size(); i++) {
-			if(std.string(list[i].goal) == hand_goal) {
-				return true;
-			}
-		}
-		return false;
-	}, 8000);
-
-if(find_goal) {
-	glist = rtr.tasks_summary();
-	for(i = 0; i < glist.size(); i++) {
-		if(std.string(glist[i].goal) == hand_goal) {
-			goal_taskid = std.string(glist[i].taskid);
-		}
-	}
+wait_turns(n) {
+    return wait_for([stub_agent, n]() { return stub_agent.turns >= n; }, 8000);
 }
-check("the goal is mirrored exactly once", find_goal && goal_taskid.length() > 0, std.string(goal_taskid));
 
-bound = wait_for([rtr, goal_taskid]() {
-		t = rtr.inspect_task(goal_taskid);
-		return std.is_json(t) && std.string(t.remote_taskid).length() > 0;
-	}, 8000);
+turns_pre = stub_agent.turns;
+bot.clear();
+bot.on_any_message([chatid = CHAT_A, text = "fix the http login page"]);
+bot.on_any_message([chatid = CHAT_A, text = "sorry, I meant the http signup page"]);
 
-gr = rtr.inspect_task(goal_taskid);
-check("the node's task_started bound the record", bound, std.string(gr));
-check("the record took the NODE's task name", std.is_json(gr) && std.string(gr.name) == "Sushi-Goal", std.string(gr));
+check("a burst of messages is answered", wait_turns(turns_pre + 1), std.string(stub_agent.turns - turns_pre));
+std.sleep(TG_COALESCE_MS + 300);
+burst_prompt = stub_agent.prompts[stub_agent.prompts.size() - 1];
+check("a burst of messages is ONE turn", stub_agent.turns == turns_pre + 1, std.string(stub_agent.turns - turns_pre));
+check("the turn carries both messages in order", burst_prompt.contains("1. fix the http login page") && burst_prompt.contains("2. sorry, I meant the http signup page"), burst_prompt);
 
-grtid = "";
-if(std.is_json(gr))
-	grtid = std.string(gr.remote_taskid);
+user_logged = false;
+for(a : rtr.last_actions) {
+    if(std.string(a.action) == "user_message" && std.string(a.text).contains("signup page"))
+        user_logged = true;
+}
+check("the user's messages are in the action ring (get_last_actions)", user_logged, std.string(rtr.last_actions[0]));
 
-check("the node finishes its task", hostA.finish_task(grtid, "finished", "the sushi model is trained"), grtid);
+turns_pre = stub_agent.turns;
+bot.on_any_message([chatid = CHAT_A, text = "make it the http admin page instead", reply = [text = "picked WebBox", msgid = 5]]);
+wait_turns(turns_pre + 1);
+check("a reply quotes the message it answers", stub_agent.prompts[stub_agent.prompts.size() - 1].contains("(in reply to: \"picked WebBox\")"), stub_agent.prompts[stub_agent.prompts.size() - 1]);
 
-done_msg = wait_for([bot]() { return bot.has_for(CHAT_A, "[done] " + GPU_NAME + ": task Sushi-Goal"); }, 8000);
-check("the completion names the NODE's task", done_msg, bot.last_for(CHAT_A));
-check("the completion carries the node's report", bot.has_for(CHAT_A, "the sushi model is trained"), bot.last_for(CHAT_A));
-check("one routed goal is announced once per chat",
-	bot.count_with_for(CHAT_A, "Sushi-Goal") == 1 && bot.count_with_for(CHAT_B, "Sushi-Goal") == 1,
-	std.string(bot.count_with_for(CHAT_A, "Sushi-Goal")) + "/" + std.string(bot.count_with_for(CHAT_B, "Sushi-Goal")));
-check("no lost is announced for a goal that is simply running", !bot.has_for(CHAT_A, "[lost]"), std.string(bot.sent));
+bot.files["F1"] = "# Plan\n- step one: the http status page\n";
+web_requests = hostB.requests.size();
+turns_pre = stub_agent.turns;
+bot.on_any_message([chatid = CHAT_A, caption = "implement this plan for the http site", document = [fileid = "F1", fileuid = "U1", filename = "plan.md", filesize = 40, mimetype = "text/markdown"]]);
+wait_turns(turns_pre + 1);
+file_prompt = stub_agent.prompts[stub_agent.prompts.size() - 1];
+check("the caption is the instruction", file_prompt.starts("implement this plan for the http site"), file_prompt);
+check("the agent sees the file content", file_prompt.contains("Attached file 'plan.md'") && file_prompt.contains("- step one: the http status page"), file_prompt);
+tg_file_delivered(host) {
+    for(r : host.requests) {
+        if(r.contains("Files the user attached") && r.contains("- step one: the http status page"))
+            return true;
+    }
+    return false;
+}
+delivered = wait_for([hostB]() { return tg_file_delivered(hostB); }, 8000);
+check("the node receives the file verbatim with the delegated goal", delivered, std.string(hostB.requests.size()));
+check("the file is kept in telegram_inbox/", fileio.files(rtr.tg_inbox, false).size() >= 1, rtr.tg_inbox);
+check("the attachments end with the turn", wait_for([rtr]() { return rtr.turn_attachments.size() == 0 && rtr.tg_active == None; }, 8000), "");
+
+turns_pre = stub_agent.turns;
+bot.on_any_message([chatid = CHAT_A, caption = "QUESTION: what is in this picture", document = [fileid = "F2", fileuid = "U2", filename = "photo.png", filesize = 4000, mimetype = "image/png"]]);
+wait_turns(turns_pre + 1);
+check("a binary file is not read, the agent is told why", stub_agent.prompts[stub_agent.prompts.size() - 1].contains("not a text file"), stub_agent.prompts[stub_agent.prompts.size() - 1]);
+
+bot.clear();
+bot.on_any_message([chatid = CHAT_A, text = "/goals"]);
+goals_answered = wait_for([bot]() { return bot.has_for(CHAT_A, GPU_NAME) && bot.has_for(CHAT_A, WEB_NAME); }, 8000);
+check("/goals asks every node (worker thread)", goals_answered, bot.last_for(CHAT_A));
+check("/goals says when a node has no .agentspace", bot.has_for(CHAT_A, "no .agentspace"), bot.last_for(CHAT_A));
+
+bot.clear();
+bot.on_any_message([chatid = CHAT_A, text = "/goal pause nightly"]);
+check("/goal on an unknown goal is answered", wait_for([bot]() { return bot.has_for(CHAT_A, "no node has a goal"); }, 8000), bot.last_for(CHAT_A));
+
+for(f : fileio.files(rtr.tg_inbox, false)) {
+    try { fileio.remove(rtr.tg_inbox + "/" + fileio.file_name(f)); } catch(e) {}
+}
+try { fileio.remove(rtr.tg_inbox); } catch(e) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  5. A task finished on ANY node is a notification in EVERY trusted chat
@@ -844,13 +836,20 @@ bot.clear();
 rtr.handle_event([kind = "node_state", node = "GhostBox", online = true]);
 rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "queued"]);
 rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "generating"]);
-rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "stopped"]);
 
 std.sleep(700);
 
 check("node online/offline is not sent", !bot.has_for(CHAT_A, "[node]"), bot.last_for(CHAT_A));
 check("queued/running transitions are not sent", !bot.has_for(CHAT_A, "[queued]") && !bot.has_for(CHAT_A, "[running]"), bot.last_for(CHAT_A));
-check("a stop is not sent", !bot.has_for(CHAT_A, "ChatterJob"), bot.last_for(CHAT_A));
+
+// a STOPPED task is a terminal fact and must arrive: it used to be filtered out,
+// which is exactly the silence the owner complained about.
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x1", name = "ChatterJob", state = "stopped", error = "the owner stopped it"]);
+
+stopped_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[stopped] GPUBox: task ChatterJob stopped"); }, 6000);
+check("a stopped task is reported", stopped_seen, bot.last_for(CHAT_A));
+check("the stop carries the reason", bot.has_for(CHAT_A, "error: the owner stopped it"), bot.last_for(CHAT_A));
+check("a stopped task reaches every trusted chat", bot.has_for(CHAT_B, "[stopped] GPUBox: task ChatterJob stopped"), bot.last_for(CHAT_B));
 
 rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x2", name = "FailJob", state = "failed", report = "the gpu ran out of memory"]);
 
@@ -867,6 +866,66 @@ rtr.handle_event([kind = "notify", node = GPU_NAME, message = "the node asks: wh
 
 question_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "which python shall I use?"); }, 6000);
 check("a node report / question (notify) is delivered", question_seen, bot.last_for(CHAT_A));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  5c. Every failure carries its REASON, a stall is announced, and an empty
+//      report is never a bare line. This is the owner's complaint: "run from X
+//      until Y on node Z" on a node without a goal system errored and the chat
+//      saw NOTHING.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// C1 + C3: the node answered status="error" -> state failed, the reason is in
+// `error`, the report is empty.
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x4", name = "NoGoalJob", state = "failed", report = "", error = "Goals are not enabled on this node: start it in a folder with an .agentspace (shz miniagent.goals init) or with --agentspace <dir>."]);
+
+reason_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[failed] GPUBox: task NoGoalJob failed"); }, 6000);
+check("a failure with an empty report is reported", reason_seen, bot.last_for(CHAT_A));
+check("a failure with an empty report renders the reason", bot.has_for(CHAT_A, "error: Goals are not enabled on this node"), bot.last_for(CHAT_A));
+check("the failure reason reaches every trusted chat", bot.has_for(CHAT_B, "error: Goals are not enabled on this node"), bot.last_for(CHAT_B));
+
+// report AND reason: both are rendered
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x5", name = "BothJob", state = "failed", report = "the worker died mid-turn", error = "exit code 3"]);
+
+both_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[failed] GPUBox: task BothJob failed"); }, 6000);
+check("a failure renders the report and the reason",
+    both_seen && bot.has_for(CHAT_A, "the worker died mid-turn") && bot.has_for(CHAT_A, "error: exit code 3"),
+    bot.last_for(CHAT_A));
+
+// a lost task: the reason the node is gone
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x6", name = "GoneJob", state = "lost", report = "", error = "node offline"]);
+lost_reason = wait_for([bot]() { return bot.has_for(CHAT_A, "[lost] GPUBox: task GoneJob lost"); }, 6000);
+check("a lost task renders the reason", lost_reason && bot.has_for(CHAT_A, "error: node offline"), bot.last_for(CHAT_A));
+
+// a finished task with an EMPTY report must not be a bare line
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x7", name = "SilentJob", state = "finished", report = ""]);
+silent_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[done] GPUBox: task SilentJob finished"); }, 6000);
+check("a finished task with an empty report says so",
+    silent_seen && bot.has_for(CHAT_A, "(the node reported nothing)"), bot.last_for(CHAT_A));
+
+// C2: the stall watchdog — one message per episode, in every trusted chat.
+// 960000 ms = 16 min.
+rtr.handle_event([kind = "task_stalled", node = GPU_NAME, taskid = "s1", name = "StallJob", state = "generating", idle_ms = 960000, error = ""]);
+
+stalled_seen = wait_for([bot]() {
+        return bot.has_for(CHAT_A, "[stalled] GPUBox: task StallJob has made no progress for 16 min (state generating)")
+            && bot.has_for(CHAT_B, "[stalled] GPUBox: task StallJob has made no progress for 16 min (state generating)");
+    }, 6000);
+
+check("a stalled task is announced in every trusted chat", stalled_seen, bot.last_for(CHAT_A));
+check("the stall is announced exactly once per chat",
+    bot.count_with("[stalled] GPUBox: task StallJob") == 2, std.string(bot.count_with("[stalled] GPUBox: task StallJob")));
+check("the stall tells the owner what to do", bot.has_for(CHAT_A, "Ask it for status with a message, or /tasks."), bot.last_for(CHAT_A));
+
+// a node that ASKS: task_finished in state question -> [question]
+rtr.handle_event([kind = "task_finished", node = "GhostBox", taskid = "q1", name = "AskJob", state = "question", report = "which branch shall I push?"]);
+ask_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[question] GhostBox: task AskJob question"); }, 6000);
+check("a question task_finished renders [question]", ask_seen, bot.last_for(CHAT_A));
+check("the node's question is in the message", bot.has_for(CHAT_A, "which branch shall I push?"), bot.last_for(CHAT_A));
+
+// the poller's own view of the same fact (task_state question) is visible too
+rtr.handle_event([kind = "task_state", node = GPU_NAME, taskid = "x8", name = "PollAskJob", state = "question", report = "the node needs a decision"]);
+poll_ask = wait_for([bot]() { return bot.has_for(CHAT_A, "[question] GPUBox: task PollAskJob question"); }, 6000);
+check("a task_state question is reported", poll_ask && bot.has_for(CHAT_A, "the node needs a decision"), bot.last_for(CHAT_A));
 
 // tg_events = "all" (--verbose-events) restores the full stream.
 // A node name the table does not know is always a transition, so the event is
@@ -903,6 +962,13 @@ check("/tasks <state> filters out finished work", !bot.has_for(CHAT_B, "TGJob [f
 
 bot.on_any_message([chatid = CHAT_B, text = "/nodes"]);
 check("/nodes lists the fleet", bot.has_for(CHAT_B, WEB_NAME) && bot.has_for(CHAT_B, GPU_NAME), bot.last_for(CHAT_B));
+check("/nodes shows goals: yes for the node with a goal system", bot.has_for(CHAT_B, "goals: yes"), bot.last_for(CHAT_B));
+check("/nodes shows goals: no for the node without one", bot.has_for(CHAT_B, "goals: no"), bot.last_for(CHAT_B));
+
+bot.on_any_message([chatid = CHAT_B, text = "/help"]);
+check("/help describes the stall notification", bot.has_for(CHAT_B, "[stalled]"), bot.last_for(CHAT_B));
+check("/help describes the failure reason", bot.has_for(CHAT_B, "error: ..."), bot.last_for(CHAT_B));
+check("/help describes the stop notification", bot.has_for(CHAT_B, "is stopped"), bot.last_for(CHAT_B));
 
 bot.on_any_message([chatid = CHAT_B, text = "/status"]);
 check("/status shows the trust state", bot.has_for(CHAT_B, "trusted chats") && bot.has_for(CHAT_B, TRUSTED_FILE), bot.last_for(CHAT_B));

@@ -271,6 +271,8 @@ Scopes are resolved when the script is compiled, by position in the source:
 - Assigning to a name that already exists in an enclosing scope (defined EARLIER in the source) changes that variable. This also applies to globals inside functions, as long as the global is assigned above the function.
 - Otherwise the assignment creates a NEW variable in the current block. Every `{ }` / indentation block (`if`, `for`, function body) is its own scope: variables created inside it do NOT exist after the block (compile error `Variable 'x' does not exist`). This includes the loop variable of `for(i = 0; ...)`.
 - `var x = ...;` (or `let`) always creates a new local variable, even if an outer one with the same name exists (shadowing).
+- A new variable cannot be read in its own first assignment: `total = total + x;` or `count += 1;` without an earlier `total` / `count`, and `var x = x + 1;`, are compile errors (`Variable 'total' does not exist`). A lambda may capture itself: `fib = [&fib](n) { ... };`.
+- A class name must be new in its scope: a second `class A`, or `class f` next to a function or variable `f`, is a compile error.
 
 ```
 g = 1;
@@ -882,6 +884,7 @@ any loose = 1;                        // 'any' / 'dynamic': not checked
 
 - Types: `int`, `bool` (= int), `float`, `number` (int or float), `string`, `json`, `function`, `any` / `dynamic`, `void` (returns nothing), class and interface names, `list<T>` and `map<T>`.
 - An annotated assignment always declares a NEW variable, like `var`: `for (int i = 0; ...)` does not touch an outer `i`, and `int x = 1; int x = 2;` in the same block is a double definition.
+- Reading a member does not create anything in strict code (#238): `x.foo` / `x["foo"]` on `None` is a runtime error (outside strict code it turns `x` into a JSON object), and a missing key reads as `None` without being added. Assignments (`cfg.window.width = 800;`) still create what they need.
 - Annotations do NOT convert: `float f = 1;` is an error in strict mode (the value would stay an int), write `1.0` or `std.float(x)`.
 - Without annotation a variable / member / return value gets the type of everything assigned to it. Different types (e.g. `x = 1; x = "a";`) make it `any`: not checked, dynamic code stays legal. So does passing it by reference (`f(&p)` parameter, `[&x]` capture, `r = &x`).
 

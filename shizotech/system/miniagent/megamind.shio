@@ -1,6 +1,76 @@
 
 #include "miniagent"
 
+// Contract C6: normalize one receptionist turn into the result the owner sees.
+// The role's finish(summary) tool puts the turn's report into
+// receptionist.env.reports, but miniagent only returns them when
+// env.use_finalize is set, so a turn that ended with finish() came back as
+// "Agent was stopped." although everything worked. Fold them in: the report IS
+// the answer, and the turn is a success. Every result carries a human-readable
+// report, so a node-side failure ("Goals are not enabled on this node: ...")
+// reaches the chat instead of a bare "Agent was stopped.".
+//
+//	agent				the receptionist miniagent (its env.reports are folded)
+//	res					what receptionist.task() returned (may be None)
+//	crash					"" , or the text of the exception that escaped the turn
+//	execution_time_ms		turn duration, used when res carries none
+megamind_turn_result(agent, res, crash = "", execution_time_ms = -1) {
+	out = res;
+
+	if(!std.is_json(out))
+		out = [ok = false, reports = []];
+
+	if(!std.is_json(out.reports))
+		out.reports = [];
+
+	if(execution_time_ms >= 0 && !out.has("execution_time_ms"))
+		out.execution_time_ms = execution_time_ms;
+
+	reps = [];
+
+	if(agent && std.is_json(agent.env) && agent.env.has("reports") && std.is_json(agent.env.reports))
+		reps = agent.env.reports.copy();
+
+	//An exception that escaped the turn is a crash, and that is what the owner
+	//must read - even when the agent had pushed a report before it died.
+	if(crash) {
+		out.ok = false;
+		out.error = crash;
+		out.reports = [[
+			report = "The node's receptionist crashed: " + crash,
+			time = std.millis(),
+			time_str = std.timestamp(),
+		]];
+		return out;
+	}
+
+	if(reps.size()) {
+		out.ok = true;
+		out.reports = reps;
+		out.error = "";
+		return out;
+	}
+
+	//Nothing was reported: keep the reason and give the owner text for it, so
+	//every request ends with a readable report.
+	if(!out.reports.size()) {
+		if(out.stopped)
+			out.reports = [[
+				report = "The receptionist turn was stopped.",
+				time = std.millis(),
+				time_str = std.timestamp(),
+			]];
+		else
+			out.reports = [[
+				report = "The node's receptionist turn ended without a report: " + (out.error ?? ""),
+				time = std.millis(),
+				time_str = std.timestamp(),
+			]];
+	}
+
+	return out;
+}
+
 class Megamind {
 	
 	running = true;
@@ -16,7 +86,16 @@ class Megamind {
 	
 	request_queue = [];
 	
-	__init__(cfg, worker_cfg = None, max_workers = 1) {
+	//Worker threads, for background_capacity()
+	max_workers = 1;
+	//Last request a person sent (std.millis), the goal scheduler yields to it
+	last_interactive_ms = 0;
+	//GoalScheduler of this node (goal_engine.shio), None without an .agentspace
+	goals = None;
+	
+	__init__(cfg, worker_cfg = None, _max_workers = 1) {
+		
+		max_workers = _max_workers;
 		
 		receptionist = miniagent(cfg, "receptionist");
 		receptionist.set_reasoning_effort("low");
@@ -49,7 +128,11 @@ class Megamind {
 		}
 	}
 	
-	request(prompt, on_finish_cb = None, on_action_cb = None) {
+	//interactive = false for requests the node sends itself (health checks)
+	request(prompt, on_finish_cb = None, on_action_cb = None, interactive = true) {
+		if(interactive)
+			last_interactive_ms = std.millis();
+		
 		new_request = [
 			id = std.random_hash(),
 			prompt = prompt,
@@ -199,12 +282,49 @@ class Megamind {
 		_task_finish_cb = cb;
 	}
 	
+	//Additional finished-task listeners (on_task_finished keeps its single slot
+	//for the shizonet node service; the goal scheduler listens here).
+	add_task_finished_listener(cb) {
+		_task_finish_listeners.push_back(cb);
+	}
+	
+	_emit_task_finished(task) {
+		if(_task_finish_cb)
+			_task_finish_cb(task);
+		
+		for(i = 0; i < _task_finish_listeners.size(); i++) {
+			try {
+				_task_finish_listeners[i](task);
+			}
+			catch(e) {
+				std.error("task finished listener failed: ", e);
+			}
+		}
+	}
+	
+	//Room for background work (goal_engine.shio GoalScheduler.capacity_ok)
+	background_capacity() {
+		idle = 1000000000;
+		
+		if(last_interactive_ms > 0)
+			idle = (std.millis() - last_interactive_ms) / 1000;
+		
+		if(_receptionist_active || request_queue.size())
+			idle = 0;
+		
+		return [
+			workers = max_workers,
+			busy = tasks.size() + tasks_scheduled.size(),
+			interactive_idle_secs = idle,
+		];
+	}
+	
 	health_thread() {
 		for(this.running) {
 			std.sleep(1000 * 60 * 30);
 			if(!tasks.size())
 				continue;
-			request("Check the status of the running tasks (check for stuck tasks or infinite repetition loops, stop stuck tasks, do not touch healthy tasks).");
+			request("Check the status of the running tasks (check for stuck tasks or infinite repetition loops, stop stuck tasks, do not touch healthy tasks).", None, None, false);
 		}
 	}
 	
@@ -214,24 +334,42 @@ class Megamind {
 				std.sleep(100);
 				continue;
 			
+			req = request_queue[0];
 			result = None;
+			crash = "";
+			start_ms = std.millis();
 			
 			_receptionist_active = true;
 			try {
-				receptionist.on_action = request_queue[0].on_action_cb;
+				receptionist.on_action = req.on_action_cb;
 				receptionist.clear_chat();
-				result = receptionist.task(request_queue[0].prompt);
+				result = receptionist.task(req.prompt);
 			}
 			catch(e) {
-				
+				//An empty catch left result = None: the caller got nothing at all
+				//and the chat stayed silent. Report the crash (contract C6).
+				crash = std.string(e);
+				std.error("[megamind] receptionist turn crashed: ", e);
 			}	
 			_receptionist_active = false;
 			
-			if(request_queue[0].on_finish_cb)
-				request_queue[0].on_finish_cb(result);
+			//The turn result the owner sees: finish(summary) reports win, a
+			//crash or a stop becomes a readable report.
+			result = megamind_turn_result(receptionist, result, crash, std.millis() - start_ms);
 			
-			request_queue[0].result = result;
-			request_queue[0].finished = true;
+			if(req.on_finish_cb) {
+				try {
+					req.on_finish_cb(result);
+				}
+				catch(e) {
+					//A throwing callback must not strand the request: the
+					//result is delivered to the caller below either way.
+					std.error("[megamind] receptionist finish callback failed: ", e);
+				}
+			}
+			
+			req.result = result;
+			req.finished = true;
 			request_queue.erase(0);
 		
 			std.sleep(10); //Let tasks start
@@ -254,6 +392,12 @@ class Megamind {
 					std.sleep(1);
 				}
 				
+				//The root of the task takes a max_running_agents slot from the pool;
+				//its subagents borrow it while the root waits for them.
+				//(the stop flag of the previous task's signal() must not skip the wait)
+				worker.stopped = false;
+				root_slot = agent_slot(worker, None);
+				
 				try {
 					worker.clear_chat();
 					worker.env.clear();
@@ -262,6 +406,7 @@ class Megamind {
 					worker.on_action = [task](action) {
 						
 						task.last_update = std.timestamp();
+						task.last_update_ms = std.millis();
 						
 						if(action.reasoning)
 							task.raw_output += action.reasoning;
@@ -281,6 +426,7 @@ class Megamind {
 					task.worker = worker;	
 					
 					task.start_time = std.timestamp();
+					task.last_update_ms = std.millis();
 					
 					worker.task("# Instruction\nI will give you a task description and you will research what is needed to complete the task.\nYou should not start the task or look for solutions right now, just gather context and required files and code lines and emit a report via signal().\nNOTE: If the task is simple or trivial, just return immediately via signal().\n\n# Task Description\n" + task.task);
 					
@@ -330,10 +476,11 @@ class Megamind {
 							break;
 					}
 
+					root_slot.release();
+					
 					std.print("--- " + task.name + " " + task.state + " ---");
 					
-					if(_task_finish_cb)
-						_task_finish_cb(task);
+					_emit_task_finished(task);
 					
 					if(task.state == "failed") {
 						tasks_failed.push_back(task);
@@ -349,7 +496,11 @@ class Megamind {
 				}
 				catch(e) {
 					std.print(e);
+					root_slot.release();
 					task.state = "failed";
+					task.worker = None;
+					if(!task.report)
+						task.report = "The worker crashed: " + std.string(e);
 					for(i = 0; i < tasks.size(); i++) {
 						if(tasks[i].taskid == task.taskid)
 							tasks.erase(i);
@@ -358,6 +509,10 @@ class Megamind {
 					tasks_failed.push_back(task);
 					if(tasks_failed.size() > 5)
 						tasks_failed.erase(0);
+					
+					//A crash is a finished task too: routers and the goal scheduler
+					//must hear about it instead of waiting for a task that is gone.
+					_emit_task_finished(task);
 				}
 			}
 			
@@ -368,4 +523,5 @@ class Megamind {
 	_receptionist_active = false;
 	_notify_cb = None;
 	_task_finish_cb = None;
+	_task_finish_listeners = [];
 }

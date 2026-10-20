@@ -5,15 +5,20 @@
 //
 //  Passes when it prints "ALL PASSED" and never "FAIL" (exit code 0).
 //
-//  Two ShizoNet servers in ONE process (the _testing/shizonet.shio trick: the
-//  second server binds the next port and they find each other by beacon):
+//  Three ShizoNet servers in ONE process (the _testing/shizonet.shio trick: the
+//  first server takes the Art-Net port 6454, the others bind the next ports and
+//  they find each other by beacon):
 //
-//      node side    ai_node_attach(node_server, ai_stub_host())
-//      router side  ai_router_attach(router_server, ai_stub_router())
+//      node side     ai_node_attach(node_server, ai_stub_host())
+//      router side   ai_router_attach(router_server, ai_stub_router())
+//      goals node    ai_node_attach(goals_server, ai_stub_host_goals())
 //
 //  No LLM, no model config, no IPs, no network setup: the host is a stub that
 //  mimics the Megamind surface (request() emits deltas and a miniagent-shaped
-//  result), the router is a stub that records every ai_event.
+//  result), the router is a stub that records every ai_event. The goals node is
+//  the same stub host plus a goal scheduler member: it proves the node info
+//  advertises `goals = 1|0` (contract C5) without ever calling into the
+//  scheduler.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "shizonet_ai"
@@ -21,6 +26,11 @@
 // shizonet node names are fixed width (16 chars, space padded): keep them short
 NODE_NAME = "SHZ_AI_NODE";
 ROUTER_NAME = "SHZ_AI_ROUTER";
+GOALS_NAME = "SHZ_AI_GOALS";
+
+// node_server takes 6454, router_server the next port: the goals node needs an
+// explicit one so it cannot collide with the auto-assigned port.
+GOALS_PORT = 6456;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Harness
@@ -280,6 +290,38 @@ class ai_stub_host {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  ai_stub_goals — a stand-in for the node's GoalScheduler (goal_engine.shio).
+//  ai_node_info only looks at the `goals` MEMBER, it must never call into the
+//  scheduler (it runs on the refresh thread every 5 s), so every method here
+//  counts its calls and the selftest asserts the counter stays 0.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ai_stub_goals {
+
+	calls = 0;
+
+	overview() {
+		calls++;
+		return [[id = "g1", state = "active"]];
+	}
+
+	request_run(goal, force) {
+		calls++;
+		return [ok = true];
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ai_stub_host_goals — an .agentspace host: the same Megamind stub surface,
+//  plus the `goals` member node.shio sets when a goal scheduler exists.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ai_stub_host_goals : ai_stub_host {
+
+	goals = ai_stub_goals();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  ai_stub_router — the Router surface: events land in handle_event()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -323,10 +365,27 @@ class ai_stub_router {
 std.print("ShizoNet AI protocol selftest\n\n");
 
 host = ai_stub_host();
+goals_host = ai_stub_host_goals();
 stub_router = ai_stub_router();
 
 node_server = shizonet.server(NODE_NAME);
 router_server = shizonet.server(ROUTER_NAME);
+
+// shizonet.server() raises when the port is taken, and on a machine with a live
+// ShizoNet network the two servers above already took the ports after 6454:
+// walk up from GOALS_PORT until one is free.
+goals_server = None;
+
+for(p = GOALS_PORT; p < GOALS_PORT + 8; p++) {
+	if(std.is_none(goals_server)) {
+		try {
+			goals_server = shizonet.server(GOALS_NAME, p);
+		}
+		catch(e) {
+			goals_server = None;
+		}
+	}
+}
 
 node = ai_node_attach(node_server, host, [
 	name = NODE_NAME,
@@ -340,10 +399,37 @@ router = ai_router_attach(router_server, stub_router, [
 	description = "selftest router",
 ]);
 
+// a second node that DOES run a goal scheduler: the node info must say goals = 1
+goals_node = None;
+
+if(!std.is_none(goals_server))
+	goals_node = ai_node_attach(goals_server, goals_host, [
+		name = GOALS_NAME,
+		description = "selftest node with goals",
+	]);
+
 check("ai_node_attach returns a handle", !std.is_none(node));
 check("ai_router_attach returns a handle", !std.is_none(router));
+check("the goals node server bound a port", !std.is_none(goals_server), "no free port from " + GOALS_PORT);
+check("ai_node_attach returns a handle for the goals node", !std.is_none(goals_node));
 check("the handle has stop()", std.is_function(node.stop) && std.is_function(router.stop));
 check("timeouts per contract", AI_TIMEOUT_CONTROL == 5000 && AI_TIMEOUT_POLL == 2000 && AI_MAX_KEPT == 200);
+
+// ── the goals flag straight from the builder (no transport involved) ────────
+// ai_node_info is the single source of both the AINodeInfo prop and the ai_info
+// reply, so the flag is checked here first. The host shapes are interleaved on
+// purpose: a class host with a scheduler, a class host without the member, a
+// plain json host, None. One access site that resolves for one shape and reuses
+// the resolution for the next answers goals = 0 for the scheduler host and
+// goals = 1 for None, so every shape is checked, then the scheduler host again.
+
+check("node info goals = 1 with a scheduler", ai_node_info(goals_host, []).goals == 1, std.string(ai_node_info(goals_host, [])));
+check("node info goals = 0 without the member", ai_node_info(ai_stub_host(), []).goals == 0, std.string(ai_node_info(ai_stub_host(), [])));
+check("node info goals = 0 with goals = None", ai_node_info([goals = None], []).goals == 0);
+check("node info goals = 1 with a json scheduler", ai_node_info([goals = ai_stub_goals()], []).goals == 1);
+check("node info goals = 0 on a None host", ai_node_info(None, []).goals == 0);
+check("node info goals = 1 with a scheduler, again", ai_node_info(goals_host, []).goals == 1, std.string(ai_node_info(goals_host, [])));
+check("node info never calls into the scheduler", goals_host.goals.calls == 0, std.string(goals_host.goals.calls));
 
 // ── discovery ───────────────────────────────────────────────────────────────
 
@@ -376,6 +462,8 @@ check("AINodeInfo tags", std.is_json(info) && info.tags.size() == 1);
 check("AINodeInfo max_workers", std.is_json(info) && info.max_workers == 3);
 check("AINodeInfo idle", std.is_json(info) && !info.busy);
 check("AINodeInfo uptime_ms", std.is_json(info) && info.uptime_ms >= 0);
+check("AINodeInfo carries goals", std.is_json(info) && info.has("goals"), std.string(info));
+check("AINodeInfo goals = 0 without a scheduler", std.is_json(info) && info.goals == 0, std.string(info));
 
 check("AIRouter prop marks the router", node_dev.get_prop(AI_PROP_ROUTER, AI_TIMEOUT_CONTROL) == AI_NET_VERSION);
 
@@ -393,6 +481,39 @@ nodeinfo = dev.get(AI_CMD_INFO, [], AI_TIMEOUT_CONTROL);
 check("ai_info ok", std.is_json(nodeinfo) && nodeinfo.ok, std.string(nodeinfo));
 check("ai_info name", std.is_json(nodeinfo) && nodeinfo.name == NODE_NAME);
 check("ai_info model key", std.is_json(nodeinfo) && nodeinfo.has("model"));
+check("ai_info goals = 0 without a scheduler", std.is_json(nodeinfo) && nodeinfo.goals == 0, std.string(nodeinfo));
+
+// ── goals = 1: the node that runs a GoalScheduler advertises it ─────────────
+// The goals node is the same stub host plus a `goals` member (an .agentspace
+// node). Its scheduler stub counts every call: the node info must be presence
+// only, and ai_goals is the one command allowed to call into it.
+
+gdev = None;
+
+// ShizoNet on one machine: only the server owning the Art-Net port 6454 hears every
+// beacon (README §Tests). The router runs on the next port, so it can never see the
+// goals node - the node side (6454) sees every peer and asks the very same commands,
+// so the goals checks run over that peer.
+if(!std.is_none(goals_node)) {
+	if(wait_for([node_server, GOALS_NAME]() { return !std.is_none(find_named(node_server, GOALS_NAME)); }, 10000))
+		gdev = find_named(node_server, GOALS_NAME);
+}
+
+check("the goals node is discovered", !std.is_none(gdev), "node server sees: " + dev_names(node_server));
+
+if(!std.is_none(gdev)) {
+	ginfo = gdev.get_prop(AI_PROP_NODE_INFO, AI_TIMEOUT_CONTROL);
+	check("AINodeInfo goals = 1 with a scheduler", std.is_json(ginfo) && ginfo.goals == 1, std.string(ginfo));
+
+	greply = gdev.get(AI_CMD_INFO, [], AI_TIMEOUT_CONTROL);
+	check("ai_info goals = 1 with a scheduler", std.is_json(greply) && greply.goals == 1, std.string(greply));
+	check("ai_info of the goals node keeps its name", std.is_json(greply) && greply.name == GOALS_NAME, std.string(greply));
+	check("the node info did not call the scheduler", goals_host.goals.calls == 0, std.string(goals_host.goals.calls));
+
+	ggoals = gdev.get(AI_CMD_GOALS, [action = "list"], AI_TIMEOUT_CONTROL);
+	check("ai_goals on a goals node answers ok", std.is_json(ggoals) && ggoals.ok, std.string(ggoals));
+	check("ai_goals is the only caller of the scheduler", goals_host.goals.calls == 1, std.string(goals_host.goals.calls));
+}
 
 // ── ai_request -> poll -> done ──────────────────────────────────────────────
 
@@ -639,8 +760,12 @@ check("node idle again after the follow-up tests", wait_for([node]() { return !n
 node.stop();
 router.stop();
 
+if(!std.is_none(goals_node))
+	goals_node.stop();
+
 check("node service stopped", !node.running);
 check("router service stopped", !router.running);
+check("goals node service stopped", std.is_none(goals_node) || !goals_node.running);
 
 std.print("\n", passed, " passed, ", failed, " failed\n");
 

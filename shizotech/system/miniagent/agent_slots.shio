@@ -1,0 +1,130 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  agent_slots.shio — how many agents GENERATE at the same time
+//
+//  model_config.max_running_agents caps the agents that talk to the model at
+//  once (<= 0: no cap). Agents form a tree, and a parent that waits for its
+//  children (start_task, continue_task, fork, task_batch) does not generate.
+//  So a slot belongs to whoever is generating:
+//
+//    * a waiting parent LENDS its slot to one child: a chain
+//      root -> child -> grandchild uses ONE slot, not three;
+//    * further children running in parallel (fork siblings, batch items)
+//      take their own slot from the shared pool, and also pick up the
+//      parent's slot whenever the child that borrowed it is done;
+//    * a root (a Megamind worker task) takes its slot from the pool.
+//
+//  Agents only need the fields _slot_held / _slot_lent, model_config and
+//  should_stop() (see miniagent.shio), so tests can use stand-ins.
+//
+//      managed slot = agent_slot(child, parent);   // parent None = a root
+//      ... child.task(...) ...                      // slot freed with the object
+// ═════════════════════════════════════════════════════════════════════════════
+
+AGENT_SLOT_LOCK = "miniagent_slots";
+AGENT_SLOT_GLOBAL = "shared_agents_global";
+
+agent_slot_pool() {
+	pool = std.global(AGENT_SLOT_GLOBAL);
+
+	if(!pool.count)
+		pool.count = 0;
+
+	return pool;
+}
+
+// the agents generating right now that hold a pool slot
+agent_slots_in_use() {
+	return std.int(agent_slot_pool().count);
+}
+
+class agent_slot {
+	agt = None;
+	parent = None;
+	borrowed = false;		// the slot is the parent's, lent while it waits
+	held = false;
+	limit = 0;
+
+	__init__(_agt, _parent = None) {
+		agt = _agt;
+		parent = _parent;
+
+		cfg_owner = parent ? parent : agt;
+		limit = std.int(cfg_owner.model_config.max_running_agents ?? 0);
+
+		// no cap configured: nothing to count
+		if(limit <= 0)
+			return;
+
+		first = true;
+
+		for(1) {
+			if(stopped())
+				return;
+
+			if(try_take())
+				return;
+
+			if(first) {
+				std.print("Max running agents: " + agent_slots_in_use() + " / " + limit + " - waiting for a slot");
+				first = false;
+			}
+
+			std.sleep(10);
+		}
+	}
+
+	__deinit__() {
+		release();
+	}
+
+	stopped() {
+		if(agt && agt.should_stop())
+			return true;
+		if(parent && parent.should_stop())
+			return true;
+		return false;
+	}
+
+	// borrow the waiting parent's slot, else take one from the pool (atomic)
+	try_take() {
+		pool = agent_slot_pool();
+		cs = std.critical_section_named(AGENT_SLOT_LOCK);
+
+		if(parent && parent._slot_held && !parent._slot_lent) {
+			parent._slot_lent = true;
+			borrowed = true;
+		}
+		else if(pool.count < limit) {
+			pool.count++;
+			borrowed = false;
+		}
+		else {
+			cs.release();
+			return false;
+		}
+
+		held = true;
+		agt._slot_held = true;
+		agt._slot_lent = false;
+		cs.release();
+		return true;
+	}
+
+	release() {
+		if(!held)
+			return;
+
+		pool = agent_slot_pool();
+		cs = std.critical_section_named(AGENT_SLOT_LOCK);
+
+		if(borrowed)
+			parent._slot_lent = false;	// back to the parent (or its next child)
+		else
+			pool.count--;
+
+		agt._slot_held = false;
+		agt._slot_lent = false;
+		held = false;
+		cs.release();
+	}
+}

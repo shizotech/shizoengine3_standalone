@@ -1,0 +1,424 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  goal_tools.shio — the goal operations an agent may use (receptionist role)
+//
+//  #include "goal_tools"
+//      goal_tools_add(agt)              registers the tools on a miniagent
+//      goal_tool_create(sch, args) ...  the same operations without an agent
+//
+//  The model interprets "tonight, work on X" and proposes a structured goal;
+//  this code validates it, refuses duplicates and stale edits, and writes the
+//  Markdown file. The model never writes goal files and never decides when
+//  work runs. The scheduler comes from agt.env.mind.goals (Megamind.goals).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "goal_engine"
+
+// actions that keep a goal in proposed/ until the owner activates it
+GOAL_HIGH_IMPACT = ["merge", "release", "deploy", "delete", "force_push", "publish", "payment"];
+
+goal_tool_scheduler(agt) {
+	sch = None;
+	try {
+		sch = agt.env.mind.goals;
+	}
+	catch(e) {}
+	return sch;
+}
+
+goal_tool_disabled() {
+	return [ok = false, error = "Goals are not enabled on this node: start it in a folder with an .agentspace (shz miniagent.goals init) or with --agentspace <dir>."];
+}
+
+goal_arg(args, key) {
+	v = gj(args, key, None);
+	if(std.is_none(v))
+		return "";
+	return std.string(v).strip();
+}
+
+goal_arg_yes(args, key, def = false) {
+	v = goal_arg(args, key).lowercase();
+	if(!v)
+		return def;
+	return v == "yes" || v == "true" || v == "1" || v == "on";
+}
+
+// the scheduling context the model resolves words like "tonight" with
+goal_tool_context(sch) {
+	prefs = sch.space.preferences();
+	zone = gt_zone(gj_str(prefs, "timezone", "local"));
+	t_now = gt_now();
+	l = gt_utc_to_local(zone, t_now);
+
+	return [
+		now = gt_format_local(zone, t_now),
+		weekday = GT_WEEKDAYS[l.wday],
+		timezone = gj_str(prefs, "timezone", "local"),
+		windows = gj(prefs, "windows", std.json()),
+		default_window = gj_str(prefs, "default_window", ""),
+		default_duration = gj_str(prefs, "default_duration", "4h"),
+		rules = [
+			"An explicit time or date in the request wins over the named windows.",
+			"A named window ('tonight', 'morning', ...) from 'windows' wins over generic defaults.",
+			"No time at all: use default_window.",
+			"'tonight' after midnight but before its window starts means TODAY's window.",
+			"Ask the user when the date, the recurrence or the impact is unclear.",
+		],
+	];
+}
+
+goal_tool_list(sch) {
+	ctx = goal_tool_context(sch);
+	goals = [];
+	try {
+		goals = sch.overview();
+	}
+	catch(e) {}
+	ctx.goals = goals;
+	return ctx;
+}
+
+// args (strings): title, instructions, schedule_type, date, days, window, start,
+// end, duration, timezone, project, priority, stop_policy, repeat, verify,
+// dry_run, max_runs, allow, require_approval, activate, id, allow_duplicate
+goal_tool_front(args) {
+	data = std.json();
+	data.title = goal_arg(args, "title");
+
+	if(goal_arg(args, "project"))
+		data.project = goal_arg(args, "project");
+	if(goal_arg(args, "priority"))
+		data.priority = goal_arg(args, "priority").lowercase();
+
+	sch_in = std.json();
+	sch_in.type = goal_arg(args, "schedule_type").lowercase();
+	for(k : ["date", "window", "start", "end", "duration", "timezone", "misfire"]) {
+		if(goal_arg(args, k))
+			sch_in[k] = goal_arg(args, k);
+	}
+	if(goal_arg(args, "days")) {
+		d = goal_arg(args, "days").lowercase();
+		if(d == "daily" || d == "weekdays" || d == "weekends")
+			sch_in.days = d;
+		else
+			sch_in.days = goal_string_list(d);
+	}
+	data.schedule = sch_in;
+
+	pol = std.json();
+	if(goal_arg(args, "stop_policy"))
+		pol.stop_policy = goal_arg(args, "stop_policy").lowercase();
+	if(goal_arg(args, "repeat"))
+		pol.repeat_in_window = goal_arg_yes(args, "repeat") ? 1 : 0;
+	if(goal_arg(args, "max_runs"))
+		pol.max_runs_per_window = std.int(goal_arg(args, "max_runs"));
+	if(goal_arg(args, "verify"))
+		pol.verify = goal_arg_yes(args, "verify") ? 1 : 0;
+	if(goal_arg(args, "dry_run"))
+		pol.dry_run = goal_arg_yes(args, "dry_run") ? 1 : 0;
+	if(goal_arg(args, "allow"))
+		pol.allow = goal_string_list(goal_arg(args, "allow"));
+	if(goal_arg(args, "require_approval"))
+		pol.require_approval = goal_string_list(goal_arg(args, "require_approval"));
+	if(pol.size())
+		data.policy = pol;
+
+	data.created_by = "agent";
+	return data;
+}
+
+goal_tool_summary(sch, def, path, status) {
+	nw = goal_next_windows(def, gt_now(), 3);
+	wins = [];
+	for(w : nw)
+		wins.push_back(goal_window_text(def, w));
+
+	return [
+		id = def.id,
+		title = def.title,
+		status = status,
+		schedule = goal_schedule_text(def),
+		next_windows = wins,
+		stop_policy = def.policy.stop_policy,
+		dry_run = def.policy.dry_run,
+		path = path,
+		revision = def.revision,
+	];
+}
+
+goal_tool_create(sch, args) {
+	data = goal_tool_front(args);
+	body = goal_arg(args, "instructions");
+
+	if(!data.title)
+		return [ok = false, error = "title is required"];
+
+	id = goal_arg(args, "id");
+	if(!id)
+		id = goal_slug(data.title);
+	if(!goal_valid_id(id))
+		return [ok = false, error = "cannot build a goal id from '" + data.title + "', pass id (lowercase letters, digits, '-')"];
+
+	// duplicates: the same id, or a very similar open goal
+	existing = sch.space.find(id);
+	if(existing)
+		return [ok = false, duplicate_of = id, status = existing.status, error = "goal '" + id + "' exists already (goals/" + existing.status + "/). Change it with update_goal instead of creating a second one."];
+
+	if(!goal_arg_yes(args, "allow_duplicate")) {
+		prefs = sch.space.preferences();
+		for(f : sch.space.folders()) {
+			if(f.status == "archived" || f.status == "cancelled" || f.status == "completed")
+				continue;
+			r = sch.space.load(f, prefs);
+			if(!r.ok)
+				continue;
+			sim = goal_similarity(r.def.title + " " + r.def.body, data.title + " " + body);
+			if(sim >= 0.5 || goal_similarity(r.def.title, data.title) >= 0.6)
+				return [ok = false, duplicate_of = f.id, status = f.status, error = "a similar goal exists: '" + f.id + "' (" + r.def.title + "). Update it with update_goal, or pass allow_duplicate=yes if the user really wants a second goal."];
+		}
+	}
+
+	status = goal_arg_yes(args, "activate") ? "active" : "proposed";
+	needs_owner = false;
+
+	pol = gj(data, "policy", std.json());
+	for(a : gj(pol, "allow", [])) {
+		if(goal_list_has(GOAL_HIGH_IMPACT, a))
+			needs_owner = true;
+	}
+	if(needs_owner)
+		status = "proposed";
+
+	res = sch.space.write_goal(id, data, body, status);
+
+	if(!res.ok)
+		return [ok = false, errors = res.errors, error = "the goal is invalid, nothing was written: " + gfm_join(res.errors, "; ")];
+
+	out = goal_tool_summary(sch, res.def, res.path, status);
+	out.ok = true;
+	out.warnings = gj(res, "warnings", []);
+	if(needs_owner)
+		out.note = "The goal allows high impact actions, so it stays in goals/proposed/ until the owner activates it (set_goal_status active after an explicit yes).";
+	else if(status == "proposed")
+		out.note = "Saved as PROPOSED: nothing runs until it is activated. Show the user the schedule and ask for a yes.";
+	else
+		out.note = "Active: the scheduler starts it in its next window. Tell the user the window and the time zone so they can correct it.";
+	return out;
+}
+
+goal_tool_update(sch, args) {
+	id = goal_arg(args, "id");
+	f = sch.space.find(id);
+	if(!f)
+		return [ok = false, error = "no goal '" + id + "'"];
+
+	text = goal_read(f.path);
+	doc = gfm_read_text(text);
+	if(!doc.ok)
+		return [ok = false, error = "goal.md is currently invalid (" + doc.error + "); a person has to fix it first"];
+
+	expected = goal_arg(args, "revision");
+	if(!expected)
+		return [ok = false, error = "pass the revision you read (get_goals shows it), so a concurrent edit is not overwritten"];
+
+	data = doc.data;
+	upd = goal_tool_front(args);
+
+	if(upd.title)
+		data.title = upd.title;
+	if(gj(upd, "project"))
+		data.project = upd.project;
+	if(gj(upd, "priority"))
+		data.priority = upd.priority;
+
+	// schedule fields given in the call replace the stored ones
+	sch_new = gj(data, "schedule", std.json());
+	for(k, v : upd.schedule) {
+		if(k == "type" && !v)
+			continue;
+		sch_new[k] = v;
+	}
+	// start/end replace a named window, a window replaces start/end
+	if(goal_arg(args, "start") && !goal_arg(args, "window") && sch_new.has("window"))
+		sch_new.remove("window");
+	if(goal_arg(args, "window") && !goal_arg(args, "start")) {
+		if(sch_new.has("start"))
+			sch_new.remove("start");
+		if(sch_new.has("end"))
+			sch_new.remove("end");
+	}
+	if(goal_arg(args, "duration") && sch_new.has("end") && !goal_arg(args, "end"))
+		sch_new.remove("end");
+	data.schedule = sch_new;
+
+	if(gj(upd, "policy")) {
+		pol = gj(data, "policy", std.json());
+		for(k, v : upd.policy)
+			pol[k] = v;
+		data.policy = pol;
+	}
+
+	if(data.has("created_by") && data.created_by == "agent")
+		data.updated = "agent";
+
+	body = goal_arg(args, "instructions") ? goal_arg(args, "instructions") : doc.body;
+
+	res = sch.space.write_goal(id, data, body, f.status, expected);
+	if(!res.ok)
+		return [ok = false, conflict = gj(res, "conflict", false), error = gfm_join(res.errors, "; ")];
+
+	try {
+		sch.ledger.goal(id).pending_actor = "agent";
+	}
+	catch(e) {}
+
+	out = goal_tool_summary(sch, res.def, res.path, f.status);
+	out.ok = true;
+	out.note = "Saved. A run that is working right now keeps its revision; the change applies from the next run.";
+	return out;
+}
+
+goal_tool_set_status(sch, args) {
+	id = goal_arg(args, "id");
+	to = goal_arg(args, "status").lowercase();
+
+	if(to == "resume" || to == "activate")
+		to = "active";
+	if(to == "pause")
+		to = "paused";
+	if(to == "cancel")
+		to = "cancelled";
+	if(to == "complete" || to == "done")
+		to = "completed";
+	if(to == "archive")
+		to = "archived";
+
+	res = sch.space.move(id, to);
+	if(!res.ok)
+		return [ok = false, error = res.error];
+
+	what = [
+		active = "it runs in its next window",
+		paused = "no new windows; a run working right now finishes",
+		cancelled = "no new windows; a running task is stopped",
+		completed = "no new windows",
+		archived = "no new windows",
+		proposed = "no new windows until it is activated",
+	];
+
+	return [ok = true, id = id, from = res.from, to = to, effect = gj_str(what, to, "")];
+}
+
+goal_tool_run_now(sch, args) {
+	return sch.request_run(goal_arg(args, "id"), goal_arg_yes(args, "dry_run"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+GOAL_TOOL_SCHEDULE_PARAMS = [
+	schedule_type = "string(): once | recurring | windowed (repeats work inside the window) | manual",
+	date = "string(): OPTIONAL YYYY-MM-DD, required for once",
+	days = "string(): OPTIONAL weekdays for recurring/windowed: 'monday,thursday', 'daily', 'weekdays', 'weekends'",
+	window = "string(): OPTIONAL a named window from get_goals().windows, e.g. 'tonight'",
+	start = "string(): OPTIONAL HH:MM local start (overrides the window)",
+	end = "string(): OPTIONAL HH:MM local end",
+	duration = "string(): OPTIONAL instead of end, e.g. '2h'",
+	timezone = "string(): OPTIONAL IANA zone, default from the preferences",
+];
+
+goal_tools_add(agt) {
+	agt.add_tool(
+		"get_goals",
+		"The node's scheduled goals plus the scheduling context: the local time, the time zone, and the named windows ('tonight' = ...) that words in a request map to. Call it before creating or changing a goal.",
+		None,
+		[](agt, args) {
+			sch = goal_tool_scheduler(agt);
+			if(!sch)
+				return goal_tool_disabled();
+			return goal_tool_list(sch);
+		}
+	);
+
+	create_params = [
+		title = "&string(): Short title of the goal",
+		instructions = "&string(): What the worker should do, in the user's words plus scope and acceptance criteria (Markdown)",
+		schedule_type = "&string(): once | recurring | windowed (repeats work inside the window) | manual",
+		id = "string(): OPTIONAL id (lowercase-with-dashes), derived from the title otherwise",
+		project = "string(): OPTIONAL project folder in .agentspace/projects/",
+		priority = "string(): OPTIONAL low | normal | high | urgent (urgent ignores the background limits)",
+		stop_policy = "string(): OPTIONAL what happens at the window end: drain | checkpoint | cancel",
+		verify = "string(): OPTIONAL yes = a verification run checks the acceptance criteria",
+		dry_run = "string(): OPTIONAL yes = only write the prompt to history.md, dispatch nothing",
+		allow = "string(): OPTIONAL comma separated allowed actions (e.g. 'edit,test,commit,push_branch')",
+		activate = "string(): yes = active now (only when the user asked for it clearly), otherwise it is saved as proposed",
+		allow_duplicate = "string(): OPTIONAL yes = create it even though a similar goal exists",
+	];
+	for(k, v : GOAL_TOOL_SCHEDULE_PARAMS) {
+		if(!create_params.has(k))
+			create_params[k] = v;
+	}
+
+	agt.add_tool(
+		"create_goal",
+		"Create a scheduled goal (autonomous work at set times) from the user's request. The code validates it, refuses duplicates and writes .agentspace/goals/<status>/<id>/goal.md. Resolve times with get_goals() first. Tell the user the resulting window and time zone.",
+		create_params,
+		[](agt, args) {
+			sch = goal_tool_scheduler(agt);
+			if(!sch)
+				return goal_tool_disabled();
+			return goal_tool_create(sch, args);
+		}
+	);
+
+	update_params = [
+		id = "&string(): The goal id",
+		revision = "&string(): The revision from get_goals() (an edit made since then is not overwritten)",
+		title = "string(): OPTIONAL new title",
+		instructions = "string(): OPTIONAL new instructions (replace the old ones)",
+		stop_policy = "string(): OPTIONAL drain | checkpoint | cancel",
+		priority = "string(): OPTIONAL low | normal | high | urgent",
+	];
+	for(k, v : GOAL_TOOL_SCHEDULE_PARAMS)
+		update_params[k] = v;
+
+	agt.add_tool(
+		"update_goal",
+		"Change an existing goal (schedule, instructions, policy). Only the given fields change.",
+		update_params,
+		[](agt, args) {
+			sch = goal_tool_scheduler(agt);
+			if(!sch)
+				return goal_tool_disabled();
+			return goal_tool_update(sch, args);
+		}
+	);
+
+	agt.add_tool(
+		"set_goal_status",
+		"Activate, pause, resume, cancel, complete or archive a goal. Activating a proposed goal needs the user's explicit yes.",
+		[
+			id = "&string(): The goal id",
+			status = "&string(): active | paused | cancelled | completed | archived | proposed",
+		],
+		[](agt, args) {
+			sch = goal_tool_scheduler(agt);
+			if(!sch)
+				return goal_tool_disabled();
+			return goal_tool_set_status(sch, args);
+		}
+	);
+
+	agt.add_tool(
+		"run_goal_now",
+		"Start an active goal right now, outside its schedule (when the user says 'now' or 'urgently').",
+		[
+			id = "&string(): The goal id",
+		],
+		[](agt, args) {
+			sch = goal_tool_scheduler(agt);
+			if(!sch)
+				return goal_tool_disabled();
+			return goal_tool_run_now(sch, args);
+		}
+	);
+}
