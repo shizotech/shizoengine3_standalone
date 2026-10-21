@@ -15,11 +15,12 @@ From left to right:
 | Chevron | *Open or collapse the timeline* | Collapses the timeline to its bar. Click it again (or drag the bar up) to open it at its last height. |
 | Link | *Cable view: show every link* | [Cable view](Linking.md#seeing-your-links) on or off: every link on screen as a cable. The same switch as in [*Settings* › *Links*](Settings.md#links). Green while on. |
 | Lock | *Show mode: lock notches and editing* | [Show mode](#show-mode). |
-| *Play* | *Play or pause the timeline* | Runs the timeline. Green while playing. Click again to pause. |
-| *Stop* | *Stop and go back to the start* | Stops and goes back to the start (Bar 1.1.00). |
+| Blackout | *Blackout (Ctrl+B)* | All outputs to black at once, again: back with a fade. See [Blackout](Output-and-Devices.md#blackout). Has a notch for MIDI. |
+| *Play* | *Play or pause the timeline (Space)* | Runs the timeline. Green while playing. Click again to pause. Key: Space. |
+| *Stop* | *Stop and go back to the start (Shift+Space)* | Stops and goes back to the start (Bar 1.1.00). Key: Shift + Space. |
 | *Follow* | *Follow the playhead* | While it is on, the timeline pages along with the playhead: when the playhead reaches the right edge (or jumps out of view), the view moves so the playhead is at the left again. Dragging the ruler still moves the view by hand. |
 | *BPM* | | The tempo. 150 at the start. |
-| *Tap* | *Click on each beat to set the tempo* | Tap the tempo. |
+| *Tap* | *Click on each beat to set the tempo, or press T* | Tap the tempo. Key: T. |
 | *Beat* | | Where the playhead is inside the current beat, from 0 to 1. |
 | *Bar* | | The position as bar.beat.tick. |
 | *View* | | *Timeline* / *Loops* / *Patch*. See [The view switch](#the-view-switch). |
@@ -32,13 +33,15 @@ From left to right:
 - **The bubble on the link button:** while *Cable view* is off, it counts the generators that draw their own links.
   Rest the mouse on the button and a broken link slides in on its right half (*End all local cable views*): a click
   ends them all.
-- **No keys:** Play, Stop and Tap have no keyboard shortcut. Map them to a MIDI pad if you need them under your hand.
+- **Keys:** Space plays or pauses, Shift + Space stops, T taps the tempo. They work anywhere in the program, also in
+  show mode, but not while you type in a text field or a code editor. For a show, a MIDI pad is still safer under your
+  hand: see [MIDI](MIDI.md).
 
 ## Set the tempo
 
 1. Click *BPM* and type the tempo. Press Enter.
-2. Or click *Tap* on each beat, at least twice. The tempo is the average of your last taps (eight at most). Wait two
-   seconds to start over.
+2. Or click *Tap* (or press T) on each beat, at least twice. The tempo is the average of your last taps (eight at
+   most). Wait two seconds to start over.
 3. Or let the music set it: see [Sync the timeline from audio](#sync-the-timeline-from-audio).
 
 ## Beat and Bar
@@ -62,6 +65,7 @@ every 4 beats (a bar). The line of text reads the beat under the playhead, the z
 | Gesture | Does |
 |---|---|
 | Mouse wheel over the timeline | Zooms in or out around the mouse, from 1/8 to 64 times. At 1 you see 16 beats. Away from you zooms in, as in a Patchview. |
+| Trackpad (Mac) | Two fingers sideways move the time, a pinch zooms around the mouse, two fingers with Cmd held zoom like the wheel. |
 | Drag on the ruler | Left or right moves the view, up or down zooms. |
 | Right click on the ruler | Moves the playhead to the nearest whole beat. A left click does not move it. |
 
@@ -72,13 +76,42 @@ The timeline has no clips or lanes of its own yet: it is the clock of the progra
 | View | Shows |
 |---|---|
 | *Timeline* | The ruler and the playhead. |
-| *Loops* | An area for [generator windows](The-Screen.md#generator-windows) that belong to the timeline. |
-| *Patch* | Today the same area as *Loops*. |
+| *Loops* | The [loops](#loops): timelines of their own that turn along the main timeline. |
+| *Patch* | An area for [generator windows](The-Screen.md#generator-windows) that belong to the timeline. |
 
-- The generators in this area are saved with the project.
+- The generators in the *Patch* area are saved with the project.
 - Windows there snap to a grid of 16 px when you move or resize them, as in a Patchview: see
   [Zoom and the grid of a Patchview](The-Screen.md#zoom-and-the-grid-of-a-patchview).
 - You can select and move them as in a Patchview: see [Select and move generators](Generators.md#select-and-move-generators).
+
+## Loops
+
+A loop is a timeline of its own with a fixed length in beats. It turns along the main timeline: it moves while the
+timeline plays, at its BPM, and stands still while it stops. But it has its own place in its turn, which you start,
+stop and reset on their own. Use it for things that should repeat every 2, 8 or 16 beats, or that should only run for a
+while.
+
+*View* › *Loops*, then *+ Loop*. Each loop is a row:
+
+| Part | What it does |
+|---|---|
+| Name | Shown in the *Source* list of synced controls. |
+| *Start* | The loop turns, from where the main timeline is: a loop of 4 beats started on beat 6 is half way through its turn, so loops started at different times still meet on the bars. |
+| *Stop* | The loop stands still where it is. |
+| *Reset* | Back to the start of the turn, now. |
+| */2*, *x2* | Half or twice as fast. The size of the change shows next to the buttons. |
+| *Beats* | How many beats one turn takes. |
+| *Phase* | Where the loop is in its turn, 0 to 1. [Link](Linking.md) it to anything that should follow the loop. |
+| *Envelope* | The curve on the right, read at the phase of the loop. Link it to the controls it should drive. |
+| The bin | Deletes the loop. Controls that followed it stand still. |
+
+- *Start*, *Stop*, *Reset*, */2*, *x2* and *Beats* are controls: map them to a pad or a button of your controller
+  ([MIDI](MIDI.md)), or link a beat or a button to them.
+- A synced control can follow a loop instead of the main timeline: its options, tab *Env*, *Source*
+  ([Envelope and sync](Linking.md#envelope-and-sync)). With *SYNC* it then runs through its range once per turn of the
+  loop.
+- The loops are saved with the project, the turn they are in too.
+- Planned: light shows, audio and video clips on a loop, as on the main timeline.
 
 ## Snap windows
 
@@ -100,17 +133,20 @@ Show mode locks the program for performing, so nothing gets linked, moved or clo
 |---|---|
 | Notches: no options, no linking, no hold and drag | Values and sliders |
 | The layout: splitting, closing, moving and replacing views; adding, renaming and deleting tabs | Buttons |
-| Moving and resizing windows, Alt + drag | Play, Stop, BPM and Tap |
+| Moving and resizing windows, Alt + drag | Play, Stop, BPM, Tap and Blackout |
 | Dropping assets, moving clips | Clips, columns and cues |
 | Every right-click menu | MIDI |
 | Undo and redo | The power buttons of the generators |
 | Closing generators, *Paste settings*, *Reload module* | |
 | *Exit* and the close button of the window | |
 | The cable view | |
+| The [autosave](Getting-Started.md#autosave) | |
 
 - While locked, free notches are hidden and linked ones stay as a coloured edge. No cables are drawn. See
   [Linking](Linking.md#show-mode).
 - Show mode is not saved. VibeVJ always starts unlocked.
+- Values you change in show mode are no [undo](The-Screen.md#undo-and-redo) steps. The history from before stays and
+  works again when you leave show mode.
 - To lock only one Clipview, use its [*Live*](Clipview.md#live) button.
 
 ## Sync the timeline from audio

@@ -1,113 +1,115 @@
- // EnvelopeOutput generator
- // Exposes an "Option" slider that has an editable envelope (graph), that can
- // be run FREE (free-running clock) or SYNC (locked to the beat/timeline, like
- // LFOSynth), and outputs the sampled envelope value into a bottom "Output"
- // slider (Regler) that the engine can consume.
- //
- // Envelope points use the standard graph/envelope format:
- //   [[x, y, weight], ...]  with x in 0..1, y in 0..1.
- // The generator samples the (piecewise) curve itself so beat-sync is
- // deterministic and independent of the clip playback system.
- import nanogui;
+// EnvelopeOutput generator
+// A curve you draw (an editable envelope graph), played free running or locked to the timeline (Sync), once every
+// Duration beats. The value of the curve at the play position goes to the pure output "Output".
+//
+// Envelope points use the standard graph format [[x, y, weight], ...] with x / y in 0..1. The output is read with
+// graph.value_at(), the same evaluation the graph draws with, so a point bent with the mouse wheel (weight > 0)
+// gives the curve that is shown. (Before #436 the weights were ignored and the output was always straight lines.)
+// The play position is shown as the graph's cursor.
+import nanogui;
 
- // Controls (created in entry)
- base = None;      // Option slider (base level / where the envelope lives)
- env_graph = None; // Editable envelope graph
- rate = None;      // Beats per full envelope loop (higher = slower)
- phase = None;     // Phase offset 0..1
- mode = None;      // 0 = FREE, 1 = SYNC
- out = None;       // Output slider (Regler)
+using eigen;
 
- // Free-running clock state
- free_time = 0.0;
+// Controls (created in entry)
+env_graph = None; // editable envelope graph
+rate = None;      // beats per run through the curve (higher = slower)
+phase = None;     // phase offset 0..1
+mode = None;      // 0 = free, 1 = sync
+out = None;       // output
 
- // Sample a piecewise-linear envelope (points [[x,y,w],...], x/y in 0..1) at
- // phase ph (0..1). Weight is ignored (linear interpolation).
- sample_env(points, ph) {
- 	n = points.size();
- 	if(n == 0)
- 		return 0.0;
- 	if(n == 1)
- 		return points[0][1];
+// Free-running clock state
+free_time = 0.0;
 
- 	// Clamp ph into the point range.
- 	if(ph < points[0][0])
- 		return points[0][1];
- 	if(ph > points[n-1][0])
- 		return points[n-1][1];
+// A cell of a row cut into n equal parts, with a 4 px gap to the next cell. The control in it fills it.
+row_cell(row, i, n) {
+	l = std.float(i) / std.float(n);
+	r = std.float(n - 1 - i) / std.float(n);
+	return row.widget().anchor_top(0).anchor_bottom(0).anchor_left(l, "percent").anchor_right(r, "percent");
+}
+cell_gap(i, n) {
+	return (i < n - 1) ? 4 : 0;
+}
 
- 	for(i = 0; i < n-1; i++) {
- 		x0 = points[i][0];
- 		x1 = points[i+1][0];
- 		if(ph >= x0 && ph <= x1) {
- 			span = x1 - x0;
- 			if(span <= 0.0)
- 				return points[i+1][1];
- 			f = (ph - x0) / span;
- 			return points[i][1] + (points[i+1][1] - points[i][1]) * f;
- 		}
- 	}
- 	return points[n-1][1];
- }
+// A colour of the UI theme as vec4f, or the fallback when the theme has no such key.
+theme_color(t, key, fallback) {
+	if(t && t.has(key)) {
+		c = t[key];
+		return vec4f(c.r, c.g, c.b, c.a);
+	}
+	return fallback;
+}
 
- entry(generator, area) {
- 	area.layout(nanogui.layout_vertical());
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
 
- 	// ---- Option slider + editable envelope graph ----
-	base = area.controlslider("Option").min(0).max(1).value(0.5).fixed_height(24);
+	t = area.theme().to_json();
+	c_field = theme_color(t, "input_fill", vec4f(22.0 / 255.0, 23.0 / 255.0, 26.0 / 255.0, 1.0));
+	c_curve = theme_color(t, "text_secondary_color", vec4f(155.0 / 255.0, 155.0 / 255.0, 160.0 / 255.0, 1.0));
+
+	// ---- Editable envelope graph ----
+	//(An "Option" slider was here: it was saved but never changed the output, so it went. A saved "option" is ignored)
 	env_box = area.widget().fixed_height(140);
-	env_graph = env_box.graph("Envelope").anchor(0);
+	env_graph = env_box.graph("").anchor(0);
 	env_graph.envelope_mode(true);
 	env_graph.editable(true);
+	env_graph.background_color(c_field);
+	env_graph.foreground_color(c_curve);
 	env_graph.points([[0.0, 0.0, 0.0], [0.5, 1.0, 0.0], [1.0, 0.0, 0.0]]);
+	env_graph.tooltip("Click: add a point. Drag: move a point. Right-click: remove a point. Mouse wheel on a point: bend the line. The vertical line is where it plays right now");
+	// A right-click on the pad removes a point. The screen opens the context menu of the nearest widget that has
+	// one after a right-click: without one of its own the menu of the view behind (Split right, Split down, ...)
+	// opened on the same click (#436)
+	env_graph.on_context_menu([](pos) {
+		return;
+	});
 
- 	// ---- Sync / timing controls ----
- 	row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
- 	mode = row.controlcombo("Mode").fixed_width(90);
- 	mode.items(["Free", "Sync"]);
- 	rate = row.controlslider("Beats").min(0.5).max(8).value(1.0).fixed_width(110);
- 	phase = row.controlslider("Phase").min(0).max(1).value(0.0).fixed_width(110);
+	// ---- [ Mode | Duration | Phase ] ----
+	row = area.widget().fixed_height(28).anchor_left(0).anchor_right(0).fixed_width(360);
+	mode = row_cell(row, 0, 3).controlcombo("Mode").tooltip("Sync: follows the position of the [[timeline]]. Free: runs on its own").anchor(0).anchor_right(cell_gap(0, 3));
+	mode.items(["Free", "Sync"]).segmented(true); //index-based (0 = free, 1 = sync)
+	rate = row_cell(row, 1, 3).controlslider("Beats").caption("Duration").unit("beats").tooltip("How many [[beat|beats]] one run through the curve takes").min(0.5).max(8).value(1.0).anchor(0).anchor_right(cell_gap(1, 3));
+	phase = row_cell(row, 2, 3).controlslider("Phase").tooltip("Where in the curve it starts, 0 to 1").min(0).max(1).value(0.0).anchor(0);
 
- 	// ---- Output slider (Regler) ----
- 	out = area.controlslider("Output").as_output(true).min(0).max(1).value(0.0).fixed_height(30);
- }
+	// ---- Output ----
+	out = area.controlslider("Output").as_output(true).tooltip("The value of the curve right now, 0 to 1. A [[pure output]]: [[link]] it into what should move\n[[wiki:Assets#generators--utility]]").min(0).max(1).value(0.0);
+}
 
- update(generator, tl_pos, pos_delta) {
-	// Compute the current envelope phase (0..1) for the beat clock.
+update(generator, tl_pos, pos_delta) {
+	// Current play position in the curve (0..1)
 	ph = 0.0;
 	if(mode.value() == 0) {
- 		// FREE: free-running, pos_delta is in beats.
- 		free_time = free_time + pos_delta / rate.value();
- 		ph = math.mod(free_time + phase.value(), 1.0);
- 	}
- 	else {
- 		// SYNC: locked to the timeline (tl_pos is in beats), loops every 'rate' beats.
- 		ph = math.mod(tl_pos / rate.value() + phase.value(), 1.0);
- 	}
+		// Free: free-running, pos_delta is in beats.
+		free_time = free_time + pos_delta / rate.value();
+		ph = math.mod(free_time + phase.value(), 1.0);
+	}
+	else {
+		// Sync: locked to the timeline (tl_pos is in beats), one run every Duration beats.
+		ph = math.mod(tl_pos / rate.value() + phase.value(), 1.0);
+	}
 
- 	// Sample the envelope and drive the output slider.
- 	v = sample_env(env_graph.points(), ph);
- 	if(v < 0.0)
- 		v = 0.0;
- 	if(v > 1.0)
- 		v = 1.0;
- 	out.value(v);
- }
+	env_graph.cursor(ph);
 
- save_state() {
- 	state = [mode=mode.value(), rate=rate.value(), phase=phase.value(), option=base.value(), env=env_graph.points()];
- 	return state;
- }
+	// The curve at the play position, as the graph draws it (0 without points)
+	v = env_graph.value_at(ph);
+	if(v < 0.0)
+		v = 0.0;
+	if(v > 1.0)
+		v = 1.0;
+	out.value(v);
+}
 
- load_state(state) {
- 	if(state.has("mode"))
- 		mode.value(state.mode);
- 	if(state.has("rate"))
- 		rate.value(state.rate);
- 	if(state.has("phase"))
- 		phase.value(state.phase);
- 	if(state.has("option"))
- 		base.value(state.option);
- 	if(state.has("env"))
- 		env_graph.points(state.env);
- }
+save_state() {
+	state = [mode=mode.value(), rate=rate.value(), phase=phase.value(), env=env_graph.points()];
+	return state;
+}
+
+load_state(state) {
+	if(state.has("mode"))
+		mode.value(state.mode);
+	if(state.has("rate"))
+		rate.value(state.rate);
+	if(state.has("phase"))
+		phase.value(state.phase);
+	if(state.has("env"))
+		env_graph.points(state.env);
+}

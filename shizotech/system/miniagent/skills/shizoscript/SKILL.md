@@ -330,6 +330,7 @@ json_value = std.json("..."); //A valid JSON string
 WRONG:
 - Do NOT assume that every type has standard conversion functions like `type.int()` or `type.string()`
 - Only SOME types (like JSON variables) have builtin `string()` and `compact_string()` functions (check the docs!)
+- `fileio.write_json(path, data)` writes pretty-printed JSON; `fileio.write_json(path, data, true)` writes it compact (no indentation, no line breaks) (#96)
 
 ---
 
@@ -448,12 +449,34 @@ for(x : list) { }             // each element of a list
 for(i, x : list) { }          // index and element
 for(k, v : json) { }          // key and value of a JSON object
 for(c : "text") { }           // each character of a string (UTF-8), for(i, c : s) with the character index
+for(b : buf) { }              // each byte of a std.buffer (0 - 255), for(i, b : buf) with the byte index
+for(x : obj) { }              // a class instance: what obj.__iter__() returns
+for(i : std.range(10)) { }    // 0 ... 9 without a list; std.range(2, 10), std.range(10, 0, -2)
+for(int x : xs) { }           // with types (checked in strict code): for(string k, float v : m)
 ```
 
 - `for(x : expr)`: `x` (and the key) are new variables of the loop, also when an outer variable has the same name; they
   do not exist after the loop. `expr` is evaluated once. `break`, `continue` and `return` work as in every loop.
 - A list gives its elements (key: the index), a JSON object its values (key: the key), a string its characters (key:
-  the character index). Any other value (None, numbers, class instances) is a runtime error.
+  the character index), a `std.buffer` (or binary value) its bytes as ints 0 - 255 (key: the byte index; for typed
+  values use `buf.read("f32", i)` in an index loop).
+- `std.range(stop)`, `std.range(start, stop)`, `std.range(start, stop, step)` are the ints `start`, `start + step`, ...
+  up to (not including) `stop`, like Python's `range()` (`start` defaults to 0, `step` to 1, a negative `step` counts
+  down, `step` 0 and non-int parameters are errors). The loop computes each value, no list is built (key: the
+  position). `r.size()`, `r[i]` (negative `i` counts from the end), `r.contains(v)`, `r.list()`, `r.start()`,
+  `r.stop()`, `r.step()`; an empty range is false in a condition. Prefer `for(i : std.range(n))` over
+  `for(i = 0; i < n; i++)` when `i` is not changed in the body.
+- A class instance is iterable when its class (or a base) defines `__iter__()` (no parameters): it is called once
+  when the loop starts, and what it returns is iterated (a list, a JSON object, a string or a buffer, e.g.
+  `__iter__() { return items; }`). Returning another class instance, or a class without `__iter__`, is a runtime
+  error; so is any other value (None, numbers, functions). All of them can be caught with `try` / `catch`.
+- Types in front of the loop variables like in a declaration: `for(int x : xs)`, `for(string k, int v : m)`,
+  `for(list<int> row : grid)`, `for(int? v : l)` (a class type without `?`: `for(Vec2 p : points)`). In strict code
+  they are checked against the elements (section 23): a `list<T>` gives `int` keys and `T` values, a `map<T>`
+  `string` keys and `T` values, a string `int` and `string`, a `std.buffer` / `std.range` `int` and `int`, an instance what its
+  `__iter__` returns. Without a type the loop variable has that type; iterating a value that is known not to be
+  iterable (an int, a class without `__iter__`) is a compile error there. Outside strict code an unknown type is a
+  syntax error (like `itn x = 1;`), the elements are not checked against it.
 - Changing members of an element (`o.n += 1`) changes the element in the list; assigning the loop variable does not.
 - Prefer it over `for(i = 0; i < l.size(); i++) { x = l[i]; }`: shorter and about twice as fast.
 
@@ -488,7 +511,8 @@ up = s.uppercase;
 up();            // "ABC" (the bound method keeps its object)
 ```
 
-- Builtin functions are NOT accepted as callbacks where a script function is expected (e.g. `list.foreach(std.print)`); wrap them in a lambda instead.
+- Builtin functions and bound methods ARE accepted as callbacks (e.g. `list.foreach(std.print)`, `list.map(std.string)`). A bound method callback runs on the object it is bound to and gets no arguments; a namespace builtin receives as many arguments as it can take (the value, or key and value when it takes two). Wrap it in a lambda when you need a fixed signature. The same holds for the callbacks of modules (`button.on_click(std.print)`, `net.on_connect(devices.push)`).
+- Callbacks of `foreach`, `map`, `filter`, `any` and `all` get `(key, value)`, or the value only when they take one parameter (`list.map([](x) { return x * 2; })`). `reduce` callbacks get `(acc, key, value)` or `(acc, value)`.
 - `noexcept` functions and methods: a runtime error inside them does not propagate, the function returns `None` and the caller continues.
 
 ```
@@ -592,6 +616,7 @@ Classes overload operators with dunder methods:
 | unary `-` | `__neg__` | |
 | `obj[key]` | `__getitem__(key)` | |
 | `obj[key] = value`, `obj[key] += x`, `obj[key]++` | `__setitem__(key, value)` (after `__getitem__` for `+=` / `++`) | |
+| `for(x : obj)` | `__iter__()`, returns the list / JSON object / string / buffer that is iterated (section 7) | |
 
 ```
 class Vec2
@@ -736,6 +761,7 @@ multiline"""
 t = std.thread(fn);
 t.run();
 t.join();
+t.terminate();                       // ends the tasks that have not finished (see below)
 ```
 
 `std.thread` runs script tasks cooperatively on the script thread: a task runs until it waits (`std.sleep`,
@@ -758,6 +784,8 @@ sem.release();  sem.release(3);  sem.count();
 
 cv = std.condition_variable();
 cv.wait();                           // until notify_one() / notify_all(); cv.wait(100) -> false after 100 ms
+c = std.critical_section("queue");
+for(!ready) cv.wait(c);              // gives up c while it waits, holds it again when it returns; cv.wait(c, 100)
 cv.wait_for([&ready]() { return ready; });   // until the predicate is true; checks it first
 cv.notify_one();  cv.notify_all();
 
@@ -777,8 +805,13 @@ Rules:
 - Waiters are woken in the order they started waiting.
 - A `notify_one()` / `notify_all()` while no task waits is lost (like C++): wait with `wait_for(predicate)` or check
   the condition in a loop (`for(!ready) cv.wait();`). For a signal that must not get lost use `std.event`.
-- Release a critical section before waiting (`c.release();`): a suspended task keeps it, and the task that would
-  wake it may need it.
+- `cv.wait(c)` gives up the critical section `c` (every level this task holds) while it waits and holds it again
+  before it returns, also after a timeout, like `std::condition_variable::wait(lock)`: check the condition with `c`
+  held. Every other waiting call keeps the critical sections of the task: release them first (`c.release();`), the
+  task that would wake it may need them.
+- `t.terminate()` ends the tasks of the thread that have not finished (not the calling task) and returns how many.
+  A task unwinds the next time it continues: a waiting task when its wait ends (a wake, its timeout, the object
+  destroyed). A terminated task takes no permit or event signal, and `cv.wait(c)` does not take its section back.
 - If the event / semaphore / condition variable / oneshot is destroyed while tasks wait (its last variable reassigned), they
   return false instead of waiting forever. Keep it in a variable: `std.event().wait(100)` waits on a temporary that
   is gone right after the call.
@@ -1005,6 +1038,8 @@ int first = ids[0];                   // reading gives the element type
 
 - Checked in strict code: the elements of a literal (`[1, "a"]` for a `list<int>`, keys in a list literal, missing keys in a map literal), `xs[i] = v`, `m.key = v`, `push` / `push_back` / `push_cyclic` / `insert`, and reads (`xs[i]`, `m.key`, `m["key"]`) have the element type. `list<int>` is not a `list<float>`.
 - A plain `json` (a function result without annotation, `[]` built step by step) can be stored in a `list<T>`: its elements are not known.
+- `for(x : xs)` over a `list<T>` / `map<T>` gives `x` the type `T`; `for(int x : xs)` declares it, and elements of
+  another type are an error (`for(int v : names)` with `list<string> names`). See section 7.
 
 Speed: in strict code, arithmetic and comparisons whose operands are typed numbers (annotated or inferred `int` / `float` locals, parameters, globals, class members `x` / `this.x` / `o.x`, and literals) and assignments of them to such variables or to members of `this` (also declarations like `int t = a * b;`) run as one fused instruction instead of one instruction and temporary variable per operand (number loops about 3-4x faster). Method calls `obj.method(...)`, `this.method(...)` and `method(...)` inside a class start the call directly, without creating a bound function variable first (number methods on class members about 2x faster). Annotate parameters (`int fib(int n)`) to get it there; an unannotated parameter is `any`. The result is always the same as without strict mode: when a value is not a number at runtime (a typed function called from dynamic code with a string), or for a zero divisor, the normal instructions run.
 
@@ -1228,7 +1263,21 @@ Before using a lambda:
 shz file_name
 shz --check file_name    // syntax check only (includes the strict mode checks)
 shz --strict file_name   // strict mode for every file, as if each started with #strict
+shz --watch file_name    // run it, start it again when it or a file it #includes changes
+shz -i                   // the prompt: one input at a time (also "shz" alone on a terminal without a script)
 ```
+
+- `--watch` (`-w`) runs the script in a child process. After a change of the script or of a file it `#include`s (and of
+  any `.shio` next to it) the script is stopped and started again; a script that ends or does not compile waits for the
+  next change. Files loaded at run time (`std.module`, `fileio`) are not watched. Ctrl+C ends both.
+
+- `-i` (`--interactive`) is a prompt. Every input runs in the global scope of one program: variables, functions,
+  classes, `using` and `import` stay for the next input, and earlier inputs do not run again. Without `;` at the end the
+  value of an expression is shown (`x * 2` shows 20; `x = 5`, `x * 2;` and `std.print(...)` show nothing more). A line
+  with open brackets (`{`, `(`, `[`) asks for more lines (`..`). On a terminal: arrows, up / down through the history,
+  Ctrl+C drops the input, Ctrl+D ends (Windows: Ctrl+Z, Enter). An input that does not compile changes nothing.
+  Timers and threads of earlier inputs only go on while an input runs. Piped input (`shz -i < file`) exits with `1`
+  when an input failed.
 
 - The process exits with code `1` after an uncaught runtime error in the main script (errors caught by `try`/`catch` do not count).
 

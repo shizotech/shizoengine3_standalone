@@ -2,10 +2,13 @@
 using eigen;
 
 #include "artnet_menu"
+#include "network_cards_menu"
 #include "fixture_menu"
 #include "mcp_menu"
 #include "chat_menu"
 #include "projects_menu"
+#include "shader_preview"
+#include "midi_controller_menu"
 
 save_in_progress = false;
 load_in_progress = false;
@@ -14,8 +17,11 @@ class assetbrowser
 {
 	managed window = None;
 	managed scale_widget = None;
+	band = 0; //macOS: height of the band at the top that holds the traffic lights (window_buttons_band), 0 = none
 	managed fixtures = None;
 	managed artnet = None;
+	managed network_cards = None; //Devices > Network > Network cards (#501)
+	managed midi_controller = None; //the virtual MIDI controller (#343)
 	managed shizonet = None;
 	managed chat = None;
 	managed mcp = None;
@@ -33,6 +39,7 @@ class assetbrowser
 	//"Convert to HAP" of a video in the list (#278): the running jobs (nanogui.video_convert, a job is cancelled when
 	//it is dropped), the menu of the right click and the line at the bottom of the list that shows how far they are
 	filebrowser = None;     //the list of the Assets tab
+	managed preview = None; //the preview of a shader the mouse rests on (#536, shader_preview.shio)
 	convert_jobs = [];      //[job=, name=]
 	convert_btn = None;
 	convert_status = None;
@@ -92,6 +99,12 @@ class assetbrowser
 		convert_status.caption(text).visible(text ? true : false);
 	}
 
+	//macOS: a band of this height at the top for the traffic lights, the tabs below it (0 = none, the tabs at the top)
+	window_buttons_band(height) {
+		band = height;
+		scale_widget.anchor_top(height);
+	}
+
 	__init__(engine, main_menu) {
 	
 		project_env = std.global("project");
@@ -111,6 +124,15 @@ class assetbrowser
 		});
 		
 		scale_widget = window.scrollarea().anchor(0).fit_mode(true).zoom_on_scroll(false);
+		//The band of the traffic lights (macOS) is the title bar of the sidebar: a press moves the window, a double click
+		//zooms it. The right edge still resizes the sidebar
+		window.on_mouse_button([this, engine](pos, btn, down, mods){
+			if(this.band > 0 && pos.y < this.band && btn == 0 && down) {
+				engine.screen.begin_drag();
+				return true;
+			}
+			return this.window.mouse_button_default(pos, btn, down, mods);
+		});
 		tabs = scale_widget.tabwidget();
 		tabs.anchor(0).anchor_right(5);
 		
@@ -166,7 +188,28 @@ class assetbrowser
 			.anchor_left(0).anchor_right(0)
 			.value(engine.screen.refresh_rate())
 			.hide_config_menu();
-		
+
+		//Autosave (__init__.shio): how often the open project is written to the autosave folder. Personal, kept in the
+		//style file
+		settings.section(page_project, "Autosave");
+		settings.note(page_project, "Personal: the same for every project. Never in show mode. If VibeVJ does not close properly, the next start offers the autosave.");
+		autosave_items = [];
+		autosave_index = 0;
+		for(i = 0; i < AUTOSAVE_MINUTES.size(); i++) {
+			minutes = AUTOSAVE_MINUTES[i];
+			autosave_items.push_back(minutes == 0 ? "Off" : std.string(minutes) + " min");
+			if(minutes == engine.autosave_minutes)
+				autosave_index = i;
+		}
+		autosave_select = page_project.combobox().fixed_height(28).items(autosave_items).segmented(true).tooltip("How often the open project is saved to the [[autosave]] folder, never in [[show mode]]. It never replaces your own save.\n[[wiki:Settings#autosave]]");
+		autosave_select.selected(autosave_index);
+		autosave_select.on_change([engine](v, txt) {
+			engine.autosave_minutes = AUTOSAVE_MINUTES[v];
+			style = fileio.read_json(STYLE_FILE);
+			style.autosave_minutes = AUTOSAVE_MINUTES[v];
+			fileio.write_json(STYLE_FILE, style);
+		});
+
 		//Link overview: draws every link whose two controls are visible on screen (saved with the project).
 		//Generators with "always draw links" on draw their own links regardless of this switch.
 		settings.section(page_links, "Cables");
@@ -197,7 +240,7 @@ class assetbrowser
 		//Interface size: everything bigger or smaller, on top of the scale of the system (a 4K screen at 100 % in
 		//Linux, a projector far away). Personal, kept in the style file, applied at start up
 		settings.section(appearance_content, "Interface size");
-		settings.note(appearance_content, "Personal: the same for every project. 100 % is the scale of your system. Takes effect the next time VibeVJ starts.");
+		settings.note(appearance_content, "Personal: the same for every project. 100 % is the scale of your system. Until you choose one, VibeVJ takes the size that suits the screen (more than 100 % on a 4K screen without system scaling).");
 		ui_sizes = [0.9, 1.0, 1.1, 1.25, 1.5, 2.0];
 		ui_now = engine.screen.ui_scale();
 		ui_index = 1;
@@ -208,7 +251,9 @@ class assetbrowser
 		ui_select = appearance_content.combobox().fixed_height(28).items(["90 %", "100 %", "110 %", "125 %", "150 %", "200 %"]).segmented(true)
 			.tooltip("How big buttons, text and windows are drawn. Useful on a 4K screen without system scaling, or far from the screen.\n[[wiki:Settings#interface-size]]");
 		ui_select.selected(ui_index);
-		ui_select.on_change([ui_sizes](v, txt) {
+		//At once: the views and the timeline follow the new size (on_window_resize in timeline.shio)
+		ui_select.on_change([ui_sizes, engine](v, txt) {
+			engine.screen.ui_scale(ui_sizes[v]);
 			style = fileio.read_json(STYLE_FILE);
 			style.ui_scale = ui_sizes[v];
 			fileio.write_json(STYLE_FILE, style);
@@ -276,6 +321,27 @@ class assetbrowser
 			fileio.write_json(STYLE_FILE, style);
 			if(engine.env.refresh_areas)
 				engine.env.refresh_areas();
+		});
+
+		//Blackout (#538): how it comes back. Personal, kept in the style file
+		settings.section(page_output, "Blackout");
+		settings.note(page_output, nanogui.key_text("Personal. Ctrl+B or the Blackout button of the timeline: black at once, back with this fade."));
+		blackout_items = [];
+		blackout_index = 0;
+		for(i = 0; i < BLACKOUT_FADES.size(); i++) {
+			sec = BLACKOUT_FADES[i];
+			blackout_items.push_back(BLACKOUT_FADE_NAMES[i]);
+			if(engine.blackout && math.abs(sec - engine.blackout.fade_back) < 0.01)
+				blackout_index = i;
+		}
+		blackout_select = page_output.combobox().fixed_height(28).items(blackout_items).segmented(true).tooltip("How long the outputs take to come back after a [[blackout]].\n[[wiki:Output-and-Devices#blackout]]");
+		blackout_select.selected(blackout_index);
+		blackout_select.on_change([engine](v, txt) {
+			if(engine.blackout)
+				engine.blackout.fade_back = BLACKOUT_FADES[v];
+			style = fileio.read_json(STYLE_FILE);
+			style.blackout_fade = BLACKOUT_FADES[v];
+			fileio.write_json(STYLE_FILE, style);
 		});
 
 		settings.section(page_output, "NDI");
@@ -388,7 +454,14 @@ class assetbrowser
 				}
 			}
 			
+			//The Blackout button is cleared too: the outputs stay as they are (engine/blackout.shio)
+			if(engine.blackout)
+				engine.blackout.loading = true;
 			nanogui.deserialize_controls([clear=true]);
+			if(engine.blackout) {
+				engine.blackout.loading = false;
+				engine.blackout.sync();
+			}
 						
 			set_project_label("<New Project>");
 
@@ -447,6 +520,9 @@ class assetbrowser
 		engine.env.save_project_as = saveas_callback;
 
 		project_actions = [new=do_new, load=do_load, save=do_save, save_as=do_save_as, exit=do_exit];
+		//Ctrl+S and Ctrl+Shift+S (generators.shio app_key): the same as Save and Save as… of the Projects tab
+		engine.env.project_save = do_save;
+		engine.env.project_save_as = do_save_as;
 
 		//The Projects tab (#479), before Assets as until #360: the actions, an overview of the open project, all
 		//projects and templates. The engine rebuilds its lists from its frame update (#315): at start up, after a
@@ -566,6 +642,24 @@ class assetbrowser
 			this.convert_btn.pushed(true);
 		});
 
+		//Rest the mouse on a shader in the list: it runs in a small window beside the sidebar (#536). The list keeps its
+		//own hover (mouse_motion_default)
+		preview = shader_preview(engine, window);
+		engine.env.shader_preview = preview;   //ticks in on_frame_finished of the engine
+		filebrowser.on_mouse_motion([this](p, rel, button, mods){
+			fb = this.filebrowser;
+			fb.mouse_motion_default(p, rel, button, mods);
+			if(button != 0) {
+				this.preview.hover("", 0); //a drag: no preview
+				return;
+			}
+			this.preview.hover(fb.path_at(p), fb.absolute_position().y + p.y);
+		});
+		filebrowser.on_mouse_enter([this](pos, enter){
+			if(!enter)
+				this.preview.hover("", 0);
+		});
+
 		asset_tab.on_draw([this](){
 			if(this.convert_jobs.size() == 0 && !this.convert_note)
 				return;
@@ -586,6 +680,14 @@ class assetbrowser
 		midi_learn_global = midi_vec.pushbutton("MIDI learn").tooltip("[[midi learn|MIDI learn]] for all devices: click a control, then move a fader or hit a pad.").latched_style("cue"); //learning waits for a MIDI message: cue (amber), not on
 		midi_learn_global.on_change([](v) {
 			nanogui.midi_learn(v);
+		});
+
+		//The virtual controller (#343); its window and device are made below, after the device handler
+		controller_btn = midi_vec.button("Virtual controller").icon(nanogui.icon("th")).anchor_left(0).anchor_right(0)
+			.tooltip("Knobs, faders, buttons and pads on the screen that send MIDI like a controller (device " + MIDI_CONTROLLER_DEVICE + "): "
+				+ "[[midi learn|MIDI learn]] and show prep without hardware.\n[[wiki:MIDI#the-virtual-controller]]");
+		controller_btn.on_click([this]() {
+			this.midi_controller.show();
 		});
 		
 		nanogui.mididevicehandler([this, midi_vec](dev){
@@ -620,13 +722,20 @@ class assetbrowser
 			if(dev.has_output())
 				dev_vec.control("OUT " + dev.device_name()).caption("Out · " + dev.device_name());
 		});
+
+		//After the device handler, so its device gets a section like a plugged in one
+		midi_controller = midi_controller_menu(engine);
 		
 		network_vec = ctrls_panel.collapsable("Network").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		
-		artnet_vec = network_vec.collapsable("Artnet").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
+		artnet_vec = network_vec.collapsable("Art-Net").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		artnet = artnet_menu(engine, artnet_vec);
 		
-		shizonet_vec = network_vec.collapsable("Shizonet").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
+		//The cards Art-Net and ShizoNet use (#501)
+		cards_vec = network_vec.collapsable("Network cards").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
+		network_cards = network_cards_menu(cards_vec);
+
+		shizonet_vec = network_vec.collapsable("ShizoNet").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		enable_shizonet = shizonet_vec.controlbutton("Shizonet").tooltip("ShizoNet on or off. Off: VibeVJ stops looking for ShizoNet devices and talking to them. [[art-net|Art-Net]] keeps running.\n[[wiki:Output-and-Devices#shizonet]]").push(1).value(1).hide_config_menu().anchor_left(0).anchor_right(0);
 		//The module switch is net.enabled (shizonet_enabled): off stops the ShizoNet device polling,
 		//connections and traffic; Art-Net keeps running (#318).

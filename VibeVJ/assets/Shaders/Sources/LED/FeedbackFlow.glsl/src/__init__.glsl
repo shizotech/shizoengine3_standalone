@@ -22,7 +22,7 @@ uniform float shape_size;
 uniform float intensity;
 
 //@enum options=(Blob, Ring, Capsule, Star) value=0
-uniform float pattern;
+uniform int pattern;
 
 //@rgb value=(0.5, 0.9, 1.0)
 uniform vec3 foreground_color;
@@ -43,9 +43,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
     // --- 1. Fade the previous frame (decaying trail via feedback buffer) ---
     vec4 prev = texture(feedback, uv);
-    vec3 col = prev.rgb * memory;
-    // Hard clamp the accumulation every frame so trails can never run away.
-    col = clamp(col, vec3(0.0), vec3(1.0));
 
     // --- 2. Sample the divergence-free flow field (curl-noise + vortex) ---
     vec2 fp = uv * flow_scale * 3.0 + vec2(t * 0.15, t * -0.1);
@@ -54,9 +51,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     // --- 3. Advection: trace the flow field backward by a few texels ---
     vec2 texel = 1.0 / iResolution.xy;
     vec2 src_uv = uv - v * texel * 6.0;
-    // Add a soft "smearing" glow by sampling the trailed buffer along the field
-    vec3 trail = texture(feedback, src_uv).rgb * 0.5;
-    col = clamp(col + trail, vec3(0.0), vec3(1.0));
+    // Smear the last frame along the field: half of it stays, half comes from upstream. Together they fade with
+    // Memory, so the trail never gains light (#436: last frame x Memory + 0.5 x upstream ran up to white)
+    vec3 col = mix(prev.rgb, texture(feedback, src_uv).rgb, 0.5) * memory;
 
     // --- 4. Advect SDF shapes through the field and paint new ink ---
     for (int i = 0; i < 12; i++)
@@ -74,8 +71,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         vec2 q = p - center + cv * 0.15;
         float d = ff_shape(q, s);
         float cover = 1.0 - smoothstep(0.0, 0.12, d);
-        // Paint new ink on top of the faded trail (additive glow, clamped)
-        col = clamp(col + foreground_color * cover * intensity, vec3(0.0), vec3(1.0));
+        // Paint new ink over the faded trail. max(), not +: added every frame, the ink ran up to white inside the
+        // shapes; this way a shape shows Foreground colour x Intensity
+        col = max(col, clamp(foreground_color * cover * intensity, vec3(0.0), vec3(1.0)));
     }
 
     // --- 5. Blend to background where there is no ink ---

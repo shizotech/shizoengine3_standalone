@@ -9,11 +9,11 @@
 uniform float speed;
 //@float min=-10.0 max=10.0 value=0.0
 uniform float offset;
-//@slider min=1.0 max=20.0 value=5.0
+//@int min=1 max=20 value=5
 uniform int rings;
-//@rgb
+//@rgb value=(1.0, 0.3, 0.1)
 uniform vec3 colorA;
-//@rgb
+//@rgb value=(0.1, 0.3, 1.0)
 uniform vec3 colorB;
 
 uniform sampler2D input;

@@ -11,10 +11,28 @@ managed monitor_screen = None;
 managed video_router = None;
 
 last_monitor_index = -1;
+monitor_out = None; //the shader of the display output that copies the picture (picture_fit: stretch, fit, fill)
+
+//How the picture fills a display whose shape differs: 0 Stretch (as before), 1 Fit (bars, nothing cut off), 2 Fill
+//(nothing empty, the edges cut off). The copy shader of the output does it, with the sizes of both
+MONITOR_COPY_SHADER = "uniform sampler2D in_texture; uniform vec2 shz_out_size; uniform int shz_fit;\n" +
+	"void main(){\n" +
+	"  vec2 uv = v_uv;\n" +
+	"  vec2 src = vec2(textureSize(in_texture, 0));\n" +
+	"  if(shz_fit != 0 && src.x > 0.0 && src.y > 0.0 && shz_out_size.x > 0.0 && shz_out_size.y > 0.0) {\n" +
+	"    float a = (src.x / src.y) / (shz_out_size.x / shz_out_size.y);\n" +
+	"    vec2 k = a > 1.0 ? vec2(1.0, a) : vec2(1.0 / a, 1.0);\n" +
+	"    if(shz_fit == 2) k = a > 1.0 ? vec2(1.0 / a, 1.0) : vec2(1.0, a);\n" +
+	"    uv = (v_uv - 0.5) * k + 0.5;\n" +
+	"    if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }\n" +
+	"  }\n" +
+	"  fragColor = texture(in_texture, uv);\n" +
+	"}";
 last_frame_index = -1;
 
 uniforms = [];
 inputs = [];
+text_uniform_ctrls = []; //name -> the text field of a //@text annotation
 is_shadertoy = false;
 
 size_x = None;
@@ -30,16 +48,113 @@ control_area = None;
 
 render_callback = None;
 
-shadertoy_header = R"(
-/*---INJECTED HEADER CODE---*/
-precision highp float; uniform vec3 iResolution;  uniform float iTime;  uniform float iTimeDelta;  uniform int iFrame; 
-//@slidervec4
-uniform vec4 iMouse;
-uniform vec4 iDate; uniform float iSampleRate; uniform sampler2D iChannel0; uniform sampler2D iChannel1; uniform sampler2D iChannel2; uniform sampler2D iChannel3; uniform int RenderMaskActive; uniform sampler2D RenderMaskInput;
-/*---*/
-)";
+#include "engine/generators/extensions/glsl/shadertoy"
 
-shadertoy_main = "/*---INJECTED MAIN FUNCTION---*/\nvoid main(){ vec4 new_color = vec4(0,0,0,0); vec2 n_coord = v_uv*iResolution.xy; if(RenderMaskActive == 1) { vec4 mask_color = texture(RenderMaskInput, v_uv); if(mask_color.rgb == vec3(0.0)) { fragColor = new_color; return; }} mainImage( new_color, n_coord ); fragColor = new_color;}\n/*---*/\n";
+//The visible name of a shader control, made from its uniform name (#436): "bg_colour" -> "Background colour",
+//"timeMultiplier" -> "Time multiplier", "stage5_offset" -> "Stage 5 offset", "BAND_WIDTH" -> "Band width". Only the
+//caption: the uniform name stays the ID of the control (links, MIDI mappings and saved projects find it by that), and
+//a displayname= of the annotation or a name the user gives the control still wins
+SHADER_CAPTION_WORDS = [bg="background", fg="foreground", rot="rotation", freq="frequency", amp="amplitude",
+	pos="position", src="source", tgt="target", num="number", anim="animation", dir="direction", mult="multiplier",
+	lum="luminance", func="function", hi="high", rgb="RGB", rgba="RGBA", hsv="HSV", uv="UV", vhs="VHS", fft="FFT",
+	bpm="BPM", sdf="SDF", led="LED", x="X", y="Y", z="Z", w="W", fps="FPS", interp="interpolation",
+	kaleido="kaleidoscope", cols="columns", dist="distance", fov="FOV", aa="anti-aliasing"];
+SHADER_CAPTION_WORDS["3d"] = "3D";
+SHADER_CAPTION_WORDS["2d"] = "2D";
+
+shader_uniform_caption(name) {
+	s = name;
+	if(s.starts("u_"))
+		s = s.substr(2);
+	words = [];
+	word = "";
+	prev = "";
+	for(c : s) {
+		is_digit = "0123456789".contains(c);
+		is_upper = !is_digit && c != c.lowercase();
+		prev_digit = prev != "" && "0123456789".contains(prev);
+		prev_lower = prev != "" && !prev_digit && prev != "_" && prev == prev.lowercase();
+		if(c == "_" || c == " " || c == "-") {
+			if(word != "")
+				words.push_back(word);
+			word = "";
+		}
+		else {
+			if(word != "" && ((is_upper && (prev_lower || prev_digit)) || (is_digit && !prev_digit)))
+				words.push_back(word);
+				word = "";
+			word += c;
+		}
+		prev = c;
+	}
+	if(word != "")
+		words.push_back(word);
+	if(words.size() == 0)
+		return name;
+	//Shadertoy style: iMouse -> Mouse
+	if(words.size() > 1 && words[0] == "i")
+		words.erase(0);
+	//A name in capitals only (BAND_WIDTH_FAR) is read as plain words
+	shouting = s == s.uppercase();
+	out = "";
+	for(i, w : words) {
+		l = w.lowercase();
+		if(SHADER_CAPTION_WORDS.has(l))
+			l = SHADER_CAPTION_WORDS[l];
+		else if(!shouting && w.size() > 1 && w == w.uppercase() && w != l)
+			l = w; //an abbreviation written in capitals stays (RGB, UV)
+		else if(i > 0 && l.size() == 1)
+			l = l.uppercase(); //colorB -> Color B
+		if(i == 0 && l.size() > 0)
+			l = l.substr(0, 1).uppercase() + l.substr(1);
+		out += (i > 0 ? " " : "") + l;
+	}
+	return out;
+}
+
+//iDate of Shadertoy: year, month - 1, day, seconds since midnight (local time, with milliseconds). Declared for every
+//Shadertoy shader, it was never set and stayed 0 (#436: the clock of DateTime showed 00:00)
+shadertoy_idate() {
+	d = std.date("%Y %m %d %z").split(" ");
+	z = d[3]; //UTC offset, "+0200"
+	tz = (std.int(z.substr(1, 2)) * 60 + std.int(z.substr(3, 2))) * 60;
+	if(z.starts("-"))
+		tz = -tz;
+	secs = math.mod(std.millis() / 1000.0 + tz, 86400.0);
+	return vec4f(std.int(d[0]), std.int(d[1]) - 1, std.int(d[2]), secs);
+}
+
+//The characters a //@text annotation can send, from code 32 (space) on
+SHADER_TEXT_CHARS = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
+//Sends a text into the int uniforms of a //@text annotation: <prefix>1 .. <prefix><slots> get the character codes (a
+//character outside of ASCII becomes a space), <count> the number of characters
+shader_send_text(shader, text, opts) {
+	t = std.string(text ?? "");
+	i = 0;
+	for(c : t) {
+		if(i >= opts.slots)
+			break;
+		code = SHADER_TEXT_CHARS.find(c);
+		shader.uniform(opts.prefix + (i + 1), code < 0 ? 32 : code + 32);
+		i++;
+	}
+	n = i;
+	for(j = n; j < opts.slots; j++)
+		shader.uniform(opts.prefix + (j + 1), 32);
+	if(opts.count != "")
+		shader.uniform(opts.count, n);
+}
+
+//The caption of an input port (#436), like the In / Out of the other generators: "input" -> "In", "input2" -> "In 2",
+//"iChannel0" -> "Channel 0", any other sampler by its name ("AUDIO" -> "Audio"). Only the caption, the port's ID stays
+shader_input_caption(name) {
+	if(name == "input")
+		return "In";
+	if(name.starts("input") && "0123456789".contains(name.substr(5, 1)))
+		return "In " + name.substr(5);
+	return shader_uniform_caption(name);
+}
 
 find_shader(name) {
 	for(i = 0; i < shaders.size(); i++) {
@@ -152,6 +267,10 @@ entry(generator, area, shader_dir) {
 	control_area = ctrls_tab;
 	settings_tab = control_tabs.add_tab("Settings").anchor(0).vscroll().anchor(0).content().layout(nanogui.layout_vertical());
 	transform_tab = control_tabs.add_tab("Transform").anchor(0).vscroll().anchor(0).content().layout(nanogui.layout_vertical());
+	//Tooltips (#379): one sentence each, the last line leads into the wiki (F1)
+	control_tabs.tab_tooltip(0, "The time, the controls of the [[shader]], its inputs and where its picture goes\n[[wiki:Output-and-Devices#the-tabs-of-a-shader]]");
+	control_tabs.tab_tooltip(1, "Size, format and mask of the picture the [[shader]] renders\n[[wiki:Output-and-Devices#render-settings-tab-settings]]");
+	control_tabs.tab_tooltip(2, "Move, turn, zoom and mirror the picture, and fit it onto a surface (projection mapping)\n[[wiki:Output-and-Devices#transform-and-projection-mapping-tab-transform]]");
 	
 	io_panel = area.widget().anchor_bottom(0).anchor_left(0).anchor_right(0).fixed_height(25);
 	in_panel = io_panel.widget().anchor(0).anchor_right(70);
@@ -176,29 +295,44 @@ entry(generator, area, shader_dir) {
 	
 	//Time controls
 	time_vec = ctrls_tab.controlvector("Time", "ctrls").expanded(false);
+	time_vec.tooltip("How the time of the [[shader]] runs\n[[wiki:Settings#default-sync]]");
 	time_type_ctrl = time_vec.controlcombo("Sync", "timectrls").items(["Free", "Manual", "Sync"]).segmented(true); //index-based
 	time_type_ctrl.value(generator.engine.env.default_sync_mode.value());
+	time_type_ctrl.tooltip("Free: runs on its own, in seconds. Manual: stands still, set Time yourself or [[link]] it. Sync: follows the [[timeline]], in [[beat|beats]]\n[[wiki:Settings#default-sync]]");
 	time_ctrl = time_vec.controlfloat("Time", "timectrls");
 	time_offs_ctrl = time_vec.controlfloat("Offset", "timectrls");
 	time_mult_ctrl = time_vec.controlslider("Multiplier", "timectrls").min(-2).max(2).value(1);
 	
 	//Uniforms
 	uniform_vec = ctrls_tab.controlvector("Controls", "uniforms").expanded(false);
+	uniform_vec.tooltip("The controls the [[shader]] itself has");
 	
 	//Input controls
 	input_vec = ctrls_tab.controlvector("Inputs", "ctrls").expanded(false);	
+	input_vec.tooltip("The pictures the [[shader]] takes in: from a [[video router]] name, or No Input");
 	
 	//Output controls
 	output_vec = ctrls_tab.controlvector("Outputs", "ctrls").expanded(false);	
+	output_vec.tooltip("Where the picture goes: a display, the [[video router]], Spout or NDI\n[[wiki:Output-and-Devices#outputs-tab-control]]");
 	
 	monitor_vec = output_vec.controlvector("Monitor", "output_ctrls_monitor").expanded(false);
+	monitor_vec.tooltip("Show the picture on a display or projector\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
 	monitor_type = monitor_vec.controlcombo("monitor_type", "output_ctrls_monitor").caption("Display mode").items(["Fullscreen", "Window"]).segmented(true); //index-based
+	//The name of the display that was chosen, kept with the project: at another venue the order of the displays
+	//differs, the output goes to the display with that name or stays off (no fallback onto the screen of the program)
+	monitor_name = monitor_vec.controltext("monitor_name", "output_ctrls_monitor").caption("Display name").hide_config_menu();
+	monitor_name.visible(false);
 	monitor_select = monitor_vec.controlcombo("monitor_select", "output_ctrls_monitor").caption("Display");
+	monitor_fit = monitor_vec.controlcombo("monitor_fit", "output_ctrls_monitor").caption("Picture").items(["Stretch", "Fit", "Fill"]).segmented(true); //index-based
+	monitor_fit.tooltip("When the picture and the display have another shape: Stretch fills the display and distorts it, Fit shows all of it with black bars, Fill fills the display and cuts the edges off\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
+	monitor_type.tooltip("Fullscreen covers the display; Window opens a window you can move");
+	monitor_select.tooltip("The display that shows the picture; Off closes it\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
 	monitor_select.on_open([monitor_select](){
 		ctx = nanogui.current_context();
 		items = ["Off"];
 		for(i = 0; i < ctx.monitor_count(); i++) {
-			items.push_back("Display " + (i+1));
+			info = ctx.monitor_info(i);
+			items.push_back("Display " + (i+1) + (info && info.name ? " · " + info.name : ""));
 		}
 		monitor_select.items(items);
 	});
@@ -209,6 +343,9 @@ entry(generator, area, shader_dir) {
 	videorouter_vec = output_vec.controlvector("VideoRouter", "video_router").caption("Video router").expanded(false);
 	videorouter_enable = videorouter_vec.controlbutton("Enable Router").caption("Enable router").push(1);
 	videorouter_name = videorouter_vec.controltext("VideoRouterName").caption("Video router name").hide_config_menu();
+	videorouter_vec.tooltip("Offer the picture to other shaders by name: they pick it under Inputs\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+	videorouter_enable.tooltip("Offer the picture in the [[video router]]");
+	videorouter_name.tooltip("The name other shaders pick it by");
 	
 	videorouter_enable.callback([videorouter_name](v){
 		if(v)
@@ -226,6 +363,8 @@ entry(generator, area, shader_dir) {
 	spout_vec = output_vec.controlvector("SPOUT", "output_ctrls_spout").caption("Spout").expanded(false);
 	spout_enable = spout_vec.controlbutton("Enable SPOUT", "spout").caption("Enable Spout").push(1);
 	spout_name = spout_vec.controltext("SpoutName", "spout").caption("Spout name").hide_config_menu();
+	spout_vec.tooltip("Send the picture to other programs on this computer (Windows only)\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+	spout_name.tooltip("The name the other program finds the picture by");
 	
 	spout_enable.callback([spout_name, monitor_select](v){
 		shaders[0].shader.spout_sender_name(spout_name.value());
@@ -240,6 +379,8 @@ entry(generator, area, shader_dir) {
 	ndi_vec = output_vec.controlvector("NDI Stream", "output_ctrls_ndi").caption("NDI stream").expanded(false);
 	ndi_enable = ndi_vec.controlbutton("Enable NDI", "ndi").push(1);
 	ndi_name = ndi_vec.controltext("NDI Name", "ndi").caption("NDI name").hide_config_menu();
+	ndi_vec.tooltip("Send the picture over the network as NDI\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+	ndi_name.tooltip("The name receivers on the network find the stream by");
 	
 	ndi_enable.callback([ndi_name, monitor_select](v){
 		shaders[0].shader.ndi_source_name(ndi_name.value());
@@ -250,16 +391,54 @@ entry(generator, area, shader_dir) {
 		shaders[0].shader.ndi_source_name(v);
 	});
 	
-	monitor_select.callback([monitor_select, spout_enable, monitor_type,](index) {
+	monitor_select.callback([monitor_select, spout_enable, monitor_type, monitor_name, monitor_fit](index) {
 		
 		if(index == last_monitor_index)
 			return;
 		
+		ctx = nanogui.current_context();
+		count = ctx.monitor_count();
+		//A display by its name: the one the project was made with, wherever it is in the list now. A saved display
+		//that is not connected leaves the output off; it does not land on the screen of the program
+		if(index > 0) {
+			wanted = monitor_name.value();
+			found = -1;
+			if(wanted) {
+				for(i = 0; i < count; i++) {
+					info = ctx.monitor_info(i);
+					if(info && info.name == wanted && found < 0)
+						found = i + 1;
+				}
+				//The same name twice (two displays of one model): the place in the list decides
+				if(index <= count) {
+					here = ctx.monitor_info(index - 1);
+					if(here && here.name == wanted)
+						found = index;
+				}
+			}
+			if(index > count || (wanted && found < 0)) {
+				std.warn("Display output: \"" + (wanted ? wanted : "Display " + index) + "\" is not connected, the output stays off");
+				last_monitor_index = 0;
+				monitor_select.value(0, false); //no second round through this callback
+				if(monitor_screen) {
+					std.free(monitor_screen);
+					monitor_screen = None;
+				}
+				monitor_out = None;
+				return;
+			}
+			if(found > 0 && found != index) {
+				monitor_select.value(found, false);
+				index = found;
+			}
+		}
+
 		last_monitor_index = index;
 		
 		if(monitor_screen)
 			std.free(monitor_screen);
 			monitor_screen = None;
+		monitor_out = None;
 		
 		//None
 		if(index == 0) 
@@ -267,8 +446,9 @@ entry(generator, area, shader_dir) {
 		
 		index = index-1; //To get monitor id
 		
-		ctx = nanogui.current_context();
 		mon_info = ctx.monitor_info(index);
+		if(mon_info && mon_info.name)
+			monitor_name.value(mon_info.name);
 		
 		//In pixels: macOS gives a Retina display's size in points, the shader rendered at half its resolution (#260)
 		if(mon_info) {
@@ -284,15 +464,31 @@ entry(generator, area, shader_dir) {
 			monitor_select.value(0);
 		});
 
-		shadertoy_header_screen = "uniform sampler2D in_texture;";
-		shadertoy_main_screen = "void main(){ fragColor = texture(in_texture, v_uv); }";
 		shader = monitor_screen.shader();
 		shader.anchor(0);
 		fb = monitor_screen.framebuffer_size();
 		shader.render_size(eigen.vec2i(fb[0], fb[1]));
-		shader.fragment_source(shadertoy_header_screen + shadertoy_main_screen);
+		shader.fragment_source(MONITOR_COPY_SHADER);
 		shader.input("in_texture", shaders[0].shader);
+		shader.uniform("shz_out_size", vec2f(fb[0], fb[1]));
+		shader.uniform("shz_fit", std.int(monitor_fit.value()));
+		monitor_out = shader;
+
+		//The output window can change its size (Window mode, a display that changes its resolution): the copy renders
+		//at the new size, so the picture stays sharp and keeps its shape
+		monitor_screen.on_window_resize([](new_size, old_size){
+			if(!monitor_screen || !monitor_out)
+				return;
+			fb = monitor_screen.framebuffer_size();
+			monitor_out.render_size(eigen.vec2i(fb[0], fb[1]));
+			monitor_out.uniform("shz_out_size", vec2f(fb[0], fb[1]));
+		});
 		
+	});
+
+	monitor_fit.callback([](v) {
+		if(monitor_out)
+			monitor_out.uniform("shz_fit", std.int(v));
 	});
 
 	//Display mode applies at once: the output that shows is made again in the new mode. Before, the mode was only
@@ -310,6 +506,8 @@ entry(generator, area, shader_dir) {
 	size_vec = settings_tab.controlvector("Render", "settings");
 	size_mode = size_vec.controlcombo("resize_mode", "settings").caption("Size").items(["Custom", "Project"]).segmented(true); //index-based
 	render_downscale = size_vec.controlfloat("Renderscale").caption("Render scale").value(1);
+	size_mode.tooltip("Project: the size of the [[project]] (Settings, Project). Custom: Width and Height below\n[[wiki:Output-and-Devices#render-settings-tab-settings]]");
+	render_downscale.tooltip("Multiplies the size: 0.5 renders at half size (faster), 1 at full size");
 	size_vec = settings_tab.controlvector("Size", "settings");
 	//Instead of this, just change the size automatically if the generator has the same dims as the project had before
 	size_x = size_vec.controlint("Width", "settings").value(generator.engine.project_width.value());
@@ -369,6 +567,8 @@ entry(generator, area, shader_dir) {
 	
 	mask_vec = settings_tab.controlvector("Mask", "settings").expanded(false);
 	rendermask_active = mask_vec.controlbutton("Rendermask", "settings").caption("Render mask").push(true);
+	fmt_vec.tooltip("The format of the picture. NDI always sends 8-bit RGBA\n[[wiki:Output-and-Devices#render-settings-tab-settings]]");
+	rendermask_active.tooltip("Turns the mask input on or off");
 	
 	rendermask_active.callback([](v) {
 		for(i = 0; i < shaders.size(); i++) {
@@ -386,6 +586,9 @@ entry(generator, area, shader_dir) {
 	zoom = transform_vec.controlslider("Zoom").value(1.0);
 	flip_x = transform_vec.controlbutton("Flip X").push(1).fixed_height(25);
 	flip_y = transform_vec.controlbutton("Flip Y").push(1).fixed_height(25);
+	clip_uv.tooltip("Cut the picture off where a move, a turn or the zoom pushes it out of its frame\n[[wiki:Output-and-Devices#transform-and-projection-mapping-tab-transform]]");
+	flip_x.tooltip("Mirror the picture left to right");
+	flip_y.tooltip("Mirror the picture top to bottom");
 	
 
 	translate_x.callback([translate_x, translate_y](v) {
@@ -440,6 +643,11 @@ entry(generator, area, shader_dir) {
 	projection_grid_fine_y = projection_grid_fine_vec.controlint("Y", "mapping").value(4);
 	
 	projection_reset = projection_vec.button("Reset");
+	projection_btn.tooltip("Show a grid over the picture: drag its points to fit the picture onto a surface\n[[wiki:Output-and-Devices#transform-and-projection-mapping-tab-transform]]");
+	projection_subdivide.tooltip("A finer grid");
+	projection_reset.tooltip("Back to the plain grid");
+	projection_grid_vec.tooltip("How many fields the grid has across and down");
+	projection_grid_fine_vec.tooltip("How finely each field is divided");
 	
 	set_projection_grid_cb = [projection_btn](v) {
 		if(!projection_btn.pushed()) //Only set when its actually activated once, "lazy" set
@@ -483,6 +691,43 @@ entry(generator, area, shader_dir) {
 
 		shader = shaders[shader_index].shader;
 
+		//@text prefix=char slots=16 count=char_count value="HTTP": a text field whose characters go into the int
+		//uniforms char1 .. char16 and their number into char_count (#436). The uniform below the annotation only
+		//names the field, the shader does not need to use it
+		if(str.starts("text")) {
+			opts = [prefix = name, slots = 16, count = "", value = ""];
+			attributes = str.smart_split(" ");
+			for(i = 1; i < attributes.size(); i++) {
+				kv = attributes[i].smart_split("=");
+				if(kv.size() < 2)
+					continue;
+				if(kv[0] == "prefix")
+					opts.prefix = kv[1];
+				else if(kv[0] == "slots")
+					opts.slots = math.max(std.int(kv[1]), 0);
+				else if(kv[0] == "count")
+					opts.count = kv[1];
+				else if(kv[0] == "value")
+					opts.value = kv[1].extract("\"", "\"");
+			}
+			if(text_uniform_ctrls.has(name)) {
+				uniforms[name].push_back(shader);
+				shader_send_text(shader, text_uniform_ctrls[name].value(), opts);
+				return;
+			}
+			ctrl = uniform_vec.controltext(name, "uniforms").caption(shader_uniform_caption(name)).value(opts.value);
+			ctrl.tooltip("The text the shader shows, up to " + std.int(opts.slots) + " characters");
+			text_uniform_ctrls[name] = ctrl;
+			uniforms[name] = [shader];
+			uniform_entry = &uniforms[name];
+			shader_send_text(shader, ctrl.value(), opts);
+			ctrl.callback([uniform_entry, opts](v) {
+				for(j = 0; j < uniform_entry.size(); j++)
+					shader_send_text(uniform_entry[j], v, opts);
+			});
+			return;
+		}
+
 		if(!shader.has_uniform(name))
 			//std.warn("Uniform doesnt exist in shader: ", name);
 			return;
@@ -509,7 +754,9 @@ entry(generator, area, shader_dir) {
 			ctrl = uniform_vec.controlfloat(name, "uniforms");
 		}
 		else if(attributes[0] == "button") {
-			ctrl = uniform_vec.controlbutton(name, "uniforms");
+			//A toggle, as SHADER_GUIDE.MD says: without push(1) it was a button that only reports the press, a //@button
+			//(Flip Y of DateTime, ...) could be switched on and never off again (#436)
+			ctrl = uniform_vec.controlbutton(name, "uniforms").push(1);
 		}
 		else if(attributes[0] == "pushbutton") {
 			ctrl = uniform_vec.controlbutton(name, "uniforms").push(1);
@@ -614,6 +861,7 @@ entry(generator, area, shader_dir) {
 		}
 		
 		if(ctrl) {
+			ctrl.caption(shader_uniform_caption(name));
 			for(i = 1; i < attributes.size(); i++) {
 				attr = &attributes[i];
 				if(attr.find("=") >= 0) {
@@ -624,6 +872,10 @@ entry(generator, area, shader_dir) {
 						}
 						else if(key_value[0] == "displayname") {
 							ctrl.display_name(key_value[1].extract("\"","\""));
+						}
+						else if(key_value[0] == "value" && attributes[0] == "enum" && "0123456789".contains(key_value[1].substr(0, 1))) {
+							//value=2 is the index of the option: a string would be looked up as the text of an option (#436)
+							ctrl.value(std.int(key_value[1]));
 						}
 						else if(vec_ctrls) {
 							vec_values = key_value[1].extract("(",")").split(",", -1, true);
@@ -783,14 +1035,15 @@ entry(generator, area, shader_dir) {
 			in_ctrl = None;
 			
 			if(input_name == "RenderMaskInput") {
-				in_ctrl = mask_vec.control(input_name, "input_ctrls");
+				in_ctrl = mask_vec.control(input_name, "input_ctrls").caption("Render mask input");
 			}
 			else {
-				in_ctrl = in_panel.control(input_name, "input_ctrls");
+				in_ctrl = in_panel.control(input_name, "input_ctrls").caption(shader_input_caption(input_name));
 				in_ctrl.anchor_left((*total_inputs) * 100).anchor_top(0).anchor_bottom(0).fixed_width(100);
 				*total_inputs++;
 			}
 			
+			in_ctrl.tooltip("An input of the shader: [[link]] a picture into it\n[[wiki:Output-and-Devices#the-tabs-of-a-shader]]");
 			in_ctrl.on_unlink([in_ctrl, input_name, input_entry](ctrl1,ctrl2){
 				if(ctrl2 == in_ctrl) {
 					for(sid = 0; sid < input_entry.size(); sid++)
@@ -808,7 +1061,7 @@ entry(generator, area, shader_dir) {
 			if(!default_input && (lc == "input" || lc == "ichannel0"))
 				default_input = in_ctrl;
 			
-			input_collapsable = input_vec.collapsable(input_name); //the vertical layout gives it the full width inside the padding
+			input_collapsable = input_vec.collapsable(input_name == "RenderMaskInput" ? "Render mask input" : shader_input_caption(input_name)); //the vertical layout gives it the full width inside the padding
 			select_video_router = input_collapsable.combobox().items(["Select Input"]).anchor_left(0).anchor_right(0);
 			
 			select_video_router.on_open([select_video_router](){
@@ -854,6 +1107,19 @@ entry(generator, area, shader_dir) {
 	};
 	
 	has_time_controls = false;
+
+	//A Shadertoy shader declares mainImage(). Looked for line by line: regex_search refuses a text of more than
+	//16384 characters (#102), and a pass of Audio/noise is longer (#552)
+	declares_main_image = [](src) {
+		if(src.find("mainImage") < 0)
+			return false;
+		src_lines = src.split("\n");
+		for(i = 0; i < src_lines.size(); i++) {
+			if(src_lines[i].find("mainImage") >= 0 && src_lines[i].regex_search(R"(void\s+mainImage\s*\()") >= 0)
+				return true;
+		}
+		return false;
+	};
 	
 	for(sid = 0; sid < shader_paths.size(); sid++) {
 		shader_src_file = fileio.read_string(shader_paths[sid]);
@@ -864,7 +1130,7 @@ entry(generator, area, shader_dir) {
 			shader_src = resolve_includes(fileio.file_dir(include_file), fileio.file_name(include_file)).strip();
 		}
 		
-		if(shader_src.regex_search(R"(void\s+mainImage\s*\()") >= 0) {
+		if(declares_main_image(shader_src)) {
 			is_shadertoy = true;
 			//#line: compile errors then count lines from the start of the shader file, not of the injected header
 			shader_src = shadertoy_header + "\n#line 1\n" + shader_src + "\n" + shadertoy_main;
@@ -929,6 +1195,7 @@ entry(generator, area, shader_dir) {
 		has_itime = shader_entry.shader.has_uniform("iTime");
 		has_itimedelta = shader_entry.shader.has_uniform("iTimeDelta");
 		has_iframe = shader_entry.shader.has_uniform("iFrame");
+		has_idate = shader_entry.shader.has_uniform("iDate");
 		
 		is_first = (sid == 0);
 		
@@ -936,7 +1203,7 @@ entry(generator, area, shader_dir) {
 			shader_entry.frame = 0;
 		
 		shader_entry.shader.before_render([shader_entry, is_first, time_ctrl, time_offs_ctrl, time_mult_ctrl, time_type_ctrl, timeline,
-			has_iresolution, has_itime, has_itimedelta, has_iframe, projection_grid_x, projection_grid_y, projection_grid_fine_x, projection_grid_fine_y](){
+			has_iresolution, has_itime, has_itimedelta, has_iframe, has_idate, projection_grid_x, projection_grid_y, projection_grid_fine_x, projection_grid_fine_y](){
 
 			if(!shader_entry || !shader_entry.shader)
 				return;
@@ -990,12 +1257,15 @@ entry(generator, area, shader_dir) {
 				if(has_iframe)
 					shader_entry.shader.uniform("iFrame", shader_entry.frame);
 					shader_entry.frame++;
+				if(has_idate)
+					shader_entry.shader.uniform("iDate", shadertoy_idate());
 			}	
 		
 		});
 	}
 	
-	out = io_panel.control("OUT", "output_ctrls").as_output(true);
+	out = io_panel.control("OUT", "output_ctrls").caption("Out").as_output(true);
+	out.tooltip("The picture of the shader: [[link]] it into an input, MapLab or a display\n[[wiki:Output-and-Devices#the-tabs-of-a-shader]]");
 	out.anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(70);
 	out.value(shaders[0].shader);
 	out.callback([out](v){

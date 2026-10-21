@@ -1,10 +1,12 @@
 // LFO Synth generator
-// Multiple LFO channels (default 3, up to 8). Each channel has a selectable
-// waveform (SINE/TRIANGLE/SAWTOOTH/SQUARE) plus freq/phase/bias/gain and a
-// per-channel output controlslider the engine can consume. Global FREE/SYNC
-// mode, a single global "Phase Delay" control that offsets all channels
-// uniformly, a deterministic master ADSR envelope (Attack/Decay/Sustain/
-// Release + Trigger), and an "active" dispatcher.
+// Several waves (default 3, up to 8 at a time) in one window. Every wave has its own shape (sine, triangle, sawtooth,
+// square), Frequency, Phase, Bias, Gain and a pure output. Global: Mode (Free / Sync), Phase delay (shifts all waves
+// by the same amount) and an ADSR envelope (Attack / Decay / Sustain / Release, Trigger and Release buttons) that all
+// waves are multiplied with. All times count in timeline beats (pos_delta / tl_pos are beats).
+//
+// Control IDs (saved projects, links, MIDI mappings): "Mode", "Phase Delay", "Attack", "Decay", "Sustain",
+// "Release time" (the slider; until #436 it shared the ID "Release" with the button, so only the button could be
+// linked), "Trigger", "Release" (the button), and per wave "Wave n", "Freq n", "Phase n", "Bias n", "Gain n", "Out n".
 import nanogui;
 
 managed vs = None;
@@ -19,24 +21,46 @@ envelope_sustain = None;
 envelope_release = None;
 trigger = None;
 
-// Channel bookkeeping
+// Channel bookkeeping. channel_max is the next free wave number: it only grows, so the control names of a removed
+// wave are never given to another one.
 channel_max = 0;
 channel_list = [];
 free_times = [];
+max_channels = 8;
+
+// Rows of removed waves. A row is not freed inside the click of its own button, but hidden there and freed at the
+// start of the next update(), where no widget event is running.
+pending_free = [];
 
 // Envelope runtime
 env_time = 0.0;
 env_firing = false;
 env_releasing = false;
+env_done = false;      // the envelope was released to 0 and stays there until the next Trigger
 env_level = 0.0;
 env_release_level = 0.0;
 env_release_time = 0.0;
+// Presses of Trigger / Release since the last update(), and whether they were held in the last one (see update)
+trigger_hits = 0;
+trigger_held = false;
+release_hits = 0;
+release_held = false;
 lfo_active = true;
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "active") {
 		lfo_active = value;
 	}
+}
+
+// A cell of a row cut into n equal parts, with a 4 px gap to the next cell. The control in it fills it.
+row_cell(row, i, n) {
+	l = std.float(i) / std.float(n);
+	r = std.float(n - 1 - i) / std.float(n);
+	return row.widget().anchor_top(0).anchor_bottom(0).anchor_left(l, "percent").anchor_right(r, "percent");
+}
+cell_gap(i, n) {
+	return (i < n - 1) ? 4 : 0;
 }
 
 // Returns a [-1,1] waveform sample for the given waveform index and phase (radians).
@@ -64,96 +88,132 @@ wave_value(type, phase_rad) {
 	}
 }
 
-// Adds a new LFO channel row into channel_list_area and registers it in channel_list.
-add_new_channel() {
-	ch_id = "CH" + channel_max;
+// Adds a wave row to channel_list_area and registers it in channel_list.
+// num: the wave number of a saved wave (its controls get the same names again), -1 for a new one.
+add_new_channel(num = -1) {
+	if(num < 0)
+		num = channel_max;
+	if(num >= channel_max)
+		channel_max = num + 1;
 
-	row = channel_list_area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	ch_id = "CH" + num;
 
-	// Every channel gets its own control names ("Freq 1", "Freq 2", ...): controls are found, linked and saved by
+	// [ Wave | Frequency | Phase | Bias | Gain | Output ] [remove]
+	row = channel_list_area.widget().fixed_height(28).anchor_left(0).anchor_right(0).fixed_width(560);
+	cells = row.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).anchor_right(32);
+
+	// Every wave gets its own control names ("Freq 1", "Freq 2", ...): controls are found, linked and saved by
 	// name, so with the same name in every row only one of them could be linked (issue #203)
-	n = " " + (channel_max + 1);
-	wf = row.controlcombo("Wave" + n).caption("Wave").fixed_width(90);
+	n = " " + (num + 1);
+	wf = row_cell(cells, 0, 6).controlcombo("Wave" + n).caption("Wave").tooltip("The shape of this wave: sine, triangle, sawtooth or square").anchor(0).anchor_right(cell_gap(0, 6));
 	wf.items(["Sine", "Triangle", "Sawtooth", "Square"]); //index-based (wave_value)
-	freq = row.controlslider("Freq" + n).caption("Frequency").min(0).max(2).value(0.25).fixed_width(90);
-	phase = row.controlslider("Phase" + n).caption("Phase").min(0).max(1).value(0.0).fixed_width(90);
-	bias = row.controlslider("Bias" + n).caption("Bias").min(-1).max(1).value(0.0).fixed_width(90);
-	gain = row.controlslider("Gain" + n).caption("Gain").min(0).max(2).value(1.0).fixed_width(90);
-	out = row.controlslider("Out" + n).caption("Out").as_output(true).fixed_width(90);
-	del_btn = row.button("").icon(nanogui.icon("times")).fixed_width(25).anchor_right(0);
+	freq = row_cell(cells, 1, 6).controlslider("Freq" + n).caption("Frequency").unit("per beat").tooltip("How many waves per [[beat]]").min(0).max(2).value(0.25).anchor(0).anchor_right(cell_gap(1, 6));
+	phase = row_cell(cells, 2, 6).controlslider("Phase" + n).caption("Phase").tooltip("Shifts this wave in time, 0 to 1 of a wave").min(0).max(1).value(0.0).anchor(0).anchor_right(cell_gap(2, 6));
+	bias = row_cell(cells, 3, 6).controlslider("Bias" + n).caption("Bias").tooltip("Moves this wave up or down").min(-1).max(1).value(0.0).anchor(0).anchor_right(cell_gap(3, 6));
+	gain = row_cell(cells, 4, 6).controlslider("Gain" + n).caption("Gain").tooltip("How big this wave is. 0: flat, 1: from 0 to 1").min(0).max(2).value(1.0).anchor(0).anchor_right(cell_gap(4, 6));
+	out = row_cell(cells, 5, 6).controlslider("Out" + n).caption("Output").as_output(true).tooltip("This wave times the [[envelope]], from 0 to 1. A [[pure output]]: [[link]] it into what should move\n[[wiki:Assets#generators--math]]").anchor(0).anchor_right(cell_gap(5, 6));
+	del_btn = row.button("").icon(nanogui.icon("times")).tooltip("Remove this wave").danger("hover").fixed_width(28).anchor_right(0).anchor_top(0).anchor_bottom(0);
 
-	channel_list[ch_id] = [id=ch_id, row=row, waveform=wf, freq=freq, phase=phase, bias=bias, gain=gain, out=out];
+	channel_list[ch_id] = [id=ch_id, num=num, row=row, waveform=wf, freq=freq, phase=phase, bias=bias, gain=gain, out=out];
 	free_times[ch_id] = 0.0;
 
+	// Stops the wave at once and hides its row; update() frees it (not inside this click)
 	del_btn.on_click([row, ch_id]() {
 		if(channel_list.has(ch_id))
 			channel_list.erase(ch_id);
 		if(free_times.has(ch_id))
 			free_times.erase(ch_id);
-		std.free(row);
+		row.visible(false);
+		pending_free.push_back(row);
 	});
+}
 
-	channel_max++;
+// Frees the rows removed since the last frame (see pending_free)
+flush_pending_free() {
+	if(pending_free.size() == 0)
+		return;
+	for(i = 0; i < pending_free.size(); i++)
+		std.free(pending_free[i]);
+	pending_free.clear();
+	channel_list_area.refresh_layout();
 }
 
 entry(generator, area) {
+	//Wide enough for the six fields of a wave row (at the default width their names were cut off)
+	generator.window.fixed_size([640, 380]);
 	area.layout(nanogui.layout_vertical());
 
-	// Globals section: Mode combo + global Phase Delay slider, laid out in one row.
-	gl_row = area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	// [ Mode | Phase delay ]
+	gl_row = area.widget().fixed_height(28).anchor_left(0).anchor_right(0).fixed_width(240);
+	mode = row_cell(gl_row, 0, 2).controlcombo("Mode").tooltip("Sync: every wave is locked to the position of the [[timeline]], so it lines up with the [[beat]]. Free: they keep their own phase").anchor(0).anchor_right(cell_gap(0, 2));
+	mode.items(["Free", "Sync"]).segmented(true); //index-based (0 = free, 1 = sync)
+	global_phase = row_cell(gl_row, 1, 2).controlslider("Phase Delay").caption("Phase delay").tooltip("Shifts all waves in time by the same amount, 0 to 1 of a wave").min(0).max(1).value(0.0).anchor(0);
 
-	// Global mode: 0 = FREE, 1 = SYNC
-	mode = gl_row.controlcombo("Mode").fixed_width(90);
-	mode.items(["Free", "Sync"]).segmented(true); //index-based
-
-	// Single global phase delay applied uniformly to ALL channels (0..1, default 0.0).
-	global_phase = gl_row.controlslider("Phase Delay").caption("Phase delay").min(0).max(1).value(0.0).fixed_width(130);
-
-	add_btn = area.button("Add LFO channel");
-
-	// Master ADSR envelope
+	// ADSR envelope, multiplied with every wave. Until the first Trigger it is off (the waves pass unchanged).
 	env_area = area.collapsable("Envelope").expanded(true);
 	env_inner = env_area.content().layout(nanogui.layout_vertical());
-	envelope_attack = env_inner.controlslider("Attack").unit("beats").min(0).max(5).value(0.1);
-	envelope_decay = env_inner.controlslider("Decay").unit("beats").min(0).max(5).value(0.2);
-	envelope_sustain = env_inner.controlslider("Sustain").min(0).max(1).value(0.5);
-	envelope_release = env_inner.controlslider("Release").unit("beats").min(0).max(5).value(0.3);
-	trigger = env_inner.controlbutton("Trigger");
-	trigger.get_button().on_click([]() {
-		env_time = 0.0;
-		env_firing = true;
-		env_releasing = false;
-		env_release_time = 0.0;
+	envelope_attack = env_inner.controlslider("Attack").tooltip("After Trigger: how long the [[envelope]] takes to rise to full").unit("beats").min(0).max(5).value(0.1);
+	envelope_decay = env_inner.controlslider("Decay").tooltip("Then how long it takes to fall to Sustain").unit("beats").min(0).max(5).value(0.2);
+	envelope_sustain = env_inner.controlslider("Sustain").tooltip("The level the [[envelope]] holds until Release").min(0).max(1).value(0.5);
+	envelope_release = env_inner.controlslider("Release time").caption("Release").tooltip("After the Release button: how long the [[envelope]] takes to fall to 0").unit("beats").min(0).max(5).value(0.3);
+
+	// [ Trigger | Release ]. callback (not on_click of the inner button): a link or MIDI into them works too.
+	env_btns = env_inner.widget().fixed_height(28).anchor_left(0).anchor_right(0).fixed_width(240);
+	trigger = row_cell(env_btns, 0, 2).controlbutton("Trigger").tooltip("Starts the [[envelope]]: all waves rise and fall with it. [[link]] a beat into it").anchor(0).anchor_right(cell_gap(0, 2));
+	trigger.callback([](v) {
+		if(v)
+			trigger_hits++;
 	});
-	release_btn = env_inner.controlbutton("Release");
-	release_btn.get_button().on_click([]() {
-		env_releasing = true;
-		env_release_time = 0.0;
-		env_release_level = (env_level > 0.0) ? env_level : 1.0;
+	release_btn = row_cell(env_btns, 1, 2).controlbutton("Release").tooltip("Lets the [[envelope]] fall to 0 in Release; it stays there until the next Trigger").anchor(0);
+	release_btn.callback([](v) {
+		if(v)
+			release_hits++;
 	});
 
-	// Scrollable dynamic channel list
+	add_btn = area.button("Add wave").icon(nanogui.icon("plus")).tooltip("Another wave with its own output, up to 8\n[[wiki:Assets#generators--math]]");
+
+	// Scrollable list of the waves
 	vs = area.vscroll();
 	channel_list_area = vs.content().layout(nanogui.layout_vertical());
 
-	// Add button: allow up to 8 channels
 	add_btn.on_click([]() {
-		if(channel_max < 8)
+		if(channel_list.size() < max_channels)
 			add_new_channel();
 	});
 
-	// Default 3 channels
+	// Default 3 waves
 	for(i = 0; i < 3; i++)
 		add_new_channel();
 }
 
 update(generator, tl_pos, pos_delta) {
-	// Compute master ADSR envelope factor in [0,1] (deterministic 4-stage ADSR).
-	// A (Attack): linear 0 -> 1 over 'a' seconds.
-	// D (Decay): 1 -> sustain over 'd' seconds.
-	// S (Sustain): hold at sustain level indefinitely (no auto release).
-	// R (Release): from current level -> 0 over 'r' seconds (triggered by Release button).
-	// If env_firing is false AND env_releasing is false: envelope is idle, env = 1.0.
+	flush_pending_free();
+
+	// Trigger / Release act on the press only. A link calls the callback of a button on every frame while its source
+	// is high: the envelope started again each frame and never got past the beginning of the attack (#436)
+	pressed = trigger_hits > 0;
+	trigger_hits = 0;
+	if(pressed && !trigger_held) {
+		env_time = 0.0;
+		env_firing = true;
+		env_releasing = false;
+		env_done = false;
+		env_release_time = 0.0;
+	}
+	trigger_held = pressed;
+	pressed = release_hits > 0;
+	release_hits = 0;
+	if(pressed && !release_held) {
+		env_releasing = true;
+		env_release_time = 0.0;
+		env_release_level = (env_firing || env_done) ? env_level : 1.0;
+	}
+	release_held = pressed;
+
+	// Envelope factor in [0,1] (deterministic 4-stage ADSR, times in beats).
+	// Attack: 0 -> 1 over Attack. Decay: 1 -> Sustain over Decay. Sustain: holds (no automatic release).
+	// Release (button): from the current level -> 0 over Release, then stays at 0 until the next Trigger.
+	// Never triggered: the envelope is off, env = 1.0.
 	env = 1.0;
 
 	a = envelope_attack.value();
@@ -161,34 +221,14 @@ update(generator, tl_pos, pos_delta) {
 	s = envelope_sustain.value();
 	r = envelope_release.value();
 
-	if(env_firing && !env_releasing) {
-		// Firing: advance time
-		env_time += pos_delta;
-
-		if(env_time < a) {
-			// Attack: linear 0 -> 1
-			env = (a > 0.0) ? env_time / a : 1.0;
-		}
-		else if(env_time < a + d) {
-			// Decay: linear 1 -> sustain
-			frac = (d > 0.0) ? (env_time - a) / d : 1.0;
-			env = 1.0 + (s - 1.0) * frac;
-		}
-		else {
-			// Sustain: hold at sustain level indefinitely
-			env = s;
-		}
-
-		// Track current level for release capture
-		env_level = env;
-	}
-	else if(env_releasing) {
-		// Release: linear decay from env_release_level -> 0 over 'r' seconds
+	if(env_releasing) {
 		env_release_time += pos_delta;
 		if(env_release_time >= r) {
 			env = 0.0;
 			env_releasing = false;
 			env_firing = false;
+			// Before #436 the envelope went back to "off" (1.0) here, so the waves jumped up to full after Release
+			env_done = true;
 		}
 		else {
 			frac = (r > 0.0) ? env_release_time / r : 1.0;
@@ -196,28 +236,46 @@ update(generator, tl_pos, pos_delta) {
 		}
 		env_level = env;
 	}
-	// else: not firing and not releasing -> env stays at 1.0 (envelope idle/disabled)
+	else if(env_firing) {
+		env_time += pos_delta;
+
+		if(env_time < a) {
+			env = (a > 0.0) ? env_time / a : 1.0;
+		}
+		else if(env_time < a + d) {
+			frac = (d > 0.0) ? (env_time - a) / d : 1.0;
+			env = 1.0 + (s - 1.0) * frac;
+		}
+		else {
+			env = s;
+		}
+		env_level = env;
+	}
+	else if(env_done) {
+		env = 0.0;
+		env_level = 0.0;
+	}
 
 	if(env < 0.0)
 		env = 0.0;
 	if(env > 1.0)
 		env = 1.0;
 
+	// Global phase delay (the same for all waves)
+	global_offset = global_phase.value() * 2.0 * math.PI;
+
 	for(i = 0; i < channel_list.size(); i++) {
 		ch_id = channel_list.key(i);
 		ch = channel_list[ch_id];
 		phase_rad = 0.0;
 
-		// Global phase delay offset (uniform across all channels)
-		global_offset = global_phase.value() * 2.0 * math.PI;
-
-	if(mode.value() == 0) {
-		free_times[ch_id] = free_times[ch_id] + pos_delta * ch.freq.value();
-		phase_rad = free_times[ch_id] * 2.0 * math.PI + ch.phase.value() * 2.0 * math.PI + global_offset;
-	}
-	else {
-		phase_rad = tl_pos * 2.0 * math.PI * ch.freq.value() + ch.phase.value() * 2.0 * math.PI + global_offset;
-	}
+		if(mode.value() == 0) {
+			free_times[ch_id] = free_times[ch_id] + pos_delta * ch.freq.value();
+			phase_rad = free_times[ch_id] * 2.0 * math.PI + ch.phase.value() * 2.0 * math.PI + global_offset;
+		}
+		else {
+			phase_rad = tl_pos * 2.0 * math.PI * ch.freq.value() + ch.phase.value() * 2.0 * math.PI + global_offset;
+		}
 
 		v = wave_value(ch.waveform.value(), phase_rad);
 
@@ -225,7 +283,7 @@ update(generator, tl_pos, pos_delta) {
 		v = v * ch.gain.value() + ch.bias.value();
 		v = 0.5 + v / 2.0;
 
-		// Apply envelope and clamp to [0,1]
+		// Apply the envelope and clamp to [0,1]
 		v = v * env;
 		if(v < 0.0)
 			v = 0.0;
@@ -269,21 +327,27 @@ load_state(state) {
 	if(state.has("phase_delay"))
 		global_phase.value(state.phase_delay);
 
-	// Tear down existing channel rows
+	// Tear down the existing rows (load_state does not run inside a widget event)
 	for(i = 0; i < channel_list.size(); i++) {
 		ch_id = channel_list.key(i);
 		std.free(channel_list[ch_id].row);
 	}
 	channel_list.clear();
 	free_times.clear();
+	flush_pending_free();
 	channel_max = 0;
 
 	if(state.has("channels")) {
 		for(i = 0; i < state.channels.size(); i++) {
 			c = state.channels[i];
-			add_new_channel();
-			ch_id = "CH" + (channel_max - 1);
-			rec = channel_list[ch_id];
+			// The saved id ("CH2") gives the wave its old number, so its controls get their old names and links
+			// and MIDI mappings find them again. Before #436 the waves were numbered 1, 2, 3, ... again, so after
+			// removing a wave the waves behind it lost their links on the next load.
+			num = channel_max;
+			if(c.has("id") && std.string(c.id).size() > 2)
+				num = std.int(std.string(c.id).substr(2));
+			add_new_channel(num);
+			rec = channel_list["CH" + num];
 			if(c.has("waveform"))
 				rec.waveform.value(c.waveform);
 			if(c.has("freq"))
@@ -298,6 +362,8 @@ load_state(state) {
 				rec.out.value(c.out);
 		}
 	}
+	if(state.has("channel_max") && state.channel_max > channel_max)
+		channel_max = std.int(state.channel_max);
 
 	if(state.has("envelope") && state.envelope.size() > 0) {
 		e = state.envelope[0];

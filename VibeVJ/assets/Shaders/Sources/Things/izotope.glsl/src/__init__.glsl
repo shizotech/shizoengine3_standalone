@@ -5,7 +5,7 @@
 //@enum options=(No Stripes, Horz Stripes, Vert Stripes)
 uniform int make_stripes;
 
-//@slider
+//@slider value=0.0
 uniform float stripe_offset;
 
 //@float min=0.0 max=100.0 value=25.0

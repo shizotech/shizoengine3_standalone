@@ -82,6 +82,36 @@ twice (e.g. a reboot).
 Receiving: `on_artnet(fn(universe, data))` for every universe, frames (all universes that arrive regularly) are
 detected for any number of universes.
 
+## Network interfaces
+
+By default every interface is used: ArtPoll goes to the directed broadcast address of every IPv4 interface that is up
+(#194), the other broadcasts (ShizoNet beacons, ArtSync, stream broadcasts) to 255.255.255.255, which leaves through the
+interface of the default route. That includes virtual interfaces (docker, VPN, WSL, Hyper-V switches, bridges) and
+networks where Art-Net has no business (the office Wi-Fi). #501 lets a script choose:
+
+```
+for (i : shizonet.interfaces())            // one entry per IPv4 address
+    std.print(i.name, i.ip, i.physical, i.wireless, i.used);
+shizonet.use_interfaces("physical");       // only network cards (wired, Wi-Fi), no virtual interfaces
+shizonet.use_interfaces(["eth1", "Ethernet 2"]);   // these (names without case; Windows: also description or id)
+shizonet.use_interfaces(["physical", "wg0"]);      // the network cards and wg0
+shizonet.use_interfaces("all");            // default
+```
+
+- With a selection every broadcast (ArtPoll, ArtSync, beacons, streams) goes to the directed broadcast addresses of the
+  selected interfaces that are up, 255.255.255.255 is not used. A selection without an interface sends no broadcasts.
+- Packets from the network of an interface that is not selected are dropped (the node does not find or accept devices
+  there). Loopback and routed networks (not on any interface of this machine) are always accepted.
+- Unicast to known devices (found before, or added with `add_artnet_device(ip)`) is not filtered: the system routes it.
+- Process wide, for every node of `shz` (not for the Prolink module, which has its own copy of ShizoNet). The interface
+  list is read again every 2 seconds, so cards and cables that come and go are picked up.
+- `physical`: Linux: the interface has a device (`/sys/class/net/<name>/device`). macOS: `en0`, `en1`, ... Windows:
+  Ethernet or Wi-Fi adapters whose description and MAC address are not those of a virtual switch / VPN / tunnel.
+  `wireless` is not known on macOS.
+- The socket is still bound to all interfaces (`INADDR_ANY`).
+- VibeVJ: *Devices* › *Network* › *Network cards*, kept in `engine/style.json` (`network_interfaces`).
+- Test: `_testing/shizonet_interfaces.shio`.
+
 ## Static buffers
 
 A device describes fixed size buffers in its device info, the other side keeps a copy, only the 256 byte chunks that

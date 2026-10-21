@@ -152,18 +152,20 @@ command for `ai_request`-backed tasks and `ai_task_update` for `ai_task_add`-bac
 ## Events (node pushes, router receives)
 
 Command `ai_event`, sent with `broadcast("ai_event", payload)` by the node whenever
-`Megamind.on_task_finished` or `Megamind.on_notify` fires, and on node state changes.
+`Megamind.on_task_finished`, `Megamind.on_notify` or `Megamind.on_file` fires, and on node state changes.
 The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other device does.
 
 ```
 [
-    kind    = "task_finished" | "notify" | "node_state",
+    kind    = "task_finished" | "notify" | "file" | "node_state",
     time    = <ms on the node>,
     node    = <node name>,
     # task_finished:
     taskid, name, state, report,
     # notify:
     message,
+    # file (send_file of an agent on the node, Megamind.share_file):
+    name, bytes, caption, data = <base64 of the file>,
     # node_state:
     online = bool,
 ]
@@ -175,6 +177,7 @@ The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other dev
 |---|---|---|
 | `task_finished` | `[kind, time, node, taskid, name, state, report]` | node push |
 | `notify` | `[kind, time, node, message]` | node push (`notify_user` on the node) |
+| `file` | `[kind, time, node, name, bytes, caption, data]` | node push (`share_file` on the node, the `send_file` tool); `data` is base64 |
 | `node_state` | `[kind, time, node, online]` | node push + the router's own discovery |
 | `task_state` | `[kind, time, node, taskid, name, state, prev, report, error]` | the router's mirror moved a task |
 | `task_stalled` | `[kind, time, node, taskid, name, state, idle_ms, error]` | the router's stall watchdog |

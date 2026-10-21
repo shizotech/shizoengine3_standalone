@@ -3,9 +3,9 @@
 uniform float tile_size;
 //@slider min=0.0 max=6.28318 value=0.0
 uniform float rotation;
-//@rgb
+//@rgb value=(1.0, 1.0, 1.0)
 uniform vec3 color1;
-//@rgb
+//@rgb value=(0.1, 0.3, 1.0)
 uniform vec3 color2;
 //@int min=1 max=5 value=1
 uniform int pattern_type;

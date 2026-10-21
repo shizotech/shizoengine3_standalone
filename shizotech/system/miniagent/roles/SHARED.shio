@@ -895,6 +895,22 @@ cmd_drain_output(proc)
 	return out;
 }
 
+// The exit code of a process that ended. Not "st.returncode ?? -1": "??" replaces 0 as well,
+// so every successful command came back with exit code -1 ("unknown").
+cmd_exit_code(proc, st, fallback = -1)
+{
+	if(std.is_json(st) && st.has("returncode") && !std.is_none(st.returncode))
+		return st.returncode;
+
+	rc = None;
+	try {
+		rc = proc.returncode();
+	}
+	catch(e) {}
+
+	return std.is_none(rc) ? fallback : rc;
+}
+
 // Collect output for up to wait_ms milliseconds (negative = wait without limit).
 // Stops early as soon as output appears OR the process exits.
 // stop_check is an OPTIONAL predicate (a stopped agent must not sit in a wait).
@@ -921,7 +937,7 @@ cmd_wait_for_output(proc, wait_ms, stop_check = None)
 		{
 			// Process exited: drain whatever is left in the pipes.
 			out += cmd_drain_output(proc);
-			return [output = out, exited = true, exit_code = (st.returncode ?? -1)];
+			return [output = out, exited = true, exit_code = cmd_exit_code(proc, st)];
 		}
 
 		// If we already have output, don't keep waiting for more.
@@ -972,7 +988,7 @@ cmd_wait_for_exit(proc, max_ms, stop_check = None)
 		if(!st.running)
 		{
 			out += cmd_drain_output(proc);
-			return [output = out, exited = true, exit_code = (st.returncode ?? -1)];
+			return [output = out, exited = true, exit_code = cmd_exit_code(proc, st)];
 		}
 
 		if(std.millis() >= deadline)
@@ -1022,23 +1038,26 @@ cmd_script_profile(kind)
 	return [ext = "bat", argv = ["cmd.exe", "/C"]];
 }
 
-// Directory the command scripts are written to. Returns "" when it can not be created.
-cmd_script_dir(cwd)
+// Directory for the scripts that need a file: the system temp directory, never the project
+// (the old ./.shz_cmd folder was left in every working directory). Returns "" when there is none.
+cmd_script_dir()
 {
-	dir = ((cwd && cwd != ".") ? cwd : ".") + "/.shz_cmd";
-
-	if(!fileio.exists(dir))
-		fileio.mkdir(dir);
-
-	if(!fileio.exists(dir))
+	if(subprocess.platform() != "windows")
 		return "";
 
-	return fileio.absolute_path(dir);
+	dir = std.system_path("%TEMP%");
+	if(!dir || dir.contains("%") || !fileio.exists(dir))
+		return "";
+
+	return dir;
 }
 
 // Builds the argv used to launch a command.
-// A single line is handed to the shell as-is. A multi-line command would be collapsed into
-// one shell statement, so it is written to a script file and executed line by line instead.
+// A single line is handed to the shell as-is. A multi-line command would be collapsed into one
+// shell statement, so it goes to its interpreter as a whole: sh and python get the script text as
+// one argument (sh -c, python -c), no file is written. cmd.exe and PowerShell only run a multi-line
+// script (labels, goto, functions) from a file: it is written to the system temp directory and
+// removed with the session.
 // Returns [argv: list, shell: bool, script: string, label: string].
 cmd_prepare_command(session_id, command, cwd, kind)
 {
@@ -1052,16 +1071,20 @@ cmd_prepare_command(session_id, command, cwd, kind)
 	if(!kind || kind == "auto")
 		kind = (subprocess.platform() == "windows") ? "bat" : "sh";
 
+	if(kind == "sh")
+		return [argv = ["sh", "-c", command], shell = false, script = "", label = "sh script (" + std.string(command.count("\n") + 1) + " lines)"];
+
+	if(kind == "py")
+		return [argv = ["python", "-c", command], shell = false, script = "", label = "py script (" + std.string(command.count("\n") + 1) + " lines)"];
+
 	profile = cmd_script_profile(kind);
 
-	dir = cmd_script_dir(cwd);
+	dir = cmd_script_dir();
 	if(!dir)
 		return [argv = [command], shell = true, script = "", label = command];
 
-	script = dir + "/shz_cmd_" + std.string(session_id) + "." + profile.ext;
-
-	if(subprocess.platform() == "windows")
-		script = script.replace("/", "\\");
+	script = dir + "/shz_cmd_" + std.string(std.random_hash(8)) + "_" + std.string(session_id) + "." + profile.ext;
+	script = script.replace("/", "\\");
 
 	written = fileio.write_text(script, command + "\n");
 
@@ -1095,7 +1118,7 @@ agt_add_command_tools(agt)
 {
 	agt.add_tool(
 		"command_start",
-		"Start a new command session.\n\nStarts a process and waits until either the process exits or the timeout expires.\nIf the process exits, returns its final state, exit code and available console output.\nIf the timeout expires while the process is still running, the process is NOT terminated; instead the current state, output and a session_id are returned so the session can be continued with command_read / command_input.\nA timeout is not an error.\nPass a negative timeout to wait without any limit until the process exits (for commands that are certain to terminate, like build tools); in that case the full output is collected and no session is left behind.\n'command' may contain several lines: multi-line commands are stored in a script file and executed line by line, so batch/shell scripts work exactly as written.",
+		"Start a new command session.\n\nStarts a process and waits until either the process exits or the timeout expires.\nIf the process exits, returns its final state, exit code and available console output.\nIf the timeout expires while the process is still running, the process is NOT terminated; instead the current state, output and a session_id are returned so the session can be continued with command_read / command_input.\nA timeout is not an error.\nPass a negative timeout to wait without any limit until the process exits (for commands that are certain to terminate, like build tools); in that case the full output is collected and no session is left behind.\n'command' may contain several lines: a multi-line command runs as one script (sh / python get it inline, batch / PowerShell from a file in the system temp directory), so scripts work exactly as written.",
 		[
 			command = "&string(): Command line to execute. Multiple lines are allowed.",
 			timeout = "&int(0): Maximum time in milliseconds to wait for the command during this call.",
@@ -1262,7 +1285,7 @@ agt_add_command_tools(agt)
 				res = [
 					output = cmd_drain_output(proc),
 					exited = true,
-					exit_code = (st.returncode ?? proc.returncode() ?? -1),
+					exit_code = cmd_exit_code(proc, st),
 				];
 				fmt = cmd_format_result(res.output);
 				cmd_session_cleanup(store, key);
@@ -1413,7 +1436,7 @@ agt_add_command_tools(agt)
 
 			if(!st.running)
 			{
-				rc = (st.returncode ?? proc.returncode()) ?? "unknown";
+				rc = cmd_exit_code(proc, st, "unknown");
 
 				cmd_session_cleanup(store, key);
 				return [
@@ -1447,7 +1470,7 @@ agt_add_command_tools(agt)
 				if(!st.running)
 				{
 					exited = true;
-					exit_code = st.returncode ?? "unknown";
+					exit_code = cmd_exit_code(proc, st, "unknown");
 					break;
 				}
 				std.sleep(20);
@@ -1465,7 +1488,7 @@ agt_add_command_tools(agt)
 					if(!st.running)
 					{
 						exited = true;
-						exit_code = st.returncode ?? "unknown";
+						exit_code = cmd_exit_code(proc, st, "unknown");
 						break;
 					}
 					std.sleep(20);
@@ -1574,6 +1597,50 @@ agt_add_command_tools(agt)
 				result.note = "No active command sessions.";
 
 			return result;
+		}
+	);
+}
+
+// ── send_file: a document for the owner's chat ───────────────────────────────
+// The node (Megamind) of an agent tree: the agent itself or one of its parents has
+// env.mind (the receptionist and the worker task get it, subagents find it here).
+SHARE_FILE_MAX = 20 * 1024 * 1024;   // Telegram bots can upload 50 MB, the event travels over ShizoNet
+
+agt_find_mind(agt) {
+	a = agt;
+	for(a) {
+		m = a.env.mind ?? None;
+		if(m)
+			return m;
+		a = a._parent;
+	}
+	return None;
+}
+
+agt_add_share_tools(agt) {
+	agt.add_tool(
+		"send_file",
+		"Send a file to the owner's chat (Telegram) as a document, with an optional caption.\nUse it for results that are too long or too rich for a chat message: write a report, a table or a presentation into a file (HTML or Markdown look best) and send that file instead of pasting it into the text.",
+		[
+			path = "&string(): Path of the file to send",
+			caption = "string(): OPTIONAL short caption shown with the document",
+		],
+		[](agt, args)
+		{
+			path = std.string(args.path ?? "");
+
+			if(!path || !fileio.exists(path))
+				return [ok = false, error = "file not found: " + path];
+
+			size = fileio.size(path);
+			if(size > SHARE_FILE_MAX)
+				return [ok = false, error = "the file has " + std.string(size) + " bytes, at most " + std.string(SHARE_FILE_MAX) + " can be sent"];
+
+			mind = agt_find_mind(agt);
+			if(!mind)
+				return [ok = false, error = "this agent does not run on a node, there is no chat to send the file to"];
+
+			return mind.share_file(path, std.string(args.caption ?? ""));
 		}
 	);
 }

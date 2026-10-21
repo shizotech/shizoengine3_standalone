@@ -1,0 +1,240 @@
+using eigen;
+
+#include "engine/generators/extensions/glsl/shadertoy"
+
+//The preview of a shader in the Assets tab (#536): rest the mouse on a .glsl asset and a small window beside the sidebar
+//shows it running, with the values its uniforms start with (//@slider ... value=, //@rgb value=, ...).
+//- The source is made ready like engine/generators/extensions/glsl/shader_loader.shio does it: #include resolved, a
+//  Shadertoy shader (mainImage) gets the same header and main. iTime / u_time, iTimeDelta, iFrame and iResolution are set
+//  every frame.
+//- A shader that needs a picture (an effect: in Shaders/Effects or with a sampler2D input) has nothing to work on here:
+//  the window says so.
+//- One shader widget for every preview; it goes when the mouse leaves the list.
+
+PREVIEW_WIDTH = 320;
+PREVIEW_HEIGHT = 180;
+PREVIEW_DELAY = 450;   //ms the mouse rests on a shader before the preview opens
+PREVIEW_COLOR_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+
+//#include "file" of a shader, relative to the file (like shader_loader.shio), depth limited
+preview_resolve_includes(dir, file, depth = 0) {
+	src = fileio.read_string(dir + "/" + file);
+	if(depth > 8 || src.find("#include") < 0)
+		return src;
+	out = "";
+	for(line : src.split("\n")) {
+		if(line.strip().starts("#include")) {
+			inc = line.strip().removeprefix("#include").strip().extract_quotes();
+			path = dir + "/" + inc;
+			if(fileio.exists(path))
+				out += preview_resolve_includes(fileio.file_dir(path), fileio.file_name(path), depth + 1).strip() + "\n";
+			continue;
+		}
+		out += line + "\n";
+	}
+	return out;
+}
+
+//"1.0" or "(0.5, 0.5)" after value= of a //@ line, as a list of numbers ([] when there is none)
+preview_values(line) {
+	at = line.find("value=");
+	if(at < 0)
+		return [];
+	rest = line.substr(at + 6).strip();
+	text = rest;
+	if(rest.starts("(")) {
+		close = rest.find(")");
+		text = close > 0 ? rest.substr(1, close - 1) : rest.substr(1);
+	}
+	else {
+		space = rest.find(" ");
+		if(space > 0)
+			text = rest.substr(0, space);
+	}
+	nums = [];
+	for(part : text.split(",")) {
+		p = part.strip();
+		if(p != "")
+			nums.push_back(std.float(p));
+	}
+	return nums;
+}
+
+class shader_preview
+{
+	managed window = None;
+	managed shader = None;
+	managed caption = None;
+	managed note = None;
+	engine = None;
+	sidebar = None;          //the window of the sidebar: the preview opens right beside it
+	hovered = "";            //the .glsl asset under the mouse
+	hover_since = 0;
+	hover_y = 0;             //screen y of the mouse
+	shown = "";              //the asset the preview shows
+	start = 0;
+	frame = 0;
+	last_time = 0.0;
+
+	__init__(engine, sidebar) {
+		this.engine = engine;
+		this.sidebar = sidebar;
+		window = engine.screen.window("");
+		window.header_enabled(false).movable(false).resizable(false).overlay(true).visible(false)
+			.fixed_size(vec2f(PREVIEW_WIDTH + 16, PREVIEW_HEIGHT + 44));
+		shader = window.shader();
+		shader.anchor_left(8).anchor_top(8).fixed_width(PREVIEW_WIDTH).fixed_height(PREVIEW_HEIGHT);
+		shader.render_size(vec2i(PREVIEW_WIDTH, PREVIEW_HEIGHT));
+		shader.before_render([this](){
+			this.update_uniforms();
+		});
+		caption = window.label("").font_size(13).anchor_left(10).anchor_right(10).anchor_top(PREVIEW_HEIGHT + 14).fixed_height(18);
+		note = window.label("").font_size(12).text_color(PREVIEW_COLOR_TEXT_2).wrap(true)
+			.anchor_left(18).anchor_right(18).anchor_top(60).fixed_height(60).visible(false);
+	}
+
+	//The mouse is over the list at a row with path ("" for none). screen_y: where the mouse is on the screen
+	hover(path, screen_y) {
+		asset = glsl_asset(path);
+		hover_y = screen_y;
+		if(asset == hovered)
+			return;
+		hovered = asset;
+		hover_since = std.millis();
+		if(asset == "")
+			hide();
+	}
+
+	//Called often (the draw of the Assets tab): opens the preview once the mouse rested long enough
+	tick() {
+		if(hovered == "" || hovered == shown)
+			return;
+		if(std.millis() - hover_since < PREVIEW_DELAY)
+			return;
+		show(hovered);
+	}
+
+	//The X.glsl folder of a path in the list (the folder itself or a file in it), "" when it is no shader asset
+	glsl_asset(path) {
+		p = std.string(path).replace("\\", "/");
+		at = p.find(".glsl");
+		if(at < 0)
+			return "";
+		end = at + 5;
+		if(end < p.size() && p.substr(end, 1) != "/")
+			return "";
+		dir = p.substr(0, end);
+		return fileio.is_directory(dir) ? dir : "";
+	}
+
+	show(asset) {
+		shown = asset;
+		src_dir = asset + "/src";
+		if(!fileio.exists(src_dir + "/__init__.glsl")) {
+			hide();
+			return;
+		}
+		src = preview_resolve_includes(src_dir, "__init__.glsl");
+		uniform_defaults = defaults(src);
+		//The shaders in Shaders/Effects read their picture from iChannel0 (the sources use it too, for the sound); others
+		//name an input of their own
+		needs_input = ("/" + asset).find("/Shaders/Effects/") >= 0 || src.regex_search(R"(uniform\s+sampler2D\s+(?!iChannel|RenderMaskInput)\w+)") >= 0;
+		if(src.regex_search(R"(void\s+mainImage\s*\()") >= 0) {
+			//The header and main of a Shadertoy shader, as shader_loader.shio adds them (shadertoy.shio)
+			src = shadertoy_header + "\n#line 1\n" + src + "\n" + shadertoy_main;
+		}
+		caption.caption(fileio.pure_name(asset) + (needs_input ? "   (an effect)" : ""));
+		note.caption(needs_input ? "An effect: it changes a picture it gets. Drop it onto a view with a source to see it." : "");
+		note.visible(needs_input);
+		shader.visible(!needs_input);
+		if(!needs_input) {
+			shader.fragment_source(src);
+			for(i = 0; i < uniform_defaults.size(); i++) {
+				u = uniform_defaults[i];
+				try {
+					shader.uniform(u.name, u.value);
+				}
+				catch(e) {}
+			}
+		}
+		start = std.millis();
+		frame = 0;
+		last_time = 0.0;
+		place();
+		window.visible(true);
+	}
+
+	hide() {
+		shown = "";
+		if(window.visible())
+			window.visible(false);
+	}
+
+	place() {
+		left = sidebar.position().x + sidebar.size().x + 8;
+		y = hover_y - (PREVIEW_HEIGHT + 44) / 2;
+		max_y = engine.screen.height() - PREVIEW_HEIGHT - 60;
+		if(y > max_y)
+			y = max_y;
+		if(y < 40)
+			y = 40;
+		window.position(vec2f(left, y));
+	}
+
+	update_uniforms() {
+		if(shown == "")
+			return;
+		t = (std.millis() - start) / 1000.0;
+		size = shader.render_size();
+		try {
+			shader.uniform("iResolution", vec3f(size.x, size.y, size.x / math.max(1, size.y)));
+			shader.uniform("iTime", t);
+			shader.uniform("u_time", t);
+			shader.uniform("iTimeDelta", t - last_time);
+			shader.uniform("iFrame", frame);
+		}
+		catch(e) {}
+		last_time = t;
+		frame++;
+	}
+
+	//The values the uniforms start with: the value= of the //@ line above each uniform
+	defaults(src) {
+		list = [];
+		pending = [];
+		for(raw : src.split("\n")) {
+			line = raw.strip();
+			if(line.starts("//@")) {
+				pending = preview_values(line);
+				continue;
+			}
+			if(!line.starts("uniform")) {
+				if(line != "" && !line.starts("//"))
+					pending = [];
+				continue;
+			}
+			parts = line.compress_whitespace().replace(";", "").split(" ");
+			if(parts.size() < 3 || pending.size() == 0) {
+				pending = [];
+				continue;
+			}
+			type = parts[1];
+			name = parts[2];
+			v = None;
+			if(type == "float" && pending.size() >= 1)
+				v = pending[0];
+			else if(type == "int" && pending.size() >= 1)
+				v = std.int(pending[0]);
+			else if(type == "vec2" && pending.size() >= 2)
+				v = vec2f(pending[0], pending[1]);
+			else if(type == "vec3" && pending.size() >= 3)
+				v = vec3f(pending[0], pending[1], pending[2]);
+			else if(type == "vec4" && pending.size() >= 4)
+				v = vec4f(pending[0], pending[1], pending[2], pending[3]);
+			if(!std.is_none(v))
+				list.push_back([name = name, value = v]);
+			pending = [];
+		}
+		return list;
+	}
+}

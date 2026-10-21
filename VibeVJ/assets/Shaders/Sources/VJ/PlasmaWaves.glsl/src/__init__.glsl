@@ -31,7 +31,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
     wave = wave + bass * 2.0;
 
-    float phase = fract(t * 0.1) + wave * mid;
+    // The waves always show; the mids make them stronger (multiplied by the mids alone, they vanished without sound
+    // and the picture was one flat colour, #436)
+    float phase = fract(t * 0.1) + wave * (0.5 + mid);
     vec3 col = mix(color_a, color_b, 0.5 + 0.5 * sin(6.2831853 * phase));
     col = 0.3 + 0.7 * col;
     fragColor = vec4(col * intensity * (0.7 + 0.6 * bass), 1.0);

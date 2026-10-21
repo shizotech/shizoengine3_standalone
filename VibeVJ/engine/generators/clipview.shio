@@ -32,9 +32,15 @@ class clipview
 	link_shaders_lazy = false;
 	
 	on_change_callback = None; //callback(item, row, col) If item == None that means the cell was removed...
+	//Undo / redo (#350): engine.env.clip_views finds this view by its uid; clip_recording: a user action on clips runs
+	uid = "";
+	listed = false;
+	clip_recording = false;
 	
 	__init__(parent)
 	{		
+		uid = std.random_hash();
+		enlist();
 		cnt_area = parent.widget().anchor(0);
 		
 		cnt = cnt_area.widget().anchor(0).anchor_bottom(25);
@@ -108,8 +114,7 @@ class clipview
 		});
 		
 		grid.on_cell_drop([this, grid](payload, row, col) {	
-			//std.print(payload);
-			
+			//A clip dragged from a cell (Ctrl: a copy)
 			if(payload.has("cell") && payload.has("item"))
 			{	
 				//A layer (the head of a row, column < 0) is not moved into the grid (#428)
@@ -120,46 +125,26 @@ class clipview
 				
 				if(cell && cell.row() == payload.cell.row() && cell.col() == payload.cell.col())
 					return true;
-			
-				state = payload.item.save_state();
-				node_state = payload.item.node.serialize_json(false);
-				path = payload.item.path;
-			
-				//std.print(node_state);
-			
-				if(!grid.screen().modifier_ctrl())
-					payload.item.on_close();
-			
-				//TODO:
-				//When the clip is dragged onto another clip, it is added to that clip
-				//Now this doesnt work yet because both clips are shaderstacks
-				//Would have to save each shader individually from the stack and then add them to the existing clip
-				//And also serialized each shaderstack item...
-			
-				item = None;
-				if(cell)
-					item = cell.attr.item.dispatch("add_generator", path);
-					cell.attr.select_preview(true);
-					return true;
-				else
-					item = this.add_generator(path, row, col);
-				item.load_state(state);
-				item.node.deserialize_json(node_state, true);
+
+				//One step of the undo history (#350): the cell it lands in and, for a move, the one it leaves
+				copy = grid.screen().modifier_ctrl();
+				cells = [[view = this, row = row, col = col]];
+				source = this.clip_view_of(payload.item);
+				if(!copy && source)
+					cells.insert(0, [view = source, row = payload.cell.row(), col = payload.cell.col()]);
+				name = copy ? "Copy clip" : (cell ? "Add to clip" : "Move clip");
+				this.clip_step(name, cells, [this, payload, row, col, copy](){
+					this.drop_clip(payload, row, col, copy);
+				});
 				return true;
 			}
 			
-			
+			//An asset: a new clip, or one more entry of the clip in that cell
 			path = fileio.relative_path_cwd(payload.path);	
 			cell = grid.get_item_at(row, col);
-			if(cell)
-				cell.attr.item.dispatch("add_generator", path);
-				cell.attr.select_preview(true);
-				this.link_shaders();
-				return true;
-				//std.print("Freeing existing cell...");
-				//std.free(cell.attr.item);
-			this.add_generator(path, row, col);
-			this.link_shaders();
+			this.clip_step(cell ? "Add to clip" : "Add clip", [[view = this, row = row, col = col]], [this, path, row, col](){
+				this.drop_asset(path, row, col);
+			});
 			return true;
 		});
 		
@@ -449,6 +434,11 @@ class clipview
 		autoplay_prev = ctrl_cnt.controlbutton("<", "layer_autoplay_prev_"+row).anchor_left(0,"percent").anchor_top(80).anchor_right(0.7,"percent").fixed_height(18).hide_config_menu();
 		autoplay_next = ctrl_cnt.controlbutton(">", "layer_autoplay_next_"+row).anchor_left(0.7,"percent").anchor_top(80).anchor_right(0).fixed_height(18).hide_config_menu();
 		
+		//Autoplay runs the show, it is no edit: no steps of the undo history (#350)
+		autoplay_backward.undoable(false);
+		autoplay_random.undoable(false);
+		autoplay_forward.undoable(false);
+
 		//Transport glyphs as icons; the control names stay the same, MIDI mappings and saved projects use them
 		autoplay_backward.get_button().caption("").icon(nanogui.icon("backward")).tooltip("[[autoplay|Autoplay]] backwards");
 		autoplay_random.get_button().caption("").icon(nanogui.icon("random")).tooltip("[[autoplay|Autoplay]] random");
@@ -1064,6 +1054,14 @@ class clipview
 		
 		cell.attr.item = item;
 		cell.attr.preview_btn = preview_btn;
+
+		//What the user does to the stack of this clip (an entry added or removed) is a step of the undo history (#350).
+		//Not for a layer: its stack is made by the Clipview
+		if(col >= 0) {
+			item.dispatch("on_user_step", [this, cell](name, action){
+				this.clip_step(name, [[view = this, row = cell.row(), col = cell.col()]], action);
+			});
+		}
 		cell.attr.trigger_btn = trigger_btn;
 		cell.attr.hidden_label = hidden_label;
 		
@@ -1302,6 +1300,168 @@ class clipview
 		return item;
 	}
 
+	//A clip dropped on the cell row, col: moved there (copy: copied), or added to the clip in it
+	drop_clip(payload, row, col, copy) {
+		cell = grid.get_item_at(row, col);
+		state = payload.item.save_state();
+		node_state = payload.item.node.serialize_json(false);
+		path = payload.item.path;
+	
+		if(!copy)
+			payload.item.on_close();
+	
+		//TODO:
+		//When the clip is dragged onto another clip, it is added to that clip
+		//Now this doesnt work yet because both clips are shaderstacks
+		//Would have to save each shader individually from the stack and then add them to the existing clip
+		//And also serialized each shaderstack item...
+	
+		if(cell) {
+			cell.attr.item.dispatch("add_generator", path);
+			cell.attr.select_preview(true);
+			return;
+		}
+		item = this.add_generator(path, row, col);
+		if(!item)
+			return;
+		item.load_state(state);
+		item.node.deserialize_json(node_state, true);
+	}
+
+	//An asset dropped on the cell row, col: a new clip, or one more entry of the clip in it
+	drop_asset(path, row, col) {
+		cell = grid.get_item_at(row, col);
+		if(cell) {
+			cell.attr.item.dispatch("add_generator", path);
+			cell.attr.select_preview(true);
+		}
+		else
+			this.add_generator(path, row, col);
+		this.link_shaders();
+	}
+
+	// =========================================================================
+	// Undo / redo of clips (#350)
+	// =========================================================================
+	//A user action on clips is one step: the cells it touches are kept as they were before and as they are after it
+	//(clip_snapshot), the history puts them back (generators.shio, apply_clips -> set_cell). A clip is made again with
+	//its guid, its stack, its settings and its links.
+
+	//Undo finds this view again by its uid (generators.shio): the Clipviews that are alive
+	enlist() {
+		if(listed)
+			return;
+		eng = std.global("engine");
+		if(!eng || !eng.env)
+			return;
+		if(!eng.env.clip_views)
+			eng.env.clip_views = [];
+		eng.env.clip_views.push_back(this);
+		listed = true;
+	}
+
+	delist() {
+		eng = std.global("engine");
+		if(!listed || !eng || !eng.env || !eng.env.clip_views)
+			return;
+		views = eng.env.clip_views;
+		for(i = 0; i < views.size(); i++) {
+			if(views[i].uid == uid) {
+				views.erase(i);
+				break;
+			}
+		}
+		listed = false;
+	}
+
+	__deinit__() {
+		delist();
+	}
+
+	//The Clipview that holds the clip item, None if none does
+	clip_view_of(item) {
+		views = std.global("engine").env.clip_views;
+		if(!views || !item)
+			return None;
+		for(i = 0; i < views.size(); i++) {
+			if(views[i].items.has(item.guid))
+				return views[i];
+		}
+		return None;
+	}
+
+	//The clip in a cell as data, None for an empty cell. key: the clip and its entries, to see whether it changed
+	clip_snapshot(row, col) {
+		cell = grid.get_item_at(row, col);
+		if(!cell || !cell.attr.item)
+			return None;
+		item = cell.attr.item;
+		key = item.guid;
+		entries = item.dispatch("get_items");
+		if(entries) {
+			for(i = 0; i < entries.size(); i++)
+				key += ":" + std.string(entries.key(i));
+		}
+		return [path = item.path, guid = item.guid, state = item.save_state(), node = item.node.serialize_json(true), key = key];
+	}
+
+	clip_key(snapshot) {
+		return std.is_none(snapshot) ? "" : snapshot.key;
+	}
+
+	//Runs a user action on clips as one step of the history. cells: [view, row, col] it may change
+	clip_step(name, cells, action) {
+		env = std.global("engine").env;
+		if(clip_recording || !std.is_function(env.clip_step)) {
+			action();
+			return;
+		}
+		before = [];
+		for(i = 0; i < cells.size(); i++)
+			before.push_back([clip = cells[i].view.clip_snapshot(cells[i].row, cells[i].col)]);
+		clip_recording = true;
+		try {
+			action();
+		}
+		catch(e) {}
+		clip_recording = false;
+
+		changes = [];
+		for(i = 0; i < cells.size(); i++) {
+			c = cells[i];
+			after = c.view.clip_snapshot(c.row, c.col);
+			if(clip_key(before[i].clip) != clip_key(after))
+				changes.push_back([view = c.view.uid, row = c.row, col = c.col, before = before[i].clip, after = after]);
+		}
+		if(changes.size() > 0)
+			env.clip_step(name, changes);
+	}
+
+	//The cell row, col as the data says: the clip in it goes, the one of the data (None: none) is made again
+	set_cell(row, col, clip) {
+		cell = grid.get_item_at(row, col);
+		if(cell && cell.attr.item) {
+			cell.attr.item.on_close();
+			//The clip of the data may have the same guid: the old one has to be gone first
+			for(!grid.screen().garbage_cleared()) {
+				std.sleep(0);
+			}
+		}
+		if(!std.is_none(clip)) {
+			item = add_generator(clip.path, row, col, clip.guid, false);
+			if(!item)
+				std.warn("Undo / redo: the clip " + clip.path + " cannot be made again, it is skipped");
+			else {
+				try {
+					item.load_state(clip.state);
+					item.node.deserialize_json(clip.node, true);
+				}
+				catch(e) {}
+			}
+		}
+		link_shaders();
+	}
+
 	insert_generator(path, row, col) {
 		cell = grid.get_item_at(row, col);
 		item = None;
@@ -1344,6 +1504,7 @@ class clipview
 	//back into the view while they render, so they must be gone before the view is ("class not valid" otherwise)
 	free_items() {
 		load_in_progress = true; //the render callbacks of the layers do nothing from here on
+		delist();
 
 		for(i = 0; i < this.items.size(); i++) {
 			try {

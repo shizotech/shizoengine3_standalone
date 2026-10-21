@@ -1,0 +1,160 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  role_slots_test.shio — the task tools of the adaptive role honour
+//  max_running_agents (shizotech/shizoscript3_source#521)
+//
+//  Usage:  shz tests/role_slots_test.shio     (from system/miniagent, no LLM)
+//
+//  A real ModelConfig with max_running_agents = 2 and the real tools
+//  (file_task_batch, fork, start_task). Every child gets a stub LLM that counts
+//  how many children generate at the same time and marks its task finished.
+//
+//  Found with it:
+//    * "cfg.max_running_agents ?? 0" on a ModelConfig gave 0 (no limit) with shz
+//      before the fix of "class_instance.member ?? x"; agent_slots.shio reads the
+//      value into a variable first, so the limit holds with older shz builds too.
+//    * file_task_batch captured the loop variable by reference: items ran twice
+//      and others never (reported as failed).
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+meter = [now = 0, peak = 0, runs = 0, items = []];
+
+meter_reset() {
+	meter.now = 0;
+	meter.peak = 0;
+	meter.runs = 0;
+	meter.items = [];
+}
+
+// generating = inside task(): counted, held for a moment, then the task is finished
+class meter_api {
+	owner = None;
+	stops = 0;
+	context = [body = [messages = []]];	// fork imports the parent's history into it
+
+	__init__(_owner) { owner = _owner; }
+
+	stop() { stops++; }
+
+	task(prompt) {
+		cs = std.critical_section_named("role_slots_meter");
+		meter.now++;
+		meter.runs++;
+		if(meter.now > meter.peak)
+			meter.peak = meter.now;
+		cs.release();
+
+		std.sleep(60);
+
+		t = owner.env.active_task ?? None;
+		cs = std.critical_section_named("role_slots_meter");
+		meter.now--;
+		if(t)
+			meter.items.push_back(t.assigned_item ?? t.name);
+		cs.release();
+
+		if(t) {
+			t.finished = true;
+			t.finish_reason = "finished";
+			t.report = "ok";
+		}
+		owner.env.signal_report = "ok";
+		return "";
+	}
+
+	set_reasoning_effort(effort) { }
+	set_model(model) { }
+	add_tool(name, description, params, cb) { }
+}
+
+// the tools create their children through subagent(): every child gets the stub
+class metered_agent : miniagent {
+	subagent(system_role, log_actions = true, copy_config = false) {
+		c = super.subagent(system_role, log_actions, copy_config);
+		c.llm_api = meter_api(c);
+		return c;
+	}
+}
+
+call(agt, name, args) {
+	return agt.llm_api.tools.tool_callbacks[name](args);
+}
+
+std.print("role_slots_test\n");
+
+LIMIT = 2;
+cfg = ModelConfig();
+cfg.max_running_agents = LIMIT;
+
+managed root = metered_agent(cfg, "adaptive");
+
+// like a Megamind worker: the root takes its slot from the pool
+root_slot = agent_slot(root, None);
+check("the root takes a slot of a ModelConfig limit", root_slot.held && root_slot.limit == LIMIT && agent_slots_in_use() == 1,
+	"held=" + std.string(root_slot.held) + " limit=" + std.string(root_slot.limit) + " in use=" + std.string(agent_slots_in_use()));
+
+// ── file_task_batch: 6 items, never more than LIMIT generating ──────────────
+dir = "tests/_role_slots_tmp";
+names = [];
+for(i = 0; i < 6; i++) {
+	names.push_back(dir + "/item" + i + ".txt");
+	fileio.write_string(names[-1], "x");
+}
+
+meter_reset();
+r = call(root, "file_task_batch", [target = dir + "/*.txt", goal = "process the item"]);
+
+check("batch: every item ran", meter.runs == 6 && r.total == 6, "runs=" + std.string(meter.runs) + " total=" + std.string(r.total));
+check("batch: every item finished", r.finished == 6 && r.failed == 0, "finished=" + std.string(r.finished) + " failed=" + std.string(r.failed));
+once = true;
+for(i = 0; i < names.size(); i++) {
+	n = 0;
+	for(j = 0; j < meter.items.size(); j++)
+		if(meter.items[j] == names[i])
+			n++;
+	if(n != 1)
+		once = false;
+}
+check("batch: each item ran exactly once", once, std.string(meter.items));
+check("batch: at most max_running_agents generate", meter.peak <= LIMIT, "peak=" + std.string(meter.peak));
+check("batch: items ran in parallel", meter.peak == LIMIT, "peak=" + std.string(meter.peak));
+check("batch: the slots are back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+for(i = 0; i < names.size(); i++)
+	fileio.remove(names[i]);
+fileio.remove(dir);
+
+// ── fork: 4 siblings ──────────────────────────────────────────────────────────
+meter_reset();
+call(root, "fork", [tasks = ["a", "b", "c", "d"], tool_call = [id = "call_1"]]);
+check("fork: every sibling ran", meter.runs == 4, "runs=" + std.string(meter.runs));
+check("fork: at most max_running_agents generate", meter.peak <= LIMIT, "peak=" + std.string(meter.peak));
+check("fork: the slots are back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+// ── start_task: the child runs on the root's lent slot ──────────────────────
+meter_reset();
+r = call(root, "start_task", [name = "t", goal = "g", context = "", contract = "", effort = "low"]);
+check("start_task: the child ran and reported", meter.runs == 1 && r.report == "ok", std.string(r));
+check("start_task: no extra pool slot", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+root_slot.release();
+check("all slots released", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+std.print("\n", passed, " passed, ", failed, " failed");
+if(failed)
+	std.exitprocess(1);

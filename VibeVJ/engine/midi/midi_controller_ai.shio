@@ -1,0 +1,98 @@
+//Issue #343: the virtual MIDI controller for AI agents (Chat and MCP). An agent can read and set its layout, so it can
+//build a controller that fits the project (knobs for the levels, pads for the clips, ...) and map its elements to the
+//controls, without hardware. Needs engine/interfaces/aiinterface.shio and midi_controller.shio included before it.
+//
+//The interface has the live_path "virtual_controller" (MCP: each query is a tool of its own, vibevj_list_generators
+//lists it). The controls of a generator come from its own queries (get_local_controls, get_local_control returns the
+//full_path that map_controller_element takes).
+
+MIDI_CONTROLLER_AI_LIVE_PATH = "virtual_controller";
+
+class midi_controller_ai_target {
+	get_live_path() {
+		return "virtual_controller";
+	}
+	get_relative_path() {
+		return "assets/Devices/VirtualController.menu";
+	}
+}
+
+MIDI_CONTROLLER_AI_LAYOUT_HELP = "A layout: [name = text, elements = [element, ...]]. An element: id (stays when the layout is made again, "
+	+ "so learned controls keep working), type (knob, slider, button, pad, grid, xy, bend, pressure, program, label), x, y, w, h in pixels, label, channel 0..15; "
+	+ "knob / slider: cc, a knob with mode relative is an endless encoder (sends steps, its mapping is relative); xy: cc (x) and cc_y (y); "
+	+ "button / pad: note, or cc to send 127 / 0 on a controller, mode momentary or toggle; "
+	+ "grid: rows, cols (1..16), note_base, note_stride; bend: pitch bend of its channel, spring (back to the middle, default true); "
+	+ "pressure: channel pressure (aftertouch); program: program (0..127), a program change when pressed. "
+	+ "Numbers left out get free ones (CC from 21, notes from 36, programs from 0).";
+
+//holder: has .controller (a midi_controller, looked up when a query runs) and find_control(full_path) -> the control or
+//None (the engine's nanogui context: a second nanogui.context() would replace the screens)
+midi_controller_ai_register(iface, holder) {
+	iface.register("get_controller_layout", [], [holder](args) {
+		c = holder.controller;
+		return [
+			device = c.device ? c.device.device_name() : None,
+			layout = c.get_layout(),
+			help = MIDI_CONTROLLER_AI_LAYOUT_HELP,
+		];
+	}, "Virtual MIDI controller: its device name and its layout (knobs, faders, buttons, pads, the numbers they send). " + MIDI_CONTROLLER_AI_LAYOUT_HELP);
+
+	iface.register("set_controller_layout", [
+		layout = "&any(): The layout, as get_controller_layout returns it",
+	], [holder](args) {
+		if(!std.is_json(args.layout))
+			return [ok = 0, error = "layout is not a JSON object. " + MIDI_CONTROLLER_AI_LAYOUT_HELP];
+		c = holder.controller;
+		errors = c.set_layout(args.layout, true);
+		c.edited();
+		return [ok = 1, elements = c.layout.elements.size(), problems = errors, layout = c.get_layout()];
+	}, "Virtual MIDI controller: replaces its layout. It is checked first: unknown types are left out, free numbers are given, "
+		+ "problems are listed. An element (same id) that gets other numbers takes the controls mapped to it along. Saved with the project. "
+		+ MIDI_CONTROLLER_AI_LAYOUT_HELP);
+
+	iface.register("move_controller_mappings", [
+		device = "&string(): The name of the real MIDI device (as midi devices are listed in Devices > MIDI)",
+		back = "int(0,1): 1 moves the mappings from that device back to the virtual controller",
+	], [holder](args) {
+		c = holder.controller;
+		if(!c.device)
+			return [ok = 0, error = "the controller has no device"];
+		own = c.device.device_name();
+		other = std.string(args.device);
+		if(!other || other == own)
+			return [ok = 0, error = "name a device other than " + own];
+		back = args.has("back") && !std.is_none(args.back) && std.int(args.back) == 1;
+		n = back ? midi_move_mappings(other, own) : midi_move_mappings(own, other);
+		return [ok = 1, moved = n, from = back ? other : own, to = back ? own : other];
+	}, "Virtual MIDI controller: every control mapped to it gets the same message on a real controller (or back), so a show "
+		+ "prepared with the virtual controller plays on the real one without learning again. Give the elements the numbers "
+		+ "of the real controller first (set_controller_layout); mapped controls follow their elements.");
+
+	iface.register("map_controller_element", [
+		element = "&string(): The id of an element of the layout",
+		control = "&string(): The full path of the control (full_path of get_local_control of a generator)",
+		cell = "int(0,255): The pad of a grid (row * cols + col) or the axis of an xy (0 x, 1 y); 0 else",
+	], [holder](args) {
+		c = holder.controller;
+		ctrl = holder.find_control(std.string(args.control));
+		if(!ctrl)
+			return [ok = 0, error = "there is no control with the path '" + args.control + "'"];
+		res = c.map_element(args.element, ctrl, args.has("cell") && !std.is_none(args.cell) ? std.int(args.cell) : 0);
+		if(std.is_string(res))
+			return [ok = 0, error = res];
+		return [ok = 1, mapping = res];
+	}, "Virtual MIDI controller: MIDI learn in one step. The control learns what the element sends and follows it from now on "
+		+ "(also when a real controller with the same name is used). The control keeps its value, the element shows it.");
+
+	iface.register("play_controller_element", [
+		element = "&string(): The id of an element of the layout",
+		value = "&float(0,1): 0..1 (a button: 1 pressed, 0 released)",
+		cell = "int(0,255): The pad of a grid or the axis of an xy; 0 else",
+	], [holder](args) {
+		c = holder.controller;
+		cell = args.has("cell") && !std.is_none(args.cell) ? std.int(args.cell) : 0;
+		if(!c.set_value(args.element, std.float(args.value), cell))
+			return [ok = 0, error = "there is no element '" + args.element + "' that sends something"];
+		return [ok = 1];
+	}, "Virtual MIDI controller: plays an element as if it was moved with the mouse; the controls mapped to it follow.");
+}

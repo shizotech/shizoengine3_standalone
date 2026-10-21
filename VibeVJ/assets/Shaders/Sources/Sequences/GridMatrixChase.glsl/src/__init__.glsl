@@ -12,10 +12,10 @@ uniform int grid_y;
 //@slider min=0.1 max=5.0 value=1.0
 uniform float speed;
 
-//@rgb
+//@rgb value=(0.1, 1.0, 0.4)
 uniform vec3 matrix_color;
 
-//@rgb
+//@rgb value=(0.0, 0.0, 0.0)
 uniform vec3 bg_color;
 
 //@enum options=(Horizontal, Vertical, Diagonal, Corner Sweep, Spiral)

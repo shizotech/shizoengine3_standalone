@@ -6,7 +6,7 @@ uniform float pixel_sort_threshold;
 //@slider min=1 max=100 value=20
 uniform float pixel_sort_distance;
 
-//@slider min=0 max=1 value=0
+//@enum options=(Horizontal, Vertical) value=0
 uniform int pixel_sort_direction;
 
 //@slider min=0.0 max=1.0 value=0.8
@@ -15,7 +15,7 @@ uniform float pixel_sort_intensity;
 //@slider min=0.0 max=1.0 value=0.5
 uniform float pixel_sort_color_hold;
 
-//@slider min=0 max=3 value=0
+//@enum options=(Average, Grayscale, Brightest channel, Darkest channel) value=0
 uniform int pixel_sort_lum_func;
 
 

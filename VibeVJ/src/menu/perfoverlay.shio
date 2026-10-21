@@ -1,0 +1,272 @@
+using eigen;
+
+//The performance overlay (#537): a small panel at the top right that tells what makes the output slow.
+//- FPS, the frame time on average and the slowest frame of the last second
+//- script time, GPU time and video memory of all shaders together
+//- the generators that cost the most: their script time per frame (their callbacks before and after the frame,
+//  measured in __init__.shio with nanogui.micros()), the GPU time of their shaders (GL timer queries of nanogui,
+//  widget.gpu_stats()) and the video memory of their render textures. A generator in a view counts for itself, not
+//  for the view too.
+//- how long the last autosave took
+//A click on a generator brings its area to the front (like a click in the Projects tab).
+//Nothing is measured while the overlay is off. Ctrl+Shift+P, or "Performance overlay" in the command palette. Not
+//saved: it starts off.
+
+PERF_WIDTH = 380;
+PERF_TOP = 46;
+PERF_MARGIN = 12;
+PERF_LINES = 10;
+PERF_LINE_HEIGHT = 18;
+PERF_TOP_GENERATORS = 5;
+PERF_SLOW_US = 4000;   //a generator that takes more per frame is marked
+PERF_COLOR_SURFACE = vec4f(0.078, 0.078, 0.086, 0.92);
+PERF_COLOR_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+PERF_COLOR_WARN = vec4f(0.973, 0.737, 0.259, 1.0);
+
+class perf_overlay
+{
+	managed window = None;
+	engine = None;
+	on = false;
+	labels = [];
+	//Collected in the current second
+	frames = 0;
+	frame_sum = 0;      //microseconds
+	frame_max = 0;
+	last_frame = 0;
+	costs = [];         //uid -> [name=, us=]: script time of the generators
+	second_start = 0;
+	shown_gens = [];    //the generator of each top line, for the click
+
+	__init__(engine) {
+		this.engine = engine;
+		window = engine.screen.window("");
+		window.header_enabled(false).movable(false).resizable(false).overlay(true).visible(false)
+			.fixed_size(vec2f(PERF_WIDTH, PERF_LINES * PERF_LINE_HEIGHT + 24));
+		bg = window.widget_solid().background_color(PERF_COLOR_SURFACE).anchor(0);
+		for(i = 0; i < PERF_LINES; i++) {
+			l = window.label("").font_size(i == 0 ? 14 : 12).anchor_left(12).anchor_right(10)
+				.anchor_top(8 + i * PERF_LINE_HEIGHT).fixed_height(PERF_LINE_HEIGHT);
+			labels.push_back(l);
+		}
+		//The lines of the top generators: a click shows where the generator is
+		for(n = 0; n < PERF_TOP_GENERATORS; n++) {
+			index = n;
+			labels[4 + n].on_mouse_button([this, index](pos, btn, down, mods){
+				if(btn == 0 && !down)
+					this.jump(index);
+				return true;
+			});
+		}
+	}
+
+	//The area the generator of top line index is in comes to the front: the view tab, the Tabviews on the way
+	jump(index) {
+		if(index >= shown_gens.size() || !shown_gens[index])
+			return;
+		gen = shown_gens[index];
+		views = engine.menu ? engine.menu.generators_menu : None;
+		if(!views)
+			return;
+		try {
+			live = gen.get_live_path();
+			ordered = views.ordered_workspaces();
+			for(t = 0; t < ordered.size(); t++) {
+				leaves = [];
+				ordered[t].view.collect_leaves(leaves);
+				for(i = 0; i < leaves.size(); i++) {
+					item = leaves[i].item;
+					if(!item)
+						continue;
+					//The generator fills the area, or it is in the view that does
+					item_live = "";
+					try {
+						item_live = item.get_live_path();
+					}
+					catch(e) {}
+					if(item == gen || (item_live != "" && (live == item_live || live.starts(item_live + "/")))) {
+						views.reveal_area(leaves[i].uid);
+						return;
+					}
+				}
+			}
+		}
+		catch(e) {}
+	}
+
+	toggle() {
+		on = !on;
+		window.visible(on);
+		//The GPU time of the shaders is only measured while the overlay is on
+		nanogui.gpu_timing(on);
+		frames = 0;
+		frame_sum = 0;
+		frame_max = 0;
+		last_frame = 0;
+		costs = [];
+		second_start = nanogui.micros();
+		if(on) {
+			place();
+			labels[0].caption("Measuring…");
+			for(i = 1; i < labels.size(); i++)
+				labels[i].caption("");
+		}
+	}
+
+	//What one generator took this frame (__init__.shio, only while on)
+	add(gen, us) {
+		key = key_of(gen);
+		if(!costs.has(key))
+			costs[key] = [name = name_of(gen), us = 0];
+		costs[key].us = costs[key].us + us;
+	}
+
+	key_of(gen) {
+		return (gen.uid ?? "") != "" ? gen.uid : (gen.guid ?? "");
+	}
+
+	//gen.path, not get_relative_path(): that asks the file system (milliseconds per generator)
+	name_of(gen) {
+		try {
+			return fileio.pure_name(gen.path);
+		}
+		catch(e) {}
+		return "?";
+	}
+
+	//End of every frame (__init__.shio)
+	frame() {
+		if(!on)
+			return;
+		now = nanogui.micros();
+		if(last_frame > 0) {
+			dt = now - last_frame;
+			frames++;
+			frame_sum = frame_sum + dt;
+			if(dt > frame_max)
+				frame_max = dt;
+		}
+		last_frame = now;
+		if(now - second_start >= 1000000) {
+			show(now - second_start);
+			second_start = now;
+			frames = 0;
+			frame_sum = 0;
+			frame_max = 0;
+			costs = [];
+		}
+	}
+
+	//Milliseconds with one decimal ("12.3")
+	fmt(us) {
+		tenths = std.int(us / 100);
+		return std.string(std.int(tenths / 10)) + "." + std.string(tenths % 10);
+	}
+
+	mb(bytes) {
+		return std.string(std.int((bytes + 524288) / 1048576)) + " MB";
+	}
+
+	//What the shaders of every generator cost, a generator in a view only once: [key=, name=, gpu=, bytes=]. The window
+	//of a view holds the windows of the generators in it, so they are taken off the view.
+	shader_costs() {
+		list = [];
+		registry = engine.ai_interfaces;
+		for(i = 0; i < registry.size(); i++) {
+			iface = registry[i];
+			if(!iface || !iface.target)
+				continue;
+			try {
+				gen = iface.target;
+				if(!gen.window || gen.path.replace("\\", "/").contains("engine/assets/"))
+					continue;
+				st = gen.window.gpu_stats();
+				list.push_back([id = key_of(gen), name = name_of(gen), live = gen.get_live_path(), gpu = st.us, bytes = st.bytes, gen = gen]);
+			}
+			catch(e) {}
+		}
+		list.sort_by("live");
+		//The generator each one is in: the last one before it in the sorted list whose path its own starts with
+		parents = [];
+		for(i = 0; i < list.size(); i++) {
+			for(parents.size() > 0 && !list[i].live.starts(list[parents[parents.size() - 1]].live + "/"))
+				parents.erase(parents.size() - 1);
+			if(parents.size() > 0) {
+				p = parents[parents.size() - 1];
+				list[p].gpu = math.max(0, list[p].gpu - list[i].gpu);
+				list[p].bytes = math.max(0, list[p].bytes - list[i].bytes);
+			}
+			parents.push_back(i);
+		}
+		return list;
+	}
+
+	show(span) {
+		place();
+		fps = frames > 0 ? std.int(frames * 1000000 / span) : 0;
+		avg = frames > 0 ? frame_sum / frames : 0;
+		target = 0;
+		try {
+			target = nanogui.current_context().fps();
+		}
+		catch(e) {}
+		labels[0].caption(std.string(fps) + " FPS" + (target > 0 ? "   (target " + std.string(std.int(target)) + ")" : ""));
+		labels[0].text_color(target > 0 && fps < target * 0.9 ? PERF_COLOR_WARN : vec4f(1.0, 1.0, 1.0, 1.0));
+		labels[1].caption("Frame " + fmt(avg) + " ms, slowest " + fmt(frame_max) + " ms").text_color(PERF_COLOR_TEXT_2);
+
+		//One row per generator: script time per frame of this second, GPU time and video memory of its shaders
+		rows = [];
+		script_total = 0;
+		for(i = 0; i < costs.size(); i++) {
+			per_frame = frames > 0 ? costs[i].us / frames : 0;
+			script_total = script_total + per_frame;
+			rows[costs.key(i)] = [name = costs[i].name, script = per_frame, gpu = 0, bytes = 0, gen = None];
+		}
+		for(c : shader_costs()) {
+			if(!rows.has(c.id))
+				rows[c.id] = [name = c.name, script = 0, gpu = 0, bytes = 0, gen = None];
+			rows[c.id].gpu = c.gpu;
+			rows[c.id].bytes = c.bytes;
+			rows[c.id].gen = c.gen;
+		}
+
+		//All shaders of the screen, also those of no generator (outputs, previews)
+		all = engine.screen.gpu_stats();
+		labels[2].caption("Script " + fmt(script_total) + " ms   GPU " + fmt(all.us) + " ms   VRAM " + mb(all.bytes)
+			+ " (" + std.string(all.shaders) + " shaders)").text_color(PERF_COLOR_TEXT_2);
+		labels[3].caption("The most per frame:   script | GPU,   VRAM").text_color(PERF_COLOR_TEXT_2);
+
+		order = [];
+		for(i = 0; i < rows.size(); i++)
+			order.push_back([name = rows[i].name, script = rows[i].script, gpu = rows[i].gpu, bytes = rows[i].bytes,
+				cost = rows[i].script + rows[i].gpu, gen = rows[i].gen]);
+		shown_gens = [];
+		for(n = 0; n < PERF_TOP_GENERATORS; n++) {
+			best = -1;
+			for(i = 0; i < order.size(); i++) {
+				if(order[i].cost >= 0 && (best < 0 || order[i].cost > order[best].cost || (order[i].cost == order[best].cost && order[i].bytes > order[best].bytes)))
+					best = i;
+			}
+			line = labels[4 + n];
+			if(best < 0 || (order[best].cost == 0 && order[best].bytes == 0)) {
+				line.caption(n == 0 ? "  (no generator costs anything measurable)" : "");
+				shown_gens.push_back(None);
+				continue;
+			}
+			r = order[best];
+			shown_gens.push_back(r.gen);
+			line.caption("  " + fmt(r.script) + " | " + fmt(r.gpu) + " ms,  " + mb(r.bytes) + "   " + r.name)
+				.text_color(r.cost > PERF_SLOW_US ? PERF_COLOR_WARN : vec4f(1.0, 1.0, 1.0, 1.0));
+			order[best].cost = -1;
+		}
+		auto_ms = engine.env.last_autosave_ms;
+		labels[9].caption(std.is_none(auto_ms) ? "Last autosave: none yet" : "Last autosave: " + std.string(auto_ms) + " ms (stops the output)")
+			.text_color(PERF_COLOR_TEXT_2);
+	}
+
+	place() {
+		scr = engine.screen;
+		x = scr.width() - PERF_WIDTH - PERF_MARGIN;
+		window.position(vec2f(x > 0 ? x : 0, PERF_TOP));
+	}
+}

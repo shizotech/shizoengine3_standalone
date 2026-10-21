@@ -7,9 +7,9 @@
 //@settings dtype=float32 format=rgba
 //@slider min=0.0 max=1.0 value=0.5
 uniform float speed;
-//@rgb
+//@rgb value=(1.0, 0.3, 0.1)
 uniform vec3 color1;
-//@rgb
+//@rgb value=(0.1, 0.3, 1.0)
 uniform vec3 color2;
 
 uniform sampler2D input;

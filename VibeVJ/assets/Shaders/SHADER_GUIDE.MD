@@ -37,7 +37,13 @@ MyShader.glsl/
    - use `texture()`, never `texture2D()` / `textureCube()` / `gl_FragColor` (removed from the core profile);
    - never name anything `in`, `out` or another keyword, and do not redefine built-ins such as `noise2()`;
    - no implicit conversions: `vec3(p)` with a `vec2 p` does not compile (`vec3(p, 0.0)`, `p.xyx`), and assigning a `vec2` to a `float` is an error;
-   - no `\` line continuations.
+   - no `\` line continuations;
+   - the annotation must fit the uniform type: `//@slider` / `//@float` on `float`, `//@int` / `//@enum` on `int`,
+     `//@button` on `bool`. The engine sets a uniform with the type of the control, so a `//@slider` on an `int` is a
+     control that does nothing (the shader keeps 0). Use `//@int` for counts and `//@enum` for modes.
+   - `//@enum ... value=2` is the index of the option (0 = the first).
+   - give every `//@slider`, `//@float`, `//@int`, `//@rgb` and `//@rgba` a `value=`: without it the control starts at 0,
+     a colour black, and the shader looks broken until someone moves it.
 
    Check: `python3 compile_scripts/check_glsl.py` (needs `glslangValidator`, it also runs in CI).
 

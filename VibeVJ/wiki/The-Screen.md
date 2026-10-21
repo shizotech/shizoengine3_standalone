@@ -17,7 +17,8 @@ the timeline area. You design most of the screen yourself, by splitting it into 
 
 ## The program window
 
-VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it brings its own:
+VibeVJ runs without the frame of the system on Windows and Linux, so it brings its own. On a Mac it uses the window of
+macOS instead (see [On a Mac](#on-a-mac) below):
 
 - **The buttons** sit at the top right, on the top bar. From left to right the window gets bigger: *Minimize*,
   *Maximize*, *Full screen*, and *Close* in the corner.
@@ -29,8 +30,6 @@ VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it bring
     by dragging a tab bar away from the top.
   - On Linux the window manager does the full screen, so its own keys or menu for it work too, and the buttons follow.
   - On a Wayland desktop VibeVJ runs through XWayland, and the full screen works the same way.
-  - On a Mac it is the full screen of macOS: VibeVJ moves into a Space of its own, the menu bar and the Dock hide,
-    Cmd + Tab and the swipe between Spaces keep working. **Ctrl + Cmd + F** switches it too.
 - **Close** (✕) works like *Exit* in the [Projects tab](#projects-tab): a project with a name is saved and VibeVJ quits, an unnamed project
   first asks "Save the new project before quitting?". In show mode it does nothing, so a stray click does not end the
   show.
@@ -38,21 +37,42 @@ VibeVJ runs without the frame of the system (Windows, Linux, macOS), so it bring
   **+** and the buttons do not move the window.
 - **Resize:** drag the outer edge or a corner of the window (a band of 5 px; the cursor changes there). Not while it is
   maximized or in the full screen.
+- **Size and place are kept:** VibeVJ starts the way you left it: maximized, in the full screen, or as a window at its
+  place and size. When that monitor is not connected any more, it opens on the main one. The window does not get
+  smaller than 960 × 600 (less on a smaller screen); the views and the timeline follow every change of its size.
+
+### On a Mac
+
+- **The traffic lights** (close, minimize, zoom) sit at the top left, as in every Mac program. With the sidebar shown
+  they are in a band at its top; with the sidebar hidden the buttons of the top bar move right to make room for them.
+  The green one zooms the window or, held or with **Ctrl + Cmd + F**, takes it into the full screen of macOS: a Space
+  of its own, the menu bar and the Dock hide, Cmd + Tab and the swipe between Spaces keep working.
+- **VibeVJ starts zoomed**: the window fills the screen below the menu bar, next to the Dock.
+- **Move** by dragging the free part of the top bar or the band of the sidebar. The window snaps to the edges of the
+  screen like every Mac window. A **double click** there does what *System Settings › Desktop & Dock › Double-click a
+  window's title bar* says (zoom or minimize). **Resize** at any edge or corner.
+- **Closing** the window or **Cmd + Q** works like *Exit*: a named project is saved, an unnamed one asks first.
+- **The menu bar** at the top of the screen has *File*, *Edit*, *View*, *Show*, *Window* and *Help*. Its items do what
+  their keys do; *VibeVJ › Settings…* (**Cmd + ,**) opens the settings, *Help › VibeVJ Help* (**Cmd + ?**) this wiki.
+- **The trackpad:** two fingers move a Patchview, the timeline (sideways) and the mapping editors; pinch to zoom.
+  With **Cmd** held, two fingers zoom like the mouse wheel. A mouse wheel zooms as on Windows and Linux.
 
 ## Top bar
 
 ![The left end of the top bar: sidebar button, settings, help, undo and redo, then the view tabs and +](media/top-bar.png)
 
 ```
-[sidebar] [⚙] [?] | [undo] [redo] | [back] | [Views] [View 2] [+]  … free space …  project name [window buttons]
+[sidebar] [⚙] [?] [🔔] | [undo] [redo] | [back] | [Views] [View 2] [+]  … free space …  project name [window buttons]
 ```
 
 - **Sidebar button:** at the left edge. It shows or hides the sidebar; its chevron points where the sidebar goes.
 - **⚙ (Settings):** opens the *Settings* window. See [Settings](Settings.md).
 - **? (Help):** opens this wiki in a window of the program, where you left it; a second click closes it. F1 opens it
   at the part that explains what the mouse is on. See [The Help window](#the-help-window).
-- **Undo, redo:** take back the last change of the layout, or do it again (Ctrl + Z, Ctrl + Y). Their tooltips name
-  the step. See [Undo and redo](#undo-and-redo).
+- **Bell (Log):** opens the log of errors and warnings; its badge counts the errors since you looked last. See
+  [The log](Troubleshooting.md#the-log).
+- **Undo, redo:** take back the last change of the layout, a link or a value, or do it again (Ctrl + Z, Ctrl + Y).
+  Their tooltips name the step. See [Undo and redo](#undo-and-redo).
 - **View tabs:** each tab is its own work area. **+** adds an empty one. Double-click a tab to rename it, drag it to move
   it along the bar, click its × to delete it (a tab with views in it asks first). The last view tab stays. The tabs and
   their names are saved with the project. A view that you close in an area gets a tab of its own here.
@@ -112,7 +132,7 @@ The sidebar has five tabs. The settings are not here: they have a window of thei
 |---|---|
 | *Projects* | New, open and save, an overview of the project you have open, and all your projects and templates. See [Projects tab](#projects-tab). |
 | *Assets* | All assets in the `assets` folder: generators, shaders, views, textures, fixtures. What comes with VibeVJ is on [Assets](Assets.md). |
-| *Devices* | *MIDI*, *Network* (*Artnet*, *Shizonet*) and *Fixtures*. See [MIDI](MIDI.md) and [Output and devices](Output-and-Devices.md). |
+| *Devices* | *MIDI*, *Network* (*Art-Net*, *ShizoNet*) and *Fixtures*. See [MIDI](MIDI.md) and [Output and devices](Output-and-Devices.md). |
 | *Chat* | An AI chat that can look at and change your generators. |
 | *MCP* | A server for outside AI tools (for example Claude), next to the chat. |
 
@@ -299,8 +319,8 @@ and a project saved with view windows opens their views in their tabs.
   Right-clicking the tab offers the same.
 - **Back:** close the window with the × of its frame, or *Back into the tab*. The views come back into their tab.
 - **Inside the window** everything works as in a view tab: split, move, maximize and close areas, pick views, and the
-  same keys (Ctrl + E, Ctrl + D, Ctrl + W, Ctrl + Space, F6, Ctrl + Z / Ctrl + Y). Undo and redo share one history with
-  the main window.
+  same keys (Ctrl + E, Ctrl + D, Ctrl + W, Ctrl + Space, F6, Ctrl + Z / Ctrl + Y, and Ctrl + S, Space, Shift + Space
+  and T of [Shortcuts](Shortcuts-and-Tips.md#keys)). Undo and redo share one history with the main window.
 - **F11** in the window makes it fill its monitor, without a frame: a projector or an output monitor. F11 again brings
   the frame back, at the place and size from before.
 - **Saved with the project:** which tabs are in windows, where the windows are, how big, and whether they fill their
@@ -313,22 +333,36 @@ and a project saved with view windows opens their views in their tabs.
 
 ### Undo and redo
 
-Ctrl + Z takes back the last change of the layout or of a link, Ctrl + Y (or Ctrl + Shift + Z) does it again. The two buttons in the
-top bar do the same; their tooltips name the step.
+Ctrl + Z takes back the last change of the layout, of a link or of a value, Ctrl + Y (or Ctrl + Shift + Z) does it
+again. The two buttons in the top bar do the same; their tooltips name the step.
 
-- **What it covers:** splitting, moving, swapping, duplicating and closing areas, adding and deleting views, the
-  view tabs (add, rename, delete), also the tabs of a Tabview, and generators you dragged out of a Patchview
-  ([Select and move generators](Generators.md#select-and-move-generators)).
+- **What it covers:** splitting, moving, swapping, duplicating and closing areas, the line between two areas you
+  dragged, adding and deleting views, the view tabs (add, rename, delete, dragged to another place in the bar), also the
+  tabs of a Tabview, and generators you dragged out of a Patchview, into an area or into another Patchview, moved or
+  copied ([Select and move generators](Generators.md#select-and-move-generators)). Undo deletes a copy; redo makes it
+  again with the settings it had.
+- **Generators and clips:** a generator you dragged from the sidebar into a Patchview, or deleted with its × (undo
+  makes it again with its settings and its links), and in a [Clipview](Clipview.md#move-copy-delete) a clip you made,
+  moved or copied, an asset you stacked onto a clip and an entry you removed from its stack (the clip goes with its
+  last entry, undo brings it back). Undo and redo keep the guid of what they make again, so the steps after it still
+  find it.
 - **Nothing is reloaded:** the views move back into place as they are, with their state, links and MIDI mappings. Only
   a view that you deleted is loaded again, as it was when you deleted it.
 - **Links** too: a link you made (dragged, dropped or chosen in a link menu), removed (also in the
   [Links view](Linking.md)), its type changed, and a cable you pulled into shape or laid again with a double click. Undo
   brings a removed link back with its type and its cable. Links that generators make by themselves are not steps.
-- **Not yet:** changes of values, and generators inside a Patchview or Clipview. Dragging the line between two areas and
-  the order of the view tabs are not steps either.
+- **Values** too: a slider you dragged (the whole drag, from pressing to letting go, is one step), a switch or a list
+  you clicked, a number or a text you typed and confirmed. Turning the mouse wheel over a field is one step as long as
+  you keep turning. The tooltip names the control: *Undo: Value: Bias*.
+- **Not values:** what a [link](Linking.md), [MIDI](MIDI.md), the timeline or a generator itself sets, anything you do
+  in show mode, and the controls that steer rather than edit: Play, Stop, Follow, the position, the view switch and
+  *Snap windows* of the timeline bar, the autoplay buttons of a Clipview and the position of a video. A button that
+  only triggers something (*Restart*) has no value to take back.
+- **Not yet:** generators moved inside one Patchview, and what a layer of a Clipview holds.
 - Loading a project or *New project* empties the history. Up to 100 steps are kept.
 - In show mode undo and redo are off.
-- A code editor and the mapping editors keep their own Ctrl + Z while they have the focus.
+- A code editor and the mapping editors keep their own Ctrl + Z while they have the focus, and so does a field while
+  you type into it: press Enter first. A slider or a field you only clicked or turned passes Ctrl + Z on.
 
 ### Things to know
 
@@ -372,7 +406,8 @@ snap to the fine dots:
 - **New generators** come in as big as their controls need, never bigger than the part of the canvas you see. When
   you drop one on top of another, it moves to the nearest free spot instead. The same goes for generators the AI adds.
 - **Zoom:** the mouse wheel zooms at the cursor. A step that passes 100 % stops there, so the natural size is easy to
-  find again. One step in and one step out always land where you started.
+  find again. One step in and one step out always land where you started. On a Mac trackpad a pinch zooms and two
+  fingers move the canvas (with Cmd held they zoom).
 - **The zoom chip** in the bottom right corner shows the zoom. Click it for *Show everything*, *Show the selection*,
   *100 %*, *Zoom in* and *Zoom out*.
 - **Keys:** Ctrl + 0 shows everything, Ctrl + 1 goes to 100 %. They work on the Patchview the mouse was over last.

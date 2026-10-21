@@ -172,6 +172,14 @@ trivial actions.
 Pure waiting, for external state. Never busy-poll children: `start_task` already returns when the
 child is done.
 
+### `send_file(path, caption)`
+
+Sends a file to the owner's chat (Telegram) as a document. Chat messages are short; a result that
+is long or benefits from layout — a report, a table, a comparison, a presentation — goes into a
+file (HTML or Markdown look best) that you send with `send_file`, and your `signal()` report says
+in a few lines what is in it. A report that is too long for a message is attached as a file
+automatically, but a document you designed reads much better.
+
 ---
 
 # Batch work: `file_task_batch`

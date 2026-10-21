@@ -138,6 +138,10 @@ The tab *Env* of a slider or number field changes how its value runs.
 
 *Trigger* is a control of its own: link a button or a beat to it, or map it to a pad ([MIDI](MIDI.md)).
 
+The second list, *Source*, is the clock: *Timeline* (the main timeline) or one of the [loops](Timeline.md#loops). On a
+loop, one turn of the loop is what one beat is on the main timeline: *SYNC* runs through the range once per turn,
+*TRIGGER* over one turn. A control whose loop was deleted stands still and shows *Missing source*.
+
 On a slider the fill shows the value that is sent, after envelope and smoothing; the thumb shows where you put it.
 
 ## Link types

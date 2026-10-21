@@ -69,7 +69,8 @@ Every new feature or UI change adds or updates its page here in the same pull re
 ### What the Help window shows
 
 Headings (three levels), paragraphs, lists (one level of nesting), tables, pictures and GIFs, notes (`>`), code
-blocks, links. Bold and italic lose their marks. A `|` inside a table cell is written `\|`.
+blocks, links. Bold and italic show in paragraphs, list items and notes (not in tables and headings, there they lose
+their marks). A `|` inside a table cell is written `\|`.
 
 ### The glossary and the tooltips
 

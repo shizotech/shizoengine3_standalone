@@ -10,6 +10,9 @@ uniform vec3 color1;
 //@rgb value=(0,1,0)
 uniform vec3 color2;
 
+//@rgb value=(0,0,0)
+uniform vec3 background_color;
+
 vec3 hsv2rgb( in vec3 c )
 {
     vec3 rgb = clamp( abs(mod(c.x*6.0+vec3(0.0,4.0,2.0),6.0)-3.0)-1.0, 0.0, 1.0 );
@@ -50,19 +53,18 @@ void mainImage( out vec4 col, in vec2 pos )
     float specular = pow(max(dot(N, Dir(1.4)), 0.), 3.5);
     float specularb = G(0.4*(Nb.zz - border_h))*pow(max(dot(Nb.xy, Dir(1.4)), 0.), 3.);
     
-    float a = pow(smoothstep(fluid_rho*0., fluid_rho*2., rho.z),0.1);
+    // Ink coverage. A trace of fluid stays background: with pow(..., 0.1) from 0 on it was nearly opaque everywhere, which
+    // the old white background hid and a dark one shows as a tint over the whole picture
+    float a = pow(smoothstep(fluid_rho*0.1, fluid_rho*2., rho.z),0.3);
     float b = exp(-1.7*smoothstep(fluid_rho*1., fluid_rho*7.5, rho.z));
     vec3 col0 = color1;
     vec3 col1 = color2;
 	vec3 fcol = mixN(col0, col1, tanh(3.*(rho.w - 0.7))*0.5 + 0.5);
     // Output to screen
-    col = vec4(3.);
+    // The background: tanh() below maps it back to the colour picked (it was a fixed white, vec4(3.), #436)
+    col = vec4(atanh(clamp(background_color, 0.0, 0.995)), 1.0);
     col.xyz = mixN(col.xyz, fcol.xyz*(1.5*b + specular*5.), a);
     col.xyz = mixN(col.xyz, 0.*vec3(0.5,0.5,1.), bord);
     col.xyz = tanh(col.xyz);
-	
-	//Random unconventional hack, treat "white" as "black"
-	//float bri = (col.x + col.y + col.z) / 3.0;
-	//col.a = pow(1.0 - bri, 0.5);
 	col.a = 1.0;
 }

@@ -34,10 +34,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     mat2 rot = mat2(cos(angle_rad), -sin(angle_rad), sin(angle_rad), cos(angle_rad));
     grid_uv = rot * grid_uv;
 
-    // Calculate grid lines
-    vec2 grid = abs(fract(grid_uv / grid_spacing) - 0.5) / grid_spacing;
-    float line = max(grid.x, grid.y);
-    float mask = 1.0 - smoothstep(line_width, line_width + 0.005, line);
+    // Distance to the nearest grid line, in the units of uv. The old test lit only the middle of each cell (where
+    // both axes are far from a line), a dot too small to see, so the picture was black (#436)
+    vec2 spacing = max(grid_spacing, vec2(0.001));
+    vec2 to_line = (0.5 - abs(fract(grid_uv / spacing) - 0.5)) * spacing;
+    float line = min(to_line.x, to_line.y);
+    float aa = 1.5 / iResolution.y;
+    float mask = 1.0 - smoothstep(line_width * 0.5, line_width * 0.5 + aa, line);
 
     vec3 color = mix(bg_color, grid_color, mask);
     fragColor = vec4(color, 1.0);

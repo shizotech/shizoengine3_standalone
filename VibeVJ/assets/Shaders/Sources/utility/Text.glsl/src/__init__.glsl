@@ -72,7 +72,7 @@ uniform float letter_spacing;      // extra gap between glyphs (in glyph-width u
 uniform bool flip_y;               // flip the glyphs vertically (for flipped uv origin)
 
 // ---- Format ----
-//@enum options=(Left, Center, Right)
+//@enum options=(Left, Center, Right) value=1
 uniform int alignment;             // horizontal alignment relative to 'position'
 
 //@enum options=(Solid, Glow, Outline)
@@ -297,8 +297,6 @@ vec2 toGlyphSpace(vec2 uv)
     p.y = (uv.y - position.y - offset.y) / max(text_height, 1e-4);
     if (flip_y)
         p.y = -p.y;
-    // center the glyph vertically (font rows 0..6)
-    p.y += 0.5 * 7.0 / 5.0; // baseline tweak: glyph is 5 units tall after scaling
     return p;
 }
 
@@ -349,6 +347,12 @@ float glyphMaskAt(vec2 p)
     float pitch = glyphPitch();
     int count = activeCharCount();
     vec2 scaled = vec2(p.x * col_unit, p.y * col_unit);
+    // Text height is the height of the 7 rows, centred on the position; row 0 is the top. Outside the rows nothing is
+    // lit (the row was clamped into 0..6 before, so every lit column ran over the whole picture, upside down, #436)
+    float rowf = (0.5 - p.y) * 7.0;
+    if (rowf < 0.0 || rowf >= 7.0)
+        return 0.0;
+    int grow = int(floor(rowf));
 
     for (int g = 0; g < 16; g++) {
         if (g >= count) break;
@@ -358,9 +362,6 @@ float glyphMaskAt(vec2 p)
             continue;
 
         int gcol = int(floor(cell_x));
-        int grow = int(floor(clamp(scaled.y, 0.0, 6.999)));
-        if (grow < 0) grow = 0;
-        if (grow > 6) grow = 6;
 
         if (glyphLit(charCodeAt(g), gcol, grow))
             return 1.0;

@@ -1,6 +1,6 @@
 // ==== Custom Uniform Controls ====
 
-//@slider
+//@slider value=0.5
 uniform float value;
 
 //@int min=0 max=1 value=0

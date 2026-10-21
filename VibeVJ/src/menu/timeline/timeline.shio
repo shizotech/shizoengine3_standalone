@@ -2,6 +2,7 @@
 using eigen;
 
 #include "engine/generators/generatorview"
+#include "loops"
 
 class timeline
 {
@@ -17,9 +18,11 @@ class timeline
 	managed menu = None;
 	managed screen = None;
 	managed timeline_generators = None;
+	managed loops = None; //the Loops view (#273)
 	managed bar_parts = None; //the controls of the bar that give up width on a narrow screen (fit_bar)
 	bar_mode = -1;
-	
+	bar_rest = 0; //the width of the bar without the parts that give up width (buttons, gaps, spacing), measured (fit_bar)
+
 	nudge_factor = 1.0;
 	tap_times = []; //std.millis() of the recent taps on Tap
 	show_press = 0; //std.millis() of the press on the show mode button
@@ -65,13 +68,17 @@ class timeline
 				generators_window.fixed_height(pos.y);
 				generators_window.refresh_layout();
 				
-			this.window.fixed_height(engine.screen.height() - pos.y);
+			//The screen height with its fraction (size(), not height(), which is an int) and rounded: an interface size
+			//like 78.75 % gives a height such as 1079.4, and an int height or the cut off fraction made the timeline
+			//1 px lower than the bottom anchor put it, so it moved down on every layout pass, out of the window
+			this.window.fixed_height(math.round(engine.screen.size().y - pos.y));
 			this.fit_bar();
 		});
 		
 		window.on_move([this](pos, old_pos) {
 			this.place(pos.y);
 		});
+
 		
 		timeline_node = window.matrixnode("timeline").anchor(0);
 		
@@ -148,6 +155,22 @@ class timeline
 			return true;
 		});
 
+		//Blackout (#538): everything that leaves the program to black, back with a fade. Next to show mode at the start
+		//of the bar, so it is never cut off; MIDI-mappable (ID BLACKOUT). Red while on
+		blackout_btn = button_panel.controlbutton("BLACKOUT").caption("Blackout").push(true).fixed_width(44);
+		blackout_btn.get_button().caption("").icon(nanogui.icon("adjust")).tooltip("[[blackout|Blackout]] (Ctrl+B): all outputs to black at once, the lights too. Again: back with a fade.\n[[wiki:Output-and-Devices#blackout]]");
+		blackout_btn.callback([engine](v){
+			if(engine.blackout)
+				engine.blackout.set(v);
+		});
+		if(engine.blackout) {
+			engine.blackout.on_change = [blackout_btn](on){
+				if((blackout_btn.value() ? true : false) != on)
+					blackout_btn.value(on ? 1 : 0);
+				blackout_btn.get_button().danger(on ? "text" : "none");
+			};
+		}
+
 		//A hairline between the view tools (sidebar, collapse, cable view, show mode) and the transport
 		transport_gap = button_panel.widget().fixed_width(13);
 		transport_gap.widget_solid().anchor_left(6).fixed_width(1).anchor_top(2).anchor_bottom(2).background_color(vec4f(1.0, 1.0, 1.0, 0.12));
@@ -157,26 +180,15 @@ class timeline
 		stop_btn = button_panel.controlbutton("STOP").caption("Stop").fixed_width(44);
 		follow_btn = button_panel.controlbutton("FOLLOW").caption("Follow").push(true).fixed_width(44);
 		//Transport as icons with tooltips (Shizo UI); Play and Follow are green while on
-		play_btn.get_button().caption("").icon(nanogui.icon("play")).tooltip("Play or pause the [[timeline]]. [[autoplay|Autoplay]] and everything that is synced run while it plays.");
-		stop_btn.get_button().caption("").icon(nanogui.icon("stop")).tooltip("Stop the [[timeline]] and go back to the start");
+		play_btn.get_button().caption("").icon(nanogui.icon("play")).tooltip("Play or pause the [[timeline]] (Space). [[autoplay|Autoplay]] and everything that is synced run while it plays.");
+		stop_btn.get_button().caption("").icon(nanogui.icon("stop")).tooltip("Stop the [[timeline]] and go back to the start (Shift+Space)");
 		follow_btn.get_button().caption("").icon(nanogui.icon("crosshairs")).tooltip("Follow the playhead: the [[timeline]] pages along while it plays\n[[wiki:Timeline#the-transport-bar]]");
 		bpm_ctrl = button_panel.controlfloat("BPM").tooltip("[[bpm|BPM]]: the tempo. Click to type it.").readout(true).fixed_width(125).value(150);
 		
 		//Tap tempo: the average of the taps, a pause of two seconds starts over
-		tap_btn = button_panel.button("Tap").fixed_width(44).tooltip("Click on each [[beat]] to set the tempo\n[[wiki:Timeline#set-the-tempo]]");
+		tap_btn = button_panel.button("Tap").fixed_width(44).tooltip("Click on each [[beat]] to set the tempo, or press T\n[[wiki:Timeline#set-the-tempo]]");
 		tap_btn.on_click([this](){
-			now = std.millis();
-			n = this.tap_times.size();
-			if(n > 0 && now - this.tap_times[n - 1] > 2000)
-				this.tap_times = [];
-			this.tap_times.push_back(now);
-			n = this.tap_times.size();
-			if(n < 2)
-				return;
-			first = n > 8 ? n - 8 : 0;
-			span = this.tap_times[n - 1] - this.tap_times[first];
-			if(span > 0)
-				this.bpm_ctrl.value(60000.0 * (n - 1 - first) / span);
+			this.tap();
 		});
 		
 		//Start at 0, so an unset value never shows as 1.18e-38
@@ -211,11 +223,15 @@ class timeline
 		timeline_generators.area.visible(false);
 		timeline_generators.grid_size = 16.0; //the grid of a Patchview (CANVAS_GRID), without its dots
 		
-		//Compared as an index (0 timeline, else the generator view)
-		select_mode = button_panel.controlcombo("view_mode_switch").tooltip("What the area of the [[timeline]] shows: the ruler, or an area for the windows of [[generator|generators]].\n[[wiki:Timeline#the-view-switch]]").caption("View").items(["Timeline", "Loops", "Patch"]).segmented(true, false).fixed_width(230);
-		select_mode.callback([timeline_widget, timeline_generators](v) {
+		//The loops (#273): timelines of their own that turn along the main timeline
+		loops = loops_view(timeline_node, this);
+
+		//Compared as an index: 0 timeline, 1 loops, 2 the generator view
+		select_mode = button_panel.controlcombo("view_mode_switch").tooltip("What the area of the [[timeline]] shows: the ruler, the [[loop|loops]], or an area for the windows of [[generator|generators]].\n[[wiki:Timeline#the-view-switch]]").caption("View").items(["Timeline", "Loops", "Patch"]).segmented(true, false).fixed_width(230);
+		select_mode.callback([timeline_widget, timeline_generators, loops](v) {
 			timeline_widget.visible(v == 0);
-			timeline_generators.area.visible(v != 0);
+			loops.area.visible(v == 1);
+			timeline_generators.area.visible(v == 2);
 		});
 		
 		snap_btn = button_panel.controlbutton("SNAP WINDOWS").caption("Snap windows").push(1).value(1);
@@ -224,6 +240,16 @@ class timeline
 		bar_parts = [bpm = bpm_ctrl, beat = beat_ctrl, pos = pos_ctrl, view = select_mode, snap = snap_btn];
 		fit_bar();
 
+		//The transport, the playhead and what the area shows steer, they are no edits: no steps of the undo history
+		//(#350). The tempo is one
+		play_btn.undoable(false);
+		stop_btn.undoable(false);
+		follow_btn.undoable(false);
+		beat_ctrl.undoable(false);
+		pos_ctrl.undoable(false);
+		select_mode.undoable(false);
+		snap_btn.undoable(false);
+
 		engine.save_hooks["timeline_generators"] = [timeline_generators](){		
 			return timeline_generators.save_state();
 		};
@@ -231,25 +257,72 @@ class timeline
 		engine.load_hooks["timeline_generators"] = [timeline_generators](states){					
 			return timeline_generators.load_state(states);
 		};
+
+		engine.save_hooks["loops"] = [loops](){
+			return loops.save_state();
+		};
+
+		engine.load_hooks["loops"] = [loops](states){
+			return loops.load_state(states);
+		};
 	}
 
 
-	//The bar on a narrow screen (#review): about 1160 px of controls do not fit next to the sidebar below 1440 px.
-	//Step 1 makes the value fields and the view switch narrower and leaves Snap windows its icon, step 2 goes
-	//further. Applied only when the step changes, so the layout settles
+	//The program window changed size (dragged, zoomed, the full screen, another interface size; main_menu): the
+	//timeline keeps its height at the bottom and the views, if they reached down to it, take what is left. Before, the
+	//views kept the height of the start and the timeline took the rest
+	window_resized(new_size, old_size) {
+		if(old_size.y <= 0)
+			return;
+		views = menu.generators_menu.window;
+		touching = views.y() + views.height() >= window.y() - 1.0;
+		y = place(new_size.y - (old_size.y - window.y()));
+		if(touching) {
+			views.fixed_height(y - views.y());
+			views.refresh_layout();
+		}
+		fit_bar();
+	}
+
+	//The bar on a narrow screen (#review): about 1220 units of controls do not fit next to the sidebar below 1520.
+	//Step 1 makes the value fields and the view switch narrower and leaves Snap windows its icon, steps 2 to 4 go
+	//further. The widest step that fits whole: what the rest of the bar takes is measured where the last control ends
+	//(fixed limits cut the end of the bar off: at a window 1200 wide with the sidebar, step 2 still needed 25 more).
+	//Applied only when the step changes, so the layout settles
 	fit_bar() {
 		if(!bar_parts)
 			return;
-		w = window.width();
-		mode = w >= 1180 ? 0 : (w >= 960 ? 1 : 2);
-		if(mode == bar_mode)
-			return;
-		bar_mode = mode;
-		widths = [
+		steps = [
 			[bpm = 125, beat = 125, pos = 200, view = 230, snap = 140],
 			[bpm = 104, beat = 112, pos = 140, view = 186, snap = 36],
 			[bpm = 100, beat = 108, pos = 124, view = 162, snap = 36],
-		][mode];
+			//the fields keep their captions down to here (a caption needs 24 next to the value)
+			[bpm = 92, beat = 100, pos = 116, view = 150, snap = 36],
+			//a wider sidebar: the values alone, their captions go into the tooltips
+			[bpm = 84, beat = 88, pos = 100, view = 138, snap = 36],
+		];
+		//Measured once the bar is laid out in a step: the end of its last control minus the parts of that step
+		snap = bar_parts.snap;
+		end = snap.position().x + snap.width();
+		if(bar_mode >= 0 && end > 0) {
+			s = steps[bar_mode];
+			bar_rest = end - (s.bpm + s.beat + s.pos + s.view + s.snap);
+		}
+		//Before the first layout: the rest as it is with the default fonts
+		rest = bar_rest > 0 ? bar_rest : 400;
+		w = window.width() - 4; //a little room at the right end
+		mode = steps.size() - 1;
+		for(i = 0; i < steps.size(); i++) {
+			s = steps[i];
+			if(rest + s.bpm + s.beat + s.pos + s.view + s.snap <= w) {
+				mode = i;
+				break;
+			}
+		}
+		if(mode == bar_mode)
+			return;
+		bar_mode = mode;
+		widths = steps[mode];
 		bar_parts.bpm.fixed_width(widths.bpm);
 		bar_parts.beat.fixed_width(widths.beat);
 		bar_parts.pos.fixed_width(widths.pos);
@@ -262,10 +335,10 @@ class timeline
 	//Puts the top edge of the timeline at y, clamped so 120 px of views stay above and the bar stays visible.
 	//The views follow when they are snapped or would overlap the timeline. Returns the clamped y.
 	place(y) {
-		h = screen.height();
+		h = screen.size().y; //with its fraction, see on_layout
 		y = math.clamp(y, 120.0, h - 35.0);
 		window.y(y);
-		window.fixed_height(h - y);
+		window.fixed_height(math.round(h - y)); //rounded, see on_layout
 		window.refresh_layout();
 		
 		views = menu.generators_menu.window;
@@ -295,6 +368,35 @@ class timeline
 
 	set_bpm(bpm) {
 		bpm_ctrl.value(bpm);
+	}
+
+	// Transport. The buttons and the keys of the program (generators.shio: Space, Shift+Space, T) run these
+
+	//Play or pause, like the Play button
+	toggle_play() {
+		play_btn.value(play_btn.value() ? 0 : 1);
+	}
+
+	//Stop and back to the start, like the Stop button
+	stop() {
+		play_btn.value(0);
+		cursor_pos.value(0);
+	}
+
+	//Tap tempo: the average of the last taps, a pause of two seconds starts over
+	tap() {
+		now = std.millis();
+		n = tap_times.size();
+		if(n > 0 && now - tap_times[n - 1] > 2000)
+			tap_times = [];
+		tap_times.push_back(now);
+		n = tap_times.size();
+		if(n < 2)
+			return;
+		first = n > 8 ? n - 8 : 0;
+		span = tap_times[n - 1] - tap_times[first];
+		if(span > 0)
+			bpm_ctrl.value(60000.0 * (n - 1 - first) / span);
 	}
 	
 	set_show_mode(enabled) {

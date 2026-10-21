@@ -38,7 +38,8 @@ These files open as a generator:
    - onto a **CueList**: it becomes a cue (see [CueList](CueList.md#add-cues)).
 
 To remove a generator, click × in its header. A generator that fills an area has no window header: use *Delete view…*
-in the menu of the area (⋯ in the header of the area, or a right click).
+in the menu of the area (⋯ in the header of the area, or a right click). Ctrl + Z brings a generator back that you removed or
+takes back one you dropped in: see [Undo and redo](The-Screen.md#undo-and-redo).
 
 ## The window header
 
@@ -111,7 +112,8 @@ In a Patchview (and in the *Patch* area of the timeline) you can select generato
 - A generator that moves keeps its controls, links and MIDI mappings. Nothing is reloaded.
 - A copy has the settings of its original, but no links to other generators.
 - Alt is the key of [*Settings* › *Appearance* › *Move areas with*](Settings.md#move-areas-with).
-- Ctrl + Z takes the move back: see [Undo and redo](The-Screen.md#undo-and-redo).
+- Ctrl + Z takes a move or a copy into an area or another Patchview back: see
+  [Undo and redo](The-Screen.md#undo-and-redo). A move inside the same Patchview is not a step.
 - Not yet: dropping generators into a Clipview cell or a CueList.
 - Not in show mode.
 

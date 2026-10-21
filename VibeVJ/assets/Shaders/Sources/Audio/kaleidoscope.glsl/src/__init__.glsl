@@ -19,7 +19,7 @@ uniform float BASS_BASE_HEIGHT;
 uniform float ZOOM_FACTOR;
 
 //@button
-uniform float USE_KALEIDOSCOPE;
+uniform bool USE_KALEIDOSCOPE;
 
 // math const
 const float PI = 3.14159265359;
@@ -59,7 +59,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 	vec2 uv = ( fragCoord.xy * 2.0 - iResolution.xy ) / min( iResolution.x, iResolution.y );
 	
 	// --- Kaleidoscope ---
-	uv = mix( uv, Kaleidoscope( uv, NUM_SIDES, iTime ), USE_KALEIDOSCOPE ); 
+	uv = mix( uv, Kaleidoscope( uv, NUM_SIDES, iTime ), USE_KALEIDOSCOPE ? 1.0 : 0.0 );
 	
 	uv *= ZOOM_FACTOR+(BASS_INTENSITY)* (texture(iChannel1, vec2(.01,0)).r);
 	

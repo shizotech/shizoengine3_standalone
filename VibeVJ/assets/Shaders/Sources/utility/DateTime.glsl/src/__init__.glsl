@@ -44,8 +44,8 @@ uniform float stroke_width;        // segment thickness (relative to glyph heigh
 //@slider min=0.5 max=1.0 value=0.66
 uniform float glyph_width;         // glyph width (relative to glyph height)
 
-//@slider min=0.55 max=1.2 value=0.72
-uniform float glyph_pitch;         // horizontal advance (relative to glyph height)
+//@slider min=0.55 max=1.2 value=0.9
+uniform float glyph_pitch;         // horizontal advance (relative to glyph height); 0.72 was narrower than a glyph with its strokes (0.66 + 0.12): the digits ran into each other (#436)
 
 //@slider min=0.0 max=0.5 value=0.12
 uniform float corner_radius;       // 0 = hard corners, higher = rounded segments
@@ -92,14 +92,14 @@ int segMask(int d)
 {
     if (d == 0) return 119;
     if (d == 1) return 36;
-    if (d == 2) return 109;
-    if (d == 3) return 117;
+    if (d == 2) return 93;   // top, top-right, middle, bottom-left, bottom (it had the mask of 3, #436)
+    if (d == 3) return 109;  // top, top-right, middle, bottom-right, bottom (it drew a J)
     if (d == 4) return 46;
     if (d == 5) return 107;
     if (d == 6) return 123;
     if (d == 7) return 37;
     if (d == 8) return 127;
-    return 47; // 9
+    return 111; // 9: like 8 without bottom-left (it had no bottom bar)
 }
 
 bool segOn(int mask, int bit)
@@ -185,23 +185,25 @@ float lineSDF(vec2 p, int kind, float lh, int hours, int mins, int secs, int day
 
     float cells = 10.0;
     if (kind == 0) cells = 5.0;
-    else if (kind == 1) cells = 7.0;
+    else if (kind == 1) cells = 8.0; // HH:MM:SS is 2 + 1 + 2 + 1 + 2 cells (7 put it off centre, #436)
 
     float xs = -0.5 * cells * pitch;
-    float off = 1e9;
+    // The colons are left out with a branch: with "sepSDF(...) + 1e9 * (1.0 - colon_vis)" an NVIDIA driver never drew
+    // them, probably reordered to (sepSDF + 1e9) - 1e9, where float precision loses the distance (#436)
+    bool colon_on = colon_vis > 0.5;
 
     if (kind == 0) {
         float d = digitsField(p, xs, 2, hours, lh);
-        d = min(d, sepSDF(p, xs + 2.5 * pitch, 1, lh) + off * (1.0 - colon_vis));
+        if (colon_on) d = min(d, sepSDF(p, xs + 2.5 * pitch, 1, lh));
         d = min(d, digitsField(p, xs + 3.0 * pitch, 2, mins, lh));
         return d;
     }
 
     if (kind == 1) {
         float d = digitsField(p, xs, 2, hours, lh);
-        d = min(d, sepSDF(p, xs + 2.5 * pitch, 1, lh) + off * (1.0 - colon_vis));
+        if (colon_on) d = min(d, sepSDF(p, xs + 2.5 * pitch, 1, lh));
         d = min(d, digitsField(p, xs + 3.0 * pitch, 2, mins, lh));
-        d = min(d, sepSDF(p, xs + 5.5 * pitch, 1, lh) + off * (1.0 - colon_vis));
+        if (colon_on) d = min(d, sepSDF(p, xs + 5.5 * pitch, 1, lh));
         d = min(d, digitsField(p, xs + 6.0 * pitch, 2, secs, lh));
         return d;
     }
@@ -262,10 +264,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     int secv  = int(mod(floor(secs), 60.0));
 
     // ---- date (from the engine-provided iDate, with safe fallbacks) ----
-    float month = max(iDate.y, 0.0);
-    if (month < 1.0)
-        month += 1.0;              // handle 0-based months
-    month = clamp(month, 1.0, 12.0);
+    float month = clamp(iDate.y + 1.0, 1.0, 12.0); // iDate.y counts months from 0, like Shadertoy
 
     float day = clamp(max(iDate.z, 1.0), 1.0, 31.0);
 
@@ -297,6 +296,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float lh = text_height;
     if (two_line == 1)
         lh = text_height * 0.45;
+
+    // The widest line fits into the picture: a date has 10 cells and ran off both sides at the default size (#436)
+    float widest = 10.0;
+    if (format_mode == 0) widest = 5.0;
+    else if (format_mode == 1) widest = 8.0;
+    lh = min(lh, 0.94 * aspect / (widest * glyph_pitch));
 
     float mask = 0.0;
 

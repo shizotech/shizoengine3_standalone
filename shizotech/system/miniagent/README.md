@@ -252,6 +252,10 @@ shz telegram_router.shio --bot-token 123456:ABC...
   the message it answers. A text document (`.md` plan, `.txt`, `.json`, code, up to 256 KB) is
   read, kept in `telegram_inbox/` next to the trust file, shown to the router agent and
   attached verbatim to the goal the turn delegates; its caption is the instruction.
+* **Files to the chat.** A report longer than 2500 characters (a notify: 3500) is clipped in
+  the message and attached in full as a `.md` document. The node's agents (worker and
+  receptionist) have `send_file(path, caption)`: the file travels as a `file` event
+  (base64, up to 20 MB) to every router and arrives as a Telegram document.
 * Commands: `/help` `/id` `/nodes` `/tasks [state]` `/status` `/goals [node]`
   `/goal <run|pause|resume|cancel|archive> <id> [node]` `/allow` `/deny` `/forget`.
   `/nodes` shows per node whether it runs a goal system (`goals`), so a schedule request aimed
@@ -364,9 +368,17 @@ shz goals_selftest.shio         time zones / DST, front matter, validation, the 
                                  is notified, the `every: 2d` interval schedules and the
                                  agent goal
                                  tools, stall watchdog, state/overview.md, fake host +
-                                 fake clock -> 161 checks, ALL PASSED
+                                 fake clock -> 162 checks, ALL PASSED
 shz tests/agent_slots_test.shio  max_running_agents: lending, forks, roots, stops
                                  -> 13 checks, ALL PASSED
+shz tests/command_tools_test.shio  command_start with multi-line sh / python scripts:
+                                 state across lines, quotes, here documents, exit codes,
+                                 a running script as a session, no .shz_cmd folder
+                                 -> 11 checks, ALL PASSED
+shz tests/role_slots_test.shio   max_running_agents with a real ModelConfig and the
+                                 adaptive role's file_task_batch / fork / start_task,
+                                 stub LLM: never more than the limit generating, every
+                                 batch item exactly once  -> 13 checks, ALL PASSED
 shz tests/stop_propagation_test.shio  miniagent.stop() across the agent tree, no LLM:
                                   every child and grandchild registered and stopped,
                                   no generation under a stopped ancestor, a child
@@ -379,14 +391,15 @@ shz tests/receptionist_tools_test.shio  the receptionist role's tools against a 
                                   the disabled-node error when the node has no
                                   .agentspace, finish(summary) becomes the report, a
                                   crash / stop / silent turn ends with readable text
-                                  -> 58 checks, ALL PASSED
+                                  + send_file -> 64 checks, ALL PASSED
 shz tests/feedback_chain_test.shio  the whole feedback chain, no LLM: a stub AI node
                                   behind the real ShizoNet service, the real Router
                                   mirror + poller + watchdog, the real TelegramRouter
                                   into a fake bot — the node's report, the failure
                                   reason, the stall, the notify, the refused delegation
-                                  and the goals flag all arrive in the chat
-                                  -> 23 checks, ALL PASSED
+                                  and the goals flag all arrive in the chat, a long
+                                  report / notify in full as an attached .md, a
+                                  node's send_file document -> 34 checks, ALL PASSED
 ```
 
 ShizoNet on one machine: only the process binding UDP **6454** hears every beacon, so a

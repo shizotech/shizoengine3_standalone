@@ -1,7 +1,18 @@
+//Art-Net receiver: rows that follow single channels of all the Art-Net on the network (no node to pick).
+//The control IDs stay ("U", "C", CTRLn of each row, "START UNIVERSE", "START CHANNEL"): saved projects, links and MIDI
+//mappings use them. Only the captions say what they are.
+
+using eigen;
 
 managed vs = None;
 managed start_universe = None;
 managed start_channel = None;
+managed empty_label = None;
+
+ROW = 28;
+GAP = 4;
+UNIVERSE_W = 92;
+CHANNEL_W = 100;
 
 artnet_active = true;
 
@@ -12,25 +23,68 @@ last_universe = 0;
 last_start_index = 1;
 
 last_learn = None;
-last_data = None;
+last_data = std.json(); //the last frame of each universe, for learn
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "active") {
 		if(value && !generator.active_btn.value())
 			return;
-		
+
 		artnet_active = value;
 	}
 }
 
+//A theme colour ({r,g,b,a} 0..1) as vec4f, the token default when the theme does not have it
+theme_color(t, key, fallback) {
+	if(t && t.has(key)) {
+		c = t[key];
+		return vec4f(c.r, c.g, c.b, c.a);
+	}
+	return fallback;
+}
+
+//Two halves of a row with a gap between them
+row_half(row, right) {
+	half = row.widget().anchor_top(0).anchor_bottom(0);
+	if(right)
+		half.anchor_left(0.5, "percent").anchor_right(0);
+	else
+		half.anchor_left(0).anchor_right(0.5, "percent");
+	return half;
+}
+
+//Rows removed since the last frame: freed at the start of update(), where no widget event is running
+pending_free = [];
+flush_pending_free() {
+	if(pending_free.size() == 0)
+		return;
+	for(i = 0; i < pending_free.size(); i++)
+		std.free(pending_free[i]);
+	pending_free.clear();
+}
+
+update(generator, tl_pos, pos_delta) {
+	flush_pending_free();
+}
+
+update_empty() {
+	if(empty_label)
+		empty_label.visible(channel_list.size() == 0);
+}
+
 add_new_ctrl(ctrl_id, type="8bit")
 {
-	new_ctrl_cnt = vs.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
-	
-	universe = new_ctrl_cnt.controlint("U", ctrl_id).min(0).max(15).value(last_universe).anchor(0).clear_anchor_right().fixed_width(60);
-	channel = new_ctrl_cnt.controlint("C", ctrl_id).min(1).max(512).value(last_start_index).anchor_left(50).clear_anchor_right().anchor_top(0).anchor_bottom(0).fixed_width(75);
-	learn = new_ctrl_cnt.pushbutton("L").anchor_left(125).clear_anchor_right().anchor_top(0).anchor_bottom(0).fixed_width(25);
-	
+	row = vs.widget().fixed_height(ROW).anchor_left(0).anchor_right(0);
+
+	universe = row.controlint("U", ctrl_id).caption("Universe").tooltip("The [[art-net|Art-Net]] universe of this row, 0 to 15").min(0).max(15).value(last_universe)
+		.anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(UNIVERSE_W);
+	channel = row.controlint("C", ctrl_id).caption("Channel").tooltip("The channel of this row, 1 to 512").min(1).max(512).value(last_start_index)
+		.anchor_left(UNIVERSE_W + GAP).anchor_top(0).anchor_bottom(0).fixed_width(CHANNEL_W);
+	learn_x = UNIVERSE_W + GAP + CHANNEL_W + GAP;
+	learn = row.pushbutton("").icon(nanogui.icon("crosshairs")).latched_style("cue")
+		.tooltip("Learn: click, then move the fader on your console. Universe and channel are filled in\n[[wiki:Output-and-Devices#art-net]]")
+		.anchor_left(learn_x).anchor_top(0).anchor_bottom(0).fixed_width(ROW);
+
 	learn.on_change([learn, channel, universe](v){
 		if(last_learn)
 			last_learn.learn.pushed(false);
@@ -39,71 +93,91 @@ add_new_ctrl(ctrl_id, type="8bit")
 			last_learn = [learn=learn, channel=channel, universe=universe];
 		learn.pushed(v);
 	});
-	
+
 	universe.hide_config_menu();
 	channel.hide_config_menu();
-	
-	val = new_ctrl_cnt.controlslider(ctrl_id, ctrl_id).anchor_left(150).anchor_right(35);
 
-	del_btn = new_ctrl_cnt.button("").icon(nanogui.icon("times")).anchor_right(0).fixed_width(25);
+	//The value: Art-Net writes it, so a pure output
+	tip = type == "16bit" ? "The two channels from Channel on as one value (0 to 65535), 0 to 1. A [[pure output]]: [[link]] it into what should move"
+		: "The channel (0 to 255), 0 to 1. A [[pure output]]: [[link]] it into what should move";
+	val = row.controlslider(ctrl_id, ctrl_id).caption(ctrl_id.replace("CTRL", "Value ")).as_output(true).tooltip(tip)
+		.anchor_left(learn_x + ROW + GAP).anchor_right(ROW + GAP).anchor_top(0).anchor_bottom(0);
+
+	del_btn = row.button("").icon(nanogui.icon("times")).danger("hover").tooltip("Remove this row")
+		.anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(ROW);
 
 	universe.callback([](v){
 		if(v != last_universe)
 			last_start_index = 1;
 		last_universe = v;
 	});
-	
+
 	channel.callback([type](v){
 		if(type == "8bit")
 			last_start_index = v + 1;
 		else
 			last_start_index = v + 2;
 	});
-	
-	channel_list[ctrl_id] = [cnt = new_ctrl_cnt, value=val, type=type, universe=universe, channel=channel];
-	
-	del_btn.on_click([new_ctrl_cnt, ctrl_id]()
+
+	channel_list[ctrl_id] = [cnt = row, value=val, type=type, universe=universe, channel=channel];
+
+	del_btn.on_click([row, ctrl_id]()
 	{
 		if(channel_list.has(ctrl_id))
 			channel_list.erase(ctrl_id);
-		std.free(new_ctrl_cnt);
+		//Not freed inside the click of its own button: hidden now, freed in the next update()
+		row.visible(false);
+		pending_free.push_back(row);
+		update_empty();
 	});
-	
+
 	if(type == "8bit")
 		last_start_index++;
 	else if(type == "16bit")
 		last_start_index = last_start_index + 2;
-		
+
+	update_empty();
 };
 
 entry(generator, area) {
+	generator.window.fixed_size(vec2f(480, 360));
+
 	engine = std.global("engine");
 	//Pass the module instead of the generator, because of the RELOAD feature, the generator might not be destroyed while reloading...
 	engine.register_artnet_callback(generator.module, [](uni, data) {
-		
-		//learn should always work
+
+		//Learn always works, also with the power button off. The frame is compared with the last one of the same
+		//universe: the first channel that moved is the one of the console's fader.
 		if(last_learn) {
-			if(last_data) {
+			key = std.string(uni);
+			if(last_data.has(key)) {
+				prev = last_data[key];
 				for(i = 0; i < 512; i++) {
-					if(data[i] != last_data[i])
+					if(data[i] != prev[i]) {
 						last_learn.universe.value(uni);
-						last_learn.channel.value(i+1);
+						last_learn.channel.value(i + 1);
 						break;
+					}
 				}
 			}
 
-			last_data = data;
+			//A copy: data is the engine's buffer of this universe, refilled with every packet. Kept as it is, prev
+			//was the same buffer as data, nothing ever differed and learn never fired (#436 review)
+			snap = [];
+			for(i = 0; i < 512; i++)
+				snap.push_back(data[i]);
+			last_data[key] = snap;
 		}
-		
+
 		if(!artnet_active)
 			return;
 		for(i = 0; i < channel_list.size(); i++) {
 			chan = channel_list[i];
 			if(chan.universe.value() + start_universe.value() != uni)
 				continue;
-			
+
 			channel_index = (chan.channel.value() + (start_channel.value()-1)) - 1;
-			
+
 			if(chan.type == "8bit") {
 				if(channel_index >= 0 && channel_index < 512)
 					chan.value.value(data[channel_index] / 255.0);
@@ -116,25 +190,35 @@ entry(generator, area) {
 				}
 			}
 		}
-		//std.print("ARTNET:", uni);	
 	});
-	
-	area.layout(nanogui.layout_vertical());
-	
-	add_btn = area.button("Add channel");
-	add_16b_btn = area.button("Add 16-bit channel");
-	start_universe = area.controlint("START UNIVERSE").caption("Start universe").min(0).max(15);
-	start_channel = area.controlint("START CHANNEL").caption("Start channel").min(1).max(512).value(1);
-	
-	//Hacky
-	vs = area.vscroll().anchor_top(130).anchor_bottom(0);
-	vs.content().layout(nanogui.layout_vertical());
-	
+
+	area.layout(None);
+	t = area.theme().to_json();
+	text_3 = theme_color(t, "disabled_text_color", vec4f(94 / 255.0, 94 / 255.0, 99 / 255.0, 1.0));
+
+	add_row = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(ROW);
+	add_btn = row_half(add_row, false).button("Add channel").icon(nanogui.icon("plus")).anchor_left(0).anchor_right(GAP / 2).anchor_top(0).anchor_bottom(0)
+		.tooltip("A row that follows one channel (0 to 255) of all the [[art-net|Art-Net]] on the network\n[[wiki:Output-and-Devices#art-net]]");
+	add_16b_btn = row_half(add_row, true).button("Add 16-bit channel").icon(nanogui.icon("plus")).anchor_left(GAP / 2).anchor_right(0).anchor_top(0).anchor_bottom(0)
+		.tooltip("A row that follows two channels as one value (0 to 65535)\n[[wiki:Output-and-Devices#art-net]]");
+
+	start_row = area.widget().anchor_left(0).anchor_right(0).anchor_top(ROW + GAP).fixed_height(ROW);
+	start_universe = row_half(start_row, false).controlint("START UNIVERSE").caption("Start universe").tooltip("Added to the universe of every row").min(0).max(15)
+		.anchor_left(0).anchor_right(GAP / 2).anchor_top(0).anchor_bottom(0);
+	start_channel = row_half(start_row, true).controlint("START CHANNEL").caption("Start channel").tooltip("Shifts the channel of every row: 1 keeps them where they are").min(1).max(512).value(1)
+		.anchor_left(GAP / 2).anchor_right(0).anchor_top(0).anchor_bottom(0);
+
+	list = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(2 * (ROW + GAP) + GAP).anchor_bottom(0);
+	list.content().layout(nanogui.layout_vertical().spacing(GAP));
+	vs = list;
+
+	empty_label = vs.label("Add a channel to follow it").text_color(text_3);
+
 	add_btn.on_click([](){
 		add_new_ctrl("CTRL"+channel_max, "8bit");
 		channel_max++;
 	});
-	
+
 	add_16b_btn.on_click([](){
 		add_new_ctrl("CTRL"+channel_max, "16bit");
 		channel_max++;
@@ -158,12 +242,12 @@ save_state() {
 load_state(state) {
 	if(state.has("channel_max"))
 		channel_max = state.channel_max;
-	
+
 	for(i = 0; i < state.channels.size(); i++) {
-		
+
 		chan = state.channels[i];
 		add_new_ctrl(chan.ctrl_id, chan.type);
-		
+
 		new_chan = channel_list[chan.ctrl_id];
 		new_chan.universe.value(chan.universe);
 		new_chan.channel.value(chan.channel);

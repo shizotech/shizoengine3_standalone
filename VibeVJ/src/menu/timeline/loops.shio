@@ -1,0 +1,212 @@
+#include "loop_clock"
+
+//Issue #273: the Loops view of the timeline area. One row per loop:
+//- Start, Stop, Reset, /2, x2 and Length are midicontrols (MIDI learn, links), in a node named after the loop's guid,
+//  so their MIDI mappings and links are saved in controls.json like every control.
+//- Phase is an output (0..1 over one turn) that can be linked to anything that should follow the loop.
+//- The envelope (the graph on the right) is read at the loop's phase; its value goes out of Envelope, also an output.
+//- Every loop is a time source of nanogui: a synced control can follow it instead of the main timeline (Env tab of
+//  its options, Source). nanogui gets the loops by guid (nanogui.sync_sources) and each frame their turns
+//  (nanogui.sync_source, in update()).
+//The loops are saved with the project (engine.save_hooks["loops"]); the load hook runs before the controls are loaded,
+//so the controls of the loops and the controls that follow them find each other.
+
+LOOP_ROW_H = 132;
+LOOP_LEFT_W = 360;
+
+class loops_view
+{
+	managed area = None;  //shown while the view switch of the timeline is on Loops
+	managed list = None;  //the rows
+	loops = [];           //[clock=, row=, graph=, phase_ctrl=, env_ctrl=, length_ctrl=, rate_label=]
+	timeline = None;
+
+	__init__(parent, tl) {
+		timeline = tl;
+		area = parent.widget().anchor(0).visible(false);
+		list = area.vscroll().anchor(0).content().widget().layout(nanogui.layout_vertical()).anchor(0);
+
+		bar = list.widget().anchor_left(0).anchor_right(0).fixed_height(30).layout(nanogui.layout_horizontal());
+		add_btn = bar.button("+ Loop").fixed_width(90).tooltip("A new [[loop]]: a timeline of its own, 4 [[beat|beats]] long, that turns along the main timeline.\n[[wiki:Timeline#loops]]");
+		add_btn.on_click([this](){
+			this.add_loop(None);
+		});
+		bar.label("  Synced controls can follow a loop: options of the control, Env, Source.").font_size(13).text_color(vec4f(1, 1, 1, 0.5));
+	}
+
+	// =========================================================================
+	// Loops
+	// =========================================================================
+
+	//A loop, new (d = None) or from a saved project
+	add_loop(d) {
+		clock = loop_clock();
+		if(d)
+			clock.load(d);
+		if(!clock.guid)
+			clock.guid = std.random_hash();
+		if(!d)
+			clock.name = "Loop " + std.string(loops.size() + 1);
+
+		row = list.widget().anchor_left(0).anchor_right(0).fixed_height(LOOP_ROW_H);
+		node = row.matrixnode("", clock.guid).anchor(0);
+
+		left = node.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(LOOP_LEFT_W).layout(nanogui.layout_vertical());
+
+		head = left.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
+		name_box = head.textbox(clock.name).editable(true).fixed_width(LOOP_LEFT_W - 40).tooltip("The name of the [[loop]], as the Source of synced controls shows it");
+		del_btn = head.button("").icon(nanogui.icon("trash_alt")).fixed_width(30).tooltip("Delete this [[loop]]. Controls that followed it stand still.");
+
+		buttons = left.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
+		start_btn = buttons.controlbutton("START").caption("Start").fixed_width(60);
+		stop_btn = buttons.controlbutton("STOP").caption("Stop").fixed_width(60);
+		reset_btn = buttons.controlbutton("RESET").caption("Reset").fixed_width(64);
+		half_btn = buttons.controlbutton("HALF").caption("/2").fixed_width(40);
+		double_btn = buttons.controlbutton("DOUBLE").caption("x2").fixed_width(40);
+		rate_label = buttons.label("").font_size(13).fixed_width(100);
+		start_btn.get_button().tooltip("Start the [[loop]]: it turns with the main timeline, from where the main timeline is (loops meet on the bars). [[midi learn|MIDI learn]] and links work.");
+		stop_btn.get_button().tooltip("Stop the [[loop]]: it stands still where it is.");
+		reset_btn.get_button().tooltip("Back to the start of the turn, now.");
+		half_btn.get_button().tooltip("Half as fast: one turn takes twice as long.");
+		double_btn.get_button().tooltip("Twice as fast: one turn takes half as long.");
+
+		length_ctrl = left.controlint("LENGTH").caption("Beats").value(std.int(clock.length)).anchor_left(0).anchor_right(0).fixed_height(24)
+			.tooltip("How many [[beat|beats]] one turn of the [[loop]] takes");
+		phase_ctrl = left.controlslider("PHASE").caption("Phase").min(0).max(1).value(clock.phase()).as_output(true).anchor_left(0).anchor_right(0).fixed_height(24)
+			.tooltip("Where the [[loop]] is in its turn, 0 to 1. [[link|Link]] it to anything that should follow the loop.");
+		env_ctrl = left.controlslider("ENVELOPE").caption("Envelope").min(0).max(1).value(0).as_output(true).anchor_left(0).anchor_right(0).fixed_height(24)
+			.tooltip("The envelope on the right at the loop's phase. [[link|Link]] it to the controls it should drive.");
+
+		graph = node.widget().anchor_left(LOOP_LEFT_W + 8).anchor_right(4).anchor_top(4).anchor_bottom(4).graph("Envelope").anchor(0);
+		graph.envelope_mode(true);
+		graph.editable(true);
+		graph.points(d && d.has("envelope") ? d.envelope : [[0.0, 0.0, 0.0], [0.5, 1.0, 0.0], [1.0, 0.0, 0.0]]);
+		graph.tooltip("The envelope of the [[loop]]: drag the points, double click adds one. Read once per turn, its value goes out of Envelope.");
+
+		entry = [clock = clock, row = row, graph = graph, phase_ctrl = phase_ctrl, env_ctrl = env_ctrl, length_ctrl = length_ctrl, rate_label = rate_label];
+		loops.push_back(entry);
+
+		start_btn.callback([this, clock](v){
+			if(v)
+				clock.start(this.main_pos());
+		});
+		stop_btn.callback([clock](v){
+			if(v)
+				clock.stop();
+		});
+		reset_btn.callback([clock](v){
+			if(v)
+				clock.reset();
+		});
+		half_btn.callback([this, clock, entry](v){
+			if(v) {
+				clock.half();
+				this.show_rate(entry);
+			}
+		});
+		double_btn.callback([this, clock, entry](v){
+			if(v) {
+				clock.double();
+				this.show_rate(entry);
+			}
+		});
+		length_ctrl.callback([clock](v){
+			clock.set_length(v);
+		});
+		name_box.on_change([this, clock](text){
+			clock.name = text;
+			this.publish();
+		});
+		guid = clock.guid;
+		del_btn.on_click([this, guid](){
+			this.remove_loop(guid);
+		});
+
+		show_rate(entry);
+		publish();
+		return entry;
+	}
+
+	remove_loop(guid) {
+		for(i = 0; i < loops.size(); i++) {
+			if(loops[i].clock.guid == guid) {
+				row = loops[i].row;
+				loops.erase(i);
+				std.free(row);
+				publish();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	clear() {
+		for(loops.size() > 0) {
+			row = loops[0].row;
+			loops.erase(0);
+			std.free(row);
+		}
+		publish();
+	}
+
+	show_rate(entry) {
+		r = entry.clock.rate;
+		entry.rate_label.caption(r == 1.0 ? "" : (r > 1.0 ? "x" + std.string(std.int(r)) : "/" + std.string(std.int(1.0 / r + 0.5))));
+	}
+
+	main_pos() {
+		return timeline && timeline.cursor_pos ? timeline.cursor_pos.value() : 0.0;
+	}
+
+	//The loops as time sources of nanogui, by guid, with the names the Source list of the controls shows
+	publish() {
+		sources = [];
+		for(i = 0; i < loops.size(); i++)
+			sources.push_back([id = loops[i].clock.guid, name = loops[i].clock.name]);
+		nanogui.sync_sources(sources);
+	}
+
+	// =========================================================================
+	// Every frame, before nanogui.sync_update (__init__.shio)
+	// =========================================================================
+
+	//delta: how far the main timeline moved in this frame, in beats (0 while it stops)
+	update(delta) {
+		for(i = 0; i < loops.size(); i++) {
+			e = loops[i];
+			c = e.clock;
+			c.advance(delta);
+			ph = c.phase();
+			nanogui.sync_source(c.guid, c.turns);
+			if(e.phase_ctrl.value() != ph)
+				e.phase_ctrl.value(ph);
+			env = e.graph.value_at(ph);
+			if(e.env_ctrl.value() != env)
+				e.env_ctrl.value(env);
+			e.graph.cursor(ph);
+		}
+	}
+
+	// =========================================================================
+	// Saved with the project
+	// =========================================================================
+
+	save_state() {
+		out = [];
+		for(i = 0; i < loops.size(); i++) {
+			d = loops[i].clock.save();
+			d.envelope = loops[i].graph.points();
+			out.push_back(d);
+		}
+		return [loops = out];
+	}
+
+	//states: what save_state returned, None for a new project
+	load_state(states) {
+		clear();
+		if(!states || !states.has("loops"))
+			return;
+		for(i = 0; i < states.loops.size(); i++)
+			add_loop(states.loops[i]);
+	}
+}

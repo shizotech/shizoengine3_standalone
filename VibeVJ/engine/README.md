@@ -92,7 +92,7 @@ the layout runs) and `vibevj_list_links` (every link between controls with both 
 `nanogui.cable_place`, the type and the values; optional `filter`). "Pause" rejects every request, "Allow changes"
 off rejects every write.
 
-Tests: `_testing/aiinterface.shio`, `_testing/vibevj_mcp_bridge.shio`, `_testing/patch_ai.shio` (repo root, no GUI needed), and the Linux smoke test
+Tests: `_testing/aiinterface_test.shio`, `_testing/vibevj_mcp_bridge.shio`, `_testing/patch_ai.shio` (repo root, no GUI needed), and the Linux smoke test
 `_testing/linux_app/smoke.py`, which drives the running app and checks it through this server (#385).
 
 ## Components

@@ -1,0 +1,332 @@
+#include "../../../engine/midi/midi_controller"
+#include "../../../engine/midi/midi_controller_ai"
+
+//Issue #343: the virtual MIDI controller of VibeVJ. A MIDI device inside the app ("Shizo Virtual MIDI", in Devices >
+//MIDI like a plugged in controller) and a window with knobs, faders, buttons and pads that play it with the mouse.
+//MIDI learn works against it with no hardware; a real controller is mapped by the same learn later.
+//- The layout is saved with the project (virtual_controller.json); a new project starts with midi_layout_default().
+//- Edit: move and size elements, add, delete, properties (label, channel, CC / note, mode, rows / cols). Not in show
+//  mode: there the controller is played, not changed.
+//- AI agents: the queries of midi_controller_ai.shio (live_path "virtual_controller").
+//- With a real controller: "From hardware" gives the selected element the number of a knob or pad moved on it (the
+//  controls mapped to the element come along), "Move mappings" moves every mapping of the virtual device to the real
+//  one, so a show prepared at home plays on site without learning again.
+
+MIDI_CONTROLLER_DEVICE = "Shizo Virtual MIDI";
+MIDI_CONTROLLER_BAR_H = 30;
+
+class midi_controller_menu
+{
+	engine = None;
+	managed tool = None;
+	managed controller = None;
+	managed ai = None;
+	device = None;
+	edit_btn = None;
+	edit_buttons = []; //enabled only while editing
+	hw_btn = None;
+	port_btn = None;
+	port_changing = false;
+	status = None;     //a line at the bottom: what happened last
+
+	__init__(engine) {
+		this.engine = engine;
+		device = nanogui.virtual_midi_device(MIDI_CONTROLLER_DEVICE);
+
+		tool = toolwindow(engine, "Virtual controller", 1200, 440);
+		w = tool.window;
+
+		bar = w.widget().anchor_left(8).anchor_right(8).anchor_top(6).fixed_height(MIDI_CONTROLLER_BAR_H).layout(nanogui.layout_horizontal());
+		edit_btn = bar.pushbutton("Edit").icon(nanogui.icon("pen")).fixed_width(80)
+			.tooltip("Move an element by dragging it, size it by its lower right corner. Not in show mode.\n[[wiki:MIDI#the-virtual-controller]]");
+		edit_btn.on_change([this](v) {
+			if(v && nanogui.show_mode()) {
+				this.edit_btn.pushed(false);
+				return;
+			}
+			this.controller.editing = v ? true : false;
+			this.controller.selected = "";
+			this.update_buttons();
+		});
+
+		add_btn = bar.button_popup("Add").icon(nanogui.icon("plus")).side("bottom").fixed_width(90)
+			.tooltip("Adds an element below the others, with free MIDI numbers");
+		add_menu = add_btn.popup().content().layout(nanogui.layout_vertical());
+		add_menu.fixed_width(260);
+		add_types = [
+			["Knob", "knob", "control change"],
+			["Endless knob", "knob relative", "control change steps"],
+			["Fader", "slider", "control change"],
+			["Button", "button", "note"],
+			["Pads", "grid", "4 x 8 notes"],
+			["XY", "xy", "two control changes"],
+			["Pitch bend", "bend", "springs back to the middle"],
+			["Pressure", "pressure", "channel aftertouch"],
+			["Program", "program", "program change"],
+			["Label", "label", "text only"]];
+		for(t : add_types) {
+			b = add_menu.button(t[0] + "  ·  " + t[2]).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+			b.on_click([this, t, add_btn]() {
+				add_btn.close();
+				if(!this.can_edit())
+					return;
+				parts = t[1].split(" ");
+				id = this.controller.add_element(parts[0]);
+				if(parts.size() > 1)
+					this.controller.set_element(id, [mode = parts[1]]);
+			});
+		}
+		edit_buttons.push_back(add_btn);
+		props = bar.button("Properties").icon(nanogui.icon("cog")).fixed_width(110).tooltip("Label, MIDI channel and number of the selected element");
+		props.on_click([this]() {
+			this.edit_properties();
+		});
+		edit_buttons.push_back(props);
+		del = bar.button("").icon(nanogui.icon("trash_alt")).fixed_width(34).tooltip("Deletes the selected element. Controls mapped to it keep their mapping.");
+		del.on_click([this]() {
+			if(this.can_edit() && this.controller.selected)
+				this.controller.remove_element(this.controller.selected);
+		});
+		edit_buttons.push_back(del);
+		reset = bar.button("Default").fixed_width(80).tooltip("Back to the standard layout: 8 knobs (CC 21-28), 8 faders (CC 41-48), 4 buttons and 4 x 8 pads (notes from 36)");
+		reset.on_click([this]() {
+			if(!this.can_edit())
+				return;
+			this.controller.set_layout(midi_layout_default(), true);
+			this.controller.edited();
+		});
+		edit_buttons.push_back(reset);
+
+		hw_btn = bar.button("From hardware").icon(nanogui.icon("crosshairs")).fixed_width(150)
+			.tooltip("The selected element takes the number of the next knob, fader or pad you move on a real controller. "
+				+ "Controls mapped to the element come along.\n[[wiki:MIDI#later-with-a-real-controller]]");
+		hw_btn.on_click([this]() {
+			this.learn_from_hardware();
+		});
+		edit_buttons.push_back(hw_btn);
+
+		move_btn = bar.button("Move mappings").icon(nanogui.icon("exchange_alt")).fixed_width(150)
+			.tooltip("Every control mapped to " + MIDI_CONTROLLER_DEVICE + " gets the same message on a real controller, or back. "
+				+ "No learning again on site.\n[[wiki:MIDI#later-with-a-real-controller]]");
+		move_btn.on_click([this]() {
+			this.move_mappings();
+		});
+
+		//Issue #343: other programs see the controller as a MIDI port of the system (Linux, ALSA sequencer). Personal,
+		//like the network cards: kept in the style file, not in the project
+		//os_platform(): "windows ...", "macos", on Linux the name of the distribution
+		platform = std.os_platform().lowercase();
+		linux = !platform.starts("windows") && !platform.starts("mac");
+		port_btn = bar.pushbutton("System port").icon(nanogui.icon("external_link_alt")).fixed_width(140);
+		if(linux)
+			port_btn.tooltip("Other programs (a DAW, another VJ tool) see " + MIDI_CONTROLLER_DEVICE + " as a MIDI port: they get what you play here, "
+				+ "and what they send comes in like from a controller.\n[[wiki:MIDI#other-programs]]");
+		else
+			port_btn.enabled(false).tooltip("Only on Linux for now. On Windows a virtual port needs a driver: loopMIDI makes one, and VibeVJ lists it as a device.\n[[wiki:MIDI#other-programs]]");
+		port_btn.on_change([this](v) {
+			if(!this.port_changing)
+				this.set_os_port(v, true);
+		});
+
+		status = w.label("").font_size(13).text_color(TOOLWINDOW_TEXT_2).anchor_left(12).anchor_right(12).anchor_bottom(2).fixed_height(22);
+		area = w.vscroll().anchor(0).anchor_top(MIDI_CONTROLLER_BAR_H + 12).anchor_bottom(26);
+		controller = midi_controller(area.content(), device);
+		controller.set_layout(midi_layout_default());
+		update_buttons();
+
+		engine.save_hooks["virtual_controller"] = [this]() {
+			return this.controller.get_layout();
+		};
+		engine.load_hooks["virtual_controller"] = [this](state) {
+			this.controller.set_layout(state && std.is_json(state) && state.has("elements") ? state : midi_layout_default());
+		};
+
+		if(linux) {
+			try {
+				style = fileio.read_json(STYLE_FILE);
+				if(style && style.has("virtual_midi_port") && style.virtual_midi_port)
+					set_os_port(true, false);
+			}
+			catch(err) {}
+		}
+
+		ai = AIInterface(midi_controller_ai_target(), w, "assets/Devices/VirtualController.menu");
+		ai.add_capability("midi");
+		midi_controller_ai_register(ai, this);
+	}
+
+	//A control by its full path (for map_controller_element)
+	find_control(path) {
+		return engine.ctx.get_control_by_path(path);
+	}
+
+	can_edit() {
+		return controller.editing && !nanogui.show_mode();
+	}
+
+	update_buttons() {
+		for(b : edit_buttons)
+			b.enabled(controller.editing);
+		if(!controller.editing && controller.is_learning()) {
+			controller.stop_learning();
+			hw_btn.caption("From hardware");
+		}
+	}
+
+	note(text) {
+		status.caption(text);
+	}
+
+	//The port of the system on or off; remember: kept in the style file
+	set_os_port(on, remember) {
+		ok = device.os_port(on);
+		port_changing = true;
+		port_btn.pushed(ok);
+		port_changing = false;
+		if(on && !ok)
+			note("No port of the system: the ALSA sequencer is not there (snd-seq).");
+		else
+			note(ok ? "Other programs see " + MIDI_CONTROLLER_DEVICE + " as a MIDI port now." : "");
+		if(!remember)
+			return;
+		try {
+			style = fileio.read_json(STYLE_FILE);
+			if(!style)
+				style = [];
+			style.virtual_midi_port = on && ok;
+			fileio.write_json(STYLE_FILE, style);
+		}
+		catch(err) {}
+	}
+
+	//The selected element waits for a knob, fader or pad of a real controller
+	learn_from_hardware() {
+		if(!can_edit())
+			return;
+		if(controller.is_learning()) {
+			controller.stop_learning();
+			hw_btn.caption("From hardware");
+			note("");
+			return;
+		}
+		id = controller.selected;
+		e = id ? controller.element(id) : None;
+		if(!e || e.type == "label") {
+			note("Select a knob, fader, button or pads first.");
+			return;
+		}
+		what = e.type == "grid" ? "hit the first pad" : (e.type == "xy" ? "move the knob for x, then the one for y" :
+			(e.type == "knob" || e.type == "slider" ? "move a knob or fader" : "hit a pad or button"));
+		controller.learn_from_hardware(id, [this](id, dev) {
+			this.hw_btn.caption("From hardware");
+			e = this.controller.element(id);
+			this.note(id + " now sends " + this.controller.number_text(e) + " on channel " + std.string(e.channel + 1) + ", like " + dev + ".");
+		});
+		hw_btn.caption("Waiting… (click: stop)");
+		note(id + ": " + what + " on the real controller.");
+	}
+
+	//Every mapping of one device moved to another (virtual -> real controller, or back)
+	move_mappings() {
+		if(nanogui.show_mode())
+			return;
+		to = controller.layout.has("hardware") ? controller.layout.hardware : "";
+		if(!to) {
+			for(i = 0; i < nanogui.midi_device_count(); i++) {
+				name = nanogui.midi_device_name(i);
+				if(name != MIDI_CONTROLLER_DEVICE) {
+					to = name;
+					break;
+				}
+			}
+		}
+		form = [
+			[id = "from", label = "From device", type = "text", default = MIDI_CONTROLLER_DEVICE],
+			[id = "to", label = "To device (the name as in Devices > MIDI)", type = "text", default = to],
+		];
+		tool.window.visible(false);
+		res = None;
+		try {
+			res = engine.screen.modal_form(form, "Move MIDI mappings", "Move", "Cancel");
+		}
+		catch(err) {}
+		tool.window.visible(true);
+		if(!res || res.choice != "submit")
+			return;
+		from = std.string(res.values.from).trim();
+		to = std.string(res.values.to).trim();
+		if(!from || !to || from == to) {
+			note("Two different device names are needed.");
+			return;
+		}
+		n = midi_move_mappings(from, to);
+		note(std.string(n) + (n == 1 ? " control" : " controls") + " moved from " + from + " to " + to + ".");
+	}
+
+	show() {
+		//show mode while it was closed: no editing
+		if(nanogui.show_mode() && controller.editing) {
+			edit_btn.pushed(false);
+			controller.editing = false;
+			update_buttons();
+		}
+		tool.show();
+	}
+
+	//Label, channel, number and the rest of the selected element, in a form
+	edit_properties() {
+		if(!can_edit() || !controller.selected)
+			return;
+		e = controller.element(controller.selected);
+		if(!e)
+			return;
+		form = [[id = "label", label = "Label", type = "text", default = e.label]];
+		if(e.type != "label") {
+			form.push_back([id = "channel", label = "MIDI channel (1-16)", type = "int", default = std.string(e.channel + 1)]);
+			if(midi_layout_sends_cc(e))
+				form.push_back([id = "cc", label = e.type == "xy" ? "CC of x" : "CC (0-127)", type = "int", default = std.string(e.cc)]);
+			if(e.type == "knob")
+				form.push_back([id = "mode", label = "Mode: absolute or relative (an endless encoder: steps)", type = "text", default = e.has("mode") ? e.mode : "absolute"]);
+			if(e.type == "program")
+				form.push_back([id = "program", label = "Program (0-127)", type = "int", default = std.string(e.program)]);
+			if(e.type == "bend")
+				form.push_back([id = "spring", label = "Back to the middle when let go: yes or no", type = "text", default = e.spring ? "yes" : "no"]);
+			if(e.type == "xy")
+				form.push_back([id = "cc_y", label = "CC of y", type = "int", default = std.string(e.cc_y)]);
+			if(e.type == "grid") {
+				form.push_back([id = "note_base", label = "Note of the first pad (0-127)", type = "int", default = std.string(e.note_base)]);
+				form.push_back([id = "rows", label = "Rows (1-16)", type = "int", default = std.string(e.rows)]);
+				form.push_back([id = "cols", label = "Columns (1-16)", type = "int", default = std.string(e.cols)]);
+			}
+			else if(midi_layout_sends_notes(e))
+				form.push_back([id = "note", label = "Note (0-127)", type = "int", default = std.string(e.note)]);
+			if(e.type == "button" || e.type == "pad")
+				form.push_back([id = "mode", label = "Mode: momentary or toggle", type = "text", default = e.mode]);
+		}
+		//the tool window stays above everything, also above the form: hidden while the form is open
+		tool.window.visible(false);
+		res = None;
+		try {
+			res = engine.screen.modal_form(form, "Element " + e.id, "OK", "Cancel");
+		}
+		catch(err) {}
+		tool.window.visible(true);
+		if(!res)
+			return;
+		if(res.choice != "submit")
+			return;
+		fields = res.values.copy();
+		remove = [];
+		if(fields.has("channel"))
+			fields.channel = fields.channel - 1;
+		if(fields.has("spring"))
+			fields.spring = std.string(fields.spring).trim().lowercase() != "no";
+		if(e.type == "knob" && fields.has("mode") && std.string(fields.mode).trim().lowercase() != "relative") {
+			fields.erase("mode");
+			remove.push_back("mode");
+		}
+		controller.set_element(e.id, fields, remove);
+		if(e.type != "label")
+			note("Controls mapped to " + e.id + " follow its new numbers.");
+	}
+}

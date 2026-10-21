@@ -69,6 +69,7 @@ wait_for(cond, ms) {
 class fb_fake_bot {
 
 	sent = [];              // [[chatid, text]]
+	docs = [];              // [[chatid, name, content, caption]] (send_document)
 	on_any_message = None;
 
 	send_rich(chatdata, options) {
@@ -84,6 +85,25 @@ class fb_fake_bot {
 	}
 
 	send_rich_draft(chatdata, draft_id, options) { return [ok = true]; }
+
+	// the router removes the file after sending: read it now
+	send_document(chatdata, path, options = None) {
+		docs.push_back([
+			chatid = std.int(chatdata.chatid ?? 0),
+			name = fileio.file_name(path),
+			content = fileio.read_string(path),
+			caption = std.string((options ?? []).caption ?? ""),
+		]);
+		return [ok = true];
+	}
+
+	doc_with(needle) {
+		for(d : docs) {
+			if(std.string(d.content).contains(needle))
+				return d;
+		}
+		return None;
+	}
 	new_draft_id(chatid) { return 1; }
 	download_file(fileid, destination = "") { return [success = false]; }
 
@@ -107,7 +127,7 @@ class fb_fake_bot {
 		return n;
 	}
 
-	clear() { sent = []; }
+	clear() { sent = []; docs = []; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,8 +155,19 @@ class fb_stub_host {
 
 	_notify_cb = None;
 	_task_finish_cb = None;
+	_file_cbs = [];
 
 	on_notify(cb) { _notify_cb = cb; }
+	on_file(cb) { _file_cbs.push_back(cb); }
+
+	// like megamind.share_file (the send_file tool)
+	share_file(path, caption = "") {
+		data = fileio.read_file(path);
+		f = [name = fileio.file_name(path), bytes = data.size(), caption = std.string(caption), data = std.base64_encode(data)];
+		for(cb : _file_cbs)
+			cb(f);
+		return [ok = _file_cbs.size() > 0, name = f.name, bytes = f.bytes];
+	}
 	on_task_finished(cb) { _task_finish_cb = cb; }
 	on_action(cb) { }
 
@@ -166,6 +197,12 @@ class fb_stub_host {
 		report = "stub answer: " + p;
 		if(p.starts("GOALDISABLED"))
 			report = GOAL_DISABLED_TEXT;
+		if(p.starts("LONG")) {
+			report = "LONG REPORT START\n";
+			for(i = 0; i < 400; i++)
+				report += "line " + i + " of a long report\n";
+			report += "LONG REPORT END";
+		}
 
 		result = [
 			ok = true,
@@ -280,6 +317,42 @@ host.notify_user("which python shall I use?");
 check("a node notify reaches the chat",
 	wait_for([bot]() { return bot.has_for(CHAT, "[notify] " + NODE_NAME + ": which python shall I use?"); }, 6000),
 	std.string(bot.sent));
+
+// ── a long report: clipped in the chat, in full as an attached .md ──────────
+
+bot.clear();
+lid = rtr.add_task("LongJob", "LONG write the whole analysis", NODE_NAME);
+check("the long delegation is accepted", !std.is_none(lid), std.string(lid));
+long_doc = wait_for([bot]() { return bot.doc_with("LONG REPORT END") != None; }, 12000);
+check("a long report is attached in full", long_doc, std.string(bot.docs.size()));
+check("the chat message says it is attached", bot.has_for(CHAT, "(the full report is attached)"), std.string(bot.sent));
+d = bot.doc_with("LONG REPORT END");
+check("the attachment is the whole report, as .md", d && d.content.contains("LONG REPORT START") && d.name.ends(".md") && d.chatid == CHAT, std.string(d));
+check("the chat message stays below the Telegram limit", !bot.has_for(CHAT, "LONG REPORT END"), "");
+
+// ── a long notify: the same ─────────────────────────────────────────────────
+
+bot.clear();
+long_msg = "NOTIFY START ";
+for(i = 0; i < 700; i++)
+	long_msg += "word" + i + " ";
+long_msg += "NOTIFY END";
+host.notify_user(long_msg);
+check("a long notify is attached in full", wait_for([bot]() { return bot.doc_with("NOTIFY END") != None; }, 6000), std.string(bot.docs.size()));
+check("the notify message says it is attached", bot.has_for(CHAT, "(the full message is attached)"), std.string(bot.sent));
+
+// ── send_file: a document of the node's agent reaches the chat ──────────────
+
+bot.clear();
+share_path = OUT_DIR + "/fb_report.html";
+fileio.write_string(share_path, "<html><body><h1>Weekly report</h1>SHARE_MARKER</body></html>");
+shared = host.share_file(share_path, "the weekly report");
+check("the node hands the file over", shared.ok, std.string(shared));
+check("the document reaches the chat", wait_for([bot]() { return bot.doc_with("SHARE_MARKER") != None; }, 6000), std.string(bot.docs.size()));
+sd = bot.doc_with("SHARE_MARKER");
+check("it keeps its name and caption", sd && sd.name.ends("fb_report.html") && sd.caption == "the weekly report", std.string(sd));
+check("the chat announces the file and its size", bot.has_for(CHAT, "[file] " + NODE_NAME + ": fb_report.html (" + std.string(fileio.size(share_path)) + " bytes)"), std.string(bot.sent));
+try { fileio.remove(share_path); } catch(e) {}
 
 // ── C4: a refused delegation keeps its reason on the router ─────────────────
 

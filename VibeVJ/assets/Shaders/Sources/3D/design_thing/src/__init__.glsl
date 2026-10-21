@@ -86,6 +86,8 @@ vec4 raycastPlane(in vec3 rayOrigin, vec3 rayDirection, in float planeHeight) {
     return vec4(hitPoint.x, hitPoint.z, hitPoint.y, length(rayDirection));
 }
 
+// Camera: the angles below, or turning on its own (it had no control, so only Manual was reachable, #436)
+//@enum options=(Manual, Animated) value=0 displayname="Camera"
 uniform int angle_mod;
 //@slider min=0.0 max=1.0 value=0.0
 uniform float cangle_x;

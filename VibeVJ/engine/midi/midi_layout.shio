@@ -1,0 +1,288 @@
+//Issue #343: the layout of a virtual MIDI controller, without UI (midi_controller.shio draws it).
+//A layout is plain JSON, saved with the project and made by hand, by script or by an AI agent:
+//  [name = "Show Prep", elements = [
+//    [id = "k1", type = "knob",   x = 8,  y = 8,  w = 56, h = 56, channel = 0, cc = 21, label = "Intensity"],
+//    [id = "b1", type = "button", x = 72, y = 8,  w = 56, h = 56, channel = 0, note = 48, mode = "momentary"],
+//    [id = "g1", type = "grid",   x = 8,  y = 72, w = 400, h = 200, channel = 1, rows = 4, cols = 8, note_base = 36]]]
+//Element types: knob, slider (a fader), button, pad, grid (rows x cols pads), xy (cc for x, cc_y for y), bend (pitch
+//bend), pressure (channel pressure, aftertouch), program (a button that sends a program change), label.
+//knob / slider / xy send control changes (0..127); button / pad / grid send notes (note on 127, note off), a button with
+//cc instead of note sends 127 / 0 on that controller. mode: "momentary" (default) or "toggle". A knob with
+//mode = "relative" is an endless encoder: it sends steps (1..63 up, 127..65 down) instead of its value.
+//bend sends the 14 bit pitch bend of its channel and springs back to the middle when let go (spring = false: stays).
+//pressure sends the channel pressure of its channel. program sends its program number (0..127) when pressed.
+//The id is what stays when a layout is made again: elements keep their numbers, so learned controls keep working.
+
+MIDI_LAYOUT_TYPES = ["knob", "slider", "button", "pad", "grid", "xy", "bend", "pressure", "program", "label"];
+MIDI_LAYOUT_FIRST_CC = 21;
+MIDI_LAYOUT_FIRST_NOTE = 36;
+
+midi_layout_clamp_int(v, lo, hi, fallback) {
+	if(std.is_none(v))
+		return fallback;
+	n = std.int(v);
+	return n < lo ? lo : (n > hi ? hi : n);
+}
+
+midi_layout_sends_cc(e) {
+	return e.type == "knob" || e.type == "slider" || e.type == "xy" || ((e.type == "button" || e.type == "pad") && e.has("cc"));
+}
+
+midi_layout_sends_notes(e) {
+	return e.type == "grid" || ((e.type == "button" || e.type == "pad") && !e.has("cc"));
+}
+
+//The notes an element plays (a grid: one per cell, row by row)
+midi_layout_notes(e) {
+	notes = [];
+	if(e.type == "grid") {
+		for(i = 0; i < e.rows * e.cols; i++)
+			notes.push_back(e.note_base + i * e.note_stride);
+	}
+	else if(midi_layout_sends_notes(e))
+		notes.push_back(e.note);
+	return notes;
+}
+
+midi_layout_ccs(e) {
+	ccs = [];
+	if(midi_layout_sends_cc(e))
+		ccs.push_back(e.cc);
+	if(e.type == "xy")
+		ccs.push_back(e.cc_y);
+	return ccs;
+}
+
+//Every message an element sends, as a mapping would name it: [[status = 0xB0 / 0x90 / ..., channel =, number =, relative =], ...]
+//(an xy: x then y, a grid: its pads row by row). Two versions of an element with the same id are compared by these.
+//Pitch bend, channel pressure and program change have no number in a mapping (it listens to the whole channel): 0
+midi_layout_messages(e) {
+	out = [];
+	if(e.type == "bend")
+		out.push_back([status = 0xE0, channel = e.channel, number = 0, relative = 0]);
+	if(e.type == "pressure")
+		out.push_back([status = 0xD0, channel = e.channel, number = 0, relative = 0]);
+	if(e.type == "program")
+		out.push_back([status = 0xC0, channel = e.channel, number = 0, relative = 0]);
+	//an endless knob: its mapping moves the control by steps (relative 1: two's complement, as it sends)
+	rel = e.type == "knob" && e.has("mode") && e.mode == "relative" ? 1 : 0;
+	for(c : midi_layout_ccs(e))
+		out.push_back([status = 0xB0, channel = e.channel, number = c, relative = rel]);
+	for(n : midi_layout_notes(e))
+		out.push_back([status = 0x90, channel = e.channel, number = n, relative = 0]);
+	return out;
+}
+
+//The first controller number from MIDI_LAYOUT_FIRST_CC that no element of that channel uses
+midi_layout_next_cc(layout, channel) {
+	used = [];
+	for(e : layout.elements)
+		if(e.channel == channel)
+			for(c : midi_layout_ccs(e))
+				used.push_back(c);
+	for(n = MIDI_LAYOUT_FIRST_CC; n < 128; n++)
+		if(!used.has_value(n))
+			return n;
+	return 0;
+}
+
+//The first program number no program element of that channel sends
+midi_layout_next_program(layout, channel) {
+	used = [];
+	for(e : layout.elements)
+		if(e.type == "program" && e.channel == channel)
+			used.push_back(e.program);
+	for(n = 0; n < 128; n++)
+		if(!used.has_value(n))
+			return n;
+	return 0;
+}
+
+//The first note from MIDI_LAYOUT_FIRST_NOTE with count free notes after it on that channel
+midi_layout_next_note(layout, channel, count) {
+	used = [];
+	for(e : layout.elements)
+		if(e.channel == channel)
+			for(n : midi_layout_notes(e))
+				used.push_back(n);
+	for(n = MIDI_LAYOUT_FIRST_NOTE; n + count <= 128; n++) {
+		free = true;
+		for(k = 0; k < count && free; k++)
+			if(used.has_value(n + k))
+				free = false;
+		if(free)
+			return n;
+	}
+	return 0;
+}
+
+//A layout as it may come from a file, a script or an agent, checked and completed: known types, an id for every
+//element (unique), sizes, channel 0..15, numbers 0..127, free numbers where none were given. Returns
+//[layout =, errors = [text, ...]]; elements that cannot be used are left out and named in errors.
+midi_layout_normalize(input) {
+	errors = [];
+	out = [name = "Virtual controller", elements = []];
+	if(std.is_none(input) || !std.is_json(input)) {
+		errors.push_back("the layout is not a JSON object");
+		return [layout = out, errors = errors];
+	}
+	if(input.has("name") && input.name)
+		out.name = std.string(input.name);
+	//the real controller the elements learned their numbers from (midi_controller.learn_from_hardware)
+	if(input.has("hardware") && input.hardware)
+		out.hardware = std.string(input.hardware);
+	if(!input.has("elements") || std.is_none(input.elements))
+		return [layout = out, errors = errors];
+
+	ids = [];
+	for(i = 0; i < input.elements.size(); i++) {
+		src = input.elements[i];
+		if(!std.is_json(src)) {
+			errors.push_back("element " + std.string(i) + " is not an object");
+			continue;
+		}
+		type = src.has("type") ? std.string(src.type).lowercase() : "";
+		if(type == "fader")
+			type = "slider";
+		if(!MIDI_LAYOUT_TYPES.has_value(type)) {
+			errors.push_back("element " + std.string(i) + ": unknown type '" + type + "' (" + MIDI_LAYOUT_TYPES.combine_string(", ") + ")");
+			continue;
+		}
+		e = [type = type];
+		id = src.has("id") && src.id ? std.string(src.id) : "";
+		if(!id || ids.has_value(id)) {
+			if(id)
+				errors.push_back("element " + std.string(i) + ": the id '" + id + "' is used twice, a new one was given");
+			n = 1;
+			for(ids.has_value(type + std.string(n)))
+				n++;
+			id = type + std.string(n);
+		}
+		ids.push_back(id);
+		e.id = id;
+		tall = type == "slider" || type == "pressure";
+		big = type == "grid" ? 8 * 52 : (tall ? 48 : (type == "bend" ? 160 : 56));
+		e.x = midi_layout_clamp_int(src.geti("x"), 0, 4000, 8);
+		e.y = midi_layout_clamp_int(src.geti("y"), 0, 4000, 8);
+		e.w = midi_layout_clamp_int(src.geti("w"), 16, 4000, big);
+		e.h = midi_layout_clamp_int(src.geti("h"), 16, 4000, tall ? 160 : (type == "grid" ? 4 * 52 : (type == "bend" ? 48 : 56)));
+		e.label = src.has("label") && !std.is_none(src.label) ? std.string(src.label) : "";
+		e.channel = midi_layout_clamp_int(src.geti("channel"), 0, 15, 0);
+		if(type == "button" || type == "pad")
+			e.mode = src.has("mode") && std.string(src.mode).lowercase() == "toggle" ? "toggle" : "momentary";
+		if(type == "knob" && src.has("mode") && std.string(src.mode).lowercase() == "relative")
+			e.mode = "relative";
+		if(type == "bend")
+			e.spring = !(src.has("spring") && !std.is_none(src.spring) && !src.spring);
+		if(type == "grid") {
+			e.rows = midi_layout_clamp_int(src.geti("rows"), 1, 16, 4);
+			e.cols = midi_layout_clamp_int(src.geti("cols"), 1, 16, 8);
+			e.note_stride = midi_layout_clamp_int(src.geti("note_stride"), 1, 16, 1);
+		}
+		out.elements.push_back(e);
+		//numbers after the element is in, so the next free one skips what is given
+		if(type == "label" || type == "bend" || type == "pressure")
+			continue;
+		if(type == "program") {
+			e.program = src.has("program") && !std.is_none(src.program) ? midi_layout_clamp_int(src.program, 0, 127, 0) : midi_layout_next_program(out, e.channel);
+			continue;
+		}
+		if(midi_layout_sends_cc(e) || (type == "button" || type == "pad") && src.has("cc")) {
+			if(src.has("cc") && !std.is_none(src.cc))
+				e.cc = midi_layout_clamp_int(src.cc, 0, 127, 0);
+			else
+				e.cc = midi_layout_next_cc(out, e.channel);
+			if(type == "xy")
+				e.cc_y = src.has("cc_y") && !std.is_none(src.cc_y) ? midi_layout_clamp_int(src.cc_y, 0, 127, 0) : midi_layout_next_cc(out, e.channel);
+		}
+		else if(type == "grid") {
+			count = e.rows * e.cols;
+			if(src.has("note_base") && !std.is_none(src.note_base))
+				e.note_base = midi_layout_clamp_int(src.note_base, 0, 127, 0);
+			else
+				e.note_base = midi_layout_next_note(out, e.channel, count * e.note_stride);
+			if(e.note_base + (count - 1) * e.note_stride > 127)
+				errors.push_back("grid '" + id + "': its notes go past 127");
+		}
+		else {
+			if(src.has("note") && !std.is_none(src.note))
+				e.note = midi_layout_clamp_int(src.note, 0, 127, 0);
+			else
+				e.note = midi_layout_next_note(out, e.channel, 1);
+		}
+	}
+	return [layout = out, errors = errors];
+}
+
+//The layout VibeVJ starts with: 8 knobs, 8 faders, 4 buttons and a grid of 4 x 8 pads
+midi_layout_default() {
+	elements = [];
+	for(i = 0; i < 8; i++)
+		elements.push_back([id = "knob" + std.string(i + 1), type = "knob", x = 8 + i * 64, y = 8, w = 56, h = 56, cc = 21 + i, label = "K" + std.string(i + 1)]);
+	for(i = 0; i < 8; i++)
+		elements.push_back([id = "fader" + std.string(i + 1), type = "slider", x = 12 + i * 64, y = 76, w = 48, h = 150, cc = 41 + i, label = "F" + std.string(i + 1)]);
+	for(i = 0; i < 4; i++)
+		elements.push_back([id = "button" + std.string(i + 1), type = "button", x = 536, y = 8 + i * 56, w = 72, h = 48, note = 24 + i, label = "B" + std.string(i + 1)]);
+	elements.push_back([id = "grid1", type = "grid", x = 624, y = 8, w = 8 * 48, h = 4 * 48 + 26, rows = 4, cols = 8, note_base = 36, label = "Pads"]);
+	return midi_layout_normalize([name = "Virtual controller", elements = elements]).layout;
+}
+
+//Which elements a message the app sends to the device belongs to: [element, cell, value 0..1] for each (cell: the pad
+//of a grid, the axis of an xy: 0 x, 1 y; else 0). Note off and note on with velocity 0 are 0.
+midi_layout_feedback(layout, status, d1, d2) {
+	hits = [];
+	type = status & 0xF0;
+	ch = status & 0x0F;
+	v = d2 / 127.0;
+	for(e : layout.elements) {
+		if(e.type == "label" || e.channel != ch)
+			continue;
+		if(type == 0xE0) {
+			if(e.type == "bend")
+				hits.push_back([element = e, cell = 0, value = (d2 * 128 + d1) / 16383.0]);
+		}
+		else if(type == 0xD0) {
+			if(e.type == "pressure")
+				hits.push_back([element = e, cell = 0, value = d1 / 127.0]);
+		}
+		else if(type == 0xC0) {
+			//the program that is now chosen lights, the others of the channel go off
+			if(e.type == "program")
+				hits.push_back([element = e, cell = 0, value = e.program == d1 ? 1.0 : 0.0]);
+		}
+		else if(type == 0xB0) {
+			if(midi_layout_sends_cc(e) && e.cc == d1)
+				hits.push_back([element = e, cell = 0, value = v]);
+			if(e.type == "xy" && e.cc_y == d1)
+				hits.push_back([element = e, cell = 1, value = v]);
+		}
+		else if(type == 0x90 || type == 0x80) {
+			on = type == 0x90 && d2 > 0 ? v : 0.0;
+			if(e.type == "grid") {
+				rel = d1 - e.note_base;
+				if(rel >= 0 && rel % e.note_stride == 0 && rel / e.note_stride < e.rows * e.cols)
+					hits.push_back([element = e, cell = rel / e.note_stride, value = on]);
+			}
+			else if(midi_layout_sends_notes(e) && e.note == d1)
+				hits.push_back([element = e, cell = 0, value = on]);
+		}
+	}
+	return hits;
+}
+
+//The message an element sends for a value 0..1 (cell: the pad of a grid, the axis of an xy): [status, d1, d2]
+midi_layout_message(e, cell, value) {
+	if(e.type == "bend") {
+		raw = std.int(math.clamp(value, 0.0, 1.0) * 16383.0 + 0.5);
+		return [0xE0 | e.channel, raw % 128, std.int(raw / 128)];
+	}
+	v = std.int(math.clamp(value, 0.0, 1.0) * 127.0 + 0.5);
+	if(e.type == "pressure")
+		return [0xD0 | e.channel, v, 0];
+	if(e.type == "program")
+		return [0xC0 | e.channel, e.program, 0];
+	if(midi_layout_sends_cc(e))
+		return [0xB0 | e.channel, e.type == "xy" && cell == 1 ? e.cc_y : e.cc, v];
+	note = e.type == "grid" ? e.note_base + cell * e.note_stride : e.note;
+	return [(v > 0 ? 0x90 : 0x80) | e.channel, note, v];
+}

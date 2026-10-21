@@ -32,7 +32,7 @@ start.
 - With *DJ Watch (USB)* and no board found it says "DJ Watch not connected".
 - *DJ Watch port (empty = auto)*, in the section *Settings* of the window, picks a USB port by hand. Leave it empty to
   find the board by itself.
-- For *DJ Watch (network)*, *Shizonet* must be on in the sidebar: see [Output and devices](Output-and-Devices.md#shizonet).
+- For *DJ Watch (network)*, *ShizoNet* must be on in the sidebar: see [Output and devices](Output-and-Devices.md#shizonet).
 
 ## The values
 

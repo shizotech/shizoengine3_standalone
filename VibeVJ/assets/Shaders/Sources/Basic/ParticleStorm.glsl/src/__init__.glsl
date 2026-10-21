@@ -4,14 +4,22 @@
 // All particle data is computed on the GPU using hash functions
 
 // --- Particle Parameters ---
+// (they had no controls, so nothing set them and every one was 0: no particles, #436)
+//@slider min=10 max=500 value=150
 uniform float particle_count;
+//@slider min=0.0 max=2.0 value=0.6
 uniform float particle_speed;
+//@slider min=-2.0 max=2.0 value=-0.4
 uniform float particle_gravity;
+//@slider min=0.5 max=10.0 value=3.0
 uniform float particle_size;
-//@rgb
+//@rgb value=(1.0, 0.55, 0.15)
 uniform vec3  particle_colors;
+//@slider min=0.2 max=8.0 value=3.0
 uniform float particle_life;
+//@slider min=0.1 max=4.0 value=1.0
 uniform float particle_emission;
+//@slider min=0.0 max=5.0 value=1.0
 uniform float particle_spread;
 
 // --- Hash & Noise Functions ---

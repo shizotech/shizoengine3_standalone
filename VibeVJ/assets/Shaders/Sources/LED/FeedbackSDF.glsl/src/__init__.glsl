@@ -67,15 +67,17 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec4 prev = texture(feedback, uv);
     col = mix(col, prev.rgb, feedback_amount);
 
-    // Cheap glow: average of 4 surrounding feedback taps
+    // Cheap glow: a halo from the average of the last frame around this pixel. It is a max(), not an add, and its
+    // gain stays below 1, so the trail fades out instead of running up to white (#436: it was 1.25 x the last frame
+    // added on top of the trail every frame)
     vec2 texel = 1.0 / iResolution.xy;
     vec3 blur = prev.rgb;
     blur += texture(feedback, uv + vec2(texel.x, 0.0)).rgb;
     blur += texture(feedback, uv + vec2(-texel.x, 0.0)).rgb;
     blur += texture(feedback, uv + vec2(0.0, texel.y)).rgb;
     blur += texture(feedback, uv + vec2(0.0, -texel.y)).rgb;
-    blur *= 0.25;
-    col += glow * blur;
+    blur /= 5.0;
+    col = max(col, blur * clamp(glow / 3.0, 0.0, 1.0) * 0.9);
 
     fragColor = vec4(clamp(col, vec3(0.0), vec3(1.0)), 1.0);
 }

@@ -11,7 +11,15 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
 | F1 | Anywhere | Opens [Help](The-Screen.md#the-help-window): this wiki, in the program. With the mouse on something that has a tooltip, it opens the part of the wiki that tooltip is about; otherwise the page for the part of the screen the mouse is in. |
 | F11 | Anywhere | The window fills the whole monitor, and back. See [The program window](The-Screen.md#the-program-window). |
 | F11 | A [view window](The-Screen.md#view-windows) | That window fills its monitor without a frame (a projector, an output monitor), and back. |
-| Ctrl + Z | The views | [Undo](The-Screen.md#undo-and-redo): takes back the last change of the layout. |
+| Ctrl + K | Anywhere | The [command palette](#the-command-palette): find an action, an asset, a project or a page of the wiki by typing. |
+| Ctrl + Shift + P | Anywhere | The [performance overlay](Troubleshooting.md#the-output-stutters): FPS, frame time, GPU time, video memory and the generators that need the most. |
+| Ctrl + S | Anywhere | *Save* the project, as in the [Projects tab](Getting-Started.md#save). A new project first asks for a name. |
+| Ctrl + Shift + S | Anywhere | *Save as…*: asks for a new name. |
+| Space | Anywhere | Play or pause the [timeline](Timeline.md#the-transport-bar). |
+| Shift + Space | Anywhere | Stop the timeline and go back to the start. |
+| T | Anywhere | Tap the tempo, like the *Tap* button: press it on each beat. |
+| Ctrl + B | Anywhere | [Blackout](Output-and-Devices.md#blackout): all outputs to black at once; again: back with a fade. |
+| Ctrl + Z | The views | [Undo](The-Screen.md#undo-and-redo): takes back the last change of the layout, a link or a value. |
 | Ctrl + Y or Ctrl + Shift + Z | The views | Redo. |
 | Ctrl + E | An area of a view tab | *Split right*: an empty area appears beside it. |
 | Ctrl + Shift + E | An area of a view tab | *Split down*: an empty area appears below it. |
@@ -33,23 +41,44 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
   After F6 they act on the marked area, until the mouse enters an area again. The buttons in the header of an area name
   their key in the tooltip. More in [The screen](The-Screen.md#views-and-tabs).
 - Undo, redo and the keys for areas are off in [show mode](Timeline.md#show-mode).
-- Play, Stop and Tap of the timeline have no key: map them to [MIDI](MIDI.md).
+- Ctrl + K, Ctrl + S, Ctrl + B, Space, Shift + Space and T work everywhere, also in show mode, but not while you type: a text field, a
+  value you type, the code editor (there Ctrl + S saves the code) and the mapping editors keep their keys. After a click
+  on a button or a slider they work at once.
 
 ### On a Mac
 
-Cmd (⌘) does what this page calls Ctrl: Cmd + Z, Cmd + E, Cmd + W, Cmd + 0, Cmd while dropping a clip, Cmd + C in a text
+Cmd (⌘) does what this page calls Ctrl: Cmd + K, Cmd + S, Cmd + B, Cmd + Z, Cmd + E, Cmd + W, Cmd + 0, Cmd while dropping a clip, Cmd + C in a text
 field, and so on. macOS keeps a few keys for itself, so these differ:
 
 | Windows and Linux | Mac | Why |
 |---|---|---|
-| F11 | Ctrl + Cmd + F (F11 too, where macOS does not use it for itself) | The Mac key for the full screen. VibeVJ goes into the full screen of macOS, in a Space of its own. |
+| F11 | Ctrl + Cmd + F (F11 too, where macOS does not use it for itself), or the green traffic light | The Mac key for the full screen. VibeVJ goes into the full screen of macOS, in a Space of its own. |
+| Ctrl + Y (redo) | Cmd + Shift + Z (Cmd + Y too) | The Mac key for redo. |
 | Ctrl + Space (maximize an area) | Cmd + Return | Cmd + Space opens Spotlight. |
 | Ctrl + Tab / Ctrl + Shift + Tab | Control + Tab / Control + Shift + Tab | Cmd + Tab switches programs. |
 | Ctrl + Space in the code editor | Control + Space | Spotlight. |
 | Ctrl + H in the code editor | Cmd + Option + F | Cmd + H hides the program. |
 | Right click | Control + click also works | As everywhere on a Mac. |
 
-The tooltips name the Ctrl keys of Windows and Linux.
+On a Mac the tooltips, the command palette and the menu bar show the Mac keys: ⌘ is Cmd, ⌥ Option, ⇧ Shift and ⌃
+Control, so *Undo (⌘Z)*, *Redo (⇧⌘Z)*, *Maximize this area (⌘↩)*. The menu bar has an item for most keys of this page;
+choosing it does exactly what the key does. Two fingers on the trackpad move a view, a pinch zooms
+([On a Mac](The-Screen.md#on-a-mac)).
+
+## The command palette
+
+Press **Ctrl + K** and type a few letters of what you want. The list shows what matches, at most ten:
+
+| Kind | On the right | Enter |
+|---|---|---|
+| Actions | Their key (Ctrl+S) or where they are | Runs it: Save, Blackout, Play / pause, Split right, Settings, Help, Log, … |
+| Assets | *Add* and the folder | Puts the generator, shader, view, picture, video or preset into the area the mouse is in, like a drop: an empty area takes it, a full one gets it as a tab. Undo takes it back. |
+| Projects, templates | *Open project*, *New project from template* | Opens it. |
+| Wiki pages | *Wiki* | Opens the [Help window](The-Screen.md#the-help-window) at that page. |
+
+- Several words find what has all of them (`shader spiral`). What starts with your text comes first.
+- Up / Down choose another line, Enter runs it, a click on a line too. Esc closes the palette.
+- In show mode the palette has no assets and none of the actions that change the layout.
 
 ## Tooltips
 

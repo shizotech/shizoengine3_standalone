@@ -1,7 +1,8 @@
 # Troubleshooting
 
 Common problems and what to do. Most of them come down to three things: a power button that is off, show mode that is
-still on, or a device that VibeVJ cannot see.
+still on, or a device that VibeVJ cannot see. When something goes wrong, VibeVJ says so at the bottom right and keeps
+the message in [the log](#the-log).
 
 > Screenshot to add: a generator window with its power button off (grey icon, dimmed title) next to the same window with the
 > power button on (green icon).
@@ -115,7 +116,7 @@ Input Analysis has its own, shorter messages (the last two rows).
 | "Port busy (is bridge.py or a serial monitor running?)" | Close the other program that uses the port. |
 | "Permission denied (add the user to the dialout group)" | Linux: add your user to the group *dialout*, then log in again. |
 | "Lost the DJ Watch (cable unplugged or restart)" | Plug it in again. VibeVJ reconnects by itself. |
-| "Waiting for the relay (ShizoNet)" or "No data from the relay (ShizoNet)" | Source *Network*: the relay ESP32 is not on the same network as VibeVJ, or it is off. Check that [*Shizonet*](Output-and-Devices.md#shizonet) is on in *Devices* › *Network*. |
+| "Waiting for the relay (ShizoNet)" or "No data from the relay (ShizoNet)" | Source *Network*: the relay ESP32 is not on the same network as VibeVJ, or it is off. Check that [*ShizoNet*](Output-and-Devices.md#shizonet) is on in *Devices* › *Network*. |
 | "Connecting to DJ Watch…" | VibeVJ is still looking for the box. If it stays, see the rows above. |
 | "DJ Watch connected, no tempo master" | Prolink Bridge is connected, but no CDJ is tempo master. Make a deck master on the CDJs. |
 | "DJ Watch not connected" | Audio with *DJ Watch (USB)*: the board is not connected. See the first row. |
@@ -178,7 +179,7 @@ More on [MIDI](MIDI.md).
 
 ## Lights do not react (Art-Net, fixtures)
 
-1. In *Devices* › *Network* › *Artnet*, check that the node is listed. If not, VibeVJ cannot see it on the network.
+1. In *Devices* › *Network* › *Art-Net*, check that the node is listed. If not, VibeVJ cannot see it on the network.
 2. In the [fixture setup](Output-and-Devices.md#set-up-your-lamps), every lamp needs a node, the right *Universe* and
    *Address*. Red lamps have a problem: point at them in the list to see which. *Highlight* lights the selected lamps
    to check the address.
@@ -189,6 +190,43 @@ More on [MIDI](MIDI.md).
    between their values.
 5. In *ArtnetSender*, pick the node in the list at the top. Values are sent once the node is found; move the slider
    again.
+
+## The output stutters
+
+Press **Ctrl + Shift + P** (or *Performance overlay* in the [command palette](Shortcuts-and-Tips.md#the-command-palette))
+for a small panel at the top right. It counts each second:
+
+| Line | Tells |
+|---|---|
+| *FPS* | Frames per second, and the target of [*Settings* › *Project*](Settings.md#project). Yellow when it is more than 10 % below the target. |
+| *Frame* | How long a frame takes on average, and the slowest frame of the second. |
+| *Script … GPU … VRAM …* | All generators together: their script time per frame, the time the graphics card needs for all shaders, and the video memory the shaders take. If the frame is long but script and GPU are small, the outputs or the resolution are what is slow. |
+| The next lines | The generators that cost the most per frame: script time, GPU time and video memory. Yellow above 4 ms. A generator in a view counts for itself, not for the view too. Click one to bring its area to the front. |
+| *Last autosave* | How long the last [autosave](Getting-Started.md#autosave) took; the output stands still for that time. |
+
+Press Ctrl + Shift + P again to close it. While it is closed nothing is measured.
+
+The video memory is the one of the shaders' pictures: a shader at 1920 × 1080 takes about 16 MB (8 bit) up to 63 MB (32 bit float), depending on its
+[format](Output-and-Devices.md#render-settings-tab-settings). Too many large shaders and the graphics card runs out of
+memory; a smaller *Render scale* in their *Settings* helps.
+
+## The log
+
+Errors and warnings show up as short messages at the bottom right of the screen, above the timeline: red for an error,
+yellow for a warning, with the file and line where it happened. A warning goes after 6 seconds, an error after 12. The
+same message again counts up on its message (×3) instead of a new one. Click one to open the log.
+
+The log is a window with the last 400 messages. Open it with the bell in the [top bar](The-Screen.md#top-bar); its badge
+counts the errors since you looked last.
+
+- **All / Errors / Warnings:** which messages the list shows.
+- **Clear:** empties the list.
+- Each line starts with the time. A runtime error also names where it happened (*at*) and the calls that led there
+  (*from*), the last call first.
+- You can select text in the list and copy it (Ctrl + C) for a bug report.
+
+What ends up there: errors and warnings of VibeVJ and its generators, scripts that fail, and shaders that do not
+compile. A shader that does not compile also shows its error in its window.
 
 ## A tooltip is in the way
 

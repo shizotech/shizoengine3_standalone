@@ -1,26 +1,31 @@
 // ============================================================================
-// StepChaser - bar-synced step sequencer / value chaser
+// StepChaser (Math) - bar-synced step sequencer / value chaser
 // ============================================================================
-// The bar (Takt) is divided into a configurable number of counts (Zaehlzeiten).
-// Each count either gets an explicit Wert (target value 0..1) or is flagged
-// HOLD, meaning the last explicitly set value is kept for that count.
+// The bar (Bar length, in beats) is cut into Steps (columns). Each step either gets
+// its own Value (0..1) or is flagged Hold: then the last value that was set
+// explicitly is kept for that step.
 //
-// When a count is reached the target value is emitted:
-//   attack  current value -> Wert over FadeIn   (beats)
-//   hold    Wert for the remaining part of the count
-//   release Wert -> 0 over FadeOut              (beats, at the END of the count)
-// Hold counts never release, so the value is simply sustained.
-// FadeIn / FadeOut are per count and clamped to the length of the count.
+// When a step is reached its value is played:
+//   attack  current output -> Value over Fade in    (beats)
+//   hold    Value for the rest of the step
+//   release Value -> 0 over Fade out                 (beats, at the END of the step)
+// Hold steps never release, so the value simply stays.
+// Fade in / Fade out are per step and clamped to the length of the step.
 //
 // UI: a nanogui.gridview table.
-//   columns  = counts (1..16)
-//   rows     = 3 rows per BLOCK  ->  row0: Wert (+Hold)  row1: FadeOut  row2: FadeIn
-//   top header = count numbers, left header (rowspan 3) = block name
-//   left header, top -> bottom:  Name / Wert (live readout slider) / OUT / REMOVE
-//   All in-cell setting sliders use an explicit fixed_width so they fit into
-//   their column completely (no overflow out of the cell).
-// Blocks are stacked vertically on the SAME grid, so several blocks produce
-// several independent OUT outputs (one linkable controlfloat per block).
+//   columns  = steps (1..16)
+//   rows     = 3 rows per BLOCK  ->  row 0: Hold + Value   row 1: Fade out   row 2: Fade in
+//   top header = step numbers, left header (rowspan 3) = the block:
+//     row 0: name + remove button, row 1: Level (a bar), row 2: Output
+// Blocks are stacked on the SAME grid, so several blocks give several
+// independent outputs (one linkable Output per block).
+//
+// Utility/StepChaser is the other step chaser: one collapsible table per output, Sync only, and Hold keeps the
+// output as it is at that moment (also halfway through a fade). Both stay, projects use both.
+//
+// Control IDs (saved projects, links): "Mode", "Beats per Bar", "Counts per Bar", per block (group "block<id>")
+// "Name", "Wert" (Level), "OUT" (Output) and per step "Hold S<n>", "Wert S<n>" (Value), "FadeOut S<n>",
+// "FadeIn S<n>". The save keys keep the old names too (wert = value).
 //
 // IMPORTANT (crash safety):
 //   No widget teardown may ever happen inside a callback of a widget that is
@@ -32,19 +37,19 @@
 import nanogui;
 using eigen;
 
-max_steps = 16;   // maximum counts per bar
+max_steps = 16;   // maximum steps per bar
 max_blocks = 32;  // maximum stacked blocks
-max_fade = 8.0;   // maximum FadeIn / FadeOut in beats
+max_fade = 8.0;   // maximum Fade in / Fade out in beats
 
-// Grid cell size and derived slider widths. The setting sliders are explicitly
-// sized (instead of filling the cell) so they fit completely into their column.
+// Grid cell size. A cell holds one 28 px row with 4 px above and below, so the
+// three rows of the left header line up with the three rows of the steps.
 cell_w = 130;
-cell_h = 34;
-hold_w = 30;              // Hold toggle button
-slider_w = cell_w - 6;    // FadeIn / FadeOut sliders
-wert_w = cell_w - 6 - hold_w;  // Wert slider (shares its row with Hold)
+cell_h = 36;
+pad = 4;                  // space around a control in a cell
+row_h = cell_h - 2 * pad; // 28
+hold_w = 56;              // Hold toggle (shares row 0 with Value)
 
-// Default per-count values.
+// Default per-step values.
 default_wert = 1.0;
 default_fade_in = 0.0;
 default_fade_out = 0.0;
@@ -52,9 +57,9 @@ default_hold = 0;
 
 // Widgets
 grid = None;
-mode = None;        // 0 = SYNC, 1 = FREE
+mode = None;        // 0 = sync, 1 = free
 beats_ctrl = None;  // beats per bar
-steps_ctrl = None;  // counts per bar
+steps_ctrl = None;  // steps per bar
 
 // Block records (ordered). Stable ids keep control group names stable.
 block_max_id = 0;
@@ -67,12 +72,12 @@ free_time = 0.0;
 pending_rebuild = false;
 
 // Unique control group for a block. Control names are unique inside a group,
-// so a block's controls read as e.g. "Wert S1@block3", "OUT@block3".
+// so a block's controls read as e.g. "block3@Wert S1", "block3@OUT".
 grp(bid) {
     return "block" + bid;
 }
 
-// Grow / shrink a block's per-count arrays to n.
+// Grow / shrink a block's per-step arrays to n.
 resize_block(rec, n) {
     if(n < 1)
         n = 1;
@@ -102,27 +107,18 @@ build_block(b) {
     left = grid.add_header_left_item(base);
     left.rowspan(3);
 
-    name_ctrl = left.controltext("Name", group);
+    // Row 0: name + remove
+    name_ctrl = left.controltext("Name", group).tooltip("The name of this block");
     name_ctrl.value(rec.name, false, false)
-        .anchor_left(0).anchor_top(0).anchor_right(0).fixed_height(20)
+        .anchor_left(pad).anchor_top(pad).anchor_right(pad + row_h + 4).fixed_height(row_h)
         .hide_config_menu(true);
     name_ctrl.callback([rec](v) {
         rec.name = v;
     });
 
-    // Live readout: slider that outputs the current value of this block.
-    readout_ctrl = left.controlslider("Wert", group);
-    readout_ctrl.min(0).max(1).value(rec.env, false, false)
-        .anchor_left(0).anchor_top(22).anchor_right(0).fixed_height(20)
-        .hide_config_menu(true);
-
-    out_ctrl = left.controlfloat("OUT", group).caption("Out");
-    out_ctrl.min(0).max(1).value(rec.env, false, false)
-        .anchor_left(0).anchor_top(44).anchor_right(0).fixed_height(20)
-        .hide_config_menu(true);
-
-    // REMOVE must NOT destroy itself -> mark + hide, rebuild deferred to update().
-    del_btn = left.button("Remove").anchor_left(0).anchor_bottom(0).anchor_right(0).fixed_height(20);
+    // Remove must NOT destroy itself -> mark + hide, rebuild deferred to update().
+    del_btn = left.button("").icon(nanogui.icon("trash")).tooltip("Remove this block").danger("hover")
+        .anchor_right(pad).anchor_top(pad).fixed_width(row_h).fixed_height(row_h);
     del_btn.on_click([rec, left]() {
         rec.pending_remove = 1;
         rec.env = 0.0;
@@ -130,45 +126,57 @@ build_block(b) {
         pending_rebuild = true;
     });
 
+    // Row 1: the current value as a bar
+    readout_ctrl = left.controlslider("Wert", group).caption("Level").as_output(true).tooltip("The value of this block right now, as a bar. A [[pure output]], the same as Output");
+    readout_ctrl.min(0).max(1).value(rec.env, false, false)
+        .anchor_left(pad).anchor_top(cell_h + pad).anchor_right(pad).fixed_height(row_h)
+        .hide_config_menu(true);
+
+    // Row 2: the output
+    out_ctrl = left.controlfloat("OUT", group).caption("Output").as_output(true).tooltip("The output of this block, 0 to 1. A [[pure output]]: [[link]] it into what should follow the steps\n[[wiki:Assets#generators--math]]");
+    out_ctrl.min(0).max(1).value(rec.env, false, false)
+        .anchor_left(pad).anchor_top(2 * cell_h + pad).anchor_right(pad).fixed_height(row_h)
+        .hide_config_menu(true);
+
     rec.name_ctrl = name_ctrl;
     rec.readout_ctrl = readout_ctrl;
     rec.out_ctrl = out_ctrl;
 
-    // Per-count cells.
+    // Per-step cells.
     for(s = 0; s < n_steps; s++) {
-        // Row 0: Wert + Hold toggle.
+        // Row 0: Hold toggle + Value.
         wert_item = grid.add_item(base + 0, s);
-        wert_item.layout(nanogui.layout_horizontal());
         wert_item.children_visible(true);
 
-        hold_ctrl = wert_item.controlbutton("Hold S" + (s + 1), group);
-        hold_ctrl.push(1).transparent(1).fixed_width(hold_w).hide_config_menu(true);
+        hold_ctrl = wert_item.controlbutton("Hold S" + (s + 1), group).caption("Hold").tooltip("Hold: this step keeps the last value that was set, without fading");
+        hold_ctrl.push(1).hide_config_menu(true)
+            .anchor_left(pad).anchor_top(pad).fixed_width(hold_w).fixed_height(row_h);
         hold_ctrl.value(rec.hold[s], false, false);
         hold_ctrl.callback([rec, s](v) {
             rec.hold[s] = (v) ? 1 : 0;
         });
 
-        wert_ctrl = wert_item.controlfloat("Wert S" + (s + 1), group);
-        wert_ctrl.min(0).max(1).value(rec.wert[s], false, false).hide_config_menu(true);
-        wert_ctrl.fixed_width(wert_w);
+        wert_ctrl = wert_item.controlfloat("Wert S" + (s + 1), group).caption("Value").tooltip("The value this step goes to, 0 to 1");
+        wert_ctrl.min(0).max(1).value(rec.wert[s], false, false).hide_config_menu(true)
+            .anchor_left(pad + hold_w + 4).anchor_top(pad).anchor_right(pad).fixed_height(row_h);
         wert_ctrl.callback([rec, s](v) {
             rec.wert[s] = v;
         });
 
-        // Row 1: FadeOut.
+        // Row 1: Fade out.
         fo_item = grid.add_item(base + 1, s);
-        fo_ctrl = fo_item.controlslider("FadeOut S" + (s + 1), group);
-        fo_ctrl.min(0).max(max_fade).value(rec.fade_out[s], false, false).hide_config_menu(true);
-        fo_ctrl.fixed_width(slider_w);
+        fo_ctrl = fo_item.controlslider("FadeOut S" + (s + 1), group).caption("Fade out").unit("beats").tooltip("How long the value takes to fall back to 0 at the end of this step");
+        fo_ctrl.min(0).max(max_fade).value(rec.fade_out[s], false, false).hide_config_menu(true)
+            .anchor_left(pad).anchor_top(pad).anchor_right(pad).fixed_height(row_h);
         fo_ctrl.callback([rec, s](v) {
             rec.fade_out[s] = v;
         });
 
-        // Row 2: FadeIn.
+        // Row 2: Fade in.
         fi_item = grid.add_item(base + 2, s);
-        fi_ctrl = fi_item.controlslider("FadeIn S" + (s + 1), group);
-        fi_ctrl.min(0).max(max_fade).value(rec.fade_in[s], false, false).hide_config_menu(true);
-        fi_ctrl.fixed_width(slider_w);
+        fi_ctrl = fi_item.controlslider("FadeIn S" + (s + 1), group).caption("Fade in").unit("beats").tooltip("How long the output takes to reach the value of this step at its start");
+        fi_ctrl.min(0).max(max_fade).value(rec.fade_in[s], false, false).hide_config_menu(true)
+            .anchor_left(pad).anchor_top(pad).anchor_right(pad).fixed_height(row_h);
         fi_ctrl.callback([rec, s](v) {
             rec.fade_in[s] = v;
         });
@@ -189,7 +197,7 @@ rebuild_grid() {
 
     for(s = 0; s < n_steps; s++) {
         top = grid.add_header_top_item(s);
-        top.label("S" + (s + 1)).anchor(0).font_size(12);
+        top.label("Step " + (s + 1)).anchor(0).font_size(13);
     }
 
     for(b = 0; b < blocks.size(); b++) {
@@ -230,34 +238,45 @@ add_block() {
     rebuild_grid();
 }
 
+// A cell of a row cut into n equal parts, with a 4 px gap to the next cell. The control in it fills it.
+row_cell(row, i, n) {
+    l = std.float(i) / std.float(n);
+    r = std.float(n - 1 - i) / std.float(n);
+    return row.widget().anchor_top(0).anchor_bottom(0).anchor_left(l, "percent").anchor_right(r, "percent");
+}
+cell_gap(i, n) {
+    return (i < n - 1) ? 4 : 0;
+}
+
 entry(generator, area) {
-    area.layout(nanogui.layout_vertical());
+    // Top row by anchors, the table below it fills the rest of the window
+    area.layout(None);
 
+    // [ Mode | Bar length | Steps | Add block ]
     top_row = area.widget().fixed_height(28)
-        .anchor_left(0).anchor_top(0).anchor_right(0)
-        .layout(nanogui.layout_horizontal());
+        .anchor_left(0).anchor_top(0).anchor_right(0);
 
-    // 0 = SYNC (timeline position), 1 = FREE (internal accumulator).
-    mode = top_row.controlcombo("Mode").fixed_width(80);
-    mode.items(["Sync", "Free"]);
+    // 0 = sync (timeline position), 1 = free (own clock).
+    mode = row_cell(top_row, 0, 4).controlcombo("Mode").tooltip("Sync: follows the position of the [[timeline]]. Free: counts on its own").anchor(0).anchor_right(cell_gap(0, 4));
+    mode.items(["Sync", "Free"]).segmented(true); //index-based (0 = sync, 1 = free)
 
-    beats_ctrl = top_row.controlslider("Beats per Bar").min(0.1).max(32).value(4.0).fixed_width(150);
-    steps_ctrl = top_row.controlint("Counts per Bar").min(1).max(max_steps).value(4).fixed_width(130);
+    beats_ctrl = row_cell(top_row, 1, 4).controlslider("Beats per Bar").caption("Bar length").unit("beats").tooltip("How many [[beat|beats]] one bar of the chaser lasts").min(0.1).max(32).value(4.0).anchor(0).anchor_right(cell_gap(1, 4));
+    steps_ctrl = row_cell(top_row, 2, 4).controlint("Counts per Bar").caption("Steps").tooltip("Into how many steps (columns) the bar is cut").min(1).max(max_steps).value(4).anchor(0).anchor_right(cell_gap(2, 4));
 
-    add_btn = area.button("Add block").fixed_height(26);
+    add_btn = row_cell(top_row, 3, 4).button("Add block").icon(nanogui.icon("plus")).tooltip("Another row of steps with its own output\n[[wiki:Assets#generators--math]]").anchor(0).anchor_top(2).anchor_bottom(2);
     add_btn.on_click([]() {
         add_block();
     });
 
     grid = area.gridview()
-        .anchor(0).anchor_top(112)
+        .anchor(0).anchor_top(36)
         .header_left_width(200)
         .header_top_height(28)
         .cell_size(vec2f(cell_w, cell_h))
         .rows(0).cols(0)
         .show_grid(true);
 
-    // Changing the count subdivision rebuilds the table (values kept in records).
+    // Changing the number of steps rebuilds the table (values kept in records).
     steps_ctrl.callback([](v) {
         for(b = 0; b < blocks.size(); b++) {
             blocks[b].last_step = -1;
@@ -303,7 +322,7 @@ update(generator, tl_pos, pos_delta) {
         if(s < 0)
             s = 0;
 
-        // Count boundary crossed -> latch the target for this count.
+        // Step boundary crossed -> latch the target for this step.
         if(current_step != rec.last_step) {
             rec.prev_env = rec.env;
             rec.last_step = current_step;
@@ -320,11 +339,11 @@ update(generator, tl_pos, pos_delta) {
         fo = rec.fade_out[s];
         if(fo < 0.0)
             fo = 0.0;
-        // Hold counts never release.
+        // Hold steps never release.
         if(held)
             fo = 0.0;
 
-        // Clamp fades to the length of the count.
+        // Clamp fades to the length of the step.
         fi_eff = math.min(fi, step_len);
         fo_eff = math.min(fo, step_len - fi_eff);
 
@@ -345,7 +364,7 @@ update(generator, tl_pos, pos_delta) {
         }
         else {
             if(fo_eff > 0.0) {
-                // Release: target -> 0 at the end of the count.
+                // Release: target -> 0 at the end of the step.
                 q = (p - (step_len - fo_eff)) / fo_eff;
                 if(q > 1.0)
                     q = 1.0;

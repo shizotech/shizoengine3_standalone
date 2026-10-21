@@ -30,7 +30,7 @@ uniform vec3 stage1_color;
 uniform float stage1_offset;
 //@float min=0.1 max=10.0 value=2.0
 uniform float stage1_duration;
-//@int min=0 max=2 value=0
+//@enum options=(Solid, Circle, Fade) value=0
 uniform int stage1_shape;
 
 // Stage 2 controls
@@ -40,7 +40,7 @@ uniform vec3 stage2_color;
 uniform float stage2_offset;
 //@float min=0.1 max=10.0 value=2.0
 uniform float stage2_duration;
-//@int min=0 max=2 value=0
+//@enum options=(Solid, Circle, Fade) value=0
 uniform int stage2_shape;
 
 // Stage 3 controls
@@ -50,7 +50,7 @@ uniform vec3 stage3_color;
 uniform float stage3_offset;
 //@float min=0.1 max=10.0 value=2.0
 uniform float stage3_duration;
-//@int min=0 max=2 value=0
+//@enum options=(Solid, Circle, Fade) value=0
 uniform int stage3_shape;
 
 // Stage 4 controls
@@ -60,7 +60,7 @@ uniform vec3 stage4_color;
 uniform float stage4_offset;
 //@float min=0.1 max=10.0 value=2.0
 uniform float stage4_duration;
-//@int min=0 max=2 value=0
+//@enum options=(Solid, Circle, Fade) value=0
 uniform int stage4_shape;
 
 // Stage 5 controls
@@ -70,7 +70,7 @@ uniform vec3 stage5_color;
 uniform float stage5_offset;
 //@float min=0.1 max=10.0 value=2.0
 uniform float stage5_duration;
-//@int min=0 max=2 value=0
+//@enum options=(Solid, Circle, Fade) value=0
 uniform int stage5_shape;
 
 // Get stage color based on index
@@ -135,7 +135,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.xy;
     
     // Calculate animation parameter
-    float anim_time = iTime * sequence_speed;
+    // The sequence loops over the length of its stages (it played once, then stayed black, #436)
+    float cycle = 0.1;
+    for (int i = 1; i <= 5; i++) {
+        if (i > stage_count) break;
+        cycle = max(cycle, get_stage_offset(i) + get_stage_duration(i));
+    }
+    float anim_time = mod(iTime * sequence_speed, cycle);
     
     // Grid center
     vec2 grid_center = vec2(0.5, 0.5);

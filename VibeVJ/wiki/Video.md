@@ -23,7 +23,7 @@ On a Mac, install FFmpeg with Homebrew: `brew install ffmpeg`. VibeVJ finds it t
 1. Open the *Assets* tab and find the file (`.mp4 .mov .m4v .mkv .webm .avi .mxf .mpg .mpeg .ts .wmv`).
 2. Drag it into a [Patchview](The-Screen.md#views-and-tabs), or into a cell of a [Clipview](Clipview.md#make-a-clip).
    In a Clipview, click the cell to start the clip on its layer.
-3. Link *OUT* to the input of a shader or another generator ([Ports](Linking.md#ports)). The video is a picture source
+3. Link *Out* to the input of a shader or another generator ([Ports](Linking.md#ports)). The video is a picture source
    like an image or a shader.
 
 ![A video clip running on a Clipview layer](media/video-clipview.png)
@@ -32,7 +32,7 @@ On a Mac, install FFmpeg with Homebrew: `brew install ffmpeg`. VibeVJ finds it t
 
 | Control | What it does |
 |---|---|
-| *OUT* | The picture. Link it to an input. |
+| *Out* | The picture. Link it to an input. |
 | *Play* | Plays or holds the current frame. |
 | *Restart* | Starts the clip from its first frame. |
 | *Speed* | -4 to 4 times normal speed. Below 0 the clip plays backwards; that needs a file in which every frame stands on its own (HAP, ProRes, DNxHR, see [Which files play well](#which-files-play-well)). Other files go from 0 to 4. |

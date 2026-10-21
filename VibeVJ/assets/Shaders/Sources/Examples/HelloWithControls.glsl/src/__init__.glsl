@@ -7,9 +7,9 @@ uniform float speed;
 uniform int segments;
 //@vec2 min=(0.0,0.0) max=(2.0,2.0) value=(1.0,1.0)
 uniform vec2 resolution_scale;
-//@rgb
+//@rgb value=(0.1, 0.2, 0.5)
 uniform vec3 base_color;
-//@rgb
+//@rgb value=(1.0, 0.5, 0.1)
 uniform vec3 accent_color;
 //@slidervec2 min=(0.0,0.0) max=(1.0,1.0) value=(0.5,0.5)
 uniform vec2 center;

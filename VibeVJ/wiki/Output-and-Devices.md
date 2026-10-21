@@ -15,21 +15,32 @@ Every shader generator can send its picture out. A simple way is the shader *out
    See [Ports](Linking.md#ports).
 3. On the tab *Control*, open *Outputs* › *Monitor*.
 4. Choose the *Display mode* first: *Fullscreen* or *Window* (a window without a frame).
-5. Choose the *Display*: *Display 1*, *Display 2* … The output opens there. *Width* and *Height* are set to the size
-   of that display.
-6. To stop, set *Display* to *Off*. Closing the output window does the same.
+5. Choose the *Display*: *Display 1*, *Display 2* …, each with the name of the display. The output opens there.
+   *Width* and *Height* are set to the size of that display.
+6. *Picture*: what happens when the picture and the display have another shape. *Stretch* (the standard) fills the
+   display and distorts the picture, *Fit* shows all of it with black bars, *Fill* fills the display and cuts the
+   edges off.
+7. To stop, set *Display* to *Off*. Closing the output window does the same.
 
-*Display mode* can be changed while the output shows: the output opens again in the new mode.
+*Display mode* and *Picture* can be changed while the output shows.
+
+The project keeps the name of the display. At another venue, where the displays are connected in another order, the
+output goes to the display with that name. When it is not connected, the output stays off and the [Log](Troubleshooting.md#the-log)
+says so: it never lands on the screen VibeVJ itself is on.
 
 ## The tabs of a shader
 
 A shader generator has three tabs: *Control*, *Settings* and *Transform*.
 
+The section *Controls* of the tab *Control* holds the shader's own controls. Their names come from the shader's code in
+plain words: `bg_colour` shows as *Background colour*, `timeMultiplier` as *Time multiplier*. Its inputs are *In* (or
+*In 1*, *In 2*, …, *Channel 0*, …), its picture goes out at *Out*.
+
 ### Outputs (tab Control)
 
 | Section | Controls | What it does |
 |---|---|---|
-| *Monitor* | *Display mode*, *Display* | Picture on a display, see above. |
+| *Monitor* | *Display mode*, *Display*, *Picture* | Picture on a display, see above. |
 | *Video router* | *Enable router*, *Video router name* | Offers the picture to other shaders by name. In another shader, open *Inputs*, then the input, and pick the name from the list. *No Input* clears it. |
 | *Spout* | *Enable Spout*, *Spout name* | Sends the picture to other programs on the same computer. Windows only. |
 | *NDI stream* | *Enable NDI*, *NDI name* | Sends the picture over the network as NDI. |
@@ -65,6 +76,27 @@ How the time of a shader runs (*Free*, *Manual*, *Sync*) is on [Settings](Settin
 
 For several slices and outputs with masks and soft edges, use *MapLab*: see [Mapping](#mapping).
 
+## Blackout
+
+When something goes wrong on the screen or in the lights, press **Ctrl + B** (Cmd + B on a Mac) or the Blackout button
+in the bar of the [timeline](Timeline.md#the-transport-bar), next to the show mode lock. Everything that leaves VibeVJ
+goes black at once:
+
+- the Display outputs of shaders and of MapLab (the picture on a projector or monitor),
+- the NDI of every shader and of the whole window, and the Spout of every shader,
+- the brightness and colour channels of your [fixtures](#fixtures) and every [LEDMapper](#ledmapper).
+
+Pan, tilt, gobos and the other channels of a fixture stay where they are, so moving heads do not swing. The views in
+VibeVJ keep showing everything, so you see what will come back. The button is marked while the blackout is on.
+
+Press Ctrl + B or the button again: the outputs come back with a fade, one second at the start. Change it in
+[*Settings* › *Output* › *Blackout*](Settings.md#output).
+
+- It works in show mode.
+- The button has a notch: map it to a MIDI pad ([MIDI](MIDI.md)) to have it under your hand.
+- A blackout is not part of the project: opening a project keeps the outputs as they are.
+- *ArtnetSender* sends exactly what you give it: the blackout does not change it.
+
 ## The whole window as NDI
 
 [*Settings* › *Output*](Settings.md#output) › *NDI* sends the whole VibeVJ window as NDI (*Enable NDI*, *NDI name*,
@@ -74,31 +106,44 @@ For several slices and outputs with masks and soft edges, use *MapLab*: see [Map
 
 *NDIReceiver* and *SpoutReceiver* (in `Generators` › `Network`) bring video from other programs in.
 
-1. Open the list *Select* at the top and pick a sender.
-2. Link *OUT* of the generator onward.
+1. Open the list *Pick a sender…* at the top and pick a sender, or type its name into *Sender*.
+2. Link *Out* of the generator onward.
 
-- *Flip Y* (NDI) turns the picture upside down.
-- *VideoRouter* offers the picture to shaders by name, as a shader does.
-- NDI needs the NDI runtime on this computer, Spout works on Windows only: see
-  [Troubleshooting](Troubleshooting.md#ndi-not-visible).
+- *Flip Y* (NDI) turns the picture upside down. Under the list NDI shows whether it is connected.
+- *Size* shows the width and height of the picture that comes in.
+- *Video router* offers the picture to shaders by name, as a shader does.
+- NDI needs the NDI runtime on this computer, Spout works on Windows only (on other systems *SpoutReceiver* says so):
+  see [Troubleshooting](Troubleshooting.md#ndi-not-visible).
 
 ## Art-Net
 
-The sidebar tab *Devices*, section *Network* › *Artnet*:
+The sidebar tab *Devices*, section *Network* › *Art-Net*:
 
-- *ArtNetSync* (on at the start) sends an Art-Net sync after every frame, so all nodes update at the same moment.
+- *Art-Net sync* (on at the start) sends an Art-Net sync after every frame, so all nodes update at the same moment.
 - Every Art-Net node that VibeVJ finds on the network gets a section "name [MAC]" with its IP and MAC address.
 
 Two generators in `Generators` › `Network` work with single channels.
 
 | Generator | How to use it |
 |---|---|
-| *ArtnetSender* | Pick a node in the list *Select device* at the top; its name, IP and MAC show below. Click *Add channel* or *Add 16-bit channel*: each row has *Universe* (0–15), *Channel* (1–512) and a slider *Value* that sends 0–255 (16-bit: 0–65535). × removes a row. *Start universe* and *Start channel* shift all rows. The node is remembered by its MAC address. |
-| *ArtnetReceiver* | It listens to all Art-Net on the network, there is no node to pick. Click *ADD CHANNEL* or *ADD 16-BIT CHANNEL*. The slider of a row follows that channel. Click *L* on a row, then move the fader on your console: *U* (universe) and *C* (channel) are filled in. *START UNIVERSE* and *START CHANNEL* shift all rows. |
+| *ArtnetSender* | Pick a node in the list at the top (*No node* until you do); its IP and MAC show below. Click *Add channel* or *Add 16-bit channel*: each row has *Universe*, *Channel* (1–512) and a slider *Value* that sends 0–255 (16-bit: 0–65535). × removes a row. *Start universe* and *Start channel* shift all rows. The node is remembered by its MAC address; until it answers, the line below says "not found on the network". |
+| *ArtnetReceiver* | It listens to all Art-Net on the network, there is no node to pick. Click *Add channel* or *Add 16-bit channel*. The *Value* of a row follows that channel (a [pure output](Linking.md#pure-outputs)). Click the crosshair of a row (learn, amber while it waits), then move the fader on your console: *Universe* and *Channel* are filled in. *Start universe* and *Start channel* shift all rows. |
 
-With the power button off, the sender stops sending and the receiver stops following. *L* still works.
+With the power button off, the sender stops sending and the receiver stops following. Learn still works.
 
 For whole lamps instead of single channels, use fixtures.
+
+### Network cards
+
+*Devices* › *Network* › *Network cards* chooses the network cards Art-Net and ShizoNet use: VibeVJ looks for nodes over
+them (ArtPoll, ShizoNet), sends the Art-Net sync over them, and only accepts nodes from their networks.
+
+- *All* (at the start): every card, as before.
+- *Network cards*: the wired and Wi-Fi cards, without docker, VPN, WSL or Hyper-V switches.
+- *Picked*: only the cards switched on in the list below. It starts with the cards *Network cards* would use.
+
+The list shows every card with its address, "virtual" and "down" where that applies. *Refresh* reads the cards again,
+e.g. after plugging in a USB network adapter. The choice belongs to this computer: it is the same for every project.
 
 ## Fixtures
 
@@ -140,6 +185,8 @@ and on the plan, and the top right says how many lamps need attention. A lamp is
 is fine). The *universe map* at the bottom shows the 512 channels of the universe of the selected lamp: each lamp has
 its own colour, the selected ones are highlighted, channels a LEDMapper sends to are grey, red channels are used twice.
 Point at a channel to see who uses it, lamps and LEDMapper segments; click it to select that lamp.
+
+![A bar of the fixture setup that a LEDMapper segment writes over: red in the list, the problem under its settings, its channels red in the universe map, the other channels of the LEDMapper grey](media/fixture-setup-ledmapper.png)
 
 **Find a lamp in the rig.** Switch on *Highlight*: the selected lamps go to full (white, intensity full). Select other
 lamps and they light up instead. Off: back to their values.
@@ -187,27 +234,27 @@ uses the words of a lighting desk: wave, speed, phase, width, wings.
 1. Drag *Phaser* into a view and click *Add phaser*.
 2. *Lamps*: a group of the fixture setup, or all lamps of a type. *Attribute*: the channel it moves, such as *DIMMER*,
    *PAN* or a colour.
-3. Pick the *Wave* and how fast it runs (*Beats* per cycle: it follows the BPM of the [timeline](Timeline.md)).
+3. Pick the *Wave* and how fast it runs (*Cycle* in beats: it follows the BPM of the [timeline](Timeline.md)).
 4. *Phase* spreads the wave over the lamps: 0° all together, 360° one wave from the first lamp to the last.
 
 | Setting | What it does |
 |---|---|
 | Level slider (the row) | 0 holds the lamps at *Low*, 1 runs the full wave. Link or map it like any slider. |
 | *Wave* | *Sine*, *Triangle*, *Ramp up*, *Ramp down*, *Square*, *Pulse*, *Random*, or *Input* (below). |
-| *Beats* | Length of a cycle in beats. |
+| *Cycle* | Length of a cycle in beats. |
 | *Phase* | Degrees of the wave spread over the lamps. 720 makes two waves. |
 | *Spread* | Which lamp comes first: *In order* (the order of the group), *From the middle*, *Left to right*, *Right to left*, *Back to front*, *Front to back*, *Outside in*. The directions use where the lamps hang on the plan. |
 | *Width* | The part of a cycle the wave runs; the rest of it the lamp stays at *Low*. A *Pulse* with a small width is a chase. |
 | *Low*, *High* | The values at the bottom and the top of the wave. |
 | *Wings* | Mirrors the phase: with 2 wings the second half of the lamps runs the other way. |
-| *Start device*, *End device* | Only the lamps from … to … of the group (counted from 0, *End device* -1: to the last). |
-| *Auto Mirror X* / *Y* | Lamps left of (behind) the middle of the stage get the mirrored value: pan and tilt move symmetrically. |
+| *First lamp*, *Last lamp* | Only the lamps from … to … of the group (counted from 0, *Last lamp* -1: to the last). |
+| *Auto mirror X* / *Y* | Lamps left of (behind) the middle of the stage get the mirrored value: pan and tilt move symmetrically. |
 | *Priority* (top) | When two phasers move the same channel, the higher priority wins. |
 
 The bars under each row show what it sends to each lamp; the plan on the left shows the lamps of the phaser whose
 settings are open, lit by their values.
 
-**Input.** With the wave *Input* the Level slider is the value that runs over the lamps, each lamp *Phase Delay* beats
+**Input.** With the wave *Input* the Level slider is the value that runs over the lamps, each lamp *Phase delay* beats
 later than the first. Put an LFO or the audio analysis into the area on the left of the Phaser and link it into the
 slider. This is what the Phaser did before; phasers of older projects keep doing it.
 
@@ -218,9 +265,9 @@ for.
 
 | Generator | What it is for |
 |---|---|
-| *MapLab* | Projection mapping with several inputs, slices and outputs: cut slices out of the inputs, place and warp them with a grid, mask them, blend their edges. Each output has an *OUT* port and goes to a display, Spout, NDI or a video router: see [the outputs of MapLab](#the-outputs-of-maplab). |
+| *MapLab* | Projection mapping with several inputs, slices and outputs: cut slices out of the inputs, place and warp them with a grid, mask them, blend their edges. Each output has an *Out* port and goes to a display, Spout, NDI or a video router: see [the outputs of MapLab](#the-outputs-of-maplab). |
 | *LEDMapper* | LED strips, bars and matrices drawn over a picture; their colours go to Art-Net nodes or to lamps of the fixture setup. See [LEDMapper](#ledmapper). |
-| *MaskTransform* | One mask or warp surface between an *IN* and an *OUT*. |
+| *MaskTransform* | One mask or warp surface between an *In* and an *Out*. |
 
 Their inputs list every picture that is offered by a *Video router*: a shader, a [video](Video.md#controls) or a
 receiver with its router on.
@@ -286,6 +333,8 @@ universe* fills a universe with whole LEDs only (170 RGB, 128 RGBW), as many nod
 another one writes the same channels of its node: in this LEDMapper, in another LEDMapper, or a lamp of the
 [fixture setup](#set-up-your-lamps) it is not meant for. The status under the picture counts them, and the settings
 of the segment say what it overlaps with.
+
+![A LEDMapper segment on the channels of a bar of the fixture setup: the segment and the status under the picture are red, the settings say which lamp it overlaps](media/ledmapper-overlap.png)
 
 **Lamps of the fixture setup.** A group's *Output* can be a *Lamp of the setup* instead of a node, and a segment can
 have a *Lamp*: the address then comes from the lamp and follows it when you re-address the lamp. *Add these lamps*
@@ -392,9 +441,9 @@ To keep the light/VJ card first for the computer's own broadcasts:
 > Screenshot to add: Prolink Decks with *Source* › *Network card*, the line at the top "Network card Ethernet 2", two
 > decks with waveforms.
 
-## Shizonet
+## ShizoNet
 
-*Devices* › *Network* › *Shizonet* switches ShizoNet on or off (on at the start). Off stops VibeVJ from looking for
+*Devices* › *Network* › *ShizoNet* switches ShizoNet on or off (on at the start). Off stops VibeVJ from looking for
 ShizoNet devices and from talking to them; Art-Net keeps running. ShizoNet is used by the DJ Watch sources of
 [Audio](Audio.md#source) and Prolink when they come over the network.
 

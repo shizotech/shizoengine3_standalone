@@ -18,7 +18,8 @@ The window floats above the program.
 
 ## Project
 
-The settings on the page *Project* are saved with the project. The page has two sections, "Output size" and "Timing".
+The settings on the page *Project* are saved with the project, except *Autosave*. The page has three sections,
+"Output size", "Timing" and "Autosave".
 
 | Setting | What it does |
 |---|---|
@@ -26,6 +27,7 @@ The settings on the page *Project* are saved with the project. The page has two 
 | *Target FPS* | How many frames per second VibeVJ draws. Starts at the refresh rate of your screen. The lowest value is 30; 0 means no limit. It has no options: to map it to MIDI, see [MIDI](MIDI.md#the-midi-tab-in-the-options). |
 | *Default sync* | How the time of a new shader generator runs: *Free*, *Manual* or *Sync* (see below). |
 | *Current FPS* | Shows the frames per second VibeVJ reaches right now. |
+| *Autosave* | How often the open project is saved to the autosave folder: *Off*, *1 min*, *2 min*, *5 min* (the standard) or *10 min*. Personal, see below. |
 
 ### Default sync
 
@@ -37,6 +39,17 @@ starts with; you can change each shader later.
 | *Free* | Runs on its own, in seconds, times the shader's *Multiplier*. |
 | *Manual* | Stands still. You set *Time* yourself, or link it to another control. |
 | *Sync* | Follows the timeline position, in beats. It stops when the timeline stops. |
+
+### Autosave
+
+*Autosave* writes the open project into the folder `VibeVJ/autosave/` as often as you choose here. If VibeVJ does not
+close properly, the next start offers to restore it: see [Autosave](Getting-Started.md#autosave). It never writes into
+your project folder.
+
+The setting is personal like the ones of *Appearance*: it is kept in `VibeVJ/engine/style.json`, the same for every
+project, and takes effect at once. Saving a big project takes a moment, and an autosave can make a frame late, so
+there is none in [show mode](Timeline.md#show-mode): the time starts again when you leave it. If an autosave still
+shows in your output while you build, choose a longer time.
 
 ## Links
 
@@ -70,7 +83,7 @@ The settings on the page *Appearance* are personal. They are not saved in the pr
 
 | Setting | What it does |
 |---|---|
-| *Interface size* | How big everything is drawn: 90 % to 200 %, on top of the scale of your system. Takes effect the next time VibeVJ starts. See [Interface size](#interface-size). |
+| *Interface size* | How big everything is drawn: 90 % to 200 %, on top of the scale of your system. Takes effect at once. See [Interface size](#interface-size). |
 | *Accent colour* | The colour picker sets your highlight colour, used for links and selection. Violet at the start. |
 | *Reset accent colour* | Sets the accent colour back to violet. |
 | *Calm notches* | Where free notches show their grey edge: *Everywhere* (the standard) or *Clipview only*. |
@@ -83,11 +96,11 @@ VibeVJ follows the display scale of your system. On a screen where that is too s
 changes it for VibeVJ alone:
 
 1. Open *Settings* › *Appearance*.
-2. Pick a size under *Interface size*. *100 %* is the scale of your system.
-3. Start VibeVJ again.
+2. Pick a size under *Interface size*. *100 %* is the scale of your system. The views and the timeline follow at once.
 
-Useful on a 4K screen under Linux without display scaling (pick *150 %* or *200 %*), or when you stand far from the
-screen. It works the same on Windows, Linux and macOS: on a Mac the window keeps its size and everything in it is
+Until you pick one, VibeVJ chooses: on a screen that is wider than 3000 at the scale of the system (a 4K screen at
+100 %, mostly under Linux) it draws everything bigger, so that about 1920 fit across; on every other screen it keeps
+*100 %*. Useful beyond that when you stand far from the screen. It works the same on Windows, Linux and macOS: on a Mac the window keeps its size and everything in it is
 drawn bigger or smaller, still sharp on a Retina screen.
 
 ### Calm notches
@@ -129,6 +142,7 @@ The page *Output* is for the output of the whole VibeVJ window.
 
 | Setting | What it does |
 |---|---|
+| *Blackout* | How the outputs come back after a [blackout](Output-and-Devices.md#blackout): *At once*, *0.5 s*, *1 s* (the standard), *2 s* or *4 s*. Personal, kept in `VibeVJ/engine/style.json`. |
 | *NDI stream* | In the section "NDI". *Enable NDI* sends the whole VibeVJ window, interface included, as an NDI source named after *NDI name* (*ProgramOut* at the start). |
 
 The NDI output of a single shader is on [Output and devices](Output-and-Devices.md).

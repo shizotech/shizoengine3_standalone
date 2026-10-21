@@ -1,13 +1,13 @@
 // Kaleidoscope Effect
 // Shadertoy format
 
-//@slider min=2 max=16 value=8
+//@int min=2 max=16 value=8
 uniform int kalie_segments;
 
 //@slider min=-3.14 max=3.14 value=0.0
 uniform float kalie_rotation;
 
-//@slider min=0 max=2 value=1
+//@enum options=(Off, Mirror, Bloom) value=1
 uniform int kalie_mirror;
 
 //@slider min=0.1 max=5.0 value=1.0

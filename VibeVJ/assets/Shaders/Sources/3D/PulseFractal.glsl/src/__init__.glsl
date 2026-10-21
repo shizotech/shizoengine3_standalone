@@ -3,7 +3,7 @@
 //@slider min=0.0 max=4.0 value=2.0
 uniform float pulse_speed;
 
-//@slider min=2 max=8 value=4
+//@int min=2 max=8 value=4
 uniform int fractal_depth;
 
 //@slidervec2 min=(0.0,0.0) max=(6.283,6.283) value=(0.0,0.0)
@@ -19,26 +19,29 @@ float smin(float a, float b, float k)
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-// 3D IFS (Sierpinski-style) distance field, iterated `fractal_depth` times.
-// Returns signed distance approximation for the raymarcher.
+// Sierpinski tetrahedron as a distance field (Syntopia's fold): each step moves the point towards the nearest corner
+// and scales it by 2, `fractal_depth` times; the shape is a sphere of radius 1 at the last level. The old version
+// measured the distance to points (no radius) and grew instead of shrinking, so the rays never hit anything (#436).
 float iFS(vec3 p)
 {
-    float d = 1e5;
+    const vec3 a1 = vec3( 1.0,  1.0,  1.0);
+    const vec3 a2 = vec3(-1.0, -1.0,  1.0);
+    const vec3 a3 = vec3( 1.0, -1.0, -1.0);
+    const vec3 a4 = vec3(-1.0,  1.0, -1.0);
+    const float scale = 2.0;
+    float k = 1.0;
     for (int i = 0; i < 8; i++)
     {
-        if (i > fractal_depth) break;
-
-        // 4 Sierpinski-style transformations (sub-scale 0.5)
-        d = min(d, length(p - vec3(0.5, 0.5, 0.5) * 0.5 + vec3(0.5, 0.5, 0.5)) / 0.5);
-        d = min(d, length(p - vec3(0.5, 0.5, -0.5) * 0.5 + vec3(0.5, 0.5, 0.5)) / 0.5);
-        d = min(d, length(p - vec3(0.5, -0.5, 0.5) * 0.5 + vec3(0.5, 0.5, 0.5)) / 0.5);
-        d = min(d, length(p - vec3(-0.5, 0.5, 0.5) * 0.5 + vec3(0.5, 0.5, 0.5)) / 0.5);
-
-        // map back with inverse scale to iterate
-        p = (p - vec3(0.5, 0.5, 0.5)) / 0.5;
-        p -= vec3(0.5, 0.5, 0.5);
+        if (i >= fractal_depth) break;
+        vec3 c = a1;
+        float best = length(p - a1);
+        float d = length(p - a2); if (d < best) { c = a2; best = d; }
+        d = length(p - a3); if (d < best) { c = a3; best = d; }
+        d = length(p - a4); if (d < best) { c = a4; best = d; }
+        p = scale * p - c * (scale - 1.0);
+        k *= scale;
     }
-    return d;
+    return (length(p) - 1.0) / k;
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)

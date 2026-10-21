@@ -4,6 +4,7 @@
 #include "engine/interfaces/aiinterface"
 #include "engine/patch/dmx"
 #include "engine/patch/patch_ai"
+#include "engine/blackout"
 #include "src/menu/menu"
 
 import nanogui;
@@ -60,8 +61,16 @@ class shizoengine
 	ai_interfaces_revision = 0; //Changes when an interface or its queries change (the MCP server rebuilds its tools)
 	ai_activity = []; //Last write of an AI caller (Chat / MCP): caller, query, target, time
 	main_generator_view = None; //Direct link to the main view
-	
+
+	managed blackout = None; //the switch that takes all outputs to black (#538, engine/blackout.shio)
+
+	//Autosave (AUTOSAVE_DIR): minutes between two autosaves, 0 is off (Settings > Project, kept in the style file)
+	autosave_minutes = AUTOSAVE_DEFAULT;
+	autosave_last = 0;      //std.millis() of the last save, autosave or load
+	autosave_ready = false; //only after the start up asked about an old autosave: before, it must not be overwritten
+
 	__init__() {
+		autosave_last = std.millis();
 	
 		engine_global = std.global("engine");
 		engine_global.set(this);
@@ -69,25 +78,64 @@ class shizoengine
 		//In engine.ai_interfaces from the start: the Chat and the MCP server can change the fixture setup
 		patch_ai = patch_ai_create(this);
 	
+		//The network cards Art-Net and ShizoNet use (#501): picked in Devices > Network > Network cards, kept in the
+		//style file (personal). Before the server starts, so its first ArtPoll already goes to the right cards
+		try {
+			net_style = fileio.read_json(STYLE_FILE);
+			if(net_style && net_style.has("network_interfaces"))
+				shizonet.use_interfaces(net_style.network_interfaces);
+		}
+		catch(e) {}
+
 		net = shizonet.server("SHIZOV3");
 	
 		ctx = nanogui.context();
 		screen = ctx.screen("ShizoEngineX - VVJ");
-		screen.decorated(0);
-		//No OS frame, so the outer 5 px of the screen resize the window instead (not while maximized)
-		screen.resize_border(5);
-		//VibeVJ starts in the full screen, over the taskbar or panel. On Windows the screen gets there by itself once the
-		//frame is gone; on Linux the window manager is asked for it, where it has a full screen
-		if(!std.os_platform().starts("windows") && screen.fill_monitor_available())
-			screen.fill_monitor(true);
+		style = fileio.read_json(STYLE_FILE);
+		//The window as it was left (place, size, maximized or full screen; save_window_state). Without one the defaults
+		saved_window = style.has("window") ? style.window : None;
+		saved_state = saved_window && saved_window.has("state") ? saved_window.state : "";
+		//macOS: the title bar of macOS lies under the top bar, with the traffic lights at its left end (the top bar
+		//places them again with its own height). The window starts zoomed, as Mac programs do, not in a full screen Space
+		mac_frame = screen.native_frame(48);
+		if(mac_frame)
+			screen.window_title("VibeVJ"); //the Window menu, Mission Control and the Dock name it
+		if(!mac_frame) {
+			screen.decorated(0);
+			//No OS frame, so the outer 5 px of the screen resize the window instead (not while maximized)
+			screen.resize_border(5);
+		}
+		//Where it was, also on another monitor; a monitor that is gone gives the primary one (place_window)
+		if(saved_window && saved_window.has("w"))
+			screen.place_window(vec2f(saved_window.x, saved_window.y), vec2f(saved_window.w, saved_window.h));
+		if(saved_state == "normal") {
+			//Its own size: out of the full screen Windows gives a borderless window by itself
+			if(screen.fill_monitor())
+				screen.fill_monitor(false);
+			if(saved_window.has("w"))
+				screen.place_window(vec2f(saved_window.x, saved_window.y), vec2f(saved_window.w, saved_window.h));
+		}
+		else if(saved_state == "maximized")
+			screen.maximized(true);
+		//The full screen: what VibeVJ starts in on Windows and Linux, over the taskbar or panel. On Windows the screen
+		//gets there by itself once the frame is gone, unless place_window above took it out again (a rect kept from an
+		//earlier start); on Linux the window manager is asked for it, where it has a full screen. On a Mac only when it
+		//was left there (its own Space)
+		else if(saved_state == "full" || (!mac_frame && saved_state == "")) {
+			if(screen.fill_monitor_available() && !screen.fill_monitor())
+				screen.fill_monitor(true);
+		}
+		else if(mac_frame)
+			screen.maximized(true);
 
 		//ctx.widget_debug(true);
 
-		style = fileio.read_json(STYLE_FILE);
 		screen.theme().from_json(style);
-		//Interface size (Appearance): on top of the system scale, before anything is laid out
-		if(style.has("ui_scale"))
-			screen.ui_scale(style.ui_scale);
+		//Interface size (Appearance): on top of the system scale, before anything is laid out. Until it is chosen, the
+		//size that suits the screen (auto_ui_scale: a 4K screen at 100 % gets more than 100 %)
+		screen.ui_scale(style.has("ui_scale") ? style.ui_scale : auto_ui_scale());
+		//Smaller than this the bars and the sidebar no longer fit; on a smaller screen the window fills it
+		screen.min_size(vec2f(960, 600));
 		//Calm notches (Shizo UI): "everywhere" (default) or "clipview", set in Appearance
 		nanogui.calm_notches(style.has("calm_notches") ? style.calm_notches : "everywhere");
 		//Linked notches (Shizo UI): "open" (default) or "edge", set in Appearance
@@ -96,7 +144,11 @@ class shizoengine
 		env.area_headers_auto_hide = (style.has("area_headers") && style.area_headers == "auto_hide") ? 1 : 0;
 		//Move areas with (#347): "alt" (default), "ctrl+alt" or "none", set in Appearance
 		nanogui.grab_modifier(style.has("grab_modifier") ? style.grab_modifier : "alt");
-		
+		//Autosave: minutes, set in Settings > Project
+		if(style.has("autosave_minutes"))
+			autosave_minutes = std.int(style.autosave_minutes);
+
+		blackout = blackout_switch(this);
 		menu = main_menu(this);
 		
 		//update style file
@@ -118,6 +170,10 @@ class shizoengine
 		});
 		
 		screen.pre_render_callback([this, screen, ctx](){
+
+			//The fade of the blackout goes on while a project loads
+			if(this.blackout)
+				this.blackout.tick();
 		
 			if(load_in_progress)
 				return;
@@ -133,9 +189,17 @@ class shizoengine
 				this.timeline.nudge_factor = 1.0; //Reset
 				this.timeline.cursor_pos.value(cur_pos);
 			
+			//The loops turn with the main timeline and tell nanogui where they are (#273): before the sync, so
+			//controls that follow a loop get its position of this frame
+			if(this.timeline.loops)
+				this.timeline.loops.update(pos_delta);
+
 			//Sync all midicontrols to timeline which are sync enabled
 			nanogui.sync_update(this.timeline.cursor_pos.value(), pos_delta);
 			
+			//The performance overlay (#537) measures each generator while it is on
+			perf = this.env.perf;
+			measure = perf && perf.on;
 			for(i = 0; i < this.generators_pre_callbacks.size(); i++) {
 				if(!this.generators_pre_callbacks[i] || !this.generators_pre_callbacks[i].module || !this.generators_pre_callbacks[i]._pre_callback)
 					this.generators_pre_callbacks.erase(i);
@@ -143,7 +207,10 @@ class shizoengine
 					continue;
 					
 				try {
+					t0 = measure ? nanogui.micros() : 0;
 					this.generators_pre_callbacks[i]._pre_callback(this.generators_pre_callbacks[i], this.timeline.cursor_pos.value(), pos_delta);
+					if(measure)
+						perf.add(this.generators_pre_callbacks[i], nanogui.micros() - t0);
 				}
 				catch(e) {
 					this.generators_pre_callbacks.erase(i);
@@ -163,6 +230,10 @@ class shizoengine
 		});
 		
 		ctx.on_frame_finished([this](){
+
+			//Errors and warnings to the toasts and the Log (#539), also while a project loads
+			if(this.menu && this.menu.log)
+				this.menu.log.poll();
 			
 			if(load_in_progress)
 				return;
@@ -180,7 +251,17 @@ class shizoengine
 				if(this.env.refresh_recent)
 					this.env.refresh_recent();
 			}
-			
+
+			this.autosave_tick();
+
+			//The shader preview of the Assets tab opens once the mouse rested on a shader (#536)
+			if(this.env.shader_preview)
+				this.env.shader_preview.tick();
+
+			perf = this.env.perf;
+			measure = perf && perf.on;
+			if(measure)
+				perf.frame();
 			for(i = 0; i < this.generators_post_callbacks.size(); i++) {
 				if(!this.generators_post_callbacks[i] || !this.generators_post_callbacks[i].module || !this.generators_post_callbacks[i]._post_callback)
 					this.generators_post_callbacks.erase(i);
@@ -188,7 +269,10 @@ class shizoengine
 					continue;
 					
 				try {
+					t0 = measure ? nanogui.micros() : 0;
 					this.generators_post_callbacks[i]._post_callback(this.generators_post_callbacks[i]);
+					if(measure)
+						perf.add(this.generators_post_callbacks[i], nanogui.micros() - t0);
 				}
 				catch(e) {
 					this.generators_post_callbacks.erase(i);
@@ -197,8 +281,11 @@ class shizoengine
 			}
 		});
 			
-		if(fileio.exists("engine/last_project.dat"))
+		//An autosave that is still there: VibeVJ did not close properly last time. Restore it, or the last project
+		if(!restore_autosave() && fileio.exists("engine/last_project.dat"))
 			load_project(fileio.read_string("engine/last_project.dat"));
+		autosave_last = std.millis();
+		autosave_ready = true;
 	}
 	
 	__deinit__() {
@@ -232,37 +319,180 @@ class shizoengine
 		if(old_format < PROJECT_FORMAT && fileio.exists(project_dir + "/generators.json"))
 			backup_project_files(project_dir, old_format);
 
-		if(patch)
-			fileio.write_json("projects/" + project_env.name + "/" + "fixture_setup.json", patch);
-		
-		for(i = 0; i < save_hooks.size(); i++) {
-			hook_name = save_hooks.key(i);
-			try {
-				hook_data = save_hooks[i]();
-				fileio.write_json("projects/" + project_env.name + "/" + hook_name + ".json", hook_data);
-			}
-			catch(e) {
-				std.error("Cannot run save hook: " + save_hooks.key(i));
-			}
-		}
-		
-		fileio.write_json("projects/" + project_env.name + "/controls.json", nanogui.serialize_controls());
-		write_project_format(project_dir);
-		
+		write_project(project_dir);
+
 		/*
 		fileio.write_json("projects/" + project_env.name + "/ui_settings.json", [
 			filebrowser_scale = this.scale_widget.scale(),
 		]);
 		*/
-		
+
+		//The project on disk is up to date: the autosave is not needed any more
+		autosave_remove();
+		autosave_last = std.millis();
+
 		screen.status_overlay("");
 		save_in_progress = false;
+	}
+
+	//Writes every file of the open project into dir: the patch, one file per save hook, the controls and the format.
+	//Save writes into projects/<name>, the autosave into AUTOSAVE_DIR
+	write_project(dir) {
+		if(patch)
+			fileio.write_json(dir + "/fixture_setup.json", patch);
+
+		for(i = 0; i < save_hooks.size(); i++) {
+			hook_name = save_hooks.key(i);
+			try {
+				hook_data = save_hooks[i]();
+				fileio.write_json(dir + "/" + hook_name + ".json", hook_data);
+			}
+			catch(e) {
+				std.error("Cannot run save hook: " + save_hooks.key(i) + ": " + e);
+			}
+		}
+
+		fileio.write_json(dir + "/controls.json", nanogui.serialize_controls());
+		write_project_format(dir);
+	}
+
+	// Autosave
+	//The open project, named or not, goes to AUTOSAVE_DIR every autosave_minutes. It is written into a folder of its
+	//own first and takes the place of the old autosave only when it is complete: a crash while writing keeps the old
+	//one. autosave.json in it names the project ("" for a project without a name) and the time
+
+	//Called at the end of every frame
+	autosave_tick() {
+		if(!autosave_ready || autosave_minutes <= 0 || save_in_progress || load_in_progress)
+			return;
+		//Not in show mode: the show is built, it is only played, and a save there could make a frame late. The time
+		//starts again, so the first autosave comes a full interval after leaving show mode
+		if(nanogui.show_mode()) {
+			autosave_last = std.millis();
+			return;
+		}
+		if(std.millis() - autosave_last < autosave_minutes * 60000)
+			return;
+		autosave_now();
+	}
+
+	autosave_now() {
+		autosave_last = std.millis();
+		if(save_in_progress || load_in_progress)
+			return false;
+		save_in_progress = true;
+		ok = false;
+		next = AUTOSAVE_DIR + "_next";
+		try {
+			started = std.millis();
+			fileio.remove(next);
+			write_project(next);
+			fileio.write_json(next + "/autosave.json", [name = std.global("project").name ?? "", time = std.date("%Y-%m-%d %H:%M")]);
+			fileio.remove(AUTOSAVE_DIR);
+			ok = fileio.rename(next, AUTOSAVE_DIR) ? true : false;
+			env.last_autosave_ms = std.millis() - started;
+			std.print("Autosave took ", env.last_autosave_ms, " ms");
+		}
+		catch(e) {
+			std.warn("Autosave failed: " + e);
+		}
+		save_in_progress = false;
+		return ok;
+	}
+
+	autosave_remove() {
+		try {
+			fileio.remove(AUTOSAVE_DIR);
+			fileio.remove(AUTOSAVE_DIR + "_next");
+		}
+		catch(e) {}
+	}
+
+	//Start up: an autosave that is still there is offered. true when it was loaded
+	restore_autosave() {
+		info_file = AUTOSAVE_DIR + "/autosave.json";
+		if(!fileio.exists(info_file))
+			return false;
+		info = [];
+		try {
+			info = fileio.read_json(info_file);
+		}
+		catch(e) {}
+		name = info.name ?? "";
+		what = name ? "of the project " + name : "of a project without a name";
+		question = "VibeVJ did not close properly. Restore the autosave " + what + (info.time ? " from " + info.time : "") + "?\n" +
+			"No deletes it" + (name ? " and opens the project as it was last saved." : ".");
+		res = "no";
+		try {
+			res = screen.modal_yes_no(question, "Restore autosave");
+		}
+		catch(e) {}
+		if(res != "yes") {
+			autosave_remove();
+			return false;
+		}
+		//It stays until the next save: VibeVJ can stop again before that
+		return load_project(name, "projects", AUTOSAVE_DIR);
 	}
 	
 	//Exit / window close decision (#314): a named project is saved and the app quits, an unnamed
 	//project is asked first - Save opens the existing "Save as…" flow, Don't save quits without
 	//writing anything, Cancel keeps the app running. Returns true when the app may exit.
+	//The interface size that suits the monitor VibeVJ opens on, until one is chosen in Settings > Appearance. A screen
+	//whose system scale leaves more than 3000 units across (a 4K screen at 100 %, mostly on Linux) gets the largest
+	//size of the list that still leaves 1920 across; everything else keeps the size of the system (100 %)
+	auto_ui_scale() {
+		try {
+			//No monitor reported (a display that sleeps): the size of the system
+			if(ctx.monitor_count() < 1)
+				return 1.0;
+			info = ctx.monitor_info(0);
+			scale = info.has("scale") && info.scale > 0 ? info.scale : 1.0;
+			//Logical units across at 100 %: points on a Mac (width), pixels divided by the system scale elsewhere
+			across = std.os_platform() == "macos" ? info.width : info.pixel_width / scale;
+			if(across < 3000)
+				return 1.0;
+			sizes = [2.0, 1.5, 1.25];
+			for(s : sizes) {
+				if(across / s >= 1920)
+					return s;
+			}
+		}
+		catch(e) {}
+		return 1.0;
+	}
+
+	//Keeps where the window is, for the next start (__init__): its state, and the place and size it has when it is
+	//neither maximized nor in the full screen
+	save_window_state() {
+		try {
+			st = fileio.read_json(STYLE_FILE);
+			state = screen.fill_monitor() ? "full" : (screen.maximized() ? "maximized" : "normal");
+			w = st.has("window") ? st.window : [state = state];
+			w.state = state;
+			if(state == "normal") {
+				pos = screen.window_position();
+				size = screen.window_size();
+				w.x = pos.x;
+				w.y = pos.y;
+				w.w = size.x;
+				w.h = size.y;
+			}
+			st.window = w;
+			fileio.write_json(STYLE_FILE, st);
+		}
+		catch(e) {}
+	}
+
+	//Whether VibeVJ may quit now (Exit, the close button, Cmd + Q): a named project is saved, an unnamed one asked about
 	confirm_quit() {
+		ok = this.confirm_quit_project();
+		if(ok)
+			this.save_window_state();
+		return ok;
+	}
+
+	confirm_quit_project() {
 		
 		project_env = std.global("project");
 		
@@ -282,8 +512,12 @@ class shizoengine
 			return false;
 		}
 		
-		if(res == "no")
-			return true; //Don't save: quit and lose the unnamed project, on purpose
+		if(res == "no") {
+			//Don't save: quit and lose the unnamed project, on purpose. Its autosave goes too, the next start does
+			//not offer it. (A save removes the autosave by itself)
+			autosave_remove();
+			return true;
+		}
 		
 		if(res != "yes")
 			return false; //Cancel
@@ -303,18 +537,21 @@ class shizoengine
 	
 	//folder: where the project is read from. "templates" (#425) loads a template as a new project without a name:
 	//Save asks for one, so the template itself is never overwritten
-	load_project(name, folder = "projects") {
+	//from_dir: read the files from this folder instead (the autosave), the project is called name ("": no name)
+	load_project(name, folder = "projects", from_dir = None) {
 		if(save_in_progress || load_in_progress)
 			return false;
-		
+
 		//Nothing is changed before the project folder has been checked (#315): loading a name that
 		//does not exist used to keep the old content on screen under the new name, and the next Save
 		//wrote that content into a new folder with that name.
-		if(!name)
+		if(!name && !from_dir)
 			return false;
-		
+
 		is_template = folder != "projects";
-		project_dir = folder + "/" + name;
+		project_dir = from_dir ? from_dir : folder + "/" + name;
+		//A template and an autosave of a project without a name come in without a name
+		unnamed = is_template || !name;
 		
 		if(!fileio.is_directory(project_dir)) {
 			std.error((is_template ? "Template" : "Project") + " not found: " + name);
@@ -346,10 +583,10 @@ class shizoengine
 		project_env = std.global("project");
 		
 		//A template comes in without a name: the start up keeps opening the last real project
-		project_env.name = is_template ? None : name;
-		project_env.label.text(is_template ? "<New Project>" : name);
-		
-		if(!is_template)
+		project_env.name = unnamed ? None : name;
+		project_env.label.text(unnamed ? "<New Project>" : name);
+
+		if(!unnamed)
 			fileio.write_string("engine/last_project.dat", name);
 		
 		screen.status_overlay("Loading...");
@@ -357,6 +594,8 @@ class shizoengine
 		load_in_progress = true;
 		
 		load_timer = std.millis();
+		if(blackout)
+			blackout.loading = true;
 		
 		try {
 			//A project without lamps starts with an empty patch, not with the lamps of the project before
@@ -377,7 +616,7 @@ class shizoengine
 						hook(hook_data);
 					}
 					catch(e) {
-						std.error("Cannot load hook: " + hook_name);
+						std.error("Cannot load hook: " + hook_name + ": " + e);
 					}
 				});
 				
@@ -399,7 +638,14 @@ class shizoengine
 		}
 		catch(e) {}
 		
+		//The Blackout button was saved with the project: the outputs stay as they were before the load
+		if(blackout) {
+			blackout.loading = false;
+			blackout.sync();
+		}
 		std.print("Loading took: ", (std.millis() - load_timer) / 1000.0, " seconds.");
+		//The first autosave of this project comes a full interval later
+		autosave_last = std.millis();
 		
 		screen.status_overlay("");
 		

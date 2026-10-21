@@ -65,20 +65,22 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
         // Particle position (2D, in uv space)
         vec2 pos = origin + dir * age * speed;
-        pos.y += 0.5 * gravity * age * age; // gravity pulls sparks downward
+        pos.y -= 0.5 * gravity * age * age; // gravity pulls sparks down (uv.y points up)
 
         // Lifetime fade: alpha decays over spark_life
         float life = clamp(1.0 - age / spark_life, 0.0, 1.0);
 
-        // Distance based falloff (soft point + glow)
-        vec2 d = uv - pos;
+        // Distance based falloff (soft point + glow). Spark size 1 is a spark of 1 % of the picture's height: it was
+        // used as a radius in uv units, so every spark covered the whole picture (#436)
+        vec2 d = (uv - pos) * vec2(iResolution.x / iResolution.y, 1.0);
         float dist = length(d);
-        float core = smoothstep(spark_size, 0.0, dist);
-        float halo = exp(-dist * dist / (0.001 + 0.01 * spark_glow)) * spark_glow;
+        float r = 0.01 * spark_size;
+        float core = smoothstep(r, 0.0, dist);
+        float halo = exp(-dist * dist / (r * r * (1.0 + 40.0 * spark_glow))) * spark_glow;
         float a = core * life + halo * life;
 
         col += spark_color * a;
     }
 
-    fragColor = vec4(col, 1.0);
+    fragColor = vec4(min(col, vec3(1.0)), 1.0);
 }

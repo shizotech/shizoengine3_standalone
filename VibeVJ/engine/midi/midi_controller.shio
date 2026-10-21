@@ -1,0 +1,769 @@
+#include "midi_layout"
+
+//Issue #343: a virtual MIDI controller on the screen. It draws a layout (midi_layout.shio) into one widget and plays it
+//with the mouse: what is turned, pushed or hit goes into the virtual MIDI device (device.input), so MIDI learn and the
+//learned controls get it like from hardware. What the app sends back to the device (a learned control that moves by
+//itself, MIDI backpropagate) comes in through device.on_output and moves the element: a knob follows, a pad lights.
+//Edit mode: drag an element to move it, its lower right corner to size it (snapped to MIDI_CTRL_SNAP). Not in show mode.
+//Mappings move with the element: when an element gets another number (properties, an agent, learn_from_hardware), the
+//controls mapped to its old number on the virtual device get the new one. midi_move_mappings() moves all mappings of
+//one device to another, e.g. to the real controller whose numbers the elements learned.
+//
+//  c = midi_controller(parent_widget, nanogui.virtual_midi_device("Shizo Virtual MIDI"));
+//  c.set_layout(midi_layout_default());
+//  c.set_value("knob1", 0.5);           //as if turned: sends CC 21 = 64
+//  c.on_change = [](id, cell, value) {}; //every value the controller sends
+
+MIDI_CTRL_SNAP = 8;
+MIDI_CTRL_ACCENT = vec4f(0.616, 0.522, 1.0, 1.0);
+MIDI_CTRL_FACE = vec4f(0.16, 0.16, 0.18, 1.0);
+MIDI_CTRL_EDGE = vec4f(1.0, 1.0, 1.0, 0.10);
+MIDI_CTRL_TEXT = vec4f(1.0, 1.0, 1.0, 0.75);
+MIDI_CTRL_DIM = vec4f(1.0, 1.0, 1.0, 0.35);
+MIDI_CTRL_SELECT = vec4f(1.0, 0.82, 0.35, 0.9);
+//NanoVG text alignment
+MIDI_CTRL_ALIGN_CENTER_MIDDLE = 2 | 16;
+
+//Two messages as a mapping names them ([status, channel, number]); note on and note off are both "the note"
+midi_same_message(a, b) {
+	ta = a.status & 0xF0;
+	tb = b.status & 0xF0;
+	if(ta == 0x80)
+		ta = 0x90;
+	if(tb == 0x80)
+		tb = 0x90;
+	return ta == tb && a.channel == b.channel && a.number == b.number;
+}
+
+//Every control mapped to device from gets the same message on device to (the real controller after show prep with
+//the virtual one, or back). Returns how many controls moved
+midi_move_mappings(from, to) {
+	if(!from || !to || from == to)
+		return 0;
+	n = 0;
+	for(c : nanogui.midi_mapped_controls(from)) {
+		m = c.midi_mapping();
+		if(!m)
+			continue;
+		c.midi_mapping([device = to, status = m.status, channel = m.channel, number = m.number]);
+		n++;
+	}
+	return n;
+}
+
+class midi_controller
+{
+	managed widget = None;
+	device = None;
+	layout = [name = "Virtual controller", elements = []];
+	values = [];       //"id" or "id:cell" -> 0..1
+	editing = false;
+	selected = "";     //id of the selected element (edit mode)
+	on_change = None;  //callback(id, cell, value): a value the controller sent
+	on_edit = None;    //callback(): the layout was changed by hand (edit mode)
+
+	learning = None;   //learn_from_hardware: [id =, step =, cc =, on_done =]
+
+	//drag state
+	drag = None;       //[id =, cell =, kind = "turn" / "slide" / "xy" / "move" / "size", from =, start_value =, start =]
+
+	__init__(parent, dev) {
+		device = dev;
+		widget = parent.widget();
+		widget.on_draw([this](){
+			this.draw();
+		});
+		widget.on_mouse_button([this](pos, btn, down, mods){
+			return this.mouse_button(pos, btn, down, mods);
+		});
+		widget.on_mouse_drag([this](pos, rel, btn, mods){
+			return this.mouse_drag(pos, rel, btn, mods);
+		});
+		widget.on_scroll([this](pos, rel){
+			return this.scroll(pos, rel);
+		});
+		if(device)
+			device.on_output([this](status, d1, d2){
+				this.feedback(status, d1, d2);
+			});
+	}
+
+	// =========================================================================
+	// Layout
+	// =========================================================================
+
+	//Sets a layout (checked and completed by midi_layout_normalize). Returns the problems found, [] when none.
+	//carry: an element (same id) that sends other numbers now takes the controls mapped to its old ones along; not
+	//when a project is loaded (its controls come with their own mappings)
+	set_layout(l, carry = false) {
+		r = midi_layout_normalize(l);
+		old = layout;
+		layout = r.layout;
+		if(carry)
+			carry_mappings(old, layout);
+		//the values of elements that are still there stay
+		kept = [];
+		for(k, v : values) {
+			id = k.split(":")[0];
+			if(element(id))
+				kept[k] = v;
+		}
+		values = kept;
+		selected = "";
+		fit();
+		return r.errors;
+	}
+
+	get_layout() {
+		return layout.copy();
+	}
+
+	save(path) {
+		return fileio.write_json(path, layout);
+	}
+
+	load(path) {
+		return set_layout(fileio.read_json(path));
+	}
+
+	element(id) {
+		for(e : layout.elements)
+			if(e.id == id)
+				return e;
+		return None;
+	}
+
+	//The widget is as big as the layout (it sits in a scroll area)
+	fit() {
+		w = 64;
+		h = 64;
+		for(e : layout.elements) {
+			w = math.max(w, e.x + e.w + 8);
+			h = math.max(h, e.y + e.h + 8);
+		}
+		widget.fixed_size(vec2f(w, h));
+		if(widget.parent())
+			widget.parent().refresh_layout();
+	}
+
+	//Adds an element of that type at a free place, with free numbers. Returns its id
+	add_element(type) {
+		bottom = 8;
+		for(e : layout.elements)
+			bottom = math.max(bottom, e.y + e.h + 8);
+		l = layout.copy();
+		l.elements.push_back([type = type, x = 8, y = bottom]);
+		set_layout(l, true);
+		id = layout.elements[layout.elements.size() - 1].id;
+		selected = id;
+		edited();
+		return id;
+	}
+
+	remove_element(id) {
+		for(i = 0; i < layout.elements.size(); i++) {
+			if(layout.elements[i].id == id) {
+				layout.elements.erase(i);
+				if(selected == id)
+					selected = "";
+				fit();
+				edited();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//Changes fields of an element (label, cc, note, channel, mode, rows, cols, ...), checked again afterwards. remove:
+	//names of fields to take away (a button with cc that should send a note again). Mapped controls move along (carry)
+	set_element(id, fields, remove = []) {
+		l = layout.copy();
+		for(i = 0; i < l.elements.size(); i++) {
+			if(l.elements[i].id != id)
+				continue;
+			for(k, v : fields)
+				if(k != "id")
+					l.elements[i][k] = v;
+			for(k : remove)
+				if(k != "id" && l.elements[i].has(k))
+					l.elements[i].erase(k);
+		}
+		keep = selected;
+		errors = set_layout(l, true);
+		selected = keep;
+		edited();
+		return errors;
+	}
+
+	edited() {
+		if(std.is_function(on_edit))
+			on_edit();
+	}
+
+	//The controls mapped on the virtual device to what an element sent before get what it sends now, element by element
+	//(same id) and message by message (an xy: x, y; a grid: pad by pad). Returns how many controls moved
+	carry_mappings(old_layout, new_layout) {
+		if(!device)
+			return 0;
+		moves = [];
+		for(e : new_layout.elements) {
+			o = None;
+			for(x : old_layout.elements)
+				if(x.id == e.id)
+					o = x;
+			if(!o)
+				continue;
+			a = midi_layout_messages(o);
+			b = midi_layout_messages(e);
+			for(i = 0; i < math.min(a.size(), b.size()); i++)
+				if(!midi_same_message(a[i], b[i]) || a[i].relative != b[i].relative)
+					moves.push_back([from = a[i], to = b[i]]);
+		}
+		if(moves.size() == 0)
+			return 0;
+		name = device.device_name();
+		//all found first, then changed: two elements that swap their numbers swap their controls
+		plan = [];
+		for(c : nanogui.midi_mapped_controls(name)) {
+			m = c.midi_mapping();
+			if(!m)
+				continue;
+			for(mv : moves) {
+				if(midi_same_message(m, mv.from)) {
+					plan.push_back([control = c, to = mv.to]);
+					break;
+				}
+			}
+		}
+		for(p : plan)
+			p.control.midi_mapping([device = name, status = p.to.status, channel = p.to.channel, number = p.to.number, relative = p.to.relative]);
+		return plan.size();
+	}
+
+	// =========================================================================
+	// The numbers of a real controller
+	// =========================================================================
+
+	//The element takes the numbers of the next knob, fader or pad moved on a real controller (any device but the
+	//virtual one): a knob / fader / xy a control change (xy: two different ones, x then y), a pad grid the note of its
+	//first pad, a button either. Controls mapped to the element come along. layout.hardware remembers the device, for
+	//midi_move_mappings. on_done(id, device) when it is done. Returns false for an element that sends nothing
+	learn_from_hardware(id, on_done = None) {
+		e = element(id);
+		if(!e || e.type == "label")
+			return false;
+		stop_learning();
+		learning = [id = id, step = 0, cc = 0, on_done = on_done];
+		nanogui.midi_monitor([this](status, d1, d2, dev) {
+			this.hardware_message(status, d1, d2, dev);
+		});
+		return true;
+	}
+
+	stop_learning() {
+		if(!learning)
+			return;
+		learning = None;
+		try {
+			nanogui.midi_monitor(None);
+		}
+		catch(err) {}
+	}
+
+	is_learning(id = "") {
+		return learning && (!id || learning.id == id);
+	}
+
+	hardware_message(status, d1, d2, dev) {
+		if(!learning || (device && dev == device.device_name()))
+			return;
+		type = status & 0xF0;
+		note_on = type == 0x90 && d2 > 0;
+		if(type != 0xB0 && type != 0xE0 && type != 0xD0 && type != 0xC0 && !note_on)
+			return;
+		id = learning.id;
+		e = element(id);
+		if(!e) {
+			stop_learning();
+			return;
+		}
+		fields = [channel = status & 0x0F];
+		remove = [];
+		//pitch bend, pressure and program change only fit their own element, and need no number but the program
+		channel_only = e.type == "bend" || e.type == "pressure" || e.type == "program";
+		if(type == 0xE0 || type == 0xD0 || type == 0xC0) {
+			if((type == 0xE0 && e.type != "bend") || (type == 0xD0 && e.type != "pressure") || (type == 0xC0 && e.type != "program"))
+				return;
+			if(type == 0xC0)
+				fields.program = d1;
+		}
+		else if(channel_only)
+			return;
+		else if(type == 0xB0) {
+			if(e.type == "grid")
+				return; //pads need notes
+			if(e.type == "xy") {
+				if(learning.step == 0) {
+					learning.cc = d1;
+					learning.step = 1;
+					return;
+				}
+				if(d1 == learning.cc)
+					return;
+				fields.cc = learning.cc;
+				fields.cc_y = d1;
+			}
+			else {
+				fields.cc = d1;
+				remove.push_back("note");
+			}
+		}
+		else {
+			if(e.type == "knob" || e.type == "slider" || e.type == "xy")
+				return; //they need control changes
+			if(e.type == "grid")
+				fields.note_base = d1;
+			else {
+				fields.note = d1;
+				remove.push_back("cc");
+			}
+		}
+		done = learning.on_done;
+		stop_learning();
+		layout.hardware = dev;
+		set_element(id, fields, remove);
+		if(std.is_function(done))
+			done(id, dev);
+	}
+
+	// =========================================================================
+	// Values and MIDI
+	// =========================================================================
+
+	key(id, cell) {
+		return cell == 0 ? id : id + ":" + std.string(cell);
+	}
+
+	value(id, cell = 0) {
+		k = key(id, cell);
+		if(values.has(k))
+			return values[k];
+		//a pitch bend rests in the middle
+		e = element(id);
+		return e && e.type == "bend" ? 0.5 : 0.0;
+	}
+
+	is_relative(e) {
+		return e.type == "knob" && e.has("mode") && e.mode == "relative";
+	}
+
+	//As if the element was played: stores the value and sends its message into the device
+	set_value(id, v, cell = 0) {
+		e = element(id);
+		if(!e || e.type == "label")
+			return false;
+		v = math.clamp(v, 0.0, 1.0);
+		k = key(id, cell);
+		old = values.has(k) ? values[k] : -1.0;
+		values[k] = v;
+		if(is_relative(e)) {
+			//an endless encoder sends the steps between the old and the new value (two's complement: 1..63 up, 127..65 down)
+			steps = std.int(v * 127.0 + 0.5) - std.int(math.max(old, 0.0) * 127.0 + 0.5);
+			if(steps == 0)
+				return true;
+			steps = math.clamp(steps, -63, 63);
+			if(device)
+				device.input(0xB0 | e.channel, e.cc, steps > 0 ? steps : 128 + steps);
+			if(std.is_function(on_change))
+				on_change(id, cell, v);
+			return true;
+		}
+		m = midi_layout_message(e, cell, v);
+		//a knob dragged slowly gives the same 0..127 (a bend the same 14 bits) many times: sent once
+		if(old >= 0 && (midi_layout_sends_cc(e) || e.type == "bend" || e.type == "pressure")
+			&& std.string(midi_layout_message(e, cell, old)) == std.string(m))
+			return true;
+		//a program button lights, the others of its channel go off (sent only when pressed)
+		if(e.type == "program") {
+			if(v <= 0.0)
+				return true;
+			for(o : layout.elements)
+				if(o.type == "program" && o.channel == e.channel && o.id != e.id)
+					values[o.id] = 0.0;
+		}
+		if(device)
+			device.input(m[0], m[1], m[2]);
+		if(std.is_function(on_change))
+			on_change(id, cell, v);
+		return true;
+	}
+
+	//MIDI learn in one step: control (a nanogui control) learns what the element sends, as if learn mode was on, the
+	//control picked and the element played. The control keeps its value; the element shows it afterwards.
+	//Returns the mapping of the control ([device, status, channel, number]) or a text that says why it failed
+	map_element(id, control, cell = 0) {
+		e = element(id);
+		if(!e)
+			return "there is no element '" + std.string(id) + "'";
+		if(e.type == "label")
+			return "a label sends nothing";
+		if(!device)
+			return "the controller has no device";
+		if(!control)
+			return "there is no such control";
+		if(e.type == "grid" && (cell < 0 || cell >= e.rows * e.cols))
+			return "the grid '" + id + "' has no cell " + std.string(cell);
+		m = midi_layout_message(e, e.type == "grid" || e.type == "xy" ? cell : 0, value(id, cell));
+		//a note with velocity 0 as note on: it is learned as a note like a pad hit, and the control gets 0
+		if(midi_layout_sends_notes(e))
+			m[0] = 0x90 | e.channel;
+		//learning sets the control to what the element sent; it gets its own value back, which goes back to the
+		//element (MIDI backpropagate), so nothing jumps
+		before = control.value();
+		was = nanogui.midi_learn();
+		nanogui.midi_learn(true);
+		control.midi_learn(true);
+		device.input(m[0], m[1], m[2]);
+		control.midi_learn(false);
+		nanogui.midi_learn(was);
+		control.value(before);
+		msgs = midi_layout_messages(e);
+		want = msgs[math.min(math.max(cell, 0), msgs.size() - 1)];
+		mapping = control.midi_mapping();
+		if(!mapping || mapping.device != device.device_name() || mapping.number != want.number || mapping.channel != e.channel)
+			return "the control did not learn it (is MIDI mapping of another device on?)";
+		//an endless knob: the control moves by its steps
+		if(want.relative) {
+			mapping.relative = want.relative;
+			control.midi_mapping(mapping);
+		}
+		return mapping;
+	}
+
+	//What the app sends to the device: the element shows it, nothing is sent again
+	feedback(status, d1, d2) {
+		for(h : midi_layout_feedback(layout, status, d1, d2))
+			values[key(h.element.id, h.cell)] = h.value;
+	}
+
+	// =========================================================================
+	// Mouse
+	// =========================================================================
+
+	//The element under pos and the cell of a grid: [element =, cell =], None on empty space
+	hit(pos) {
+		for(i = layout.elements.size() - 1; i >= 0; i--) {
+			e = layout.elements[i];
+			if(pos.x < e.x || pos.y < e.y || pos.x >= e.x + e.w || pos.y >= e.y + e.h)
+				continue;
+			cell = 0;
+			if(e.type == "grid") {
+				g = grid_rect(e);
+				cx = std.int((pos.x - g.x) * e.cols / g.w);
+				cy = std.int((pos.y - g.y) * e.rows / g.h);
+				if(cx < 0 || cy < 0 || cx >= e.cols || cy >= e.rows)
+					return [element = e, cell = -1];
+				cell = cy * e.cols + cx;
+			}
+			return [element = e, cell = cell];
+		}
+		return None;
+	}
+
+	can_edit() {
+		return editing && !nanogui.show_mode();
+	}
+
+	mouse_button(pos, btn, down, mods) {
+		if(btn != 0)
+			return false;
+		if(!down) {
+			if(drag && drag.kind == "press") {
+				e = element(drag.id);
+				if(e && e.mode != "toggle" && e.type != "program")
+					set_value(drag.id, 0.0, drag.cell);
+			}
+			//a pitch bend springs back to the middle, pressure ends when let go
+			if(drag && drag.kind == "slide") {
+				e = element(drag.id);
+				if(e && e.type == "bend" && e.spring)
+					set_value(e.id, 0.5);
+				if(e && e.type == "pressure")
+					set_value(e.id, 0.0);
+			}
+			moved = drag && (drag.kind == "move" || drag.kind == "size");
+			drag = None;
+			if(moved) {
+				fit();
+				edited();
+			}
+			return true;
+		}
+		h = hit(pos);
+		if(can_edit()) {
+			selected = h ? h.element.id : "";
+			if(!h)
+				return true;
+			e = h.element;
+			corner = pos.x > e.x + e.w - 12 && pos.y > e.y + e.h - 12;
+			drag = [id = e.id, cell = 0, kind = corner ? "size" : "move", from = pos, start = [x = e.x, y = e.y, w = e.w, h = e.h]];
+			return true;
+		}
+		if(!h || h.cell < 0)
+			return false;
+		e = h.element;
+		if(e.type == "knob") {
+			drag = [id = e.id, cell = 0, kind = "turn", from = pos, start_value = value(e.id)];
+		}
+		else if(e.type == "slider" || e.type == "pressure" || e.type == "bend") {
+			drag = [id = e.id, cell = 0, kind = "slide"];
+			slide(e, pos);
+		}
+		else if(e.type == "xy") {
+			drag = [id = e.id, cell = 0, kind = "xy"];
+			slide_xy(e, pos);
+		}
+		else if(e.type == "button" || e.type == "pad" || e.type == "grid" || e.type == "program") {
+			if(e.type != "grid" && e.mode == "toggle")
+				set_value(e.id, value(e.id) > 0.5 ? 0.0 : 1.0);
+			else
+				set_value(e.id, 1.0, h.cell);
+			drag = [id = e.id, cell = h.cell, kind = "press"];
+		}
+		return true;
+	}
+
+	mouse_drag(pos, rel, btn, mods) {
+		if(!drag)
+			return false;
+		e = element(drag.id);
+		if(!e)
+			return false;
+		if(drag.kind == "turn") {
+			//up turns right; Shift for fine steps
+			range = mods == 1 ? 1500.0 : 150.0;
+			set_value(e.id, drag.start_value + (drag.from.y - pos.y) / range);
+		}
+		else if(drag.kind == "slide")
+			slide(e, pos);
+		else if(drag.kind == "xy")
+			slide_xy(e, pos);
+		else if(drag.kind == "move") {
+			e.x = math.max(0, snap(drag.start.x + pos.x - drag.from.x));
+			e.y = math.max(0, snap(drag.start.y + pos.y - drag.from.y));
+		}
+		else if(drag.kind == "size") {
+			e.w = math.max(16, snap(drag.start.w + pos.x - drag.from.x));
+			e.h = math.max(16, snap(drag.start.h + pos.y - drag.from.y));
+		}
+		return true;
+	}
+
+	scroll(pos, rel) {
+		if(can_edit())
+			return false;
+		h = hit(pos);
+		if(!h)
+			return false;
+		e = h.element;
+		if(e.type != "knob" && e.type != "slider" && e.type != "pressure")
+			return false;
+		set_value(e.id, value(e.id) + rel.y / 64.0);
+		return true;
+	}
+
+	snap(v) {
+		return std.int(v / MIDI_CTRL_SNAP + 0.5) * MIDI_CTRL_SNAP;
+	}
+
+	slide(e, pos) {
+		track = slider_track(e);
+		if(track.horizontal)
+			set_value(e.id, (pos.x - track.x) / math.max(1, track.w));
+		else
+			set_value(e.id, 1.0 - (pos.y - track.y) / math.max(1, track.h));
+	}
+
+	slide_xy(e, pos) {
+		set_value(e.id, (pos.x - e.x) / math.max(1, e.w), 0);
+		set_value(e.id, 1.0 - (pos.y - e.y) / math.max(1, e.h - 16), 1);
+	}
+
+	//The track of a fader, a pressure or a pitch bend; a bend wider than high lies (horizontal)
+	slider_track(e) {
+		if(e.type == "bend" && e.w > e.h)
+			return [x = e.x + 8, y = e.y + (e.h - 16) / 2 - 3, w = e.w - 16, h = 6, horizontal = true];
+		return [x = e.x + e.w / 2 - 3, y = e.y + 6, w = 6, h = e.h - 30, horizontal = false];
+	}
+
+	grid_rect(e) {
+		top = e.label ? 20 : 0;
+		return [x = e.x, y = e.y + top, w = e.w, h = e.h - top];
+	}
+
+	// =========================================================================
+	// Drawing (NanoVG, in the coordinates of the widget)
+	// =========================================================================
+
+	box(x, y, w, h, r, color) {
+		nanogui.nvgBeginPath();
+		nanogui.nvgRoundedRect(vec2f(x, y), vec2f(w, h), r);
+		nanogui.nvgFillColor(color);
+		nanogui.nvgFill();
+	}
+
+	outline(x, y, w, h, r, color, width) {
+		nanogui.nvgBeginPath();
+		nanogui.nvgRoundedRect(vec2f(x, y), vec2f(w, h), r);
+		nanogui.nvgStrokeColor(color);
+		nanogui.nvgStrokeWidth(width);
+		nanogui.nvgStroke();
+	}
+
+	text(x, y, s, size, color) {
+		nanogui.nvgFontFace("sans");
+		nanogui.nvgFontSize(size);
+		nanogui.nvgTextAlign(MIDI_CTRL_ALIGN_CENTER_MIDDLE);
+		nanogui.nvgFillColor(color);
+		nanogui.nvgText(vec2f(x, y), s);
+	}
+
+	draw() {
+		for(e : layout.elements) {
+			if(e.type == "knob")
+				draw_knob(e);
+			else if(e.type == "slider" || e.type == "pressure")
+				draw_slider(e);
+			else if(e.type == "bend")
+				draw_bend(e);
+			else if(e.type == "program")
+				draw_button(e);
+			else if(e.type == "button" || e.type == "pad")
+				draw_button(e);
+			else if(e.type == "grid")
+				draw_grid(e);
+			else if(e.type == "xy")
+				draw_xy(e);
+			else if(e.type == "label")
+				text(e.x + e.w / 2, e.y + e.h / 2, e.label, 14, MIDI_CTRL_TEXT);
+			if(editing) {
+				outline(e.x, e.y, e.w, e.h, 4, e.id == selected ? MIDI_CTRL_SELECT : MIDI_CTRL_DIM, e.id == selected ? 2 : 1);
+				//the corner that sizes it
+				box(e.x + e.w - 8, e.y + e.h - 8, 8, 8, 1, e.id == selected ? MIDI_CTRL_SELECT : MIDI_CTRL_DIM);
+			}
+		}
+	}
+
+	number_text(e) {
+		if(e.type == "bend")
+			return "PB ch" + std.string(e.channel + 1);
+		if(e.type == "pressure")
+			return "AT ch" + std.string(e.channel + 1);
+		if(e.type == "program")
+			return "PG " + std.string(e.program);
+		if(is_relative(e))
+			return "CC " + std.string(e.cc) + " rel";
+		if(midi_layout_sends_cc(e))
+			return "CC " + std.string(e.cc);
+		if(e.type == "grid")
+			return "N " + std.string(e.note_base) + "+";
+		return "N " + std.string(e.note);
+	}
+
+	draw_knob(e) {
+		size = math.min(e.w, e.h - 14);
+		cx = e.x + e.w / 2;
+		cy = e.y + size / 2 + 2;
+		r = size / 2 - 4;
+		v = value(e.id);
+		a0 = 0.75 * math.PI;
+		a1 = a0 + 1.5 * math.PI;
+		nanogui.nvgBeginPath();
+		nanogui.nvgArc(vec2f(cx, cy), r, a0, a1, 2);
+		nanogui.nvgStrokeColor(MIDI_CTRL_EDGE);
+		nanogui.nvgStrokeWidth(4);
+		nanogui.nvgStroke();
+		if(v > 0.001) {
+			nanogui.nvgBeginPath();
+			nanogui.nvgArc(vec2f(cx, cy), r, a0, a0 + v * 1.5 * math.PI, 2);
+			nanogui.nvgStrokeColor(MIDI_CTRL_ACCENT);
+			nanogui.nvgStrokeWidth(4);
+			nanogui.nvgStroke();
+		}
+		box(cx - r + 6, cy - r + 6, (r - 6) * 2, (r - 6) * 2, r - 6, MIDI_CTRL_FACE);
+		//the pointer
+		a = a0 + v * 1.5 * math.PI;
+		nanogui.nvgBeginPath();
+		nanogui.nvgMoveTo(vec2f(cx, cy));
+		nanogui.nvgLineTo(vec2f(cx + math.cos(a) * (r - 7), cy + math.sin(a) * (r - 7)));
+		nanogui.nvgStrokeColor(MIDI_CTRL_TEXT);
+		nanogui.nvgStrokeWidth(2);
+		nanogui.nvgStroke();
+		text(cx, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+	}
+
+	draw_slider(e) {
+		t = slider_track(e);
+		v = value(e.id);
+		box(t.x, t.y, t.w, t.h, 3, MIDI_CTRL_EDGE);
+		box(t.x, t.y + t.h * (1.0 - v), t.w, t.h * v, 3, MIDI_CTRL_ACCENT);
+		box(e.x + 4, t.y + t.h * (1.0 - v) - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
+		text(e.x + e.w / 2, e.y + e.h - 8, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+	}
+
+	draw_button(e) {
+		v = value(e.id);
+		box(e.x, e.y, e.w, e.h, 6, v > 0.001 ? MIDI_CTRL_ACCENT : MIDI_CTRL_FACE);
+		outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 1, 6, MIDI_CTRL_EDGE, 1);
+		text(e.x + e.w / 2, e.y + e.h / 2, e.label ? e.label : number_text(e), 12, MIDI_CTRL_TEXT);
+	}
+
+	draw_grid(e) {
+		g = grid_rect(e);
+		if(e.label)
+			text(e.x + e.w / 2, e.y + 9, e.label, 12, MIDI_CTRL_TEXT);
+		cw = g.w / e.cols;
+		chh = g.h / e.rows;
+		for(row = 0; row < e.rows; row++) {
+			for(col = 0; col < e.cols; col++) {
+				cell = row * e.cols + col;
+				v = value(e.id, cell);
+				color = v > 0.001 ? vec4f(MIDI_CTRL_ACCENT.x, MIDI_CTRL_ACCENT.y, MIDI_CTRL_ACCENT.z, 0.35 + 0.65 * v) : MIDI_CTRL_FACE;
+				box(g.x + col * cw + 2, g.y + row * chh + 2, cw - 4, chh - 4, 4, color);
+			}
+		}
+	}
+
+	draw_xy(e) {
+		box(e.x, e.y, e.w, e.h - 16, 4, MIDI_CTRL_FACE);
+		x = e.x + value(e.id, 0) * e.w;
+		y = e.y + (1.0 - value(e.id, 1)) * (e.h - 16);
+		nanogui.nvgBeginPath();
+		nanogui.nvgCircle(vec2f(x, y), 6);
+		nanogui.nvgFillColor(MIDI_CTRL_ACCENT);
+		nanogui.nvgFill();
+		text(e.x + e.w / 2, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+	}
+
+	draw_bend(e) {
+		t = slider_track(e);
+		v = value(e.id);
+		box(t.x, t.y, t.w, t.h, 3, MIDI_CTRL_EDGE);
+		if(t.horizontal) {
+			mid = t.x + t.w / 2;
+			at = t.x + t.w * v;
+			box(math.min(mid, at), t.y, math.abs(at - mid), t.h, 3, MIDI_CTRL_ACCENT);
+			box(mid - 1, t.y - 6, 2, t.h + 12, 1, MIDI_CTRL_DIM);
+			box(at - 5, t.y - 8, 10, t.h + 16, 3, MIDI_CTRL_TEXT);
+		}
+		else {
+			mid = t.y + t.h / 2;
+			at = t.y + t.h * (1.0 - v);
+			box(t.x, math.min(mid, at), t.w, math.abs(at - mid), 3, MIDI_CTRL_ACCENT);
+			box(t.x - 6, mid - 1, t.w + 12, 2, 1, MIDI_CTRL_DIM);
+			box(e.x + 4, at - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
+		}
+		text(e.x + e.w / 2, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+	}
+
+}

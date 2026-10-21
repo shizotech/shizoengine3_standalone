@@ -78,6 +78,8 @@ What can become a clip is on [Generators](Generators.md#what-a-generator-is) and
   you dragged goes, unless you hold Ctrl.
 - **Delete:** select the clip. In the *Layer* window, click × (tooltip *Remove*) on every entry of its stack. When
   the last entry goes, the clip goes. There is no other way to delete a clip.
+- **Undo:** Ctrl + Z (or the undo button of the top bar) takes back each of these, also a clip you made and an asset
+  you stacked onto a clip: see [Undo and redo](The-Screen.md#undo-and-redo). A clip that comes back is not live.
 
 ### The stack of a clip
 

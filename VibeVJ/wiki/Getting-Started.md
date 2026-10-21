@@ -54,8 +54,8 @@ All project actions are in the *Projects* tab of the sidebar, the first tab. Wha
 |---|---|
 | *New project* | Asks "Create a new project?" and then clears all views, generators and links. |
 | *Open…* | Asks for a project name and opens that project. |
-| *Save* | Saves the project. A new project without a name first asks for one. |
-| *Save as…* | Asks for a new name and saves the project under it. From then on you work in the new project. |
+| *Save* | Saves the project. A new project without a name first asks for one. Key: Ctrl + S. |
+| *Save as…* | Asks for a new name and saves the project under it. From then on you work in the new project. Key: Ctrl + Shift + S. |
 | *Exit* | Saves the project and closes VibeVJ. |
 | *Projects* | Every saved project, newest first. Click one to open it. See [Open a project](#open-a-project). |
 | *Templates* | Projects to start from. Click one to open it as a new project. See [Templates](#templates). |
@@ -70,6 +70,24 @@ To save a project for the first time:
 **Exit and unsaved projects:** *Exit* saves a project that has a name and closes VibeVJ. A new project that was never
 saved first asks "Save the new project before quitting?". *Yes* opens the dialog *Save project*, *No* closes VibeVJ
 and your work is lost, *Cancel* keeps VibeVJ open. The close button (✕) of the top bar does the same.
+
+### Autosave
+
+Every five minutes VibeVJ also writes the open project into the folder `VibeVJ/autosave/`, with or without a name. It
+does not touch your project folder: only *Save* does that. *Save* and a normal *Exit* delete the autosave again.
+
+In [show mode](Timeline.md#show-mode) there is no autosave: the show is built and only played, and a save could make
+a frame late. The next autosave comes five minutes after you leave show mode. Save before the show.
+
+When VibeVJ did not close properly (a crash, a power cut), the next start asks "VibeVJ did not close properly. Restore
+the autosave …?":
+
+- *Yes* opens the autosave, under the name of its project. Look it over, then *Save* to keep it. Until then the autosave
+  stays, in case VibeVJ stops again.
+- *No* deletes the autosave and opens the project as it was last saved.
+
+How often it saves, or not at all, is set in [*Settings* › *Project* › *Autosave*](Settings.md#autosave). An autosave
+holds the same files as a project folder; to keep one by hand, copy `autosave/` into `projects/` under a new name.
 
 ### What is saved with a project
 

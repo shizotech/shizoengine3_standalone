@@ -41,5 +41,5 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
     float grid = smoothstep((sin(length(uv.y-0.5)*(800.*length(uv.y+0.5))) * sin(length(uv.x+0.5)*(800.*length(uv.x-0.5)))), 0.0, 1.0);
     outColor.rgb += (outColor.rgb * vec3(grid) * 0.6);
 
-    fragColor = outColor;
+    fragColor = vec4(outColor.rgb, 1.0); // alpha stayed 0: the picture was invisible in the preview and in a mix (#436)
 }

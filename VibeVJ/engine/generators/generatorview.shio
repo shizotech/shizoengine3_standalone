@@ -66,8 +66,10 @@ class generatorview
 
 			path = fileio.relative_path_cwd(payload.path);
 			item = this.add_generator(area,path,pos);
-			if(item)
+			if(item) {
 				this.settle_new(item);
+				this.history_step("Add generator", [], [[view = this.uid, guid = item.guid]], []);
+			}
 			//Handle payload.paths for multi-file later...
 
 			return true;
@@ -100,6 +102,11 @@ class generatorview
 			this.marquee_from = pos;
 			this.marquee_to = pos;
 			return true; //the drag belongs to the canvas now
+		});
+		//The canvas takes no keys. Without this, nanogui's default (a widget without children keeps every key) made an
+		//empty canvas that had the focus swallow Ctrl+Z / Ctrl+Y, e.g. right after the undo moved its last generator out
+		content.on_keyboard([](key, scancode, action, mods){
+			return false;
 		});
 		content.on_mouse_drag([this, content](pos, rel, btn, mods){
 			if(std.is_none(this.marquee_from))
@@ -256,6 +263,7 @@ class generatorview
 		deselect(guid);
 		items.erase(guid);
 		gen.on_close = None;
+		gen.on_user_close = None;
 		return gen;
 	}
 
@@ -273,6 +281,10 @@ class generatorview
 		origin = source.items.has(drag.grabbed) ? source.items[drag.grabbed].window.position() : None;
 
 		moved = [];
+		//For undo (#387): generators that went to this view [guid, from, from_pos, to, to_pos], copies made here
+		//[view, guid]. Moves inside one view only change positions and are no step
+		step_moves = [];
+		step_copies = [];
 		for(i = 0; i < drag.guids.size(); i++) {
 			guid = drag.guids[i];
 			if(!source.items.has(guid))
@@ -285,8 +297,10 @@ class generatorview
 
 			if(copy) {
 				made = copy_generator(gen, target);
-				if(made)
+				if(made) {
 					moved.push_back(made.guid);
+					step_copies.push_back([view = uid, guid = made.guid]);
+				}
 			}
 			else if(source.uid == uid) {
 				gen.window.position(target);
@@ -295,12 +309,18 @@ class generatorview
 			}
 			else {
 				source.forget(guid);
-				gen.window.move_to(area);
-				gen.window.position(target);
-				adopt_generator(gen);
-				clamp_item(gen);
+				receive(gen, target);
 				moved.push_back(gen.guid);
+				now = gen.window.position(); //clamped
+				step_moves.push_back([guid = gen.guid, from = source.uid, from_pos = [x = at.x, y = at.y], to = uid, to_pos = [x = now.x, y = now.y]]);
 			}
+		}
+
+		//One step of the history: the history runs it in the main program, by the uids and guids, as this view may
+		//be gone by then (generators.shio, generator_step)
+		if(step_moves.size() > 0 || step_copies.size() > 0) {
+			count = step_moves.size() + step_copies.size();
+			history_step((step_copies.size() > 0 ? "Copy " : "Move ") + (count == 1 ? "generator" : "generators"), step_moves, step_copies, []);
 		}
 
 		//What arrived is the selection here
@@ -310,6 +330,59 @@ class generatorview
 		for(i = 0; i < moved.size(); i++)
 			select(moved[i]);
 		return true;
+	}
+
+	//A generator that comes alive from another view of this kind lands at pos (a drop, and the undo / redo of one)
+	receive(gen, pos) {
+		gen.window.move_to(area);
+		gen.window.position(pos);
+		adopt_generator(gen);
+		clamp_item(gen);
+	}
+
+	//One step of the undo history (generators.shio, generator_step): moves [guid, from, from_pos, to, to_pos], generators
+	//made [view, guid] and generators deleted [view, guid, kept], by the uids of the views and the guids, as a view may be
+	//gone by then
+	history_step(name, moves, made, deleted) {
+		env_step = std.global("engine").env.generator_step;
+		if(std.is_function(env_step))
+			env_step(name, moves, made, deleted);
+	}
+
+	//The close button of a generator (#350): it is deleted as one step, with what is needed to make it again, its links
+	//to other generators included
+	user_close(guid) {
+		kept = remove_generator(guid, true);
+		if(!std.is_none(kept))
+			history_step("Delete generator", [], [], [[view = uid, guid = guid, kept = kept]]);
+	}
+
+	//The undo of a copy (#387) or of an added generator, the redo of a deleted one (#350): the generator is deleted.
+	//Returns what restore_generator needs to make it again; links: with its links to other generators
+	remove_generator(guid, links = false) {
+		if(!items.has(guid))
+			return None;
+		gen = items[guid];
+		kept = [path = gen.get_relative_path(), guid = guid, state = gen.save_state(), node = gen.node.serialize_json(links)];
+		deselect(guid);
+		items.erase(guid);
+		std.free(gen);
+		return kept;
+	}
+
+	//The redo of a copy: made again of what remove_generator kept, with the same guid, so the steps after it (links
+	//to its controls) find it again
+	restore_generator(kept) {
+		pos = kept.state.has("x") ? vec2f(kept.state.x, kept.state.y) : vec2f(0, 0);
+		made = add_generator(area, kept.path, pos, kept.guid);
+		if(!made)
+			return None;
+		try {
+			made.load_state(kept.state);
+			made.node.deserialize_json(kept.node, true);
+		}
+		catch(e) {}
+		return made;
 	}
 
 	//A copy of a generator at pos: a new one of the same asset with the state and the controls of the original, as a
@@ -431,6 +504,9 @@ class generatorview
 					std.free(item);
 				}
 			};
+			item.on_user_close = [this, item_guid]() {
+				this.user_close(item_guid);
+			};
 
 			//A click on its header selects it (Ctrl / Shift + click adds or takes away), Alt + drag takes it out
 			window = item.window;
@@ -476,9 +552,9 @@ class generatorview
 		menu = zoom_chip.popup().content().layout(nanogui.layout_vertical());
 		menu.fixed_width(230);
 		entries = [
-			[label = "Show everything", hint = "Ctrl+0", icon = "expand", act = "all"],
+			[label = "Show everything", hint = nanogui.key_text("Ctrl+0"), icon = "expand", act = "all"],
 			[label = "Show the selection", hint = "", icon = "object_group", act = "selection"],
-			[label = "100 %", hint = "Ctrl+1", icon = "search", act = "100"],
+			[label = "100 %", hint = nanogui.key_text("Ctrl+1"), icon = "search", act = "100"],
 			[label = "Zoom in", hint = "Wheel", icon = "search_plus", act = "in"],
 			[label = "Zoom out", hint = "Wheel", icon = "search_minus", act = "out"],
 		];

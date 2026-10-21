@@ -69,7 +69,9 @@ import tgbot;
 
 TG_TRUSTED_KEY = "trusted_chats";
 TG_MAX_MSG = 3900;
-TG_REPORT_CHARS = 900;
+TG_REPORT_CHARS = 2500;      // a report longer than this goes in full as an attached .md file
+TG_NOTIFY_CHARS = 3500;      // the same for a notify
+TG_CAPTION_CHARS = 1000;     // Telegram allows 1024 characters of caption
 TG_DRAFT_MS = 3000;
 TG_MAX_QUEUED_OUT = 100;
 TG_DEDUPE_MS = 1500;
@@ -86,7 +88,7 @@ class TelegramRouter : Router
     tg_path = "";
     tg_chats = [];          // [{chatid, name, added}] — the trust list
     tg_queue = [];          // inbound turns: [chatdata, text]
-    tg_out = [];            // outbound event texts (never sent on the shizonet thread)
+    tg_out = [];            // outbound event texts, or [text, files] (never sent on the shizonet thread)
     tg_thread = None;
     tg_running = false;
     tg_active = None;       // the chat of the turn currently streaming
@@ -734,7 +736,7 @@ class TelegramRouter : Router
         }
 
         for(f : files) {
-            out += "\n\nAttached file '" + f.name + "' (" + std.string(f.size) + " bytes, kept at " + f.path + "). It is attached verbatim to the task you delegate in this turn; do not copy it into the task text.\n````\n" + tg_clip(f.content, TG_FILE_PROMPT_CHARS) + "\n````";
+            out += "\n\nAttached file '" + f.name + "' (" + std.string(f.bytes) + " bytes, kept at " + f.path + "). It is attached verbatim to the task you delegate in this turn; do not copy it into the task text.\n````\n" + tg_clip(f.content, TG_FILE_PROMPT_CHARS) + "\n````";
         }
 
         for(n : notes) {
@@ -785,7 +787,8 @@ class TelegramRouter : Router
         name = std.string(tg_get(doc, "filename", "file"));
         size = std.int(tg_get(doc, "filesize", 0));
         mime = std.string(tg_get(doc, "mimetype", ""));
-        fail = [ok = false, name = name, content = "", path = "", size = size, error = ""];
+        //"bytes", not "size": a json literal drops a key named size (it is the size() method)
+        fail = [ok = false, name = name, content = "", path = "", bytes = size, error = ""];
 
         if(size > TG_FILE_MAX) {
             fail.error = "too large (" + std.string(size / 1024) + " KB, the limit is " + std.string(TG_FILE_MAX / 1024) + " KB)";
@@ -834,7 +837,7 @@ class TelegramRouter : Router
             path = "(not saved: " + std.string(e) + ")";
         }
 
-        return [ok = true, name = name, content = content, path = path, size = content.length(), error = ""];
+        return [ok = true, name = name, content = content, path = path, bytes = content.length(), error = ""];
     }
 
     // /goals [node] and /goal <action> <id> [node] (ask the nodes: worker thread)
@@ -923,11 +926,20 @@ class TelegramRouter : Router
 
         for(tg_out.size()) {
             cs = std.critical_section_named(tg_lock);
-            txt = tg_out[0];
+            item = tg_out[0];
             tg_out.erase(0);
             cs.release();
 
-            tg_broadcast(std.string(txt));
+            if(std.is_json(item)) {
+                tg_broadcast(std.string(item.text ?? ""));
+                files = item.files ?? [];
+                for(i = 0; i < files.size(); i++) {
+                    tg_broadcast_file(files[i]);
+                }
+            }
+            else {
+                tg_broadcast(std.string(item));
+            }
             n++;
         }
 
@@ -982,11 +994,77 @@ class TelegramRouter : Router
         return list.size();
     }
 
-    // queue an event notification (safe from any thread, never blocks)
-    tg_notify(txt)
+    // a document for every trusted chat. f: [name, caption, text] (a long report) or [name, caption, data]
+    // (base64, a file of a node's send_file). It is written next to the trust file, sent, and removed.
+    tg_broadcast_file(f)
+    {
+        name = tg_safe_name(std.string(f.name ?? "file"));
+        path = tg_inbox + "/out-" + std.string(std.millis()) + "-" + name;
+
+        try {
+            if(!fileio.exists(tg_inbox)) {
+                fileio.mkdir(tg_inbox);
+            }
+
+            if(f.has("data")) {
+                fileio.write_file(path, std.base64_decode(std.string(f.data)));
+            }
+            else {
+                fileio.write_string(path, std.string(f.text ?? ""));
+            }
+        }
+        catch(e) {
+            std.error("[telegram] cannot write the attachment ", name, ": ", e);
+            return 0;
+        }
+
+        caption = tg_clip(std.string(f.caption ?? ""), TG_CAPTION_CHARS);
+        list = tg_chat_list();
+
+        for(i = 0; i < list.size(); i++) {
+            tg_send_file([chatid = std.int(list[i].chatid)], path, caption);
+        }
+
+        try {
+            fileio.remove(path);
+        }
+        catch(e) {}
+
+        return list.size();
+    }
+
+    tg_send_file(chatdata, path, caption = "")
+    {
+        if(!tg_bot) {
+            std.print("[telegram:", std.string(chatdata.chatid ?? 0), "] (document) ", path, " ", caption, "\n");
+            return false;
+        }
+
+        try {
+            opts = [];
+            if(caption) {
+                opts.caption = caption;
+            }
+            tg_bot.send_document(chatdata, path, opts);
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram] sending the document ", path, " to ", std.string(chatdata.chatid ?? 0), " failed: ", e);
+            return false;
+        }
+    }
+
+    // queue an event notification (safe from any thread, never blocks).
+    // files: documents sent after the text (see tg_broadcast_file)
+    tg_notify(txt, files = None)
     {
         cs = std.critical_section_named(tg_lock);
-        tg_out.push_back(std.string(txt));
+        if(files && files.size()) {
+            tg_out.push_back([text = std.string(txt), files = files]);
+        }
+        else {
+            tg_out.push_back(std.string(txt));
+        }
         for(tg_out.size() > TG_MAX_QUEUED_OUT) {
             tg_out.erase(0);
         }
@@ -1001,7 +1079,7 @@ class TelegramRouter : Router
             return;
         }
 
-        tg_notify(msg);
+        tg_notify(msg, tg_event_files(e));
     }
 
     // What deserves the owner's attention. Every terminal state is in: a task
@@ -1015,6 +1093,11 @@ class TelegramRouter : Router
         }
 
         if(kind == "notify") {
+            return true;
+        }
+
+        // a document a node's agent sent with send_file
+        if(kind == "file") {
             return true;
         }
 
@@ -1045,6 +1128,45 @@ class TelegramRouter : Router
     //     + "(the node reported nothing)" when there is neither
     //   [stalled] <node>: task <name> ... for <N> min (state <state>) ...
     //     from the C2 task_stalled event, once per stall episode
+    // The documents that go with an event (tg_render_event says they are attached):
+    //   a report longer than TG_REPORT_CHARS / a notify longer than TG_NOTIFY_CHARS, in full as .md,
+    //   the file of a node's send_file (kind "file", base64 data).
+    tg_event_files(e)
+    {
+        kind = std.string(e.kind ?? "");
+        files = [];
+
+        if(kind == "file") {
+            if(e.data) {
+                files.push_back([name = std.string(e.name ?? "file"), caption = std.string(e.caption ?? ""), data = std.string(e.data)]);
+            }
+            return files;
+        }
+
+        if(kind == "notify") {
+            m = std.string(e.message ?? "");
+            if(m.length() > TG_NOTIFY_CHARS) {
+                files.push_back([name = "notify-" + std.string(e.node ?? "node") + ".md", caption = "", text = m]);
+            }
+            return files;
+        }
+
+        // only the messages that show the report (tg_render_event: a task that ended)
+        st = std.string(e.state ?? "");
+        ended = kind == "task_finished" || (kind == "task_state" && (st == "finished" || st == "failed" || st == "lost" || st == "stopped" || st == "question"));
+        rep = std.string(e.report ?? "");
+        if(ended && rep.length() > TG_REPORT_CHARS && tg_render_event(e)) {
+            task_name = std.string(e.name ?? "task");
+            files.push_back([
+                name = "report-" + (task_name ? task_name : "task") + ".md",
+                caption = std.string(e.node ?? "") + ": task " + task_name,
+                text = rep,
+            ]);
+        }
+
+        return files;
+    }
+
     tg_render_event(e)
     {
         kind = std.string(e.kind ?? "event");
@@ -1080,6 +1202,9 @@ class TelegramRouter : Router
 
             if(rep) {
                 body = tg_clip(rep, TG_REPORT_CHARS);
+                if(rep.length() > TG_REPORT_CHARS) {
+                    body += "\n(the full report is attached)";
+                }
             }
 
             // C1: the reason of the transition. A failure without a reason is
@@ -1113,7 +1238,19 @@ class TelegramRouter : Router
         }
 
         if(kind == "notify") {
-            return "[notify] " + node + ": " + std.string(e.message ?? "");
+            m = std.string(e.message ?? "");
+            if(m.length() > TG_NOTIFY_CHARS) {
+                m = tg_clip(m, TG_NOTIFY_CHARS) + "\n(the full message is attached)";
+            }
+            return "[notify] " + node + ": " + m;
+        }
+
+        if(kind == "file") {
+            out = "[file] " + node + ": " + std.string(e.name ?? "file") + " (" + std.string(std.int(e.bytes ?? 0)) + " bytes)";
+            if(e.caption) {
+                out += "\n" + tg_clip(std.string(e.caption), TG_CAPTION_CHARS);
+            }
+            return out;
         }
 
         if(kind == "node_state") {

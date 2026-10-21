@@ -21,20 +21,22 @@ uniform float aurora_wind;
 //@float min=0.0 max=1.0 value=0.5
 uniform float aurora_streaks;
 
-// --- Preset: Layer count ---
-uniform int preset; // [layer_count] 1-5
+// --- Presets (they had no controls and stayed 0, #436) ---
+// Layer count
+//@enum options=(1 layer, 2 layers, 3 layers, 4 layers, 5 layers) value=2 displayname="Layers"
+uniform int preset;
 
 // --- Preset: Color scheme ---
-uniform int preset2; // [scheme] 0-Green 1-Purple 2-Rainbow
-
-// --- Preset: Wave shape ---
-uniform int preset3; // [wave_shape] 0-Sine 2-Square 1-Sawtooth
+//@enum options=(Green, Purple, Rainbow) value=0 displayname="Colours"
+uniform int preset2;
 
 // --- Preset: Star count ---
-uniform int preset4; // [star_count] 500 1000
+//@enum options=(500 stars, 1000 stars) value=0 displayname="Stars"
+uniform int preset4;
 
 // --- Preset: Aurora shape ---
-uniform int preset5; // [aurora_shape] 0-Flat 1-Curve 2-Dome
+//@enum options=(Flat, Curve, Dome) value=0 displayname="Shape"
+uniform int preset5;
 
 float hash(vec2 p)
 {
@@ -129,10 +131,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec3 sky_color = mix(vec3(0.01, 0.01, 0.04), vec3(0.0, 0.0, 0.02), sky_grad);
 
     // Add stars
-    int star_count = 500;
-    if (preset == 1) star_count = 500;
-    else if (preset == 2) star_count = 1000;
-    else star_count = 500;
+    // Star count is preset4 (it read the layer preset before, #436)
+    int star_count = preset4 == 1 ? 1000 : 500;
 
     // Adjust based on UV range for star density
     vec3 stars = starfield(uv * 3.0, star_count) * (1.0 - uv.y * 0.5);

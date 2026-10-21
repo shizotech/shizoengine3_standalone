@@ -221,19 +221,23 @@ vec3 map(vec3 p)
 
         q=p;
         q.y-=1.5*n0*sprog*cb(15);
-        if( camz<30. )
-            if( cb(2)==0. )
-                if( cb(4)==0. )
+        // braces everywhere: Apple's GLSL compiler finds the if / else chain without them ambiguous (#552)
+        if( camz<30. ) {
+            if( cb(2)==0. ) {
+                if( cb(4)==0. ) {
                     dmin(d,
                         length(vec2(q.z, length(q.xy)-.5))-.025,
                         2.5, -.3);
-                else
+                }
+                else {
                     dmin(d,
                         length(q)-.6,
                         1.8+eclipse*(p.z+.4*(p.y+p.x)<0. ? -.8 : .5),
                         .0);
-            else
-                if( cb(4)==0. )
+                }
+            }
+            else {
+                if( cb(4)==0. ) {
                     for( float i=0.; i<.99; i+=1./(3.+cb(3)) ) {
                         t=q;
                         pR(t.xy, i);
@@ -242,6 +246,7 @@ vec3 map(vec3 p)
                             max(length(t.yz)-.025, abs(t.x)-.532),
                             2.5, -.3);
                     }
+                }
                 else
                 {
                     pR(q.xz, .05);
@@ -250,6 +255,8 @@ vec3 map(vec3 p)
                         max(q.y, dot(abs(q), normalize(vec3(1, .6, 1)))-.4),
                         1.4, .0);
                 }
+            }
+        }
 
 
         vec2 r=p.xz+p.xy, s = vec2(.5, -.5), vd=50.*vcore(vcore(vcore(vcore(vec2(1), r, s.xx), r, s.xy), r, s.yx), r, s.yy);
@@ -258,6 +265,9 @@ vec3 map(vec3 p)
 
         return d;
 }
+
+// The last frame, for the trail (it was iChannel0, an input nothing feeds in VibeVJ, #436)
+uniform sampler2D feedback;
 
 void mainImage( out vec4 fragColor, in vec2 fragCoord )
 {
@@ -336,6 +346,6 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
             -float(iA.y==128)
             ;
 
-        fragColor = mix(scol.xyzz, texture(iChannel0, uv), pow(.0001, iTimeDelta));
+        fragColor = mix(scol.xyzz, texture(feedback, uv), pow(.0001, iTimeDelta));
     }
 }

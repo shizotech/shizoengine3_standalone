@@ -1,13 +1,11 @@
 // TV Bubble/Arc Effect
 // Shadertoy format
 
-uniform float time;
-uniform vec2 resolution;
 
 //@slider min=0.01 max=3.0 value=0.5
 uniform float bubble_speed;
 
-//@slider min=1 max=20 value=5
+//@int min=1 max=20 value=5
 uniform int bubble_count;
 
 //@rgb value=(0.8,0.4,1.0)
@@ -29,7 +27,7 @@ vec3 hsv2rgb(vec3 c) {
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-    vec2 uv = fragCoord / resolution;
+    vec2 uv = fragCoord / iResolution.xy; // it read its own `resolution` and `time`, which nothing sets (#436)
     
     vec3 color = vec3(0.0);
     
@@ -37,7 +35,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         if (i >= bubble_count) break;
         
         float t = float(i);
-        float bubble_time = time * bubble_speed + t * 0.7;
+        float bubble_time = iTime * bubble_speed + t * 0.7;
         
         // Create bubble positions - moving arcs from bottom to top
         float angle = t * 0.5 + bubble_time * 0.3;
@@ -58,7 +56,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         
         // Arc effect - only show part of the bubble
         float arc_angle = atan(diff.y, diff.x);
-        float arc = smoothstep(0.5, 0.0, abs(arc_angle - bubble_time));
+        // The angle to the moving arc, wrapped to -pi..pi (unwrapped, the arc was gone after a few seconds)
+        float da = mod(arc_angle - bubble_time + 3.14159265, 6.2831853) - 3.14159265;
+        float arc = smoothstep(0.5, 0.0, abs(da));
         bubble *= arc;
         
         // Color with gradient

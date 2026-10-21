@@ -1,0 +1,354 @@
+using eigen;
+
+//Errors and warnings in the program (#539): short messages at the bottom right ("toasts") and the window *Log* with the
+//last ones. They come from std.log_capture: every std.error / std.warn, runtime error and syntax error of the script
+//and of its threads, and the shaders that do not compile (nanogui logs them). poll() reads them once per frame, on the
+//UI thread.
+//- A runtime error arrives as one message per level of the call stack, the outermost first; only the last one holds
+//  the text (between two lines of *). They are put together into one entry with the places of the calls.
+//- The same message again within a few seconds counts up on its toast ("×3") instead of a new one.
+
+LOG_MAX_ENTRIES = 400;       //the window keeps the last ones
+LOG_TOAST_MAX = 4;           //toasts at the same time
+LOG_TOAST_SECONDS = 6;       //a warning shows this long, an error twice as long
+LOG_TOAST_WIDTH = 440;
+LOG_TOAST_HEIGHT = 54;
+LOG_TOAST_MARGIN = 14;
+LOG_TOAST_BOTTOM = 62;       //above the bar of the timeline
+LOG_TOAST_PAD = 8;           //the window around the toasts
+LOG_COLOR_ERROR = vec4f(0.937, 0.325, 0.314, 1.0);
+LOG_COLOR_WARN = vec4f(0.973, 0.737, 0.259, 1.0);
+LOG_COLOR_SURFACE = vec4f(0.118, 0.118, 0.129, 0.97);
+LOG_COLOR_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+
+//A line that only has this character (the frames of the error boxes)
+log_line_of(line, c) {
+	t = line.trim();
+	if(t.size() < 3)
+		return false;
+	for(ch : t) {
+		if(ch != c)
+			return false;
+	}
+	return true;
+}
+
+//"--> file.shio:12:5" in the box: "file.shio:12:5", "" when there is none
+log_location(lines) {
+	for(line : lines) {
+		t = line.trim();
+		if(t.starts("-->"))
+			return t.substr(3).trim();
+	}
+	return "";
+}
+
+//The source line under the place: " 12 | code"
+log_source(lines) {
+	for(line : lines) {
+		bar = line.find("|");
+		if(bar <= 0)
+			continue;
+		num = line.substr(0, bar).trim();
+		code = line.substr(bar + 1).trim();
+		if(num != "" && std.int(num) > 0 && code != "")
+			return code;
+	}
+	return "";
+}
+
+//One logged message as [kind=, text=, place=, code=]. kind: "runtime" (a box of the call stack), "syntax" or "plain".
+//text is "" for a level of the call stack without the error text
+log_parse(message) {
+	lines = std.string(message).split("\n");
+	first = lines.size() > 0 ? lines[0].trim() : "";
+	if(first == "Runtime Error") {
+		text = "";
+		inside = false;
+		for(line : lines) {
+			if(log_line_of(line, "*")) {
+				if(inside)
+					break;
+				inside = true;
+				continue;
+			}
+			if(inside && line.trim() != "")
+				text = text == "" ? line.trim() : text + " " + line.trim();
+		}
+		return [kind = "runtime", text = text, place = log_location(lines), code = log_source(lines)];
+	}
+	if(first == "*** Syntax Error ***" || first == "*** Syntax Warning ***") {
+		text = "";
+		for(i = 1; i < lines.size(); i++) {
+			t = lines[i].trim();
+			if(t.starts("*** "))
+				text = text == "" ? t.substr(4) : text + " " + t.substr(4);
+		}
+		return [kind = "syntax", text = "Syntax error: " + (text ? text : "see the log"), place = log_location(lines), code = log_source(lines)];
+	}
+	//A plain message: its lines without empty ones
+	text = "";
+	for(line : lines) {
+		t = line.trim();
+		if(t != "")
+			text = text == "" ? t : text + "\n" + t;
+	}
+	return [kind = "plain", text = text, place = "", code = ""];
+}
+
+//The first line, at most n characters
+log_short(text, n) {
+	t = std.string(text);
+	nl = t.find("\n");
+	if(nl >= 0)
+		t = t.substr(0, nl);
+	if(t.char_length() > n)
+		t = t.substr_chars(0, n - 1) + "…";
+	return t;
+}
+
+class logwindow
+{
+	managed capture = None;
+	managed tool = None;
+	managed toast_window = None;
+	managed text = None;     //the textarea of the window
+	managed filter_select = None;
+	engine = None;
+	entries = [];            //[level=, time=, text=, place=, trace=[]]
+	toasts = [];             //[level=, text=, place=, until=, count=, row=]
+	pending = [];            //levels of a call stack that came without the error text yet (log_parse)
+	filter = 0;              //0 all, 1 errors, 2 warnings
+	unseen_errors = 0;       //errors since the window was open last (the badge of its button)
+	on_unseen = None;        //callback(count): the badge of the button in the top bar
+
+	__init__(engine) {
+		this.engine = engine;
+		capture = std.log_capture("warn error");
+
+		tool = toolwindow(engine, "Log", 900, 560);
+		page = tool.window.widget().anchor(0);
+		bar = page.widget().anchor_left(12).anchor_right(12).anchor_top(8).fixed_height(28);
+		filter_select = bar.combobox().items(["All", "Errors", "Warnings"]).segmented(true)
+			.anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(300)
+			.tooltip("Which messages the list shows");
+		filter_select.on_change([this](v, txt){
+			this.filter = v;
+			this.rebuild();
+		});
+		clear_btn = bar.button("Clear").icon(nanogui.icon("trash_alt")).anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(90)
+			.tooltip("Empty the list");
+		clear_btn.on_click([this](){
+			this.clear();
+		});
+		text = page.textarea().anchor(0).anchor_top(44).anchor_left(12).anchor_right(12).anchor_bottom(12)
+			.editable(false).selectable(true).wrap_text(true);
+
+		//The toasts: a window without a header at the bottom right, over everything, as high as its toasts
+		toast_window = engine.screen.window("");
+		toast_window.header_enabled(false).movable(false).resizable(false).overlay(true)
+			.fixed_size(vec2f(LOG_TOAST_WIDTH, LOG_TOAST_HEIGHT)).visible(false);
+	}
+
+	// Reading the messages
+
+	//Once per frame (__init__.shio, also while a project loads: the capture keeps everything until it is read).
+	//Everything in try: an error caught there is not logged, so a mistake in here cannot feed itself through the
+	//capture
+	poll() {
+		try {
+			msgs = capture.read(true, true);
+			if(msgs && msgs.size() > 0) {
+				for(m : msgs)
+					take(m[0], m[1]);
+			}
+			update_toasts();
+		}
+		catch(e) {
+			std.print("Log window: " + e);
+		}
+	}
+
+	take(channel, message) {
+		level = channel == "error" ? "error" : "warn";
+		p = log_parse(message);
+		if(p.kind == "runtime" && p.text == "") {
+			//A level of the call stack: kept until the box with the text comes
+			pending.push_back(p.place + (p.code ? "   " + p.code : ""));
+			if(pending.size() > 50)
+				pending.erase(0);
+			return;
+		}
+		trace = [];
+		if(p.kind == "runtime") {
+			trace = pending;
+			pending = [];
+		}
+		add(level, p.text ? p.text : "(no text)", p.place + (p.code ? "   " + p.code : ""), trace);
+	}
+
+	add(level, msg, place, trace = []) {
+		entry = [level = level, time = std.date("%H:%M:%S"), text = msg, place = place, trace = trace];
+		entries.push_back(entry);
+		if(entries.size() > LOG_MAX_ENTRIES)
+			entries.erase(0);
+		if(tool.visible() && shows(entry))
+			text.append(format(entry));
+		else if(level == "error") {
+			unseen_errors++;
+			if(std.is_function(on_unseen))
+				on_unseen(unseen_errors);
+		}
+		toast(level, msg, place);
+	}
+
+	shows(entry) {
+		return filter == 0 || (filter == 1 && entry.level == "error") || (filter == 2 && entry.level == "warn");
+	}
+
+	format(entry) {
+		s = entry.time + "  " + (entry.level == "error" ? "ERROR" : "WARN ") + "  " + entry.text + "\n";
+		if(entry.place)
+			s = s + "          at " + entry.place + "\n";
+		//The calls that led there, the innermost first
+		for(i = entry.trace.size() - 1; i >= 0; i--)
+			s = s + "          from " + entry.trace[i] + "\n";
+		return s + "\n";
+	}
+
+	rebuild() {
+		all = "";
+		for(entry : entries) {
+			if(shows(entry))
+				all = all + format(entry);
+		}
+		text.value(all);
+	}
+
+	clear() {
+		entries = [];
+		text.value("");
+		unseen_errors = 0;
+		if(std.is_function(on_unseen))
+			on_unseen(0);
+	}
+
+	// The window
+
+	open() {
+		rebuild();
+		tool.show();
+		unseen_errors = 0;
+		if(std.is_function(on_unseen))
+			on_unseen(0);
+	}
+
+	toggle() {
+		if(tool.visible())
+			tool.hide();
+		else
+			open();
+	}
+
+	// Toasts
+
+	toast(level, msg, place) {
+		now = std.millis();
+		short = log_short(msg, 64);
+		//The same again: its toast counts up and stays longer
+		for(i = 0; i < toasts.size(); i++) {
+			if(toasts[i].text == short && toasts[i].level == level) {
+				toasts[i].count = toasts[i].count + 1;
+				toasts[i].until = now + toast_ms(level);
+				toasts[i].dirty = true;
+				layout_toasts();
+				return;
+			}
+		}
+		if(toasts.size() >= LOG_TOAST_MAX)
+			drop_toast(0);
+		toasts.push_back([level = level, text = short, place = place, until = now + toast_ms(level), count = 1, row = None, dirty = true]);
+		layout_toasts();
+	}
+
+	toast_ms(level) {
+		return (level == "error" ? 2 : 1) * LOG_TOAST_SECONDS * 1000;
+	}
+
+	drop_toast(index) {
+		t = toasts[index];
+		if(t.row)
+			std.free(t.row);
+		toasts.erase(index);
+	}
+
+	update_toasts() {
+		if(toasts.size() == 0)
+			return;
+		now = std.millis();
+		changed = false;
+		for(i = toasts.size() - 1; i >= 0; i--) {
+			if(toasts[i].until < now) {
+				drop_toast(i);
+				changed = true;
+			}
+		}
+		for(t : toasts) {
+			if(t.dirty)
+				changed = true;
+		}
+		if(changed)
+			layout_toasts();
+		else
+			place_window();
+	}
+
+	//The toasts top to bottom, the newest at the bottom. Each one is a row: a coloured mark, the text, where it
+	//happened; a click opens the window
+	layout_toasts() {
+		if(toasts.size() == 0) {
+			toast_window.visible(false);
+			return;
+		}
+		for(i = 0; i < toasts.size(); i++) {
+			t = toasts[i];
+			if(t.row && !t.dirty)
+				continue;
+			if(t.row)
+				std.free(t.row);
+			row = toast_window.widget_solid().background_color(LOG_COLOR_SURFACE)
+				.anchor_left(0).anchor_right(0).fixed_height(LOG_TOAST_HEIGHT - 6);
+			row.widget_solid().background_color(t.level == "error" ? LOG_COLOR_ERROR : LOG_COLOR_WARN)
+				.anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(4);
+			row.label((t.count > 1 ? "×" + std.string(t.count) + "  " : "") + t.text).font_size(14)
+				.anchor_left(14).anchor_right(10).anchor_top(6).fixed_height(20);
+			row.label(t.place ? log_short(t.place, 70) : (t.level == "error" ? "Error" : "Warning") + " · click for the log")
+				.font_size(12).text_color(LOG_COLOR_TEXT_2).anchor_left(14).anchor_right(10).anchor_top(26).fixed_height(16);
+			btn = row.button("").transparent(true).anchor(0).tooltip("Open the log (all messages)\n[[wiki:Troubleshooting#the-log]]");
+			btn.on_click([this](){
+				this.open();
+			});
+			toasts[i].row = row;
+			toasts[i].dirty = false;
+		}
+		for(i = 0; i < toasts.size(); i++)
+			toasts[i].row.anchor_top(i * LOG_TOAST_HEIGHT);
+		h = toasts.size() * LOG_TOAST_HEIGHT + LOG_TOAST_PAD;
+		toast_window.fixed_size(vec2f(LOG_TOAST_WIDTH, h));
+		toast_window.size(vec2f(LOG_TOAST_WIDTH, h));
+		toast_window.visible(true);
+		place_window();
+	}
+
+	//At the bottom right of the screen, also after the window of the program changed its size
+	place_window() {
+		scr = engine.screen;
+		h = toasts.size() * LOG_TOAST_HEIGHT + LOG_TOAST_PAD;
+		x = scr.width() - LOG_TOAST_WIDTH - LOG_TOAST_MARGIN;
+		y = scr.height() - h - LOG_TOAST_BOTTOM;
+		pos = vec2f(x > 0 ? x : 0, y > 0 ? y : 0);
+		cur = toast_window.position();
+		if(cur.x != pos.x || cur.y != pos.y)
+			toast_window.position(pos);
+	}
+}

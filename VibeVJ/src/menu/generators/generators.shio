@@ -11,6 +11,16 @@ using eigen;
 //Every view tab ("workspace") holds one singleview. The first one keeps the node name "generator_view", so older
 //projects and their MIDI mappings load unchanged.
 
+//screen.key_absorbed() of nanogui: the last keyboard_default() was only swallowed by a button or a slider that has
+//the focus. A nanogui from before it: false, the keys of the program then only work when nothing has the focus
+key_absorbed(scr) {
+	try {
+		return scr.key_absorbed() ? true : false;
+	}
+	catch(e) {}
+	return false;
+}
+
 class generators
 {
 	managed window = None;
@@ -24,6 +34,7 @@ class generators
 	//Undo / redo (#350). The layout is the first thing in it: every step keeps the layout before and after
 	managed undo_history = None;
 	recording = false;    //a layout step is running: steps inside it belong to it
+	tab_drag_before = None; //the layout when a view tab was pressed: dragged along the bar it is a step (#350)
 	graves = [];          //uid -> [path=, guid=, state=, node=]: views a step took away, kept to make them again
 	parking = None;       //holds the views while a layout is rebuilt
 	undo_btn = None;
@@ -39,6 +50,14 @@ class generators
 	btn_step = 38;
 	tab_height = 30; //the tabs are lower than the bar and sit in its middle
 
+	//macOS: the title bar of macOS lies under the bar (screen.native_frame), its traffic lights at the left end. The
+	//buttons at the left end of the bar move right to make room for them while the sidebar is hidden; with the sidebar
+	//shown they sit in a band at its top (window_buttons_room)
+	mac_frame = false;
+	left_buttons = [];  //[b=, x=]: the buttons at the left end and where they sit without the traffic lights
+	left_room = 0;      //the room the left buttons take, from the left end
+	right_room = 0;     //the room the project name (and elsewhere the window buttons) take, from the right end
+
 	//The shortcuts of the layout work on one area (#349): the one the mouse is in, or the one F6 went to
 	active_area = "";
 	marked_area = ""; //F6 went there: it shows a line at its top edge until the mouse enters an area again
@@ -51,6 +70,8 @@ class generators
 		if(style && style.toolbar_height)
 			bar_height = style.toolbar_height;
 		btn_top = std.int((bar_height - btn_size) / 2);
+		//macOS: the traffic lights in the middle of the bar, which has its height only now
+		mac_frame = engine.screen.native_frame(bar_height);
 
 		window = engine.screen.window("");
 		window.anchor_top(0)
@@ -100,7 +121,13 @@ class generators
 				}
 				return true;
 			}
-			if(subviews.mouse_button_default(pos, btn, down, mods))
+			//A view tab dragged along the bar: its new place is a step of the undo history (#350)
+			if(btn == 0 && down && pos.y < subviews.header_height() && subviews.tab_under(pos) >= 0)
+				this.tab_drag_before = this.layout_drag_begin();
+			handled = subviews.mouse_button_default(pos, btn, down, mods);
+			if(btn == 0 && !down)
+				this.tab_drag_end();
+			if(handled)
 				return true;
 			if(down && pos.y < subviews.header_height())
 				engine.screen.begin_drag();
@@ -142,10 +169,17 @@ class generators
 			});
 		});
 
-		left = add_left_buttons(engine, main_menu);
-		right = add_frame_buttons(engine);
-		right = add_project_info(engine, main_menu, right + 8);
-		subviews.header_insets(left, right + 8);
+		left_room = add_left_buttons(engine, main_menu);
+		//On a Mac the traffic lights are the window buttons, at the other end
+		right = mac_frame ? 0 : add_frame_buttons(engine);
+		right_room = add_project_info(engine, main_menu, right + 8) + 8;
+		if(mac_frame) {
+			//In the full screen the traffic lights are gone (they come with the menu bar at the top edge): the room too
+			engine.screen.on_maximize([this, main_menu](maximized){
+				this.window_buttons_room(main_menu);
+			});
+		}
+		window_buttons_room(main_menu);
 
 		main = add_workspace("Views", "", false, true);
 		engine.main_generator_view = main.view;
@@ -214,6 +248,10 @@ class generators
 
 		//Every key comes here before the focused widget gets it
 		engine.screen.on_keyboard([this, engine](key, scancode, action, mods){
+			//The command palette (#535) takes Up, Down, Enter and Esc before its search field
+			pal = engine.env.palette;
+			if((action == 1 || action == 2) && pal && pal.visible() && pal.key(key, mods))
+				return true;
 			//The letter of the key in the keyboard layout in use: the key codes are positions on a US keyboard, where
 			//a German Z is a Y. Empty for a key without a letter
 			letter = action == 1 ? engine.screen.key_name(key, scancode) : "";
@@ -222,6 +260,9 @@ class generators
 			handled = engine.screen.keyboard_default(key, scancode, action, mods);
 			//Undo / redo, when nothing that has the focus used the key itself (a code editor, a mapping editor)
 			if(!handled && action == 1 && this.history_key(letter, mods))
+				return true;
+			//Save and the transport: also when a button or a slider that was clicked last only swallowed the key
+			if(action == 1 && (!handled || key_absorbed(engine.screen)) && this.app_key(key, mods, letter))
 				return true;
 			return handled;
 		});
@@ -236,12 +277,39 @@ class generators
 		link_steps_attach(undo_history, engine.ctx, [this, engine](){
 			return this.recording || engine.load_in_progress;
 		});
+		//And values the user changes (#350): a drag of a slider, a toggle, a list, a number typed
+		value_steps_attach(undo_history, engine.ctx, [this, engine](){
+			return this.recording || engine.load_in_progress;
+		});
 		refresh_history_buttons();
 		engine.env.layout_step = [this](name, action){
 			this.layout_step(name, action);
 		};
 		engine.env.bury_views = [this](area){
 			this.bury_views(area);
+		};
+		//A drag that changes the layout, the line between two areas (splitpanes.shio): begin before, end after it
+		engine.env.layout_drag_begin = [this](){
+			return this.layout_drag_begin();
+		};
+		engine.env.layout_drag_end = [this](name, before){
+			this.layout_drag_end(name, before);
+		};
+		//Generators moved or copied from one Patchview to another (#387), added to one or deleted (#350)
+		engine.env.generator_step = [this, engine](name, moves, copies, deletes){
+			if(!this.undo_history || this.undo_history.busy || this.recording || engine.load_in_progress)
+				return;
+			this.undo_history.push(name,
+				[this, moves, copies, deletes](){ this.undo_generators(moves, copies, deletes); },
+				[this, moves, copies, deletes](){ this.redo_generators(moves, copies, deletes); });
+		};
+		//Clips added, moved, copied, stacked or removed in a Clipview (#350): the cells before and after
+		engine.env.clip_step = [this, engine](name, changes){
+			if(!this.undo_history || this.undo_history.busy || this.recording || engine.load_in_progress)
+				return;
+			this.undo_history.push(name,
+				[this, changes](){ this.apply_clips(changes, true); },
+				[this, changes](){ this.apply_clips(changes, false); });
 		};
 
 		//The setting for the heads of the areas changed (Settings, Appearance)
@@ -312,7 +380,7 @@ class generators
 		undo_name = undo_history.undo_name();
 		redo_name = undo_history.redo_name();
 		undo_btn.enabled(undo_name != "");
-		undo_btn.tooltip((undo_name != "" ? "Undo: " + undo_name + " (Ctrl+Z)" : "Undo the last change of the [[layout]] or of a [[link]] (Ctrl+Z)") + "\n[[wiki:The-Screen#undo-and-redo]]");
+		undo_btn.tooltip((undo_name != "" ? "Undo: " + undo_name + " (Ctrl+Z)" : "Undo the last change of the [[layout]], of a [[link]] or of a value (Ctrl+Z)") + "\n[[wiki:The-Screen#undo-and-redo]]");
 		redo_btn.enabled(redo_name != "");
 		redo_btn.tooltip((redo_name != "" ? "Redo: " + redo_name + " (Ctrl+Y)" : "Redo the change you took back (Ctrl+Y)") + "\n[[wiki:The-Screen#undo-and-redo]]");
 	}
@@ -339,6 +407,156 @@ class generators
 		undo_history.push(name,
 			[this, before](){ this.restore_layout(before); },
 			[this, after](){ this.restore_layout(after); });
+	}
+
+	// Drags on the layout (#350): the line between two areas, a view tab along the bar. The layout is described when
+	// the drag starts and when it ends; undo and redo set the shares of the splits, the order of the view tabs and the
+	// tab in front in place, nothing is rebuilt (restore_in_place)
+
+	//The layout now, when a drag starts that may change it. None while nothing may be recorded
+	layout_drag_begin() {
+		if(!undo_history || undo_history.busy || recording || nanogui.show_mode() || eng.load_in_progress)
+			return None;
+		return describe_all();
+	}
+
+	//The drag ended: one step if the layout changed
+	layout_drag_end(name, before) {
+		if(std.is_none(before) || !undo_history || undo_history.busy || recording)
+			return;
+		after = describe_all();
+		if(before.compact_string() == after.compact_string())
+			return;
+		undo_history.push(name,
+			[this, before](){ this.restore_in_place(before); },
+			[this, after](){ this.restore_in_place(after); });
+	}
+
+	//The release of a press on a view tab: a step if the same view tabs are in another order now. A click that only
+	//brings a tab to the front is no step, and a tab dragged down into an area is a step of its own (start_drag)
+	tab_drag_end() {
+		before = tab_drag_before;
+		tab_drag_before = None;
+		if(std.is_none(before) || !undo_history || undo_history.busy || recording)
+			return;
+		after = describe_all();
+		a = before.view_tabs;
+		b = after.view_tabs;
+		if(a.size() != b.size())
+			return;
+		moved = false;
+		for(i = 0; i < a.size(); i++) {
+			if(a[i].guid != b[i].guid)
+				moved = true;
+			if(!layout_tab_of(after, a[i].guid))
+				return;
+		}
+		if(!moved)
+			return;
+		undo_history.push("Move tab",
+			[this, before](){ this.restore_in_place(before); },
+			[this, after](){ this.restore_in_place(after); });
+	}
+
+	//The view tab of guid in a description, None without one
+	layout_tab_of(desc, guid) {
+		for(i = 0; i < desc.view_tabs.size(); i++) {
+			if(desc.view_tabs[i].guid == guid)
+				return desc.view_tabs[i];
+		}
+		return None;
+	}
+
+	//What the layout below an area of a description is, without the shares of its splits
+	layout_shape(d) {
+		if(d.kind == "split") {
+			s = "split(" + std.string(d.guid) + ":";
+			for(i = 0; i < d.views.size(); i++)
+				s += layout_shape(d.views[i]) + ",";
+			return s + ")";
+		}
+		if(d.kind == "tabs") {
+			s = "tabs(" + std.string(d.guid) + ":" + std.string(d.selected) + ":";
+			for(i = 0; i < d.tabs.size(); i++)
+				s += std.string(d.tabs[i].name) + "|" + std.string(d.tabs[i].guid) + "=" + layout_shape(d.tabs[i].view) + ",";
+			return s + ")";
+		}
+		if(d.kind == "leaf")
+			return "leaf(" + std.string(d.uid) + ":" + std.string(d.hide) + ")";
+		return std.string(d.kind);
+	}
+
+	//The two descriptions differ only in the shares of splits, the order of the view tabs and the tab in front
+	same_but_places(a, b) {
+		if(a.view_tabs.size() != b.view_tabs.size())
+			return false;
+		for(i = 0; i < a.view_tabs.size(); i++) {
+			t = a.view_tabs[i];
+			other = layout_tab_of(b, t.guid);
+			if(!other || other.name != t.name || layout_shape(other.root) != layout_shape(t.root))
+				return false;
+		}
+		return true;
+	}
+
+	//The layout of desc where only places differ from now (same_but_places): the shares, the order of the view tabs and
+	//the tab in front are set. Anything else is rebuilt (restore_layout)
+	restore_in_place(desc) {
+		maximized = eng.env.maximized_view;
+		if(maximized)
+			maximized.restore_maximized();
+		if(!same_but_places(describe_all(), desc)) {
+			restore_layout(desc);
+			return;
+		}
+
+		for(t = 0; t < desc.view_tabs.size(); t++) {
+			ws = workspace_of(desc.view_tabs[t].guid);
+			if(ws)
+				set_sizes_tree(ws.view, desc.view_tabs[t].root);
+		}
+
+		//The view tabs take the places in the bar the view tabs have now (code tabs keep theirs)
+		places = [];
+		for(i = 0; i < subviews.tab_count(); i++) {
+			if(find_workspace(subviews.tab_at(i)))
+				places.push_back(i);
+		}
+		for(k = 0; k < desc.view_tabs.size() && k < places.size(); k++) {
+			ws = workspace_of(desc.view_tabs[k].guid);
+			if(!ws)
+				continue;
+			at = subviews.tab_index(ws.tab);
+			if(at >= 0 && at != places[k])
+				subviews.swap_tabs(at, places[k]);
+		}
+
+		front = workspace_of(desc.front);
+		if(front)
+			subviews.set_active_tab(front.tab);
+	}
+
+	workspace_of(guid) {
+		for(i = 0; i < workspaces.size(); i++) {
+			if(workspaces[i].node.guid() == guid)
+				return workspaces[i];
+		}
+		return None;
+	}
+
+	//The shares of the splits below view as in the description d (of the same shape)
+	set_sizes_tree(view, d) {
+		if(!view || !view.item)
+			return;
+		if(d.kind == "split" && view.is_split()) {
+			view.item.module.call("set_sizes", d.sizes);
+			for(i = 0; i < d.views.size(); i++)
+				set_sizes_tree(view.item.module.call("get_view", i), d.views[i]);
+		}
+		else if(d.kind == "tabs" && view.is_tabs()) {
+			for(i = 0; i < d.tabs.size(); i++)
+				set_sizes_tree(view.item.module.call("get_view", i), d.tabs[i].view);
+		}
 	}
 
 	//The layout of every view tab as data
@@ -523,6 +741,112 @@ class generators
 		return false;
 	}
 
+	// =========================================================================
+	// Undo / redo of generators moved or copied between Patchviews (#387)
+	// =========================================================================
+	//A Patchview hands over what a drop did as data (generatorview.drop_generators): moves [guid, from, from_pos, to,
+	//to_pos] and copies [view, guid]. Views are found by their uid (engine.env.patch_views), generators by their guid.
+	//A copy that is undone is deleted, its state is kept in the step and the redo makes it again with the same guid.
+	//A generator added by a drop of an asset is a copy too; one deleted with its close button (#350) is the other way
+	//round: deletes [view, guid, kept], undo makes it again with its links, redo deletes it.
+	//What is gone by then (a view that was deleted outside the history) is skipped with a warning.
+
+	patch_view(uid) {
+		views = eng.env.patch_views;
+		if(!views)
+			return None;
+		for(v = 0; v < views.size(); v++) {
+			if(views[v].uid == uid)
+				return views[v];
+		}
+		return None;
+	}
+
+	//back: the undo (to -> from), else the redo (from -> to). The undo goes through them backwards
+	move_generators(moves, back) {
+		for(k = 0; k < moves.size(); k++) {
+			m = moves[back ? moves.size() - 1 - k : k];
+			src = patch_view(back ? m.to : m.from);
+			dst = patch_view(back ? m.from : m.to);
+			pos = back ? m.from_pos : m.to_pos;
+			if(!src || !dst || !src.items.has(m.guid)) {
+				std.warn((back ? "Undo" : "Redo") + ": a moved generator or its view no longer exists, it is skipped");
+				continue;
+			}
+			gen = src.forget(m.guid);
+			if(gen)
+				dst.receive(gen, vec2f(pos.x, pos.y));
+		}
+	}
+
+	undo_generators(moves, copies, deletes = []) {
+		for(k = deletes.size() - 1; k >= 0; k--) {
+			d = deletes[k];
+			view = patch_view(d.view);
+			if(!view || view.items.has(d.guid) || !view.restore_generator(d.kept))
+				std.warn("Undo: a deleted generator cannot be made again (its view no longer exists), it is skipped");
+		}
+		for(k = copies.size() - 1; k >= 0; k--) {
+			c = copies[k];
+			view = patch_view(c.view);
+			kept = view ? view.remove_generator(c.guid) : None;
+			if(std.is_none(kept))
+				std.warn("Undo: a copied generator or its view no longer exists, it is skipped");
+			else
+				copies[k].kept = kept;
+		}
+		move_generators(moves, true);
+	}
+
+	redo_generators(moves, copies, deletes = []) {
+		move_generators(moves, false);
+		for(k = 0; k < copies.size(); k++) {
+			c = copies[k];
+			view = patch_view(c.view);
+			if(!view || !c.has("kept") || view.items.has(c.guid) || !view.restore_generator(c.kept))
+				std.warn("Redo: a copied generator cannot be made again (its view no longer exists), it is skipped");
+		}
+		for(k = 0; k < deletes.size(); k++) {
+			d = deletes[k];
+			view = patch_view(d.view);
+			kept = view ? view.remove_generator(d.guid, true) : None;
+			if(std.is_none(kept))
+				std.warn("Redo: a deleted generator or its view no longer exists, it is skipped");
+			else
+				deletes[k].kept = kept;
+		}
+	}
+
+	// =========================================================================
+	// Undo / redo of clips (#350)
+	// =========================================================================
+	//A Clipview hands over the cells a user action changed (clipview.clip_step): [view, row, col, before, after], a
+	//clip as data or None for an empty cell. Undo puts the cells back as they were, the last one first; redo as they
+	//became. Views are found by their uid (engine.env.clip_views).
+
+	clip_view(uid) {
+		views = eng.env.clip_views;
+		if(!views)
+			return None;
+		for(v = 0; v < views.size(); v++) {
+			if(views[v].uid == uid)
+				return views[v];
+		}
+		return None;
+	}
+
+	apply_clips(changes, back) {
+		for(k = 0; k < changes.size(); k++) {
+			c = changes[back ? changes.size() - 1 - k : k];
+			view = clip_view(c.view);
+			if(!view) {
+				std.warn((back ? "Undo" : "Redo") + ": the Clipview of a clip no longer exists, it is skipped");
+				continue;
+			}
+			view.set_cell(c.row, c.col, back ? c.before : c.after);
+		}
+	}
+
 	//The generator with that uid, taken alive out of the Patchview it is in (the redo of "Move generators")
 	take_from_patch(uid) {
 		views = eng.env.patch_views;
@@ -600,6 +924,54 @@ class generators
 	}
 
 	// Shortcuts (#349). They are named in the tooltips of the buttons and in wiki/Shortcuts-and-Tips.md
+
+	//The keys of the whole program, after the widget with the focus had the key and did not use it: a text field types
+	//a space or a T, the code editor saves its code with Ctrl+S. They work in show mode too: Save and the transport
+	//change nothing of the layout. true: the key was used up
+	app_key(key, mods, letter) {
+		//Ctrl+Shift+P: the performance overlay (#537)
+		if(letter == "p" && mods == 3) {
+			if(eng.env.perf)
+				eng.env.perf.toggle();
+			return true;
+		}
+		//Ctrl+K: the command palette (#535)
+		if(letter == "k" && mods == 2) {
+			if(eng.env.palette)
+				eng.env.palette.toggle();
+			return true;
+		}
+		//Ctrl+S, Ctrl+Shift+S (Cmd on a Mac): the project, like Save and Save as… of the Projects tab
+		if(letter == "s" && (mods == 2 || mods == 3)) {
+			save = mods == 2 ? eng.env.project_save : eng.env.project_save_as;
+			if(save)
+				save();
+			return true;
+		}
+		//Ctrl+B: blackout of all outputs (#538)
+		if(letter == "b" && mods == 2) {
+			if(eng.blackout)
+				eng.blackout.toggle();
+			return true;
+		}
+		tl = eng.timeline;
+		if(!tl || !tl.play_btn)
+			return false;
+		//Space: play or pause the timeline, Shift+Space: stop
+		if(key == 32 && (mods == 0 || mods == 1)) {
+			if(mods == 0)
+				tl.toggle_play();
+			else
+				tl.stop();
+			return true;
+		}
+		//T: tap the tempo
+		if(letter == "t" && mods == 0) {
+			tl.tap();
+			return true;
+		}
+		return false;
+	}
 
 	//true: the key was a shortcut and is used up. mods: 0 none, 1 Shift, 2 Ctrl, 3 Ctrl+Shift. letter: the letter on
 	//the key in the keyboard layout in use ("" for a key without one). On a Mac Cmd arrives as Ctrl (2) and the Control
@@ -1101,6 +1473,8 @@ class generators
 			handled = scr.keyboard_default(key, scancode, action, mods);
 			if(!handled && action == 1 && this.history_key(letter, mods))
 				return true;
+			if(action == 1 && (!handled || key_absorbed(scr)) && this.app_key(key, mods, letter))
+				return true;
 			return handled;
 		});
 
@@ -1269,6 +1643,20 @@ class generators
 			else
 				main_menu.help.open("");
 		});
+		x += btn_step;
+
+		//Errors and warnings (#539): the window Log. The badge counts the errors since it was open last
+		log_btn = window.button("").icon(nanogui.icon("bell")).tooltip("Log: the errors and warnings of the program\n[[wiki:Troubleshooting#the-log]]")
+			.anchor_top(btn_top).anchor_left(x).fixed_width(btn_size).fixed_height(btn_size).overlay(true);
+		log_btn.on_click([main_menu](){
+			if(main_menu.log)
+				main_menu.log.toggle();
+		});
+		if(main_menu.log) {
+			main_menu.log.on_unseen = [log_btn](n){
+				log_btn.badge(n > 0 ? (n > 99 ? "99+" : std.string(n)) : "");
+			};
+		}
 		x += btn_step + 8;
 
 		//Undo / redo (#350). They follow the history (refresh_history_buttons)
@@ -1295,7 +1683,22 @@ class generators
 		});
 		x += btn_step + 8;
 
+		left_buttons = [[b = sidebar_btn, x = 6], [b = settings_btn, x = 6 + btn_step], [b = help_btn, x = 6 + btn_step * 2],
+			[b = log_btn, x = 6 + btn_step * 3], [b = undo_btn, x = 6 + btn_step * 4 + 8], [b = redo_btn, x = 6 + btn_step * 5 + 8],
+			[b = back_btn, x = 6 + btn_step * 6 + 16]];
 		return x;
+	}
+
+	//macOS: room for the traffic lights. With the sidebar shown they sit in a band at its top, as in the sidebar of a Mac
+	//program; without it the left buttons of the bar move right. Again when the sidebar shows or hides and when the window
+	//enters or leaves the full screen (where they do not show)
+	window_buttons_room(main_menu) {
+		w = mac_frame ? eng.screen.window_buttons_width() : 0;
+		on_bar = main_menu.sidebar_visible ? 0 : w;
+		for(i = 0; i < left_buttons.size(); i++)
+			left_buttons[i].b.anchor_left(left_buttons[i].x + on_bar);
+		subviews.header_insets(left_room + on_bar, right_room);
+		main_menu.asset_menu.window_buttons_band(main_menu.sidebar_visible && w > 0 ? bar_height : 0);
 	}
 
 	//Right end of the bar, left of the window buttons: the name of the project (#360). The Projects tab of the sidebar
@@ -1321,6 +1724,7 @@ class generators
 	show_sidebar(main_menu, visible) {
 		if(main_menu.sidebar_visible != visible)
 			main_menu.toggle_sidebar();
+		window_buttons_room(main_menu);
 		if(sidebar_btn)
 			sidebar_btn.icon(nanogui.icon(main_menu.sidebar_visible ? "chevron_left" : "chevron_right"));
 	}
