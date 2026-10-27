@@ -1,0 +1,226 @@
+//FixtureState: the lamps of the fixture setup as a texture, so the video can follow the light.
+//
+//One column per lamp (in the order of the group, or of the patch), three rows, float RGBA:
+//  row 0  what the lamp shows: colour x dimmer in rgb, the dimmer in a
+//  row 1  where it hangs on the stage plan: x, y, z in metres (x to the right, y towards the audience, z up), a = 1
+//  row 2  pan and tilt 0..1 as sent (0.5 for a lamp that does not move), b = 1 for a moving head
+//The values are those Devices > Fixtures sends (the Phaser, links, MIDI, the blackout): engine.fixture_menu.lamp_light /
+//lamp_pan_tilt. A shader reads them with texelFetch(<its sampler>, ivec2(lamp, row), 0) and textureSize(..., 0).x lamps.
+//Virtual lamps (assets/Fixtures/Virtual, no node) are lamps like the others: a Phaser runs over them, the shader shows it.
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/palette"
+#include "engine/interfaces/videorouter"
+
+FS_ROWS = 3;
+FS_SIDE_W = 260;
+
+engine = None;
+managed video_router = None;
+managed output = None;
+managed image = None;
+managed texture = None;
+managed lamps_combo = None;
+managed info = None;
+managed preview = None;
+
+target = ""; //"" = every lamp of the patch, else a target of the patch ("group:<id>", "type:<path>")
+targets = []; //the targets of the items of lamps_combo after the first
+active = true;
+combo_revision = -1; //engine.patch_revision the list of lamps was filled at
+lamps = []; //the lamps of the last frame
+count = -1; //the width of the texture now
+lights = []; //[r, g, b, dimmer] of each lamp of the last frame, for the preview
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_output")
+		return output;
+	if(cmd == "active") {
+		if(value && !generator.active_btn.value())
+			return;
+		active = value;
+	}
+}
+
+//The lamps the texture has: the target, or every lamp of the patch
+target_lamps() {
+	if(!engine)
+		return [];
+	if(!target)
+		return engine.patch.fixtures;
+	return patch_target_fixtures(engine.patch, target);
+}
+
+fill_lamps_combo() {
+	targets = patch_targets(engine.patch);
+	items = ["All lamps"];
+	sel = 0;
+	for(i = 0; i < targets.size(); i++) {
+		items.push_back(targets[i].name);
+		if(targets[i].id == target)
+			sel = i + 1;
+	}
+	if(target && sel == 0) {
+		items.push_back(patch_target_name(engine.patch, target) + " (gone)");
+		sel = items.size() - 1;
+	}
+	lamps_combo.items(items).selected(sel);
+}
+
+//The data of one frame: FS_ROWS rows of count lamps, RGBA floats, row 0 first
+frame_data(list) {
+	menu = engine.fixture_menu;
+	data = [];
+	rows = [[], [], []];
+	lights = [];
+	for(i = 0; i < list.size(); i++) {
+		f = list[i];
+		light = menu ? menu.lamp_light(f) : None;
+		if(!light)
+			light = [r = 0.0, g = 0.0, b = 0.0, dimmer = 0.0];
+		lights.push_back(light);
+		rows[0].push_back([light.r * light.dimmer, light.g * light.dimmer, light.b * light.dimmer, light.dimmer]);
+		rows[1].push_back([std.float(f.x ?? 0.0), std.float(f.y ?? 0.0), std.float(f.z ?? 0.0), 1.0]);
+		pt = menu ? menu.lamp_pan_tilt(f) : None;
+		if(pt)
+			rows[2].push_back([pt.pan, pt.tilt, 1.0, 0.0]);
+		else
+			rows[2].push_back([0.5, 0.5, 0.0, 0.0]);
+	}
+	for(r = 0; r < FS_ROWS; r++) {
+		for(i = 0; i < rows[r].size(); i++) {
+			px = rows[r][i];
+			for(c = 0; c < 4; c++)
+				data.push_back(px[c]);
+		}
+	}
+	return data;
+}
+
+update(generator, tl_pos, pos_delta) {
+	if(!engine || !texture || !active)
+		return;
+	//The list follows the fixture setup (groups and types added or renamed)
+	if(engine.patch_revision != combo_revision) {
+		combo_revision = engine.patch_revision;
+		fill_lamps_combo();
+	}
+	lamps = target_lamps();
+	n = math.max(1, lamps.size());
+	if(n != count) {
+		count = n;
+		texture.size(vec2i(n, FS_ROWS));
+		info.caption(lamps.size() + (lamps.size() == 1 ? " lamp" : " lamps") + " · texture " + n + " × " + FS_ROWS);
+	}
+	data = frame_data(lamps);
+	//No lamp: one black column
+	if(lamps.size() == 0) {
+		data = [];
+		for(i = 0; i < 4 * FS_ROWS; i++)
+			data.push_back(0.0);
+	}
+	texture.upload_data(data);
+}
+
+//The colours of the lamps as the texture has them, one square each
+draw_preview() {
+	//Not while the generator is torn down (a project loaded over an open one): the preview has no size then
+	if(!preview)
+		return;
+	s = preview.size();
+	if(std.type(s) != "eigen.vec2f")
+		return;
+	nvgBeginPath();
+	nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
+	nvgFillColor(PAL_CANVAS);
+	nvgFill();
+	if(lights.size() == 0) {
+		pal_text(vec2f(s.x / 2.0, s.y / 2.0), "No lamps: set them up in Devices > Fixtures", 13, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		return;
+	}
+	cell = math.clamp(s.x / lights.size(), 4.0, 40.0);
+	for(i = 0; i < lights.size(); i++) {
+		l = lights[i];
+		x = i * cell;
+		if(x > s.x)
+			break;
+		nvgBeginPath();
+		nvgRect(vec2f(x + 1, 1), vec2f(math.max(1.0, cell - 2), s.y - 2));
+		nvgFillColor(vec4f(l.r * l.dimmer, l.g * l.dimmer, l.b * l.dimmer, 1.0));
+		nvgFill();
+	}
+}
+
+entry(generator, area) {
+	engine = generator.engine;
+	generator.window.fixed_size(vec2f(560, 240));
+	area.layout(None);
+
+	side = area.vscroll().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(FS_SIDE_W).content().layout(nanogui.layout_vertical());
+	preview = area.widget().anchor_left(FS_SIDE_W + 4).anchor_top(0).anchor_bottom(0).anchor_right(0);
+	preview.tooltip("The lamps as the texture has them: what each one shows (colour x dimmer), left to right");
+	preview.on_draw([]() { draw_preview(); });
+
+	output = side.control("OUT").caption("Out")
+		.tooltip("The lamps as a texture (one column per lamp; rows: colour x dimmer, place on the stage, pan and tilt): [[link]] it into a [[shader]] input\n[[wiki:Output-and-Devices#fixturestate]]")
+		.as_output(true);
+
+	lamps_combo = side.combobox().fixed_height(25)
+		.tooltip("Which lamps: all of the [[fixture setup]] (in its order), a group (in its order) or every lamp of a type");
+	lamps_combo.on_change([](index, text) {
+		if(index == 0)
+			target = "";
+		else if(index - 1 < targets.size())
+			target = targets[index - 1].id;
+	});
+	info = side.label("").fixed_height(20).text_color(PAL_TEXT_3);
+
+	videorouter_vec = side.controlvector("VideoRouter", "video_router").expanded(false);
+	videorouter_enable = videorouter_vec.controlbutton("Enable Router").push(1);
+	videorouter_name = videorouter_vec.controltext("VideoRouterName").hide_config_menu();
+	videorouter_enable.callback([videorouter_name](v) {
+		if(v) {
+			if(!video_router)
+				video_router = VideoRouter(videorouter_name.value(), output);
+		}
+		else
+			video_router = None;
+	});
+	videorouter_name.callback([](v) {
+		if(video_router)
+			video_router.name = v;
+	});
+	videorouter_name.value("FixtureState");
+
+	//The data texture: one texel per value, never filtered (the image's texture is Nearest)
+	image = side.image().visible(false);
+	texture = image.texture();
+	texture.pixel_format("rgba").component_format("float32").flip_y(false).size(vec2i(1, FS_ROWS));
+	empty = [];
+	for(i = 0; i < 4 * FS_ROWS; i++)
+		empty.push_back(0.0);
+	texture.upload_data(empty);
+	count = 1;
+
+	output.value(image);
+	output.callback([](v) {
+		output.value(image);
+	});
+
+	fill_lamps_combo();
+}
+
+save_state() {
+	return [target = target];
+}
+
+load_state(state) {
+	target = state.target ?? "";
+	if(lamps_combo)
+		fill_lamps_combo();
+}

@@ -3,6 +3,7 @@
 //No UI; tested headless in _testing/patch_ai.shio.
 //
 //Needs engine/patch/patch.shio, engine/patch/dmx.shio and engine/interfaces/aiinterface.shio included before it.
+//GDTF import (#669, import_gdtf): engine/patch/gdtf.shio, included here.
 //
 //The engine owns one interface (engine.patch_ai, made by patch_ai_create()). It is in engine.ai_interfaces with the
 //live_path "fixture_setup", so:
@@ -16,6 +17,8 @@
 //types by their path (assets/Fixtures/...json) or their name.
 //Argument names are never names of JSON methods (filter, remove, map, any, all, ...): a JSON literal drops such keys.
 
+#include "gdtf"
+
 PATCH_AI_LIVE_PATH = "fixture_setup";
 
 //What the interface belongs to: the live_path and file the MCP server and the Chat show for it
@@ -24,7 +27,7 @@ class patch_ai_target {
 		return "fixture_setup";
 	}
 	get_relative_path() {
-		return "assets/Fixtures/Setup.menu";
+		return "engine/menus/fixtures/setup.menu";
 	}
 }
 
@@ -148,10 +151,13 @@ patch_ai_type_list() {
 		if(!t.valid)
 			continue;
 		labels = [];
-		for(k = 0; k < t.controls.size(); k++)
+		functions = [];
+		for(k = 0; k < t.controls.size(); k++) {
 			labels.push_back(t.controls[k].label);
+			functions.push_back(t.controls[k].function);
+		}
 		list.push_back([path = path, name = t.name, channels = patch_footprint(path), pixels = patch_pixel_slots(path).size(),
-			controls = labels]);
+			controls = labels, functions = functions, moving = t.moving, kind = t.kind]);
 	}
 	return list;
 }
@@ -190,14 +196,19 @@ patch_ai_describe_lamp(holder, p, f, problems = None) {
 		type = f.type,
 		type_name = patch_type(f.type).name,
 		node = f.node,
-		node_name = patch_node_name(holder.net, p, f.node),
+		node_name = !f.node && patch_is_virtual(f) ? "Virtual (no DMX)" : patch_node_name(holder.net, p, f.node),
+		virtual = patch_is_virtual(f) ? 1 : 0,
 		universe = f.universe,
 		address = f.address,
 		last_channel = patch_end(f),
 		channels = patch_footprint(f.type),
 		x = f.x,
 		y = f.y,
+		z = f.z ?? 0.0,
 		rotation = f.rotation ?? 0,
+		mount = f.mount ?? "floor",
+		lean = f.lean ?? 0.0,
+		kind = patch_type(f.type).kind,
 		groups = groups,
 		problems = problems[f.id] ?? [],
 	];
@@ -282,6 +293,136 @@ patch_ai_universe(holder, p, node, universe) {
 }
 
 // =========================================================================
+// Test values (#670): lamps held at values to see them, e.g. in the camera picture
+// =========================================================================
+
+//A value 0..1 of set_fixture_test (a number, or "50%")
+patch_ai_level(v, what) {
+	if(std.is_string(v) && std.string(v).strip().ends("%"))
+		return math.clamp(std.float(std.string(v).strip().removesuffix("%")) / 100.0, 0.0, 1.0);
+	if(std.is_none(v) || std.is_json(v))
+		std.runtime_error(what + ": a value from 0 to 1 is needed, not " + std.string(v));
+	return math.clamp(std.float(v), 0.0, 1.0);
+}
+
+//The controls of a type for an error: "Pan (pan), Tilt (tilt), ..."
+patch_ai_control_names(t) {
+	labels = [];
+	for(i = 0; i < t.controls.size(); i++)
+		labels.push_back(t.controls[i].label + " (" + t.controls[i].function + ")");
+	return labels.combine_string(", ").removesuffix(", ");
+}
+
+//Index of the first RGB / RGBW control of a type, 0 if it has none
+patch_ai_first_color(t) {
+	for(i = 0; i < t.controls.size(); i++) {
+		if(t.controls[i].kind == "RGB" || t.controls[i].kind == "RGBW")
+			return i;
+	}
+	return 0;
+}
+
+//The control indices (as in Devices > Fixtures, patch_type(type).controls) and values of `values` for a lamp of this type:
+//[index -> value]. Keys: a function (dimmer, pan, tilt, strobe, ...: every control that does it), "color" ([r, g, b] or
+//[r, g, b, w] 0..1: the first colour of the lamp), "pan_degrees" / "tilt_degrees" (from 0, by the range of the type) or
+//the label of a control ("Pan", "RGB - R"; list_fixture_types lists them). A function or colour the type does not have
+//is skipped (its key goes into skipped: {"dimmer": 1, "color": [1, 1, 1]} lights a par without a dimmer and a moving head
+//with a colour wheel alike); a label it does not have, or nothing left at all, is a runtime error
+patch_ai_test_values(type, values, skipped = None) {
+	t = patch_type(type);
+	out = [];
+	if(std.is_none(skipped))
+		skipped = [];
+	color_slot = t.controls.size() ? t.controls[patch_ai_first_color(t)].slot : -1;
+	if(!std.is_json(values))
+		std.runtime_error("values is an object, e.g. {\"dimmer\": 1, \"color\": [1, 0, 0], \"pan\": 0.5}");
+	for(k = 0; k < values.size(); k++) {
+		key = std.string(values.key(k));
+		v = values[k];
+		want = key.lowercase();
+		found = 0;
+		if(want == "color" || want == "colour") {
+			comps = std.is_json(v) ? v : [];
+			if(std.is_json(v) && v.has("r"))
+				comps = [v.r ?? 0.0, v.g ?? 0.0, v.b ?? 0.0, v.has("w") ? v.w : None];
+			if(comps.size() < 3)
+				std.runtime_error("color is [r, g, b] (or [r, g, b, w]) from 0 to 1");
+			for(i = 0; i < t.controls.size(); i++) {
+				c = t.controls[i];
+				if(c.kind != "RGB" && c.kind != "RGBW")
+					continue;
+				if(c.slot != color_slot)
+					continue;
+				if(c.comp < comps.size() && !std.is_none(comps[c.comp])) {
+					out[std.string(i)] = patch_ai_level(comps[c.comp], "color");
+					found++;
+				}
+			}
+			if(!found)
+				skipped.push_back(key);
+			continue;
+		}
+		degrees = want == "pan_degrees" || want == "tilt_degrees";
+		func = degrees ? want.removesuffix("_degrees") : want;
+		for(i = 0; i < t.controls.size(); i++) {
+			c = t.controls[i];
+			if(degrees || PATCH_FUNCTIONS.has_value(func)) {
+				if(c.function != func || ((c.kind == "RGB" || c.kind == "RGBW") && func == "color"))
+					continue;
+			}
+			else if(std.string(c.label).lowercase() != want)
+				continue;
+			if(degrees) {
+				range = func == "pan" ? t.pan_range : t.tilt_range;
+				out[std.string(i)] = math.clamp(std.float(v) / range, 0.0, 1.0);
+			}
+			else
+				out[std.string(i)] = patch_ai_level(v, key);
+			found++;
+		}
+		if(!found) {
+			if(degrees || PATCH_FUNCTIONS.has_value(func)) {
+				skipped.push_back(key);
+				continue;
+			}
+			std.runtime_error(t.name + " has no control '" + key + "'. It has: " + patch_ai_control_names(t));
+		}
+	}
+	if(!out.size() && values.size())
+		std.runtime_error(t.name + " has none of " + skipped.combine_string(", ").removesuffix(", ") + " (a colour wheel is 'colorwheel'). It has: " + patch_ai_control_names(t));
+	return out;
+}
+
+//The brightness and colour controls of a type at 0: a lamp held dark
+patch_ai_dark_values(type) {
+	t = patch_type(type);
+	out = [];
+	for(i = 0; i < t.controls.size(); i++) {
+		c = t.controls[i];
+		if(c.kind == "RGB" || c.kind == "RGBW" || c.function == "dimmer")
+			out[std.string(i)] = 0.0;
+	}
+	return out;
+}
+
+//What the lamps send now, with their test values
+patch_ai_describe_values(holder, p, lamps) {
+	menu = holder.fixture_menu;
+	held = menu ? menu.test_lamps() : [];
+	list = [];
+	for(i = 0; i < lamps.size(); i++) {
+		f = lamps[i];
+		list.push_back([id = f.id, name = f.name, testing = held.has_value(f.id), controls = menu ? menu.lamp_values(f) : None]);
+	}
+	//(not `?? 1.0`: ?? goes by truth, a full blackout is 0.0)
+	master = holder.env && holder.env.has("output_master") ? std.float(holder.env.output_master) : 1.0;
+	result = [fixtures = list, testing = held.size()];
+	if(master < 1.0)
+		result.blackout = "The blackout is on (output at " + std.int(master * 100.0) + " %): brightness and colour go out darker or not at all.";
+	return result;
+}
+
+// =========================================================================
 // The interface
 // =========================================================================
 
@@ -323,7 +464,17 @@ patch_ai_register(iface, holder) {
 
 	iface.register("list_fixture_types", [], [](args) {
 		return patch_ai_type_list();
-	}, "Fixture setup: the fixture types that lamps can be (files in assets/Fixtures) with their channels, pixels (colour channels an LEDMapper can fill) and controls.");
+	}, "Fixture setup: the fixture types that lamps can be (files in assets/Fixtures) with their channels, pixels (colour channels an LEDMapper can fill), controls, what each control does (functions: dimmer, pan, tilt, color, ...) and what the lamp is (kind: head, bar, par or dimmer).");
+
+	iface.register("import_gdtf", [
+		path = "&string(): The .gdtf file (GDTF Share, the manufacturer, an export of grandMA3 / Vectorworks): a path on this computer, or relative to the app (assets/Fixtures/...)",
+	], [holder](args) {
+		r = gdtf_import(std.string(args.path));
+		if(!r.ok)
+			return [ok = false, error = r.error];
+		return [ok = true, fixture = r.name, manufacturer = r.manufacturer, folder = r.folder, gdtf = r.gdtf, types = r.types,
+			problems = r.problems];
+	}, "Fixture setup: imports a GDTF fixture file (.gdtf, the format of grandMA3, Vectorworks and the GDTF Share): one fixture type per DMX mode in assets/Fixtures/<manufacturer>/<fixture>/<name> - <mode>.json, with the channels in DMX order (what each does), the kind of lamp, pan and tilt range, beam angle and size. add_fixtures takes the path of a type it returns.");
 
 	iface.register("list_fixture_groups", [], [holder](args) {
 		p = holder.patch;
@@ -374,7 +525,7 @@ patch_ai_register(iface, holder) {
 		node = "string(): Art-Net node: MAC, IP or name (default: the node of the last lamp, else none)",
 		universe = "int(0,32767): Universe (default: of the last lamp on that node, else 0)",
 		address = "int(0,512): DMX address of the first lamp, 0 or missing = the next free channels (also into the next universes)",
-		x = "float(): Position of the first lamp on the stage plan in metres (the others one metre apart to the right)",
+		x = "float(): Position of the first lamp on the stage plan in metres (the others one metre apart to the right). Default: right of the lamps already in that row",
 		y = "float(): Position in metres, towards the audience",
 		name = "string(): Name (with count > 1 the lamps are numbered: 'Name 1', 'Name 2', ...). Default: type name and number",
 		group = "string(): Also put the new lamps into this group (id or name; a new group when there is none of that name)",
@@ -402,7 +553,18 @@ patch_ai_register(iface, holder) {
 		address = patch_ai_int(args, "address", 0);
 		if(address > 0 && address + patch_footprint(type) - 1 > PATCH_UNIVERSE_SIZE)
 			return [ok = false, error = "A lamp of " + patch_footprint(type) + " channels does not fit at address " + address + "."];
-		added = patch_add(p, type, count, node, universe, address, patch_ai_float(args, "x", 0.0), patch_ai_float(args, "y", 0.0));
+		//Without x the lamps go to the right of the lamps of their row (on top of a lamp the stage plans show one dot, #719)
+		y = patch_ai_float(args, "y", 0.0);
+		x = 0.0;
+		if(args.has("x"))
+			x = patch_ai_float(args, "x", 0.0);
+		else {
+			for(i = 0; i < p.fixtures.size(); i++) {
+				if(math.abs(std.float(p.fixtures[i].y) - y) < 0.5)
+					x = math.max(x, std.float(p.fixtures[i].x) + 1.0);
+			}
+		}
+		added = patch_add(p, type, count, node, universe, address, x, y);
 		if(args.has("name") && args.name) {
 			for(i = 0; i < added.size(); i++)
 				added[i].name = count > 1 ? args.name + " " + std.string(i + 1) : std.string(args.name);
@@ -436,7 +598,10 @@ patch_ai_register(iface, holder) {
 		address = "int(1,512): DMX start address",
 		x = "float(): Position on the stage plan in metres",
 		y = "float(): Position in metres",
+		z = "float(): Height above the floor in metres (3D view)",
 		rotation = "float(): Rotation in degrees",
+		mount = "string(): floor (standing) or hanging (upside down on a truss)",
+		lean = "float(-90,90): Degrees the lamp leans towards its front (3D view)",
 	], [holder](args) {
 		p = holder.patch;
 		f = patch_ai_lamp(p, args.fixture);
@@ -456,9 +621,18 @@ patch_ai_register(iface, holder) {
 			f.y = patch_ai_float(args, "y", f.y);
 		if(args.has("rotation"))
 			f.rotation = std.int(patch_ai_float(args, "rotation", 0.0));
+		if(args.has("z"))
+			f.z = math.max(0.0, patch_ai_float(args, "z", 0.0));
+		if(args.has("mount")) {
+			if(!PATCH_MOUNTS.has_value(args.mount))
+				std.runtime_error("mount is floor or hanging");
+			f.mount = args.mount;
+		}
+		if(args.has("lean"))
+			f.lean = math.clamp(patch_ai_float(args, "lean", 0.0), -90.0, 90.0);
 		patch_ai_changed(holder);
 		return patch_ai_describe_lamp(holder, p, f);
-	}, "Fixture setup: changes one lamp (name, fixture type, node, universe, address, position). Returns the lamp with its problems, e.g. when it now shares channels with another lamp.");
+	}, "Fixture setup: changes one lamp (name, fixture type, node, universe, address, position, height, mount, lean). Returns the lamp with its problems, e.g. when it now shares channels with another lamp.");
 
 	iface.register("remove_fixtures", [
 		fixtures = "&array(string): The lamps: ids or names",
@@ -601,11 +775,97 @@ patch_ai_register(iface, holder) {
 			names.push_back(lamps[i].name);
 		return [highlighted = names];
 	}, "Fixture setup: lights lamps at full (white, intensity full) so they can be found in the rig, like Highlight in the fixture setup. Empty list: off.");
+
+	iface.register("set_fixture_test", [
+		fixtures = "&array(string): The lamps: ids or names",
+		values = "&any(): What they send, as an object: a function (dimmer, pan, tilt, strobe, colorwheel, gobo, ...) or the label of a control (list_fixture_types) with a value from 0 to 1; color: [r, g, b] 0..1; pan_degrees / tilt_degrees: an angle from 0. A function a lamp does not have is skipped for it (not_on_these_lamps). Example: {\"dimmer\": 1, \"color\": [1, 0, 0], \"pan_degrees\": 270, \"tilt\": 0.5}",
+		dark_others = "int(0,1): 1 holds every other lamp dark (dimmer and colour 0), to see only these lamps",
+	], [holder](args) {
+		p = holder.patch;
+		menu = holder.fixture_menu;
+		if(!menu)
+			return [ok = false, error = "Devices > Fixtures is not set up yet."];
+		lamps = patch_ai_lamps(p, args.fixtures);
+		if(!lamps.size())
+			return [ok = false, error = "No lamps given."];
+		//Every lamp first, so a key one of them does not have changes nothing
+		held = [];
+		skipped = [];
+		for(i = 0; i < lamps.size(); i++) {
+			miss = [];
+			held.push_back(patch_ai_test_values(lamps[i].type, args.values, miss));
+			if(miss.size())
+				skipped.push_back([fixture = lamps[i].name, skipped = miss]);
+		}
+		ids = patch_ai_ids(lamps);
+		if(patch_ai_int(args, "dark_others", 0)) {
+			for(i = 0; i < p.fixtures.size(); i++) {
+				f = p.fixtures[i];
+				if(!ids.has_value(f.id)) {
+					menu.clear_test([f.id]);
+					menu.set_test(f.id, patch_ai_dark_values(f.type));
+				}
+			}
+		}
+		for(i = 0; i < lamps.size(); i++)
+			menu.set_test(lamps[i].id, held[i]);
+		result = patch_ai_describe_values(holder, p, lamps);
+		if(skipped.size())
+			result.not_on_these_lamps = skipped;
+		return result;
+	}, "Fixture setup: holds lamps at test values (brightness, colour, pan / tilt, ...) to see them, e.g. in the picture of a camera, also while a Phaser moves them. They stay held until clear_fixture_test. Returns what each control of the lamps sends now. The blackout still darkens them.");
+
+	iface.register("set_fixture_values", [
+		fixtures = "&array(string): The lamps: ids or names",
+		values = "&any(): The values, as for set_fixture_test: {\"dimmer\": 0.8, \"color\": [0, 0, 1], \"pan_degrees\": 200, \"tilt\": 0.3}",
+	], [holder](args) {
+		p = holder.patch;
+		menu = holder.fixture_menu;
+		if(!menu)
+			return [ok = false, error = "Devices > Fixtures is not set up yet."];
+		lamps = patch_ai_lamps(p, args.fixtures);
+		if(!lamps.size())
+			return [ok = false, error = "No lamps given."];
+		values = [];
+		skipped = [];
+		for(i = 0; i < lamps.size(); i++) {
+			miss = [];
+			values.push_back(patch_ai_test_values(lamps[i].type, args.values, miss));
+			if(miss.size())
+				skipped.push_back([fixture = lamps[i].name, skipped = miss]);
+		}
+		for(i = 0; i < lamps.size(); i++)
+			menu.set_values(lamps[i].id, values[i]);
+		result = patch_ai_describe_values(holder, p, lamps);
+		if(skipped.size())
+			result.not_on_these_lamps = skipped;
+		return result;
+	}, "Fixture setup: sets controls of lamps in Devices > Fixtures for good, as moving their sliders does (saved with the project): e.g. a position found with set_fixture_test and the camera. A Phaser on a control still moves it; a test value still wins until clear_fixture_test.");
+
+	iface.register("clear_fixture_test", [
+		fixtures = "array(string): The lamps (ids or names); empty or missing = every lamp",
+	], [holder](args) {
+		p = holder.patch;
+		menu = holder.fixture_menu;
+		if(!menu)
+			return [ok = false, error = "Devices > Fixtures is not set up yet."];
+		ids = args.has("fixtures") && args.fixtures ? patch_ai_ids(patch_ai_lamps(p, args.fixtures)) : [];
+		menu.clear_test(ids);
+		return [testing = menu.test_lamps().size()];
+	}, "Fixture setup: the lamps send their own values (Devices > Fixtures, Phasers) again after set_fixture_test. Without lamps: every lamp.");
+
+	iface.register("get_fixture_values", [
+		fixtures = "array(string): The lamps (ids or names); empty or missing = every lamp",
+	], [holder](args) {
+		p = holder.patch;
+		lamps = args.has("fixtures") && args.fixtures ? patch_ai_lamps(p, args.fixtures) : p.fixtures;
+		return patch_ai_describe_values(holder, p, lamps);
+	}, "Fixture setup: what each control of the lamps has (value), holds for a test (held) and sends (sent, 0..1 after dimmers, flash, highlight and blackout); testing: the lamps with test values.");
 }
 
 //The interface of the fixture setup: in holder.ai_interfaces (when it is the engine), live_path "fixture_setup"
 patch_ai_create(holder) {
-	iface = AIInterface(patch_ai_target(), None, "assets/Fixtures/Setup.menu");
+	iface = AIInterface(patch_ai_target(), None, "engine/menus/fixtures/setup.menu");
 	iface.add_capability("fixtures");
 	patch_ai_register(iface, holder);
 	return iface;

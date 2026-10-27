@@ -3,11 +3,11 @@
 //
 //  +--------------------+----------------------------------------------------+----------------------+
 //  | Input, size, LEDs  | toolbar: Select Line Curve Transform | Snap Grid | | Scene / group /      |
-//  | Layout (outliner): |          Test Addresses              status       | segment settings     |
+//  | Layout (outliner): |          Test Addresses Channels                   | segment settings     |
 //  |  scene             | LED strip (what is sent)                           | (inspector)          |
 //  |   group            | canvas: the picture with the segments              |                      |
-//  |    segment         |                                                    |                      |
-//  | Library (presets)  | masters of the scenes                              |                      |
+//  |    segment         | channels: the universe of the selection (drag)     |                      |
+//  | Library (presets)  | masters of the scenes                    status    |                      |
 //  +--------------------+----------------------------------------------------+----------------------+
 //
 //- A segment is one strip with its own number of LEDs (no fixture per strip as in other software): a line or a curve,
@@ -15,7 +15,11 @@
 //  other. A scene is a set of groups with a master.
 //- Positions, addresses and what is sent are worked out in engine/patch/ledmap.shio (tested in _testing/ledmap.shio).
 //- Presets of scenes, groups and segments are in the Library on the left (and can still be dragged in from the Assets
-//  tab): click one to insert it where the selection is.
+//  tab): click one to insert it where the selection is. A preset is a scene, group or segment by its "type", else by
+//  the folder it is in (scenes, groups, segments; ledmap_preset_kind).
+//- Channels (#655): the 512 channels of the universe of the selection (engine/patch/channelmap.shio). Drag a segment
+//  to other channels: the first segment of a group moves the group, another one gets its own address. Lamps of the
+//  fixture setup on that universe are there too and can be moved the same way (their address in the patch).
 //- Test lights the selected segment, group or scene white and everything else black: to find a strip in the rig.
 //- What it sends goes into the DMX registry of the engine (engine/patch/dmx.shio): segments that write the channels of a
 //  lamp of the fixture setup (one they are not meant for) or of another LEDMapper are red, like overlapping segments here.
@@ -30,6 +34,7 @@ using nanogui;
 #include "engine/patch/ledmap"
 #include "engine/patch/dmx"
 #include "engine/patch/palette"
+#include "engine/patch/channelmap"
 
 LM_ROW = 26;
 LM_LEFT_W = 250;
@@ -37,6 +42,7 @@ LM_RIGHT_W = 270;
 LM_TOOLBAR_H = 32;
 LM_STRIP_H = 14;
 LM_MASTERS_H = 34;
+LM_CHANNELS_H = 170;
 LM_HANDLE = 7;
 LM_HIT = 9; //pixels a click may be away from a segment
 LM_PRESET_DIR = __DIR__ + "/../";
@@ -59,6 +65,11 @@ LM_KEY_L = 76;
 LM_KEY_R = 82;
 LM_KEY_T = 84;
 LM_KEY_V = 86;
+LM_KEY_RIGHT = 262;
+LM_KEY_LEFT = 263;
+LM_KEY_DOWN = 264;
+LM_KEY_UP = 265;
+LM_MOD_SHIFT = 1;
 LM_MOD_CTRL = 2;
 
 //The picture as it comes in
@@ -184,6 +195,10 @@ class led_mapper {
 	grid_div = 12;
 	test_on = false;
 	labels_on = true;
+	channels_on = true; //the channel map under the picture
+	map_shift = 0; //universes its arrows stepped from the selection
+	map_cells = None; //dmx_universe_cells() of the universe in the map, cached
+	map_cells_key = "";
 
 	build_data = None;
 	build_dirty = true;
@@ -225,6 +240,10 @@ class led_mapper {
 	managed test_btn = None;
 	managed labels_btn = None;
 	managed snap_btn = None;
+	managed channels_btn = None;
+	managed channels_area = None;
+	managed center_holder = None;
+	managed chmap = None;
 	managed status_label = None;
 	info_label = None; //addresses of the selection in the inspector
 
@@ -253,6 +272,8 @@ class led_mapper {
 	}
 
 	select(si, gi = -1, k = -1) {
+		if(si != sel_scene || gi != sel_group || k != sel_segment)
+			map_shift = 0; //the channel map goes back to the universe of the selection
 		sel_scene = si;
 		sel_group = gi;
 		sel_segment = k;
@@ -419,6 +440,7 @@ class led_mapper {
 	// Presets (the Library)
 	// =========================================================================
 
+	//The preset files: [path (from the app folder), kind, label]. (fileio.files() names them relative to their folder.)
 	preset_files() {
 		list = [];
 		for(i = 0; i < LM_PRESET_KINDS.size(); i++) {
@@ -428,30 +450,32 @@ class led_mapper {
 			files = fileio.files(dir, false);
 			for(j = 0; j < files.size(); j++) {
 				if(std.string(files[j]).ends(".json"))
-					list.push_back([path = files[j], kind = LM_PRESET_KINDS[i][1], label = LM_PRESET_KINDS[i][2]]);
+					list.push_back([path = dir + "/" + fileio.file_name(files[j]), kind = LM_PRESET_KINDS[i][1], label = LM_PRESET_KINDS[i][2]]);
 			}
 		}
 		return list;
 	}
 
-	//A preset (or a dropped file) into the layout where the selection is
-	insert_preset(config) {
+	//A preset (or a dropped file) into the layout where the selection is. kind: what the file is when it does not say
+	//(its folder); presets saved before #655 have no "type"
+	insert_preset(config, kind = "") {
 		if(!config || std.type(config) != "json")
 			return false;
+		kind = ledmap_preset_kind(config, kind);
 		data = ledmap_new_ids(config.copy());
 		if(data.has("type"))
 			data.erase("type");
-		if(config.type == "scene") {
+		if(kind == "scene") {
 			scenes.push_back(ledmap_normalize_scene(data));
 			select(scenes.size() - 1, -1, -1);
 		}
-		else if(config.type == "group") {
+		else if(kind == "group") {
 			if(!cur_scene())
 				add_scene();
 			cur_scene().groups.push_back(ledmap_normalize_group(data));
 			select(sel_scene, cur_scene().groups.size() - 1, -1);
 		}
-		else if(config.type == "segment") {
+		else if(kind == "segment") {
 			if(!cur_group())
 				add_group();
 			cur_group().segments.push_back(ledmap_normalize_segment(data));
@@ -459,6 +483,7 @@ class led_mapper {
 		}
 		else
 			return false;
+		set_tool("select"); //what was inserted can be moved and picked right away
 		changed(true);
 		return true;
 	}
@@ -477,19 +502,37 @@ class led_mapper {
 		build_library();
 	}
 
+	//The presets by kind: click to insert, × to delete
 	build_library() {
 		library_box = fresh_box(library_holder, library_box);
 		files = preset_files();
 		if(!files.size())
-			library_box.label("No presets yet: Save as preset in the settings of a scene, group or segment.").wrap(true)
+			library_box.label("No presets yet: Preset in the settings of a scene, group or segment saves one.").wrap(true)
 				.fixed_width(LM_LEFT_W - 16).text_color(PAL_TEXT_3);
+		last_kind = "";
 		for(i = 0; i < files.size(); i++) {
 			entry = files[i];
 			path = entry.path;
-			b = library_box.button(entry.label + ": " + fileio.pure_name(path)).icon(nanogui.icon("plus")).alignment("left").fixed_height(LM_ROW);
-			b.tooltip("Insert this " + entry.kind + (entry.kind == "scene" ? "" : " into the selected " + (entry.kind == "group" ? "scene" : "group")));
-			b.on_click([this, path]() {
-				this.insert_preset(fileio.read_json(path));
+			kind = entry.kind;
+			if(kind != last_kind) {
+				last_kind = kind;
+				library_box.label(entry.label + "s").fixed_height(LM_ROW - 6).text_color(PAL_TEXT_3);
+			}
+			row = library_box.widget().fixed_height(LM_ROW);
+			b = row.button(fileio.pure_name(path)).icon(nanogui.icon("plus")).alignment("left").anchor_left(0).anchor_right(LM_ROW + 2).fixed_height(LM_ROW);
+			where = kind == "scene" ? "as a new scene" : (kind == "group" ? "into the selected scene" : "into the selected group");
+			b.tooltip("Click: insert this " + kind + " " + where + " (one is made when there is none). Or drag it from the Assets tab (Mapping > LEDMapper) onto the picture");
+			b.on_click([this, path, kind]() {
+				if(!this.insert_preset(fileio.read_json(path), kind))
+					this.engine.screen.modal_yes_no("This preset could not be read: " + path, "Preset");
+			});
+			del = row.button("").icon(nanogui.icon("times")).anchor_right(0).fixed_width(LM_ROW).fixed_height(LM_ROW).transparent(true);
+			del.tooltip("Delete this preset");
+			del.on_click([this, path]() {
+				if(this.engine.screen.modal_yes_no("Delete the preset " + fileio.pure_name(path) + "?", "Delete preset")) {
+					fileio.remove(path);
+					this.build_library();
+				}
 			});
 		}
 		library_holder.refresh_layout();
@@ -1073,7 +1116,9 @@ class led_mapper {
 	upload_gains() {
 		gains_dirty = false;
 		//The blackout (engine/blackout.shio) scales every pixel, the test light too
-		master = engine.env.output_master ?? 1.0;
+		//Not `?? 1.0`: ?? goes by truth, so a full blackout (the master 0.0, #670) reads as missing, and
+		//has() alone hands back a None value: both guards, the key present and not None (#570, #670)
+		master = engine.env.has("output_master") && !std.is_none(engine.env.output_master) ? engine.env.output_master : 1.0;
 		uploaded_master = master;
 		list = [];
 		slots = build_data ? build_data.slots : [];
@@ -1125,7 +1170,7 @@ class led_mapper {
 		if(dmx_state(engine) != seen_dmx_state)
 			check_conflicts();
 		//the gains follow the masters each frame (cheap): they are linked and move all the time
-		if(gains_dirty || !test_on || (engine.env.output_master ?? 1.0) != uploaded_master)
+		if(gains_dirty || !test_on || (engine.env.has("output_master") && !std.is_none(engine.env.output_master) ? engine.env.output_master : 1.0) != uploaded_master)
 			upload_gains();
 
 		buffer = led_shader.pixel_buffer();
@@ -1260,6 +1305,12 @@ class led_mapper {
 	}
 
 	mouse_button(pos, button, down, mods) {
+		//the right mouse button ends drawing: back to Select
+		if(button == 1 && down && tool_name != "select") {
+			set_tool("select");
+			drag = None;
+			return true;
+		}
 		if(button != 0)
 			return false;
 		p = vec2f(pos.x, pos.y);
@@ -1407,8 +1458,17 @@ class led_mapper {
 			return true;
 		}
 		if(key == LM_KEY_ESCAPE) {
-			select(-1, -1, -1);
+			//a drawing tool goes back to Select first
+			if(tool_name != "select")
+				set_tool("select");
+			else
+				select(-1, -1, -1);
 			return true;
+		}
+		if(key == LM_KEY_LEFT || key == LM_KEY_RIGHT || key == LM_KEY_UP || key == LM_KEY_DOWN) {
+			dx = key == LM_KEY_LEFT ? -1 : (key == LM_KEY_RIGHT ? 1 : 0);
+			dy = key == LM_KEY_UP ? -1 : (key == LM_KEY_DOWN ? 1 : 0);
+			return nudge(dx, dy, (mods & LM_MOD_SHIFT) ? true : false);
 		}
 		if((mods & LM_MOD_CTRL) && key == LM_KEY_D) {
 			duplicate_selected();
@@ -1431,6 +1491,38 @@ class led_mapper {
 		}
 		else
 			return false;
+		return true;
+	}
+
+	//The selected segment (or group) a step to the side (arrow keys): a cell of the grid with Snap, else a pixel (Shift:
+	//ten pixels)
+	nudge(dx, dy, big) {
+		g = cur_group();
+		if(!g)
+			return false;
+		s = canvas_size();
+		step = snap_on ? vec2f(1.0 / math.max(1, grid_div), 1.0 / math.max(1, grid_div)) : vec2f(1.0 / s.x, 1.0 / s.y);
+		if(big && !snap_on)
+			step = step * 10.0;
+		d = vec2f(dx * step.x, dy * step.y);
+		seg = cur_segment();
+		if(seg) {
+			//in the coordinates of the segment (before the transform of its group)
+			o = untransform(g, vec2f(0.5, 0.5));
+			m = untransform(g, vec2f(0.5 + d.x, 0.5 + d.y)) - o;
+			pts = [seg.start_pos, seg.end_pos, seg.control];
+			for(i = 0; i < pts.size(); i++) {
+				pts[i].x = pts[i].x + m.x;
+				pts[i].y = pts[i].y + m.y;
+			}
+		}
+		else {
+			for(i = 0; i < 4; i++) {
+				g.transform_uv[i].x = g.transform_uv[i].x + d.x;
+				g.transform_uv[i].y = g.transform_uv[i].y + d.y;
+			}
+		}
+		build_dirty = true;
 		return true;
 	}
 
@@ -1471,35 +1563,33 @@ class led_mapper {
 			limit = (to_px(leds[neighbour]) - to_px(leds[0])).length() * 0.45;
 		}
 		width = math.min(width * ui, limit) / ui;
+		//all rows in one path: one draw call (#690). They do not overlap (limit), so an alpha colour stays even
+		s = canvas_size();
+		nvgBeginPath();
 		for(r = 0; r < rows; r++) {
 			first = r * per_row;
 			last = math.min(n, first + per_row) - 1;
 			if(first > last)
 				continue;
 			step = math.max(1, std.int(per_row / 48));
-			nvgBeginPath();
-			nvgMoveTo(to_px(leds[first]));
+			nvgMoveTo(vec2f(leds[first].x * s.x, leds[first].y * s.y));
 			for(i = first + step; i < last; i += step)
-				nvgLineTo(to_px(leds[i]));
-			nvgLineTo(to_px(leds[last]));
-			nvgStrokeColor(color);
-			nvgStrokeWidth(width * ui);
-			nvgLineCap(1);
-			nvgStroke();
+				nvgLineTo(vec2f(leds[i].x * s.x, leds[i].y * s.y));
+			nvgLineTo(vec2f(leds[last].x * s.x, leds[last].y * s.y));
 		}
-		//dots when they are at least 5 px apart. One path per dot: the canvas is drawn into the framebuffer of the
-		//shader, which has no stencil, and a fill of several shapes would cover their whole bounding box
+		nvgStrokeColor(color);
+		nvgStrokeWidth(width * ui);
+		nvgLineCap(1);
+		nvgStroke();
+		//dots when they are at least 5 px apart, all of a slot in one stroke (#690: a fill per dot was a draw call each,
+		//6000 LEDs took 166 ms a frame instead of 67 under software GL; one fill of many circles needs a stencil, which
+		//the framebuffer of the shader has not)
 		if(n > 1 && n <= 600) {
 			gap = (to_px(leds[1]) - to_px(leds[0])).length();
 			if(gap >= 5.0 * ui) {
 				dot = math.min(math.min(3.0 * ui, gap / 3.0), limit * 0.6);
-				dot_color = is_selected ? PAL_TEXT : vec4f(0.0, 0.0, 0.0, 0.5);
-				for(i = 0; i < n; i++) {
-					nvgBeginPath();
-					nvgCircle(to_px(leds[i]), dot);
-					nvgFillColor(dot_color);
-					nvgFill();
-				}
+				nvgStrokeColor(is_selected ? PAL_TEXT : vec4f(0.0, 0.0, 0.0, 0.5));
+				nvgStrokeDots(leds, dot, s);
 			}
 		}
 		//the first LED (where the data comes in) and the direction
@@ -1585,6 +1675,13 @@ class led_mapper {
 	draw() {
 		ui = 1.0 / math.max(0.05, canvas_scroll.scale());
 		draw_grid();
+		//An empty layout: what to do (#655)
+		if(!scenes.size() && !(drag && drag.mode == "draw")) {
+			s = canvas_size();
+			text = tool_name == "line" || tool_name == "curve" ? "Drag on the picture to draw a strip of LEDs" : "Choose Line (L) or Curve (C), then drag on the picture";
+			pal_badge(vec2f(s.x / 2.0, s.y / 2.0), text, pal_alpha(PAL_RAISED, 0.92), PAL_TEXT, 14 * ui);
+			pal_badge(vec2f(s.x / 2.0, s.y / 2.0 + 26 * ui), "or click a preset in the Library on the left", pal_alpha(PAL_RAISED, 0.92), PAL_TEXT_2, 12 * ui);
+		}
 		if(!build_data)
 			return;
 		//sent segments, from the last build
@@ -1665,12 +1762,13 @@ class led_mapper {
 	// =========================================================================
 
 	build_ui(area) {
-		gen.window.fixed_size(vec2f(1300, 820));
+		gen.window.fixed_size(vec2f(1400, 880));
 		area.layout(None);
 
 		left = area.widget().anchor_left(0).anchor_top(0).anchor_bottom(30).fixed_width(LM_LEFT_W);
 		right = area.widget().anchor_right(0).anchor_top(0).anchor_bottom(30).fixed_width(LM_RIGHT_W);
 		center = area.widget().anchor_left(LM_LEFT_W + 4).anchor_right(LM_RIGHT_W + 4).anchor_top(0).anchor_bottom(30);
+		center_holder = center;
 
 		in_ctrl = area.control("IN").caption("In").anchor_left(0).anchor_bottom(0).fixed_height(30).fixed_width(LM_LEFT_W);
 		out_ctrl = area.control("OUT").caption("Out").anchor_right(0).anchor_bottom(0).fixed_height(30).fixed_width(LM_RIGHT_W).as_output(true);
@@ -1753,6 +1851,10 @@ class led_mapper {
 		labels_btn = toolbar.pushbutton("Addresses").icon(nanogui.icon("list_ol")).anchor_left(x).anchor_top(2).fixed_width(110).fixed_height(LM_ROW).pushed(labels_on);
 		labels_btn.tooltip("Show the first and last DMX address of each segment");
 		labels_btn.on_change([this](v) { this.labels_on = v; });
+		x += 112;
+		channels_btn = toolbar.pushbutton("Channels").icon(nanogui.icon("table")).anchor_left(x).anchor_top(2).fixed_width(110).fixed_height(LM_ROW).pushed(channels_on);
+		channels_btn.tooltip("The 512 channels of the universe of the selection under the picture. Drag a segment there to other channels (the first segment of a group moves the group), or a lamp of the fixture setup");
+		channels_btn.on_change([this](v) { this.show_channels(v); });
 
 
 		coords_image = area.image().visible(false);
@@ -1781,6 +1883,17 @@ class led_mapper {
 		canvas.fragment_source(LM_SHADER_SRC);
 		led_shader.input("input", canvas);
 
+		channels_area = center.widget().anchor_left(0).anchor_right(0).anchor_bottom(LM_MASTERS_H).fixed_height(LM_CHANNELS_H);
+		chmap = channel_map(channels_area);
+		chmap.provider = [this]() { return this.map_data(); };
+		chmap.on_pick = [this](b, mods) { this.map_pick(b); };
+		chmap.on_move = [this](b, delta) { this.map_move(b, delta); };
+		chmap.on_universe = [this](d) {
+			data = this.chmap.data;
+			if(data && data.universe + d >= 0)
+				this.map_shift = this.map_shift + d;
+		};
+
 		masters_holder = center.widget().anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(LM_MASTERS_H);
 		status_label = masters_holder.label("").anchor_right(4).anchor_top(0).fixed_height(LM_MASTERS_H).fixed_width(360).alignment("right");
 
@@ -1807,7 +1920,7 @@ class led_mapper {
 		out_ctrl.value(canvas);
 		out_ctrl.callback([this](v) { this.out_ctrl.value(this.canvas); });
 
-		//Presets dropped from the Assets tab
+		//Presets dropped from the Assets tab: [config, kind] (kind by "type", the folder or the content)
 		accepts = [](payload) {
 			if(!payload.has("path"))
 				return None;
@@ -1815,9 +1928,10 @@ class led_mapper {
 			if(!std.string(path).ends(".json"))
 				return None;
 			config = fileio.read_json(path);
-			if(config && (config.type == "scene" || config.type == "group" || config.type == "segment"))
-				return config;
-			return None;
+			kind = ledmap_preset_kind(config, ledmap_preset_kind_of_path(path));
+			if(!kind)
+				return None;
+			return [config = config, kind = kind];
 		};
 		drop_targets = [left, right, canvas];
 		for(i = 0; i < drop_targets.size(); i++) {
@@ -1825,7 +1939,8 @@ class led_mapper {
 				return accepts(payload) ? true : false;
 			});
 			drop_targets[i].on_dragdrop([this, accepts](payload, pos) {
-				return this.insert_preset(accepts(payload));
+				found = accepts(payload);
+				return found ? this.insert_preset(found.config, found.kind) : false;
 			});
 		}
 
@@ -1833,6 +1948,138 @@ class led_mapper {
 		build_inspector();
 		build_library();
 		build_masters();
+		show_channels(channels_on);
+		set_tool("line"); //an empty layout: draw right away
+	}
+
+	// =========================================================================
+	// Channels: the universe of the selection, segments and lamps dragged to other channels (#655)
+	// =========================================================================
+
+	show_channels(v) {
+		channels_on = v ? true : false;
+		channels_btn.pushed(channels_on);
+		channels_area.visible(channels_on);
+		canvas_scroll.anchor_bottom(LM_MASTERS_H + (channels_on ? LM_CHANNELS_H + 2 : 0));
+		center_holder.refresh_layout();
+	}
+
+	in_selection(s) {
+		return s.scene == sel_scene && (sel_group < 0 || s.group == sel_group) && (sel_segment < 0 || s.segment == sel_segment);
+	}
+
+	//The segment and group of a slot of the last build, None when the layout changed since
+	slot_items(s) {
+		if(s.scene >= scenes.size() || s.group >= scenes[s.scene].groups.size() || s.segment >= scenes[s.scene].groups[s.group].segments.size())
+			return None;
+		g = scenes[s.scene].groups[s.group];
+		return [scene = scenes[s.scene], group = g, segment = g.segments[s.segment]];
+	}
+
+	//What the channel map shows (channelmap.shio): the universe of the selection, its segments and the lamps on it
+	map_data() {
+		data = [node = "", universe = 0, title = "", blocks = [], cells = None,
+			empty = "Channels: draw a segment, then give its group a node (or a lamp of the fixture setup)"];
+		if(!build_data || !build_data.slots.size())
+			return data;
+		slots = build_data.slots;
+		base = None;
+		for(i = 0; i < slots.size() && !base; i++) {
+			if(sel_scene >= 0 && in_selection(slots[i]))
+				base = slots[i];
+		}
+		if(!base)
+			base = slots[0];
+		if(!base.node) {
+			data.empty = "Channels: this group has no node yet (Node in the settings of the group)";
+			return data;
+		}
+		node = base.node;
+		universe = math.max(0, base.start.universe + map_shift);
+		data.node = node;
+		data.universe = universe;
+		used = 0;
+		for(i = 0; i < slots.size(); i++) {
+			s = slots[i];
+			items = slot_items(s);
+			if(s.node != node || !items)
+				continue;
+			parts = ledmap_slot_ranges(s);
+			for(k = 0; k < parts.size(); k++) {
+				part = parts[k];
+				if(part.universe != universe)
+					continue;
+				used += part.last - part.first + 1;
+				on_lamp = items.segment.target || items.group.target;
+				data.blocks.push_back([ref = i, first = part.first, last = part.last,
+					label = items.scene.name + " › " + items.group.name + " › " + items.segment.name,
+					color = pal_hue(s.scene * 7 + s.group, 0.9), movable = on_lamp ? false : true, selected = in_selection(s),
+					problem = overlap_slots.has_value(i), tip = on_lamp ? "its address comes from its lamp: drag the lamp" : ""]);
+			}
+		}
+		//the lamps of the fixture setup on this universe
+		p = engine.patch;
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			if(f.node != node || f.universe != universe)
+				continue;
+			used += math.min(patch_end(f), DMX_UNIVERSE_SIZE) - math.max(1, f.address) + 1;
+			data.blocks.push_back([ref = "lamp:" + f.id, first = math.max(1, f.address), last = math.min(patch_end(f), DMX_UNIVERSE_SIZE),
+				label = f.name + " (fixture setup)", color = pal_alpha(PAL_TEXT_2, 0.55), movable = true, selected = false,
+				problem = false, tip = ""]);
+		}
+		//other LEDMappers (this one draws its own segments)
+		key = node + "|" + std.string(universe) + "|" + std.string(engine.patch_revision) + "|" + seen_dmx_state;
+		if(!map_cells || key != map_cells_key) {
+			map_cells = dmx_universe_cells(engine, p, node, universe, gen.ai_interface.registry_id);
+			map_cells_key = key;
+		}
+		data.cells = map_cells;
+		data.title = patch_node_name(engine.net, p, node) + " · Universe " + std.string(universe) + " · " + std.string(used) +
+			" channels used · lamps of the fixture setup grey";
+		return data;
+	}
+
+	map_pick(b) {
+		if(std.type(b.ref) == "string")
+			return;
+		s = build_data.slots[b.ref];
+		if(s.scene != sel_scene || s.group != sel_group || s.segment != sel_segment) {
+			select(s.scene, s.group, s.segment);
+			map_shift = 0;
+		}
+	}
+
+	//A segment or lamp dragged delta channels in the channel map
+	map_move(b, delta) {
+		if(std.type(b.ref) == "string") {
+			f = patch_find(engine.patch, std.string(b.ref).substr(5));
+			if(f) {
+				f.address = dmx_lamp_moved(f, delta);
+				engine.patch_changed();
+			}
+			return;
+		}
+		if(!build_data || b.ref >= build_data.slots.size())
+			return;
+		s = build_data.slots[b.ref];
+		items = slot_items(s);
+		if(!items)
+			return;
+		to = dmx_shift_address(s.start.universe, s.start.channel, delta);
+		seg = items.segment;
+		g = items.group;
+		if(seg.universe < 0 && seg.channel < 0 && s.segment == 0) {
+			//the first segment starts the group: the group moves
+			g.start_universe = to.universe;
+			g.start_channel = to.channel;
+		}
+		else {
+			//its own address (the ones after it follow it)
+			seg.universe = to.universe;
+			seg.channel = to.channel;
+		}
+		changed(false, true);
 	}
 
 	// =========================================================================
@@ -1939,6 +2186,26 @@ class led_mapper {
 			return g ? [ok = true, value = g.name] : [ok = false, error = "No lamps with colour channels"];
 		}, "Adds the lamps of a target of the fixture setup as a group, one segment per lamp");
 
+		gen.register("list_presets", [], [this](args) {
+			list = [];
+			files = this.preset_files();
+			for(i = 0; i < files.size(); i++)
+				list.push_back([name = fileio.pure_name(files[i].path), kind = files[i].kind, path = files[i].path]);
+			return [ok = true, value = list];
+		}, "The presets of the Library: scenes, groups and segments");
+
+		gen.register("insert_preset", [name = "&string(): Name of the preset (list_presets)", kind = "string(): scene, group or segment (when two have the name)"], [this](args) {
+			files = this.preset_files();
+			for(i = 0; i < files.size(); i++) {
+				if(fileio.pure_name(files[i].path) == args.name && (!args.has("kind") || args.kind == files[i].kind)) {
+					if(!this.insert_preset(fileio.read_json(files[i].path), files[i].kind))
+						return [ok = false, error = "The preset could not be read"];
+					return [ok = true, value = this.describe().selection];
+				}
+			}
+			return [ok = false, error = "No preset " + args.name];
+		}, "Inserts a preset like a click in the Library: a scene as a new scene, a group into the selected scene, a segment into the selected group");
+
 		gen.register("remove_selected", [], [this](args) {
 			this.remove_selected();
 			return [ok = true];
@@ -1946,7 +2213,7 @@ class led_mapper {
 	}
 
 	save() {
-		return [fixture_scenes = scenes, grid = grid_div, snap = snap_on, labels = labels_on];
+		return [fixture_scenes = scenes, grid = grid_div, snap = snap_on, labels = labels_on, channels = channels_on];
 	}
 
 	load(state) {
@@ -1959,6 +2226,8 @@ class led_mapper {
 		sel_segment = -1;
 		snap_btn.pushed(snap_on ? true : false);
 		labels_btn.pushed(labels_on ? true : false);
+		show_channels(state.has("channels") ? state.channels : true);
+		set_tool(scenes.size() ? "select" : "line");
 		build_dirty = true;
 		build_outliner();
 		build_inspector();

@@ -1,0 +1,468 @@
+//The 3D models of a GDTF file (#669) for the 3D view: read (glTF .glb, 3DS .3ds), put into GDTF coordinates (metres,
+//z up, the lamp hanging with its beam down -z, x along the yoke), scaled to the size the file gives the model (Length x,
+//Width y, Height z, as the GDTF says a model is shown) and made simple enough to draw with nvg every frame (vertex
+//clustering: about GDTF_MESH_MAX_TRIS triangles per part).
+//
+//A model of a lamp (what engine/patch/stage3d_draw.shio draws), saved as a .mesh file (JSON) next to its fixture files:
+//  [version = 1, parts = [[name, parent (index, -1: none), m (3 x 4 matrix, rows, to the parent: the GDTF Position),
+//                          v (x, y, z, ...), t (triangles: 3 vertex indices each, counter-clockwise seen from outside)]],
+//   beam = [part, x, y, z] (where the light comes out, in that part; part -1: none)]
+//The parts are in the order of the geometry tree (a parent before its children). Pan turns a part around its z, tilt
+//around its x (the fixture file names the parts: gdtf.pan_part, gdtf.tilt_part).
+//
+//Needs engine/patch/xml.shio included before it. No module: the bytes come as std.buffer (zip.read_binary).
+
+GDTF_MESH_MAX_TRIS = 70;
+
+def gdtf_glb_mesh(buf, j, bin, mesh, m, &out);
+def gdtf_3ds_chunks(buf, o, end, &out, depth);
+def gdtf_mesh_compact(mesh);
+def gdtf_mesh_cluster(mesh, b, n);
+def gdtf_model_parts(node, parent, model_by_name, files, &cache, &parts, &beam, depth);
+
+// =========================================================================
+// 3 x 4 matrices (rows: [m0 m1 m2 m3, m4 m5 m6 m7, m8 m9 m10 m11], the last row 0 0 0 1)
+// =========================================================================
+
+gdtf_mat_identity() {
+	return [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+}
+
+gdtf_mat_mul(a, b) {
+	out = [];
+	for(r = 0; r < 3; r++) {
+		for(c = 0; c < 4; c++) {
+			v = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c];
+			if(c == 3)
+				v += a[r * 4 + 3];
+			out.push_back(v);
+		}
+	}
+	return out;
+}
+
+//The Position of a GDTF geometry: "{a,b,c,d}{e,f,g,h}{i,j,k,l}{0,0,0,1}" (rows, the translation in the last column)
+gdtf_mat_parse(text) {
+	m = gdtf_mat_identity();
+	if(!text)
+		return m;
+	rows = std.string(text).replace("}", "").split("{");
+	r = 0;
+	for(row : rows) {
+		parts = row.trim().split(",");
+		if(parts.size() < 4 || r > 2)
+			continue;
+		for(c = 0; c < 4; c++)
+			m[r * 4 + c] = std.float(parts[c].trim());
+		r++;
+	}
+	return m;
+}
+
+//glTF node: a column-major 4 x 4 "matrix", or translation, rotation (quaternion x y z w) and scale
+gdtf_mat_node(n) {
+	if(n.has("matrix") && n.matrix.size() == 16) {
+		a = n.matrix;
+		return [a[0], a[4], a[8], a[12], a[1], a[5], a[9], a[13], a[2], a[6], a[10], a[14]];
+	}
+	t = n.has("translation") ? n.translation : [0.0, 0.0, 0.0];
+	q = n.has("rotation") ? n.rotation : [0.0, 0.0, 0.0, 1.0];
+	s = n.has("scale") ? n.scale : [1.0, 1.0, 1.0];
+	x = std.float(q[0]);
+	y = std.float(q[1]);
+	z = std.float(q[2]);
+	w = std.float(q[3]);
+	sx = std.float(s[0]);
+	sy = std.float(s[1]);
+	sz = std.float(s[2]);
+	return [
+		(1.0 - 2.0 * (y * y + z * z)) * sx, 2.0 * (x * y - z * w) * sy, 2.0 * (x * z + y * w) * sz, std.float(t[0]),
+		2.0 * (x * y + z * w) * sx, (1.0 - 2.0 * (x * x + z * z)) * sy, 2.0 * (y * z - x * w) * sz, std.float(t[1]),
+		2.0 * (x * z - y * w) * sx, 2.0 * (y * z + x * w) * sy, (1.0 - 2.0 * (x * x + y * y)) * sz, std.float(t[2])];
+}
+
+gdtf_mat_det(m) {
+	return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) + m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+// =========================================================================
+// Reading
+// =========================================================================
+
+//A mesh: [v = [x, y, z, ...], t = [a, b, c, ...]]
+gdtf_mesh_new() {
+	return [v = [], t = []];
+}
+
+//glTF binary (.glb): the meshes of the default scene with their node transforms, turned from y up into z up
+gdtf_mesh_glb(buf) {
+	out = gdtf_mesh_new();
+	if(buf.size() < 28 || buf.read("u32", 0) != 0x46546C67) //"glTF"
+		return out;
+	json_len = buf.read("u32", 3);
+	j = std.json(buf.string(20, json_len));
+	bin = 20 + json_len + 8; //the data of the BIN chunk (chunks are padded to 4 bytes)
+	scene = j.has("scenes") && j.scenes.size() ? j.scenes[j.has("scene") ? j.scene : 0] : None;
+	roots = [];
+	if(scene && scene.has("nodes"))
+		roots = scene.nodes;
+	else if(j.has("nodes")) {
+		for(i = 0; i < j.nodes.size(); i++)
+			roots.push_back(i);
+	}
+	stack = [];
+	for(r : roots)
+		stack.push_back([node = r, m = gdtf_mat_identity(), depth = 0]);
+	for(stack.size()) {
+		e = stack[-1];
+		stack.pop_back();
+		if(e.depth > 32 || e.node >= j.nodes.size())
+			continue;
+		n = j.nodes[e.node];
+		m = gdtf_mat_mul(e.m, gdtf_mat_node(n));
+		if(n.has("mesh") && j.has("meshes") && n.mesh < j.meshes.size())
+			gdtf_glb_mesh(buf, j, bin, j.meshes[n.mesh], m, out);
+		if(n.has("children")) {
+			for(c : n.children)
+				stack.push_back([node = c, m = m, depth = e.depth + 1]);
+		}
+	}
+	//y up -> z up: (x, y, z) -> (x, -z, y), a rotation (the winding stays)
+	v = out.v;
+	for(i = 0; i < v.size(); i += 3) {
+		y = v[i + 1];
+		v[i + 1] = 0.0 - v[i + 2];
+		v[i + 2] = y;
+	}
+	return out;
+}
+
+//One accessor as a list of numbers (count x components)
+gdtf_glb_accessor(buf, j, bin, index) {
+	list = [];
+	a = j.accessors[index];
+	if(!a.has("bufferView"))
+		return list;
+	bv = j.bufferViews[a.bufferView];
+	comps = a.type == "VEC3" ? 3 : (a.type == "VEC2" ? 2 : (a.type == "VEC4" ? 4 : 1));
+	ct = a.componentType;
+	kind = ct == 5126 ? "f32" : (ct == 5125 ? "u32" : (ct == 5123 ? "u16" : "u8"));
+	size = ct == 5126 || ct == 5125 ? 4 : (ct == 5123 ? 2 : 1);
+	stride = bv.has("byteStride") && bv.byteStride ? bv.byteStride : comps * size;
+	start = bin + (bv.has("byteOffset") ? bv.byteOffset : 0) + (a.has("byteOffset") ? a.byteOffset : 0);
+	for(k = 0; k < a.count; k++) {
+		at = start + k * stride;
+		for(c = 0; c < comps; c++) {
+			o = at + c * size;
+			if(o % size != 0)
+				return []; //not aligned: not a glTF file as the spec says
+			list.push_back(buf.read(kind, o / size));
+		}
+	}
+	return list;
+}
+
+gdtf_glb_mesh(buf, j, bin, mesh, m, &out) {
+	flip = gdtf_mat_det(m) < 0.0;
+	for(p : mesh.primitives) {
+		if(!p.has("attributes") || !p.attributes.has("POSITION") || (p.has("mode") && p.mode != 4))
+			continue;
+		pos = gdtf_glb_accessor(buf, j, bin, p.attributes.POSITION);
+		base = out.v.size() / 3;
+		for(i = 0; i + 2 < pos.size(); i += 3) {
+			x = pos[i];
+			y = pos[i + 1];
+			z = pos[i + 2];
+			out.v.push_back(m[0] * x + m[1] * y + m[2] * z + m[3]);
+			out.v.push_back(m[4] * x + m[5] * y + m[6] * z + m[7]);
+			out.v.push_back(m[8] * x + m[9] * y + m[10] * z + m[11]);
+		}
+		idx = [];
+		if(p.has("indices"))
+			idx = gdtf_glb_accessor(buf, j, bin, p.indices);
+		else {
+			for(i = 0; i < pos.size() / 3; i++)
+				idx.push_back(i);
+		}
+		for(i = 0; i + 2 < idx.size(); i += 3) {
+			out.t.push_back(base + idx[i]);
+			out.t.push_back(base + (flip ? idx[i + 2] : idx[i + 1]));
+			out.t.push_back(base + (flip ? idx[i + 1] : idx[i + 2]));
+		}
+	}
+}
+
+//A little-endian integer of n bytes at a byte offset (any offset: 3DS chunks are not aligned)
+gdtf_bytes(buf, o, n) {
+	v = 0;
+	f = 1;
+	for(i = 0; i < n; i++) {
+		v += buf[o + i] * f;
+		f *= 256;
+	}
+	return v;
+}
+
+//3DS: the vertices and faces of every object (z up as GDTF)
+gdtf_mesh_3ds(buf) {
+	out = gdtf_mesh_new();
+	if(buf.size() < 6 || gdtf_bytes(buf, 0, 2) != 0x4D4D)
+		return out;
+	gdtf_3ds_chunks(buf, 0, buf.size(), out, 0);
+	return out;
+}
+
+gdtf_3ds_chunks(buf, o, end, &out, depth) {
+	base = out.v.size() / 3;
+	for(o + 6 <= end) {
+		id = gdtf_bytes(buf, o, 2);
+		len = gdtf_bytes(buf, o + 2, 4);
+		if(len < 6 || o + len > end)
+			break;
+		if(depth < 8 && (id == 0x4D4D || id == 0x3D3D || id == 0x4100))
+			gdtf_3ds_chunks(buf, o + 6, o + len, out, depth + 1);
+		else if(depth < 8 && id == 0x4000) {
+			//an object: its name (ends with a zero byte), then its chunks
+			k = o + 6;
+			for(k < o + len && buf[k] != 0)
+				k++;
+			gdtf_3ds_chunks(buf, k + 1, o + len, out, depth + 1);
+		}
+		else if(id == 0x4110) {
+			base = out.v.size() / 3;
+			n = gdtf_bytes(buf, o + 6, 2);
+			if(8 + n * 12 <= len) {
+				floats = std.buffer();
+				floats.append(buf.string(o + 8, n * 12)); //aligned for read("f32")
+				for(i = 0; i < n * 3; i++)
+					out.v.push_back(floats.read("f32", i));
+			}
+		}
+		else if(id == 0x4120) {
+			n = gdtf_bytes(buf, o + 6, 2);
+			count = out.v.size() / 3;
+			if(8 + n * 8 <= len) {
+				for(i = 0; i < n; i++) {
+					f = o + 8 + i * 8;
+					a = base + gdtf_bytes(buf, f, 2);
+					b = base + gdtf_bytes(buf, f + 2, 2);
+					c = base + gdtf_bytes(buf, f + 4, 2);
+					if(a < count && b < count && c < count) {
+						out.t.push_back(a);
+						out.t.push_back(b);
+						out.t.push_back(c);
+					}
+				}
+			}
+		}
+		o += len;
+	}
+}
+
+// =========================================================================
+// Size and simplification
+// =========================================================================
+
+//[min = [x, y, z], max = [x, y, z]] of the vertices, None without any
+gdtf_mesh_bounds(mesh) {
+	v = mesh.v;
+	if(v.size() < 3)
+		return None;
+	mn = [v[0], v[1], v[2]];
+	mx = [v[0], v[1], v[2]];
+	for(i = 3; i < v.size(); i += 3) {
+		for(c = 0; c < 3; c++) {
+			if(v[i + c] < mn[c])
+				mn[c] = v[i + c];
+			if(v[i + c] > mx[c])
+				mx[c] = v[i + c];
+		}
+	}
+	return [min = mn, max = mx];
+}
+
+//Scaled to the size of the model in the file (a 3DS in millimetres, a glTF in other units: the GDTF says how big it
+//is): each axis on its own, around the origin of the model
+gdtf_mesh_fit(&mesh, length, width, height) {
+	b = gdtf_mesh_bounds(mesh);
+	if(!b)
+		return;
+	want = [length, width, height];
+	scale = [1.0, 1.0, 1.0];
+	for(c = 0; c < 3; c++) {
+		ext = b.max[c] - b.min[c];
+		if(ext > 0.0000001 && want[c] > 0.0)
+			scale[c] = want[c] / ext;
+	}
+	v = mesh.v;
+	for(i = 0; i < v.size(); i += 3) {
+		v[i] = v[i] * scale[0];
+		v[i + 1] = v[i + 1] * scale[1];
+		v[i + 2] = v[i + 2] * scale[2];
+	}
+}
+
+//Vertex clustering on a grid of n x n x n cells: the vertices of a cell become one (their mean), triangles that lose a
+//corner or are there twice go. Coarser grids until it has at most max_tris triangles.
+gdtf_mesh_simplify(mesh, max_tris = GDTF_MESH_MAX_TRIS) {
+	b = gdtf_mesh_bounds(mesh);
+	if(!b || mesh.t.size() < 3)
+		return gdtf_mesh_new();
+	if(mesh.t.size() / 3 <= max_tris)
+		return gdtf_mesh_compact(mesh);
+	best = None;
+	for(n = 10; n >= 2; n--) {
+		r = gdtf_mesh_cluster(mesh, b, n);
+		best = r;
+		if(r.t.size() / 3 <= max_tris)
+			break;
+	}
+	return best;
+}
+
+gdtf_mesh_cluster(mesh, b, n) {
+	size = [];
+	for(c = 0; c < 3; c++)
+		size.push_back(math.max(0.000001, (b.max[c] - b.min[c]) / n));
+	v = mesh.v;
+	cell_of = std.json(); //cell -> new vertex
+	sums = [];
+	map = [];
+	for(i = 0; i < v.size(); i += 3) {
+		ix = math.min(n - 1, std.int((v[i] - b.min[0]) / size[0]));
+		iy = math.min(n - 1, std.int((v[i + 1] - b.min[1]) / size[1]));
+		iz = math.min(n - 1, std.int((v[i + 2] - b.min[2]) / size[2]));
+		key = std.string(ix + n * (iy + n * iz));
+		if(!cell_of.has(key)) {
+			cell_of[key] = sums.size();
+			sums.push_back([x = 0.0, y = 0.0, z = 0.0, count = 0]);
+		}
+		k = cell_of[key];
+		s = sums[k];
+		s.x += v[i];
+		s.y += v[i + 1];
+		s.z += v[i + 2];
+		s.count++;
+		map.push_back(k);
+	}
+	out = gdtf_mesh_new();
+	for(s : sums) {
+		out.v.push_back(s.x / s.count);
+		out.v.push_back(s.y / s.count);
+		out.v.push_back(s.z / s.count);
+	}
+	seen = std.json();
+	t = mesh.t;
+	for(i = 0; i + 2 < t.size(); i += 3) {
+		a = map[t[i]];
+		bb = map[t[i + 1]];
+		c = map[t[i + 2]];
+		if(a == bb || bb == c || a == c)
+			continue;
+		//the same three corners in either winding: once
+		lo = math.min(a, math.min(bb, c));
+		hi = math.max(a, math.max(bb, c));
+		key = lo + "," + (a + bb + c - lo - hi) + "," + hi;
+		if(seen.has(key))
+			continue;
+		seen[key] = 1;
+		out.t.push_back(a);
+		out.t.push_back(bb);
+		out.t.push_back(c);
+	}
+	return gdtf_mesh_compact(out);
+}
+
+//Only the vertices the triangles use, rounded to a tenth of a millimetre (smaller files)
+gdtf_mesh_compact(mesh) {
+	out = gdtf_mesh_new();
+	used = [];
+	for(i = 0; i < mesh.v.size() / 3; i++)
+		used.push_back(-1);
+	for(i = 0; i < mesh.t.size(); i++) {
+		k = mesh.t[i];
+		if(used[k] < 0) {
+			used[k] = out.v.size() / 3;
+			for(c = 0; c < 3; c++)
+				out.v.push_back(math.round(mesh.v[k * 3 + c] * 10000.0) / 10000.0);
+		}
+		out.t.push_back(used[k]);
+	}
+	return out;
+}
+
+// =========================================================================
+// The model of a lamp: the geometry tree of a DMX mode
+// =========================================================================
+
+//files: the archive entries -> std.buffer (the models only). model_by_name: <Model> of the file by Name. A model's
+//mesh is read once (cache: name -> mesh).
+gdtf_model_mesh(model, files, &cache) {
+	if(!model || !model.file)
+		return None;
+	if(cache.has(model.name))
+		return cache[model.name];
+	mesh = None;
+	if(files.has(model.file)) {
+		try {
+			raw = std.string(model.file).lowercase().ends(".glb") ? gdtf_mesh_glb(files[model.file]) : gdtf_mesh_3ds(files[model.file]);
+			gdtf_mesh_fit(raw, model.length, model.width, model.height);
+			mesh = gdtf_mesh_simplify(raw);
+		}
+		catch(e) {
+			std.warn("GDTF: cannot read the model " + model.file + ": " + e);
+			mesh = None;
+		}
+	}
+	cache[model.name] = mesh;
+	return mesh;
+}
+
+//The model of the geometry tree under root (an element of <Geometries>): every geometry with a mesh and the ones on
+//the way to it; references (pixels) and wiring are left out. None when no part has a mesh.
+gdtf_build_model(root, model_by_name, files, &cache) {
+	parts = [];
+	beam = [part = -1, x = 0.0, y = 0.0, z = 0.0];
+	gdtf_model_parts(root, -1, model_by_name, files, cache, parts, beam, 0);
+	has_mesh = false;
+	for(p : parts) {
+		if(p.t.size())
+			has_mesh = true;
+	}
+	if(!has_mesh)
+		return None;
+	//no Beam in the tree (the light comes from pixels a reference adds): from the bottom of the last part with a mesh
+	//(the head), where the beam (-z) leaves it
+	if(beam.part < 0) {
+		for(i = parts.size() - 1; i >= 0 && beam.part < 0; i--) {
+			b = gdtf_mesh_bounds(parts[i]);
+			if(!b || !parts[i].t.size())
+				continue;
+			beam.part = i;
+			beam.x = (b.min[0] + b.max[0]) / 2.0;
+			beam.y = (b.min[1] + b.max[1]) / 2.0;
+			beam.z = b.min[2];
+		}
+	}
+	return [version = 1, parts = parts, beam = [beam.part, beam.x, beam.y, beam.z]];
+}
+
+GDTF_MODEL_SKIP = ["Break", "GeometryReference", "WiringObject", "Inventory", "Structure", "Support", "Magnet", "Display",
+	"Laser"];
+
+gdtf_model_parts(node, parent, model_by_name, files, &cache, &parts, &beam, depth) {
+	if(depth > 32 || GDTF_MODEL_SKIP.has_value(node.tag) || !node.attrs.has("Name"))
+		return;
+	model = model_by_name.has(xml_attr(node, "Model")) ? model_by_name[xml_attr(node, "Model")] : None;
+	mesh = gdtf_model_mesh(model, files, cache);
+	index = parts.size();
+	parts.push_back([name = node.attrs.Name, parent = parent, m = gdtf_mat_parse(xml_attr(node, "Position")),
+		v = mesh ? mesh.v : [], t = mesh ? mesh.t : []]);
+	if(node.tag == "Beam" && beam.part < 0)
+		beam.part = index;
+	for(c : node.children)
+		gdtf_model_parts(c, index, model_by_name, files, cache, parts, beam, depth + 1);
+	//a part without a mesh and nothing below it that has one is not needed (unless the beam is in it)
+	if(!parts[index].t.size() && parts.size() == index + 1 && beam.part != index)
+		parts.pop_back();
+}

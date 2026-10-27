@@ -16,7 +16,7 @@ Hardware-accelerated video playback for VibeVJ, tracked in
 - The libraries are opened with `LoadLibrary` / `dlopen` like the NDI run-time
   (`ffmpeg_runtime.cpp`, modelled on `ndi_sdk.cpp`). Nothing is linked at build
   time, the module loads without FFmpeg, and the LGPL libraries ship unmodified
-  as separate, replaceable files. Headers: `shzmodule_nanogui/libraries/ffmpeg/`
+  as separate, replaceable files. Headers: `modules/shzmodule_nanogui/libraries/ffmpeg/`
   (see its README for versions, file names and search paths).
 
 ### FFmpeg libraries
@@ -181,9 +181,17 @@ v.flip_y(true);
 v.save() / v.load(json);
 nanogui.video_available(); nanogui.video_version(); nanogui.video_error();
 
+v.open_camera(id, [width = 1280, height = 720, fps = 30]);  // a camera instead of a file (see Cameras)
+v.live(); v.camera();           // a camera is open; what open_camera got + "opened_with" (options the device took)
+nanogui.camera_devices();       // [[id, name, format], ...] for open_camera
+nanogui.camera_available(); nanogui.camera_error();
+
 c = nanogui.video_convert(src, dst, "hap");  // hap (HAP Alpha with alpha), hap_alpha, hap_q, prores, dnxhr
+c = nanogui.video_convert(src, dst, "hap", 1080);  // size: shorter side at most 1080 px, never enlarged (0 = as it is)
 c.progress(); c.finished(); c.ok(); c.error(); c.frames(); c.cancel();  // poll it; dropping c cancels
 nanogui.video_formats();
+nanogui.video_probe(path);  // [ok, error, codec, format (hap, hap_alpha, hap_q, hap_q_alpha, prores, dnxhr, dnxhd, ""),
+                            //  width, height, fps, duration, alpha, audio, intra_only], no decoder thread
 ```
 
 `output.value(v)` / shader inputs work like with `image`, since the widget is a
@@ -196,17 +204,82 @@ nanogui.video_formats();
 Play, Restart, Speed (-4..4 on reversible files, 0..4 otherwise), Loop,
 Position (0..1: shows the playhead; moved by hand, MIDI or a link it jumps /
 scrubs, the slider is left alone for 250 ms after such a move), Frame back /
-Frame forward, size, Flip Y, HW Decode, Convert to HAP (`<name>_hap.mov` next
-to the file, progress in the info line, refreshes the asset browser), an info
+Frame forward, size, Flip Y, HW Decode, Convert format / Convert size / Convert
+to HAP (`<name>_hap.mov` next to the file, `<name>_<format>[_<size>p].mov` for
+the others, progress in the info line, refreshes the asset browser), an info
 line (codec, size, fps, decoder or "DXT on the GPU", "backwards") and the
-VideoRouter. A right click on a video in *Assets* offers *Convert to HAP* too
-(`assetbrowser.shio`, `filebrowser.path_at`); a line at the bottom of the list
-shows the running jobs. ACT off
+VideoRouter. A right click on a video in *Assets* offers the conversion too
+(`assetbrowser.shio`, `filebrowser.path_at`), with format and size (saved in
+`engine/style.json`: `convert_format`, `convert_size`); a right click on a
+folder converts the videos in it (not in subfolders) one after the other,
+leaving out files that `video_probe` finds in the format (and size) already,
+files whose copy exists and the copies of the files there (`clip_hap.mov` next to
+`clip.mp4`; in name order, #460). Formats, sizes and the
+copy names: `engine/generators/extensions/video/video_convert.shio`. A line at
+the bottom of the list shows the running jobs. ACT off
 pauses decoding. State saves play / speed / loop / flip / hardware / position
 and restores the position.
 
+## Cameras (#588)
+
+A camera goes through the same widget, decoder and GPU upload as a file: `v.open_camera(id, options)` opens it with
+FFmpeg's input devices (libavdevice): DirectShow on Windows, Video4Linux2 on Linux, AVFoundation on macOS (which lists
+the screens as well, *Capture screen N*). `video_camera.cpp` lists the devices and builds what `avformat_open_input`
+gets; the decoder runs in **live mode** (`shz_video_decoder::open_live`):
+
+- the worker keeps reading and a full queue drops its oldest frame, so the newest picture is always next, and
+  `shz_video_select_frame` shows it at once (paused: the picture stays, frames that come meanwhile are dropped);
+- no seek, no loop, no frame cache (MJPEG cameras are intra-only), no sound, no GPU decoder (MJPEG / raw frames on the
+  CPU, the colour conversion in the shader as for a file). `position()` is 0, `seekable()` false;
+- FFmpeg's interrupt callback ends a read that waits for the next frame when the widget closes, and opening gives up
+  after 10 s.
+
+Options: `width` / `height` (`video_size`), `fps` (`framerate`), `input_format` (`mjpeg`, `yuyv422`, ...; v4l2
+`input_format`, DirectShow `vcodec` / `pixel_format`, AVFoundation `pixel_format`), `format` (the FFmpeg input device;
+`lavfi` takes a libavfilter source graph as device, e.g. `testsrc2=size=1280x720:rate=30`, paced in real time). A
+device refuses a size, rate or format it does not have, so `shz_video_camera::prepare` lists attempts with fewer
+constraints, tried in order: as asked, without the pixel format, without the size, without anything. Linux asks for
+MJPEG first (the higher rates and sizes over USB 2), macOS for 30 fps (AVFoundation's default 29.97 is refused by most
+cameras, then 60 / 25 / 24 / 15 are tried). No such device / no permission / busy stops after the first attempt.
+
+The id of `camera_devices()`: Windows the DirectShow device path (`@device_pnp_...`, the stable "alternative name",
+opened as `video=<id>`), Linux `/dev/videoN` (nodes that do not capture video, the UVC metadata nodes, are left out),
+macOS the device name (AVFoundation has no device list in libavdevice: it is read from the log of `list_devices`,
+opened by name, by index when the name has a colon).
+
+**Libraries**: libavdevice imports libavfilter, both are loaded the first time a camera is listed or opened, from the
+folder the other FFmpeg libraries came from (`shz_ffmpeg::devices()`), optional like libswresample: without them
+files play and `camera_available()` is false. They add about 38 MB per platform to the shipped FFmpeg
+(`compile_scripts/ffmpeg_fetch.shio`; macOS: `shzscript_macos/build_ffmpeg.sh` with `--enable-avfoundation`; the app
+bundle needs `NSCameraUsageDescription`, `bundle.sh`).
+
+**VibeVJ**: `assets/Generators/Input/Camera.asset`: the list of cameras (and *Test pattern*, the lavfi source), the
+id in the control `camera` (saved, so a project opens the same camera), *Resolution*, *Frame rate*, *Play*, *Flip Y*,
+*Size* outputs, the video router and *Out*. A camera that is unplugged or busy is opened again every 3 s.
+
+## Sync (#460)
+
+`video_module.shio`, control *Sync* (Off / Bars / Deck) with *Sync settings* (*Bars*, *Deck*, *Offset* in seconds of
+the clip). The sync sets the speed every frame (the *Speed* slider is ignored meanwhile), corrects small differences
+with at most 5 % more or less speed and jumps when the clip is more than 0.15 s / 4 frames off (at most every 100 ms
+for intra-only files, every second for long-GOP ones); stopped (rate 0) it shows the frame of the target. *Play* off
+or ACT off hold the frame.
+
+- **Bars**: the clip lasts *Bars* × 4 beats of the timeline: speed = clip length / (beats × 60 / BPM), position =
+  the phase of the timeline position (`tl_pos`) in those beats × clip length. A BPM change, tap or a jump of the
+  timeline cursor moves the clip with it; with the timeline stopped, moving the cursor scrubs. More than 4× is
+  clamped (the info line says "too fast").
+- **Deck**: position = `positionMs` of the CDJ (the prolink module extrapolates it to now: CDJ-3000 position packets,
+  else beat grid + beat), speed = 1 + pitch / 100 while the deck moves. *Deck* 0 is the tempo master. The device
+  comes from a ProlinkBridge / ProlinkDecks generator: they put theirs into `std.global("prolink_sources")` (removed in
+  `on_free`), the video opens no connection of its own.
+
 ## Tests
 
+- `_testing/nanogui/video_camera.shio`: the live path without a camera (lavfi): colour through the YUV shader, frames
+  at the source rate, no seek / loop / end, pause holds, save / load, another source, back to a file, a missing v4l2
+  device (error, one attempt), closing a slow source, `camera_devices()` entries. Linux headless:
+  `LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a shz _testing/nanogui/video_camera.shio`.
 - `_testing/video/decoder_test.cpp`: headless decoder core (timing at 1x / 2x,
   pause, restart, loop on / off, pixel layout table). On Windows also the
   Direct3D half of the zero-copy path: GPU decode, video processor, pixels read
@@ -311,8 +384,9 @@ comparison: 1 x H.264 1080p60 49 %, 4 x 187 %, 1 x HEVC 2160p60 168 %.)
   drop. The caller was not found in the scripts.
 - A double click on a file in the asset browser opens it as text in a code box
   (`assetbrowser.shio`), also a video of several hundred MB.
-- VibeVJ crashes on exit in the static destructor of `shz_mididevice_handler`
-  (access violation at DLL unload), also with an empty project.
+- VibeVJ crashed on exit in the static destructor of `shz_mididevice_handler`
+  (access violation at DLL unload), also with an empty project. Fixed: the
+  handler and its device list are never destroyed (`mididevice.h`).
 
 ## Open questions (from #278)
 
@@ -364,6 +438,13 @@ comparison: 1 x H.264 1080p60 49 %, 4 x 187 %, 1 x HEVC 2160p60 168 %.)
   `<target>.part` and renames it at the end; a failure or cancel leaves
   nothing. HAP needs sizes in multiples of 4 (cut down to them), the others
   even sizes. No ffmpeg executable is shipped for it.
+  A target size (#460, `max_size`): the shorter side scaled down to it in the
+  same swscale pass (bicubic; swscale widens the filter when it scales down),
+  the aspect kept, then rounded to the nearest multiple of the format; never
+  enlarged. The colour matrix of the output follows the new height (BT.601
+  below 720 lines). `shz_video_conversion::probe()` (`nanogui.video_probe`)
+  opens the file with `avformat_find_stream_info` only; the HAP variant comes
+  from the MOV fourcc (`Hap1`, `Hap5`, `HapY`, `HapM`), DNxHR from the profile.
 
 Measured (`video_hardware.shio <media> random`, Windows, RTX 4080 +
 i5-13600K, 144 Hz):

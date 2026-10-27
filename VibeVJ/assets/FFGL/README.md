@@ -11,7 +11,7 @@ Patchview, an area or onto a clip like a shader (#428).
 - An effect has the port *In 1* in that section (a mixer *In 1* and *In 2*). *In 1* is the default input, so an FFGL
   effect works in the stack of a clip and in the effects of a MapLab output.
 - The time and the beat of the timeline go to the plugin.
-- The host: `shzmodule_nanogui/ffgl_host.cpp` (nanogui `ffgl` widget), the loader:
+- The host: `modules/shzmodule_nanogui/ffgl_host.cpp` (nanogui `ffgl` widget), the loader:
   `engine/generators/extensions/ffgl/`.
 
 Plugins are not part of the repository; this folder only holds this file.

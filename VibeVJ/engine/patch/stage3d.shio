@@ -1,0 +1,370 @@
+//The stage in 3D (#655): camera, projection and where the beam of a lamp goes. No UI: the fixture setup draws with it
+//(its 3D view), _testing/stage3d.shio checks it.
+//
+//Needs engine/patch/patch.shio included before it.
+//
+//The world is the stage plan with a height: x to the right, y towards the audience (as on the plan), z up, in metres.
+//A lamp stands at (x, y, z). Its beam (stage3d_beam_dir):
+//  - pan turns it around the vertical axis of the lamp (0.5: the middle of the pan range, pan_range of the fixture type
+//    from 0 to 1), the rotation of the lamp on the plan turns that with it
+//  - tilt tips it away from the vertical (0.5: straight up standing on the floor, straight down hanging), tilt_range
+//    from 0 to 1
+//  - a lamp that does not move points straight up (standing) or down (hanging)
+//  - lean (#669) leans all of that towards the front of the lamp (before the rotation on the plan): a bar on the floor
+//    angled at the audience, a head on a side truss
+//Vectors are [x, y, z] JSON objects.
+
+STAGE3D_FOV = 50.0; //vertical field of view in degrees
+STAGE3D_NEAR = 0.05; //metres in front of the camera: what is nearer is not drawn
+
+stage3d_v(x, y, z) {
+	return [x = x, y = y, z = z];
+}
+
+stage3d_add(a, b) {
+	return [x = a.x + b.x, y = a.y + b.y, z = a.z + b.z];
+}
+
+stage3d_sub(a, b) {
+	return [x = a.x - b.x, y = a.y - b.y, z = a.z - b.z];
+}
+
+stage3d_scale(a, s) {
+	return [x = a.x * s, y = a.y * s, z = a.z * s];
+}
+
+stage3d_dot(a, b) {
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+stage3d_cross(a, b) {
+	return [x = a.y * b.z - a.z * b.y, y = a.z * b.x - a.x * b.z, z = a.x * b.y - a.y * b.x];
+}
+
+stage3d_length(a) {
+	return math.sqrt(stage3d_dot(a, a));
+}
+
+stage3d_normalize(a) {
+	l = stage3d_length(a);
+	return l > 0.0 ? stage3d_scale(a, 1.0 / l) : stage3d_v(0.0, 0.0, 0.0);
+}
+
+//A camera that looks at target from distance metres away. yaw 0: from the audience (in front of the stage, +y), turning
+//to the right as it grows; pitch: how far above the floor it looks down from (0 level, PI/2 from straight above).
+stage3d_camera(target, yaw, pitch, distance) {
+	pitch = math.clamp(pitch, -1.5, 1.5);
+	eye = stage3d_add(target, stage3d_scale(stage3d_v(math.sin(yaw) * math.cos(pitch), math.cos(yaw) * math.cos(pitch), math.sin(pitch)), distance));
+	forward = stage3d_normalize(stage3d_sub(target, eye));
+	//(x right, y towards the audience, z up is a left-handed system: the crosses the other way round)
+	right = stage3d_normalize(stage3d_cross(stage3d_v(0.0, 0.0, 1.0), forward));
+	up = stage3d_cross(forward, right);
+	return [eye = eye, target = target, forward = forward, right = right, up = up, yaw = yaw, pitch = pitch, distance = distance];
+}
+
+//Pixels per metre at depth 1 for a view h pixels high
+stage3d_focal(h) {
+	return (h / 2.0) / math.tan(STAGE3D_FOV * math.PI / 360.0);
+}
+
+//A point on the screen of size (w, h): [x, y, depth (metres in front of the camera), ok (in front of it)]
+stage3d_project(cam, p, w, h) {
+	d = stage3d_sub(p, cam.eye);
+	depth = stage3d_dot(d, cam.forward);
+	if(depth < STAGE3D_NEAR)
+		return [x = 0.0, y = 0.0, depth = depth, ok = false];
+	f = stage3d_focal(h);
+	return [x = w / 2.0 + stage3d_dot(d, cam.right) * f / depth, y = h / 2.0 - stage3d_dot(d, cam.up) * f / depth, depth = depth, ok = true];
+}
+
+//A line between two points of the world on the screen: [x0, y0, x1, y1], None when all of it is behind the camera. The
+//part behind the camera is cut off; the rest stays straight in perspective, so its two ends are enough (#682: no pieces)
+stage3d_project_line(cam, a, b, w, h) {
+	da = stage3d_dot(stage3d_sub(a, cam.eye), cam.forward);
+	db = stage3d_dot(stage3d_sub(b, cam.eye), cam.forward);
+	cut = STAGE3D_NEAR * 2.0; //(not at STAGE3D_NEAR itself: rounding could put the cut end behind it)
+	if(da < cut && db < cut)
+		return None;
+	if(da < cut)
+		a = stage3d_add(a, stage3d_scale(stage3d_sub(b, a), (cut - da) / (db - da)));
+	else if(db < cut)
+		b = stage3d_add(b, stage3d_scale(stage3d_sub(a, b), (cut - db) / (da - db)));
+	pa = stage3d_project(cam, a, w, h);
+	pb = stage3d_project(cam, b, w, h);
+	if(!pa.ok || !pb.ok)
+		return None;
+	return [x0 = pa.x, y0 = pa.y, x1 = pb.x, y1 = pb.y];
+}
+
+//The ray from the camera through a point of the screen: [origin, dir]
+stage3d_ray(cam, sx, sy, w, h) {
+	f = stage3d_focal(h);
+	dir = stage3d_add(cam.forward, stage3d_add(stage3d_scale(cam.right, (sx - w / 2.0) / f), stage3d_scale(cam.up, (h / 2.0 - sy) / f)));
+	return [origin = cam.eye, dir = stage3d_normalize(dir)];
+}
+
+//Where a ray meets the level z (None when it runs along it or away from it)
+stage3d_hit_level(ray, z) {
+	if(math.abs(ray.dir.z) < 0.000001)
+		return None;
+	t = (z - ray.origin.z) / ray.dir.z;
+	if(t <= 0.0)
+		return None;
+	return stage3d_add(ray.origin, stage3d_scale(ray.dir, t));
+}
+
+//Where a lamp stands
+stage3d_lamp_pos(f) {
+	return stage3d_v(f.x, f.y, f.z ?? 0.0);
+}
+
+//A direction in the lamp (x along it, y its front, z its top as it stands on the floor, after the turn of a hanging
+//lamp) in the world: leaned around its x axis (towards its front), then turned by its rotation on the plan
+stage3d_lamp_to_world(f, v) {
+	lean = (f.lean ?? 0.0) * math.PI / 180.0;
+	if(lean != 0.0) {
+		//standing, leaning tips its top (and a beam going up) to the front; hanging, its beam goes down and to the front
+		if((f.mount ?? "floor") == "hanging")
+			lean = -lean;
+		v = stage3d_v(v.x, v.y * math.cos(lean) + v.z * math.sin(lean), v.z * math.cos(lean) - v.y * math.sin(lean));
+	}
+	//the rotation of the lamp on the plan (degrees, as nvgRotate draws it: from x towards y)
+	a = (f.rotation ?? 0) * math.PI / 180.0;
+	return stage3d_v(v.x * math.cos(a) - v.y * math.sin(a), v.x * math.sin(a) + v.y * math.cos(a), v.z);
+}
+
+//The direction of the beam of a lamp (length 1). pan, tilt: 0..1 as sent (None for a lamp that does not move)
+stage3d_beam_dir(f, t, pan = None, tilt = None) {
+	hanging = (f.mount ?? "floor") == "hanging";
+	tip = 0.0; //away from the vertical
+	turn = 0.0; //around it
+	if(!std.is_none(pan) && !std.is_none(tilt)) {
+		tip = (tilt - 0.5) * t.tilt_range * math.PI / 180.0;
+		turn = (pan - 0.5) * t.pan_range * math.PI / 180.0;
+	}
+	//in the lamp: tilting leans towards its front (the audience, +y), panning turns that around the vertical
+	v = stage3d_v(math.sin(tip) * math.sin(turn), math.sin(tip) * math.cos(turn), math.cos(tip));
+	//hanging upside down: turned over around its x axis
+	if(hanging)
+		v = stage3d_v(v.x, -v.y, -v.z);
+	return stage3d_lamp_to_world(f, v);
+}
+
+//Along the lamp (length 1): the way the pixels of a bar run, the axis a head tilts around
+stage3d_lamp_axis(f) {
+	return stage3d_lamp_to_world(f, stage3d_v(1.0, 0.0, 0.0));
+}
+
+//Away from where the lamp is fixed (length 1): up standing, down hanging, leaned with it. The yoke of a head stands on
+//the other side
+stage3d_lamp_up(f) {
+	return stage3d_lamp_to_world(f, stage3d_v(0.0, 0.0, (f.mount ?? "floor") == "hanging" ? -1.0 : 1.0));
+}
+
+//The two ends of a bar in the world (length: metres, patch_lamp_size): the first pixel at a
+stage3d_bar_ends(f, length) {
+	pos = stage3d_lamp_pos(f);
+	half = stage3d_scale(stage3d_lamp_axis(f), length / 2.0);
+	return [a = stage3d_sub(pos, half), b = stage3d_add(pos, half)];
+}
+
+//How far the point (px, py) is from the line from (ax, ay) to (bx, by): for clicks on a bar drawn on the screen
+stage3d_segment_distance(px, py, ax, ay, bx, by) {
+	dx = bx - ax;
+	dy = by - ay;
+	l2 = dx * dx + dy * dy;
+	t = l2 > 0.0 ? math.clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0.0, 1.0) : 0.0;
+	ex = ax + dx * t - px;
+	ey = ay + dy * t - py;
+	return math.sqrt(ex * ex + ey * ey);
+}
+
+//How far a beam reaches: to the floor when it goes down, else max_length
+stage3d_beam_length(pos, dir, max_length = 8.0) {
+	if(dir.z < -0.0001)
+		return math.min(max_length, pos.z / -dir.z);
+	return max_length;
+}
+
+//Camera distance and target that show these lamps (and the floor under them)
+stage3d_fit(lamps) {
+	if(!lamps.size())
+		return [target = stage3d_v(0.0, 0.0, 1.0), distance = 14.0];
+	b = patch_bounds(lamps);
+	top = 0.0;
+	for(i = 0; i < lamps.size(); i++)
+		top = math.max(top, lamps[i].z ?? 0.0);
+	extent = math.max(4.0, math.max(b.max_x - b.min_x, math.max(b.max_y - b.min_y, top)) + 3.0);
+	return [target = stage3d_v((b.min_x + b.max_x) / 2.0, (b.min_y + b.max_y) / 2.0, top / 2.0), distance = extent * 1.5];
+}
+
+// =========================================================================
+// 3D models of lamps (#669: the model of a GDTF import, engine/patch/gdtf_mesh.shio; drawn in stage3d_draw.shio)
+// =========================================================================
+
+STAGE3D_MODEL_SHADES = 6; //grey levels of the faces (one nvg path each per part)
+
+//3 x 4 matrix (rows) times 3 x 4 matrix
+stage3d_mat_mul(a, b) {
+	return [
+		a[0] * b[0] + a[1] * b[4] + a[2] * b[8], a[0] * b[1] + a[1] * b[5] + a[2] * b[9], a[0] * b[2] + a[1] * b[6] + a[2] * b[10],
+		a[0] * b[3] + a[1] * b[7] + a[2] * b[11] + a[3],
+		a[4] * b[0] + a[5] * b[4] + a[6] * b[8], a[4] * b[1] + a[5] * b[5] + a[6] * b[9], a[4] * b[2] + a[5] * b[6] + a[6] * b[10],
+		a[4] * b[3] + a[5] * b[7] + a[6] * b[11] + a[7],
+		a[8] * b[0] + a[9] * b[4] + a[10] * b[8], a[8] * b[1] + a[9] * b[5] + a[10] * b[9], a[8] * b[2] + a[9] * b[6] + a[10] * b[10],
+		a[8] * b[3] + a[9] * b[7] + a[10] * b[11] + a[11]];
+}
+
+//From the coordinates of a GDTF model (z up, the lamp hanging with its beam down -z) into the world, for a lamp: turned
+//over around x (the lamp in stage3d stands with its beam up), turned back for a hanging one, then leaned and turned as
+//stage3d_lamp_to_world does, at its position
+stage3d_gdtf_frame(f) {
+	hanging = (f.mount ?? "floor") == "hanging";
+	cols = [];
+	for(e : [stage3d_v(1.0, 0.0, 0.0), stage3d_v(0.0, 1.0, 0.0), stage3d_v(0.0, 0.0, 1.0)]) {
+		u = stage3d_v(e.x, -e.y, -e.z);
+		if(hanging)
+			u = stage3d_v(u.x, -u.y, -u.z);
+		cols.push_back(stage3d_lamp_to_world(f, u));
+	}
+	p = stage3d_lamp_pos(f);
+	return [cols[0].x, cols[1].x, cols[2].x, p.x, cols[0].y, cols[1].y, cols[2].y, p.y, cols[0].z, cols[1].z, cols[2].z, p.z];
+}
+
+//The world matrix of every part of a model for pan and tilt (0..1 as sent, None: the middle): pan turns its part around
+//its z, tilt its part around its x, so the head points where stage3d_beam_dir says
+stage3d_model_parts(f, t, pan = None, tilt = None) {
+	mesh = t.mesh;
+	turn = 0.0;
+	tip = 0.0;
+	if(!std.is_none(pan) && !std.is_none(tilt)) {
+		tip = (tilt - 0.5) * t.tilt_range * math.PI / 180.0;
+		turn = (pan - 0.5) * t.pan_range * math.PI / 180.0;
+	}
+	frame = stage3d_gdtf_frame(f);
+	world = [];
+	for(i = 0; i < mesh.parts.size(); i++) {
+		part = mesh.parts[i];
+		m = stage3d_mat_mul(part.parent >= 0 && part.parent < world.size() ? world[part.parent] : frame, part.m);
+		if(i == t.pan_part) {
+			c = math.cos(turn);
+			s = math.sin(turn);
+			m = stage3d_mat_mul(m, [c, 0.0 - s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+		}
+		if(i == t.tilt_part) {
+			c = math.cos(0.0 - tip);
+			s = math.sin(0.0 - tip);
+			m = stage3d_mat_mul(m, [1.0, 0.0, 0.0, 0.0, 0.0, c, 0.0 - s, 0.0, 0.0, s, c, 0.0]);
+		}
+		world.push_back(m);
+	}
+	return world;
+}
+
+//Where the light comes out of a model (world), and its direction (the -z of the beam part); None without a beam part
+stage3d_model_lens(t, world) {
+	b = t.mesh.beam;
+	if(!b || b.size() < 4 || b[0] < 0 || b[0] >= world.size())
+		return None;
+	m = world[b[0]];
+	pos = stage3d_v(m[0] * b[1] + m[1] * b[2] + m[2] * b[3] + m[3], m[4] * b[1] + m[5] * b[2] + m[6] * b[3] + m[7],
+		m[8] * b[1] + m[9] * b[2] + m[10] * b[3] + m[11]);
+	return [pos = pos, dir = stage3d_normalize(stage3d_v(0.0 - m[2], 0.0 - m[6], 0.0 - m[10]))];
+}
+
+//The model of a lamp on the screen: per part (the farthest first) its front faces in STAGE3D_MODEL_SHADES lists of
+//screen triangles (x0, y0, x1, y1, x2, y2, ...), its box on the screen (min, max: [x, y]) and where the light comes out
+//(lens in the world, lens_screen [x, y], lens_dir). None when a point is behind the camera.
+stage3d_model_project(cam, s, f, t, pan, tilt) {
+	world = stage3d_model_parts(f, t, pan, tilt);
+	focal = stage3d_focal(s.y);
+	ex = cam.eye.x; ey = cam.eye.y; ez = cam.eye.z;
+	fx = cam.forward.x; fy = cam.forward.y; fz = cam.forward.z;
+	rx = cam.right.x; ry = cam.right.y; rz = cam.right.z;
+	ux = cam.up.x; uy = cam.up.y; uz = cam.up.z;
+	hw = s.x / 2.0;
+	hh = s.y / 2.0;
+	//the light: from above, a little from the left of the camera
+	lx = ux * 0.65 - fx * 0.6 - rx * 0.35;
+	ly = uy * 0.65 - fy * 0.6 - ry * 0.35;
+	lz = uz * 0.65 - fz * 0.6 - rz * 0.35;
+	ll = math.sqrt(lx * lx + ly * ly + lz * lz);
+	lx /= ll; ly /= ll; lz /= ll;
+	min_x = 1000000.0; min_y = 1000000.0; max_x = -1000000.0; max_y = -1000000.0;
+	parts = [];
+	for(i = 0; i < t.mesh.parts.size(); i++) {
+		part = t.mesh.parts[i];
+		tri = part.t;
+		if(!tri.size())
+			continue;
+		m = world[i];
+		v = part.v;
+		w = []; //world x, y, z of each vertex
+		sc = []; //screen x, y
+		depth_sum = 0.0;
+		for(k = 0; k < v.size(); k += 3) {
+			x = v[k]; y = v[k + 1]; z = v[k + 2];
+			wx = m[0] * x + m[1] * y + m[2] * z + m[3];
+			wy = m[4] * x + m[5] * y + m[6] * z + m[7];
+			wz = m[8] * x + m[9] * y + m[10] * z + m[11];
+			dx = wx - ex; dy = wy - ey; dz = wz - ez;
+			depth = dx * fx + dy * fy + dz * fz;
+			if(depth < 0.05)
+				return None;
+			px = hw + (dx * rx + dy * ry + dz * rz) * focal / depth;
+			py = hh - (dx * ux + dy * uy + dz * uz) * focal / depth;
+			w.push_back(wx); w.push_back(wy); w.push_back(wz);
+			sc.push_back(px); sc.push_back(py);
+			depth_sum += depth;
+			if(px < min_x) min_x = px;
+			if(px > max_x) max_x = px;
+			if(py < min_y) min_y = py;
+			if(py > max_y) max_y = py;
+		}
+		shades = [];
+		for(k = 0; k < STAGE3D_MODEL_SHADES; k++)
+			shades.push_back([]);
+		for(k = 0; k + 2 < tri.size(); k += 3) {
+			a = tri[k] * 3; b = tri[k + 1] * 3; c = tri[k + 2] * 3;
+			ax = w[a]; ay = w[a + 1]; az = w[a + 2];
+			e1x = w[b] - ax; e1y = w[b + 1] - ay; e1z = w[b + 2] - az;
+			e2x = w[c] - ax; e2y = w[c + 1] - ay; e2z = w[c + 2] - az;
+			nx = e1y * e2z - e1z * e2y;
+			ny = e1z * e2x - e1x * e2z;
+			nz = e1x * e2y - e1y * e2x;
+			//only the faces that look at the camera
+			if(nx * (ex - ax) + ny * (ey - ay) + nz * (ez - az) <= 0.0)
+				continue;
+			nl = math.sqrt(nx * nx + ny * ny + nz * nz);
+			if(nl < 0.0000000001)
+				continue;
+			//some light everywhere, the rest from the light
+			light = 0.2 + 0.8 * math.max(0.0, (nx * lx + ny * ly + nz * lz) / nl);
+			level = math.clamp(std.int(light * STAGE3D_MODEL_SHADES), 0, STAGE3D_MODEL_SHADES - 1);
+			list = shades[level];
+			a2 = tri[k] * 2; b2 = tri[k + 1] * 2; c2 = tri[k + 2] * 2;
+			list.push_back(sc[a2]); list.push_back(sc[a2 + 1]);
+			list.push_back(sc[b2]); list.push_back(sc[b2 + 1]);
+			list.push_back(sc[c2]); list.push_back(sc[c2 + 1]);
+		}
+		//the farthest part first
+		entry = [depth = depth_sum / (v.size() / 3), shades = shades];
+		j = parts.size();
+		for(j > 0 && parts[j - 1].depth < entry.depth)
+			j--;
+		parts.insert(j, entry);
+	}
+	if(!parts.size())
+		return None;
+	out = [parts = parts, min = [x = min_x, y = min_y], max = [x = max_x, y = max_y], lens = None, lens_screen = None, lens_dir = None];
+	lens = stage3d_model_lens(t, world);
+	if(lens) {
+		pl = stage3d_project(cam, lens.pos, s.x, s.y);
+		if(pl.ok) {
+			out.lens = lens.pos;
+			out.lens_dir = lens.dir;
+			out.lens_screen = [x = pl.x, y = pl.y];
+		}
+	}
+	return out;
+}

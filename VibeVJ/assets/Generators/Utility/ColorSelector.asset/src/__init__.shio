@@ -3,13 +3,30 @@
 // A click on a colour sets that target's RGB and HSV outputs (scaled by Brightness, gliding by Smoothing);
 // a click on a column header sets every target to that colour.
 // The selected colour of a row is marked in the theme's accent colour (selection), the swatches are content.
+// Loading a project / preset restores the pushed colour and the RGB / HSV outputs as they were: the colour buttons
+// and the column headers carry no_load_callbacks, so writing back a saved value does not pick a colour (#203).
+// Lamps of a row (#719): a group of the fixture setup (or all lamps) takes the colour of the row directly, through the
+// lighting desk (engine.desk.set_input: like a cue stack, the colour picked last wins), while the generator runs. The
+// RGB / HSV outputs stay for everything else.
 
 import nanogui;
 
 using nanogui; //For nvg*
 using eigen;
 
+#include "engine/patch/patch"
+#include "engine/patch/fx"
+#include "engine/patch/desk"
+
+def fill_lamps_combo(combo, row);
+def pick_lamps(row, index);
+
 grid = None;
+engine = None;
+row_lamps = [];   //per row: "" (no lamps), "all" or "group:<id>" (saved)
+row_combos = [];  //per row: its Lamps combobox
+row_sent = [];    //per row: the colour it sent last ("" when it sends nothing)
+who_base = "";    //the name the desk knows the rows of this generator by
 
 // Theme colours for the selection marks (read in entry(), captured by value in on_draw)
 c_select = vec4f(157.0 / 255.0, 133.0 / 255.0, 1.0, 1.0);   // accent: selected colour
@@ -152,7 +169,7 @@ set_size(targets, colors) {
 			trigger_btn = item.attr.trigger_btn;
 		else
 			item = grid.add_header_top_item(j);
-			trigger_btn = item.controlbutton("toptrigger_"+j).anchor(0).transparent(1).hide_config_menu(true).tooltip("Set every target to this colour");
+			trigger_btn = item.controlbutton("toptrigger_"+j).anchor(0).transparent(1).hide_config_menu(true).tooltip("Set every target to this colour").no_load_callbacks(true);
 			item.attr.trigger_btn = trigger_btn;
 			
 		if(j == 0)
@@ -179,10 +196,13 @@ set_size(targets, colors) {
 		});
 		
 		trigger_btn.callback([targets, j](v){
-				for(i = 0; i < targets; i++) {
-					grid.get_item_at(i,j).attr.trigger_btn.value(true);
-				}
-			});
+			//Off is not a click on the header: it picks nothing (#203)
+			if(!v)
+				return;
+			for(i = 0; i < targets; i++) {
+				grid.get_item_at(i,j).attr.trigger_btn.value(true);
+			}
+		});
 	}
 	
 	for(i = 0; i < targets; i++) {
@@ -192,7 +212,16 @@ set_size(targets, colors) {
 		if(!grid.get_header_left_item(i))
 		{
 			left_item = grid.add_header_left_item(i);
-			left_item.controltext("target_name_"+i).value("Target "+(i+1)).anchor(0).anchor_right(100).hide_config_menu().tooltip("Name of this target");
+			left_item.controltext("target_name_"+i).value("Target "+(i+1)).anchor(0).anchor_right(100).anchor_bottom(34).hide_config_menu().tooltip("Name of this target");
+			lamps_combo = left_item.combobox().anchor_left(0).anchor_right(104).anchor_bottom(2).fixed_height(28);
+			lamps_combo.tooltip("Lamps that take the colour of this row directly: a group of the [[fixture setup]] or all lamps (through the lighting desk, like a cue stack). The RGB outputs stay for everything else\n[[wiki:Lighting-Desk#groups-as-link-targets]]");
+			row = i;
+			lamps_combo.on_open([lamps_combo, row]() { fill_lamps_combo(lamps_combo, row); });
+			lamps_combo.on_change([row](index, text) { pick_lamps(row, index); });
+			for(row_combos.size() <= i)
+				row_combos.push_back(None);
+			row_combos[i] = lamps_combo;
+			fill_lamps_combo(lamps_combo, i);
 			
 			rgb_out_scroll = left_item.vscroll().anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(100).content().layout(nanogui.layout_vertical());
 			
@@ -236,7 +265,7 @@ set_size(targets, colors) {
 				trigger_btn = item.attr.trigger_btn;
 			else
 				item = grid.add_item(i,j);			
-				trigger_btn = item.controlbutton("trigger_"+i+"_"+j).anchor(0).transparent(1).push(1).hide_config_menu(true).tooltip("Pick this colour for the target of this row");
+				trigger_btn = item.controlbutton("trigger_"+i+"_"+j).anchor(0).transparent(1).push(1).hide_config_menu(true).tooltip("Pick this colour for the target of this row").no_load_callbacks(true);
 				item.attr.trigger_btn = trigger_btn;
 			
 			trigger_btn.callback([i,j,trigger_btn,item,left_item](v){
@@ -247,6 +276,18 @@ set_size(targets, colors) {
 				}
 				else if(active_colors[i] == trigger_btn)
 					return;
+				
+				//A project load restores the pushed colour of a row without running this callback
+				//(no_load_callbacks, #203), so active_colors can be behind. Take over the row's pushed
+				//button: the block below lets go of it, and one colour per row stays selected.
+				if(!active_colors[i]) {
+					for(c = 0; c < grid.cols(); c++) {
+						other_cell = grid.get_item_at(i,c);
+						if(other_cell && other_cell.attr.trigger_btn && other_cell.attr.trigger_btn != trigger_btn &&
+							other_cell.attr.trigger_btn.value())
+							active_colors[i] = other_cell.attr.trigger_btn;
+					}
+				}
 				
 				if(active_colors[i])
 					old_trigger = active_colors[i];
@@ -320,7 +361,79 @@ set_size(targets, colors) {
 	}
 }
 
+// =========================================================================
+// Lamps of a row (#719)
+// =========================================================================
+
+lamp_targets() {
+	list = [[id = "", name = "No lamps"], [id = "all", name = "All lamps"]];
+	if(engine) {
+		groups = engine.patch.groups;
+		for(i = 0; i < groups.size(); i++)
+			list.push_back([id = "group:" + groups[i].id, name = groups[i].name]);
+	}
+	return list;
+}
+
+lamps_of(row) {
+	return row < row_lamps.size() ? std.string(row_lamps[row] ?? "") : "";
+}
+
+fill_lamps_combo(combo, row) {
+	list = lamp_targets();
+	names = [];
+	sel = 0;
+	want = lamps_of(row);
+	for(k = 0; k < list.size(); k++) {
+		names.push_back(list[k].name);
+		if(list[k].id == want)
+			sel = k;
+	}
+	if(want && sel == 0) {
+		names.push_back("(deleted group)");
+		sel = names.size() - 1;
+	}
+	combo.items(names).selected(sel);
+}
+
+pick_lamps(row, index) {
+	list = lamp_targets();
+	if(index < 0 || index >= list.size())
+		return;
+	for(row_lamps.size() <= row)
+		row_lamps.push_back("");
+	row_lamps[row] = list[index].id;
+}
+
+//Every frame: each row with lamps sends its colour to them (the desk lets them go half a second after it stops)
+update(generator, tl_pos, pos_delta) {
+	if(!engine || !engine.desk || !grid)
+		return;
+	for(i = 0; i < grid.rows(); i++) {
+		for(row_sent.size() <= i)
+			row_sent.push_back("");
+		target = lamps_of(i);
+		who = who_base + i;
+		left_item = grid.get_header_left_item(i);
+		if(!target || !left_item) {
+			if(row_sent[i]) {
+				engine.desk.set_input(who, std.json());
+				row_sent[i] = "";
+			}
+			continue;
+		}
+		rgb = [left_item.attr.r.value(), left_item.attr.g.value(), left_item.attr.b.value()];
+		key = target + ":" + rgb.compact_string();
+		moved = key != row_sent[i];
+		row_sent[i] = key;
+		ids = desk_target_ids(engine.patch, target);
+		engine.desk.set_input(who, desk_input_values(engine.patch, ids, [color = true], [color = rgb]), moved);
+	}
+}
+
 entry(generator, area) {
+	engine = generator.engine;
+	who_base = "colorselector:" + std.random_hash(8) + ":";
 	
 	t = area.theme().to_json();
 	c_select = theme_color(t, "accent_color", c_select);
@@ -367,6 +480,7 @@ entry(generator, area) {
 
 save_state() {
 	states = [];
+	states.lamps = row_lamps.copy();
 	states.cell_size_x = grid.cell_size().x;
 	states.cell_size_y = grid.cell_size().y;
 	states.spacing_x = grid.spacing().x;
@@ -375,6 +489,12 @@ save_state() {
 }
 
 load_state(states) {
+	row_lamps = states.has("lamps") && std.is_json(states.lamps) ? states.lamps.copy() : [];
+	row_sent = [];
+	for(i = 0; i < row_combos.size(); i++) {
+		if(row_combos[i])
+			fill_lamps_combo(row_combos[i], i);
+	}
 	if(states.has("cell_size_x") && states.has("cell_size_y"))
 		grid.cell_size(vec2f(states.cell_size_x, states.cell_size_y));
 	if(states.has("spacing_x") && states.has("spacing_y"))

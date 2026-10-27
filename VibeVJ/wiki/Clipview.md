@@ -26,7 +26,9 @@ column, by MIDI or with autoplay. A [CueList](CueList.md) is the same thing show
 
 ## Layers
 
-Layer 1 is the top row and gives the final picture. Each layer lays its live clip over the layers below it.
+Layer 1 is the top row and gives the final picture. Each layer lays its live clip over the layers below it. A layer
+without a live clip lets the layers below through unchanged, whatever its blend mode: stop Layer 1 and the picture is
+Layer 2. A clip that starts on an empty layer fades in over that picture.
 
 | Control | What it does |
 |---|---|
@@ -60,6 +62,8 @@ Click the name tag of a layer to select it. The *Layer* window then shows:
 1. Open the *Assets* tab in the sidebar.
 2. Drag a shader, a generator (also one without a picture, like the *Phaser* of a fixture), a view or a preset of one,
    a picture or a [video](Video.md) onto an empty cell. It becomes a clip, named after the file, and is selected.
+   A clip without a picture shows its name; a *Phaser* shows the lamps it drives, in 2D or 3D
+   ([Phaser](Output-and-Devices.md#effects-over-fixtures)).
 3. Drag another asset onto the clip, or onto the list in the *Layer* window, to stack it onto the clip as an effect.
 
 What can become a clip is on [Generators](Generators.md#what-a-generator-is) and [Assets](Assets.md).
@@ -74,10 +78,13 @@ What can become a clip is on [Generators](Generators.md#what-a-generator-is) and
 
 - **Move:** drag the clip by its name tag to an empty cell.
 - **Copy:** hold Ctrl when you let go.
-- **Onto another clip:** the first asset of the clip you drag is stacked onto that clip, with fresh settings. The clip
-  you dragged goes, unless you hold Ctrl.
-- **Delete:** select the clip. In the *Layer* window, click × (tooltip *Remove*) on every entry of its stack. When
-  the last entry goes, the clip goes. There is no other way to delete a clip.
+- **Onto another clip:** the whole stack of the clip you drag is stacked onto that clip, after its own entries, in
+  its order and each entry with its settings. The clip settings (name, *Trigger*, *Inputs*, *Autoplay*, *Macros*) stay
+  those of the clip it lands on; links of the dragged clip's macros to its entries do not come along. The clip you
+  dragged goes, unless you hold Ctrl.
+- **Delete:** select the clip (its name tag) and press Delete (or Backspace, the delete key of a Mac). The clip goes
+  with its whole stack. Not while *Live* is on. The clip also goes when you remove the last entry of its stack in the
+  *Layer* window (× on each).
 - **Undo:** Ctrl + Z (or the undo button of the top bar) takes back each of these, also a clip you made and an asset
   you stacked onto a clip: see [Undo and redo](The-Screen.md#undo-and-redo). A clip that comes back is not live.
 
@@ -139,14 +146,16 @@ Each layer has two rows of three buttons.
 
 ### Inputs: Relative / Absolute
 
-Effects that take a picture can use another layer as their input. The line above the inputs reads
-"−1 layer above · 0 off · +1 layer below".
+Effects that take a picture can use another layer as their input. The two lines above the inputs spell out both
+rules.
 
 - **Relative:** the number counts from the layer of the clip. 1 = the layer below, −1 = the layer above, 0 = off.
-- **Absolute:** the number picks one fixed layer, wherever the clip sits. It counts from 0: 1 = *Layer 2*, 2 = *Layer 3*.
-  0 is off, so *Layer 1* cannot be picked this way; use *Relative* for it.
+- **Absolute:** the number names one fixed layer, wherever the clip sits: 1 = *Layer 1*, 2 = *Layer 2*, 0 = off.
+  It used to count from 0, so 1 = *Layer 2* and *Layer 1* was out of reach (#374).
 - A new clip starts with its first input (an input named `input` or `iChannel0`) at 1, the layer below, and the
   others at 0.
+- A project saved before #374 is migrated when it loads (format 3 → 4): every saved Absolute value from 1 up gets
+  +1, so an existing link stays on the layer it was wired to. The files of the project are kept in `.backup_v3`.
 
 ## Macros
 

@@ -6,8 +6,18 @@
 //- The IDs of the controls (name + group) are those from before #439 for lamps of an old project (legacy_index), so MIDI
 //  mappings and links keep working. New lamps use their id.
 //- Highlight (from the fixture setup): the lamp goes to full (colours white, intensity channels full) to find it in the rig.
+//- Test values (#670, set_fixture_test of engine/patch/patch_ai.shio): an AI agent holds controls of a lamp at a value,
+//  e.g. to see a lamp in the camera picture. A held control sends the held value instead of its own (also while a Phaser
+//  moves it); the dimmers, flashers, highlight and blackout still apply. clear_test() lets the controls send their own
+//  values again. Not saved with the project.
 //- The menu follows the patch: build_fixture_menu() (called by engine.patch_changed()) adds, renames and removes what
 //  changed and keeps the controls of the lamps that are still there.
+//- Masters (#719), at the top: four Speed masters the Phaser can follow (speed_factor), then Groups: per group of the
+//  fixture setup its Group master, which scales the brightness of its lamps (as the blackout does: dimmers, and the
+//  colour of lamps without dimmer; a lamp in two groups gets both; the controls of the lamps keep their values, only
+//  what is sent changes), and its inputs Colour (R, G, B), Dimmer, Pan, Tilt: link targets for any generator (a
+//  ColorSelector, an LFO, MIDI). engine.desk sends what they get to the lamps of the group like a cue stack (an input
+//  sends once it moved; Release stops it).
 
 class fixtures_menu {
 
@@ -19,6 +29,14 @@ class fixtures_menu {
 
 	devices = []; //node MAC -> Art-Net device (found when first needed)
 	highlight = []; //lamp id -> true
+	test = []; //lamp id -> [control index (as in lamp_controls) -> held value 0..1]
+
+	managed masters_content = None;
+	managed group_masters_content = None;
+	managed group_masters = []; //group id -> its Group master control
+	managed group_entries = []; //group id -> [entry, color = [r, g, b], dimmer, pan, tilt]: its section in Groups
+	speed_masters = [];         //the four Speed master controls
+	lamp_masters = [];          //lamp id -> [Group master controls of its groups]
 
 	__init__(_engine, parent) {
 		engine = _engine;
@@ -31,6 +49,7 @@ class fixtures_menu {
 
 		fixture_controls = parent.matrixnode("fixture_menu").layout(nanogui.layout_vertical());
 
+		build_masters();
 		build_fixture_menu();
 	}
 
@@ -50,10 +69,10 @@ class fixtures_menu {
 		return dev;
 	}
 
-	//An 8-bit or 16-bit channel that sets the brightness: full while the lamp is highlighted
-	is_intensity(name) {
-		n = std.string(name).lowercase();
-		return n.contains("dim") || n.contains("intens") || n.contains("master") || n.contains("bright");
+	//An 8-bit or 16-bit channel that sets the brightness: full while the lamp is highlighted. By the function of the
+	//channel (patch_type: named in the fixture file, else guessed from the name, #655)
+	is_intensity(slot) {
+		return slot.function == "dimmer";
 	}
 
 	//Writes one value (0..1) of a lamp at a channel offset; bytes 2 sends coarse and fine
@@ -72,6 +91,93 @@ class fixtures_menu {
 			dev.set_artnet_channel(f.universe, channel, std.int(v * 255.0 + 0.5));
 	}
 
+	//The value control `index` of lamp `id` sends before the dimmers: the test value while one is held, else its own
+	held(id, index, v) {
+		values = test[id] ?? None;
+		if(!values)
+			return v;
+		key = std.string(index);
+		return values.has(key) ? values[key] : v;
+	}
+
+	//Holds controls of a lamp at test values: [control index -> value 0..1] (merged with what it holds already)
+	set_test(id, values) {
+		if(!test.has(id))
+			test[id] = [];
+		for(i = 0; i < values.size(); i++)
+			test[id][std.string(values.key(i))] = math.clamp(std.float(values[i]), 0.0, 1.0);
+		refresh_lamp(id);
+	}
+
+	//The lamps (ids) send their own values again; empty / None: every lamp
+	clear_test(ids = None) {
+		if(std.is_none(ids) || !ids.size()) {
+			ids = [];
+			for(i = 0; i < test.size(); i++)
+				ids.push_back(test.key(i));
+		}
+		for(i = 0; i < ids.size(); i++) {
+			if(test.has(ids[i])) {
+				test.erase(ids[i]);
+				refresh_lamp(ids[i]);
+			}
+		}
+	}
+
+	//Sets controls of a lamp to values for good, as moving its sliders does: [control index -> value 0..1]. Saved with the
+	//project; a Phaser on the control still moves it. Returns false without the lamp
+	set_values(id, values) {
+		lamp = lamps[id] ?? None;
+		if(!lamp)
+			return false;
+		for(i = 0; i < values.size(); i++) {
+			index = std.int(values.key(i));
+			if(index >= 0 && index < lamp.controls.size())
+				lamp.controls[index].value(math.clamp(std.float(values[i]), 0.0, 1.0));
+		}
+		return true;
+	}
+
+	//Lamp ids with test values
+	test_lamps() {
+		ids = [];
+		for(i = 0; i < test.size(); i++)
+			ids.push_back(test.key(i));
+		return ids;
+	}
+
+	//What each control of a lamp has: [[label, function, value (its own), held (the test value or None), sent], ...]
+	//sent is what goes out on its channel (0..1, after the white split of RGBW, the dimmers, flash, highlight and blackout);
+	//None without the lamp
+	lamp_values(f) {
+		lamp = lamps[f.id] ?? None;
+		type_entry = types[f.type] ?? None;
+		if(!lamp || !type_entry)
+			return None;
+		t = patch_type(f.type);
+		values = test[f.id] ?? None;
+		list = [];
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			c = t.controls[i];
+			own = lamp.controls[i].value();
+			v = held(f.id, i, own);
+			held_value = values && values.has(std.string(i)) ? v : None;
+			//RGBW: W sends the white part of the colour (min of R, G, B, or a held W), R, G and B the rest (build_lamp)
+			if(c.kind == "RGBW") {
+				first = i - c.comp;
+				r = held(f.id, first, lamp.controls[first].value());
+				g = held(f.id, first + 1, lamp.controls[first + 1].value());
+				b = held(f.id, first + 2, lamp.controls[first + 2].value());
+				w = held(f.id, first + 3, math.min(r, g, b));
+				v = c.comp == 3 ? w : math.max(0.0, v - w);
+			}
+			full = (c.kind == "RGB" || c.kind == "RGBW" || is_intensity(t.slots[c.slot])) ? 1.0 : None;
+			list.push_back([label = c.label, function = c.function, value = own, held = held_value,
+				sent = math.clamp(out_value(f, type_entry, c.slot, v, full), 0.0, 1.0)]);
+		}
+		return list;
+	}
+
 	//The value a control sends: scaled by the dimmer of its type, replaced by a flash, full when highlighted, and at last
 	//scaled by the blackout (engine/blackout.shio) when it is a channel of brightness or colour
 	out_value(f, type_entry, slot_index, v, highlight_value = None) {
@@ -83,10 +189,184 @@ class fixtures_menu {
 			v = flasher.ctrl.value();
 		if(highlight.has(f.id) && !std.is_none(highlight_value))
 			v = highlight_value;
-		master = engine.env.output_master ?? 1.0;
+		//Not `?? 1.0`: ?? goes by truth, so a full blackout (the master 0.0, #670) reads as missing, and
+		//has() alone hands back a None value: both guards, the key present and not None (#570, #670)
+		master = engine.env.has("output_master") && !std.is_none(engine.env.output_master) ? engine.env.output_master : 1.0;
 		if(master < 1.0 && dims_on_blackout(f, slot_index))
 			v = v * master;
+		//The Group masters scale the intensity: the dimmer, on a lamp without dimmer its colour (not both: that would
+		//darken the light twice)
+		gm = group_master(f.id);
+		if(gm < 1.0 && slot_index < type_entry.intensity.size() && type_entry.intensity[slot_index])
+			v = v * gm;
 		return v;
+	}
+
+	// =========================================================================
+	// Masters (#719)
+	// =========================================================================
+
+	//The section Masters: the Speed masters, then a Group master per group (build_group_masters)
+	build_masters() {
+		entry = fixture_controls.collapsable("Masters");
+		entry.tooltip("Speed masters for the Phaser, and for each group of the [[fixture setup]] its Group master and inputs to link into\n[[wiki:Lighting-Desk#masters]]");
+		masters_content = entry.content().layout(nanogui.layout_vertical());
+		speed_entry = masters_content.collapsable("Speed masters");
+		speed_content = speed_entry.content().layout(nanogui.layout_vertical());
+		speed_masters = [];
+		for(n = 1; n <= 4; n++) {
+			ctrl = speed_content.controlslider("SPEED_" + n, "speed_masters").caption("Speed " + n).min(0).max(4).value(1.0);
+			ctrl.tooltip("[[speed master|Speed master]]: how fast the phasers that follow Speed " + n + " run: 1 as set, 2 twice as fast, 0 stands still. Map it to a fader or link a tap\n[[wiki:Lighting-Desk#masters]]");
+			speed_masters.push_back(ctrl);
+		}
+		group_entry = masters_content.collapsable("Groups");
+		group_entry.tooltip("Each group of the [[fixture setup]]: its Group master, and Colour, Dimmer, Pan, Tilt to [[link]] any generator into (a ColorSelector, an LFO, MIDI)\n[[wiki:Lighting-Desk#groups-as-link-targets]]");
+		group_masters_content = group_entry.content().layout(nanogui.layout_vertical());
+	}
+
+	//Which slots of a type a Group master scales (one bool per slot): its dimmers, or on a lamp without dimmer its colours
+	group_master_slots(t) {
+		has_dimmer = false;
+		for(s = 0; s < t.slots.size(); s++) {
+			if(is_intensity(t.slots[s]))
+				has_dimmer = true;
+		}
+		list = [];
+		for(s = 0; s < t.slots.size(); s++) {
+			slot = t.slots[s];
+			list.push_back(has_dimmer ? is_intensity(slot) : (slot.kind == "RGB" || slot.kind == "RGBW" || slot.function == "color"));
+		}
+		return list;
+	}
+
+	//Speed master n (1..4): its factor, 1 for 0 or a number out of range
+	speed_factor(n) {
+		if(n < 1 || n > speed_masters.size())
+			return 1.0;
+		return math.max(0.0, speed_masters[n - 1].value());
+	}
+
+	//The sections of Groups follow the groups of the patch: one per group with its Group master and inputs (the group id
+	//is in the IDs of the controls, so MIDI mappings and links stay when the group is renamed)
+	build_group_masters() {
+		if(!group_masters_content)
+			return;
+		p = engine.patch;
+		for(i = group_entries.size() - 1; i >= 0; i--) {
+			id = group_entries.key(i);
+			if(!patch_group(p, id)) {
+				std.free(group_entries[i].entry);
+				group_entries.erase(id);
+				group_masters.erase(id);
+				if(engine.desk)
+					engine.desk.release_group(id);
+			}
+		}
+		lamp_masters = [];
+		for(i = 0; i < p.groups.size(); i++) {
+			g = p.groups[i];
+			e = group_entries[g.id] ?? None;
+			if(!e)
+				e = build_group(g.id, g.name);
+			e.entry.title(g.name);
+			ctrl = group_masters[g.id];
+			for(k = 0; k < g.fixtures.size(); k++) {
+				fid = g.fixtures[k];
+				if(!lamp_masters.has(fid))
+					lamp_masters[fid] = [];
+				lamp_masters[fid].push_back(ctrl);
+			}
+		}
+	}
+
+	//The section of a group: Master, then the inputs (they tell engine.desk when they move)
+	build_group(gid, name) {
+		entry = group_masters_content.collapsable(name);
+		c = entry.content().layout(nanogui.layout_vertical());
+		ctrl = c.controlslider("GROUP_MASTER", "group_master_" + gid).caption("Master").value(1.0);
+		ctrl.tooltip("[[group master|Group master]]: brightness of the lamps of this group, on top of their own values: their dimmers (lamps without dimmer: their colour)\n[[wiki:Lighting-Desk#masters]]");
+		ctrl.callback([this, gid](v) {
+			this.refresh_group(gid);
+		});
+		group_masters[gid] = ctrl;
+		grp = "group_input_" + gid;
+		vec = c.controlvector("Colour", grp);
+		vec.tooltip("Red, green and blue for the lamps of this group, 0 to 1: [[link]] the RGB outputs of a ColorSelector or anything else here. Sends once it moved\n[[wiki:Lighting-Desk#groups-as-link-targets]]");
+		rgb = [];
+		comps = ["R", "G", "B"];
+		for(k = 0; k < 3; k++) {
+			comp = vec.controlfloat(comps[k], grp + "_" + comps[k].lowercase()).min(0).max(1).value(1.0).no_load_callbacks(true);
+			comp.callback([this, gid](v) { this.group_moved(gid, "color"); });
+			rgb.push_back(comp);
+		}
+		e = [entry = entry, color = rgb];
+		funcs = ["dimmer", "pan", "tilt"];
+		captions = ["Dimmer", "Pan", "Tilt"];
+		for(k = 0; k < funcs.size(); k++) {
+			func = funcs[k];
+			sl = c.controlslider(captions[k], grp).caption(captions[k]).value(func == "dimmer" ? 1.0 : 0.5).no_load_callbacks(true);
+			sl.tooltip(captions[k] + " of the lamps of this group (on a lamp without dimmer, Dimmer scales its colour): [[link]] an LFO, the audio analysis or a fader here. Sends once it moved");
+			sl.callback([this, gid, func](v) { this.group_moved(gid, func); });
+			e[func] = sl;
+		}
+		release = c.button("Release").fixed_height(28);
+		release.tooltip("The inputs of this group stop sending: its lamps go back to what they had (cue stacks, the programmer, their sliders). An input sends again when it moves");
+		release.on_click([this, gid]() {
+			if(this.engine.desk)
+				this.engine.desk.release_group(gid);
+		});
+		group_entries[gid] = e;
+		return e;
+	}
+
+	group_moved(gid, func) {
+		if(engine.desk)
+			engine.desk.group_input_moved(gid, func);
+	}
+
+	//What the inputs of a group have now: [color = [r, g, b], dimmer, pan, tilt], or None (no such group)
+	group_input_values(gid) {
+		e = group_entries[gid] ?? None;
+		if(!e)
+			return None;
+		return [color = [e.color[0].value(), e.color[1].value(), e.color[2].value()], dimmer = e.dimmer.value(),
+			pan = e.pan.value(), tilt = e.tilt.value()];
+	}
+
+	//Sets an input of a group as a link would (func: color with v = [r, g, b], dimmer, pan, tilt); false when there is none
+	set_group_input(gid, func, v) {
+		e = group_entries[gid] ?? None;
+		if(!e)
+			return false;
+		if(func == "color") {
+			for(k = 0; k < 3; k++)
+				e.color[k].value(math.clamp(std.float(v[k]), 0.0, 1.0));
+		}
+		else if(func == "dimmer" || func == "pan" || func == "tilt")
+			e[func].value(math.clamp(std.float(v), 0.0, 1.0));
+		else
+			return false;
+		group_moved(gid, func);
+		return true;
+	}
+
+	//The product of the Group masters of a lamp (1 for a lamp in no group)
+	group_master(id) {
+		list = lamp_masters[id] ?? None;
+		if(!list)
+			return 1.0;
+		m = 1.0;
+		for(i = 0; i < list.size(); i++)
+			m = m * math.clamp(list[i].value(), 0.0, 1.0);
+		return m;
+	}
+
+	refresh_group(id) {
+		g = patch_group(engine.patch, id);
+		if(!g)
+			return;
+		for(i = 0; i < g.fixtures.size(); i++)
+			refresh_lamp(g.fixtures[i]);
 	}
 
 	//The blackout darkens brightness and light colours. Pan, tilt, gobos, CMY (0 is white there) and the rest stay
@@ -95,7 +375,7 @@ class fixtures_menu {
 		if(!t || slot_index >= t.slots.size())
 			return false;
 		slot = t.slots[slot_index];
-		if(slot.kind == "RGB" || slot.kind == "RGBW" || is_intensity(slot.name))
+		if(slot.kind == "RGB" || slot.kind == "RGBW" || is_intensity(slot))
 			return true;
 		n = std.string(slot.name).lowercase();
 		return n.contains("red") || n.contains("green") || n.contains("blue") || n.contains("white") ||
@@ -156,26 +436,137 @@ class fixtures_menu {
 		if(!type_entry)
 			return None;
 		intensity = -1.0;
+		color = None;
 		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
 			c = t.controls[i];
-			if((c.kind == "RGB" || c.kind == "RGBW") && c.comp == 0 && i + 2 < lamp.controls.size()) {
+			if(!color && (c.kind == "RGB" || c.kind == "RGBW") && c.comp == 0 && i + 2 < lamp.controls.size()) {
+				r = out_value(f, type_entry, c.slot, held(f.id, i, lamp.controls[i].value()), 1.0);
+				g = out_value(f, type_entry, c.slot, held(f.id, i + 1, lamp.controls[i + 1].value()), 1.0);
+				b = out_value(f, type_entry, c.slot, held(f.id, i + 2, lamp.controls[i + 2].value()), 1.0);
+				if(c.kind == "RGBW" && i + 3 < lamp.controls.size()) {
+					w = out_value(f, type_entry, c.slot, held(f.id, i + 3, lamp.controls[i + 3].value()), 1.0);
+					r = math.min(1.0, r + w);
+					g = math.min(1.0, g + w);
+					b = math.min(1.0, b + w);
+				}
+				color = [r = r, g = g, b = b];
+			}
+			else if(intensity < 0.0 && c.kind != "RGB" && c.kind != "RGBW" && is_intensity(t.slots[c.slot]))
+				intensity = out_value(f, type_entry, c.slot, held(f.id, i, lamp.controls[i].value()), 1.0);
+		}
+		//a colour and a dimmer (a moving head, a GDTF wash with its colours full by default): as bright as the dimmer
+		if(color && intensity >= 0.0)
+			return [r = color.r * intensity, g = color.g * intensity, b = color.b * intensity];
+		if(color)
+			return color;
+		if(intensity >= 0.0) {
+			//a colour wheel (#669, GDTF import): the colour of the slot it is on
+			slot = lamp_wheel_slot(f, t, lamp, type_entry, "colorwheel");
+			if(slot)
+				return [r = intensity * slot.color[0], g = intensity * slot.color[1], b = intensity * slot.color[2]];
+			return [r = intensity, g = intensity, b = intensity];
+		}
+		return None;
+	}
+
+	//The slot of the first wheel of a lamp with this function ("colorwheel", "gobo") at the value it is sent
+	//(patch_wheel_slot), None
+	lamp_wheel_slot(f, t, lamp, type_entry, func) {
+		if(!t.wheels)
+			return None;
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			c = t.controls[i];
+			slot = t.slots[c.slot];
+			if(slot.function != func || !slot.wheel)
+				continue;
+			return patch_wheel_slot(t, c.slot, out_value(f, type_entry, c.slot, held(f.id, i, lamp.controls[i].value())));
+		}
+		return None;
+	}
+
+	//The gobo a lamp shows (#669, the gobo wheel of a GDTF import): its mask (engine/patch/gdtf_zip.shio), None for none
+	lamp_gobo(f) {
+		lamp = lamps[f.id] ?? None;
+		if(!lamp)
+			return None;
+		t = patch_type(f.type);
+		type_entry = types[f.type] ?? None;
+		if(!type_entry || !t.wheels)
+			return None;
+		slot = lamp_wheel_slot(f, t, lamp, type_entry, "gobo");
+		return slot && slot.gobo ? slot.gobo : None;
+	}
+
+	//The light a lamp gives, as it is sent: [r, g, b, dimmer] 0..1. r, g, b: its first colour (white when it has none),
+	//dimmer: its first dimmer channel (1 when it has none). What it shows is the colour times the dimmer: MapLab tints a
+	//slice with it (a virtual lamp, assets/Fixtures/Virtual), FixtureState puts it into a texture. None for a lamp that
+	//is not built (yet) or a type that is missing
+	lamp_light(f) {
+		lamp = lamps[f.id] ?? None;
+		if(!lamp)
+			return None;
+		t = patch_type(f.type);
+		type_entry = types[f.type] ?? None;
+		if(!type_entry)
+			return None;
+		out = [r = 1.0, g = 1.0, b = 1.0, dimmer = 1.0];
+		has_color = false;
+		has_dimmer = false;
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			c = t.controls[i];
+			if(!has_color && (c.kind == "RGB" || c.kind == "RGBW") && c.comp == 0 && i + 2 < lamp.controls.size()) {
+				has_color = true;
 				r = out_value(f, type_entry, c.slot, lamp.controls[i].value(), 1.0);
 				g = out_value(f, type_entry, c.slot, lamp.controls[i + 1].value(), 1.0);
 				b = out_value(f, type_entry, c.slot, lamp.controls[i + 2].value(), 1.0);
 				if(c.kind == "RGBW" && i + 3 < lamp.controls.size()) {
 					w = out_value(f, type_entry, c.slot, lamp.controls[i + 3].value(), 1.0);
-					r = math.min(1.0, r + w);
-					g = math.min(1.0, g + w);
-					b = math.min(1.0, b + w);
+					r = r + w;
+					g = g + w;
+					b = b + w;
 				}
-				return [r = r, g = g, b = b];
+				out.r = math.clamp(r, 0.0, 1.0);
+				out.g = math.clamp(g, 0.0, 1.0);
+				out.b = math.clamp(b, 0.0, 1.0);
 			}
-			if(intensity < 0.0 && is_intensity(t.slots[c.slot].name))
-				intensity = out_value(f, type_entry, c.slot, lamp.controls[i].value(), 1.0);
+			else if(!has_dimmer && c.kind != "RGB" && c.kind != "RGBW" && is_intensity(t.slots[c.slot])) {
+				has_dimmer = true;
+				out.dimmer = math.clamp(out_value(f, type_entry, c.slot, lamp.controls[i].value(), 1.0), 0.0, 1.0);
+			}
 		}
-		if(intensity >= 0.0)
-			return [r = intensity, g = intensity, b = intensity];
-		return None;
+		//no RGB but a colour wheel (#669, GDTF import): the colour of the slot it is on
+		if(!has_color) {
+			slot = lamp_wheel_slot(f, t, lamp, type_entry, "colorwheel");
+			if(slot && slot.color) {
+				out.r = math.clamp(std.float(slot.color[0]), 0.0, 1.0);
+				out.g = math.clamp(std.float(slot.color[1]), 0.0, 1.0);
+				out.b = math.clamp(std.float(slot.color[2]), 0.0, 1.0);
+			}
+		}
+		return out;
+	}
+
+	//Where a moving head points (#655, the 3D view of the fixture setup): [pan, tilt] 0..1 as sent (the first Pan and Tilt
+	//channel), 0.5 for one it does not have; None for a lamp that does not move
+	lamp_pan_tilt(f) {
+		lamp = lamps[f.id] ?? None;
+		t = patch_type(f.type);
+		if(!lamp || !t.moving)
+			return None;
+		type_entry = types[f.type] ?? None;
+		out = [pan = 0.5, tilt = 0.5];
+		found = [];
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			func = t.controls[i].function;
+			if((func == "pan" || func == "tilt") && !found.has(func)) {
+				found[func] = true;
+				v = held(f.id, i, lamp.controls[i].value());
+				if(type_entry)
+					v = out_value(f, type_entry, t.controls[i].slot, v);
+				out[func] = math.clamp(v, 0.0, 1.0);
+			}
+		}
+		return out;
 	}
 
 	// =========================================================================
@@ -187,7 +578,8 @@ class fixtures_menu {
 		t = patch_type(path);
 		entry = fixture_controls.collapsable(t.name);
 		entry.content().layout(nanogui.layout_vertical());
-		type_entry = [entry = entry, content = entry.content(), dimmers = [], flashers = [], signature = t.signature];
+		type_entry = [entry = entry, content = entry.content(), dimmers = [], flashers = [], signature = t.signature,
+			intensity = group_master_slots(t)];
 		types[path] = type_entry;
 		type_entry = types[path];
 
@@ -240,11 +632,12 @@ class fixtures_menu {
 			group = patch_control_group(f, chan_name, slot.channel);
 			offset = slot.offset;
 			slot_index = s;
-			full = is_intensity(slot.name) ? 1.0 : None;
+			full = is_intensity(slot) ? 1.0 : None;
 
 			if(slot.kind == "RGB" || slot.kind == "RGBW") {
 				rgb_vec = inst_content.controlvector(slot.name, group);
 				color_selector = rgb_vec.color_selector();
+				first_index = lamp.controls.size(); //index of R in lamp.controls (for the test values)
 				r_comp = rgb_vec.controlslider("R", group).tooltip("Red of these lamps, 0 to 1");
 				g_comp = rgb_vec.controlslider("G", group).tooltip("Green of these lamps, 0 to 1");
 				b_comp = rgb_vec.controlslider("B", group).tooltip("Blue of these lamps, 0 to 1");
@@ -261,10 +654,11 @@ class fixtures_menu {
 					comps = [r_comp, g_comp, b_comp];
 					for(c = 0; c < 3; c++) {
 						comp_offset = offset + c;
-						comps[c].callback([this, id, comp_offset, slot_index](v) {
+						ctrl_index = first_index + c;
+						comps[c].callback([this, id, comp_offset, slot_index, ctrl_index](v) {
 							f = patch_find(this.engine.patch, id);
 							if(f)
-								this.write(f, comp_offset, this.out_value(f, this.types[f.type], slot_index, v, 1.0));
+								this.write(f, comp_offset, this.out_value(f, this.types[f.type], slot_index, this.held(id, ctrl_index, v), 1.0));
 						});
 					}
 				}
@@ -280,21 +674,34 @@ class fixtures_menu {
 						b_comp.value(col.z - w);
 						w_comp.value(w);
 					});
-					w_comp.callback([this, id, offset, slot_index](v) {
+					//While R, G or B is held for a test, W follows the held colour (the control W keeps its own value)
+					w_comp.callback([this, id, offset, slot_index, first_index, r_comp, g_comp, b_comp](v) {
 						f = patch_find(this.engine.patch, id);
-						if(f)
-							this.write(f, offset + 3, this.out_value(f, this.types[f.type], slot_index, v, 1.0));
+						if(!f)
+							return;
+						if(this.test.has(id)) {
+							r = this.held(id, first_index, r_comp.value());
+							g = this.held(id, first_index + 1, g_comp.value());
+							b = this.held(id, first_index + 2, b_comp.value());
+							v = this.held(id, first_index + 3, math.min(r, g, b));
+						}
+						this.write(f, offset + 3, this.out_value(f, this.types[f.type], slot_index, v, 1.0));
 					});
-					update_rgbw = [this, id, offset, slot_index, r_comp, g_comp, b_comp, w_comp](v) {
+					update_rgbw = [this, id, offset, slot_index, first_index, r_comp, g_comp, b_comp, w_comp](v) {
 						f = patch_find(this.engine.patch, id);
 						if(!f)
 							return;
 						type_entry = this.types[f.type];
-						r = r_comp.value();
-						g = g_comp.value();
-						b = b_comp.value();
+						r = this.held(id, first_index, r_comp.value());
+						g = this.held(id, first_index + 1, g_comp.value());
+						b = this.held(id, first_index + 2, b_comp.value());
 						w = math.min(r, g, b);
-						w_comp.value(w);
+						if(this.test.has(id)) {
+							w = this.held(id, first_index + 3, w);
+							w_comp.value(w_comp.value()); //sends the held white (its callback)
+						}
+						else
+							w_comp.value(w);
 						flasher = type_entry.flashers[slot_index] ?? None;
 						flash = flasher && flasher.btn.value();
 						lit = this.highlight.has(id);
@@ -309,16 +716,50 @@ class fixtures_menu {
 			}
 			else {
 				bytes = slot.kind == "16-bit" ? 2 : 1;
+				ctrl_index = lamp.controls.size();
 				ctrl = inst_content.controlslider(slot.name, group);
-				ctrl.callback([this, id, offset, slot_index, bytes, full](v) {
+				ctrl.callback([this, id, offset, slot_index, bytes, full, ctrl_index](v) {
 					f = patch_find(this.engine.patch, id);
 					if(f)
-						this.write(f, offset, this.out_value(f, this.types[f.type], slot_index, v, full), bytes);
+						this.write(f, offset, this.out_value(f, this.types[f.type], slot_index, this.held(id, ctrl_index, v), full), bytes);
 				});
 				lamp.controls.push_back(ctrl);
 			}
 		}
+		apply_defaults(t, lamp);
+		//A virtual lamp (a projection zone) starts with its dimmer and colour at full and white: a slice it tints looks as
+		//before until an effect moves them. Its other channels start at their "default" (#719: Pan, Tilt, Zoom and
+		//Rotate of a projection zone in the middle), else 0 (Strobe off). A loaded project sets its saved values
+		//afterwards (the menu is built before the controls are loaded)
+		if(t.virtual) {
+			for(i = 0; i < lamp.controls.size() && i < t.controls.size(); i++) {
+				c = t.controls[i];
+				bright = c.function == "dimmer" || c.kind == "RGB" || c.kind == "RGBW";
+				chan = t.channels[t.slots[c.slot].channel];
+				lamp.controls[i].value(chan.has("default") ? c.default : (bright ? 1.0 : 0.0));
+			}
+		}
 		return lamp;
+	}
+
+	//The values the channels start at (#669, "default" of the fixture file, a GDTF import: a shutter open, pan and tilt
+	//in the middle). A new lamp gets them; a project that is loaded sets its saved values after this. RGBW: W follows
+	//min(R, G, B), so its white goes into R, G and B.
+	apply_defaults(t, lamp) {
+		for(i = 0; i < t.controls.size() && i < lamp.controls.size(); i++) {
+			c = t.controls[i];
+			if(c.kind == "RGBW") {
+				if(c.comp == 3)
+					continue;
+				w = i - c.comp + 3 < t.controls.size() ? t.controls[i - c.comp + 3].default : 0.0;
+				v = math.min(1.0, c.default + w);
+				if(v > 0.0)
+					lamp.controls[i].value(v);
+				continue;
+			}
+			if(c.default > 0.0)
+				lamp.controls[i].value(c.default);
+		}
 	}
 
 	lamp_title(f) {
@@ -343,6 +784,7 @@ class fixtures_menu {
 				std.free(lamp.entry);
 				lamps.erase(id);
 				highlight.erase(id);
+				test.erase(id);
 			}
 		}
 
@@ -373,6 +815,8 @@ class fixtures_menu {
 			else
 				lamp.entry.title(lamp_title(f));
 		}
+
+		build_group_masters();
 
 		//A node may have changed: look the devices up again
 		devices = [];

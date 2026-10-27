@@ -143,6 +143,9 @@ loop, one turn of the loop is what one beat is on the main timeline: *SYNC* runs
 *TRIGGER* over one turn. A control whose loop was deleted stands still and shows *Missing source*.
 
 On a slider the fill shows the value that is sent, after envelope and smoothing; the thumb shows where you put it.
+A value you type into the slider (double click) is the value that is sent, as it is: the thumb moves to where the
+curve gives it. The same for an *Absolute* link and for a project or preset that is loaded. MIDI and *Normalized* links
+move the thumb, and the curve makes the value of it.
 
 ## Link types
 
@@ -214,8 +217,15 @@ A greyed-out control has no grip dots on its notches and takes no links.
   not in show mode.
 - **What a control is linked to:** rest the mouse anywhere on a linked control. Its tooltip lists the links: *in* for
   what drives it, *out* for what it drives, each with the partner, where the partner is (the area and the generator)
-  and the link type, and *not on screen* for a partner you cannot see right now. After a quarter of a second its
-  cables show faintly, as a hint; on a notch they show in full. Not in show mode.
+  and the link type, and *not on screen* for a partner you cannot see right now. The colours are those of the notches:
+  *in* in the accent colour (violet by default) like a linked input notch, *out* and the link type in the colour of the
+  cable (absolute the accent, normalized pink, inverted light blue). The list opens after a quarter of a
+  second, sooner than other tooltips, and the control's cables show faintly then, as a hint; on a notch they show in
+  full. A faint cable to a partner that is scrolled out of its view ends dashed at the edge of that view, with an arrow
+  pointing to where the partner is. Not in show mode.
+- **Follow a link from the list:** once the list has locked (the bar under it is full, or a middle click), move into it
+  and rest on a partner: the partner glows where it is on screen, and its own list opens next to it. Rest on one of
+  its partners to go on (Speed → Tempo → Tap Tempo), so you can follow a chain without leaving the control.
 - **Many cables:** the small pulses on a cable run from the sender to the receiver. With more than 40 cables on screen
   the pulses stop, with more than 300 the cables are drawn in a plainer way, so the frame rate holds.
 

@@ -4,6 +4,9 @@
 
 using eigen;
 
+CLIP_KEY_DELETE = 261;    //GLFW key codes
+CLIP_KEY_BACKSPACE = 259;
+
 class clipview
 {
 	managed cnt_area = None;
@@ -109,13 +112,18 @@ class clipview
 		
 		grid.dragdrop_enabled(true);
 		
+		//What the grid does not take (#346: a generator, an area, a drag without a path) gets the red outline of the
+		//screen and is not dropped
 		grid.content().on_dragdrop_hover([this, grid](payload, pos) {
-			return grid.dragdrop_enabled();
+			return grid.dragdrop_enabled() && this.takes_drop(payload);
 		});
 		
 		grid.on_cell_drop([this, grid](payload, row, col) {	
+			if(!this.takes_drop(payload))
+				return false;
+
 			//A clip dragged from a cell (Ctrl: a copy)
-			if(payload.has("cell") && payload.has("item"))
+			if(this.is_clip_payload(payload))
 			{	
 				//A layer (the head of a row, column < 0) is not moved into the grid (#428)
 				if(payload.cell.col() < 0)
@@ -149,6 +157,14 @@ class clipview
 		});
 		
 		
+		//Delete (or Backspace, the delete key of a Mac) deletes the selected clip (#374), while the grid has the focus.
+		//The name tag of a clip has its own handler (add_generator): a button without children keeps every key
+		grid.on_keyboard([this, grid](key, scancode, action, mods){
+			if(this.delete_key(key, action, mods))
+				return true;
+			return grid.keyboard_default(key, scancode, action, mods);
+		});
+
 		input_ctrl = cnt_area.control("IN", "default_io").caption("In").anchor_left(0).anchor_bottom(0).fixed_height(25).fixed_width(50);
 		out_ctrl = cnt_area.control("OUT", "default_io").caption("Out").anchor_right(0).anchor_bottom(0).fixed_height(25).fixed_width(60).as_output(true);
 		
@@ -270,8 +286,8 @@ class clipview
 			
 			try {
 			
-				if(!grid.get_header_left_item(i) || i >= layer_controls.size())
-					return; //initializing, return here
+				if(!grid.get_header_left_item(i) || i >= layer_controls.size()) //the head of this row is gone
+					continue; //the other rows and the composition go on (#574)
 				
 				cell = active_cells[i];
 				cell_item = cell ? cell.attr.item : None;
@@ -294,6 +310,15 @@ class clipview
 				//layer_transit_in = layer_transit_item ? layer_transit_item.dispatch("get_default_input") : None;
 				layer_transit_out = layer_transit_item ? layer_transit_item.dispatch("get_default_output") : None;
 
+				//No clip runs on this layer: it passes the layers below through, whatever its blend mode
+				//(layerblend.glsl). With No Blend an empty Layer 1 made the whole output black (#574)
+				if(layer_item)
+					layer_item.dispatch("set_uniform", [
+						name = "LAYER_EMPTY",
+						value = cell_out ? 0 : 1,
+						index = 0,
+					]);
+
 				//Link row active cell output to iChannel0 of the row layer shader, and the previous layer output into iChannel1 for mixing...
 				try {
 					
@@ -303,15 +328,19 @@ class clipview
 						in = cell.attr.inputs[j];
 						if(in.ctrl.value() != 0) {
 							target_layer_index = in.ctrl.value();
-							if(in.type.value() == 0) //Rel layer index
+							if(in.type.value() == 0) //Rel layer index: a row offset
 								target_layer_index += i;
-								
-							//Index convention (#312):
+							else
+								target_layer_index -= 1; //Absolute: the layer NUMBER, so 1 is the first row
+							
+							//Index convention (#312, #374):
 							//  Relative (type 0): the value is a row OFFSET added to this row, so -1 is the row above
 							//  and the target can be row 0 ("Layer 1"); 0 means "off" (handled by the if above).
-							//  Absolute (type 1): the value is the 0-based row index itself, so 0 is "Layer 1". It
-							//  stays 0-based: projects save these numbers, a shift to 1-based would move every
-							//  existing link one row down.
+							//  Absolute (type 1): the value is the layer number, 1-based: 1 = "Layer 1" (row 0),
+							//  2 = "Layer 2", and 0 = "off", the same 0 = off rule as Relative. Before #374 it was the
+							//  0-based row index, which made Absolute 1 pick Layer 2 and left Layer 1 out of reach.
+							//  Projects saved with the old numbers get +1 in migrate_3_to_4 (engine/migrate/migrate.shio),
+							//  so an existing Absolute link stays on the layer it was wired to.
 							//Both bounds are >= 0, the old > 0 excluded Layer 1.
 							target_layer_item = target_layer_index >= 0 && target_layer_index < layer_controls.size() ? layer_controls[target_layer_index].layer_item : None;
 							target_layer_out = target_layer_item ? target_layer_item.dispatch("get_default_output").value() : None;
@@ -732,23 +761,38 @@ class clipview
 				
 				transit_a = this.active_cells[row];
 				
-				//Sanity checks
-				if(std.vtype(transit_a) != "nanogui.gridview_item")
+				//Sanity checks. A clip of this row that is gone is taken out of the row here;
+				//dead_input says that happened, and the row is linked again below (#574).
+				//The && on the old value: a row without a transition is already None, that is not a death.
+				dead_input = false;
+				if(std.vtype(transit_a) != "nanogui.gridview_item" && transit_a)
 					transit_a = None;
-					this.active_cells[row] = None;			
+					this.active_cells[row] = None;
+					dead_input = true;
 				if(transit_a && !transit_a.attr.item)
 					transit_a = None;
 					this.active_cells[row] = None;
+					dead_input = true;
 					
-				if(std.vtype(ctrls.transit_b) != "nanogui.gridview_item")
+				if(std.vtype(ctrls.transit_b) != "nanogui.gridview_item" && ctrls.transit_b)
 					ctrls.transit_b = None;
+					dead_input = true;
 				if(ctrls.transit_b && !ctrls.transit_b.attr.item)
 					ctrls.transit_b = None;
+					dead_input = true;
 				
-				if(std.vtype(ctrls.transit_c) != "nanogui.gridview_item")
+				if(std.vtype(ctrls.transit_c) != "nanogui.gridview_item" && ctrls.transit_c)
 					ctrls.transit_c = None;
+					dead_input = true;
 				if(ctrls.transit_c && !ctrls.transit_c.attr.item)
 					ctrls.transit_c = None;
+					dead_input = true;
+				
+				//link_shaders only walks the cells and transits it still has, so a clip that goes leaves
+				//the layer input to itself: the layer keeps the picture of the gone clip and shows black
+				//(#574). Not here every frame: only when a clip was taken out above.
+				if(dead_input)
+					link_shaders();
 				
 				//Autoplay
 				if(autoplay_forward.value()||autoplay_backward.value()||autoplay_random.value())
@@ -1033,6 +1077,24 @@ class clipview
 		
 		cell.attr.shader_view = shader_view;
 		
+		//A clip without a picture (a Phaser) draws its cell itself (#677): the entry of its stack that has a cell preview
+		//(get_cell_preview), asked to draw every frame
+		cell_draw = None;
+		if(col >= 0) {
+			cell_draw = cell.widget().anchor(2).anchor_bottom(20).visible(false);
+			cell.attr.cell_preview = None;
+			cell_draw.on_draw([cell, cell_draw]() {
+				entry = cell.attr.cell_preview;
+				if(!entry)
+					return;
+				size = cell_draw.size();
+				nanogui.nvgSave();
+				nanogui.nvgIntersectScissor(vec2f(0, 0), vec2f(size.x, size.y));
+				entry.dispatch("draw_cell", size);
+				nanogui.nvgRestore();
+			});
+		}
+		
 		//Dont forget to save hash / name of this controlbutton too for reconstruction !!!
 		
 		item = generator(layer_area, "engine/assets/shaderstack.asset", vec2f(0,0), guid, [no_header=true, custom_path=path]);
@@ -1065,7 +1127,7 @@ class clipview
 		cell.attr.trigger_btn = trigger_btn;
 		cell.attr.hidden_label = hidden_label;
 		
-		item.dispatch("on_items_changed", [this, shader_view, name_view, item](stackview) {
+		item.dispatch("on_items_changed", [this, shader_view, name_view, cell, cell_draw, item](stackview) {
 			
 			//The clip goes with its last entry, but not while it still has entries whose asset is missing (#202)
 			if(stackview.items.size() == 0 && stackview.missing.size() == 0)
@@ -1073,11 +1135,18 @@ class clipview
 				this.link_shaders_lazy = true;
 				return;
 			try {
-				if(item.dispatch("get_default_output"))
+				has_output = item.dispatch("get_default_output") ? true : false;
+				if(has_output)
 					shader_view.shader(item.dispatch("get_default_output").value());
 					name_view.visible(false);
 				else
 					name_view.visible(true);
+				//no picture: what the clip draws itself, if it does (#677)
+				if(cell_draw) {
+					cell.attr.cell_preview = has_output ? None : item.dispatch("get_cell_preview");
+					cell_draw.visible(cell.attr.cell_preview ? true : false);
+					shader_view.visible(!cell.attr.cell_preview);
+				}
 				this.link_shaders_lazy = true;
 			}
 			catch(e) {}
@@ -1108,6 +1177,33 @@ class clipview
 			if(this.on_change_callback) {
 				this.on_change_callback(None, row, col);
 			}
+			
+			//A clip that goes has to leave the references of its row while its widgets are alive. A
+			//[[layer]] keeps the [[link]] to the output of the clip it last showed; when that clip is
+			//freed the input is dead and the layer renders black (#574). set_active(false) does not
+			//help here: its guard returns right away for the active cell, the one that is closing.
+			linked = false;
+			if(row >= 0 && row < this.active_cells.size() && this.active_cells[row] == cell) {
+				this.active_cells[row] = None;
+				linked = true;
+			}
+			if(row >= 0 && row < this.layer_controls.size()) {
+				row_ctrls = this.layer_controls[row];
+				if(row_ctrls.transit_b == cell) {
+					row_ctrls.transit_b = None;
+					//The clip the transition fades in is gone: the transition ends now (the next frame puts the
+					//layer back on the running clip and starts a queued one). Running on, it faded the layer to an
+					//empty input and showed black until its time was up (#574)
+					row_ctrls.transition_time = 0.0;
+					linked = true;
+				}
+				if(row_ctrls.transit_c == cell) {
+					row_ctrls.transit_c = None;
+					linked = true;
+				}
+			}
+			if(linked)
+				this.link_shaders(); //the rows take the pictures that are still there (#574)
 			
 			if(this.items.has(item_guid)) {
 				item = this.items[item_guid];
@@ -1158,11 +1254,22 @@ class clipview
 			else {
 				item.window.visible(false);
 				cell.attr.set_active(false);
-				this.active_preview = None;
+				//Only when this clip IS the preview: a layer head made for a new row deselects itself (select_preview(false))
+				//and used to clear the preview of another clip, whose name tag then stayed pushed - two tags lit, and the
+				//next press on it deselected instead of selecting (#574)
+				if(this.active_preview == cell)
+					this.active_preview = None;
 			}
 			
 			item.dispatch("clip_preview", preview_btn.pushed());
 		};
+
+		//Delete on the name tag that has the focus (#374): see the grid's on_keyboard
+		preview_btn.on_keyboard([this, preview_btn](key, scancode, action, mods){
+			if(this.delete_key(key, action, mods))
+				return true;
+			return preview_btn.keyboard_default(key, scancode, action, mods);
+		});
 
 		preview_btn.on_change([cell, item, col](v){
 			cell.attr.select_preview(v);
@@ -1179,8 +1286,8 @@ class clipview
 		//Helper function
 		cell.attr.set_active = [this, cell, item, preview_btn](v) {
 			row = cell.row();
-			cell.outline(false);
 			if(v || row < 0) {
+				cell.outline(false);
 				item.dispatch("active", true);
 				this.link_shaders();
 				if(row >= 0) {
@@ -1197,10 +1304,16 @@ class clipview
 						(this.layer_controls[row].transit_b && this.layer_controls[row].transit_b == cell)
 					) 
 					{
-						return;
+						return; //still running (or fading in): it keeps its Live / fading ring (#574)
 					}
 				}
-				
+
+				//A clip that is not running loses its ring; the clip queued after a transition keeps its Next ring.
+				//Before, the ring went first, also for the running clip that returns above: deselecting it as the
+				//preview made a clip that still played look stopped (#574)
+				queued = row >= 0 && this.layer_controls[row].transit_c && this.layer_controls[row].transit_c == cell;
+				if(!queued)
+					cell.outline(false);
 				item.dispatch("active", preview_btn.pushed());
 			}
 		};
@@ -1222,7 +1335,9 @@ class clipview
 			
 			inputs_vec = settings_area.controlvector("Inputs", "input_settings").content().layout(nanogui.layout_vertical());
 			
-			inputs_vec.label("−1 layer above · 0 off · +1 layer below").fixed_height(24).font_size(13);
+			//The number means something different in each mode, so both rules are spelled out (#374)
+			inputs_vec.label("Relative: −1 layer above · 0 off · +1 layer below").fixed_height(14).font_size(13);
+			inputs_vec.label("Absolute: 1 = Layer 1 · 0 off").fixed_height(14).font_size(13);
 			
 			try {
 				item_inputs = item.dispatch("get_inputs");
@@ -1244,9 +1359,9 @@ class clipview
 					
 					splitter = inputs_vec.widget().anchor_left(0).anchor_right(0).fixed_height(30);
 					
-					in_ctrl = splitter.controlint(in_name, "shader_input").anchor(0).anchor_right(164);
+					in_ctrl = splitter.controlint(in_name, "shader_input").anchor(0).anchor_right(164).tooltip("Which [[layer]] feeds this input.\nRelative: the rows away from this layer (-1 = the layer above, +1 = the layer below).\nAbsolute: the number of the layer (1 = Layer 1).\n0 is off in both modes.\n[[wiki:Clipview#inputs-relative--absolute]]");
 					//Saved as an index (0 relative, 1 absolute)
-					in_type = splitter.controlcombo(in_name+"_type", "shader_input").anchor_top(0).anchor_bottom(0).anchor_right(0).fixed_width(160).items(["Relative","Absolute"]).segmented(true, false).hide_config_menu();
+					in_type = splitter.controlcombo(in_name+"_type", "shader_input").anchor_top(0).anchor_bottom(0).anchor_right(0).fixed_width(160).items(["Relative","Absolute"]).segmented(true, false).hide_config_menu().tooltip("How the number of this input picks the [[layer]]: Relative counts from the layer of this clip, Absolute names one layer (1 = Layer 1, 0 = off).");
 					if(in_name == "input" || in_name == "iChannel0")
 						in_ctrl.value(1);
 					else
@@ -1300,6 +1415,20 @@ class clipview
 		return item;
 	}
 
+	//A drag of a clip from a cell of a Clipview (its name tag): [cell=, item=]
+	is_clip_payload(payload) {
+		return std.is_json(payload) && payload.has("cell") && payload.has("item") ? true : false;
+	}
+
+	//What a cell takes (#346): a clip, or an asset (a payload with a path, from the asset browser)
+	takes_drop(payload) {
+		if(!std.is_json(payload))
+			return false;
+		if(is_clip_payload(payload))
+			return true;
+		return payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
+	}
+
 	//A clip dropped on the cell row, col: moved there (copy: copied), or added to the clip in it
 	drop_clip(payload, row, col, copy) {
 		cell = grid.get_item_at(row, col);
@@ -1307,17 +1436,30 @@ class clipview
 		node_state = payload.item.node.serialize_json(false);
 		path = payload.item.path;
 	
+		//Onto another clip: every entry of its stack goes onto the stack of that clip, in its order, each with its
+		//settings (#374). Taken before a move closes the dragged clip. The clip settings (name, trigger, inputs,
+		//autoplay, macros) are those of the clip it lands on
+		entries = [];
+		if(cell) {
+			stack_items = payload.item.dispatch("get_items");
+			entry_states = state.data ?? [];
+			for(i = 0; i < entry_states.size(); i++) {
+				s = entry_states[i];
+				clip_entry = [state = s, node = None, button_node = None];
+				if(stack_items && s.guid && stack_items.has(s.guid)) {
+					clip_entry.node = stack_items[s.guid].node.serialize_json(false);
+					clip_entry.button_node = stack_items[s.guid].button_panel.serialize_json();
+				}
+				entries.push_back(clip_entry);
+			}
+		}
+	
 		if(!copy)
 			payload.item.on_close();
 	
-		//TODO:
-		//When the clip is dragged onto another clip, it is added to that clip
-		//Now this doesnt work yet because both clips are shaderstacks
-		//Would have to save each shader individually from the stack and then add them to the existing clip
-		//And also serialized each shaderstack item...
-	
 		if(cell) {
-			cell.attr.item.dispatch("add_generator", path);
+			for(i = 0; i < entries.size(); i++)
+				cell.attr.item.dispatch("add_entry", entries[i]);
 			cell.attr.select_preview(true);
 			return;
 		}
@@ -1338,6 +1480,82 @@ class clipview
 		else
 			this.add_generator(path, row, col);
 		this.link_shaders();
+	}
+
+	//Delete or Backspace (the delete key of a Mac): the selected clip goes (#374). Not while the grid is locked for
+	//playing (Live). True when the key was used
+	delete_key(key, action, mods) {
+		if(action != 1 || mods != 0 || (key != CLIP_KEY_DELETE && key != CLIP_KEY_BACKSPACE) || livemode.pushed())
+			return false;
+		cell = active_preview;
+		if(!cell || cell.col() < 0)
+			return false;
+		return delete_clip(cell.row(), cell.col());
+	}
+
+	//Deletes the clip in the cell row, col with its whole stack, as one step of the undo history (#374)
+	delete_clip(row, col) {
+		cell = grid.get_item_at(row, col);
+		if(!cell || !cell.attr.item)
+			return false;
+		this.clip_step("Delete clip", [[view = this, row = row, col = col]], [this, row, col](){
+			cell = this.grid.get_item_at(row, col);
+			if(cell && cell.attr.item)
+				cell.attr.item.on_close();
+			this.link_shaders_lazy = true;
+		});
+		return true;
+	}
+
+	//The column of the next clip of the row from col in the direction dir (-1: to the left, 1: to the right), empty
+	//cells skipped; -1 when there is none
+	next_clip_col(row, col, dir) {
+		for(c = col + dir; c >= 0 && c < grid.cols(); c += dir) {
+			cell = grid.get_item_at(row, c);
+			if(cell && cell.attr.item)
+				return c;
+		}
+		return -1;
+	}
+
+	//Swaps the clips of the cells row, col_a and row, col_b, as one step of the undo history named name (the CueList
+	//moves a cue up or down this way, #374): each clip is made again in the other cell with its guid, its stack, its
+	//settings and its links; the running one keeps running, the selected one stays selected. Not while the grid is
+	//locked for playing (Live). True when it swapped
+	swap_clips(row, col_a, col_b, name = "Move clip") {
+		if(livemode.pushed() || col_a == col_b || col_a < 0 || col_b < 0)
+			return false;
+		a = grid.get_item_at(row, col_a);
+		b = grid.get_item_at(row, col_b);
+		if(!a || !a.attr.item || !b || !b.attr.item)
+			return false;
+		this.clip_step(name, [[view = this, row = row, col = col_a], [view = this, row = row, col = col_b]], [this, row, col_a, col_b](){
+			this.swap_cells(row, col_a, col_b);
+		});
+		return true;
+	}
+
+	swap_cells(row, col_a, col_b) {
+		clip_a = clip_snapshot(row, col_a);
+		clip_b = clip_snapshot(row, col_b);
+		if(std.is_none(clip_a) || std.is_none(clip_b))
+			return;
+		selected = active_preview ? active_preview.attr.item.guid : "";
+		//Both go first: each clip is made again with its own guid, which must not be alive any more then
+		close_cell(row, col_a);
+		close_cell(row, col_b);
+		wait_freed();
+		make_clip(row, col_a, clip_b);
+		make_clip(row, col_b, clip_a);
+		cols = [col_a, col_b];
+		for(col : cols) {
+			cell = grid.get_item_at(row, col);
+			if(selected && cell && cell.attr.item && cell.attr.item.guid == selected) {
+				cell.attr.preview_btn.pushed(true);
+				cell.attr.select_preview(true);
+			}
+		}
+		link_shaders();
 	}
 
 	// =========================================================================
@@ -1402,11 +1620,13 @@ class clipview
 			for(i = 0; i < entries.size(); i++)
 				key += ":" + std.string(entries.key(i));
 		}
-		return [path = item.path, guid = item.guid, state = item.save_state(), node = item.node.serialize_json(true), key = key];
+		//live: it is the running clip of its row, a clip made again from this runs again (a cue moved while it plays)
+		live = row < active_cells.size() && active_cells[row] == cell;
+		return [path = item.path, guid = item.guid, state = item.save_state(), node = item.node.serialize_json(true), key = key, live = live];
 	}
 
 	clip_key(snapshot) {
-		return std.is_none(snapshot) ? "" : snapshot.key;
+		return std.is_none(snapshot) ? "" : snapshot["key"]; //snapshot.key is the method key() of a json
 	}
 
 	//Runs a user action on clips as one step of the history. cells: [view, row, col] it may change
@@ -1439,27 +1659,53 @@ class clipview
 
 	//The cell row, col as the data says: the clip in it goes, the one of the data (None: none) is made again
 	set_cell(row, col, clip) {
-		cell = grid.get_item_at(row, col);
-		if(cell && cell.attr.item) {
-			cell.attr.item.on_close();
-			//The clip of the data may have the same guid: the old one has to be gone first
-			for(!grid.screen().garbage_cleared()) {
-				std.sleep(0);
-			}
+		close_cell(row, col);
+		//The clip of the data may still be alive in another cell of this view: a swap of two clips (a cue moved, #374)
+		//is put back one cell after the other. It goes too; the change of its cell in the same step makes it again
+		if(!std.is_none(clip) && items.has(clip.guid)) {
+			other = items[clip.guid];
+			if(other.extra_widgets && other.extra_widgets.cell && other.extra_widgets.cell.col() >= 0)
+				other.on_close();
 		}
-		if(!std.is_none(clip)) {
-			item = add_generator(clip.path, row, col, clip.guid, false);
-			if(!item)
-				std.warn("Undo / redo: the clip " + clip.path + " cannot be made again, it is skipped");
-			else {
-				try {
-					item.load_state(clip.state);
-					item.node.deserialize_json(clip.node, true);
-				}
-				catch(e) {}
-			}
-		}
+		wait_freed();
+		make_clip(row, col, clip);
 		link_shaders();
+	}
+
+	//The clip of the cell row, col goes (nothing when the cell is empty)
+	close_cell(row, col) {
+		cell = grid.get_item_at(row, col);
+		if(cell && cell.attr.item)
+			cell.attr.item.on_close();
+	}
+
+	//Freed clips go with the next frame: before a clip is made again with the same guid, the old one has to be gone
+	wait_freed() {
+		for(!grid.screen().garbage_cleared()) {
+			std.sleep(0);
+		}
+	}
+
+	//Makes the clip of the data (clip_snapshot) in the empty cell row, col, with its guid. A clip that was running
+	//runs again when nothing else runs in its row
+	make_clip(row, col, clip) {
+		if(std.is_none(clip))
+			return;
+		item = add_generator(clip.path, row, col, clip.guid, false);
+		if(!item) {
+			std.warn("Undo / redo: the clip " + clip.path + " cannot be made again, it is skipped");
+			return;
+		}
+		try {
+			item.load_state(clip.state);
+			item.node.deserialize_json(clip.node, true);
+		}
+		catch(e) {}
+		cell = grid.get_item_at(row, col);
+		if((clip.live ?? false) && cell && row < active_cells.size() && !active_cells[row]) {
+			active_cells[row] = cell;
+			cell.attr.set_active(true);
+		}
 	}
 
 	insert_generator(path, row, col) {

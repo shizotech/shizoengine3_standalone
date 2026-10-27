@@ -1,0 +1,405 @@
+//The stage in 3D drawn with nvg (#655, #677): the 3D view of the fixture setup and the 3D view of the Phaser (its plan
+//and the clip cell) draw with these. The maths is in engine/patch/stage3d.shio.
+//
+//Needs engine/patch/patch.shio, engine/patch/stage3d.shio and engine/patch/palette.shio included before it.
+//
+//A lamp view (stage3d_lamp_view) is what is drawn of a lamp: [f, pos, screen, depth, color, dir, radius, angle, kind,
+//ends, ends_world, thick, base, nose, model]. model (#669): the 3D model of a GDTF import on the screen
+//(stage3d_model_project), drawn instead of the sign of its kind, its beam from its lens, clicks on its box.
+//kind (#669, patch_lamp_size): a head is drawn on its yoke with a nose where it points, a bar as a bar from its first
+//pixel to its last (ends on the screen, ends_world in metres, thick its width in pixels; None when an end is behind the
+//camera: then it is drawn as a round lamp), a par round, a dimmer square.
+//`menu` is engine.fixture_menu (the colour and pan / tilt the lamps are sent), or None.
+
+STAGE3D_NVG_LIGHTER = 8; //NVGcompositeOperation: beams add up like light
+STAGE3D_NVG_SOURCE_OVER = 0;
+
+// =========================================================================
+// 3D models of lamps (#669: the model of a GDTF import, engine/patch/gdtf_mesh.shio)
+// =========================================================================
+
+STAGE3D_MODEL_MIN_PX = 26.0; //a lamp smaller than this on the screen is drawn as its sign
+STAGE3D_GOBO_CACHE = std.json(); //gobo mask -> the corners of its lit cells around (0, 0), radius 1 (nvgFillPolygons)
+STAGE3D_MODEL_CACHE = std.json(); //lamp id -> what was projected last (the same camera, lamp, pan and tilt: drawn again)
+
+//The lit cells of a gobo mask (n x n characters "0" / "1") as squares around (0, 0) with radius 1: x0, y0, ... four
+//corners each
+stage3d_gobo_cells(mask) {
+	if(STAGE3D_GOBO_CACHE.has(mask))
+		return STAGE3D_GOBO_CACHE[mask];
+	n = std.int(math.sqrt(mask.length()) + 0.5);
+	cells = [];
+	if(n > 0 && n * n == mask.length()) {
+		size = 2.0 / n;
+		for(y = 0; y < n; y++) {
+			for(x = 0; x < n; x++) {
+				if(mask.substr(y * n + x, 1) != "1")
+					continue;
+				x0 = -1.0 + x * size;
+				y0 = -1.0 + y * size;
+				cells.push_back(x0); cells.push_back(y0);
+				cells.push_back(x0 + size); cells.push_back(y0);
+				cells.push_back(x0 + size); cells.push_back(y0 + size);
+				cells.push_back(x0); cells.push_back(y0 + size);
+			}
+		}
+	}
+	STAGE3D_GOBO_CACHE[mask] = cells;
+	return STAGE3D_GOBO_CACHE[mask];
+}
+
+//The projected model of a lamp, from STAGE3D_MODEL_CACHE when nothing it depends on changed (tag: one cache per view
+//that draws it, so two views of other sizes do not take it from each other)
+stage3d_model_cached(cam, s, f, t, pan, tilt, tag = "") {
+	key = cam.eye.x + "," + cam.eye.y + "," + cam.eye.z + "," + cam.forward.x + "," + cam.forward.y + "," + cam.forward.z + "," +
+		s.x + "," + s.y + "|" + f.x + "," + f.y + "," + (f.z ?? 0.0) + "," + (f.rotation ?? 0) + "," + (f.lean ?? 0.0) + "," +
+		(f.mount ?? "floor") + "|" + (pan ?? "-") + "," + (tilt ?? "-") + "|" + t.path + ":" + t.time;
+	id = tag + ":" + f.id;
+	if(STAGE3D_MODEL_CACHE.has(id) && STAGE3D_MODEL_CACHE[id].sig == key)
+		return STAGE3D_MODEL_CACHE[id].model;
+	model = stage3d_model_project(cam, s, f, t, pan, tilt);
+	STAGE3D_MODEL_CACHE[id] = [sig = key, model = model]; //(not "key": a JSON literal drops the names of JSON methods)
+	return model;
+}
+
+//A model (stage3d_model_project) drawn: grey faces, the lens in the colour of the lamp, a frame in the colour of the
+//ring when the lamp is selected or has a problem (width > 1)
+stage3d_draw_model(l, outline, width, alpha) {
+	model = l.model;
+	//without antialiasing: its fringes made hairlines between the faces
+	nvgShapeAntiAlias(false);
+	for(part : model.parts) {
+		for(k = 0; k < STAGE3D_MODEL_SHADES; k++) {
+			list = part.shades[k];
+			if(!list.size())
+				continue;
+			g = 0.12 + 0.6 * k / (STAGE3D_MODEL_SHADES - 1.0);
+			nvgFillColor(vec4f(g, g, g + 0.02, alpha));
+			nvgFillPolygons(list, 3);
+		}
+	}
+	nvgShapeAntiAlias(true);
+	c = l.color;
+	if(model.lens_screen) {
+		size = math.max(model.max.x - model.min.x, model.max.y - model.min.y);
+		nvgBeginPath();
+		nvgCircle(vec2f(model.lens_screen.x, model.lens_screen.y), math.clamp(size * 0.09, 2.0, 9.0));
+		nvgFillColor(pal_alpha(c.r + c.g + c.b < 0.05 ? PAL_RAISED : vec4f(c.r, c.g, c.b, 1.0), alpha));
+		nvgFill();
+	}
+	if(width > 1.0) {
+		nvgBeginPath();
+		nvgRoundedRect(vec2f(model.min.x - 3.0, model.min.y - 3.0), vec2f(model.max.x - model.min.x + 6.0, model.max.y - model.min.y + 6.0), 3.0);
+		nvgStrokeColor(pal_alpha(outline, outline.w * alpha));
+		nvgStrokeWidth(width);
+		nvgStroke();
+	}
+}
+
+//What is drawn of a lamp on a view of size s: where it is on the screen, its beam and colour; None when it is behind
+//the camera. models: a lamp with a 3D model (GDTF import) big enough on the screen is drawn as its model (l.model),
+//tag: the view (stage3d_model_cached). gobo: the mask of the gobo it shows (menu.lamp_gobo), drawn where it lands
+stage3d_lamp_view(cam, f, s, menu, models = false, tag = "") {
+	pos = stage3d_lamp_pos(f);
+	pr = stage3d_project(cam, pos, s.x, s.y);
+	if(!pr.ok)
+		return None;
+	t = patch_type(f.type);
+	color = menu ? menu.lamp_color(f) : None;
+	//a lamp without colour or dimmer channels (only movement): light as it is
+	if(!color)
+		color = [r = 0.6, g = 0.6, b = 0.6];
+	pt = menu ? menu.lamp_pan_tilt(f) : None;
+	dir = pt ? stage3d_beam_dir(f, t, pt.pan, pt.tilt) : stage3d_beam_dir(f, t);
+	focal = stage3d_focal(s.y);
+	radius = math.clamp(0.2 * focal / pr.depth, 3.0, 18.0);
+	size = patch_lamp_size(f);
+	l = [f = f, pos = pos, screen = vec2f(pr.x, pr.y), depth = pr.depth, color = color, dir = dir, radius = radius,
+		angle = t.beam_angle, kind = size.kind, ends = None, ends_world = None, thick = 0.0, base = None, nose = None,
+		model = None, gobo = menu && t.wheels ? menu.lamp_gobo(f) : None];
+	if(size.bar) {
+		w = stage3d_bar_ends(f, size.length);
+		pa = stage3d_project(cam, w.a, s.x, s.y);
+		pb = stage3d_project(cam, w.b, s.x, s.y);
+		if(pa.ok && pb.ok) {
+			l.ends = [vec2f(pa.x, pa.y), vec2f(pb.x, pb.y)];
+			l.ends_world = [w.a, w.b];
+			l.thick = math.clamp(size.width * focal / pr.depth, 3.0, 12.0);
+		}
+	}
+	//its 3D model (#669): instead of its sign, the beam from its lens
+	if(models && t.mesh && (t.mesh.extent ?? size.length) * focal / pr.depth >= STAGE3D_MODEL_MIN_PX) {
+		l.model = stage3d_model_cached(cam, s, f, t, pt ? pt.pan : None, pt ? pt.tilt : None, tag);
+		if(l.model) {
+			l.ends = None;
+			l.radius = math.max(radius, math.max(l.model.max.x - l.model.min.x, l.model.max.y - l.model.min.y) / 2.0);
+			return l;
+		}
+	}
+	else if(size.kind == "head") {
+		//the yoke stands on the side it is fixed to, the nose shows where the head points (also when it is dark)
+		pb = stage3d_project(cam, stage3d_sub(pos, stage3d_scale(stage3d_lamp_up(f), 0.3)), s.x, s.y);
+		pn = stage3d_project(cam, stage3d_add(pos, stage3d_scale(dir, 0.45)), s.x, s.y);
+		if(pb.ok)
+			l.base = vec2f(pb.x, pb.y);
+		if(pn.ok)
+			l.nose = vec2f(pn.x, pn.y);
+	}
+	return l;
+}
+
+//Is pos (screen) on the drawn lamp (view), with slack pixels around it
+stage3d_view_hit(l, pos, slack = 4.0) {
+	if(l.ends)
+		return stage3d_segment_distance(pos.x, pos.y, l.ends[0].x, l.ends[0].y, l.ends[1].x, l.ends[1].y) <= l.thick / 2.0 + slack;
+	if(l.model)
+		return pos.x >= l.model.min.x - slack && pos.x <= l.model.max.x + slack && pos.y >= l.model.min.y - slack &&
+			pos.y <= l.model.max.y + slack;
+	return (l.screen - pos).length() <= l.radius + slack;
+}
+
+//The lamps (fixtures of the patch) in front of the camera, the farthest first. models, tag: see stage3d_lamp_view
+stage3d_lamp_views(cam, lamps, s, menu, models = false, tag = "") {
+	list = [];
+	for(i = 0; i < lamps.size(); i++) {
+		l = stage3d_lamp_view(cam, lamps[i], s, menu, models, tag);
+		if(l)
+			list.push_back(l);
+	}
+	list = patch_sort_by(list, "depth");
+	out = [];
+	for(i = list.size() - 1; i >= 0; i--)
+		out.push_back(list[i]);
+	return out;
+}
+
+//A line between two points of the world into the current path (the part behind the camera is cut off; its two ends
+//are enough, #682)
+stage3d_line(cam, s, a, b) {
+	l = stage3d_project_line(cam, a, b, s.x, s.y);
+	if(!l)
+		return;
+	nvgMoveTo(vec2f(l.x0, l.y0));
+	nvgLineTo(vec2f(l.x1, l.y1));
+}
+
+//The floor around the lamps: a grid of metres (grid off: only its edge, for small views such as a clip cell), the
+//middle lines of the stage and where the audience is (label)
+stage3d_draw_floor(cam, s, lamps, label = true, grid = true) {
+	b = patch_bounds(lamps);
+	x0 = b ? math.floor(b.min_x) - 4 : -8;
+	x1 = b ? math.ceil(b.max_x) + 4 : 8;
+	y0 = b ? math.floor(b.min_y) - 4 : -6;
+	y1 = b ? math.ceil(b.max_y) + 4 : 6;
+	nvgBeginPath();
+	if(grid) {
+		for(gx = x0; gx <= x1; gx++)
+			stage3d_line(cam, s, stage3d_v(gx, y0, 0.0), stage3d_v(gx, y1, 0.0));
+		for(gy = y0; gy <= y1; gy++)
+			stage3d_line(cam, s, stage3d_v(x0, gy, 0.0), stage3d_v(x1, gy, 0.0));
+	}
+	else {
+		stage3d_line(cam, s, stage3d_v(x0, y0, 0.0), stage3d_v(x0, y1, 0.0));
+		stage3d_line(cam, s, stage3d_v(x1, y0, 0.0), stage3d_v(x1, y1, 0.0));
+		stage3d_line(cam, s, stage3d_v(x0, y0, 0.0), stage3d_v(x1, y0, 0.0));
+		stage3d_line(cam, s, stage3d_v(x0, y1, 0.0), stage3d_v(x1, y1, 0.0));
+	}
+	nvgStrokeColor(PAL_LINE);
+	nvgStrokeWidth(1.0);
+	nvgStroke();
+	//the middle of the stage
+	nvgBeginPath();
+	stage3d_line(cam, s, stage3d_v(0.0, y0, 0.0), stage3d_v(0.0, y1, 0.0));
+	stage3d_line(cam, s, stage3d_v(x0, 0.0, 0.0), stage3d_v(x1, 0.0, 0.0));
+	nvgStrokeColor(PAL_LINE_STRONG);
+	nvgStroke();
+	if(!label)
+		return;
+	audience = stage3d_project(cam, stage3d_v(0.0, y1 + 0.5, 0.0), s.x, s.y);
+	if(audience.ok)
+		pal_text(vec2f(audience.x, audience.y), "Audience", 12, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+}
+
+//The poles from the lamps (views) down to the floor: how high each lamp is
+stage3d_draw_poles(cam, s, views, alpha = 1.0) {
+	nvgBeginPath();
+	for(i = 0; i < views.size(); i++) {
+		l = views[i];
+		if(l.pos.z > 0.05)
+			stage3d_line(cam, s, l.pos, stage3d_v(l.pos.x, l.pos.y, 0.0));
+	}
+	nvgStrokeColor(pal_alpha(PAL_LINE_STRONG, PAL_LINE_STRONG.w * alpha));
+	nvgStrokeWidth(1.0);
+	nvgStroke();
+}
+
+//The beam of a bar (view): from its first to its last pixel, widening by spread pixels at its end. false when an end is
+//behind the camera (then it is drawn as a cone)
+stage3d_draw_bar_beam(cam, s, l, length, spread, tint) {
+	off = stage3d_scale(l.dir, length);
+	ea = stage3d_project(cam, stage3d_add(l.ends_world[0], off), s.x, s.y);
+	eb = stage3d_project(cam, stage3d_add(l.ends_world[1], off), s.x, s.y);
+	if(!ea.ok || !eb.ok)
+		return false;
+	u = l.ends[1] - l.ends[0];
+	if(u.length() < 0.5)
+		u = vec2f(1.0, 0.0);
+	u.normalize();
+	nvgBeginPath();
+	nvgMoveTo(l.ends[0]);
+	nvgLineTo(l.ends[1]);
+	nvgLineTo(vec2f(eb.x, eb.y) + u * spread);
+	nvgLineTo(vec2f(ea.x, ea.y) - u * spread);
+	nvgClosePath();
+	nvgFillColor(tint);
+	nvgFill();
+	return true;
+}
+
+//The beam of a lamp (view) as a cone, brighter as the lamp is; alpha dims it (lamps that are only shown around)
+stage3d_draw_beam(cam, s, l, alpha = 1.0) {
+	c = l.color;
+	bright = math.max(c.r, math.max(c.g, c.b));
+	if(bright < 0.02)
+		return;
+	//a model: from its lens (the same direction: stage3d_model_parts turns the head as stage3d_beam_dir)
+	from = l.model && l.model.lens ? l.model.lens : l.pos;
+	from_screen = l.model && l.model.lens_screen ? vec2f(l.model.lens_screen.x, l.model.lens_screen.y) : l.screen;
+	length = stage3d_beam_length(from, l.dir);
+	end = stage3d_add(from, stage3d_scale(l.dir, length));
+	pe = stage3d_project(cam, end, s.x, s.y);
+	if(!pe.ok)
+		return;
+	e = vec2f(pe.x, pe.y);
+	d = e - from_screen;
+	if(d.length() < 0.5)
+		d = vec2f(0.0, -1.0);
+	d.normalize();
+	side = vec2f(0.0 - d.y, d.x);
+	spread = length * math.tan(l.angle * math.PI / 360.0) * stage3d_focal(s.y) / pe.depth;
+	start = l.model ? 1.5 : math.max(1.5, l.radius * 0.5);
+	tint = vec4f(math.max(c.r, 0.08), math.max(c.g, 0.08), math.max(c.b, 0.08), (0.1 + 0.25 * bright) * alpha);
+	//a bar: a sheet of light from all its pixels (#669)
+	if(l.ends && stage3d_draw_bar_beam(cam, s, l, length, spread, tint))
+		return;
+	nvgBeginPath();
+	nvgMoveTo(from_screen + side * start);
+	nvgLineTo(e + side * spread);
+	nvgLineTo(e - side * spread);
+	nvgLineTo(from_screen - side * start);
+	nvgClosePath();
+	nvgFillColor(tint);
+	nvgFill();
+	//where it lands on the floor; with a gobo (#669) its picture
+	if(l.dir.z < -0.0001 && length < 7.99) {
+		r = math.max(2.0, spread);
+		cells = l.gobo && r >= 6.0 ? stage3d_gobo_cells(l.gobo) : None;
+		if(cells) {
+			nvgFillColor(vec4f(tint.x, tint.y, tint.z, (0.15 + 0.3 * bright) * alpha * 1.6));
+			nvgSave();
+			nvgTranslate(e);
+			nvgScale(vec2f(r, r));
+			nvgShapeAntiAlias(false);
+			nvgFillPolygons(cells, 4);
+			nvgShapeAntiAlias(true);
+			nvgRestore();
+		}
+		else {
+			nvgBeginPath();
+			nvgCircle(e, r);
+			nvgFillColor(vec4f(tint.x, tint.y, tint.z, (0.15 + 0.3 * bright) * alpha));
+			nvgFill();
+		}
+	}
+}
+
+//The beams of the lamps (views), added up like light
+stage3d_draw_beams(cam, s, views, alpha = 1.0) {
+	nvgGlobalCompositeOperation(STAGE3D_NVG_LIGHTER);
+	for(i = 0; i < views.size(); i++)
+		stage3d_draw_beam(cam, s, views[i], alpha);
+	nvgGlobalCompositeOperation(STAGE3D_NVG_SOURCE_OVER);
+}
+
+//The body of a lamp (view) in the colour it is sent; outline: the colour of the ring, width its width. Its form shows
+//what it is (#669): a head on its yoke with a nose, a bar, a round par, a square dimmer
+stage3d_draw_lamp(l, outline, width = 1.0, alpha = 1.0) {
+	if(l.model) {
+		stage3d_draw_model(l, outline, width, alpha);
+		return;
+	}
+	c = l.color;
+	fill = pal_alpha(c.r + c.g + c.b < 0.05 ? PAL_RAISED : vec4f(c.r, c.g, c.b, 1.0), alpha);
+	line = pal_alpha(outline, outline.w * alpha);
+	r = l.radius;
+	if(l.ends) {
+		a = l.ends[0];
+		b = l.ends[1];
+		d = b - a;
+		if(d.length() < 0.5)
+			d = vec2f(1.0, 0.0);
+		d.normalize();
+		side = vec2f(0.0 - d.y, d.x) * (l.thick / 2.0);
+		nvgBeginPath();
+		nvgMoveTo(a + side);
+		nvgLineTo(b + side);
+		nvgLineTo(b - side);
+		nvgLineTo(a - side);
+		nvgClosePath();
+		nvgFillColor(fill);
+		nvgFill();
+		nvgStrokeColor(line);
+		nvgStrokeWidth(width);
+		nvgStroke();
+		//the first pixel
+		nvgBeginPath();
+		nvgCircle(a + d * math.min(l.thick, 4.0), math.max(1.0, math.min(2.0, l.thick / 4.0)));
+		nvgFillColor(pal_alpha(PAL_TEXT_2, alpha));
+		nvgFill();
+		return;
+	}
+	if(l.kind == "head") {
+		if(l.base) {
+			//the yoke: a stem to its foot
+			nvgBeginPath();
+			nvgMoveTo(l.base);
+			nvgLineTo(l.screen);
+			nvgStrokeColor(line);
+			nvgStrokeWidth(math.max(1.5, r * 0.35));
+			nvgStroke();
+			nvgBeginPath();
+			nvgRect(l.base - vec2f(r * 0.7, r * 0.25), vec2f(r * 1.4, r * 0.5));
+			nvgFillColor(pal_alpha(PAL_RAISED, alpha));
+			nvgFill();
+			nvgStrokeColor(line);
+			nvgStrokeWidth(1.0);
+			nvgStroke();
+		}
+		nvgBeginPath();
+		nvgCircle(l.screen, r);
+		nvgFillColor(fill);
+		nvgFill();
+		nvgStrokeColor(line);
+		nvgStrokeWidth(width);
+		nvgStroke();
+		if(l.nose) {
+			nvgBeginPath();
+			nvgMoveTo(l.screen);
+			nvgLineTo(l.nose);
+			nvgStrokeColor(pal_alpha(PAL_TEXT, 0.8 * alpha));
+			nvgStrokeWidth(math.max(1.0, r * 0.25));
+			nvgStroke();
+		}
+		return;
+	}
+	nvgBeginPath();
+	if(l.kind == "dimmer")
+		nvgRoundedRect(l.screen - vec2f(r * 0.85, r * 0.85), vec2f(r * 1.7, r * 1.7), math.max(1.0, r * 0.25));
+	else
+		nvgCircle(l.screen, r);
+	nvgFillColor(fill);
+	nvgFill();
+	nvgStrokeColor(line);
+	nvgStrokeWidth(width);
+	nvgStroke();
+}

@@ -179,11 +179,11 @@ in the `random` log are the expected warnings of the "backwards refused" checks.
 | Commit | File | Cause | Shared |
 |---|---|---|---|
 | `e04a1d31` | `_testing/nanogui/video_playback.shio` | "speed(1) turns around" crossed the loop seam (Phase 3) | yes |
-| `a0b2838b` | `shzmodule_nanogui/ffmpeg_runtime.cpp` (`__APPLE__` list), `shzscript_macos/README_VibeVJ_macOS.md` | Homebrew's `ffmpeg` has no HAP encoder: `/opt/homebrew/opt/ffmpeg-full/lib` is searched first | no (macOS only) |
-| `39750c0a` | `shzmodule_nanogui/video_decoder.cpp` | cherry-pick of Linux' `0f332958` (a pass that ends after `seek()`) | yes (from Linux) |
-| `fd01b8ba` | `shzmodule_nanogui/video_decoder.cpp` | pause did not hold the picture after the decoder had fallen behind (4K60 at 4x): the clock was held only on ticks without a new frame and ran up to 2 s ahead; `pause()` then showed the frames that were already due for another 0.4 - 2 s | yes |
+| `a0b2838b` | `modules/shzmodule_nanogui/ffmpeg_runtime.cpp` (`__APPLE__` list), `shzscript_macos/README_VibeVJ_macOS.md` | Homebrew's `ffmpeg` has no HAP encoder: `/opt/homebrew/opt/ffmpeg-full/lib` is searched first | no (macOS only) |
+| `39750c0a` | `modules/shzmodule_nanogui/video_decoder.cpp` | cherry-pick of Linux' `0f332958` (a pass that ends after `seek()`) | yes (from Linux) |
+| `fd01b8ba` | `modules/shzmodule_nanogui/video_decoder.cpp` | pause did not hold the picture after the decoder had fallen behind (4K60 at 4x): the clock was held only on ticks without a new frame and ran up to 2 s ahead; `pause()` then showed the frames that were already due for another 0.4 - 2 s | yes |
 | `1661ef37` | `_testing/nanogui/video_hardware.shio` | ProRes goes through VideoToolbox on Apple Silicon, the test expected software | yes |
-| `c48311f2` | `shzmodule_nanogui/video_decoder.{h,cpp}`, `_testing/video/decoder_test.cpp` | 60 fps on a 60 Hz render loop: the clock starts on a frame time and moves in ticks, so every frame time fell on a tick and jitter dropped every third picture (40 of 60 fps), 30 fps had gaps of 50 ms. Frames are now picked half a tick early (at most half a frame) | yes |
+| `c48311f2` | `modules/shzmodule_nanogui/video_decoder.{h,cpp}`, `_testing/video/decoder_test.cpp` | 60 fps on a 60 Hz render loop: the clock starts on a frame time and moves in ticks, so every frame time fell on a tick and jitter dropped every third picture (40 of 60 fps), 30 fps had gaps of 50 ms. Frames are now picked half a tick early (at most half a frame) | yes |
 
 After all fixes: `decoder_test` `PASSED` (3 / 3 runs), `video_playback.shio` `ALL PASSED` (2 / 2, without
 `SHZ_FFMPEG_DIR`: the loader finds `ffmpeg-full`), `video_hardware.shio` and `random` `ALL PASSED`.

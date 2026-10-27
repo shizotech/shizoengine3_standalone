@@ -1,9 +1,12 @@
 
 #include "src/defs"
+#include "src/displays"
 #include "engine/migrate/migrate"
 #include "engine/interfaces/aiinterface"
 #include "engine/patch/dmx"
 #include "engine/patch/patch_ai"
+#include "engine/patch/desk_runtime"
+#include "engine/interfaces/ai_capture"
 #include "engine/blackout"
 #include "src/menu/menu"
 
@@ -47,6 +50,10 @@ class shizoengine
 	dmx_revision = 0;
 	//The fixture setup for AI agents: queries on the patch, live_path "fixture_setup" (engine/patch/patch_ai.shio)
 	managed patch_ai = None;
+	//The lighting desk (#719, engine/patch/desk_runtime.shio): programmer, palettes, cue stacks; desk.json
+	managed desk = None;
+	//Pictures for AI agents: the screen, a generator, a camera after a lamp test (engine/interfaces/ai_capture.shio)
+	managed ai_capture = None;
 	
 	load_hooks = [];
 	save_hooks = [];
@@ -54,6 +61,10 @@ class shizoengine
 	//Store these as global engine vars for convenience
 	project_width = None;
 	project_height = None;
+	project_size_source = None; //Settings > Project > Output size: 0 from the output displays, 1 by hand (#593)
+
+	//The connected displays, their role (Control / Output) and resolution (src/displays.shio, Settings > Display)
+	displays = None;
 	
 	//Specifically for the ai agent (global states)
 	ai_last_interface = None; //Contains the last focused item which implements an assistant interface
@@ -77,6 +88,8 @@ class shizoengine
 
 		//In engine.ai_interfaces from the start: the Chat and the MCP server can change the fixture setup
 		patch_ai = patch_ai_create(this);
+		desk = desk_runtime(this);
+		ai_capture = AICapture(this);
 	
 		//The network cards Art-Net and ShizoNet use (#501): picked in Devices > Network > Network cards, kept in the
 		//style file (personal). Before the server starts, so its first ArtPoll already goes to the right cards
@@ -131,9 +144,11 @@ class shizoengine
 		//ctx.widget_debug(true);
 
 		screen.theme().from_json(style);
-		//Interface size (Appearance): on top of the system scale, before anything is laid out. Until it is chosen, the
-		//size that suits the screen (auto_ui_scale: a 4K screen at 100 % gets more than 100 %)
-		screen.ui_scale(style.has("ui_scale") ? style.ui_scale : auto_ui_scale());
+		//Interface size (Appearance): on top of the system scale, before anything is laid out. Until it is chosen (or
+		//when it is "auto"), the size that suits the screen (auto_ui_scale: a 4K screen at 100 % gets more than 100 %)
+		screen.ui_scale(has_ui_scale(style) ? style.ui_scale : auto_ui_scale());
+		//Where the window is now decides which display is the one of the operator (Control)
+		displays = displays_manager(this);
 		//Smaller than this the bars and the sidebar no longer fit; on a smaller screen the window fills it
 		screen.min_size(vec2f(960, 600));
 		//Calm notches (Shizo UI): "everywhere" (default) or "clipview", set in Appearance
@@ -150,6 +165,8 @@ class shizoengine
 
 		blackout = blackout_switch(this);
 		menu = main_menu(this);
+		//The settings exist now: a new project without a saved size takes the one of the output displays (#593)
+		displays.apply_project_size();
 		
 		//update style file
 		style.merge(screen.theme().to_json());
@@ -159,6 +176,9 @@ class shizoengine
 			
 			if(load_in_progress)
 				return;
+
+			//Art-Net learn and the Art-Net mappings of the controls (Devices > Network > Art-Net)
+			nanogui.artnet_input(uni, data);
 			
 			for(i = 0; i < this.artnet_callbacks.size(); i++) {
 				if(!this.artnet_callbacks[i].generator || !this.artnet_callbacks[i].callback)
@@ -235,6 +255,14 @@ class shizoengine
 			if(this.menu && this.menu.log)
 				this.menu.log.poll();
 			
+			//Synthetic input of a test over MCP (debug_input in configs/mcp_server.json, #552): one event per frame
+			if(this.env.debug_input)
+				this.env.debug_input.tick();
+
+			//A project load / save of the MCP server (vibevj_load_project, vibevj_save_project, #634)
+			if(this.env.mcp_render_step)
+				vibevj_mcp_project_tick(this);
+			
 			if(load_in_progress)
 				return;
 			
@@ -253,6 +281,10 @@ class shizoengine
 			}
 
 			this.autosave_tick();
+
+			//Displays plugged in or out: the roles, the project size and Settings > Display follow (#593)
+			if(this.displays)
+				this.displays.tick();
 
 			//The shader preview of the Assets tab opens once the mouse rested on a shader (#536)
 			if(this.env.shader_preview)
@@ -279,6 +311,11 @@ class shizoengine
 					i--;	
 				}
 			}
+
+			//The lighting desk sends its cue stacks and the programmer after the generators (the Phaser): on top of them
+			//in the same frame (fx_contribute)
+			if(this.desk)
+				this.desk.tick();
 		});
 			
 		//An autosave that is still there: VibeVJ did not close properly last time. Restore it, or the last project
@@ -435,31 +472,47 @@ class shizoengine
 		return load_project(name, "projects", AUTOSAVE_DIR);
 	}
 	
-	//Exit / window close decision (#314): a named project is saved and the app quits, an unnamed
-	//project is asked first - Save opens the existing "Save as…" flow, Don't save quits without
-	//writing anything, Cancel keeps the app running. Returns true when the app may exit.
-	//The interface size that suits the monitor VibeVJ opens on, until one is chosen in Settings > Appearance. A screen
-	//whose system scale leaves more than 3000 units across (a 4K screen at 100 %, mostly on Linux) gets the largest
-	//size of the list that still leaves 1920 across; everything else keeps the size of the system (100 %)
+	//The interface size that suits the monitor the window of VibeVJ is on, until one is chosen in Settings > Appearance.
+	//Only a screen as dense as 4K gets more: at least 2000 rows at 100 % of the system (a 4K screen without system
+	//scaling, mostly on Linux). It gets the largest size of the list that still leaves 1920 x 1080 (turned round for an
+	//upright one). The rows decide, not the width: an ultrawide (3440 x 1440, 5120 x 1440) is wide, not dense, and got
+	//150 % or 200 % when the width decided (#593)
 	auto_ui_scale() {
 		try {
 			//No monitor reported (a display that sleeps): the size of the system
-			if(ctx.monitor_count() < 1)
+			count = ctx.monitor_count();
+			if(count < 1)
 				return 1.0;
-			info = ctx.monitor_info(0);
+			index = 0;
+			try {
+				index = screen.monitor_index();
+			}
+			catch(e) {}
+			if(index < 0 || index >= count)
+				index = 0;
+			info = ctx.monitor_info(index);
 			scale = info.has("scale") && info.scale > 0 ? info.scale : 1.0;
-			//Logical units across at 100 %: points on a Mac (width), pixels divided by the system scale elsewhere
-			across = std.os_platform() == "macos" ? info.width : info.pixel_width / scale;
-			if(across < 3000)
+			//Logical units at 100 %: points on a Mac, pixels divided by the system scale elsewhere
+			mac = std.os_platform() == "macos";
+			w = mac ? info.width : info.pixel_width / scale;
+			h = mac ? info.height : info.pixel_height / scale;
+			long_side = math.max(w, h);
+			short_side = math.min(w, h);
+			if(short_side < 2000)
 				return 1.0;
 			sizes = [2.0, 1.5, 1.25];
 			for(s : sizes) {
-				if(across / s >= 1920)
+				if(long_side / s >= 1920 && short_side / s >= 1080)
 					return s;
 			}
 		}
 		catch(e) {}
 		return 1.0;
+	}
+
+	//A size chosen in Settings > Appearance (a number); "auto" or none: auto_ui_scale()
+	has_ui_scale(style) {
+		return style.has("ui_scale") && std.type(style.ui_scale) != "string" && style.ui_scale > 0;
 	}
 
 	//Keeps where the window is, for the next start (__init__): its state, and the place and size it has when it is
@@ -628,7 +681,11 @@ class shizoengine
 				load_threads[i].join();
 			}
 			
-			nanogui.deserialize_controls(migrate_project_file("controls", fileio.read_json(project_dir + "/controls.json"), format));
+			controls = migrate_project_file("controls", fileio.read_json(project_dir + "/controls.json"), format);
+			nanogui.deserialize_controls(controls);
+			//The project size from the output displays, once every control has its saved value (#593)
+			if(displays)
+				displays.project_loaded(controls);
 			
 			/*
 			ui_settings = fileio.read_json(project_dir + "/ui_settings.json");

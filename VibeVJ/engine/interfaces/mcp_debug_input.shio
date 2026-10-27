@@ -1,0 +1,555 @@
+// ============================================================================
+// mcp_debug_input.shio — synthetic input for tests, over MCP (#552)
+//
+// Off unless "debug_input": 1 is in configs/mcp_server.json (the MCP tab has no
+// switch for it). Then the MCP server has three more tools:
+//
+//   vibevj_debug_input     keys, clicks, drags, scrolls and text into the window,
+//                          through the screen's own event path (screen.simulate_input):
+//                          focus, drags, drops and undo behave as with real input
+//   vibevj_debug_widgets   visible widgets with their text and place on the screen,
+//                          to find what to click
+//   vibevj_debug_capture   a PNG of the whole window (widget.capture)
+//
+// The real mouse pointer and keyboard are not touched, the window does not need the
+// keyboard focus of the OS: a test runs on a shared screen (the Mac smoke test,
+// _testing/mac_app/smoke.py). Moving the real pointer over the window while a test
+// runs still sends real events in between.
+//
+// Every event runs on the render thread (engine.env.debug_input.tick() in the
+// on_frame_finished of the engine), one per frame, as a window system delivers
+// them; the tool returns when the last one ran.
+// ============================================================================
+
+// GLFW codes (the widgets get them as they are, no translation of the platform: "ctrl" is the Ctrl of the
+// program, which is Command on a Mac)
+DEBUG_INPUT_MOD_SHIFT = 1;
+DEBUG_INPUT_MOD_CONTROL = 2;
+DEBUG_INPUT_MOD_ALT = 4;
+DEBUG_INPUT_MOD_SUPER = 8;
+
+// printable ASCII from 32 on, for "text" (other characters: "codepoints")
+DEBUG_INPUT_ASCII = R"( !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~)";
+
+DEBUG_INPUT_KEYS = [
+	return = 257, enter = 257, escape = 256, esc = 256, tab = 258, backspace = 259, insert = 260, delete = 261,
+	right = 262, left = 263, down = 264, up = 265, pageup = 266, pagedown = 267, home = 268, end = 269,
+	space = 32, minus = 45, equal = 61, plus = 61, comma = 44, period = 46, slash = 47, semicolon = 59,
+	apostrophe = 39, leftbracket = 91, backslash = 92, rightbracket = 93, grave = 96,
+];
+
+// The bit of a modifier name, 0 for anything else
+debug_input_mod_bit(name) {
+	if(name == "ctrl" || name == "control" || name == "cmd" || name == "command")
+		return DEBUG_INPUT_MOD_CONTROL;
+	if(name == "shift")
+		return DEBUG_INPUT_MOD_SHIFT;
+	if(name == "alt" || name == "option" || name == "opt")
+		return DEBUG_INPUT_MOD_ALT;
+	if(name == "super" || name == "win" || name == "meta")
+		return DEBUG_INPUT_MOD_SUPER;
+	return 0;
+}
+
+// The key code of a modifier bit (the left one)
+debug_input_mod_key(bit) {
+	if(bit == DEBUG_INPUT_MOD_SHIFT)
+		return 340;
+	if(bit == DEBUG_INPUT_MOD_CONTROL)
+		return 341;
+	if(bit == DEBUG_INPUT_MOD_ALT)
+		return 342;
+	return 343;
+}
+
+// "ctrl+shift+e" -> [mods = 3, code = 69]; code -1 when there are only modifiers ("alt")
+debug_input_parse_keys(text) {
+	parts = std.string(text).lowercase().split("+");
+	mods = 0;
+	code = -1;
+	for(i = 0; i < parts.size(); i++) {
+		part = parts[i].trim();
+		// "ctrl++" splits into an empty part: the key is "+"
+		if(part == "") {
+			code = 61;
+			continue;
+		}
+		bit = debug_input_mod_bit(part);
+		if(bit) {
+			mods = mods | bit;
+			continue;
+		}
+		if(code >= 0)
+			std.runtime_error("'" + text + "': more than one key that is not a modifier");
+		if(DEBUG_INPUT_KEYS.has(part))
+			code = DEBUG_INPUT_KEYS[part];
+		else if(part.length() == 1 && "abcdefghijklmnopqrstuvwxyz".find(part) >= 0)
+			code = 65 + "abcdefghijklmnopqrstuvwxyz".find(part);
+		else if(part.length() == 1 && "0123456789".find(part) >= 0)
+			code = 48 + "0123456789".find(part);
+		else if(part.length() >= 2 && part.starts("f") && std.int(part.substr(1)) >= 1 && std.int(part.substr(1)) <= 25)
+			code = 289 + std.int(part.substr(1));
+		else
+			std.runtime_error("'" + text + "': unknown key '" + part + "'");
+	}
+	return [mods = mods, code = code];
+}
+
+debug_input_button(name) {
+	if(std.is_none(name) || name == "" || name == "left")
+		return 0;
+	if(name == "right")
+		return 1;
+	if(name == "middle")
+		return 2;
+	std.runtime_error("button must be left, right or middle, not '" + name + "'");
+	return 0;
+}
+
+// type, text, tooltip and place of a widget (text: caption, title or value, whatever it has)
+debug_input_widget_info(w) {
+	text = "";
+	kind = std.vtype(w);
+	// a widget without the function raises an error: the next one is tried
+	try {
+		text = std.string(w.title() ?? "");
+	}
+	catch(e) {}
+	if(text == "") {
+		try {
+			text = std.string(w.caption() ?? "");
+		}
+		catch(e) {}
+	}
+	if(text == "" && kind == "nanogui.textbox") {
+		try {
+			text = std.string(w.value() ?? "");
+		}
+		catch(e) {}
+	}
+	tip = "";
+	try {
+		tip = std.string(w.tooltip() ?? "");
+	}
+	catch(e) {}
+	pos = w.absolute_position();
+	width = w.width(), height = w.height();
+	return [
+		type = kind,
+		text = text,
+		tooltip = tip,
+		x = std.int(pos.x), y = std.int(pos.y), w = std.int(width), h = std.int(height),
+		cx = std.int(pos.x + width / 2), cy = std.int(pos.y + height / 2),
+	];
+}
+
+// What a widget draws without child widgets: the tabs of a tabwidget, the rows of a filebrowser, the segments of a
+// segmented combobox (item_rects), as entries of the type "<type>.item" with the fields item_rects gives; the cells of
+// a gridview as "nanogui.gridview.cell"
+// The cells of a grid (a Clipview) from its headers: the column header above a cell and the row header left of it.
+// text "row,col"; a grid without both headers has none
+debug_input_grid_cells(grid) {
+	cells = [];
+	for(r = 0; r < grid.rows(); r++) {
+		left = grid.get_header_left_item(r);
+		if(!left)
+			return cells;
+		for(k = 0; k < grid.cols(); k++) {
+			top = grid.get_header_top_item(k);
+			if(!top)
+				return cells;
+			lp = left.absolute_position(), tp = top.absolute_position();
+			cells.push_back([text = std.string(r) + "," + std.string(k), row = r, col = k, used = grid.get_item_at(r, k) ? 1 : 0,
+				x = tp.x, y = lp.y, w = top.width(), h = left.height()]);
+		}
+	}
+	return cells;
+}
+
+debug_input_items(c, kind, needle, type_needle, &found, max_count) {
+	items = [];
+	if(kind == "nanogui.gridview")
+		items = debug_input_grid_cells(c);
+	else if(kind == "nanogui.tabwidget" || kind == "nanogui.filebrowser" || kind == "nanogui.combobox")
+		items = c.item_rects();
+	else
+		return;
+	for(i = 0; i < items.size() && found.size() < max_count; i++) {
+		item = items[i];
+		item.type = kind + (kind == "nanogui.gridview" ? ".cell" : ".item");
+		item.tooltip = "";
+		text = std.string(item.text) + " " + std.string(item.geti("path") ?? "");
+		if(type_needle != "" && !item.type.contains(type_needle))
+			continue;
+		if(needle != "" && !text.lowercase().contains(needle))
+			continue;
+		item.x = std.int(item.x), item.y = std.int(item.y), item.w = std.int(item.w), item.h = std.int(item.h);
+		item.cx = item.x + item.w / 2, item.cy = item.y + item.h / 2;
+		item.widget = c;
+		found.push_back(item);
+	}
+}
+
+debug_input_collect(w, needle, type_needle, &found, max_count, &skipped_types) {
+	children = w.children();
+	for(i = 0; i < children.size(); i++) {
+		if(found.size() >= max_count)
+			return;
+		c = children[i];
+		// a child that is no widget of nanogui, or one whose type has not the functions of a widget (doublebox):
+		// nothing to click, nothing looked for in it
+		info = None;
+		usable = false;
+		try {
+			if(c && std.vtype(c).starts("nanogui.") && c.visible()) {
+				c.child_count();
+				usable = true;
+				if(c.width() > 0 && c.height() > 0)
+					info = debug_input_widget_info(c);
+			}
+		}
+		catch(e) {
+			usable = false;
+			skipped_types[std.vtype(c)] = 1;
+		}
+		if(!usable)
+			continue;
+		if(info) {
+			ok = true;
+			if(type_needle != "" && !info.type.lowercase().contains(type_needle))
+				ok = false;
+			if(ok && needle != "" && !(info.text.lowercase().contains(needle) || info.tooltip.lowercase().contains(needle)))
+				ok = false;
+			if(ok && needle == "" && type_needle == "" && info.text == "" && info.tooltip == "")
+				ok = false;
+			if(ok) {
+				info.widget = c;
+				found.push_back(info);
+			}
+			debug_input_items(c, info.type, needle, type_needle, found, max_count);
+		}
+		debug_input_collect(c, needle, type_needle, found, max_count, skipped_types);
+	}
+}
+
+// target is w or lies inside w
+debug_input_inside(w, target) {
+	if(w == target)
+		return true;
+	children = [];
+	try {
+		children = w.children();
+	}
+	catch(e) {}
+	for(i = 0; i < children.size(); i++) {
+		if(debug_input_inside(children[i], target))
+			return true;
+	}
+	return false;
+}
+
+// One step for the render thread
+class VibeVJDebugStep {
+	fn = None;
+	finished = false;
+	error = "";
+	result = None;
+	not_before = 0;
+
+	__init__(fn, not_before) {
+		this.fn = fn;
+		this.not_before = not_before;
+	}
+}
+
+class VibeVJDebugInput {
+
+	screen = None;
+	step = None;
+	// what the input has done so far: where the mouse is, the modifiers held with key_down
+	mouse_x = 0.0;
+	mouse_y = 0.0;
+	held = 0;
+	frames = 0;
+	// name in the keyboard layout in use -> key code ("z" -> 89 on a German keyboard): built on first use
+	layout_codes = None;
+
+	__init__(screen) {
+		this.screen = screen;
+	}
+
+	// Render thread, once per frame: runs the waiting step
+	tick() {
+		frames++;
+		s = step;
+		if(!s || s.finished)
+			return;
+		if(s.not_before && std.millis() < s.not_before)
+			return;
+		try {
+			s.result = s.fn();
+		}
+		catch(e) {
+			s.error = std.string(e);
+		}
+		s.finished = true;
+	}
+
+	// Server thread: hands fn to the render thread and waits until it ran. wait_ms: not before then
+	run(fn, wait_ms = 0, timeout_ms = 15000) {
+		t0 = std.millis();
+		for(step && !step.finished) {
+			if(std.millis() - t0 > timeout_ms)
+				std.runtime_error("debug input: the render loop did not take the last step in time");
+			std.sleep(1);
+		}
+		s = VibeVJDebugStep(fn, wait_ms > 0 ? std.millis() + wait_ms : 0);
+		step = s;
+		for(!s.finished) {
+			if(std.millis() - t0 > timeout_ms + wait_ms)
+				std.runtime_error("debug input: the render loop did not run the step within " + timeout_ms + " ms (is the app busy?)");
+			std.sleep(1);
+		}
+		if(s.error)
+			std.runtime_error(s.error);
+		return s.result;
+	}
+
+	// ---- primitives, each one frame ----
+
+	move(x, y) {
+		run([this, x, y]() {
+			this.mouse_x = std.float(x);
+			this.mouse_y = std.float(y);
+			this.screen.simulate_input("move", this.mouse_x, this.mouse_y);
+		});
+	}
+
+	button(kind, button, mods) {
+		run([this, kind, button, mods]() {
+			this.screen.simulate_input(kind, button, mods);
+		});
+	}
+
+	key_event(kind, code, mods) {
+		run([this, kind, code, mods]() {
+			// scancode 0: the key code names the key (glfwGetKeyName ignores the scancode then)
+			this.screen.simulate_input(kind, code, 0, mods);
+		});
+	}
+
+	// Modifier keys pressed one after the other (bits not held yet), as a hand does: the state is held | each bit
+	press_mods(mods) {
+		for(bit = 1; bit <= 8; bit = bit * 2) {
+			if((mods & bit) && !(held & bit)) {
+				held = held | bit;
+				key_event("key_press", debug_input_mod_key(bit), held);
+			}
+		}
+	}
+
+	release_mods(mods) {
+		for(bit = 8; bit >= 1; bit = bit / 2) {
+			if((mods & bit) && (held & bit)) {
+				held = held & ~bit;
+				key_event("key_release", debug_input_mod_key(bit), held);
+			}
+		}
+	}
+
+	// The key code a user presses for a printable key in the keyboard layout in use. The program reads letters by their
+	// name in the layout (screen.key_name): on a German keyboard the key code of Z (a position on a US keyboard) is
+	// "y". Codes without a name of one character keep the US position
+	layout_code(code) {
+		if(code < 32 || code > 162)
+			return code;
+		if(!layout_codes) {
+			fn = [this]() {
+				names = std.json();
+				// the printable keys GLFW has (others have no scancode and make GLFW complain)
+				codes = [32, 39, 44, 45, 46, 47, 59, 61, 91, 92, 93, 96];
+				for(k = 48; k <= 57; k++)
+					codes.push_back(k);
+				for(k = 65; k <= 90; k++)
+					codes.push_back(k);
+				for(k : codes) {
+					n = this.screen.key_name(k);
+					if(n.length() == 1 && !names.has(n))
+						names[n] = k;
+				}
+				return names;
+			};
+			layout_codes = run(fn);
+		}
+		// the US name of the code: a letter or digit, or the punctuation of DEBUG_INPUT_KEYS
+		us = "";
+		if(code >= 65 && code <= 90)
+			us = "abcdefghijklmnopqrstuvwxyz".substr(code - 65, 1);
+		else if(code >= 48 && code <= 57)
+			us = "0123456789".substr(code - 48, 1);
+		if(us != "" && layout_codes.has(us))
+			return std.int(layout_codes[us]);
+		return code;
+	}
+
+	parse_mods(text) {
+		if(std.is_none(text) || text == "")
+			return 0;
+		parsed = debug_input_parse_keys(text);
+		if(parsed.code >= 0)
+			std.runtime_error("mods '" + text + "' holds a key that is no modifier");
+		return parsed.mods;
+	}
+
+	// ---- one event of the tool ----
+
+	event(e) {
+		kind = std.string(e.geti("type") ?? "");
+		button_id = debug_input_button(e.geti("button"));
+		mods = parse_mods(e.geti("mods"));
+
+		if(kind == "move") {
+			move(e.x, e.y);
+		}
+		else if(kind == "press" || kind == "release") {
+			if(e.has("x"))
+				move(e.x, e.y);
+			press_mods(mods);
+			button(kind, button_id, held);
+			if(kind == "release")
+				release_mods(mods);
+		}
+		else if(kind == "click") {
+			if(e.has("x"))
+				move(e.x, e.y);
+			press_mods(mods);
+			count = e.has("count") ? std.int(e.count) : 1;
+			for(i = 0; i < count; i++) {
+				button("press", button_id, held);
+				button("release", button_id, held);
+			}
+			release_mods(mods);
+		}
+		else if(kind == "drag") {
+			// press at x, y with mods held, move to x2, y2 in steps, then drop_mods replace mods for the release
+			// (Ctrl at the drop copies)
+			steps = e.has("steps") ? math.max(1, std.int(e.steps)) : 10;
+			x = std.float(e.x), y = std.float(e.y), x2 = std.float(e.x2), y2 = std.float(e.y2);
+			move(x, y);
+			press_mods(mods);
+			button("press", button_id, held);
+			for(i = 1; i <= steps; i++)
+				move(x + (x2 - x) * i / steps, y + (y2 - y) * i / steps);
+			drop = e.has("drop_mods") ? parse_mods(e.drop_mods) : mods;
+			release_mods(mods & ~drop);
+			press_mods(drop);
+			button("release", button_id, held);
+			release_mods(drop);
+		}
+		else if(kind == "scroll") {
+			if(e.has("x"))
+				move(e.x, e.y);
+			dx = e.has("dx") ? std.float(e.dx) : 0.0;
+			dy = e.has("dy") ? std.float(e.dy) : 0.0;
+			run([this, dx, dy]() {
+				this.screen.simulate_input("scroll", dx, dy);
+			});
+		}
+		else if(kind == "key" || kind == "key_down" || kind == "key_up") {
+			parsed = debug_input_parse_keys(e.geti("keys") ?? "");
+			if(kind != "key_up")
+				press_mods(parsed.mods);
+			if(parsed.code >= 0) {
+				parsed.code = layout_code(parsed.code);
+				if(kind != "key_up")
+					key_event("key_press", parsed.code, held);
+				if(kind != "key_down")
+					key_event("key_release", parsed.code, held);
+			}
+			if(kind != "key_down")
+				release_mods(parsed.mods);
+		}
+		else if(kind == "text") {
+			codes = [];
+			if(e.has("codepoints")) {
+				for(i = 0; i < e.codepoints.size(); i++)
+					codes.push_back(std.int(e.codepoints[i]));
+			}
+			else {
+				for(c : std.string(e.geti("text") ?? "")) {
+					at = DEBUG_INPUT_ASCII.find(c);
+					if(at < 0 || c.length() != 1)
+						std.runtime_error("text: '" + c + "' is not printable ASCII, send it as codepoints");
+					codes.push_back(32 + at);
+				}
+			}
+			for(i = 0; i < codes.size(); i++) {
+				cp = codes[i];
+				run([this, cp]() {
+					this.screen.simulate_input("char", cp);
+				});
+			}
+		}
+		else if(kind == "wait") {
+			ms = e.has("ms") ? std.int(e.ms) : 0;
+			frames_left = e.has("frames") ? std.int(e.frames) : 0;
+			if(ms > 0)
+				run([]() {}, ms);
+			for(i = 0; i < frames_left; i++)
+				run([]() {});
+		}
+		else
+			std.runtime_error("unknown event type '" + kind + "' (move, press, release, click, drag, scroll, key, key_down, key_up, text, wait)");
+	}
+
+	// The widget under the mouse, for the answer: what the input hit
+	under_mouse() {
+		fn = [this]() {
+			w = this.screen.find_widget(eigen.vec2i(std.int(this.mouse_x), std.int(this.mouse_y)));
+			if(!w)
+				return std.json();
+			return debug_input_widget_info(w);
+		};
+		return run(fn);
+	}
+
+	events(list) {
+		if(!std.is_list(list))
+			std.runtime_error("events must be a list of objects");
+		for(i = 0; i < list.size(); i++) {
+			try {
+				event(list[i]);
+			}
+			catch(e) {
+				std.runtime_error("event " + i + " (" + std.string(list[i].geti("type")) + "): " + e);
+			}
+		}
+		return [
+			ok = 1,
+			events = list.size(),
+			mouse = [x = mouse_x, y = mouse_y],
+			held = held,
+			under = under_mouse(),
+		];
+	}
+
+	// ---- widgets ----
+
+	// Visible widgets whose text, tooltip or type contain filter (case-insensitive), at most max_count
+	widgets(filter, type_filter, max_count) {
+		fn = [this, filter, type_filter, max_count]() {
+			found = [];
+			skipped = std.json();  // types without the functions of a widget
+			debug_input_collect(this.screen, std.string(filter ?? "").lowercase(), std.string(type_filter ?? "").lowercase(), found, max_count, skipped);
+			// hit: a click at the middle reaches this widget (or one inside it), nothing lies over it
+			for(i = 0; i < found.size(); i++) {
+				info = found[i];
+				top = this.screen.find_widget(eigen.vec2i(std.int(info.cx), std.int(info.cy)));
+				info.hit = top ? (debug_input_inside(info.widget, top) ? 1 : 0) : 0;
+				info.erase("widget");
+			}
+			return found;
+		};
+		return run(fn);
+	}
+}

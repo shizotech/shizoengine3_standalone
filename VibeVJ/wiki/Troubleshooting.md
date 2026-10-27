@@ -71,8 +71,9 @@ If only one Clipview is locked, its [*Live*](Clipview.md#live) button is on.
 
 ## I cannot delete a clip
 
-A clip has no delete button. Select it (click its name tag) and remove every entry of its stack with × in the *Layer*
-window. When the last entry goes, the clip goes. In a [CueList](CueList.md#a-list), the × beside the cue does it.
+Select it (click its name tag) and press Delete (or Backspace). That does nothing while *Live* is on: turn it off
+first. Removing every entry of its stack with × in the *Layer* window deletes it too. In a
+[CueList](CueList.md#a-list), the × beside the cue does it. See [Clipview](Clipview.md#move-copy-delete).
 
 ## The tempo keeps changing by itself
 
@@ -155,10 +156,11 @@ line of Prolink Bridge and Prolink Decks shows what the computer sees in the DJ 
 3. Check that the power button of the generator is on.
 4. Look for the *NDI name* in the receiving program, on the same network.
 
-## Spout not visible
+## Spout or Syphon not visible
 
-- Spout works on Windows only.
-- Check *Enable Spout*.
+- Spout works on Windows, Syphon on macOS; Linux has neither.
+- Check *Enable Spout* (*Enable Syphon* on macOS).
+- Syphon: the other program lists the server as *<app> - <name>*, for example *VibeVJ - Output 1*.
 
 ## The display output is wrong
 

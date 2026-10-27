@@ -1,0 +1,324 @@
+//Camera: the picture of a webcam, capture card or other video device of this computer, as an Out port (#588).
+//nanogui.video plays it live (open_camera): DirectShow on Windows, Video4Linux2 on Linux, AVFoundation on macOS
+//(there the screens are in the list too). The camera is remembered by its id (control "camera"), so a project opens
+//the same camera again, and a camera that was unplugged is opened again when it is back.
+//For AI agents (#670): the queries list_cameras / set_camera / get_camera_status, and the picture alone (without the
+//panel) for vibevj_capture / vibevj_camera_capture (dispatch "get_capture_widget", engine/interfaces/ai_capture.shio).
+
+#include "engine/interfaces/videorouter"
+
+using eigen;
+
+managed video_router = None;
+
+managed video = None;
+managed selector = None;
+managed camera_ctrl = None;
+managed status = None;
+
+PANEL_W = 190;
+PICK = "Pick a camera…";
+TEST_PATTERN = "Test pattern";
+TEST_ID = "lavfi:testsrc2=size=1280x720:rate=30"; //FFmpeg's test source: no camera needed
+
+//Index-based like every controlcombo: the saved value is the index
+SIZES = [[0, 0], [640, 480], [1280, 720], [1920, 1080], [3840, 2160]];
+SIZE_NAMES = ["Default", "640x480", "1280x720", "1920x1080", "3840x2160"];
+RATES = [0, 30, 60];
+RATE_NAMES = ["Default", "30", "60"];
+
+output = None;
+play_ctrl = None;
+size_ctrl = None;
+rate_ctrl = None;
+flip_ctrl = None;
+width = None;
+height = None;
+status_text = "";
+
+devices = [];         //of the last nanogui.camera_devices(), for the list
+opened_id = "";       //what is open (or was tried last)
+opened_mode = "";     //size and rate it was opened with
+retry_ms = 0;         //a camera that is gone is tried again every few seconds
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_output")
+		return output;
+
+	//The widget a capture of "the picture" takes (engine/interfaces/ai_capture.shio)
+	if(cmd == "get_capture_widget")
+		return video;
+
+	//ACT off holds the picture
+	if(cmd == "active") {
+		if(generator.is_active() && play_ctrl.value())
+			video.play();
+		else
+			video.pause();
+	}
+	return None;
+}
+
+theme_color(t, key, fallback) {
+	if(t && t.has(key)) {
+		c = t[key];
+		return vec4f(c.r, c.g, c.b, c.a);
+	}
+	return fallback;
+}
+
+set_status(text) {
+	if(text != status_text) {
+		status_text = text;
+		status.caption(text);
+	}
+}
+
+mode_text() {
+	return std.string(size_ctrl.value()) + "/" + std.string(rate_ctrl.value());
+}
+
+//Opens the camera of camera_ctrl with the size and rate of the controls. An id "lavfi:<graph>" is an FFmpeg source
+//graph instead of a device (the test pattern).
+open_camera() {
+	id = camera_ctrl.value();
+	opened_id = id;
+	opened_mode = mode_text();
+	retry_ms = std.millis();
+	if(!id) {
+		video.close();
+		return;
+	}
+
+	options = std.json();
+	size = SIZES[math.clamp(size_ctrl.value(), 0, SIZES.size() - 1)];
+	if(size[0] > 0) {
+		options.width = size[0];
+		options.height = size[1];
+	}
+	rate = RATES[math.clamp(rate_ctrl.value(), 0, RATES.size() - 1)];
+	if(rate > 0)
+		options.fps = rate;
+
+	device = id;
+	if(std.string(id).starts("lavfi:")) {
+		options.format = "lavfi";
+		device = std.string(id).substr(6);
+	}
+
+	video.open_camera(device, options);
+	video.flip_y(flip_ctrl.value());
+}
+
+camera_name(id) {
+	if(id == TEST_ID)
+		return TEST_PATTERN;
+	for(d : devices) {
+		if(d.id == id)
+			return d.name;
+	}
+	return id;
+}
+
+refresh_devices() {
+	devices = nanogui.camera_devices();
+	names = [PICK];
+	for(d : devices)
+		names.push_back(d.name);
+	names.push_back(TEST_PATTERN);
+	selector.items(names);
+}
+
+//What the camera does now, for the AI queries
+camera_status() {
+	id = camera_ctrl.value();
+	return [
+		camera = id ? camera_name(id) : "",
+		camera_id = id,
+		open = video.is_open() && !video.finished(),
+		picture = video.valid(),
+		width = video.width(),
+		height = video.height(),
+		fps = video.fps(),
+		playing = play_ctrl.value() ? 1 : 0,
+		status = status_text,
+	];
+}
+
+register_queries(generator) {
+	generator.register("list_cameras", [], [](args) {
+		refresh_devices();
+		list = [];
+		for(d : devices)
+			list.push_back([name = d.name, id = d.id]);
+		list.push_back([name = TEST_PATTERN, id = TEST_ID]);
+		result = [cameras = list, current = camera_status()];
+		if(!nanogui.camera_available())
+			result.error = nanogui.camera_error();
+		return result;
+	}, "Camera: the cameras of this computer (name, id) and the test pattern, and what this generator shows now.");
+
+	generator.register("get_camera_status", [], [](args) {
+		return camera_status();
+	}, "Camera: the camera this generator shows, whether it is open and has a picture, its size and frame rate, the status line.");
+
+	generator.register("set_camera", [
+		camera = "&string(): The camera: its name or id from list_cameras, 'Test pattern', or empty for none",
+	], [](args) {
+		want = std.string(args.camera ?? "").strip();
+		if(!want) {
+			camera_ctrl.value("");
+			return camera_status();
+		}
+		refresh_devices();
+		id = None;
+		if(want.lowercase() == TEST_PATTERN.lowercase() || want == TEST_ID)
+			id = TEST_ID;
+		for(d : devices) {
+			if(!id && (d.id == want || d.name.lowercase() == want.lowercase()))
+				id = d.id;
+		}
+		for(d : devices) {
+			if(!id && d.name.lowercase().contains(want.lowercase()))
+				id = d.id;
+		}
+		if(!id)
+			return [ok = false, error = "No camera '" + want + "' (list_cameras lists them)."];
+		camera_ctrl.value(id);
+		return camera_status();
+	}, "Camera: shows this camera (by name or id; opened with the next frame, the first picture can take a second). get_camera_status tells when the picture is there.");
+}
+
+entry(generator, area) {
+	area.layout(None);
+	t = area.theme().to_json();
+	text_2 = theme_color(t, "text_secondary_color", vec4f(155 / 255.0, 155 / 255.0, 160 / 255.0, 1.0));
+
+	control_tabs = area.vscroll().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(PANEL_W)
+		.content().layout(nanogui.layout_vertical().spacing(4));
+
+	video = area.video("").anchor_left(PANEL_W + 4).anchor_top(0).anchor_bottom(0).anchor_right(0);
+
+	selector = control_tabs.combobox("camera_select").items([PICK]).tooltip("The cameras of this computer. Pick one to show its picture");
+	camera_ctrl = control_tabs.controltext("camera").caption("Camera").value("")
+		.tooltip("The camera this shows: picked in the list above. Empty: none");
+	status = control_tabs.label("No camera").text_color(text_2).wrap(true);
+
+	selector.on_open([](){
+		refresh_devices();
+	});
+
+	selector.on_change([](v, text) {
+		if(v == 0) {
+			camera_ctrl.value("");
+			return;
+		}
+		if(v - 1 < devices.size())
+			camera_ctrl.value(devices[v - 1].id);
+		else
+			camera_ctrl.value(TEST_ID);
+	});
+
+	play_ctrl = control_tabs.controlbutton("Play").tooltip("Shows the live picture, off: holds the last one").push(1).value(1);
+	play_ctrl.callback([generator](v){
+		if(v && generator.is_active())
+			video.play();
+		else
+			video.pause();
+	});
+
+	size_ctrl = control_tabs.controlcombo("RESOLUTION").caption("Resolution").items(SIZE_NAMES)
+		.tooltip("The size asked of the camera. One it does not have falls back to what it delivers by default");
+	rate_ctrl = control_tabs.controlcombo("FPS").caption("Frame rate").items(RATE_NAMES).segmented(true)
+		.tooltip("Pictures per second asked of the camera. Default: what it delivers by itself");
+
+	flip_ctrl = control_tabs.controlbutton("Flip Y").caption("Flip Y").tooltip("Turns the picture upside down").push(1);
+	flip_ctrl.callback([](v){
+		video.flip_y(v);
+	});
+
+	size_vec = control_tabs.controlvector("Size").tooltip("The size of the picture that comes in");
+	width = size_vec.controlint("Width").as_output(true).tooltip("Width of the picture that comes in, in pixels");
+	height = size_vec.controlint("Height").as_output(true).tooltip("Height of the picture that comes in, in pixels");
+
+	videorouter_vec = control_tabs.controlvector("VideoRouter", "video_router").caption("Video router").tooltip("Offers the picture by name in the Inputs of every shader ([[video router]])").expanded(false);
+	videorouter_enable = videorouter_vec.controlbutton("Enable Router").caption("Enable router").tooltip("Offer the picture in the [[video router]]").push(1);
+	videorouter_name = videorouter_vec.controltext("VideoRouterName").caption("Video router name").tooltip("The name other shaders pick it by").hide_config_menu();
+
+	videorouter_enable.callback([videorouter_name](v){
+		if(v) {
+			if(!video_router)
+				video_router = VideoRouter(videorouter_name.value(), output);
+		}
+		else
+			video_router = None;
+	});
+
+	videorouter_name.callback([videorouter_name](v){
+		if(video_router)
+			video_router.name = v;
+	});
+
+	videorouter_name.value("Camera_" + std.random_hash(6));
+
+	output = control_tabs.control("OUT").tooltip("The picture of the camera: [[link]] it into an input").caption("Out").as_output(true);
+	output.value(video);
+	output.callback([output](v){ output.value(video); });
+
+	//Opened in update(): a project load sets camera, resolution and rate one after the other
+	camera_ctrl.callback([](v){
+		opened_id = "-";
+	});
+
+	register_queries(generator);
+}
+
+update(generator, tl_pos, pos_delta) {
+	if(!video)
+		return;
+
+	id = camera_ctrl.value();
+	if(id != opened_id || mode_text() != opened_mode)
+		open_camera();
+	else if(id && (!video.is_open() || video.finished()) && std.millis() - retry_ms > 3000)
+		open_camera(); //unplugged, or busy in another program: try again
+
+	width.value(video.width());
+	height.value(video.height());
+
+	if(!id) {
+		set_status(nanogui.camera_available() ? "No camera" : nanogui.camera_error());
+		return;
+	}
+
+	name = camera_name(id);
+	if(!video.is_open() || video.finished()) {
+		error = video.error();
+		set_status(name + ": " + (error ? error : "not available") + " (trying again)");
+		return;
+	}
+
+	mode = std.string(video.width()) + "x" + std.string(video.height());
+	if(video.fps() > 0)
+		mode = mode + " " + std.string(std.int(math.round(video.fps()))) + " fps";
+	mode = mode + " " + video.codec();
+	if(!video.valid())
+		mode = mode + ", waiting for the first picture";
+	set_status(name + ": " + mode);
+}
+
+save_state() {
+	return [
+		camera = camera_ctrl.value(),
+		playing = play_ctrl.value(),
+	];
+}
+
+load_state(state) {
+	if(!state)
+		return;
+	if(state.has("playing"))
+		play_ctrl.value(state.playing);
+	if(state.camera)
+		camera_ctrl.value(state.camera);
+}

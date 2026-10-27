@@ -1,0 +1,263 @@
+===== tgbot.cpp 110-200 =====
+110: 
+111:     //An answer of the Bot API with "ok": false (description and error_code of Telegram)
+112:     struct api_error : std::runtime_error
+113:     {
+114:         int code = 0;
+115:         int retry_after = 0;
+116:         api_error(int c, int retry, const std::string& description) : std::runtime_error(description), code(c), retry_after(retry) {}
+117:     };
+118: 
+119:     //A file part of a multipart request, read through the shz file system (the same paths as fileio)
+120:     struct upload
+121:     {
+122:         std::string field;
+123:         std::string path;
+124:     };
+125: 
+126:     //---------------- HTTP (libcurl) ----------------
+127: 
+128:     static void global_init()
+129:     {
+130:         static std::once_flag once;
+131:         std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+132:     }
+133: 
+134:     //One curl handle (its connection stays open between requests). Not thread safe: the owner serializes the calls.
+135:     class http_client
+136:     {
+137:     public:
+138:         //`active` false aborts a running request (the bot is being destroyed)
+139:         explicit http_client(const std::atomic_bool* active) : active(active) { global_init(); }
+140:         ~http_client() { if (h) curl_easy_cleanup(h); }
+141:         http_client(const http_client&) = delete;
+142:         http_client& operator=(const http_client&) = delete;
+143: 
+144:         //POST of a Bot API method: application/json, or multipart/form-data when files are uploaded.
+145:         //Returns the HTTP status, the answer is in `out`. Throws std::runtime_error when there is no answer.
+146:         long post(const std::string& url, const tgjson& params, const std::vector<upload>& uploads, long timeout_s, std::string& out)
+147:         {
+148:             CURL* c = prepare(url, timeout_s, out);
+149:             curl_slist* headers = nullptr;
+150:             curl_mime* mime = nullptr;
+151:             std::string body;
+152: 
+153:             if (uploads.empty())
+154:             {
+155:                 body = params.is_object() ? params.dump(-1, ' ', false, tgjson::error_handler_t::replace) : std::string("{}");
+156:                 headers = curl_slist_append(headers, "Content-Type: application/json");
+157:                 curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+158:                 curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
+159:                 curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
+160:             }
+161:             else
+162:             {
+163:                 mime = curl_mime_init(c);
+164:                 if (params.is_object())
+165:                 {
+166:                     for (auto it = params.begin(); it != params.end(); ++it)
+167:                     {
+168:                         //form fields are text: strings as they are, everything else (numbers, true, objects) as JSON
+169:                         std::string value = it->is_string() ? it->get<std::string>() : it->dump(-1, ' ', false, tgjson::error_handler_t::replace);
+170:                         curl_mimepart* part = curl_mime_addpart(mime);
+171:                         curl_mime_name(part, it.key().c_str());
+172:                         curl_mime_data(part, value.data(), value.size());
+173:                     }
+174:                 }
+175:                 for (auto& u : uploads)
+176:                 {
+177:                     shzstring path(u.path.data(), u.path.size());
+178:                     auto fs = shz_filesys_local();
+179:                     if (!fs || !fs->is_file(path))
+180:                     {
+181:                         curl_mime_free(mime);
+182:                         throw std::runtime_error("file not found: " + u.path);
+183:                     }
+184:                     shzbuffer data = fs->read_file(path);
+185:                     curl_mimepart* part = curl_mime_addpart(mime);
+186:                     curl_mime_name(part, u.field.c_str());
+187:                     curl_mime_data(part, (const char*)data.data(), data.size());
+188:                     std::string name = u.path.substr(u.path.find_last_of("/\\") == std::string::npos ? 0 : u.path.find_last_of("/\\") + 1);
+189:                     curl_mime_filename(part, name.empty() ? "file" : name.c_str());
+190:                 }
+191:                 curl_easy_setopt(c, CURLOPT_MIMEPOST, mime);
+192:             }
+193: 
+194:             CURLcode rc = curl_easy_perform(c);
+195:             long status = 0;
+196:             curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+197:             curl_easy_setopt(c, CURLOPT_HTTPHEADER, nullptr);
+198:             curl_easy_setopt(c, CURLOPT_MIMEPOST, nullptr);
+199:             if (headers) curl_slist_free_all(headers);
+200:             if (mime) curl_mime_free(mime);
+===== tgbot.cpp 260-300 =====
+260:         }
+261: 
+262:         static int on_progress(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+263:         {
+264:             auto active = (const std::atomic_bool*)user;
+265:             return active && !active->load() ? 1 : 0;
+266:         }
+267: 
+268:         CURL* h = nullptr;
+269:         const std::atomic_bool* active = nullptr;
+270:     };
+271: 
+272:     //URL or file_id strings are sent as they are, an existing local file is uploaded
+273:     static bool is_local_file(const std::string& s)
+274:     {
+275:         if (s.empty() || s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0 || s.rfind("attach://", 0) == 0)
+276:             return false;
+277:         auto fs = shz_filesys_local();
+278:         return fs && fs->is_file(shzstring(s.data(), s.size()));
+279:     }
+280: }
+281: 
+282: static const char* group_type_names[] = {
+283:     "Private", "Group", "Supergroup", "Channel"
+284: };
+285: 
+286: //The chat type names of the tgbot-cpp version ("private" -> "Private"), unknown types as they come
+287: static std::string chat_type_name(const std::string& t)
+288: {
+289:     if (t == "private")    return group_type_names[0];
+290:     if (t == "group")      return group_type_names[1];
+291:     if (t == "supergroup") return group_type_names[2];
+292:     if (t == "channel")    return group_type_names[3];
+293:     return t;
+294: }
+295: 
+296: class shz_telegram_api :
+297:     public shzobject<shz_telegram_api, "telegram.bot">,
+298:     public shz_pooled_class,
+299:     public shzobject_update_pre
+300: {
+===== tgbot.cpp 690-760 =====
+690:     //Shared options of the send functions: disable_notification, protect_content, reply_to_msgid, and the Bot API
+691:     //reply_markup / reply_parameters as they are
+692:     static void put_send_options(tgjson& req, shzvar_shared options)
+693:     {
+694:         put_flag(req, options, "disable_notification");
+695:         put_flag(req, options, "protect_content");
+696:         if (auto reply_to = mint(options, "reply_to_msgid"))
+697:             req["reply_parameters"] = { { "message_id", reply_to } };
+698:         if (has_key(options, "reply_parameters"))
+699:             req["reply_parameters"] = to_tgjson(member(options, "reply_parameters"));
+700:         if (has_key(options, "reply_markup"))
+701:             req["reply_markup"] = to_tgjson(member(options, "reply_markup"));
+702:     }
+703: 
+704:     //photo / audio / ...: a file_id or URL is sent as it is, a local file is uploaded
+705:     static void put_file(tgjson& req, std::vector<tg::upload>& uploads, const char* field, const std::string& value)
+706:     {
+707:         if (tg::is_local_file(value))
+708:             uploads.push_back({ field, value });
+709:         else
+710:             req[field] = value;
+711:     }
+712: 
+713:     //A thumbnail can only be uploaded (attach://), a string that is no local file goes as it is
+714:     static void put_thumbnail(tgjson& req, std::vector<tg::upload>& uploads, shzvar_shared options)
+715:     {
+716:         auto thumb = mstr(options, "thumbnail");
+717:         if (thumb.empty())
+718:             return;
+719:         if (tg::is_local_file(thumb))
+720:         {
+721:             uploads.push_back({ "thumbnail_file", thumb });
+722:             req["thumbnail"] = "attach://thumbnail_file";
+723:         }
+724:         else
+725:             req["thumbnail"] = thumb;
+726:     }
+727: 
+728:     //---------------- Bot API JSON -> script values ----------------
+729: 
+730:     //Writes a Bot API value into a script variable (in place, so it works for object members too)
+731:     static void fill_shz(shzvar_shared target, const tgjson& j)
+732:     {
+733:         if (j.is_object() || j.is_array())
+734:         {
+735:             target->as_json();
+736:             target->ptr_json->from_string(j.dump(-1, ' ', false, tgjson::error_handler_t::replace), true);
+737:         }
+738:         else if (j.is_string())
+739:             target->as_string(j.get<std::string>());
+740:         else if (j.is_boolean())
+741:             target->as_int((shzint)(j.get<bool>() ? 1 : 0));
+742:         else if (j.is_number_float())
+743:             target->as_float((shzfloat)j.get<double>());
+744:         else if (j.is_number())
+745:             target->as_int((shzint)tg::num(j));
+746:     }
+747: 
+748:     static shzvar_shared to_shz(const tgjson& j)
+749:     {
+750:         shzvar_shared v;
+751:         fill_shz(v, j);
+752:         return v;
+753:     }
+754: 
+755:     //The Bot API object of an update next to the fields of the module (new Bot API fields need no code here)
+756:     static void attach_raw(shzvar_shared target, const tgjson& j)
+757:     {
+758:         fill_shz(target["raw"], j);
+759:     }
+760: 
+===== tgbot.cpp 815-870 =====
+815:         bool caption;                   //caption (MarkdownV2 of the wrapper)
+816:         bool thumbnail;
+817:         std::vector<const char*> ints;  //int options with the Bot API name
+818:         std::vector<const char*> flags; //flag options with the Bot API name
+819:         std::vector<const char*> strs;  //string options with the Bot API name
+820:     };
+821: 
+822:     //send_photo / send_audio / ...: chatdata, file (file_id, URL or a local file, which is uploaded), options
+823:     static shzvar_shared send_media(shz_telegram_api* obj, shz_vm_context& ctx, shzvector<shzvar_shared>& params, const media_spec* spec)
+824:     {
+825:         tgjson req = tgjson::object();
+826:         std::vector<tg::upload> uploads;
+827:         put_chat(req, params[0]);
+828:         put_file(req, uploads, spec->field, std_string(params[1]->string_value()));
+829: 
+830:         auto options = opt(params, 2);
+831:         if (spec->caption)
+832:         {
+833:             auto caption = mstr(options, "caption");
+834:             if (!caption.empty())
+835:             {
+836:                 req["caption"] = processWrapperString(caption);
+837:                 req["parse_mode"] = "MarkdownV2";
+838:             }
+839:         }
+840:         for (auto k : spec->ints)  put_int(req, options, k);
+841:         for (auto k : spec->flags) put_flag(req, options, k);
+842:         for (auto k : spec->strs)  put_str(req, options, k);
+843:         if (spec->thumbnail)
+844:             put_thumbnail(req, uploads, options);
+845:         put_send_options(req, options);
+846: 
+847:         return ctx.return_thread([=]() mutable
+848:             {
+849:                 tgjson msg;
+850:                 if (obj->call_api(spec->name, spec->method, req, &msg, uploads) == 0)
+851:                     return message_result(msg);
+852:                 return shzvar_shared();
+853:             });
+854:     }
+855: 
+856:     //A call that answers True: [success]
+857:     static shzvar_shared call_success(shz_telegram_api* obj, shz_vm_context& ctx, const char* name, const char* method, tgjson req)
+858:     {
+859:         return ctx.return_thread([=]() mutable
+860:             {
+861:                 shzvar_shared result;
+862:                 tgjson r;
+863:                 const bool success = obj->call_api(name, method, req, &r) == 0 && (!r.is_boolean() || r.get<bool>());
+864:                 SET_BOOL(result, "success", success);
+865:                 return result;
+866:             });
+867:     }
+868: 
+869:     //chatdata (chatid, msgid) or chatid, msgid
+870:     static bool chat_and_message(shzvector<shzvar_shared>& params, tgjson& req)

@@ -7,14 +7,21 @@ using eigen;
 //- The source is made ready like engine/generators/extensions/glsl/shader_loader.shio does it: #include resolved, a
 //  Shadertoy shader (mainImage) gets the same header and main. iTime / u_time, iTimeDelta, iFrame and iResolution are set
 //  every frame.
-//- A shader that needs a picture (an effect: in Shaders/Effects or with a sampler2D input) has nothing to work on here:
-//  the window says so.
+//- A shader that needs a picture (an effect: in Shaders/Effects or with a sampler2D input) runs on a test
+//  picture (#572): engine/assets/test-image.png, with a texture from assets/Textures as the fallback while that
+//  file is not in the repo. The window shows the effect and, bottom right, the picture it works on.
 //- One shader widget for every preview; it goes when the mouse leaves the list.
 
 PREVIEW_WIDTH = 320;
 PREVIEW_HEIGHT = 180;
 PREVIEW_DELAY = 450;   //ms the mouse rests on a shader before the preview opens
 PREVIEW_COLOR_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+//The input of an effect (#572): the test image the owner asked for, and an existing texture while it is not
+//there. An image widget is a shader input, as in the image generator (image_module.shio) and the monitor process
+PREVIEW_TEST_IMAGES = ["engine/assets/test-image.png", "assets/Textures/strauss.png"];
+PREVIEW_INPUT_H = 58;      //the strip under the preview: the test picture and its name
+PREVIEW_INPUT_IMG_H = 44;
+PREVIEW_INPUT_W = 78;
 
 //#include "file" of a shader, relative to the file (like shader_loader.shio), depth limited
 preview_resolve_includes(dir, file, depth = 0) {
@@ -66,6 +73,9 @@ class shader_preview
 	managed shader = None;
 	managed caption = None;
 	managed note = None;
+	managed input_image = None;  //the test picture an effect works on, as shown in the corner (#572)
+	managed input_tex = None;    //the same picture as the shader's input: flipped, never drawn
+	managed input_name_lbl = None;   //its file name, under the picture
 	engine = None;
 	sidebar = None;          //the window of the sidebar: the preview opens right beside it
 	hovered = "";            //the .glsl asset under the mouse
@@ -75,13 +85,15 @@ class shader_preview
 	start = 0;
 	frame = 0;
 	last_time = 0.0;
+	input_shown = "";  //the input file connected to the shader right now
+	input_names = [];  //the samplers it is connected to
 
 	__init__(engine, sidebar) {
 		this.engine = engine;
 		this.sidebar = sidebar;
 		window = engine.screen.window("");
 		window.header_enabled(false).movable(false).resizable(false).overlay(true).visible(false)
-			.fixed_size(vec2f(PREVIEW_WIDTH + 16, PREVIEW_HEIGHT + 44));
+			.fixed_size(vec2f(PREVIEW_WIDTH + 16, PREVIEW_HEIGHT + 44 + PREVIEW_INPUT_H));
 		shader = window.shader();
 		shader.anchor_left(8).anchor_top(8).fixed_width(PREVIEW_WIDTH).fixed_height(PREVIEW_HEIGHT);
 		shader.render_size(vec2i(PREVIEW_WIDTH, PREVIEW_HEIGHT));
@@ -91,6 +103,15 @@ class shader_preview
 		caption = window.label("").font_size(13).anchor_left(10).anchor_right(10).anchor_top(PREVIEW_HEIGHT + 14).fixed_height(18);
 		note = window.label("").font_size(12).text_color(PREVIEW_COLOR_TEXT_2).wrap(true)
 			.anchor_left(18).anchor_right(18).anchor_top(60).fixed_height(60).visible(false);
+		//The test picture of an effect, in the bottom right corner with its name under it (#572), so it is clear
+		//what the effect changes. Its right edge and its bottom are the window margins
+		input_image = window.image().anchor_right(8).anchor_bottom(18).fixed_width(PREVIEW_INPUT_W).fixed_height(PREVIEW_INPUT_IMG_H).visible(false);
+		//A shader samples an image texture upside down: the input is a second, flipped image widget, as the image
+		//generator flips its picture by default (png/image_module.shio)
+		input_tex = window.image().fixed_size(vec2f(1, 1)).visible(false);
+		input_tex.flip_y(true);
+		input_name_lbl = window.label("").font_size(11).text_color(PREVIEW_COLOR_TEXT_2).wrap(true)
+			.anchor_left(8).anchor_right(8).anchor_bottom(2).fixed_height(14).visible(false);
 	}
 
 	//The mouse is over the list at a row with path ("" for none). screen_y: where the mouse is on the screen
@@ -127,8 +148,87 @@ class shader_preview
 		return fileio.is_directory(dir) ? dir : "";
 	}
 
+	//The first picture that exists: the test image of #572, a texture of the repo while it is not there
+	preview_input_file() {
+		for(i = 0; i < PREVIEW_TEST_IMAGES.size(); i++) {
+			if(fileio.exists(PREVIEW_TEST_IMAGES[i]))
+				return PREVIEW_TEST_IMAGES[i];
+		}
+		return "";
+	}
+
+	//Every sampler2D of the source except the render mask (the header of a Shadertoy shader declares
+	//iChannel0..3, so those come in here as well: a Shadertoy source gets a picture too)
+	preview_samplers(src) {
+		names = [];
+		for(line : src.split("\n")) {
+			if(line.find("sampler2D") < 0)
+				continue;
+			comment = line.find("//");
+			code = comment >= 0 ? line.substr(0, comment) : line;
+			//One declaration per statement: the Shadertoy header has all its samplers on one line
+			for(stmt : code.split(";")) {
+				words = stmt.replace("[", " ").strip().compress_whitespace().split(" ");
+				//"uniform sampler2D input" -> "input"
+				if(words.size() < 3 || words[0] != "uniform" || words[1] != "sampler2D")
+					continue;
+				name = words[2];
+				if(name == "" || name == "RenderMaskInput")
+					continue;
+				found = false;
+				for(i = 0; i < names.size(); i++) {
+					if(names[i] == name)
+						found = true;
+				}
+				if(!found)
+					names.push_back(name);
+			}
+		}
+		return names;
+	}
+
+	//An effect runs on the test picture (#572): the widget is made once per preview window, only its file changes
+	connect_input(src) {
+		file = preview_input_file();
+		if(file == "")
+			return false;
+		input_image.filename(file);
+		input_tex.filename(file);
+		samplers = preview_samplers(src);
+		for(i = 0; i < samplers.size(); i++) {
+			try {
+				shader.input(samplers[i], input_tex);
+				input_names.push_back(samplers[i]);
+			}
+			catch(e) {}
+		}
+		input_shown = file;
+		return true;
+	}
+
+	//The picture goes out of the shader before it takes a new source (a source shader after an effect must not
+	//get the picture on its iChannel0), and with the window
+	disconnect_input() {
+		for(i = 0; i < input_names.size(); i++) {
+			try {
+				shader.input(input_names[i], None);
+			}
+			catch(e) {}
+		}
+		input_names = [];
+		if(input_shown == "")
+			return;
+		input_shown = "";
+		if(!std.is_none(input_image)) {
+			input_image.visible(false);
+			this.input_name_lbl.visible(false);
+		}
+	}
+
 	show(asset) {
 		shown = asset;
+		//An input of the last shader never stays connected to this one
+		disconnect_input();
 		src_dir = asset + "/src";
 		if(!fileio.exists(src_dir + "/__init__.glsl")) {
 			hide();
@@ -143,19 +243,38 @@ class shader_preview
 			//The header and main of a Shadertoy shader, as shader_loader.shio adds them (shadertoy.shio)
 			src = shadertoy_header + "\n#line 1\n" + src + "\n" + shadertoy_main;
 		}
-		caption.caption(fileio.pure_name(asset) + (needs_input ? "   (an effect)" : ""));
-		note.caption(needs_input ? "An effect: it changes a picture it gets. Drop it onto a view with a source to see it." : "");
-		note.visible(needs_input);
-		shader.visible(!needs_input);
-		if(!needs_input) {
+		shader.visible(true);
+		//An effect: its picture is the test picture (#572). The source goes in first (it has to compile),
+		//then its inputs
+		if(needs_input) {
 			shader.fragment_source(src);
-			for(i = 0; i < uniform_defaults.size(); i++) {
-				u = uniform_defaults[i];
-				try {
-					shader.uniform(u.name, u.value);
-				}
-				catch(e) {}
+			if(!connect_input(src)) {
+				caption.caption(fileio.pure_name(asset) + "   (an effect)");
+				note.caption("An effect: it changes a picture it gets, and no test picture was found.");
+				note.visible(true);
+				shader.visible(false);
 			}
+			else {
+				caption.caption(fileio.pure_name(asset) + "   (an effect, on " + fileio.pure_name(input_shown) + ")");
+				note.visible(false);
+				input_image.visible(true);
+				this.input_name_lbl.visible(true);
+				this.input_name_lbl.caption(fileio.file_name(input_shown));
+			}
+		}
+		if(!needs_input) {
+			caption.caption(fileio.pure_name(asset));
+			note.visible(false);
+			shader.fragment_source(src);
+		}
+		//The start values of the uniforms, for an effect too: without them a zoom or an amount is 0 and the
+		//picture is black (#572)
+		for(i = 0; i < uniform_defaults.size(); i++) {
+			u = uniform_defaults[i];
+			try {
+				shader.uniform(u.name, u.value);
+			}
+			catch(e) {}
 		}
 		start = std.millis();
 		frame = 0;
@@ -166,6 +285,7 @@ class shader_preview
 
 	hide() {
 		shown = "";
+		disconnect_input();
 		if(window.visible())
 			window.visible(false);
 	}

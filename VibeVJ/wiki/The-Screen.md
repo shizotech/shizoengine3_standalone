@@ -189,6 +189,10 @@ The chat works on the generator you clicked last, and on the [fixture setup](Out
 without a click: its lamps, groups, nodes and DMX addresses, and the channels that are used twice. An AI tool on the
 *MCP* tab gets the same (the generator `fixture_setup` in its list).
 
+With a model that can see pictures, the chat can look too: at the screen, at a generator, and through a *Camera*
+generator, also right after it set lamps to test values (see
+[With the AI and a camera](Output-and-Devices.md#set-up-your-lamps)).
+
 ## Views and tabs
 
 The big area on the right has the view tabs of the top bar. A view tab starts as one empty *area*. An area holds one
@@ -214,7 +218,8 @@ listed in the *Assets* tab.
   split, beside it. Three columns are one split with three areas, not a split in a split. Closing one gives its room
   to its neighbour.
 - **Sizes:** rest the mouse on the line between two areas: it turns violet and the cursor changes. Drag it to share
-  the room of these two areas; the others keep theirs. The sizes are saved with the project.
+  the room of these two areas; the others keep theirs. Double-click it to give the two areas the same size (50/50).
+  The sizes are saved with the project.
 
 ### An empty area
 
@@ -287,6 +292,9 @@ the drop lands:
   a media file, also a view or a preset of one (a cue, a window, a clip). That is how views go into each other, for
   example a Patchview preset as a building block in another Patchview. The zones do not show there. To put something
   beside such a view, use *Split right* or *Split down* and drop into the empty area, or drag the header of an area.
+- **A red outline:** the place under the mouse does not take what you drag (a clip over a Patchview, a generator over
+  the grid of a Clipview). Letting go there does nothing.
+- **Esc** while you drag cancels it: nothing is dropped, wherever you let go.
 
 ### Moving a view
 
@@ -317,12 +325,18 @@ and a project saved with view windows opens their views in their tabs.
   are, with their state, links and MIDI mappings. Nothing is reloaded and the output does not stop.
 - **The tab stays** in the top bar and shows *Show the window* (brings it to the front) and *Back into the tab*.
   Right-clicking the tab offers the same.
-- **Back:** close the window with the × of its frame, or *Back into the tab*. The views come back into their tab.
+- **Its bar:** like the main window, a view window has no frame of the system but a bar of VibeVJ at its top. A line in
+  the accent colour along its top edge and *View window* at its left end tell it from the main window; next to it
+  stands the name of its tab. A click on *View window* brings the main window to the front. Drag the free space of the
+  bar to move the window, its edges to resize it; at the right end are minimize, maximize, full screen and close.
+- **Back:** close the window with the × at the right end of its bar, or *Back into the tab*. The views come back into
+  their tab.
 - **Inside the window** everything works as in a view tab: split, move, maximize and close areas, pick views, and the
   same keys (Ctrl + E, Ctrl + D, Ctrl + W, Ctrl + Space, F6, Ctrl + Z / Ctrl + Y, and Ctrl + S, Space, Shift + Space
   and T of [Shortcuts](Shortcuts-and-Tips.md#keys)). Undo and redo share one history with the main window.
-- **F11** in the window makes it fill its monitor, without a frame: a projector or an output monitor. F11 again brings
-  the frame back, at the place and size from before.
+- **F11** in the window (or its full screen button) makes it fill its monitor without its bar, so only the views show: a
+  projector or an output monitor. F11 again brings the bar back, at the place and size from before. On Windows, dragging
+  the bar to the top of the screen also fills the monitor, but keeps the bar.
 - **Saved with the project:** which tabs are in windows, where the windows are, how big, and whether they fill their
   monitor. Loading the project opens them there again. A window whose monitor is not connected any more opens where
   the system puts it.
@@ -337,14 +351,15 @@ Ctrl + Z takes back the last change of the layout, of a link or of a value, Ctrl
 again. The two buttons in the top bar do the same; their tooltips name the step.
 
 - **What it covers:** splitting, moving, swapping, duplicating and closing areas, the line between two areas you
-  dragged, adding and deleting views, the view tabs (add, rename, delete, dragged to another place in the bar), also the
-  tabs of a Tabview, and generators you dragged out of a Patchview, into an area or into another Patchview, moved or
+  dragged or double-clicked, adding, replacing and deleting views, the view tabs (add, rename, delete, dragged to another
+  place in the bar), also the tabs of a Tabview, and generators you dragged out of a Patchview, into an area or into another Patchview, moved or
   copied ([Select and move generators](Generators.md#select-and-move-generators)). Undo deletes a copy; redo makes it
   again with the settings it had.
 - **Generators and clips:** a generator you dragged from the sidebar into a Patchview, or deleted with its × (undo
   makes it again with its settings and its links), and in a [Clipview](Clipview.md#move-copy-delete) a clip you made,
   moved or copied, an asset you stacked onto a clip and an entry you removed from its stack (the clip goes with its
-  last entry, undo brings it back). Undo and redo keep the guid of what they make again, so the steps after it still
+  last entry, undo brings it back), and in a [CueList](CueList.md#change-the-order) a cue you moved up or down. Undo
+  and redo keep the guid of what they make again, so the steps after it still
   find it.
 - **Nothing is reloaded:** the views move back into place as they are, with their state, links and MIDI mappings. Only
   a view that you deleted is loaded again, as it was when you deleted it.
@@ -380,13 +395,16 @@ again. The two buttons in the top bar do the same; their tooltips name the step.
 - **Keys:** Ctrl + E and Ctrl + Shift + E split the area the mouse is in, Ctrl + D duplicates it, Ctrl + Space
   maximizes it, Ctrl + W closes it, F6 goes to the next area, Ctrl + Tab to the next tab of the top bar. See
   [Shortcuts and tips](Shortcuts-and-Tips.md#keys).
+- **With the AI:** an AI tool connected over the *MCP* tab can arrange the views too: split and close areas, put a
+  view into an empty area, move, copy and swap views, the view tabs and the line between two areas. Each change is a
+  step of [Undo and redo](#undo-and-redo), as if you had done it, and is locked in show mode as well.
 
 ## Generator windows
 
 Every generator lives in its own window. The window header and its buttons are on [Generators](Generators.md).
 
 - **In a Patchview** (and in the timeline area) windows float: drag the header to move a window, drag an edge or corner to
-  resize it. The mouse wheel zooms the area, dragging with the right mouse button moves it.
+  resize it. The mouse wheel zooms the area, dragging with the right or the middle mouse button moves it.
 - **In an area** (a view tab, a tab of a Tabview, half of a split) the generator fills the area and has no window
   header. Click into it and press E to show the window header, press E again to hide it.
 - In a Patchview, new windows have *Always draw links* on, so you see their cables at once.
@@ -411,8 +429,8 @@ snap to the fine dots:
 - **The zoom chip** in the bottom right corner shows the zoom. Click it for *Show everything*, *Show the selection*,
   *100 %*, *Zoom in* and *Zoom out*.
 - **Keys:** Ctrl + 0 shows everything, Ctrl + 1 goes to 100 %. They work on the Patchview the mouse was over last.
-- **Panning** with the right mouse button stops a little past the edges of the canvas, so you cannot get lost in
-  empty space.
+- **Panning** with the right or the middle mouse button (the middle one also on a generator or a control) stops a
+  little past the edges of the canvas, so you cannot get lost in empty space.
 - Zoom and position of each Patchview are saved with the project.
 
 The grid dots fade out when you zoom far out. Far out, windows are small and their text is hard to read: use
@@ -438,7 +456,7 @@ With *Snap windows* on, the views above get smaller or bigger as you move the ba
 | *View* | *Timeline*, or *Loops* / *Patch*: a free area for generator windows. Windows there snap to a grid. |
 | *Snap windows* | Keeps the views and the timeline stacked |
 
-Today *Loops* and *Patch* show the same area.
+*Loops* is its own area: the loop rows on the grid, clocked by the loop clock and startable, stoppable and resettable as learnable controls (see [Timeline](Timeline.md#loops)). *Patch* shows the patch.
 
 ## See also
 

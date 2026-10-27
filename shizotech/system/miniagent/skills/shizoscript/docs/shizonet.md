@@ -54,6 +54,13 @@ Two nodes on one network connect in a few milliseconds.
 A node's MAC is the same on every start: the hardware address of the network card (on Linux / macOS physical cards
 first, on Windows the first adapter), plus the port for every further node on the same machine (the first one gets
 6454, the next 6455, ...). So a restarted PC is the same device on the other side, like an ESP32.
+The port a node ends up on is the script's to read: `net.port()`. The default server port and the default
+client port are both the Art-Net port, so the second node of a process takes the next free one (#674): that
+documented fallback is a **verbose** line, and only a node whose port the script *named* and did not get is
+a **warning** - a normal two-node start must not fill the log with warnings (the review finding of #687).
+`_testing/shizonet.shio` and `_testing/shizonet_interfaces.shio` skip their node checks when the Art-Net
+port is held by a foreign node, because that node makes the master election of #551 and the broadcast
+checks a race; `_testing/shizonet_port_log.shio` pins the two log levels.
 
 **Restarts**: a node that restarts (an ESP32 after a reboot, same MAC) has new session ids and forgot ours. That is
 seen in the beacon replies, auth requests and acks, the device goes through `on_disconnect` / `on_connect` right away
@@ -93,7 +100,7 @@ networks where Art-Net has no business (the office Wi-Fi). #501 lets a script ch
 for (i : shizonet.interfaces())            // one entry per IPv4 address
     std.print(i.name, i.ip, i.physical, i.wireless, i.used);
 shizonet.use_interfaces("physical");       // only network cards (wired, Wi-Fi), no virtual interfaces
-shizonet.use_interfaces(["eth1", "Ethernet 2"]);   // these (names without case; Windows: also description or id)
+shizonet.use_interfaces(["eth1", "Ethernet 2"]);   // these (names without case; Windows / macOS: also description, Windows: id)
 shizonet.use_interfaces(["physical", "wg0"]);      // the network cards and wg0
 shizonet.use_interfaces("all");            // default
 ```
@@ -107,7 +114,11 @@ shizonet.use_interfaces("all");            // default
   list is read again every 2 seconds, so cards and cables that come and go are picked up.
 - `physical`: Linux: the interface has a device (`/sys/class/net/<name>/device`). macOS: `en0`, `en1`, ... Windows:
   Ethernet or Wi-Fi adapters whose description and MAC address are not those of a virtual switch / VPN / tunnel.
-  `wireless` is not known on macOS.
+- `wireless`: Linux: `/sys/class/net/<name>/wireless`, Windows: the adapter type, macOS: the media type of the
+  interface (`SIOCGIFMEDIA`; `en0` of a MacBook, and also `awdl0` / `llw0`, which are not `physical`).
+- `description`: Windows: the adapter ("Intel(R) Ethernet ..."), macOS: the name in the network settings ("Wi-Fi",
+  "Thunderbolt 1", "USB 10/100/1000 LAN"; in the system language), Linux: empty.
+- `up`: macOS also needs a link (the media status): a Thunderbolt / Ethernet port without a cable is down.
 - The socket is still bound to all interfaces (`INADDR_ANY`).
 - VibeVJ: *Devices* › *Network* › *Network cards*, kept in `engine/style.json` (`network_interfaces`).
 - Test: `_testing/shizonet_interfaces.shio`.
@@ -156,7 +167,7 @@ one request per second, answered in the receive thread). `dev.time_offset()`, `d
 
 Node (`shizonet.server` / `shizonet.client`): `all_devices`, `add_device(mac, ip, name)`,
 `add_artnet_device(ip, name, mac)`, `artnet_ports`, `artnet_auto_fps`, `artnet_max_fps`, `artnet_fps`, `add_buffer`, `buffers`, `buffer`, `write_buffer`,
-`set_buffer_value`, `buffer_value`, `on_buffer`, `receiving`, `time`, `network_time`, `time_master`.
+`set_buffer_value`, `buffer_value`, `on_buffer`, `receiving`, `time`, `network_time`, `time_master`, `port`.
 `get(command, data, timeout)` queries the first device that supports the command; `get_all(command, data, callback, timeout)` queries all matching devices and waits for their responses. `broadcast(command, data)` sends the request to all matching devices without waiting for responses and returns the number that accepted it.
 `set_prop(name, value)` stores a local property (including JSON values); `device.get_prop(name, timeout)` fetches it from that device on demand, so changes are visible without syncing or caching properties on the requester.
 `on(command, callback)` handles GET requests like `on_get`, but always sends an empty response; use `on_get` when the request needs a value back.

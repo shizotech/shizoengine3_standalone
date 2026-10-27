@@ -4,7 +4,7 @@
 //   mode 0: a row of deck panels (header + preview of the whole track) on top, scrolling lanes below
 //   mode 1: lanes only, each with an info column on the left and an optional overview bar at the bottom
 // Texts are drawn by the generator with nanovg. All layout numbers come from layout() in __init__.shio,
-// so text and graphics always match. Texture layout per deck: see shzmodule_prolink/README.md.
+// so text and graphics always match. Texture layout per deck: see modules/shzmodule_prolink/README.md.
 //
 // The view is content (Shizo UI principle 1): waveforms, beat grid, cues, loops and phrases keep the colours of the
 // STYLE. Its chrome (background, panels, lanes, the state stripe) uses the Shizo UI tokens below in both styles.

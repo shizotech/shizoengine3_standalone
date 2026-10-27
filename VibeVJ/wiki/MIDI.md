@@ -78,6 +78,7 @@ Click a notch of a control to open its options. The tab *MIDI* shows the mapping
 |---|---|
 | Mapping row, for example "nanoKONTROL2 CC 7 · ch 1" | Shows the learned device, the kind of message (*Note*, *CC*, *Program*, *Pitch bend*, *Channel pressure*, *Poly pressure*), its number and the channel. |
 | × next to the mapping | Removes the mapping. |
+| Art-Net row, for example "Art-Net U0 · Ch 12", with ×, and *16-bit* | The [Art-Net mapping](Output-and-Devices.md#art-net-mapping) of the control, if it has one. |
 | *MIDI backpropagate* | On (the standard): when the value changes in VibeVJ (mouse, a link, a clip), the value is sent back to the controller, so motor faders move and pad lights follow. Turn it off if the controller should only send. Saved per mapping. |
 | *Absolute* / *Relative* | For a control change. *Absolute* (the standard): the message sets the value, for faders and knobs with a stop. *Relative*: for an endless encoder, which sends steps; the value moves by them. Encoders send their steps in one of two ways, *Relative (1 = up, 127 = down)* or *Relative (65 = up, 63 = down)*; the manual of the controller says which. With the wrong one the value runs the wrong way or jumps. Saved per mapping. |
 
@@ -115,7 +116,7 @@ listed there like a plugged in controller, with its own *MIDI mapping* button.
 | Button | Note (24-27) | Press. A *momentary* button sends note off when released, a *toggle* button stays on until the next click. |
 | Pads | One note per pad (36-67, row by row) | Press a pad. |
 | XY | Two control changes, one for x and one for y | Drag inside it. |
-| Endless knob | Steps of a control change (1 = up, 127 = down) | Drag up and down. Its mapping is *Relative*: the control moves by the steps, so it does not jump when the knob and the control disagree. |
+| Endless knob | Steps of a control change (1 = up, 127 = down; with the encoding *offset* 65 = up, 63 = down) | Drag up and down. Its mapping is *Relative*: the control moves by the steps, so it does not jump when the knob and the control disagree. |
 | Pitch bend | Pitch bend of its channel | Drag. It springs back to the middle when you let go, unless *Properties* says otherwise. |
 | Pressure | Channel pressure (aftertouch) of its channel | Press on the track; it goes back to 0 when you let go. |
 | Program | A program change (0-127) | Click. The button of the program that is chosen lights, also when the program comes from VibeVJ. |
@@ -134,7 +135,36 @@ Click *Edit* (not in [show mode](#show-mode): there the controller is played, no
   label. It gets the next MIDI number no other element of its channel uses.
 - *Properties* changes the selected element: label, MIDI channel, CC or note, the mode of a button or a knob
   (absolute or relative), rows and columns of pads, the program of a program button, whether a pitch bend springs back. Controls mapped to the element follow its new numbers.
+  It also has the extras of the next section: the range of the value, the steps of an endless knob, *Follows VibeVJ*
+  and the colour.
 - The bin deletes the selected element, *Default* brings the standard layout back.
+
+### Range, steps, feedback and colour
+
+Each element can copy a real controller more closely. All of it is optional; a layout without it works as before.
+
+- **Range** (*min* / *max*): the values the element sends. A fader with *max* 100 sends 0 at the bottom and 100 at the
+  top, like a controller that never reaches 127; *min* above *max* turns it around. A button that sends a CC sends
+  *max* when on and *min* when off. For notes (buttons, pads) *max* is the velocity of a hit. A pitch bend counts in
+  0-16383. A mapped control only reaches the part of its range that these values give.
+- **Steps of an endless knob** (*encoding*): *twos* (1 = one step up, 127 = one step down, the default) or *offset*
+  (65 = one step up, 63 = one step down). Pick what your real encoder sends; its manual calls it "relative 2's
+  complement" or "relative binary offset". The mapping of a control learns the same kind.
+- **Follows VibeVJ** (*feedback*): *no* keeps the element where you put it, even when a mapped control moves on its
+  own. Useful for an element that plays a control a sequence or an LFO also moves.
+- **Colour** (`#rrggbb`): the colour of the element instead of the accent. Pads with a colour show it dimly while off,
+  like the pads of a launchpad. In the layout JSON a grid of pads also takes `colors`, a colour per pad, row by row.
+
+In the layout JSON (saved as `virtual_controller.json` with the project, and what agents read and write):
+
+```json
+{ "id": "f1", "type": "slider", "cc": 41, "max": 100 },
+{ "id": "enc", "type": "knob", "cc": 30, "mode": "relative", "encoding": "offset" },
+{ "id": "solo", "type": "button", "note": 24, "max": 90, "feedback": false, "color": "#ff8800" },
+{ "id": "clips", "type": "grid", "rows": 1, "cols": 4, "note_base": 36, "colors": ["#ff0000", "#00ff00", "", "#0000ff"] }
+```
+
+`mode` *increment* or *endless* is the same as *relative*.
 
 The layout is saved with the [project](Getting-Started.md#save). Every element keeps its id and its MIDI number when the
 layout changes, so mapped controls keep working.
@@ -161,18 +191,20 @@ Whenever an element gets another number (*From hardware*, *Properties*, *Default
 
 ### Other programs
 
-On Linux, *System port* in the window makes *Shizo Virtual MIDI* a MIDI port of the system (ALSA sequencer). Other
-programs, for example a DAW or another VJ tool, then list it like a controller:
+On Linux and macOS, *System port* in the window makes *Shizo Virtual MIDI* a MIDI port of the system (the ALSA
+sequencer on Linux, a CoreMIDI source and destination on macOS). Other programs, for example a DAW or another VJ tool,
+then list it like a controller:
 
 - they get what you play on the virtual controller;
 - what they send to it comes into VibeVJ like from a controller: mapped controls follow, and MIDI learn works with it.
 
-Connect it in the other program, or with `aconnect` / a patchbay such as qjackctl. VibeVJ remembers the switch on this
-computer (not in the project). If the button does not stay on, the ALSA sequencer is missing (`modprobe snd-seq`).
+Connect it in the other program, on Linux also with `aconnect` / a patchbay such as qjackctl. VibeVJ remembers the
+switch on this computer (not in the project). If the button does not stay on under Linux, the ALSA sequencer is missing
+(`modprobe snd-seq`). On macOS the port keeps its id, so the other program finds it again after a restart of VibeVJ;
+*Audio MIDI Setup* shows it only while VibeVJ runs.
 
 On Windows a virtual port needs a driver: install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html),
-make a port there, and VibeVJ lists it in *Devices › MIDI* like a controller. On macOS the button is greyed out for now; the
-*IAC Driver* in *Audio MIDI Setup* makes a port that VibeVJ lists as a device.
+make a port there, and VibeVJ lists it in *Devices › MIDI* like a controller.
 
 ### For agents
 

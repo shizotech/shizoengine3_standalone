@@ -1,0 +1,352 @@
+// The frame cost of the fixture setup (#682): with ~10 lamps the universe map and the 3D view must not
+// work through every channel of the universe each frame.
+//
+// The universe map of the setup is one channel_map (engine/patch/channelmap.shio): its background is
+// the 512 channels of a universe and its blocks are the lamps. Before #682 it filled a rect per channel
+// (512 + one per channel of every lamp, ~760 fills per frame) and rebuilt the map data every frame
+// (patch_universe_map, the used count, the overlap of every lamp); line3d() cut every world line of the
+// 3D floor grid into 1 m pieces and projected each of them. Measured on Windows with 10 lamps: the map
+// 14.3 ms and the 3D grid 14.2 ms, inside a 13 ms plan frame / a 29 ms 3D frame (the 20-30 FPS of #682).
+// Since #686 the 3D view is a nanogui.view3d drawn with OpenGL: the script only brings its items up to
+// date (sync_stage3d, the on_prepare of the view), the floor is a mesh made once.
+//
+// What it measures (the median over the frames, all of it the script's own time inside a real on_draw):
+//   map       channel_map.draw(): the universe map
+//   map_data  fixture_arranger.map_data(), the provider of the map: what it shows
+//   plan      draw_stage(): the 2D plan
+//   stage3d   sync_stage3d() + draw_stage3d(): the script's part of the 3D view (#686: its items, the labels)
+//   ref100    the reference: 100 single rect fills, the pattern of one channel cell, in the same frame
+// The budgets are ratios to the plan and to the fill reference, so they hold on a GPU box and under a
+// software renderer alike; map_data has an absolute budget (a cache makes it near zero on any box).
+//
+// A tree that still draws a fill per channel prints a SKIP line with the reason, so the suite stays
+// green on both sides of the #682 fix; where the fix is in, the budgets are checked. It also checks
+// that the map still LOOKS as before (a free channel, a channel of a block and the gap between two
+// cells, out of a widget.capture() of the map): that is what a cheaper draw must not change.
+//
+// Why it is here and not in _testing: the fixture setup includes the app by paths relative to the app
+// folder ("engine/patch/patch"), so only a script run with the app folder as its working directory can
+// include it (as VibeVJ itself runs). shz --test runs a test from the folder it found it in, so the
+// patch modules of the app are tested there (stage3d.shio, ledmap.shio, ...) and this frame-cost check
+// of the menu runs from the app:
+//   cd _shizoengine3 && shz engine/menus/fixtures/perf_check.shio [out_dir]
+//   (Linux, headless: LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a shz engine/menus/fixtures/perf_check.shio)
+// The out_dir (default "perf_out", next to the app folder) holds the PNG captures it reads the pixels from.
+// Passes when it prints "ALL PASSED" and the process exits with code 0.
+import nanogui;
+using eigen;
+using nanogui;
+
+//the app folder is the working directory of this script (see above), like the one of VibeVJ
+PATCH_ROOT = "";
+
+#include "engine/menus/fixtures/setup"
+
+NODE = "AA:BB:CC:DD:EE:01";
+BAR = "assets/Fixtures/Bars/24CHRGB.json";
+MH = "assets/Fixtures/MovingHeads/cheap_mh.json";
+NBARS = 8;
+NMH = 2; //the ~10 lamps of #682
+W = 1600;
+H = 900;
+FRAMES = 40;
+
+out_dir = std.argc() > 1 ? std.string(std.argv(1)) : "perf_out";
+fileio.mkdir(out_dir);
+
+ok = true;
+check(cond, what) {
+	if(!cond) {
+		std.print("FAIL " + what);
+		ok = false;
+	}
+}
+
+med(list) {
+	if(!list.size())
+		return 0;
+	s = list.copy();
+	for(pass = 0; pass < s.size(); pass++) {
+		for(i = 0; i < s.size() - 1 - pass; i++) {
+			if(s[i] > s[i + 1]) {
+				a = s[i];
+				s[i] = s[i + 1];
+				s[i + 1] = a;
+			}
+		}
+	}
+	return s[std.int(s.size() / 2)];
+}
+
+// ---- the engine the setup reads (as small as the patch tests keep it) ----
+class fake_fixture_menu {
+	lamp_color(f) {
+		return None;
+	}
+	lamp_pan_tilt(f) {
+		return None;
+	}
+	set_highlight(ids) {}
+	refresh_all() {}
+}
+
+class fake_engine {
+	patch = None;
+	net = None;
+	patch_revision = 0;
+	patch_change_pending = false;
+	dmx_users = [];
+	dmx_revision = 0;
+	ai_interfaces = [];
+	fixture_menu = None;
+	env = [];
+
+	__init__() {
+		patch = patch_new();
+		fixture_menu = fake_fixture_menu();
+	}
+
+	patch_changed() {
+		patch_revision++;
+	}
+}
+
+// ---- the map grid, as channelmap.shio lays it out (s = the size of the map widget) ----
+cell_w(s) {
+	return (s.x - CHMAP_LEFT - 8) / CHMAP_COLS;
+}
+cell_h(s) {
+	return (s.y - CHMAP_TOP - 8) / CHMAP_ROWS;
+}
+//centre of channel c (0-based)
+cell_x(s, c) {
+	return CHMAP_LEFT + (c % CHMAP_COLS + 0.5) * cell_w(s);
+}
+cell_y(s, c) {
+	return CHMAP_TOP + (std.int(c / CHMAP_COLS) + 0.5) * cell_h(s);
+}
+//the line between the column of channel c and the next one
+gap_x(s, c) {
+	return CHMAP_LEFT + (c % CHMAP_COLS + 1.0) * cell_w(s);
+}
+//row of the pixel buffer: the readback of a shader is bottom-up (see draw_context.shio); the marker
+//widget says whether this capture came out that way
+buf_y(h, flip, y) {
+	return flip ? h - 1 - std.int(y) : std.int(y);
+}
+
+close_to(a, b, tol = 12) {
+	return math.abs(a[0] - b[0]) <= tol && math.abs(a[1] - b[1]) <= tol && math.abs(a[2] - b[2]) <= tol;
+}
+dist2(a, b) {
+	return (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]);
+}
+rgb255(c) {
+	return [std.int(c.x * 255), std.int(c.y * 255), std.int(c.z * 255)];
+}
+//one line, so a report shows the whole colour
+txt(a) {
+	return std.string(a[0]) + "," + a[1] + "," + a[2];
+}
+
+pump(ctx, n) {
+	f0 = ctx.frame_index();
+	for(i = 0; i < 4000; i++) {
+		std.sleep(1);
+		if(ctx.frame_index() - f0 >= n)
+			return true;
+	}
+	return false;
+}
+
+// ---- the window and the setup ----
+ctx = nanogui.context();
+scr = ctx.screen("682 fixture perf", W, H, true, false, false);
+scr.visible(1);
+ctx.fps(-1); //unlimited: a frame costs what it costs
+
+//the screen's root widget has no size of its own; the anchored widgets of the setup need a host with
+//one (in the app that is the tab widget the menu builds itself in)
+host = scr.widget();
+host.fixed_size(vec2f(W, H));
+host.size(vec2f(W, H));
+
+eng = fake_engine();
+std.global("engine").set(eng);
+patch = eng.patch;
+for(i = 0; i < NBARS; i++)
+	patch_add(patch, BAR, 1, NODE, 0, 0, i * 0.8 - 3.2, -1.0);
+for(i = 0; i < NMH; i++)
+	patch_add(patch, MH, 1, NODE, 0, 0, i * 1.2 - 0.6, 1.2);
+eng.patch_changed();
+
+arr = fixture_arranger(host);
+arr.fit_view();
+
+// ---- the times of the single draw calls, measured inside a real frame ----
+times = [chmap = [], provider = [], plan = [], stage3d = [], ref100 = []];
+
+ref_probe = host.widget();
+ref_probe.position(vec2f(0, 0));
+ref_probe.fixed_size(vec2f(8, 8));
+ref_probe.on_draw([times]() {
+	t = nanogui.micros();
+	for(i = 0; i < 100; i++) {
+		nvgBeginPath();
+		nvgRect(vec2f((i % 10) * 1.5, std.int(i / 10) * 1.5), vec2f(1.0, 1.0));
+		nvgFillColor(PAL_CONTROL);
+		nvgFill();
+	}
+	times.ref100.push_back(nanogui.micros() - t);
+});
+
+arr.view3d = false;
+arr.stage.on_draw([times, arr]() {
+	t = nanogui.micros();
+	arr.draw_stage();
+	times.plan.push_back(nanogui.micros() - t);
+});
+arr.chmap.area.on_draw([times, arr]() {
+	t = nanogui.micros();
+	arr.map_data();
+	times.provider.push_back(nanogui.micros() - t);
+	t = nanogui.micros();
+	arr.chmap.draw();
+	times.chmap.push_back(nanogui.micros() - t);
+});
+pump(ctx, 20); //warm-up: the first layout, the fonts, the shaders
+times.plan = [];
+times.chmap = [];
+times.provider = [];
+pump(ctx, FRAMES);
+
+arr.view3d = true;
+arr.view3d_view.visible(true);
+arr.fit_view3d();
+frame3d = [t = 0];
+arr.view3d_view.on_prepare([times, arr, frame3d]() {
+	t = nanogui.micros();
+	arr.sync_stage3d();
+	frame3d.t = nanogui.micros() - t;
+});
+arr.view3d_view.on_draw([times, arr, frame3d]() {
+	t = nanogui.micros();
+	arr.draw_stage3d();
+	times.stage3d.push_back(frame3d.t + nanogui.micros() - t);
+});
+pump(ctx, 20);
+times.stage3d = [];
+pump(ctx, FRAMES);
+check(arr.view3d_view.error() == "", "the 3D view draws: " + arr.view3d_view.error());
+check(arr.view3d_view.count() > patch.fixtures.size(), "the 3D view has items for the lamps: " + arr.view3d_view.count());
+
+chmap_t = med(times.chmap);
+provider_t = med(times.provider);
+plan = med(times.plan);
+stage3d = med(times.stage3d);
+ref100 = med(times.ref100);
+
+std.print("T lamps=" + patch.fixtures.size() + " frames=" + FRAMES + " window=" + W + "x" + H + " us per frame, median");
+std.print("T map=" + chmap_t + " map_data=" + provider_t + " plan=" + plan + " stage3d=" + stage3d + " ref100=" + ref100);
+std.print("T map/plan=" + std.int(chmap_t / math.max(1, plan)) + " stage3d/plan=" + std.int(stage3d / math.max(1, plan)) +
+	" map/ref100=" + std.int(chmap_t / math.max(1, ref100)));
+
+// ---- the look of the map ----
+//Colour of a pixel of a PNG: a hidden image widget loads it, a hidden shader copies it into its readback
+//(the pattern of draw_context.shio)
+px(ctx, scr, file, w, h, x, y) {
+	img = scr.image(file).visible(false);
+	copy = scr.shader().visible(false);
+	copy.render_size(vec2i(w, h));
+	copy.output_component_format("uint8");
+	copy.output_pixel_format("rgb");
+	copy.pixel_readback(true);
+	copy.fragment_source("uniform sampler2D src;\nvoid main() { fragColor = vec4(texture(src, v_uv).rgb, 1.0); }\n");
+	copy.input("src", img);
+	pump(ctx, 8);
+	buffer = copy.pixel_buffer();
+	std.free(copy);
+	std.free(img);
+	o = (y * w + x) * 3;
+	if(!buffer || buffer.size() < o + 3)
+		return [-1, -1, -1];
+	return [buffer[o], buffer[o + 1], buffer[o + 2]];
+}
+
+//the readback runs bottom-up; a marker of two colours says how this capture came out
+orient = [flip = false];
+mark = host.widget();
+mark.position(vec2f(0, H - 40));
+mark.fixed_size(vec2f(8, 8));
+mark.on_draw([mark]() {
+	nvgBeginPath();
+	nvgRect(vec2f(0, 0), vec2f(8, 4));
+	nvgFillColor(vec4f(1.0, 0.0, 0.0, 1.0));
+	nvgFill();
+	nvgBeginPath();
+	nvgRect(vec2f(0, 4), vec2f(8, 4));
+	nvgFillColor(vec4f(0.0, 0.0, 1.0, 1.0));
+	nvgFill();
+});
+pump(ctx, 3);
+size_mark = mark.capture(out_dir + "/marker.png", 1.0);
+if(size_mark) {
+	marker_px = px(ctx, scr, out_dir + "/marker.png", size_mark.x, size_mark.y, 2, 1);
+	orient.flip = marker_px[2] > marker_px[0]; //blue on the first row of the buffer: the image is upside down
+	std.print("T marker=" + txt(marker_px) + " bottom_up=" + (orient.flip ? 1 : 0));
+}
+std.free(mark);
+
+arr.view3d = false;
+arr.view3d_view.visible(false);
+pump(ctx, 3);
+size_map = arr.chmap.area.capture(out_dir + "/map.png", 1.0);
+check(size_map != None && size_map.x > 300 && size_map.y > 100,
+	"the map captures at its own size (" + std.string(size_map) + ")");
+
+if(size_map) {
+	ms = arr.chmap.area.size();
+	w = size_map.x;
+	h = size_map.y;
+	block_c = 100; //inside the 5th bar (channels 97-120)
+	free_c = 24 * NBARS + 8 * NMH + 40; //past the last lamp of the patch
+	hue = pal_hue(std.int((block_c - 1) / 24), 0.8);
+	want_block = rgb255(vec4f(hue.x * 0.8 + PAL_CONTROL.x * 0.2, hue.y * 0.8 + PAL_CONTROL.y * 0.2,
+		hue.z * 0.8 + PAL_CONTROL.z * 0.2, 1.0));
+	want_free = rgb255(PAL_CONTROL);
+	want_field = rgb255(PAL_FIELD);
+
+	got_free = px(ctx, scr, out_dir + "/map.png", w, h, std.int(cell_x(ms, free_c)), buf_y(h, orient.flip, cell_y(ms, free_c)));
+	got_block = px(ctx, scr, out_dir + "/map.png", w, h, std.int(cell_x(ms, block_c)), buf_y(h, orient.flip, cell_y(ms, block_c)));
+	got_gap = px(ctx, scr, out_dir + "/map.png", w, h, std.int(gap_x(ms, free_c)), buf_y(h, orient.flip, cell_y(ms, free_c)));
+	std.print("T free=" + txt(got_free) + " want=" + txt(want_free));
+	std.print("T block=" + txt(got_block) + " want=" + txt(want_block));
+	std.print("T gap=" + txt(got_gap) + " want~=" + txt(want_field));
+
+	check(close_to(got_free, want_free), "a free channel is the control colour: " + txt(got_free) +
+		" want " + txt(want_free));
+	check(close_to(got_block, want_block), "a channel of a block is the colour of its block: " + txt(got_block) +
+		" want " + txt(want_block));
+	check(dist2(got_gap, want_field) < dist2(got_gap, want_free), "a gap stays between two cells: " +
+		txt(got_gap) + " is nearer to the field " + txt(want_field) + " than to a cell " +
+		txt(want_free));
+}
+
+std.free(ref_probe);
+
+// ---- the budgets (see the header) ----
+if(chmap_t > 3 * plan) {
+	std.print("SKIP: the universe map of the fixture setup costs " + chmap_t + " us per frame, " +
+		std.int(chmap_t / math.max(1, plan)) + " times the plan (#682: a fill per channel and its data worked out" +
+		" again every frame). The budgets below are checked in a tree that has the fix.");
+	std.print("ALL PASSED");
+	std.exitprocess(0);
+}
+
+check(provider_t <= 1000, "the map data is not worked out again every frame: " + provider_t + " us, budget 1000");
+check(chmap_t <= 2 * plan, "the universe map costs no more than twice the plan: " + chmap_t + " vs " + plan + " us");
+check(chmap_t <= 8 * ref100, "the universe map draws no fill per channel: " + chmap_t + " us, 100 fills cost " + ref100 + " us");
+check(stage3d <= 8 * plan, "the 3D view stays near the cost of the plan: " + stage3d + " vs " + plan + " us");
+
+std.print(ok ? "ALL PASSED" : "FAILED");
+std.exitprocess(ok ? 0 : 1);

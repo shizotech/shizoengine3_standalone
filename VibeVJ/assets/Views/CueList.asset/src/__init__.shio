@@ -40,6 +40,9 @@ Note: For cascading to work correctly, shaders must be placed on consecutive lay
 
 ctrls_area_size = 130;
 cue_width = 120;
+//Right of a cue: the arrows that move it (16) and its remove button (25)
+CUE_MOVE_WIDTH = 16;
+CUE_EDIT_WIDTH = 16 + 25;
 
 managed cue_area = None;
 managed clips = None;
@@ -50,6 +53,41 @@ cue_lists = [];
 reset_cue_list = true;
 
 cue_livemode_btn = None; 
+
+//Moves the cue of the clip in row, col one place up (dir -1) or down (dir 1) in its list: it swaps its cell in the
+//Clipview with the next clip of the row (#374). The list is built again from the grid in the next update(). True when it
+//moved; not at the end of a list, and not while Live is on
+move_cue(row, col, dir) {
+	if(!clips || cue_livemode_btn.pushed())
+		return false;
+	other = clips.next_clip_col(row, col, dir);
+	if(other < 0)
+		return false;
+	return clips.swap_clips(row, col, other, dir < 0 ? "Move cue up" : "Move cue down");
+}
+
+//The lists as data, for the AI interface: per list its row, name and cues in order (column, name, guid, running)
+cue_overview() {
+	lists = [];
+	if(!clips)
+		return lists;
+	for(row = 0; row < clips.grid.rows(); row++) {
+		cues = [];
+		for(col = 0; col < clips.grid.cols(); col++) {
+			cell = clips.grid.get_item_at(row, col);
+			if(cell && cell.attr.item && cell.attr.layer_name) {
+				live = row < clips.active_cells.size() && clips.active_cells[row] == cell;
+				cues.push_back([col = col, name = cell.attr.layer_name.value(), guid = cell.attr.item.guid, live = live]);
+			}
+		}
+		if(cues.size() > 0) {
+			layer_cell = clips.grid.get_header_left_item(row);
+			name = layer_cell && layer_cell.attr.layer_name ? layer_cell.attr.layer_name.value() : "";
+			lists.push_back([row = row, name = name, cues = cues]);
+		}
+	}
+	return lists;
+}
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "active") {
@@ -68,7 +106,7 @@ entry(generator, area) {
 	
 	top_bar = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(30).layout(nanogui.layout_horizontal());
 	
-	cue_livemode_btn = top_bar.pushbutton("Live").tooltip("Locks the lists for playing: no [[cue]] can be removed\n[[wiki:CueList#the-bar-at-the-top]]");
+	cue_livemode_btn = top_bar.pushbutton("Live").tooltip("Locks the lists for playing: no [[cue]] can be removed or moved\n[[wiki:CueList#the-bar-at-the-top]]");
 	cue_livemode_btn.on_change([](v){
 		clips.livemode.pushed(v);
 		cb = clips.livemode.on_change();
@@ -77,7 +115,8 @@ entry(generator, area) {
 		for(i = 0; i < cue_lists.size(); i++) {
 			for(j = 0; j < cue_lists[i].triggers.size(); j++) {
 				cue_lists[i].triggers[j].close_btn.visible(!v);
-				cue_lists[i].triggers[j].btn.anchor_right(v ? 0 : 25);
+				cue_lists[i].triggers[j].move_btns.visible(!v);
+				cue_lists[i].triggers[j].btn.anchor_right(v ? 0 : CUE_EDIT_WIDTH);
 			}
 		}
 	});
@@ -157,6 +196,36 @@ entry(generator, area) {
 	ctrls_split4 = ctrl_area.widget().fixed_height(30);
 	ctrls_split4.controlslider("Macro 7").anchor(0).anchor_right(0.5,"percent");
 	ctrls_split4.controlslider("Macro 8").anchor(0).anchor_left(0.5,"percent");
+	
+	//For agents (MCP, the in-app Chat): the lists with their cues in order, and moving a cue (#374)
+	generator.on_get_status([](){
+		return [
+			lists = cue_overview(),
+			live = cue_livemode_btn.pushed() ? true : false,
+			explanation = "A CueList shows each row of the Clipview behind it as a list of cues, in the order of the columns of that row. move_cue moves a cue one place up or down in its list (one undo step).",
+		];
+	});
+	
+	generator.register("move_cue", [
+		row = "&int(0,1000): The row of the list (lists[].row of the status).",
+		index = "&int(0,1000): The place of the cue in its list, 0 = the first.",
+		direction = "&enum(up,down): up: one place towards the start of the list, down: towards its end.",
+	], [](args){
+		lists = cue_overview();
+		for(l : lists) {
+			if(l.row != std.int(args.row))
+				continue;
+			index = std.int(args.index);
+			if(index < 0 || index >= l.cues.size())
+				return [ok = false, error = "The list has no cue " + index + " (" + l.cues.size() + " cues)."];
+			if(cue_livemode_btn.pushed())
+				return [ok = false, error = "Live is on: the lists are locked."];
+			if(!move_cue(l.row, l.cues[index].col, args.direction == "up" ? -1 : 1))
+				return [ok = false, error = "The cue is at the " + (args.direction == "up" ? "start" : "end") + " of its list."];
+			return [ok = true, lists = cue_overview()];
+		}
+		return [ok = false, error = "No list in row " + args.row + "."];
+	}, "Moves a cue one place up or down in its list: it swaps places with its neighbour, one undo step. Not while Live is on.");
 }
 
 building_cue_list = false;
@@ -253,9 +322,16 @@ update(generator, tl_pos, pos_delta) {
 							layer_cell.attr.mix_ctrl.link_to(mix, "normalized");
 							mix.link_to(layer_cell.attr.mix_ctrl, "normalized");
 							
+							//The Transition is a mirror of the layer's: the same seconds, range and curve, linked absolute both
+							//ways, so both show the same value with the handle at the same place. Linked normalized (0..1, no
+							//curve), the fraction of this slider came back into the layer as a handle position, and its curve
+							//made 0.065 s of a saved 2 s after a load (2026-10-24). Projects of before: migrate_4_to_5
 							trans = list.controlslider("Transition", "cue_trans_" + row).anchor_left(0).anchor_right(0).anchor_top(80 + 80).fixed_height(25);
-							layer_cell.attr.trans_ctrl.link_to(trans, "normalized");
-							trans.link_to(layer_cell.attr.trans_ctrl, "normalized");
+							layer_trans = layer_cell.attr.trans_ctrl;
+							trans.tooltip(layer_trans.tooltip()).unit(layer_trans.unit()).min(layer_trans.min()).max(layer_trans.max());
+							trans.envelope().points(layer_trans.envelope().points());
+							layer_trans.link_to(trans, "absolute");
+							trans.link_to(layer_trans, "absolute");
 							
 							list_scoll_area = list.vscroll().anchor(0).anchor_top(80 + 110).anchor_bottom(50);
 							
@@ -361,7 +437,7 @@ update(generator, tl_pos, pos_delta) {
 					
 					trigger_split = last_cue_list.list_scroll.widget().fixed_height(25);
 					
-					trigger_btn = trigger_split.pushbutton(cell.attr.layer_name.value()).anchor(0).anchor_right(25).fixed_height(25);
+					trigger_btn = trigger_split.pushbutton(cell.attr.layer_name.value()).anchor(0).anchor_right(CUE_EDIT_WIDTH).fixed_height(25);
 					trigger_btn.transparent(true).tooltip("Starts this [[cue]]");
 					//The running cue: a tint and a bar on the left in the live colour of the theme (it was a fixed amber,
 					//which means "queued" in the Shizo UI, #436)
@@ -387,8 +463,23 @@ update(generator, tl_pos, pos_delta) {
 						cell.attr.item.on_close();
 					});
 					
+					//Up / down: the cue swaps its place with the one before / after it, one step of the undo history (#374).
+					//The order of a list is the order of the clips in its row of the Clipview, so it is saved with it
+					move_btns = trigger_split.widget().anchor_top(0).anchor_bottom(0).anchor_right(25).fixed_width(CUE_MOVE_WIDTH);
+					move_up = move_btns.button("").icon(nanogui.icon("chevron_up")).font_size(10).anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(0.5, "percent");
+					move_up.transparent(true).tooltip("Moves this [[cue]] up").enabled(last_cue_list.triggers.size() > 0);
+					move_down = move_btns.button("").icon(nanogui.icon("chevron_down")).font_size(10).anchor_left(0).anchor_right(0).anchor_top(0.5, "percent").anchor_bottom(0);
+					move_down.transparent(true).tooltip("Moves this [[cue]] down").enabled(clips.next_clip_col(row, col, 1) >= 0);
+					move_up.on_click([row, col](){
+						move_cue(row, col, -1);
+					});
+					move_down.on_click([row, col](){
+						move_cue(row, col, 1);
+					});
+					
 					if(cue_livemode_btn.pushed())
 						trigger_delete.visible(false);
+						move_btns.visible(false);
 						trigger_btn.anchor_right(0);
 					
 					if(row < clips.active_cells.size())
@@ -407,7 +498,7 @@ update(generator, tl_pos, pos_delta) {
 						}
 					});
 					
-					last_cue_list.triggers.push_back([btn=trigger_btn, cell=cell, close_btn=trigger_delete]);
+					last_cue_list.triggers.push_back([btn=trigger_btn, cell=cell, close_btn=trigger_delete, move_btns=move_btns]);
 					
 					cue_lists = new_cue_list;
 				}

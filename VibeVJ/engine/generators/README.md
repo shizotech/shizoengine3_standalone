@@ -10,6 +10,7 @@ engine/generators/
 ├── clipview.shio            # Clip view container
 ├── clipstackview.shio       # Clip stack view container
 ├── singleview.shio          # Single-generator view
+├── copy_links.shio          # The links of copied generators among themselves (Ctrl at a drop, Ctrl+C / Ctrl+V, #348)
 └── extensions/              # Per-extension loaders (see extensions/README.md)
 ```
 
@@ -35,6 +36,34 @@ engine/generators/
 
 - **`extensions/`** — the per-extension loaders that give each generator its
   actual behavior. See [`extensions/README.md`](extensions/README.md).
+
+## Drop targets (#346)
+
+What a drag carries (`payload`, a JSON the nanogui screen hands to `on_dragdrop_hover` / `on_dragdrop`):
+
+| From | Payload |
+|---|---|
+| Asset browser (filebrowser.cpp) | `type="files"`, `path`, `paths`; `layout=1` for a view asset |
+| Header / tab of an area (`singleview.start_drag`) | `type="area"`, `layout=1`, `name` (the view is in `env.dragged_view`) |
+| Alt + drag of generators (`generatorview.start_drag`) | `type="generators"`, `generators=1`, `ghost` (in `env.dragged_generators`) |
+| Name tag of a clip (`clipview`) | `cell`, `item` (`type="generic"`) |
+| A widget with `dragdrop_enabled(true)` | `type="generic"`, `source_widget` only |
+
+- `layout=1` payloads only reach widgets with drop zones (the areas), not what an area shows.
+- Every target answers the hover with what it takes (`takes_drop(payload)` in singleview, generatorview, clipview,
+  clipstackview, `tabs_take_drop` in Tabview, `accepts` in LEDMapper): `false` makes the screen draw a red outline
+  and skip the drop. The drop callback checks again and returns `false`: a hover answer may come late, and a
+  missing key read outside `#strict` is `None`: before #346 a clip or generators dropped on a Patchview / a cell
+  went to `add_generator(fileio.relative_path_cwd(None))`, the notice "Asset has no valid extension". Check with
+  `payload.has("path")`, not `payload.path`.
+- Esc during a dragdrop cancels it in the screen (`m_dragdrop_canceled`, screen.cpp): no drop, and no new dragdrop
+  until the next mouse press, also not one a script starts late. `env.dragged_view` / `env.dragged_generators` stay
+  set; they are only read by a drop.
+- Pitfall: a widget callback (`on_mouse_button`, `on_mouse_drag`, ...) that is still running when the next event
+  comes drops that event (`shz_callback_task::call`; `call_or_spawn` would queue it). A slow press handler
+  (`describe_all` for undo) lost the release, a slow first click the second press of a double click. Keep press and
+  click handlers cheap and finish a step in the handler that makes it (the double click on a divider in
+  `splitpanes.shio` records its undo step at the press, the drag describes the layout at its first move).
 
 ## Navigation / Quick Links
 

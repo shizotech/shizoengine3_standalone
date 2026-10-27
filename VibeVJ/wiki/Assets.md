@@ -38,7 +38,7 @@ How a generator window works is on [Generators](Generators.md). Your own setting
 | `Shaders` | Pictures and effects: `Sources`, `Effects`, `Utilities`. |
 | `Views` | The views: *Clipview*, *CueList*, *Patchview*, *Tabview*, with their presets and saved layouts. See [Views and tabs](The-Screen.md#views-and-tabs). |
 | `Mapping` | *MapLab*, *LEDMapper*, *MaskTransform*. See [Mapping](Output-and-Devices.md#mapping). |
-| `Fixtures`, `FixturesEffects` | Lamps and effects over them. See [Fixtures](Output-and-Devices.md#fixtures). |
+| `Fixtures`, `FixturesEffects` | Lamps and effects over them: the Phaser, FixtureState, and the [lighting desk](Lighting-Desk.md) (Programmer, Executors, LampValues, CueTrigger). See [Fixtures](Output-and-Devices.md#fixtures). |
 | `Textures`, `Videos` | Pictures and [video files](Video.md). Each opens as a generator with an *Out* port. |
 | `FFGL` | FFGL plugins you add yourself (`.dll`, `.bundle`, `.so`). See [FFGL plugins](#ffgl-plugins). |
 
@@ -69,7 +69,7 @@ in step with the [timeline](Timeline.md).
 | *EnvelopeOutput* | A curve you draw, played free or on the beat: one run takes *Duration* beats, the line shows where it plays, *Output* gives its value. |
 | *StepChaser* | A step sequencer on the beat: the bar (*Bar length*) is cut into *Steps*, every step has a *Value* (or *Hold*), a *Fade in* and a *Fade out*. Every block (*Add output*) has its own *Output*. |
 | *Button-Feld*, *Control-Button-Matrix* | A grid of buttons to link from: 3 × 3, or *Rows* × *Columns*. The *Settings* of a button hold its name, the mode (*Flash*, *Relative*, *Absolute*), *Value*, *Input* and the *Output* to link. |
-| *ColorSelector* | Colours for several targets: pick one per row, the target sends it as *RGB* and *HSV*, with *Brightness* and *Smoothing*. |
+| *ColorSelector* | Colours for several targets: pick one per row, the target sends it as *RGB* and *HSV*, with *Brightness* and *Smoothing*. *Lamps* under the name of a row colours a group of the fixture setup directly ([lighting desk](Lighting-Desk.md#groups-as-link-targets)). |
 | *control4* | Four plain values, *Control 1* to *Control 4*, to set by hand or MIDI and link. |
 | *quantize* | Rounds *Input* down to a number of *Steps* (4: 0, 0.25, 0.5, 0.75) as its *Output*. |
 | *value_text* | Shows the value linked into *Input* as text, numbers with up to three decimals. |
@@ -114,7 +114,7 @@ says so in its window.
 |---|---|
 | *AudioInputAnalysis* | Beat, tempo, energy and breaks from the music: [Audio](Audio.md). |
 | *ArtnetSender*, *ArtnetReceiver* | Single Art-Net channels out and in: [Art-Net](Output-and-Devices.md#art-net). |
-| *NDIReceiver*, *SpoutReceiver* | Video from other programs (Spout on Windows only): [Receiving video](Output-and-Devices.md#receiving-video). |
+| *NDIReceiver*, *SpoutReceiver* | Video from other programs (Spout on Windows, Syphon on macOS): [Receiving video](Output-and-Devices.md#receiving-video). |
 | *ProlinkBridge*, *ProlinkDecks* | Tempo, beat and waveforms of CDJs: [Prolink](Output-and-Devices.md#prolink-cdjs). |
 
 ## Generators › output

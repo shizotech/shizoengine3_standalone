@@ -23,7 +23,8 @@ sizes = [];            //the share of each area
 side_by_side = true;
 root = None;
 holder = None;         //the area that holds this split (singleview.adopt)
-grip_state = [index = -1, hovered = -1, before = None]; //before: the layout when the grip was pressed (undo, #350)
+grip_state = [index = -1, hovered = -1, before = None, began = false, evened = false, last_index = -1, last_press = 0]; //before: the layout when the line started to move (undo, #350)
+SPLIT_DOUBLE_CLICK_MS = 500; //two presses on the same grip within this time: its two areas share their room 50/50 (#346)
 laid_length = 0.0;     //px of the split the areas were last laid out for (relayout): a new length lays them out again
 
 def insert_pane(index);
@@ -38,6 +39,7 @@ def grips_in_place();
 def grip_half(pane, index, after);
 def show_grip_lines();
 def move_grip(index, at);
+def even_grip(index);
 
 //The part of entry() both splits share
 split_entry(generator, parent, horizontal, docs) {
@@ -289,8 +291,14 @@ shown_sizes(length) {
 	return out;
 }
 
-//Every frame a pane draws: lays the areas out again when the split got another length (window resized, sidebar)
+//Every frame a pane draws: lays the areas out again when the split got another length (window resized, sidebar).
+//The panes of a split that dissolved draw once more after its module was freed: its globals (root) are None then,
+//and root.height() logged "'height' is not a function" for each pane (singleview.dissolve)
 check_length() {
+	//A pane of a split that is gone (undo, a move or a close rebuild the split) can still draw once: its module has
+	//no root any more ("'height' is not a function, it is none", found with #344)
+	if(!root || panes.size() == 0)
+		return;
 	length = side_by_side ? root.width() : root.height();
 	if(math.abs(length - laid_length) > 0.5)
 		relayout();
@@ -370,12 +378,32 @@ grip_half(pane, index, after) {
 			return false;
 		if(nanogui.show_mode())
 			return true; //show mode (#285): the layout is locked while performing
+		now = std.millis(); //the time of this press, before anything slow
 		grip_state.index = down ? index : -1;
 		show_grip_lines();
 		//A drag of the line is one step of the undo history (generators.shio, #350)
 		env = std.global("engine").env;
-		if(down)
-			grip_state.before = env.layout_drag_begin ? env.layout_drag_begin() : None;
+		if(down) {
+			//A double click (the second press, #346): the two areas beside the line get the same room, a step of
+			//its own right away (the release can be dropped while this callback still runs). Until the release
+			//the line does not follow the mouse
+			double_click = grip_state.last_index == index && now - grip_state.last_press < SPLIT_DOUBLE_CLICK_MS;
+			grip_state.last_index = double_click ? -1 : index;
+			grip_state.last_press = now;
+			grip_state.evened = double_click;
+			grip_state.began = false;
+			grip_state.before = None;
+			//The layout is described for undo only once the line moves (the first drag event, or here): a plain
+			//click stays cheap. While a callback still runs, the next mouse event to it is dropped, and a slow first
+			//click lost the second press of a double click
+			if(double_click) {
+				grip_state.began = true;
+				before = env.layout_drag_begin ? env.layout_drag_begin() : None;
+				even_grip(index);
+				if(!std.is_none(before) && env.layout_drag_end)
+					env.layout_drag_end("Areas 50/50", before);
+			}
+		}
 		else if(!std.is_none(grip_state.before)) {
 			before = grip_state.before;
 			grip_state.before = None;
@@ -385,8 +413,14 @@ grip_half(pane, index, after) {
 		return true;
 	});
 	half.on_mouse_drag([pane, index](pos, rel, button, mods){
-		if(grip_state.index != index)
+		//After a double click the line stays in the middle: the mouse is still where the line was
+		if(grip_state.index != index || grip_state.evened)
 			return true;
+		if(!grip_state.began) {
+			grip_state.began = true;
+			env = std.global("engine").env;
+			grip_state.before = env.layout_drag_begin ? env.layout_drag_begin() : None;
+		}
 		//pos is in the pane: into the split, then the share
 		at = side_by_side ? (pos.x + pane.x()) / root.width() : (pos.y + pane.y()) / root.height();
 		move_grip(index, at);
@@ -427,6 +461,16 @@ move_grip(index, at) {
 	relayout();
 }
 
+//Grip "index" to the middle of its two areas: they share their room 50/50, the others keep theirs (a double click)
+even_grip(index) {
+	if(index < 0 || index + 1 >= sizes.size())
+		return;
+	start = 0.0;
+	for(i = 0; i < index; i++)
+		start += sizes[i];
+	move_grip(index, start + (sizes[index] + sizes[index + 1]) / 2.0);
+}
+
 // =========================================================================
 // Save / load
 // =========================================================================
@@ -434,11 +478,14 @@ move_grip(index, at) {
 //Called by the generator before this module goes (generator.free_module_content, #361): the managed globals of a
 //module are not always released with it, and everything they hold then stays alive
 on_free() {
-	//The widgets go with the window of the split; the areas are objects of their own and free what they hold
+	//The widgets go with the window of the split; the areas are objects of their own and free what they hold.
+	//root = None: a pane that still draws a frame does not lay the areas out any more (check_length)
+	root = None;
 	grips = [];
 	for(i = 0; i < panes.size(); i++)
 		std.free(panes[i].view);
 	panes = [];
+	root = None;
 }
 
 save_state() {

@@ -6,6 +6,31 @@ Working with shizoscript files `.shio` requires the shizoscript and shizoscript 
 Generators are specific shizoscript classes defined in the engine core code ( "engine/generators" ) tied to this program.
 There are generator entry loaders for different file extensions within "engine/generators/extensions" you can find relevant source code there only when necessary.
 
+## Where the shizoscript documentation lives (no source repo needed)
+
+shizoscript is a **custom language** (ShizoScript 3) — the app you are writing an asset for *is* its
+interpreter, and it prints its own reference. Run it in the app folder (`_shizoengine3/` in a checkout,
+the folder of `VibeVJ.exe` in a released build; `shz` on an installed system):
+
+```
+shz docs                    every namespace, object type, function, its parameters, its description,
+                            examples - and every module in shizotech/packages (nanogui, json, bitmap, …)
+shz docs nanogui            the same searched by keyword (a plain word, "nanogui.widget" finds nothing)
+shz mcpdocs                 the reference as an MCP server on http://localhost:13338:
+                            shizoscript_help, shizoscript_docs, shizoscript_search_keywords,
+                            shizoscript_syntax_checker, shizoscript_debugger
+shz --check assets/.../src/__init__.shio   check an asset script without running it
+shz -p "std.print(math.abs(-2));"       run one line of shizoscript to try something
+```
+
+The language guide written for AI agents is a file, not a website:
+`shizotech/system/miniagent/skills/shizoscript/SKILL.md`, with the deep dives
+(`nanogui.md`, `kernels.md`, `shizonet.md`, `video.md`) next to it in `docs/`.
+A command name is looked up in the current folder first, so `shz docs` reaches
+`shizotech/system/docs/__init__.shio` unless a folder of that name shadows it — then run
+`shz shizotech/system/docs`. Full resolution rules and the measurements:
+[`../AGENTS.MD`](../AGENTS.MD), section *ShizoScript 3*.
+
 ## Design Your Own UI (View Composition)
 
 - A core concept of this program: users **design their own UI** by dragging a view (e.g. a `clipview` or `generatorview`) and dropping it inside another view to build individual, reusable UI setups.

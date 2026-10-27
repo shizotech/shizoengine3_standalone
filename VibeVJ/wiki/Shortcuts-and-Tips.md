@@ -34,6 +34,7 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
 | Enter / Esc | A dialog that asks for a name | Enter confirms it, Esc cancels it. You can type at once, the field has the focus. |
 | Esc | The *Settings* or *Help* window | Closes the window. All values stay. |
 | Esc | A tooltip that is locked | Closes it. |
+| Esc | While you drag something (an asset, a view, generators, a clip) | Cancels the drag: nothing is dropped. |
 
 - To use E or Page Up / Page Down, first click inside the window, view or sidebar (not into a text field), then press
   the key. In a graph or a mapping editor, Page Up / Page Down change the grid of that editor instead.
@@ -87,7 +88,7 @@ Rest the mouse on a button or a control and its tooltip shows.
 | Gesture | Does |
 |---|---|
 | Rest on the thing for a second | A tooltip with links locks: its edge turns violet, and the mouse can move into it. A small bar shows the wait. |
-| Middle click | Locks the tooltip at once. |
+| Middle click | Locks the tooltip at once. Dragging with the middle button instead moves the view under it and locks nothing. |
 | Rest on a word shown as a link | Opens the tooltip of that word, on top. It can lock too, and so on. |
 | Click *More in the wiki (F1)* | Opens the wiki at the part the tooltip is about. |
 | F1 | The same, without locking the tooltip first. |
@@ -139,6 +140,7 @@ More in [Linking](Linking.md).
 | Drag a clip by its name tag | Moves it to another cell. |
 | Ctrl while dropping a clip | Copies it instead of moving it. |
 | Drag an asset onto a clip | Stacks it onto that clip as an effect. |
+| Delete (or Backspace) | Deletes the selected clip with its stack. Not while *Live* is on. |
 | Mouse wheel on the grid | Scrolls it. With Shift: makes the cells bigger or smaller. |
 | Drag an asset onto a CueList | A new list; onto a list: one more cue. |
 
@@ -150,17 +152,20 @@ More in [Clipview](Clipview.md) and [CueList](CueList.md).
 |---|---|
 | Mouse wheel on a Patchview or the *Loops* / *Patch* area of the timeline | Zooms in or out at the cursor. Away from you zooms in, as everywhere in VibeVJ. |
 | Ctrl + 0 / Ctrl + 1 | The Patchview the mouse was over last shows everything / goes to 100 %. See [Zoom and the grid of a Patchview](The-Screen.md#zoom-and-the-grid-of-a-patchview). |
-| Right mouse button drag there | Moves the view around. |
+| Right or middle mouse button drag there | Moves the view around. The middle button moves it also when you press it on a generator or a control. |
 | Double click a view tab | Renames the tab. |
 | Drag a view tab along the top bar | Moves the tab. |
 | Drag a view tab down out of the top bar, the header of an area, or a tab of a Tabview | Moves the view to the area you drop it on: an edge splits, the middle adds a tab. See [Moving a view](The-Screen.md#moving-a-view). |
 | Hold such a drag over another tab | That tab comes to the front, so you can drop into it. |
 | Alt + drag anywhere in an area | Moves its view, like a drag by the header. The key is a setting: [*Move areas with*](Settings.md#move-areas-with). |
 | Ctrl while dropping a view | Drops a copy; the view you dragged stays where it is. |
+| Esc while dragging | Cancels the drag: nothing is dropped where you let go. |
+| Double click the line between two areas | The two areas get the same size (50/50). Ctrl + Z takes it back. |
 | Right click in an area | Opens [the menu of the area](The-Screen.md#the-menu-of-an-area). Not on a button, a text field or a control: they keep their own right click. |
 | Click the header of a generator in a Patchview | Selects it. Ctrl or Shift + click adds one or takes it away. |
 | Drag on the empty canvas of a Patchview | A frame that selects every generator it touches. With Shift or Ctrl it adds to the selection. |
 | Alt + drag a generator in a Patchview | Takes it, with the others that are selected, to another Patchview or into an area. Ctrl while dropping leaves copies. See [Select and move generators](Generators.md#select-and-move-generators). |
+| Ctrl + C, Ctrl + V in a Patchview | Copies the selected generators and pastes them where the mouse is, with the links they have among themselves. See [Select and move generators](Generators.md#select-and-move-generators). |
 | Right click on a view tab of the top bar | *Rename…*, *Save layout as preset…*, *Delete tab…*. |
 | Double click a file in *Assets* | Opens it in a new tab. |
 

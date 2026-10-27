@@ -5,6 +5,18 @@ using eigen;
 
 #include "engine/patch/patch"
 
+//The items of the Function combobox of a channel: "Auto: Pan" (the guess for its name and type), then every function
+function_items(name, kind) {
+	guess = patch_guess_function(name, kind);
+	items = ["Auto: " + PATCH_FUNCTION_LABELS[patch_index_of(PATCH_FUNCTIONS, guess)]];
+	for(f = 0; f < PATCH_FUNCTION_LABELS.size(); f++)
+		items.push_back(PATCH_FUNCTION_LABELS[f]);
+	return items;
+}
+
+//The keys of a fixture file the editor writes itself; the others are kept as they are
+EDITOR_OWN_KEYS = ["type", "channels", "kind", "pan_range", "tilt_range", "beam_angle"];
+
 class fixture_item {
 	path = "";
 	managed area = None;
@@ -12,6 +24,11 @@ class fixture_item {
 	managed channels = [];
 	
 	managed total_byte_count = None;
+	managed pan_range = None;
+	managed tilt_range = None;
+	managed beam_angle = None;
+	managed kind_select = None;
+	loading = false; //no saves while the file is read in
 	
 	__init__(editor, parent, _path) {
 	
@@ -33,7 +50,35 @@ class fixture_item {
 		splitter.label("Total count:").anchor_left(0).fixed_width(100);
 		total_byte_count = splitter.intbox().anchor(0).anchor_left(100);
 
-		scroll_area = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(90).anchor_bottom(0).content().layout(nanogui.layout_vertical());
+		//How a moving head turns and how wide the beam is: the 3D view of the fixture setup (#655)
+		ranges = area.widget().anchor_left(0).anchor_right(0).anchor_top(90).fixed_height(30);
+		ranges.label("Pan °").anchor_left(0).fixed_width(44);
+		pan_range = ranges.floatbox().anchor_left(44).fixed_width(70).min_value(1).max_value(720).value(fixture_config.pan_range ?? 540);
+		pan_range.tooltip("How far the head pans from 0 to full (degrees), from the data sheet. Most moving heads: 540");
+		ranges.label("Tilt °").anchor_left(120).fixed_width(44);
+		tilt_range = ranges.floatbox().anchor_left(164).fixed_width(70).min_value(1).max_value(360).value(fixture_config.tilt_range ?? 270);
+		tilt_range.tooltip("How far the head tilts from 0 to full (degrees). Most moving heads: 270");
+		ranges.label("Beam °").anchor_left(240).fixed_width(50);
+		beam_angle = ranges.floatbox().anchor_left(290).fixed_width(70).min_value(0).max_value(180).value(fixture_config.beam_angle ?? 0);
+		beam_angle.tooltip("Opening of the beam in degrees, for the 3D view. 0: 15 for moving heads, 30 for other lamps");
+		pan_range.value_callback([this](v) { this.save(); });
+		tilt_range.value_callback([this](v) { this.save(); });
+		beam_angle.value_callback([this](v) { this.save(); });
+
+		//What the lamp is: how the plan and the 3D view draw it (#669). Automatic: from the channels
+		kind_row = area.widget().anchor_left(0).anchor_right(0).anchor_top(120).fixed_height(30);
+		kind_row.label("Kind").anchor_left(0).fixed_width(44);
+		kind_items = ["Automatic"];
+		for(k = 0; k < PATCH_KIND_LABELS.size(); k++)
+			kind_items.push_back(PATCH_KIND_LABELS[k]);
+		kind_index = 0;
+		if(fixture_config.has("kind") && PATCH_KINDS.has_value(fixture_config.kind))
+			kind_index = patch_index_of(PATCH_KINDS, fixture_config.kind) + 1;
+		kind_select = kind_row.combobox().items(kind_items).selected(kind_index).anchor_left(44).fixed_width(150);
+		kind_select.tooltip("What the lamp is, for the plan and the 3D view of the fixture setup: a moving head on its yoke, a bar from its first pixel to its last, a round par, a square dimmer. Automatic: pan or tilt make a head, two or more colours a bar, one a par");
+		kind_select.on_change([this](index, text) { this.save(); });
+
+		scroll_area = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(150).anchor_bottom(0).content().layout(nanogui.layout_vertical());
 	
 		fixture_name.on_change([this, fixture_name, editor](txt) {
 			//Construct path on the fly based on name
@@ -59,16 +104,17 @@ class fixture_item {
 		});
 		
 		if(fixture_config.channels) {
-			for(i = 0; i < fixture_config.channels.size(); i++) {
-				chan_config = fixture_config.channels[i];
-				chan = create_channel(chan_config.name);
-				chan.type_select.selected(chan_config.type_id);
-				chan.channel_count.value(chan_config.batch_count);
-			}
+			//(the file is not written while it is read in: each channel complete, then nothing changed)
+			loading = true;
+			for(i = 0; i < fixture_config.channels.size(); i++)
+				create_channel(fixture_config.channels[i].name, fixture_config.channels[i]);
+			loading = false;
+			calculate_total_size();
 		}
 	}
 	
-	create_channel(name = "") {
+	//config: a channel of the file (type_id, batch_count, function)
+	create_channel(name = "", config = None) {
 		if(!name)
 			name = "New channel";
 		
@@ -76,17 +122,58 @@ class fixture_item {
 			
 		type_select = cnt.combobox().tooltip("The type of this channel: 8-bit, 16-bit, RGB or RGBW\n[[wiki:Output-and-Devices#make-a-fixture-file]]").fixed_width(100);
 		type_select.items(["8-bit","16-bit","RGB","RGBW"]);
-		type_select.on_change([this](index,txt){
-			this.save();
-		});
-		
+		if(config && config.has("type_id"))
+			type_select.selected(config.type_id);
 		channel_count = cnt.intbox().tooltip("How many times this channel repeats, for example 8 for the 8 pixels of a bar").anchor_left(100).fixed_width(50).min_value(1).max_value(999999).value(1);
+		if(config && config.has("batch_count"))
+			channel_count.value(config.batch_count);
 		channel_count.value_callback([this](v){
 			this.save();
 		});
 		
-		channel_name = cnt.textbox(name).tooltip("The name of the channel").anchor_left(150).anchor_right(25);
-		channel_name.on_change([this](txt){
+		channel_name = cnt.textbox(name).tooltip("The name of the channel").anchor_left(150).anchor_right(235);
+		//The value it starts at (#669): a DMX value, kept as 0..1 in the file ("default"); RGB / RGBW keep theirs (a list)
+		default = config && config.has("default") ? config.default : 0.0;
+		default_box = cnt.intbox().anchor_right(175).fixed_width(60).min_value(0).max_value(65535).value(0);
+		default_box.tooltip("The DMX value this channel starts at when a lamp is added (0-255, 16-bit 0-65535): a shutter that is closed at 0 opens, pan and tilt in the middle. A GDTF import sets it.\n[[wiki:Output-and-Devices#make-a-fixture-file]]");
+		dmx_max = [type_select](){ return type_select.selected_text() == "16-bit" ? 65535 : 255; };
+		show_default = [default_box, type_select, dmx_max](d){
+			plain = type_select.selected_text() == "8-bit" || type_select.selected_text() == "16-bit";
+			default_box.editable(plain);
+			default_box.value(plain && !std.is_list(d) ? math.round(std.float(d) * dmx_max()) : 0);
+		};
+		show_default(default);
+		//What the channel does (#655): Auto guesses it from the name ("PT Speed" a speed, "Dimmer" a dimmer)
+		function_select = cnt.combobox().tooltip("What this channel does: the Phaser offers effects that fit (a circle for Pan and Tilt, a fade for a colour), the 3D view turns the beam by Pan and Tilt. Auto: guessed from the name").anchor_right(25).fixed_width(150);
+		function_select.items(function_items(name, type_select.selected_text()));
+		if(config && config.has("function") && PATCH_FUNCTIONS.has_value(config.function))
+			function_select.selected(patch_index_of(PATCH_FUNCTIONS, config.function) + 1);
+		function_select.on_change([this](index, txt) {
+			this.save();
+		});
+		//the guess of Auto follows the name and the type
+		refresh_guess = [function_select, channel_name, type_select]() {
+			sel = function_select.selected();
+			function_select.items(function_items(channel_name.value(), type_select.selected_text())).selected(sel);
+		};
+		channel_name.on_change([this, refresh_guess](txt){
+			refresh_guess();
+			this.save();
+		});
+		type_select.on_change([this, refresh_guess, show_default, cnt](index, txt){
+			refresh_guess();
+			//the same value in the new range (8-bit 255 = 16-bit 65535)
+			for(i = 0; i < this.channels.size(); i++) {
+				if(this.channels[i].cnt == cnt)
+					show_default(this.channels[i].default);
+			}
+			this.save();
+		});
+		default_box.value_callback([this, cnt, dmx_max](v){
+			for(i = 0; i < this.channels.size(); i++) {
+				if(this.channels[i].cnt == cnt)
+					this.channels[i].default = math.clamp(v / std.float(dmx_max()), 0.0, 1.0);
+			}
 			this.save();
 		});
 		
@@ -109,6 +196,8 @@ class fixture_item {
 			type_select = type_select,
 			channel_name = channel_name,
 			channel_count = channel_count,
+			function_select = function_select,
+			default = default,
 		]);
 		
 		this.save();
@@ -117,6 +206,8 @@ class fixture_item {
 	}
 	
 	save() {
+		if(loading)
+			return;
 		
 		managed _grd = std.critical_section();
 		
@@ -132,19 +223,58 @@ class fixture_item {
 			else if(type_text == "RGBW")
 				type_size = 4;
 			
-			channel_json.push_back([
+			chan = [
 				name=channels[i].channel_name.value(),
 				type=type_text,
 				type_id = channels[i].type_select.selected(),
 				batch_count = channels[i].channel_count.value(),
 				byte_count = type_size,
-			]);
+			];
+			func = channels[i].function_select.selected();
+			if(func > 0)
+				chan.function = PATCH_FUNCTIONS[func - 1];
+			//the value it starts at: only when it is not 0; a list (RGB / RGBW of a GDTF import) only for a colour
+			d = channels[i].default;
+			plain = type_text == "8-bit" || type_text == "16-bit";
+			if(std.is_list(d) && !plain)
+				chan.default = d;
+			else if(!std.is_list(d) && plain && std.float(d) > 0.0)
+				chan.default = math.round(std.float(d) * 100000.0) / 100000.0;
+			channel_json.push_back(chan);
 		}
 		
-		fileio.write_json(path, [
+		data = [
 			type = "fixture",
 			channels = channel_json,
-		]);
+		];
+		if(kind_select && kind_select.selected() > 0)
+			data.kind = PATCH_KINDS[kind_select.selected() - 1];
+		//What the editor has no field for stays in the file (#669: where a GDTF import came from, the length of a bar)
+		old = None;
+		try {
+			old = fileio.exists(path) ? fileio.read_json(path) : None;
+		}
+		catch(e) {
+			old = None;
+		}
+		if(old && std.type(old) == "json" && !std.is_list(old)) {
+			for(k, v : old) {
+				if(!EDITOR_OWN_KEYS.has_value(k))
+					data[k] = v;
+			}
+		}
+
+		//only what differs from what most lamps do, so the files stay as they were
+		if(pan_range.value() != 540)
+			data.pan_range = pan_range.value();
+		if(tilt_range.value() != 270)
+			data.tilt_range = tilt_range.value();
+		if(beam_angle.value() > 0)
+			data.beam_angle = beam_angle.value();
+		//A virtual type (a projection zone) stays virtual: the editor has no switch for it
+		if(patch_type(path).virtual)
+			data.virtual = true;
+		fileio.write_json(path, data);
 		
 		calculate_total_size();
 

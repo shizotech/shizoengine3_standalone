@@ -11,7 +11,7 @@
 //To change the format: raise PROJECT_FORMAT, add a step migrate_<n>_to_<n+1>(file, data) and call it from
 //migrate_step() below. A step changes the JSON in place.
 
-PROJECT_FORMAT = 3;
+PROJECT_FORMAT = 5;
 
 //The files of a project that are migrated (projects/<name>/<file>.json). The load hooks add theirs
 //(generators, timeline_generators, ...); these are the ones the engine reads itself.
@@ -145,11 +145,175 @@ migrate_2_to_3(file, data) {
 		migrate_phasers(data);
 }
 
+// =========================================================================
+// 3 -> 4: the Absolute clip input counts from 1 (#374)
+// =========================================================================
+
+//The inputs of a Clipview clip are saved as two controls of its node:
+//  "input_settings.shader_input@Inputs.<input>"        which layer feeds the input
+//  "input_settings.shader_input@Inputs.<input>_type"   0 = Relative, 1 = Absolute
+//Relative is a row offset and stays as it is. Absolute used to be the 0-based row index, and 0 meant
+//"off" for both types, so Layer 1 was out of reach (Absolute 1 picked Layer 2). Absolute is now the
+//layer number, 1-based: 1 = Layer 1, 0 = off. Every saved Absolute value from 1 up gets +1, so its
+//link lands on the same layer as before; 0 = off stays off and a negative value (no layer at all)
+//stays as it is.
+//Those numbers are saved in controls.json (the control tree of the project, one entry per control)
+//and in the node of a saved generator, clip, stack entry and preset, so the walk runs over the whole
+//JSON of every file. Every other "<name>_type" control (a shader uniform such as mix_type, the
+//monitor_type of a control monitor, and the #Trigger / #max attributes of a control) is left alone.
+CLIP_INPUT_PREFIX = "input_settings.shader_input@Inputs.";
+
+migrate_clip_inputs(node) {
+	if(std.type(node) != "json")
+		return;
+	
+	for(k, v : node) {
+		name = std.string(k);
+		if(!name.ends("_type") || !name.starts(CLIP_INPUT_PREFIX))
+			continue;
+		if(std.type(v) != "json" || !v.has("value") || std.int(v.value) != 1)
+			continue;
+		base = name.removesuffix("_type");
+		if(!node.has(base))
+			continue;
+		item = node[base];
+		if(std.type(item) != "json" || !item.has("value"))
+			continue;
+		val = item.value;
+		if(std.type(val) != "int" && std.type(val) != "float")
+			continue;
+		if(val >= 1)
+			item.value = val + 1;
+	}
+	
+	for(i = 0; i < node.size(); i++) {
+		child = node[i];
+		if(std.type(child) == "json")
+			migrate_clip_inputs(child);
+	}
+}
+
+migrate_3_to_4(file, data) {
+	if(std.type(data) != "json")
+		return;
+	migrate_clip_inputs(data);
+}
+
+// =========================================================================
+// 4 -> 5: the Transition of a Cue List is a mirror of its layer's (2026-10-24)
+// =========================================================================
+
+//A Cue List (assets/Views/CueList.asset) shows the Transition of each Clipview layer, "layer_ctrls_<r>@TRANSITION"
+//(seconds, 0..60, a curve as envelope), as its own slider "cue_trans_<r>@Transition". That slider was 0..1 without a
+//curve, linked both ways normalized: it saved the fraction of the seconds (2 s: 0.033), and on a load it sent that
+//fraction back into the layer, whose curve took it as a handle position (2 s came back as 0.065 s). It is now a
+//mirror: the same seconds, range (#min / #max) and curve, linked absolute both ways. So the cue slider gets what the
+//layer saved, and the two links between them become absolute (type 0). A MIDI mapping, a sync, a name of the cue
+//slider and every other link stay. Without the layer's control in the same node nothing changes.
+CUE_TRANS_PREFIX = "cue_trans_";
+CUE_TRANS_SUFFIX = "@Transition";
+
+//The row of "cue_trans_<r>@Transition", or "" for any other name
+cue_trans_row(name) {
+	if(!name.starts(CUE_TRANS_PREFIX) || !name.ends(CUE_TRANS_SUFFIX) || name.contains("#"))
+		return "";
+	row = name.removeprefix(CUE_TRANS_PREFIX).removesuffix(CUE_TRANS_SUFFIX);
+	if(row.size() == 0)
+		return "";
+	for(c : row) {
+		if(!"0123456789".contains(c))
+			return "";
+	}
+	return row;
+}
+
+cue_layer_trans_name(row) {
+	return "layer_ctrls_" + row + "@TRANSITION";
+}
+
+//A link between the cue's Transition and the layer's of the same row (the paths of the levels above have the same
+//prefix on both sides)
+is_cue_trans_link(a, b) {
+	for(side = 0; side < 2; side++) {
+		cue = side == 0 ? a : b;
+		other = side == 0 ? b : a;
+		parts = cue.split("/");
+		row = cue_trans_row(parts[-1]);
+		if(row != "" && other == cue.removesuffix(parts[-1]) + cue_layer_trans_name(row))
+			return true;
+	}
+	return false;
+}
+
+migrate_cue_transitions(node) {
+	if(std.type(node) != "json")
+		return;
+
+	if(node.has("controls") && std.type(node.controls) == "json") {
+		ctrls = node.controls;
+		for(k, v : ctrls) {
+			name = std.string(k);
+			row = cue_trans_row(name);
+			if(row == "" || std.type(v) != "json")
+				continue;
+			layer_name = cue_layer_trans_name(row);
+			if(!ctrls.has(layer_name) || std.type(ctrls[layer_name]) != "json")
+				continue;
+			layer = ctrls[layer_name];
+			if(layer.has("value"))
+				v.value = layer.value;
+			if(layer.has("envelope")) {
+				v.envelope = layer.envelope.copy();
+				if(layer.has("envelope_pos"))
+					v.envelope_pos = layer.envelope_pos;
+			}
+			if(node.has("attributes") && std.type(node.attributes) == "json") {
+				attrs = node.attributes;
+				for(suffix : ["#min", "#max"]) {
+					if(attrs.has(layer_name + suffix) && std.type(attrs[layer_name + suffix]) == "json" && attrs[layer_name + suffix].has("value"))
+						attrs[name + suffix] = [value = attrs[layer_name + suffix].value];
+				}
+			}
+		}
+	}
+
+	if(node.has("links") && std.type(node.links) == "json") {
+		for(kind : ["local", "global"]) {
+			if(!node.links.has(kind) || std.type(node.links[kind]) != "json")
+				continue;
+			list = node.links[kind];
+			for(i = 0; i < list.size(); i++) {
+				entry = list[i];
+				if(std.type(entry) != "json" || !entry.has("ctrl1") || !entry.has("ctrl2"))
+					continue;
+				if(is_cue_trans_link(std.string(entry.ctrl1), std.string(entry.ctrl2)))
+					entry.type = 0;
+			}
+		}
+	}
+
+	for(i = 0; i < node.size(); i++) {
+		child = node[i];
+		if(std.type(child) == "json")
+			migrate_cue_transitions(child);
+	}
+}
+
+migrate_4_to_5(file, data) {
+	if(std.type(data) != "json")
+		return;
+	migrate_cue_transitions(data);
+}
+
 migrate_step(from, file, data) {
 	if(from == 1)
 		migrate_1_to_2(file, data);
 	if(from == 2)
 		migrate_2_to_3(file, data);
+	if(from == 3)
+		migrate_3_to_4(file, data);
+	if(from == 4)
+		migrate_4_to_5(file, data);
 }
 
 // =========================================================================
@@ -174,6 +338,13 @@ migrate_preset(preset, asset_path) {
 		for(f = from; f < PROJECT_FORMAT; f++)
 			migrate_step(f, "preset", item);
 		preset.state.data = item.data;
+	}
+	//The node of a preset is the control tree of the asset and of everything inside it: that is where a
+	//Clipview keeps its clip inputs (Absolute layer numbers, #374). The steps above work on the state, so
+	//the input step runs over the node as well.
+	if(from < PROJECT_FORMAT && preset.has("node") && std.type(preset.node) == "json") {
+		for(f = from; f < PROJECT_FORMAT; f++)
+			migrate_step(f, "preset_node", preset.node);
 	}
 	preset.format = PROJECT_FORMAT;
 	return true;

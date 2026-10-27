@@ -1,3 +1,5 @@
+<!-- generated from shizoscript_language_doc.md by post_compile.shio on 2026-10-27 - do not edit: edit the source and re-run post_compile.shio -->
+
 # ShizoScript Code Generation
 
 You are a code generator for **ShizoScript**, a dynamically-typed scripting language.
@@ -330,7 +332,7 @@ json_value = std.json("..."); //A valid JSON string
 WRONG:
 - Do NOT assume that every type has standard conversion functions like `type.int()` or `type.string()`
 - Only SOME types (like JSON variables) have builtin `string()` and `compact_string()` functions (check the docs!)
-- `fileio.write_json(path, data)` writes pretty-printed JSON; `fileio.write_json(path, data, true)` writes it compact (no indentation, no line breaks) (#96)
+- `fileio.write_json(path, data)` writes pretty-printed JSON; `fileio.write_json(path, data, true)` writes it compact (no indentation, no line breaks) (#96); the 4th parameter `atomic` (default false) writes to `<path>.tmp` and renames it onto the target, so a crash during the write cannot leave a half-written file (#96 point 3); the 5th parameter `backup` (default false) keeps the content the write replaces as `<path>.bak`, so a bad save cannot destroy the last good file; the `.bak` counts against a container's size limit (#96)
 
 ---
 
@@ -511,7 +513,7 @@ up = s.uppercase;
 up();            // "ABC" (the bound method keeps its object)
 ```
 
-- Builtin functions and bound methods ARE accepted as callbacks (e.g. `list.foreach(std.print)`, `list.map(std.string)`). A bound method callback runs on the object it is bound to and gets no arguments; a namespace builtin receives as many arguments as it can take (the value, or key and value when it takes two). Wrap it in a lambda when you need a fixed signature. The same holds for the callbacks of modules (`button.on_click(std.print)`, `net.on_connect(devices.push)`).
+- Builtin functions and bound methods ARE accepted as callbacks (e.g. `list.foreach(std.print)`, `list.map(std.string)`). A bound method callback runs on the object it is bound to; like a namespace builtin it receives as many arguments as it can take (none, the value, or key and value when it takes two: `[a = 1].foreach(obj.method)`). Wrap it in a lambda when you need a fixed signature. The same holds for the callbacks of modules (`button.on_click(std.print)`, `net.on_connect(devices.push)`).
 - Callbacks of `foreach`, `map`, `filter`, `any` and `all` get `(key, value)`, or the value only when they take one parameter (`list.map([](x) { return x * 2; })`). `reduce` callbacks get `(acc, key, value)` or `(acc, value)`.
 - `noexcept` functions and methods: a runtime error inside them does not propagate, the function returns `None` and the caller continues.
 
@@ -521,6 +523,24 @@ safe();          // None
 ```
 
 - Recursion depth is limited (100000 nested calls on hosts, 512 on microcontrollers). Exceeding it raises the runtime error `maximum call depth of N exceeded (endless recursion?)`, which `try`/`catch` can handle.
+
+### 8.1 Default values and named arguments
+
+```
+f(a, b = 5, c = 6) { return a * 100 + b * 10 + c; }
+
+f(1);                  // 156   b and c use their defaults
+f(1, 2);               // 126
+f(1, 2, 3);            // 123
+f(1, c = 10);          // 160   c is 10, b keeps its default 5
+f(1, c = 10, b = 20);  // 310   every named argument goes to the parameter it names
+```
+
+- A named argument is bound to **the parameter it names**, never to "the next free position". A parameter that no argument covers keeps its default value, so the order the names are written in does not matter (#579).
+- Name binding needs the parameter list at compile time: it applies to a **script function of the unit called by its plain name** (same file, or an `#include`d file; a forward declaration that carries no parameter names is a positional call).
+- Everything whose parameters are not compile-time visible stays **positional**: methods (`obj.m(...)`, bare `m(...)`, `super.m(...)`), a function stored in a variable, lambdas, constructors (`Vec2(1, 2)`) and builtin/module functions (`std.print(...)`). There, `c = 10` written in an argument is the ordinary caller-scope assignment `c = 10` and its value is passed by position - exactly what it always was.
+- A call of a known function is checked while compiling: naming a parameter that does not exist (`There is no parameter 'z' of 'f'.`, with a `did you mean` hint), giving one argument twice, putting a positional argument after a named one, and leaving a parameter that has no default uncovered are all errors, never silent position shifts.
+- In code with `#strict` the **same** slot binding drives the type checks: the declared type of a parameter is checked against the argument that fills its slot, so `f(1, c = 10)` checks `10` against `c` and not against the skipped `b` (#582). Where the call stays positional (methods, function values, lambdas, constructors, builtins) the type checks stay positional too.
 
 ---
 
@@ -674,8 +694,11 @@ Checklist:
 - `{}` becomes `[]`
 - Keys do not need to be escaped with quotes ("") but they are still treated like key-strings internally and do NOT refer to local variables.
 - A key separator can be `=` or `:` in any element: `[a: 1, b = 2]` is the same map. A `:` that closes a ternary `?` is never a key separator, so `[1 ? 2 : 3, 4]` is a list of two values.
+- One trailing `,` is allowed: `[1, 2,]` is a list of two. An empty element in front of a `,` is a syntax error (`[1,,2]`, `[,1]`), and so is a key without a value (`[a = ]`, `[a = , 1]`) (#34, `_testing/list_literal_entries.shio`).
 - Shizoscript JSONS do not differentiate between objects and lists syntactically. 
 - However, when converted to a string (or constructed from a string) it produces and accepts the official JSON syntax to keep compatibility.
+- **Keys named like a JSON method**: the names the JSON type itself registers are `push`, `push_back`, `pop`, `pop_back`, `insert`, `size`, `clear`, `clear_free`, `key`, `has`, `has_value`, `has_value_str`, `geti`, `hasi`, `erase`, `remove`, `erase_value`, `remove_value`, `remove_all_keys`, `copy`, `sort`, `sort_reverse`, `rsort`, `sort_by`, `string`, `compact_string`, `combine_string`, `from_string`, `filter_key`, `filter_value`, `filter`, `merge`, `append`, `map`, `reduce`, `any`, `all`, `foreach`, `to_list`, `resize`, `unique`, `push_cyclic`, `debug_refs` (43 in total, from `shz_std_json::script_register()`). Writing such a name is a data write, so `[size = 1]`, `obj.size = 5` and `obj["size"] = 5` all create the key (#569).
+- READING `obj.size` resolves to the METHOD, also when the JSON carries a key of exactly that name; the value behind that key is only readable as `obj["size"]` (that precedence is fixed; do not rely on the dot form for such keys). Since #569 a dot read of a name that is a method **and** a key of that JSON prints a one-line runtime warning, once per method name and process: `Runtime Warning: the json key "key" is hidden by the built-in json method of that name: obj.key is the method, use obj["key"] to read the value`. A call (`obj.size()`, `obj.key(0)`) asks for the method and does not warn. The warning changes nothing - it only makes the trap visible. Names that are **not** JSON members (`keys`, `length`, `name`, `type`, `find`, `data`, ...) are ordinary keys and read their value. `key` is additionally reserved inside a `foreach`/`map` callback, where it names the loop key.
 
 ---
 
@@ -700,6 +723,7 @@ import curl, zip;   // several at once
 ```
 #define MAX 100
 #include "helper"   // .shio is appended automatically
+#pragma once        // lex this file once per compilation unit
 def later(x);       // forward declaration of a function defined further down
 ```
 
@@ -708,6 +732,8 @@ def later(x);       // forward declaration of a function defined further down
 
 - A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.
 - A file reached through different relative paths is included only once.
+- `#pragma once` marks the file as lexed-once: the file is lexed one time per compilation unit (one load of a script with the files it `#include`s, one per `std.module`), every later inclusion of it produces no tokens. The file is identified by its **resolved absolute path** - separators, `.` / `..` and, where the filesystem normalizes paths, the case are resolved, so `"helper"`, `"./helper"` and `"../dir/helper.shio"` are one file, the same rule as the bullet above. The directive is valid at every position of a file (also inside a block) and is removed before parsing. In a source without a path (a module loaded from a string, the prompt) it is accepted and does nothing. (#195)
+- Every other `#pragma <name>` is a syntax error that names it: `*** Unknown #pragma 'msgoff'. Only '#pragma once' exists.`; a `#pragma` with no name reports `*** #pragma needs a name: '#pragma once'.`. The preprocessor knows `#define`, `#include`, `#strict` and `#pragma once` only. (#195)
 
 ---
 
@@ -818,7 +844,93 @@ Rules:
 - An error in the predicate of `wait_for()` ends the wait with false.
 - A task that waits without a timeout keeps the script alive, like `std.sleep(-1)`.
 - Native modules can wake waiting tasks from their own threads (`shz_std_sync.h`, example
-  `shzmodule_base/sync_example.cpp`: `base.signal_later(obj, delay_ms, value)`).
+  `modules/shzmodule_base/sync_example.cpp`: `base.signal_later(obj, delay_ms, value)`).
+
+### 16.1 The script lock (what runs atomically)
+
+A script runs one task at a time. The host runs it under one lock per script, the **script lock**
+(`std::recursive_mutex m_script_mutex` of `shzscript`, taken with `SCRIPTAUTOLOCK()` at the start of
+`shzscript::update()`, `core/shizoscript3_core/shz_script.cpp`): tasks, timers, callbacks and every host thread
+that calls into the script are serialised by it.
+
+- **Everything between two points where the lock is given up is atomic**: no other task of the script and no
+  other thread runs script code in between. Variables, json, lists, strings, class members, `static` and the
+  variables of the global scope need no lock of their own, and statements that follow each other without a
+  blocking call are one step: in `c = t.count; t.count = c + 1;` nothing of this script runs between the two
+  statements.
+- The lock is given up here, and only here:
+  - the task waits: `std.sleep()`, `join()`, `ev.wait()`, `sem.acquire()`, `cv.wait()`, `r.get()`, a
+    `std.critical_section` another task holds (a waiting task holds no script lock, as above);
+  - the task calls a builtin that works on a worker thread (`ctx.return_thread` / `SCRIPTAUTOUNLOCK()`): every
+    `fileio` call that touches the disk (`exists`, `read_text`, `write_json`, `files`, `glob`, `grep`, `hash`,
+    `copy`, ...), the `regex_*` methods of strings, `std.system`, `std.input`, `std.web_get`, `std.import`,
+    `k.launch(n, ...)`, `job.wait()`, and the blocking calls of the modules (`curl`, `mqtt`, `leveldb`,
+    `python`, `tgbot`, ...). Path helpers (`fileio.file_dir`, `file_name`) and plain builtins keep the lock;
+    kernel lanes run no script code at all (see Kernels).
+  - the host leaves the script (the end of the `update()` that ran the task).
+- **Nothing else yields.** There is no time slice and no instruction limit: a task that computes without a
+  blocking call keeps the lock, so no other task of the script and no other thread that needs this script runs
+  until it ends. The yield is `std.sleep(0);` - the task suspends, the other tasks continue, and the lock is free
+  when the host leaves the script. In a long loop call it per item, or every few items.
+- **The lock is no queue.** The thread that takes it first has it, and a task that comes back from a blocking
+  call has to take it again: it can wait an unbounded amount of host work. A task sharing its script with a busy
+  thread pays for every blocking call with the time the other thread holds the lock, so few big calls (read a
+  whole file, one `fileio.grep` over a tree, one regex over the whole text) beat many small ones by orders of
+  magnitude (#94).
+- **A finished job is picked up in the same frame.** The result of a blocking call is posted from the worker
+  thread into a lock free queue, and `update()` drains that queue as soon as a result lands and runs what the
+  resume schedules, so a task that chains many small blocking calls is resumed where it left off and not one
+  frame later (#94). The pump gives the lock up while it waits and spends at most 8 ms per `update()`, so a
+  render loop keeps its frames. It changes no ordering and no fairness: the point above stands, and the tasks
+  that were already runnable are still run in the order of the scheduler.
+- **One lock per script, not per application.** Two scripts of an application (each with its own variables, like
+  a script per purpose in an engine) can run on two threads at the same time with nothing between them.
+  `std.module()` loads into the current script (its own program, its own main task) and shares its lock.
+
+### 16.2 Check-then-act across a blocking call
+
+A check and the act that follows are one step only when no blocking call lies between them. At a blocking call
+the lock is free, and a task that runs in between changes the world the check was about:
+
+```
+if (!fileio.exists(path))           // exists() gives the lock up while it asks the disk
+    fileio.write_text(path, data);  // a task that ran in between may have created the file
+```
+
+Same shape: a `std.global` counter read before a `curl` request and written back after it, `fileio.hash()` of
+two files and the `fileio.copy()` that follows.
+
+`std.critical_section` closes the gap. The section belongs to the task, the task keeps it across a blocking call,
+and the other tasks that reach the same section are suspended until it comes back, in the order they arrived:
+
+```
+c = std.critical_section("save");   // one section per name, for every script of the application
+if (!fileio.exists(path))
+    fileio.write_text(path, data);  // now nothing of this script is between the check and the write
+```
+
+- `std.critical_section()` without a name is the section of the code that creates it: every task that runs
+  through that function shares it, the same call in another function is another section.
+- `std.critical_section("name")` (a `std.critical_section_named`) is one section for every place that uses that
+  name, in every script of the application. That is the lock for state that is not part of one script:
+  `std.global("name")` is one variable for every script of the application, so scripts that run at the same time
+  share it and need the section around a read, modify, write:
+
+```
+n = std.global("counter");
+c = std.critical_section("counter");    // every script that touches the counter uses this name
+n.set(n.get() + 1);
+```
+
+- Every script runs on a thread of its own. When a script releases a named section that a task of another script
+  waits for, that task continues in the next update of its own script, on its own thread (#54: before, it was
+  never resumed). The registries of both kinds of section are locked, so scripts on several threads can use them.
+- Sections protect script code only: the job of a module thread on a worker does not take them, and nothing in
+  the language protects state between two applications (for a file: the `atomic` parameter of
+  `fileio.write_json`, #96).
+- Everything else stays as above: re-entrant per task, released when the variable goes out of scope, is
+  reassigned, or by `c.release()` (`c.is_holding()` = this object still holds a level), and `cv.wait(c)` is the
+  only waiting call that gives it up.
 
 ---
 
@@ -1105,7 +1217,13 @@ blur.launch([width, height], src, dst);      // 2D domain: gid_x, gid_y
 - JIT: if a C compiler is installed (`SHZ_KERNEL_CC`, else `cc` / `gcc` / `clang`, on Windows `cl` / `clang` /
   `gcc`), the first launch of a kernel compiles it to native code in the background, later launches run that
   (3-4x faster than the VM, same results and errors). The libraries are cached (`SHZ_KERNEL_CACHE`, else
-  `~/.cache/shizoscript/kernels`). `std.kernel_jit("auto" | "sync" | "off")` (also `SHZ_KERNEL_JIT`):
+  `~/.cache/shizoscript/kernels`), one library `k_<hash>` per kernel; the files of a compile live in
+  the `tmp` subdirectory of the cache and the leftovers of compiles whose process died are swept by
+  the next process, so the cache stays clean and bounded (`SHZ_KERNEL_CACHE_MAX`). The library name
+  hashes the generated C plus the compiler and its flags; the ahead of time hash of a kernel covers
+  only the generated C and the JIT version, so a library built with `std.kernel_aot_source()` on one
+  machine is used on every machine that runs the same interpreter.
+  `std.kernel_jit("auto" | "sync" | "off")` (also `SHZ_KERNEL_JIT`):
   background compile, compile and wait, VM only. `std.kernel_jit_compiler()`, `k.jit_status()`,
   `k.jit_source()` (the generated C). Without a compiler kernels run on the VM, or on native code compiled ahead
   of time: `std.kernel_aot_source(kernels...)` writes it as one C file, built as a shared library
@@ -1261,8 +1379,10 @@ Before using a lambda:
 
 ```
 shz file_name
-shz --check file_name    // syntax check only (includes the strict mode checks)
+shz --check file_name    // syntax check only (includes the strict mode checks), a directory checks every script in it
+shz --check --format=gcc file_name   // the same, one line per diagnostic: file:line:col: error: message
 shz --strict file_name   // strict mode for every file, as if each started with #strict
+shz --test [dir...]      // run the self-checking scripts of a directory, each in its own process, with a summary
 shz --watch file_name    // run it, start it again when it or a file it #includes changes
 shz -i                   // the prompt: one input at a time (also "shz" alone on a terminal without a script)
 ```
@@ -1278,6 +1398,43 @@ shz -i                   // the prompt: one input at a time (also "shz" alone on
   Ctrl+C drops the input, Ctrl+D ends (Windows: Ctrl+Z, Enter). An input that does not compile changes nothing.
   Timers and threads of earlier inputs only go on while an input runs. Piped input (`shz -i < file`) exits with `1`
   when an input failed.
+
+- `--check` takes a directory too: every `.shio` inside it is checked, a whole project. With `--check`,
+  `--format=gcc` (`-format=gcc`) prints every diagnostic as ONE line `file:line:col: error: message` - no
+  wrapping, no colour - for the readers of an editor: the VS Code extension in `tools/vscode-shizoscript`
+  contributes the problem matcher `$shizoscript-gcc` and the task type `shizoscript-check`. A source without a
+  diagnostic answers `OK <n> file(s)`, the exit code is `1` when a file did not compile. `--format=gcc`
+  without `--check` is a usage error (one line, exit `2`); `--format=text` keeps the multi-line report.
+
+- `--test` (`-test`) runs the test suite natively: the rules of `_testing/run_tests.sh`, on every
+  platform and without bash. A test is a `*.shio` whose source contains `PASSED` or the
+  `// Expect-Exit:` directive. Discovery is the list of `run_tests.sh` and not a blind recurse: the
+  directory given and its `nanogui/` subdirectory (`_testing` by default, the current directory when
+  that is not there) - the scratch, bench and screenshot directories of `_testing/` stay out
+  (MAP.md §7); `--recursive` walks the tree instead, skipping the directories below a name starting
+  with `.` or `_` and `node_modules`. Every test runs in its own process of the same executable, from
+  the directory it was found in and named relative to it, with a time limit of 180 seconds
+  (`--timeout <seconds>`). The flags of its header line `// Run: <exe> <flags> _testing/<name>.shio`
+  are passed before the script path - that is how `sleep_forever.shio` gets its `--testrun 1` and how
+  the `; echo $?` of `exit_code_error.shio` is ignored. `--filter <text>` keeps the tests whose name
+  contains `<text>`, `--verbose` prints the output of every test.
+  A test passes when it exits with the expected code - `0`, or the value of its
+  `// Expect-Exit: <n>` directive - when its output contains `PASSED` (that check is skipped for an
+  Expect-Exit test) and when no line starts with `FAIL`. It is skipped, not failed, when its output
+  has a line starting with `SKIP` (the rest of the line is the reason, #581), when an
+  `import <module>;` has no `shizotech/packages/<module>` next to the executable (`ONLY_SHZ=1`
+  builds no modules), when its `// Requires: <path> [<path>...] : <reason>` directive names content
+  that is not there - the include of a missing file ends a test before it could print a SKIP line -,
+  when its `// Requires-Builtin: <namespace> [<namespace>...]` directive names a builtin namespace
+  this build does not compile in (`win32` and `bitmap` exist only in the Windows build; a script that
+  names a missing namespace does not compile, so it cannot print a SKIP line either),
+  when its output says `Cannot load module:`, or when it is a GUI test (in `nanogui/` or importing
+  `nanogui`) and there is no display: `--gui` runs them, `--no-gui` never, and the default (auto)
+  needs `DISPLAY` or `WAYLAND_DISPLAY` on Linux; a Windows and a macOS session always has one.
+  The core carries no list of test names: every rule comes from the test file itself.
+  The output is one line per test (`ok <name>`, `FAIL <name>: <reason>`, `skip <name> (<reason>)`),
+  then the output of every failed test, then `N passed / M failed / K skipped`; the process exits
+  with `1` when a test failed. `_testing/shz_test_cli.shio` checks the runner itself.
 
 - The process exits with code `1` after an uncaught runtime error in the main script (errors caught by `try`/`catch` do not count).
 
@@ -1353,3 +1510,4 @@ For projects and modules prefer 'strict' mode and typed coding styles with prope
 If you did not explicitly verify it:
 
 â†’ IT DOES NOT EXIST
+

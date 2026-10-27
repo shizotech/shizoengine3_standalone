@@ -4,7 +4,7 @@
 //and change the same JSON (engine.patch), saved as projects/<name>/fixture_setup.json.
 //
 //  patch = [
-//    fixtures = [[id, name, type, node, universe, address, x, y, rotation, (legacy_index)], ...],
+//    fixtures = [[id, name, type, node, universe, address, x, y, z, rotation, mount, (legacy_index)], ...],
 //    groups   = [[id, name, fixtures = [id, ...]], ...],
 //    nodes    = [[mac, ip, name], ...],
 //  ]
@@ -14,7 +14,10 @@
 //  address 1-512, as on the lamp. No internal universes or patch layers: a lamp is "node > universe > address" and that
 //  is what is shown everywhere.
 //- x, y: where the lamp hangs on the stage plan, in metres from the middle (x to the right, y towards the audience).
-//  rotation in degrees.
+//  z: height above the floor in metres (#655, the 3D view; 0 in projects before it). rotation in degrees (around the
+//  vertical). mount: "floor" (standing, the beam goes up at tilt 0.5) or "hanging" (upside down on a truss).
+//  lean (#669): degrees the lamp leans its beam towards its front (a bar on the floor angled at the audience, a head on a
+//  side truss); 0 in projects before it.
 //- groups are ordered lists of lamps: the order is the order of a phaser.
 //- nodes: nodes added by hand (by IP), so a node that does not answer ArtPoll, or is not on the network yet, can be
 //  patched. Nodes that answer ArtPoll are found by themselves and need no entry.
@@ -37,6 +40,15 @@ patch_sort_by(list, key) {
 	return out;
 }
 
+//Position of a value in a list, -1 if it is not in it
+patch_index_of(list, value) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == value)
+			return i;
+	}
+	return -1;
+}
+
 //Path with "/" (projects saved on Windows have "\")
 patch_norm_path(path) {
 	if(!path)
@@ -48,6 +60,27 @@ patch_new() {
 	return [fixtures = [], groups = [], nodes = []];
 }
 
+PATCH_MOUNTS = ["floor", "hanging"];
+
+//What a lamp is, for how the plan and the 3D view draw it (#669): a moving head (pan / tilt), a bar (two or more colour
+//pixels), a par (one colour) or a dimmer (only intensity). The fixture file can say it ("kind"), else it is guessed from
+//the channels (patch_guess_kind).
+PATCH_KINDS = ["head", "bar", "par", "dimmer"];
+PATCH_KIND_LABELS = ["Moving head", "Bar", "Par", "Dimmer"];
+
+//Keys a lamp of an older patch does not have yet (#655: height and mount for the 3D view)
+patch_fixture_defaults(f) {
+	if(!f.has("z") || std.is_none(f.z))
+		f.z = 0.0;
+	if(!f.has("rotation") || std.is_none(f.rotation))
+		f.rotation = 0;
+	if(!f.has("mount") || !PATCH_MOUNTS.has_value(f.mount))
+		f.mount = "floor";
+	if(!f.has("lean") || std.is_none(f.lean))
+		f.lean = 0.0;
+	return f;
+}
+
 //Missing lists of an empty or hand-written patch
 patch_normalize(p) {
 	if(!p.has("fixtures") || std.type(p.fixtures) != "json")
@@ -56,6 +89,8 @@ patch_normalize(p) {
 		p.groups = [];
 	if(!p.has("nodes") || std.type(p.nodes) != "json")
 		p.nodes = [];
+	for(i = 0; i < p.fixtures.size(); i++)
+		patch_fixture_defaults(p.fixtures[i]);
 	return p;
 }
 
@@ -74,6 +109,163 @@ patch_kind_bytes(kind) {
 	return 1;
 }
 
+//What a channel does (#655), as the families of a lighting desk: the Phaser offers effects that fit (a circle for pan
+//and tilt, a fade or a rainbow for a colour), the 3D view of the fixture setup turns the beams by pan and tilt.
+//A channel of a fixture file can name it ("function"); without one it is guessed from its name and type.
+PATCH_FUNCTIONS = ["dimmer", "pan", "tilt", "color", "colorwheel", "strobe", "gobo", "beam", "speed", "control", "other"];
+PATCH_FUNCTION_LABELS = ["Dimmer", "Pan", "Tilt", "Colour mix", "Colour wheel", "Strobe / shutter", "Gobo / prism",
+	"Beam (focus, zoom, frost)", "Speed", "Control (reset, mode)", "Other"];
+
+//The function of a channel by its name ("PT Speed" is a speed, "ColorFrost" a beam channel, "COLOR" a colour wheel)
+patch_guess_function(name, kind = "8-bit") {
+	if(kind == "RGB" || kind == "RGBW")
+		return "color";
+	n = std.string(name).lowercase();
+	if(n.contains("speed"))
+		return "speed";
+	if(n.contains("pan"))
+		return "pan";
+	if(n.contains("tilt"))
+		return "tilt";
+	if(n.contains("dim") || n.contains("intens") || n.contains("master") || n.contains("bright"))
+		return "dimmer";
+	if(n.contains("strobe") || n.contains("shutter"))
+		return "strobe";
+	if(n.contains("gobo") || n.contains("prism"))
+		return "gobo";
+	if(n.contains("frost") || n.contains("focus") || n.contains("zoom") || n.contains("iris"))
+		return "beam";
+	if(n.contains("color") || n.contains("colour") || n.contains("wheel"))
+		return "colorwheel";
+	if(n.contains("red") || n.contains("green") || n.contains("blue") || n.contains("white") || n.contains("amber") ||
+		n.contains("lime") || n.contains("cyan") || n.contains("magenta") || n.contains("yellow") || n == "uv" ||
+		n.starts("uv ") || n.ends(" uv"))
+		return "color";
+	if(n.contains("reset") || n.contains("mode") || n.contains("macro") || n.contains("control") || n.contains("function"))
+		return "control";
+	return "other";
+}
+
+//The function of a channel of a fixture file: its own, else the guess
+patch_channel_function(chan) {
+	kind = chan.has("type") ? chan.type : "8-bit";
+	if(chan.has("function") && PATCH_FUNCTIONS.has_value(chan.function))
+		return chan.function;
+	return patch_guess_function(chan.name ?? "", kind);
+}
+
+//The value a control of a channel has when nothing else sets it (#669, "default" of the channel: 0..1, a list for the
+//colours of RGB / RGBW), 0 when the file does not say
+patch_channel_default(chan, comp) {
+	if(!chan.has("default"))
+		return 0.0;
+	d = chan.default;
+	if(std.is_list(d))
+		return comp < d.size() ? math.clamp(std.float(d[comp]), 0.0, 1.0) : 0.0;
+	return math.clamp(std.float(d), 0.0, 1.0);
+}
+
+//The 3D models of GDTF imports (#669, engine/patch/gdtf_mesh.shio), by path: read with the types, never while drawing
+patch_mesh_store() {
+	g = std.global("patch_mesh_cache");
+	cache = g.get();
+	if(std.is_none(cache)) {
+		g.set(std.json());
+		cache = g.get();
+	}
+	return cache;
+}
+
+//The largest side (metres) of the box around a model at rest (no pan, no tilt): how big it is drawn, with its yoke and
+//head (the length of the type is its base only)
+patch_mesh_extent(mesh) {
+	world = [];
+	lo = [0.0, 0.0, 0.0];
+	hi = [0.0, 0.0, 0.0];
+	first = true;
+	for(i = 0; i < mesh.parts.size(); i++) {
+		part = mesh.parts[i];
+		a = part.m;
+		if(part.parent >= 0 && part.parent < world.size()) {
+			b = world[part.parent];
+			c = [];
+			for(r = 0; r < 3; r++) {
+				for(k = 0; k < 4; k++) {
+					v = b[r * 4] * a[k] + b[r * 4 + 1] * a[4 + k] + b[r * 4 + 2] * a[8 + k];
+					if(k == 3)
+						v += b[r * 4 + 3];
+					c.push_back(v);
+				}
+			}
+			a = c;
+		}
+		world.push_back(a);
+		v = part.v;
+		if(std.type(v) != "json")
+			continue;
+		for(j = 0; j + 2 < v.size(); j += 3) {
+			for(r = 0; r < 3; r++) {
+				w = a[r * 4] * v[j] + a[r * 4 + 1] * v[j + 1] + a[r * 4 + 2] * v[j + 2] + a[r * 4 + 3];
+				if(first || w < lo[r])
+					lo[r] = w;
+				if(first || w > hi[r])
+					hi[r] = w;
+			}
+			first = false;
+		}
+	}
+	return math.max(hi[0] - lo[0], math.max(hi[1] - lo[1], hi[2] - lo[2]));
+}
+
+//A file next to a fixture file of a GDTF import: its model (.mesh, has "parts") or its wheels (.wheels, has "wheels");
+//None without one. fresh: read it again (patch_reload_types)
+patch_mesh(path, fresh = false, needs = "parts") {
+	cache = patch_mesh_store();
+	if(!fresh && cache.has(path))
+		return cache[path];
+	data = None;
+	if(fileio.exists(PATCH_ROOT + path)) {
+		try {
+			data = fileio.read_json(PATCH_ROOT + path);
+		}
+		catch(e) {
+			data = None;
+		}
+	}
+	if(data && (std.type(data) != "json" || !data.has(needs) || !data[needs].size()))
+		data = None;
+	if(data && needs == "parts")
+		data.extent = patch_mesh_extent(data); //(not "size": a method of JSON)
+	cache[path] = data;
+	return cache[path];
+}
+
+//The slot of its wheel a slot of a fixture type shows at value (0..1, as sent): [name, color [r, g, b], gobo (a mask,
+//engine/patch/gdtf_zip.shio, "" for none)]; None when it has no wheel or is between slots (spinning, open)
+patch_wheel_slot(t, slot_index, value) {
+	if(!t.wheels || slot_index < 0 || slot_index >= t.slots.size())
+		return None;
+	w = t.slots[slot_index].wheel;
+	if(!w)
+		return None;
+	wheel = None;
+	for(candidate : t.wheels.wheels) {
+		if(candidate.name == w.name)
+			wheel = candidate;
+	}
+	if(!wheel)
+		return None;
+	n = 0;
+	for(r : w.ranges) {
+		if(r[0] > value + 0.000001)
+			break;
+		n = r[1];
+	}
+	if(n < 1 || n > wheel.slots.size())
+		return None;
+	return wheel.slots[n - 1];
+}
+
 //The cache of the parsed fixture types, shared by every module that includes this file (the engine, the fixture setup,
 //the Phaser, the LEDMapper): std.global, not a global of the file
 patch_type_store() {
@@ -86,17 +278,50 @@ patch_type_store() {
 	return cache;
 }
 
-//Reads the fixture files again on the next patch_type() (after the fixture editor saved one, when the setup opens)
+def patch_type_read(path);
+
+//Reads the fixture files of the cached types again (after the fixture editor saved one or a GDTF import wrote some, when
+//the setup opens), here and now: the cache is never empty in between. An empty cache made the next draw of the setup
+//read the files, and a file read suspends the draw (fileio runs it on a thread): it went on after its frame, every
+//nvg* call an error (#669).
 patch_reload_types() {
 	cache = patch_type_store();
-	cache.types = [];
+	fresh = std.json();
+	for(i = 0; i < cache.types.size(); i++) {
+		path = cache.types.key(i);
+		fresh[path] = patch_type_read(path);
+	}
+	cache.types = fresh;
+}
+
+//What a type of lamp is when its file does not say it (#669): pan or tilt make a moving head, two or more colour
+//pixels a bar, one (or colour channels of one byte each, R G B in another order) a par, else a dimmer
+patch_guess_kind(t) {
+	if(t.moving)
+		return "head";
+	if(t.pixels >= 2)
+		return "bar";
+	if(t.pixels == 1)
+		return "par";
+	for(i = 0; i < t.slots.size(); i++) {
+		if(t.slots[i].function == "color")
+			return "par";
+	}
+	return "dimmer";
 }
 
 //The fixture file parsed and expanded:
 //  [path, name, valid, footprint, channels, time (a new number each time the file is read), signature (of the
-//   channels), has_color,
-//   slots    = one per channel entry ([name, channel, sub, kind, offset, bytes]); a channel with a count of 3 has 3,
-//   controls = one per value ([label, slot, comp, offset, kind]): a colour has one per component (R, G, B, W)]
+//   channels), has_color, moving (has pan or tilt), pan_range / tilt_range (degrees the head turns over 0..1),
+//   beam_angle (degrees, for the 3D view), pixels (colour channels), kind (head, bar, par, dimmer: PATCH_KINDS, from
+//   "kind" of the file or patch_guess_kind), length (metres: along a bar, else across the lamp), width (metres: across
+//   a bar; "length" and "width" of the file when it has them, as a GDTF import writes them),
+//   slots    = one per channel entry ([name, channel, sub, kind, offset, bytes, function, wheel (the slots of its
+//              wheel by its value, "wheel" of the channel, or None)]); a channel with a count of 3 has 3,
+//   controls = one per value ([label, slot, comp, offset, kind, function, default (0..1, the value it starts at)]): a
+//              colour has one per component (R, G, B, W),
+//   mesh (the 3D model of a GDTF import, None without one), pan_part / tilt_part (its parts pan and tilt turn, -1),
+//   wheels (its colour and gobo wheels, patch_wheel_slot)]
 //The order of `controls` is the order of the controls of a lamp in Devices > Fixtures and of the attributes of the Phaser.
 //Read once and cached: no file access when it is cached, so it can be called while drawing.
 patch_type(path) {
@@ -104,10 +329,18 @@ patch_type(path) {
 	cache = patch_type_store();
 	if(cache.types.has(path))
 		return cache.types[path];
+	cache.types[path] = patch_type_read(path);
+	return cache.types[path];
+}
 
+//The fixture file read and parsed (patch_type without the cache)
+patch_type_read(path) {
+	path = patch_norm_path(path);
+	cache = patch_type_store();
 	cache.loads++;
 	t = [path = path, name = fileio.pure_name(path), valid = false, footprint = 0, channels = [], slots = [], controls = [],
-		time = cache.loads, has_color = false];
+		time = cache.loads, has_color = false, moving = false, pan_range = 540.0, tilt_range = 270.0, beam_angle = 0.0,
+		virtual = false];
 	file = PATCH_ROOT + path;
 	conf = None;
 	if(path && fileio.exists(file)) {
@@ -131,34 +364,115 @@ patch_type(path) {
 		kind = chan.has("type") ? chan.type : "8-bit";
 		bytes = patch_kind_bytes(kind);
 		count = chan.has("batch_count") ? math.max(1, std.int(chan.batch_count)) : 1;
+		func = patch_channel_function(chan);
+		if(func == "pan" || func == "tilt")
+			t.moving = true;
 		for(h = 0; h < count; h++) {
 			slot_name = chan.name;
 			if(h > 0)
 				slot_name += " (" + (h + 1) + ")";
 			slot_index = t.slots.size();
-			t.slots.push_back([name = slot_name, channel = k, sub = h, kind = kind, offset = offset, bytes = bytes]);
+			t.slots.push_back([name = slot_name, channel = k, sub = h, kind = kind, offset = offset, bytes = bytes, function = func,
+				wheel = chan.has("wheel") && std.type(chan.wheel) == "json" && chan.wheel.has("ranges") ? chan.wheel : None]);
 			//Labels as the Phaser always named them ("RGB - R", "RGB - R (2)")
 			suffix = count > 1 ? " (" + (h + 1) + ")" : "";
 			if(kind == "RGB" || kind == "RGBW") {
 				t.has_color = true;
 				comps = kind == "RGB" ? ["R", "G", "B"] : ["R", "G", "B", "W"];
 				for(c = 0; c < comps.size(); c++)
-					t.controls.push_back([label = chan.name + " - " + comps[c] + suffix, slot = slot_index, comp = c, offset = offset + c, kind = kind]);
+					t.controls.push_back([label = chan.name + " - " + comps[c] + suffix, slot = slot_index, comp = c, offset = offset + c,
+						kind = kind, function = func, default = patch_channel_default(chan, c)]);
 			}
 			else
-				t.controls.push_back([label = chan.name + suffix, slot = slot_index, comp = 0, offset = offset, kind = kind]);
+				t.controls.push_back([label = chan.name + suffix, slot = slot_index, comp = 0, offset = offset, kind = kind, function = func,
+					default = patch_channel_default(chan, 0)]);
 			offset += bytes;
 		}
 	}
 	t.footprint = offset;
-	//Changes only when the channels change: what the controls of a lamp are built from
+	//How the lamp moves and how wide its beam is (#655): the fixture file can tell, else what most moving heads do
+	if(conf && std.type(conf) == "json") {
+		if(conf.has("pan_range") && std.float(conf.pan_range) > 0.0)
+			t.pan_range = std.float(conf.pan_range);
+		if(conf.has("tilt_range") && std.float(conf.tilt_range) > 0.0)
+			t.tilt_range = std.float(conf.tilt_range);
+		if(conf.has("beam_angle") && std.float(conf.beam_angle) > 0.0)
+			t.beam_angle = std.float(conf.beam_angle);
+		//A virtual lamp (a zone of a projection, a MapLab slice): it needs no node, the Phaser and the fixture controls
+		//move it like a real lamp and MapLab or FixtureState show what it does
+		if(conf.has("virtual") && conf.virtual)
+			t.virtual = true;
+	}
+	//Pan and tilt of a virtual lamp move a slice of MapLab, not a beam (#719): the 3D view and FixtureState treat it as
+	//a lamp that does not move. The Phaser still offers Position for it (fx_attributes looks at the functions)
+	if(t.virtual)
+		t.moving = false;
+	if(t.beam_angle <= 0.0)
+		t.beam_angle = t.moving ? 15.0 : 30.0;
+	//What it is and how big (#669)
+	t.pixels = 0;
+	for(i = 0; i < t.slots.size(); i++) {
+		if(t.slots[i].kind == "RGB" || t.slots[i].kind == "RGBW")
+			t.pixels++;
+	}
+	t.kind = patch_guess_kind(t);
+	if(conf && std.type(conf) == "json" && conf.has("kind") && PATCH_KINDS.has_value(conf.kind))
+		t.kind = conf.kind;
+	t.length = t.kind == "bar" ? math.max(0.6, t.pixels * 0.12) : 0.5; //metres
+	t.width = t.kind == "bar" ? 0.22 : t.length;
+	//the size the file gives (a GDTF import: the model of the lamp)
+	if(conf && std.type(conf) == "json") {
+		if(conf.has("length") && std.float(conf.length) > 0.0)
+			t.length = math.clamp(std.float(conf.length), 0.05, 20.0);
+		if(conf.has("width") && std.float(conf.width) > 0.0)
+			t.width = math.clamp(std.float(conf.width), 0.02, 20.0);
+		else if(t.kind != "bar")
+			t.width = t.length;
+	}
+	//The 3D model of a GDTF import (#669): the parts pan and tilt turn
+	t.mesh = None;
+	t.wheels = None;
+	t.pan_part = -1;
+	t.tilt_part = -1;
+	if(conf && std.type(conf) == "json" && conf.has("gdtf") && std.type(conf.gdtf) == "json" && conf.gdtf.has("mesh") && conf.gdtf.mesh) {
+		dir = fileio.file_dir(path);
+		t.mesh = patch_mesh((dir ? dir + "/" : "") + conf.gdtf.mesh, true);
+	}
+	if(conf && std.type(conf) == "json" && conf.has("gdtf") && std.type(conf.gdtf) == "json" && conf.gdtf.has("wheels") &&
+		conf.gdtf.wheels) {
+		dir = fileio.file_dir(path);
+		t.wheels = patch_mesh((dir ? dir + "/" : "") + conf.gdtf.wheels, true, "wheels");
+	}
+	if(t.mesh) {
+		if(conf.gdtf.has("pan_part") && std.type(conf.gdtf.pan_part) != "string")
+			t.pan_part = std.int(conf.gdtf.pan_part);
+		if(conf.gdtf.has("tilt_part") && std.type(conf.gdtf.tilt_part) != "string")
+			t.tilt_part = std.int(conf.gdtf.tilt_part);
+	}
+	//Changes only when the channels change: what the controls of a lamp are built from. Not the start values ("default"):
+	//a changed signature builds the lamps again, and a lamp that is there keeps its values when only a start value changes
 	sig = t.valid ? "v" : "x";
 	for(i = 0; i < t.controls.size(); i++)
 		sig += "|" + t.controls[i].label + ":" + t.controls[i].kind;
 	t.signature = sig;
-	cache.types[path] = t;
-	return cache.types[path];
+	return t;
 }
+
+//The size of a lamp on the stage in metres (#669): [kind, bar (drawn long), length (along its rotation), width]
+patch_lamp_size(f) {
+	t = patch_type(f.type);
+	if(t.kind == "bar")
+		return [kind = t.kind, bar = true, length = t.length, width = t.width];
+	return [kind = t.kind, bar = false, length = t.length, width = t.width];
+}
+
+//A lamp of a virtual type (a projection zone): it needs no node
+patch_is_virtual(f) {
+	return f && patch_type(f.type).virtual;
+}
+
+//The fixture type of the virtual lamps MapLab makes for its slices
+PATCH_VIRTUAL_TYPE = "assets/Fixtures/Virtual/ProjectionZone.json";
 
 //Channels a lamp of this type takes (at least 1, so a lamp of a missing type still has an address)
 patch_footprint(path) {
@@ -214,7 +528,7 @@ patch_problems(p) {
 	for(i = 0; i < p.fixtures.size(); i++) {
 		f = p.fixtures[i];
 		list = [];
-		if(!f.node)
+		if(!f.node && !patch_is_virtual(f))
 			list.push_back("No node");
 		if(f.address < 1 || patch_end(f) > PATCH_UNIVERSE_SIZE)
 			list.push_back("Past channel 512");
@@ -331,7 +645,10 @@ patch_add(p, type, count = 1, node = "", universe = 0, address = 0, x = 0.0, y =
 			address = next.address,
 			x = x + n,
 			y = y,
+			z = 0.0,
 			rotation = 0,
+			mount = "floor",
+			lean = 0.0,
 		];
 		p.fixtures.push_back(f);
 		added.push_back(p.fixtures[-1]);
@@ -521,7 +838,7 @@ patch_control_index(type, label) {
 }
 
 //The attributes the lamps of a target have in common, by label (the `controls` of their types), in the order of the first
-//lamp: [[label, kind], ...]
+//lamp: [[label, kind, function], ...]
 patch_target_attributes(p, target) {
 	lamps = patch_target_fixtures(p, target);
 	list = [];
@@ -538,7 +855,7 @@ patch_target_attributes(p, target) {
 			}
 		}
 		if(everywhere)
-			list.push_back([label = label, kind = first.controls[i].kind]);
+			list.push_back([label = label, kind = first.controls[i].kind, function = first.controls[i].function]);
 	}
 	return list;
 }

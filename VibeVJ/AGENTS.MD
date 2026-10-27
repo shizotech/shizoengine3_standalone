@@ -6,6 +6,51 @@ This file is the **primary onboarding document for any AI agent** working in thi
 
 ---
 
+## ShizoScript 3: the language, and how to read its docs without the source repo
+
+VibeVJ runs on **ShizoScript 3**, a custom language built for this engine — not Python, not Lua, not JS, not C++. Its source files are `.shio`; the visual layers are `.glsl` (and `.hlsl` on Windows). There is no package manager, no pip/npm, no third-party runtime: **the interpreter is the program itself.** `shz` (Windows `shz.exe`, Linux `shz`, macOS `shz`) is the complete runtime, and it carries its standard library in a folder `shizotech/` next to the exe. In a released VibeVJ build (`_shizoengine3/deploy.shio`) that runtime is renamed **`VibeVJ.exe` / `VibeVJ.out`** and the app lives in the folder `VibeVJ/` beside it.
+
+An agent that has **only the released app** and no access to the ShizoScript source repository can still read the whole language and builtin reference from the command line, run in the folder of the exe:
+
+| Command | What it produces |
+|---|---|
+| `VibeVJ.exe docs` | the complete reference of *this* build: a table of contents of every namespace and object type, then for every function its signature, description and examples (`std`, `math`, `json`, `fileio`, `bitmap`, `eigen`, `shizonet`, `shzdocs`, `win32`, plus every module found in `shizotech/packages`). Measured 51 KB / 1100 lines with the stdlib alone, more with the native modules — redirect it to a file. |
+| `VibeVJ.exe docs <keyword>` | the same as a keyword search: the table of contents of everything matching `<keyword>` (`docs json`, `docs nanogui`, `docs sin`). A dotted path is not a keyword — `docs math.sin` lists nothing. |
+| `VibeVJ.exe mcpdocs` | the reference as an **MCP server** on `http://localhost:13338`: `shizoscript_help` (the syntax guide for agents), `shizoscript_docs` (exact namespace/class/path lookup, `compact`), `shizoscript_search_keywords`, `shizoscript_syntax_checker` (`--check`), `shizoscript_debugger` (`--testrun`), `shizoscript_resolve_include`, `shizoscript_system_paths`. It serves until you stop it and needs the native `webserver` + `tempfile` packages. |
+| `VibeVJ.exe --help` | the interpreter CLI: `--check`, `-p "<code>"` (run a snippet), `--interactive`, `--testrun <s>`, `--find`, `--paths`, `--verbose`. |
+
+`shz` is the same executable under its own name, so `shz docs`, `shz mcpdocs` and `shz --check <file>` (compile without running) behave identically everywhere ShizoScript is installed — a VibeVJ script with `import nanogui;` needs the `nanogui` module next to the interpreter, see *Pitfalls*.
+
+Files that carry the docs at run time (paths relative to the folder of the exe):
+
+```
+shizotech/system/miniagent/skills/shizoscript/SKILL.md   the language guide for AI agents (syntax, hard rules)
+shizotech/system/miniagent/skills/shizoscript/docs/      the deep dives: nanogui.md, kernels.md, shizonet.md, video.md
+shizotech/system/<name>/__init__.shio                    the source of every system module - the docs commands included
+shizotech/includes/mcp/README.md, .../openai/README.md   the two include libraries (MCP server, OpenAI client)
+shizotech/packages/<module>/src/                         the script side of a native module
+```
+
+**`shz <name>` — and the one case where the argument does not reach the stdlib.** `shz docs` runs `shizotech/system/docs/__init__.shio`: the argument is a *script path*, resolved through the search path list (printed by `shz --paths`) — **current working directory first**, then `<exe_dir>`, `<exe_dir>/shizotech/includes`, `.../packages`, `.../system`; first hit wins, and the entry point of a directory is `<dir>/__init__.shio`. The argument **does** work for a standalone app — measured with `--find` (`-f`, prints the resolved file and exits) in a shipped standalone folder:
+
+```
+miniagent_standalone> miniagent.exe -f docs        →  <root>\shizotech\system\docs\__init__.shio
+miniagent_standalone> miniagent.exe -f mcpdocs     →  <root>\shizotech\system\mcpdocs\__init__.shio
+miniagent_standalone> miniagent.exe -f miniagent   →  <root>\miniagent\__init__.shio     ← the app, not the module
+```
+
+The last line is the rule to respect: **a folder (or file) with the same name in the app's own directory wins and the system module is never reached**, because the app directory is search path #1. `VibeVJ.exe docs` is safe — the VibeVJ standalone root is `VibeVJ.exe` + `shizotech/` + the app in `VibeVJ/`, and nothing is named `docs`. The DJ Watch build is the counter-example: its root has a `docs/` folder of screenshots and `_standalones/djwatch_standalone/deploy.shio` deletes `shizotech/system` from that build, so `DJWatch.exe docs` finds the pictures and runs nothing. When a name is shadowed, run the module by path from the app root:
+
+```
+VibeVJ.exe shizotech/system/docs        ← the path form; the CWD is the first search path
+```
+
+Names that resolve in the shipped stdlib: `docs`, `mcpdocs`, `editor`, `aicmd`, `help`; `miniagent` resolves to the stdlib module only where no app folder of that name sits next to the exe. `fastapi` and `nettask` have no `__init__.shio` and are not commands. Starting a standalone app **without** an argument runs the app itself (the `<exe_name>/__init__.shio` default) and hides the console window on Windows; with an argument the console stays, so the docs commands are always run with the argument.
+
+The same rule is why VibeVJ's `#include "src/defs.shio"` paths and its `assets/` are app-root relative: run it from its app root (see *Pitfalls* below).
+
+---
+
 ## Core Principle: "Everything is a Generator"
 
 The entire program is built on one universal building block: the **generator**.
@@ -154,6 +199,28 @@ Things that compile in your head but fail at run time. Check them when you canno
 - A JSON object has methods (`size()`, `has()`, `merge()`, …). A key with the same name must be read as `obj["size"]`, not
   `obj.size` (that returns the method).
 - Number + string gives six decimals (`1 + ""` is `"1.000000"`). Format numbers explicitly where the text matters.
+- An object can outlive the module that made it: the view that stays when its split dissolves (`singleview.dissolve`)
+  was made by the split's module, which is freed then. Its methods still run, but the **globals** of that module read
+  None (`"dir/" + ASSET_FILE` was `"dir/"`, `root.height()` "is not a function"). Engine code that such objects run
+  (`asset_resolver`, the frame callbacks of `splitpanes`) uses literals and functions, not module globals, or checks
+  them (2026-10).
+- Since #569 a dot **read** `obj.size` of a JSON that has a key `size` warns once; a **call** `obj.size()` does not.
+- A JSON literal key with the name of a JSON method (`key`, `size`, `copy`, `remove`, `filter`, `map`, `all`, ...) is
+  hidden by the method: `[key = "x"].key` is the method. The log warns once ("the json key ... is hidden"). Use another
+  name (`ref`).
+- In a method, `name = ...` of a name that is a **member** of the class changes the member, it makes no local: a local
+  `before = snapshot()` in a method of a class with a member `before` overwrote it (#719). Give locals names no member
+  has.
+- A function called before its definition needs a forward declaration `def name(params);` at the top. In an asset this
+  is only a syntax error when the asset loads (`shz --check` of the asset shows it).
+
+**Generators**
+- An `update` / `update_pre` / `update_post` of an asset that raises a runtime error is dropped by the engine without a
+  log line (`__init__.shio`, the callbacks of the frame): the generator silently stops updating. When a generator
+  "freezes", wrap the body in `try {} catch(e) { std.error(...); }` for a moment to see the error.
+- An inactive generator (its power off, a clip that is not live) gets no update calls, only `dispatcher` ("active").
+- An `on_draw` of a generator can run once more after the generator was freed (a project loads): its widget globals
+  are gone then (`size()` of one gives an int). Start such a draw function with `if(!widget) return;`.
 
 **Checking scripts**
 - `shz --check` needs `_shizoengine3/` as working directory and the nanogui module that matches the script version.
@@ -222,6 +289,7 @@ The elements of a modmatrixnode do NOT need to be direct children of the modmatr
 - [Assets Overview](assets/README.md)
 
 ### Reference Guides
+- **ShizoScript 3 language + builtin reference: `shz docs`, `shz mcpdocs`** (or `VibeVJ.exe docs` / `VibeVJ.exe mcpdocs` in a released app) — see the section *ShizoScript 3* at the top; the stdlib source of it is `shizotech/system/docs/__init__.shio`
 - [Asset Authoring Guide](assets/ASSET_GUIDE.MD)
 - [Shader Guide](assets/Shaders/SHADER_GUIDE.MD)
 - [Shizo UI design system](../design/README.md) and its [design wiki](../design/wiki/README.md)

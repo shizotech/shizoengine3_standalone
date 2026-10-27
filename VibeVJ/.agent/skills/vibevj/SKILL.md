@@ -27,6 +27,7 @@ Examples that trigger DIRECT OPERATION:
 - When the user asks to configure or operate something in the running program
 - When the user asks to change parameters or program state
 - When the user asks to perform an action that the VibeVJ tools can directly accomplish
+- When the user asks to set up, find, test, aim or program lamps (fixtures), also by looking through a camera
 
 WHAT TO DO:
 

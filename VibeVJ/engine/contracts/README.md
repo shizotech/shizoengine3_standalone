@@ -41,7 +41,7 @@ into calls. Until then, the default `dispatch()` sends `"active"` to `active()`,
 | Mixin | Methods |
 |---|---|
 | `VideoIO` | `get_default_input()`, `get_default_output()`, `get_inputs()`, `set_input(v)`, `set_uniform(v)`, `set_render_callback(v)` |
-| `Transitionable` | `transition(v)`, `clip_preview(v)` |
+| `Transitionable` | `transition(v)`, `clip_preview(v)`, `has_cell_preview()` / `draw_cell(size)` (a module without a picture draws its clip cell, #677) |
 | `ItemStack` | `get_items()`, `get_item(i)`, `add_item(path)`, `on_items_changed(cb)` |
 
 A class asset:

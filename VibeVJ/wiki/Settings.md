@@ -1,15 +1,15 @@
 # Settings
 
-The settings have a window of their own, *Settings*. Its pages *Project* and *Links* belong to the project, the page
-*Appearance* is personal and valid for every project, and the page *Output* is for the output of the whole window. This
-page also explains how to scale views with Page Up and Page Down.
+The settings have a window of their own, *Settings*. Its pages *Project* and *Links* belong to the project, the pages
+*Appearance* and *Display* are personal and valid for every project, and the page *Output* is for the output of the
+whole window. This page also explains how to scale views with Page Up and Page Down.
 
 ![The Settings window with the page Appearance open](media/settings.png)
 
 ## Open the settings
 
 1. Click the gear button (⚙) in the top bar, between the sidebar button and the help button (?).
-2. Click a page in the list at the left side of the window: *Project*, *Links*, *Appearance* or *Output*.
+2. Click a page in the list at the left side of the window: *Project*, *Links*, *Appearance*, *Output* or *Display*.
 
 The window floats above the program.
 
@@ -23,7 +23,9 @@ The settings on the page *Project* are saved with the project, except *Autosave*
 
 | Setting | What it does |
 |---|---|
-| *Target width*, *Target height* | The output size, 1920 × 1080 at the start. New shader generators and the mapping tools start with this size. |
+| *Size from* | Where the output size comes from: *Output displays* (the standard for a new project) takes the resolution of the first output display of [*Display*](#display) and follows when displays are plugged in or out, also at another venue. *Manual*: *Target width* and *Target height*. Without an output display the size stays as it is. |
+| *Target width*, *Target height* | The output size. New shader generators and the mapping tools start with this size. Typing a value sets *Size from* to *Manual*. |
+| *Common size…* | Sets the output size to a common one: 16:9 (1280 × 720 to 3840 × 2160), 16:10, 21:9 (2560 × 1080, 3440 × 1440, 3840 × 1600, 5120 × 2160), 32:9, 4:3 and 5:4. *Size from* becomes *Manual*. |
 | *Target FPS* | How many frames per second VibeVJ draws. Starts at the refresh rate of your screen. The lowest value is 30; 0 means no limit. It has no options: to map it to MIDI, see [MIDI](MIDI.md#the-midi-tab-in-the-options). |
 | *Default sync* | How the time of a new shader generator runs: *Free*, *Manual* or *Sync* (see below). |
 | *Current FPS* | Shows the frames per second VibeVJ reaches right now. |
@@ -83,9 +85,10 @@ The settings on the page *Appearance* are personal. They are not saved in the pr
 
 | Setting | What it does |
 |---|---|
-| *Interface size* | How big everything is drawn: 90 % to 200 %, on top of the scale of your system. Takes effect at once. See [Interface size](#interface-size). |
+| *Interface size* | How big everything is drawn: a slider from 50 % to 200 %, on top of the scale of your system, and *Auto*. See [Interface size](#interface-size). |
 | *Accent colour* | The colour picker sets your highlight colour, used for links and selection. Violet at the start. |
 | *Reset accent colour* | Sets the accent colour back to violet. |
+| *Depth* | How much sections and panels stand out: *Flat*, *Subtle* (the standard) or *Strong*. See [Depth](#depth). |
 | *Calm notches* | Where free notches show their grey edge: *Everywhere* (the standard) or *Clipview only*. |
 | *Linked notches* | *Open* (the standard): a linked notch is open. *Edge only*: it stays a thin coloured edge until you hover the row. |
 | *Area headers* | *Always* (the standard): every area shows its header. *Auto-hide*: the header takes no room and only comes while the mouse is at the top edge of the area. One area can differ, see [The screen](The-Screen.md#the-header-of-an-area). |
@@ -96,12 +99,31 @@ VibeVJ follows the display scale of your system. On a screen where that is too s
 changes it for VibeVJ alone:
 
 1. Open *Settings* › *Appearance*.
-2. Pick a size under *Interface size*. *100 %* is the scale of your system. The views and the timeline follow at once.
+2. Drag the slider under *Interface size*, in steps of 5 %. *100 %* is the scale of your system. The number next to it
+   shows the size while you drag; the views and the timeline change when you let go.
+3. *Auto* gives VibeVJ the choice again.
 
-Until you pick one, VibeVJ chooses: on a screen that is wider than 3000 at the scale of the system (a 4K screen at
-100 %, mostly under Linux) it draws everything bigger, so that about 1920 fit across; on every other screen it keeps
-*100 %*. Useful beyond that when you stand far from the screen. It works the same on Windows, Linux and macOS: on a Mac the window keeps its size and everything in it is
+With *Auto* (until you pick a size), VibeVJ looks at the screen its window is on. Only a screen as dense as 4K, with at
+least 2000 rows at the scale of the system (a 4K screen at 100 %, mostly under Linux), gets everything bigger, so that
+about 1920 × 1080 still fit. Every other screen keeps *100 %*, an ultrawide screen too (2560 × 1080, 3440 × 1440,
+5120 × 1440): it is wide, not dense. Useful beyond that when you stand far from the screen. It works the same on Windows, Linux and macOS: on a Mac the window keeps its size and everything in it is
 drawn bigger or smaller, still sharp on a Retina screen.
+
+### Depth
+
+Sections (the blocks with a chevron, like *Inputs* and *Outputs*) and the panels of a view, like *Preview* and *Layer* of
+the Clipview, can stand out from what is around them:
+
+| Choice | What you see |
+|---|---|
+| *Flat* | No panels: sections are only their title and chevron, panels only their tone. |
+| *Subtle* | The standard. A section sits on a slightly lighter panel with a light top edge and a dark bottom edge; a section inside a section is one step lighter again. Panels with a header get the same edges. |
+| *Strong* | The same, twice as strong. |
+
+To change it:
+
+1. Open *Settings* › *Appearance*.
+2. Pick *Flat*, *Subtle* or *Strong* under *Depth*.
 
 ### Calm notches
 
@@ -147,6 +169,31 @@ The page *Output* is for the output of the whole VibeVJ window.
 
 The NDI output of a single shader is on [Output and devices](Output-and-Devices.md).
 
+## Display
+
+The page *Display* lists every connected display: its name, the size the system runs it at (with its shape: 16:9,
+16:10, 21:9, …), its refresh rate and, for each one, two choices. They are personal, kept in `VibeVJ/engine/style.json`
+for each display by its name, so they come back at another venue however the displays are plugged in. Two displays of
+the same model are told apart by their order ("Name (2)").
+
+| Setting | What it does |
+|---|---|
+| Role | *Control*: a screen of the operator, at the FOH. It shows VibeVJ; the size of the picture does not matter for it. *Output*: a projector, an LED wall or a monitor on stage; the picture is made for it. *Auto* (the standard): the display the VibeVJ window is on is *Control*, every other one *Output*. |
+| Resolution | The size the picture is made in for this display. *Auto* (the standard): the size the system runs it at. The list also has the common sizes (16:9, 16:10, 21:9, 32:9, 4:3, 5:4; "the display lists it" marks the ones the display reports itself), other sizes the display reports, and *Custom…* for any width and height. Pick one when a display reports a wrong size, for example behind a scaler, a splitter or an LED processor. |
+| *Detect displays* | Looks at the displays again. VibeVJ also notices by itself when a display is plugged in or out. |
+
+What follows from it:
+
+- The project size follows the first output display while *Size from* on the page [*Project*](#project) is *Output
+  displays*. The line at the top of the page says which size and display that is.
+- The *Display* lists of the outputs (a shader, MapLab) name each display with its resolution and role:
+  "Display 2 · BenQ W1070 · 1920 × 1080 (16:9) · Output".
+- A shader whose *Size* is *Custom* renders in the resolution of the display it is shown on. With *Size* *Project* it
+  keeps the project size. See [Output and devices](Output-and-Devices.md#show-the-picture-on-a-display-or-projector).
+
+VibeVJ does not switch the mode of a display: the system keeps running it at its size, and *Picture* (*Stretch*, *Fit*,
+*Fill*) of the output decides how a picture of another shape is shown on it.
+
 ## View scaling with Page Up and Page Down
 
 You can make the content of a view bigger or smaller, for example to fit a big Clipview on a small screen.
@@ -158,8 +205,8 @@ You can make the content of a view bigger or smaller, for example to fit a big C
 |---|---|---|
 | An area of a view tab, a tab of a Tabview, half of a split | Page Up / Page Down | Yes, with the project |
 | The sidebar | Page Up / Page Down | No |
-| A Patchview | Mouse wheel, the zoom chip, Ctrl + 0 / Ctrl + 1; right mouse button drags the area | Yes, with the project |
-| The timeline area | Mouse wheel; right mouse button drags the area | No |
+| A Patchview | Mouse wheel, the zoom chip, Ctrl + 0 / Ctrl + 1; right or middle mouse button drags the area | Yes, with the project |
+| The timeline area | Mouse wheel; right or middle mouse button drags the area | No |
 
 Scaling does not work while a generator window is maximized.
 

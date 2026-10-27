@@ -1,7 +1,7 @@
-//The fixture setup (#439): Setup.menu in assets/Fixtures opens it in a tab.
+//The fixture setup (#439): the button "Fixture setup" in the tab Devices opens it in a tab (#575).
 //
 //  +---------------------------------------------------------------------------------------------+
-//  | toolbar: Highlight | Duplicate  Remove | Row  Grid  Circle | Snap  Fit |            status    |
+//  | toolbar: Highlight | Duplicate  Remove | Row  Grid  Circle | Snap  Fit  3D |        status    |
 //  +----------------+-------------------------------------------------------+--------------------+
 //  | Fixture types  |                                                       | Lamp / selection   |
 //  |  (add, drag)   |                 stage plan (metres)                   |  name, node,       |
@@ -11,6 +11,9 @@
 //  +----------------+-------------------------------------------------------+--------------------+
 //
 //Everything it changes is in engine.patch (engine/patch/patch.shio); engine.patch_changed() tells the others.
+//3D (#655) shows the stage in perspective instead of the plan: lamps at their height (Height, Mount in the inspector),
+//their beams turned by pan and tilt and coloured as they are sent (engine/patch/stage3d.shio). Since #686 it is a
+//nanogui.view3d over the plan, drawn with OpenGL (engine/patch/stage3d_scene.shio): GDTF models, light on the floor.
 //LEDMappers that write the channels of a lamp (one they are not meant for) count as problems of that lamp, and their
 //channels are in the universe map (engine/patch/dmx.shio).
 
@@ -20,17 +23,18 @@ using eigen;
 using nanogui;
 
 #include "engine/patch/patch"
+#include "engine/patch/gdtf"
 #include "engine/patch/dmx"
+#include "engine/patch/stage3d"
 #include "engine/patch/palette"
+#include "engine/patch/stage3d_scene"
+#include "engine/patch/channelmap"
 
 SETUP_ROW = 28;
 SETUP_LEFT_W = 260;
 SETUP_RIGHT_W = 280;
 SETUP_TOOLBAR_H = 32;
 SETUP_MAP_H = 176;
-SETUP_MAP_COLS = 64;
-SETUP_MAP_ROWS = 8;
-SETUP_MAP_LEFT = 34; //room for the channel numbers
 SETUP_SNAP = 0.25; //metres
 
 //GLFW
@@ -41,6 +45,16 @@ SETUP_KEY_A = 65;
 SETUP_KEY_D = 68;
 SETUP_MOD_SHIFT = 1;
 SETUP_MOD_CTRL = 2;
+SETUP_KEY_R = 82;
+SETUP_KEY_PAGE_UP = 266;
+SETUP_KEY_PAGE_DOWN = 267;
+SETUP_KEY_RIGHT = 262;
+SETUP_KEY_LEFT = 263;
+SETUP_KEY_DOWN = 264;
+SETUP_KEY_UP = 265;
+SETUP_ROTATE_STEP = 15; //degrees, R / Shift+R
+SETUP_HEIGHT_STEP = 0.5; //metres, Page Up / Page Down (with Shift a fifth)
+SETUP_MOUNT_LABELS = ["Standing (floor)", "Hanging (truss)"];
 
 class fixture_arranger {
 
@@ -51,6 +65,7 @@ class fixture_arranger {
 	managed status_label = None;
 	managed highlight_btn = None;
 	managed snap_btn = None;
+	managed view3d_btn = None;
 
 	managed left_content = None;
 	managed lamp_holder = None;
@@ -61,10 +76,15 @@ class fixture_arranger {
 	managed type_browser = None;
 	managed add_count = None;
 	managed add_type_label = None;
+	managed gdtf_path = None; //GDTF import (#669): the path field
+	gdtf_busy = false; //an import runs on its thread (it takes up to a few 100 ms: not in a click, that holds up the drawing)
+	gdtf_done = None; //its result, picked up by the next frame (draw_stage)
+	gdtf_waiting = []; //[path, at] of more .gdtf files dropped at once, imported one after the other
 
 	managed stage = None;
 	managed map_area = None;
-	managed map_title = None;
+	managed chmap = None; //the universe map
+	map_shift = 0; //universes the arrows of the map stepped from the selection
 
 	managed inspector_holder = None;
 	range_label = None; //"U0 · 1–4" of the lamp in the inspector
@@ -83,20 +103,28 @@ class fixture_arranger {
 	view_x = 0.0; //where the middle of the stage is, from the middle of the plan widget
 	view_y = 0.0;
 
-	drag_mode = ""; //"move", "box", "pan"
+	view3d = false; //the stage in 3D instead of the plan
+	managed view3d_view = None; //the 3D view (#686: nanogui.view3d, drawn with OpenGL), over the plan while view3d is on
+	scene3d = None; //what it shows (engine/patch/stage3d_scene.shio)
+	drag_level = 0.0; //3D: the height a lamp is moved at
+	drag_pick = None; //3D: the lamp under a Shift press (raised by a drag, selected by a click)
+	drag_grab = None; //3D: where on that level the move started
+
+	drag_mode = ""; //"move", "box", "pan", 3D: "move3d", "orbit", "pan3d"
 	drag_start = None;
 	drag_now = None;
 	drag_moved = false;
-	drag_origin = []; //id -> [x, y] when a move started
+	drag_origin = []; //id -> [x, y, z] when a move started
 
 	seen_revision = -1;
 	seen_dmx_state = ""; //what the LEDMappers send (dmx_state): their channels are problems and in the map
 	problems = [];
 	map_cells = None; //dmx_universe_cells() of the universe in the map, cached
 	map_cells_key = "";
+	map_cache = None; //map_data(), worked out again when the patch, the selection or the universe changed (#682)
+	map_cache_key = "";
 	node_count = -1;
 	frame_counter = 0;
-	map_hover = "";
 
 	__init__(parent) {
 		engine = std.global("engine");
@@ -255,6 +283,16 @@ class fixture_arranger {
 		fit = toolbar.button("Fit").icon(nanogui.icon("expand")).anchor_left(x).anchor_top(2).fixed_width(70).fixed_height(SETUP_ROW);
 		fit.tooltip("Show all lamps (scroll to zoom, drag with the right mouse button to move the plan)");
 		fit.on_click([this]() { this.fit_view(); });
+		x += 74;
+		view3d_btn = toolbar.pushbutton("3D").icon(PAL_ICON_CUBE).anchor_left(x).anchor_top(2).fixed_width(64).fixed_height(SETUP_ROW).pushed(view3d);
+		view3d_btn.tooltip("The stage in 3D: lamps at their height (Height in the settings of a lamp), beams turned by pan and tilt and in the colour they are sent. Drag: turn, right mouse button: move, scroll: zoom. Off: the plan from above\n[[wiki:Output-and-Devices#the-stage-in-3d]]");
+		view3d_btn.on_change([this](v) {
+			this.view3d = v;
+			this.view3d_view.visible(v);
+			this.drag_mode = "";
+			if(v)
+				this.fit_view3d();
+		});
 
 		status_label = toolbar.label("").anchor_right(8).anchor_top(0).fixed_height(SETUP_TOOLBAR_H).fixed_width(420).alignment("right");
 	}
@@ -296,13 +334,17 @@ class fixture_arranger {
 
 		section_title(left_content, "Fixture types");
 		type_browser = left_content.filebrowser("assets/Fixtures").fixed_height(200);
-		type_browser.extensions([".json"]);
-		type_browser.tooltip("Click a type, then Add. Or drag it onto the plan. The Fixture editor (Editor.menu) makes new types.");
+		type_browser.extensions([".json", ".gdtf"]);
+		type_browser.tooltip("Click a type, then Add. Or drag it onto the plan. The Fixture editor (Devices, next to the Fixture setup) makes new types.\nA .gdtf file (GDTF Share, the manufacturer) in assets/Fixtures: click it to import it, one type per DMX mode.\n[[wiki:Output-and-Devices#import-a-gdtf-file]]");
 		type_browser.on_click([this](path) {
 			rel = fileio.relative_path_cwd(path);
+			if(fileio.is_file(rel) && std.string(rel).lowercase().ends(".gdtf")) {
+				this.import_gdtf(rel);
+				return;
+			}
 			if(fileio.is_file(rel) && patch_type(rel).valid) {
 				this.add_type = patch_norm_path(rel);
-				this.add_type_label.caption(patch_type(rel).name + " · " + patch_footprint(rel) + " channels");
+				this.add_type_label.caption(patch_type(rel).name + " · " + patch_footprint(rel) + " channels").text_color(PAL_TEXT_3).tooltip("");
 			}
 		});
 		type_browser.on_double_click([this](path) {
@@ -311,6 +353,23 @@ class fixture_arranger {
 				this.add_type = patch_norm_path(rel);
 				this.add_lamps(1);
 			}
+		});
+
+		//GDTF (#669): a .gdtf file from anywhere on the computer
+		gdtf_row = left_content.widget().fixed_height(SETUP_ROW + 4);
+		gdtf_path = gdtf_row.textbox("").anchor_left(0).anchor_right(70).fixed_height(SETUP_ROW).placeholder("Path of a .gdtf file");
+		gdtf_path.tooltip("A GDTF fixture file (.gdtf: GDTF Share, the manufacturer, grandMA3, Vectorworks). Import makes a fixture type of each of its DMX modes in assets/Fixtures/<manufacturer>/<fixture>.\n[[wiki:Output-and-Devices#import-a-gdtf-file]]");
+		gdtf_btn = gdtf_row.button("Import").anchor_right(0).fixed_width(66).fixed_height(SETUP_ROW);
+		gdtf_btn.tooltip("Imports the .gdtf file of the field to the left");
+		gdtf_btn.on_click([this]() {
+			path = std.string(this.gdtf_path.value()).trim();
+			if(path.starts("\"") && path.ends("\"") && path.length() >= 2)
+				path = path.substr(1, path.length() - 2); //"Copy as path" of Windows
+			if(!path) {
+				this.add_type_label.caption("Type or paste the path of a .gdtf file").text_color(PAL_DANGER);
+				return;
+			}
+			this.import_gdtf(path);
 		});
 
 		add_type_label = left_content.label("Pick a fixture type").fixed_height(22).text_color(PAL_TEXT_3);
@@ -354,7 +413,7 @@ class fixture_arranger {
 				btn.tooltip(problems[id].combine_string("\n"));
 			}
 			else
-				btn.tooltip(patch_type(f.type).name + " · " + node_name(f.node) + " · " + patch_address_text(f));
+				btn.tooltip(patch_type(f.type).name + " · " + (!f.node && patch_is_virtual(f) ? "Virtual: MapLab, FixtureState" : node_name(f.node) + " · " + patch_address_text(f)));
 			btn.on_change([this, id](v) {
 				add = this.engine.screen.modifier_shift() || this.engine.screen.modifier_ctrl();
 				this.select_ids([id], add, true);
@@ -525,12 +584,13 @@ class fixture_arranger {
 					f.y = v;
 			});
 			rot = field_row(inspector, "Rotation").intbox().anchor(0).min_value(-360).max_value(360).value(std.int(f.rotation ?? 0));
-			rot.tooltip("Degrees, for bars: which way the pixels run");
+			rot.tooltip("Degrees, for bars: which way the pixels run. In 3D: which way the lamp faces");
 			rot.value_callback([this, id](v) {
 				f = patch_find(this.patch(), id);
 				if(f)
 					f.rotation = v;
 			});
+			build_height_fields(inspector, [id], f);
 
 			problem_label = inspector.label(problems.has(id) ? problems[id].combine_string("\n") : "").wrap(true).fixed_width(SETUP_RIGHT_W - 16);
 			problem_label.text_color(PAL_DANGER);
@@ -565,11 +625,43 @@ class fixture_arranger {
 				patch_readdress(this.patch(), this.selected, this.multi_node_mac, uni.value(), 0);
 				this.changed(true);
 			});
+			build_height_fields(inspector, selected.copy(), first);
 		}
 
 		remove_btn = inspector.button(lamps.size() == 1 ? "Remove lamp" : "Remove " + lamps.size() + " lamps").icon(nanogui.icon("trash")).fixed_height(SETUP_ROW).danger(true);
 		remove_btn.on_click([this]() { this.remove_selected(); });
 		inspector_holder.refresh_layout();
+	}
+
+	//Height, mount and lean of the lamps (ids): the 3D view (#655, #669)
+	build_height_fields(parent, ids, first) {
+		height = field_row(parent, "Height").floatbox().anchor(0).value(first.z ?? 0.0);
+		height.tooltip(ids.size() > 1 ? "Metres above the floor, for all of them (3D view)" : "Metres above the floor (3D view): on a truss for example 5");
+		height.value_callback([this, ids](v) {
+			for(i = 0; i < ids.size(); i++) {
+				f = patch_find(this.patch(), ids[i]);
+				if(f)
+					f.z = math.max(0.0, v);
+			}
+		});
+		mount = field_row(parent, "Mount").combobox().items(SETUP_MOUNT_LABELS).selected((first.mount ?? "floor") == "hanging" ? 1 : 0).anchor(0);
+		mount.tooltip("Standing on the floor (the beam goes up at the middle of tilt) or hanging upside down from a truss (it goes down)");
+		mount.on_change([this, ids](index, text) {
+			for(i = 0; i < ids.size(); i++) {
+				f = patch_find(this.patch(), ids[i]);
+				if(f)
+					f.mount = PATCH_MOUNTS[index == 1 ? 1 : 0];
+			}
+		});
+		lean = field_row(parent, "Lean").floatbox().anchor(0).min_value(-90).max_value(90).value(first.lean ?? 0.0);
+		lean.tooltip("Degrees the lamp leans towards its front (3D view): a bar on the floor angled at the audience, a head on a side truss. 0: straight");
+		lean.value_callback([this, ids](v) {
+			for(i = 0; i < ids.size(); i++) {
+				f = patch_find(this.patch(), ids[i]);
+				if(f)
+					f.lean = math.clamp(v, -90.0, 90.0);
+			}
+		});
 	}
 
 	build_nodes() {
@@ -690,6 +782,7 @@ class fixture_arranger {
 
 	//add: keep the selection and add (or take out) these; toggle: a second click takes a lamp out
 	select_ids(ids, add = false, toggle = false) {
+		map_shift = 0; //the map goes back to the universe of the selection
 		if(!add) {
 			if(toggle && ids.size() == 1 && selected.size() == 1 && selected[0] == ids[0])
 				selected = [];
@@ -746,20 +839,44 @@ class fixture_arranger {
 		});
 		stage.on_dragdrop([this](payload, pos) {
 			types = this.dropped_types(payload);
-			for(i = 0; i < types.size(); i++)
-				this.add_lamp_at(types[i], this.to_world(vec2f(pos.x + i * 20, pos.y)));
+			for(i = 0; i < types.size(); i++) {
+				at = this.drop_point(vec2f(pos.x + i * 20, pos.y));
+				if(types[i].lowercase().ends(".gdtf"))
+					this.import_gdtf(types[i], at); //a lamp of its first mode where it was dropped
+				else
+					this.add_lamp_at(types[i], at);
+			}
 			return types.size() > 0;
 		});
 
-		map_area.on_draw([this]() { this.draw_map(); });
-		map_area.on_mouse_button([this](pos, button, down, mods) { return this.map_button(pos, button, down, mods); });
-		map_area.on_mouse_motion([this](pos, rel, button, mods) {
-			this.map_motion(pos);
-			return false;
+		//The stage in 3D (#686): a view over the plan, the same mouse, keys and drops
+		view3d_view = stage.view3d().anchor_left(0).anchor_right(0).anchor_top(0).anchor_bottom(0).visible(view3d);
+		view3d_view.background(PAL_CANVAS);
+		view3d_view.camera([target = [x = 0.0, y = 0.0, z = 1.0], yaw = 0.45, pitch = 0.5, distance = 16.0]);
+		scene3d = stage3d_scene(view3d_view);
+		view3d_view.on_prepare([this]() { this.sync_stage3d(); });
+		view3d_view.on_draw([this]() { this.draw_stage3d(); });
+		view3d_view.on_mouse_button([this](pos, button, down, mods) { return this.stage_button3d(pos, button, down, mods); });
+		view3d_view.on_mouse_drag([this](pos, rel, button, mods) { return this.stage_drag3d(pos, rel, button, mods); });
+		view3d_view.on_scroll([this](pos, rel) {
+			this.view3d_view.zoom(rel.y);
+			return true;
 		});
+		view3d_view.on_keyboard([this](key, scancode, action, mods) { return this.stage_key(key, action, mods); });
+		view3d_view.on_dragdrop_hover(stage.on_dragdrop_hover());
+		view3d_view.on_dragdrop(stage.on_dragdrop());
+
+		chmap = channel_map(map_area);
+		chmap.provider = [this]() { return this.map_data(); };
+		chmap.on_pick = [this](b, mods) { this.map_pick(b, mods); };
+		chmap.on_move = [this](b, delta) { this.map_move(b, delta); };
+		chmap.on_universe = [this](d) {
+			if(this.map_target().universe + d >= 0)
+				this.map_shift = this.map_shift + d;
+		};
 	}
 
-	//The fixture types in a drop from a file browser
+	//The fixture types (.json) and GDTF files (.gdtf) in a drop from a file browser
 	dropped_types(payload) {
 		list = [];
 		paths = [];
@@ -769,10 +886,65 @@ class fixture_arranger {
 			paths = [payload.path];
 		for(i = 0; i < paths.size(); i++) {
 			rel = fileio.relative_path_cwd(paths[i]);
-			if(std.string(rel).lowercase().ends(".json") && patch_type(rel).valid)
+			low = std.string(rel).lowercase();
+			if((low.ends(".json") && patch_type(rel).valid) || (low.ends(".gdtf") && fileio.is_file(rel)))
 				list.push_back(patch_norm_path(rel));
 		}
 		return list;
+	}
+
+	//Imports a .gdtf file (engine/patch/gdtf.shio) on a thread; the next frame after it is done picks its first DMX mode
+	//for Add (finish_gdtf_import). at: a point of the plan (a drop) where a lamp of that mode goes, or None
+	import_gdtf(path, at = None) {
+		if(gdtf_busy || gdtf_done) {
+			gdtf_waiting.push_back([path = path, at = at]);
+			return;
+		}
+		gdtf_busy = true;
+		add_type_label.caption("Importing " + fileio.file_name(path) + "…").text_color(PAL_TEXT_3);
+		spot = std.is_none(at) ? None : [x = at.x, y = at.y];
+		worker = std.thread([this, path, spot]() {
+			r = None;
+			try {
+				r = gdtf_import(path);
+			}
+			catch(e) {
+				r = [ok = false, error = "Import of " + fileio.file_name(path) + " failed: " + e];
+			}
+			r.at = spot;
+			this.gdtf_done = r;
+			this.gdtf_busy = false;
+		});
+		worker.run();
+	}
+
+	finish_gdtf_import(r) {
+		if(!r.ok) {
+			add_type_label.caption(r.error).text_color(PAL_DANGER);
+			add_type_label.tooltip(r.error);
+		}
+		else {
+			type_browser.refresh();
+			if(engine && engine.filebrowser)
+				engine.filebrowser.refresh();
+			first = r.types[0];
+			add_type = first.path;
+			modes = r.types.size() == 1 ? "1 mode" : r.types.size() + " modes";
+			add_type_label.caption(r.name + ": " + modes + " · " + first.mode + " · " + first.channels + " ch").text_color(PAL_TEXT_2);
+			tip = "Imported " + (r.manufacturer ? r.manufacturer + " " : "") + r.name + " into " + r.folder + ":";
+			for(t : r.types)
+				tip += "\n" + t.mode + ": " + t.channels + " channels";
+			for(problem : r.problems)
+				tip += "\n" + problem;
+			add_type_label.tooltip(tip + "\nThe other modes are in that folder of Fixture types.");
+			if(r.at)
+				add_lamp_at(first.path, r.at);
+		}
+		if(gdtf_waiting.size()) {
+			next = gdtf_waiting[0];
+			gdtf_waiting.erase(0);
+			import_gdtf(next.path, next.at);
+		}
 	}
 
 	stage_size() {
@@ -789,7 +961,20 @@ class fixture_arranger {
 		return vec2f((pos.x - s.x / 2.0 - view_x) / view_scale, (pos.y - s.y / 2.0 - view_y) / view_scale);
 	}
 
+	//Where a drop at pos lands on the stage: on the plan, or on the floor of the 3D view
+	drop_point(pos) {
+		if(view3d) {
+			at = view3d_view.hit_level(pos, 0.0);
+			return at ? vec2f(at.x, at.y) : vec2f(0.0, 0.0);
+		}
+		return to_world(pos);
+	}
+
 	fit_view() {
+		if(view3d) {
+			fit_view3d();
+			return;
+		}
 		p = patch();
 		b = patch_bounds(p.fixtures);
 		s = stage_size();
@@ -814,12 +999,9 @@ class fixture_arranger {
 		view_y += (after.y - before.y) * view_scale;
 	}
 
-	//Size of a lamp on the plan: bars (several pixels) are long, others round. [bar, length, width] in metres
+	//Size of a lamp on the plan: bars (several pixels) are long, others round. [kind, bar, length, width] in metres
 	lamp_shape(f) {
-		pixels = patch_pixel_slots(f.type).size();
-		if(pixels >= 2)
-			return [bar = true, length = math.max(0.6, pixels * 0.12), width = 0.22];
-		return [bar = false, length = 0.5, width = 0.5];
+		return patch_lamp_size(f);
 	}
 
 	//Is pos (screen) on the lamp
@@ -903,13 +1085,42 @@ class fixture_arranger {
 			w = math.max(6.0, shape.width * view_scale);
 			nvgRoundedRect(vec2f(-l / 2.0, -w / 2.0), vec2f(l, w), 2);
 		}
-		else
-			nvgCircle(vec2f(0, 0), math.max(6.0, shape.length * view_scale / 2.0));
+		else if(shape.kind == "dimmer") {
+			r = math.max(6.0, shape.length * view_scale / 2.0) * 0.85;
+			nvgRoundedRect(vec2f(-r, -r), vec2f(r * 2.0, r * 2.0), math.max(1.0, r * 0.25));
+		}
+		else {
+			r = math.max(6.0, shape.length * view_scale / 2.0);
+			//a moving head: its yoke, a square under the round head (#669)
+			if(shape.kind == "head") {
+				y = r * 1.15;
+				nvgRoundedRect(vec2f(-y, -y), vec2f(y * 2.0, y * 2.0), 2);
+				nvgFillColor(PAL_RAISED);
+				nvgFill();
+				nvgStrokeColor(outline);
+				nvgStrokeWidth(1.0);
+				nvgStroke();
+				nvgBeginPath();
+				r *= 0.8;
+			}
+			nvgCircle(vec2f(0, 0), r);
+		}
 		nvgFillColor(fill);
 		nvgFill();
 		nvgStrokeColor(outline);
 		nvgStrokeWidth(is_selected || problem ? 2.0 : 1.0);
 		nvgStroke();
+		//The front of a head (where it faces at the middle of its tilt, Rotation): a notch on its yoke
+		if(shape.kind == "head") {
+			y = math.max(6.0, shape.length * view_scale / 2.0) * 1.15;
+			nvgBeginPath();
+			nvgMoveTo(vec2f(-3.0, y));
+			nvgLineTo(vec2f(3.0, y));
+			nvgLineTo(vec2f(0.0, y + 4.0));
+			nvgClosePath();
+			nvgFillColor(outline);
+			nvgFill();
+		}
 		//Pixel order of a bar: a dot on the first pixel
 		if(shape.bar) {
 			l = math.max(16.0, shape.length * view_scale);
@@ -931,6 +1142,12 @@ class fixture_arranger {
 	}
 
 	draw_stage() {
+		//A GDTF import is done (import_gdtf ran it on a thread)
+		if(gdtf_done) {
+			r = gdtf_done;
+			gdtf_done = None;
+			finish_gdtf_import(r);
+		}
 		//The patch changed elsewhere (a project was loaded, the Phaser, ...)
 		if(engine.patch_revision != seen_revision) {
 			seen_revision = engine.patch_revision;
@@ -953,6 +1170,9 @@ class fixture_arranger {
 		if(frame_counter % 120 == 0 && known_nodes().size() != node_count)
 			build_nodes();
 
+		//(the 3D view is a widget over the plan: it draws itself, sync_stage3d / draw_stage3d)
+		if(view3d)
+			return;
 		draw_grid();
 		p = patch();
 		for(i = 0; i < p.fixtures.size(); i++) {
@@ -990,8 +1210,11 @@ class fixture_arranger {
 	}
 
 	stage_button(pos, button, down, mods) {
+		if(view3d)
+			return stage_button3d(pos, button, down, mods);
 		//(a left click already gives the plan the keyboard focus: Delete, Ctrl+A, Ctrl+D, Esc)
-		if(button == 1) {
+		//The right or the middle button moves the plan
+		if(button == 1 || button == 2) {
 			drag_mode = down ? "pan" : "";
 			return true;
 		}
@@ -1065,6 +1288,8 @@ class fixture_arranger {
 	}
 
 	stage_drag(pos, rel, button, mods) {
+		if(view3d)
+			return stage_drag3d(pos, rel, button, mods);
 		if(drag_mode == "pan") {
 			view_x += rel.x;
 			view_y += rel.y;
@@ -1097,6 +1322,9 @@ class fixture_arranger {
 	}
 
 	stage_key(key, action, mods) {
+		//(held down: only moving, raising and turning repeat)
+		if(action == 2)
+			return transform_key(key, mods);
 		if(action != 1)
 			return false;
 		if(key == SETUP_KEY_DELETE || key == SETUP_KEY_BACKSPACE) {
@@ -1119,19 +1347,262 @@ class fixture_arranger {
 			duplicate_selected();
 			return true;
 		}
+		return transform_key(key, mods);
+	}
+
+	//#669: turn, raise and nudge the selected lamps, in the plan and in 3D
+	transform_key(key, mods) {
+		if(!selected.size() || (mods & SETUP_MOD_CTRL))
+			return false;
+		fine = mods & SETUP_MOD_SHIFT;
+		if(key == SETUP_KEY_R)
+			return transform_selected(0.0, 0.0, 0.0, fine ? -SETUP_ROTATE_STEP : SETUP_ROTATE_STEP);
+		if(key == SETUP_KEY_PAGE_UP || key == SETUP_KEY_PAGE_DOWN) {
+			step = fine ? SETUP_HEIGHT_STEP / 5.0 : SETUP_HEIGHT_STEP;
+			return transform_selected(0.0, 0.0, key == SETUP_KEY_PAGE_UP ? step : -step, 0);
+		}
+		step = fine ? SETUP_SNAP / 5.0 : SETUP_SNAP;
+		if(key == SETUP_KEY_LEFT)
+			return transform_selected(-step, 0.0, 0.0, 0);
+		if(key == SETUP_KEY_RIGHT)
+			return transform_selected(step, 0.0, 0.0, 0);
+		//on the plan y grows towards the audience (down the screen)
+		if(key == SETUP_KEY_UP)
+			return transform_selected(0.0, -step, 0.0, 0);
+		if(key == SETUP_KEY_DOWN)
+			return transform_selected(0.0, step, 0.0, 0);
 		return false;
 	}
 
+	//Moves the selected lamps by (dx, dy) on the plan and dz up (not below the floor) and turns them by rot degrees
+	//(kept in -360..360, as the inspector takes it)
+	transform_selected(dx, dy, dz, rot) {
+		lamps = selected_lamps();
+		if(!lamps.size())
+			return false;
+		for(i = 0; i < lamps.size(); i++) {
+			f = lamps[i];
+			f.x += dx;
+			f.y += dy;
+			f.z = math.max(0.0, (f.z ?? 0.0) + dz);
+			r = std.int(f.rotation ?? 0) + rot;
+			for(r > 360)
+				r -= 360;
+			for(r < -360)
+				r += 360;
+			f.rotation = r;
+		}
+		changed(true);
+		return true;
+	}
+
 	// =========================================================================
-	// The universe map
+	// The stage in 3D (#655)
 	// =========================================================================
 
-	//Node and universe the map shows: of the first selected lamp, else where new lamps go
+	//The camera of the 3D view: [target, yaw, pitch, distance, fov, eye, forward, right, up] (stage3d_camera)
+	camera3d() {
+		return view3d_view.camera();
+	}
+
+	fit_view3d() {
+		fit = stage3d_fit(patch().fixtures);
+		view3d_view.camera([target = fit.target, distance = fit.distance]);
+	}
+
+	//Before each picture of the 3D view: the lamps, their colour and pan / tilt, the selection (#686)
+	sync_stage3d() {
+		if(!view3d || !engine)
+			return;
+		scene3d.sync(patch().fixtures, engine.fixture_menu, selected, problems);
+	}
+
+	//On top of the picture: the names of the lamps, the help line, the height of a lamp moved up and down
+	draw_stage3d() {
+		s = view3d_view.size();
+		lamps = patch().fixtures;
+		for(f : lamps) {
+			is_selected = selected.has_value(f.id);
+			if(!is_selected && lamps.size() > 24)
+				continue;
+			box = scene3d.lamp_box(f.id);
+			if(box)
+				pal_text(vec2f((box.min.x + box.max.x) / 2.0, box.max.y + 9), f.name, 11, is_selected ? PAL_TEXT : PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		}
+		audience = view3d_view.project([x = 0.0, y = scene3d.floor_y1 + 0.5, z = 0.0]);
+		if(audience.ok)
+			pal_text(vec2f(audience.x, audience.y), "Audience", 12, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+
+		pal_text(vec2f(8, 12), nanogui.key_text("3D   ·   Drag: turn · right mouse button: move · scroll: zoom · drag a lamp: move it at its height · Shift+drag: up and down · R: rotate · Shift+click: select more"), 12, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+		//the height of the lamp under the mouse (the others move as far)
+		if(drag_mode == "lift3d" && drag_moved && drag_pick) {
+			picked = patch_find(patch(), drag_pick);
+			if(picked)
+				pal_text(vec2f(8, 28), "Height " + metres_text(picked.z ?? 0.0), 12, PAL_TEXT, PAL_ALIGN_LEFT_MIDDLE);
+		}
+		if(!lamps.size())
+			pal_text(vec2f(s.x / 2.0, s.y / 2.0), "Drag a fixture type here", 16, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+	}
+
+	//"2.35 m"
+	metres_text(v) {
+		cm = std.int(math.round(math.max(0.0, v) * 100.0));
+		rest = cm % 100;
+		return std.string(std.int(cm / 100)) + "." + (rest < 10 ? "0" : "") + rest + " m";
+	}
+
+	lamp_at3d(pos) {
+		id = scene3d.lamp_at(pos);
+		return id ? patch_find(patch(), id) : None;
+	}
+
+	//Where the mouse is on the level z
+	level_point(pos, z) {
+		return view3d_view.hit_level(pos, z);
+	}
+
+	stage_button3d(pos, button, down, mods) {
+		//The right or the middle button moves the stage
+		if(button == 1 || button == 2) {
+			drag_mode = down ? "pan3d" : "";
+			return true;
+		}
+		if(button != 0)
+			return false;
+		p = vec2f(pos.x, pos.y);
+		if(down) {
+			drag_start = p;
+			drag_now = p;
+			drag_moved = false;
+			add = (mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL);
+			hit = lamp_at3d(p);
+			//Shift+drag a lamp: up and down (#669), with the selected ones. Shift+click without moving still selects
+			//more (on the release)
+			if(hit && (mods & SETUP_MOD_SHIFT)) {
+				drag_mode = "lift3d";
+				drag_pick = hit.id;
+				drag_origin = [];
+				p_all = patch();
+				for(i = 0; i < p_all.fixtures.size(); i++) {
+					f = p_all.fixtures[i];
+					if(f.id == hit.id || selected.has_value(f.id))
+						drag_origin[f.id] = [x = f.x, y = f.y, z = f.z ?? 0.0];
+				}
+				return true;
+			}
+			if(hit) {
+				if(!selected.has_value(hit.id))
+					select_ids([hit.id], add, false);
+				else if(add) {
+					select_ids([hit.id], true, true);
+					drag_mode = "";
+					return true;
+				}
+				drag_mode = "move3d";
+				drag_level = hit.z ?? 0.0;
+				drag_grab = level_point(p, drag_level);
+				drag_origin = [];
+				lamps = selected_lamps();
+				for(i = 0; i < lamps.size(); i++)
+					drag_origin[lamps[i].id] = [x = lamps[i].x, y = lamps[i].y];
+			}
+			else
+				drag_mode = "orbit";
+			return true;
+		}
+		//a click on the empty stage selects none
+		if(drag_mode == "orbit" && !drag_moved && !((mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL)) && selected.size())
+			select_ids([], false, false);
+		else if((drag_mode == "move3d" || drag_mode == "lift3d") && drag_moved)
+			changed(true);
+		//a Shift+click on a lamp: selects it too, or no more when it was
+		else if(drag_mode == "lift3d" && drag_pick)
+			select_ids([drag_pick], true, selected.has_value(drag_pick));
+		drag_pick = None;
+		drag_mode = "";
+		drag_start = None;
+		drag_now = None;
+		return true;
+	}
+
+	stage_drag3d(pos, rel, button, mods) {
+		if(drag_mode == "pan3d") {
+			//the target moves over the floor, as far as the mouse at its distance
+			view3d_view.pan(rel);
+			return true;
+		}
+		if(!drag_start)
+			return false;
+		drag_now = vec2f(pos.x, pos.y);
+		if((drag_now - drag_start).length() > 3.0)
+			drag_moved = true;
+		if(drag_mode == "orbit") {
+			view3d_view.orbit(rel);
+			return true;
+		}
+		if(drag_mode == "lift3d" && drag_moved) {
+			if(drag_pick && !selected.has_value(drag_pick))
+				select_ids([drag_pick], true, false);
+			//as far up as the mouse goes at the distance of the lamp (pixels to metres there), snapped to SETUP_SNAP; the
+			//selected lamps and the one under the press
+			cam = camera3d();
+			//(metres per pixel where the lamp under the mouse is)
+			depth = cam.distance;
+			lamps = selected_lamps();
+			picked = drag_pick ? patch_find(patch(), drag_pick) : None;
+			if(picked) {
+				pr = view3d_view.project(stage3d_lamp_pos(picked));
+				if(pr.ok)
+					depth = pr.depth;
+			}
+			k = depth / view3d_view.focal();
+			//up on the screen is up in the world only as far as the camera looks level
+			dz = (drag_start.y - drag_now.y) * k / math.max(0.2, math.cos(cam.pitch));
+			snap = snap_btn.pushed();
+			for(i = 0; i < lamps.size(); i++) {
+				o = drag_origin[lamps[i].id] ?? None;
+				if(!o)
+					continue;
+				nz = math.max(0.0, o.z + dz);
+				if(snap)
+					nz = math.round(nz / SETUP_SNAP) * SETUP_SNAP;
+				lamps[i].z = nz;
+			}
+			return true;
+		}
+		if(drag_mode == "move3d" && drag_moved && drag_grab) {
+			at = level_point(drag_now, drag_level);
+			if(!at)
+				return true;
+			snap = snap_btn.pushed();
+			lamps = selected_lamps();
+			for(i = 0; i < lamps.size(); i++) {
+				o = drag_origin[lamps[i].id] ?? None;
+				if(!o)
+					continue;
+				nx = o.x + at.x - drag_grab.x;
+				ny = o.y + at.y - drag_grab.y;
+				if(snap) {
+					nx = math.round(nx / SETUP_SNAP) * SETUP_SNAP;
+					ny = math.round(ny / SETUP_SNAP) * SETUP_SNAP;
+				}
+				lamps[i].x = nx;
+				lamps[i].y = ny;
+			}
+		}
+		return true;
+	}
+
+	// =========================================================================
+	// The universe map (engine/patch/channelmap.shio): drag a lamp to other channels (#655)
+	// =========================================================================
+
+	//Node and universe the map shows: of the first selected lamp, else where new lamps go; the arrows step from there
 	map_target() {
 		lamps = selected_lamps();
 		if(lamps.size())
-			return [node = lamps[0].node, universe = lamps[0].universe];
-		return [node = drop_node, universe = drop_universe];
+			return [node = lamps[0].node, universe = math.max(0, lamps[0].universe + map_shift)];
+		return [node = drop_node, universe = math.max(0, drop_universe + map_shift)];
 	}
 
 	//What the LEDMappers write in the universe of the map (dmx_universe_cells), worked out again when something changed
@@ -1144,41 +1615,25 @@ class fixture_arranger {
 		return map_cells;
 	}
 
-	map_cell_rect(c) {
-		s = map_area.size();
-		top = 30;
-		cw = (s.x - SETUP_MAP_LEFT - 8) / SETUP_MAP_COLS;
-		ch = (s.y - top - 8) / SETUP_MAP_ROWS;
-		col = c % SETUP_MAP_COLS;
-		row = std.int(c / SETUP_MAP_COLS);
-		return [x = SETUP_MAP_LEFT + col * cw, y = top + row * ch, w = cw, h = ch];
-	}
-
-	map_cell_at(pos) {
-		s = map_area.size();
-		top = 30;
-		cw = (s.x - SETUP_MAP_LEFT - 8) / SETUP_MAP_COLS;
-		ch = (s.y - top - 8) / SETUP_MAP_ROWS;
-		col = std.int((pos.x - SETUP_MAP_LEFT) / cw);
-		row = std.int((pos.y - top) / ch);
-		if(pos.x < SETUP_MAP_LEFT || pos.y < top || col < 0 || col >= SETUP_MAP_COLS || row < 0 || row >= SETUP_MAP_ROWS)
-			return -1;
-		return row * SETUP_MAP_COLS + col;
-	}
-
-	draw_map() {
-		s = map_area.size();
-		nvgBeginPath();
-		nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
-		nvgFillColor(PAL_FIELD);
-		nvgFill();
-
+	//What the channel map shows: the lamps of the universe as blocks, the LEDMappers as cells. Asked every frame: built
+	//again only when something it shows changed (#682)
+	map_data() {
 		target = map_target();
-		p = patch();
-		if(!target.node) {
-			pal_text(vec2f(8, 15), "Universe map: pick a node for a lamp to see its universe", 12, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
-			return;
+		key = target.node + "|" + std.string(target.universe) + "|" + std.string(engine.patch_revision) + "|" + seen_dmx_state +
+			"|" + selected.compact_string() + "|" + node_name(target.node);
+		if(!map_cache || key != map_cache_key) {
+			map_cache = build_map_data(target);
+			map_cache_key = key;
 		}
+		return map_cache;
+	}
+
+	build_map_data(target) {
+		data = [node = target.node, universe = target.universe, title = "", blocks = [], cells = None,
+			empty = "Universe map: pick a node for a lamp to see its universe"];
+		if(!target.node)
+			return data;
+		p = patch();
 		map = patch_universe_map(p, target.node, target.universe);
 		cells = universe_cells(target);
 		used = 0;
@@ -1189,87 +1644,49 @@ class fixture_arranger {
 			if(cells[c].state)
 				by_leds++;
 		}
-		title = node_name(target.node) + " · Universe " + target.universe + " · " + used + " of 512 channels used";
+		data.title = node_name(target.node) + " · Universe " + target.universe + " · " + used + " of 512 channels used";
 		if(by_leds)
-			title += " (" + by_leds + " by LEDMappers, grey)";
-		if(map_hover)
-			title += "   —   " + map_hover;
-		pal_text(vec2f(8, 15), title, 12, PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE);
-
-		//Index of each lamp for its colour
-		index_of = [];
-		for(i = 0; i < p.fixtures.size(); i++)
-			index_of[p.fixtures[i].id] = i;
-
-		for(c = 0; c < PATCH_UNIVERSE_SIZE; c++) {
-			r = map_cell_rect(c);
-			id = map[c];
-			nvgBeginPath();
-			nvgRect(vec2f(r.x + 0.5, r.y + 0.5), vec2f(r.w - 1, r.h - 1));
-			led = cells[c].state;
-			if(id == "!" || led == "!")
-				nvgFillColor(PAL_DANGER);
-			else if(!id && led)
-				nvgFillColor(PAL_TEXT_2); //a LEDMapper writes here
-			else if(!id)
-				nvgFillColor(PAL_CONTROL);
-			else if(selected.has_value(id))
-				nvgFillColor(PAL_ACCENT);
-			else
-				nvgFillColor(pal_hue(index_of[id] ?? 0, 0.8));
-			nvgFill();
-		}
-		//Channel numbers at the start of each row
-		for(row = 0; row < SETUP_MAP_ROWS; row++) {
-			r = map_cell_rect(row * SETUP_MAP_COLS);
-			pal_text(vec2f(r.x - 4, r.y + r.h / 2.0), std.string(row * SETUP_MAP_COLS + 1), 10, PAL_TEXT_3, PAL_ALIGN_RIGHT_MIDDLE);
-		}
-	}
-
-	map_motion(pos) {
-		c = map_cell_at(pos);
-		if(c < 0) {
-			map_hover = "";
-			return;
-		}
-		target = map_target();
-		if(!target.node) {
-			map_hover = "";
-			return;
-		}
-		p = patch();
-		names = [];
+			data.title += " (" + by_leds + " by LEDMappers, grey)";
 		for(i = 0; i < p.fixtures.size(); i++) {
 			f = p.fixtures[i];
-			if(f.node == target.node && f.universe == target.universe && c + 1 >= f.address && c + 1 <= patch_end(f))
-				names.push_back(f.name + " (+" + (c + 1 - f.address) + ")");
-		}
-		cells = universe_cells(target);
-		led_names = cells[c].names;
-		for(i = 0; i < led_names.size(); i++)
-			names.push_back(led_names[i]);
-		//(not combine_string(): it puts the separator after the last one too)
-		text = "";
-		for(i = 0; i < names.size(); i++)
-			text += (i ? ", " : "") + names[i];
-		map_hover = "Channel " + (c + 1) + ": " + (names.size() ? text : "free");
-	}
-
-	map_button(pos, button, down, mods) {
-		if(button != 0 || !down)
-			return true;
-		c = map_cell_at(pos);
-		target = map_target();
-		if(c < 0 || !target.node)
-			return true;
-		p = patch();
-		for(i = 0; i < p.fixtures.size(); i++) {
-			f = p.fixtures[i];
-			if(f.node == target.node && f.universe == target.universe && c + 1 >= f.address && c + 1 <= patch_end(f)) {
-				select_ids([f.id], (mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL), true);
-				return true;
+			if(f.node != target.node || f.universe != target.universe)
+				continue;
+			first = math.max(1, f.address);
+			last = math.min(patch_end(f), PATCH_UNIVERSE_SIZE);
+			overlap = false;
+			for(c = first; c <= last; c++) {
+				if(map[c - 1] == "!" || cells[c - 1].state == "!")
+					overlap = true;
 			}
+			data.blocks.push_back([ref = f.id, first = first, last = last, label = f.name, color = pal_hue(i, 0.8), movable = true,
+				selected = selected.has_value(f.id), problem = overlap, tip = ""]);
 		}
-		return true;
+		data.cells = cells;
+		return data;
+	}
+
+	map_pick(b, mods) {
+		add = (mods & SETUP_MOD_SHIFT) || (mods & SETUP_MOD_CTRL);
+		if(!selected.has_value(b.ref)) {
+			select_ids([b.ref], add, false);
+			map_shift = 0;
+		}
+		else if(add)
+			select_ids([b.ref], true, true);
+	}
+
+	//A lamp dragged in the map: it moves delta channels, and the other selected lamps of the universe with it
+	map_move(b, delta) {
+		p = patch();
+		f = patch_find(p, b.ref);
+		if(!f)
+			return;
+		ids = selected.has_value(f.id) ? selected : [f.id];
+		for(i = 0; i < ids.size(); i++) {
+			lamp = patch_find(p, ids[i]);
+			if(lamp && lamp.node == f.node && lamp.universe == f.universe)
+				lamp.address = dmx_lamp_moved(lamp, delta);
+		}
+		changed(true);
 	}
 }

@@ -58,6 +58,8 @@ Ideas for links:
 - *Beat* into the brightness of a shader: it pulses with the music.
 - *Low energy* into a zoom or a strobe, with a *Normalized* [link type](Linking.md#link-types) so it fills the range.
 - *Break inverted* into the *Master* of a [layer](Clipview.md#layers): the layer goes dark in a break.
+- Light cues on the music: a cue of the [lighting desk](Lighting-Desk.md#cues-from-the-music) with *Starts* *Break* or
+  *Drop* starts by itself when a break starts or ends. No link is needed.
 
 ## Sync timeline
 

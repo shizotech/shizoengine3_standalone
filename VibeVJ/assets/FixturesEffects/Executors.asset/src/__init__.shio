@@ -1,0 +1,522 @@
+//Executors (#719): the playback faders of a lighting desk. Each executor plays a cue stack of engine.desk or is the
+//master of a group of the fixture setup. Its controls are link system controls: map them to a MIDI controller (a fader
+//wing) or link them, like any other.
+//
+//- Stack: Master scales the dimmers the stack sends (HTP: the highest of all wins), Go starts the next cue, Back the
+//  one before, Off releases the stack (the lamps go back to what they had), Flash (held) plays it at full and lets go.
+//  The stack started last wins on every channel other than dimmers (LTP).
+//- Group: Master is the Group master of the group (Devices > Fixtures > Masters), Flash holds it at full.
+//- Below: the cues of the executor that is picked (its name at the top): number, name, fade, delay, how it starts
+//  (Go, Follow: when the cue before has faded in, Wait: seconds, Beats: beats of the timeline after the cue before,
+//  Drop, Break, Phrase: the music). Go to plays a cue, × deletes it. Cues are made in the Programmer (Store cue) or on
+//  its command line. Above them: Go starts (now, next beat / bar / 4 bars / DJ phrase) and On a DJ phrase (DJ Link:
+//  nothing, Go, or the cue named like the phrase), both saved with the stack.
+//- Several Executors generators are several pages of faders.
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/fx"
+#include "engine/patch/desk"
+#include "engine/patch/palette"
+
+def apply_master(slot);
+def find_cue(sid, cid);
+def cue_colors(cue);
+def draw_look(w);
+
+EX_ROW = 28;
+EX_GAP = 4;
+EX_COL_W = 156;
+EX_MAX = 12;
+EX_SHEET_COLS = [
+	[name = "Cue", w = 64], [name = "Look", w = 96], [name = "Name", w = 180], [name = "Fade s", w = 72], [name = "Delay s", w = 72],
+	[name = "Starts", w = 96], [name = "Wait", w = 72], [name = "", w = 72], [name = "", w = 28],
+];
+
+engine = None;
+desk = None;
+managed columns_area = None;
+managed sheet_content = None;
+managed sheet_title = None;
+managed count_box = None;
+
+slots = [];       //[[n, target, widgets...], ...]
+slot_count = 6;
+picked = 0;       //the executor whose cues the sheet shows
+seen_revision = -1;
+seen_patch = -1;
+sheet_key = "x";  //what the sheet was built for: stack id and its cue ids
+pending_build = true;
+
+// =========================================================================
+// Targets
+// =========================================================================
+
+//What an executor can be: [[id, name], ...]: the stacks, New stack, the groups
+target_items() {
+	list = [[id = "", name = "Pick…"]];
+	for(i = 0; i < desk.data.stacks.size(); i++)
+		list.push_back([id = "stack:" + desk.data.stacks[i].id, name = desk.data.stacks[i].name]);
+	list.push_back([id = "new", name = "New stack"]);
+	for(i = 0; i < engine.patch.groups.size(); i++)
+		list.push_back([id = "group:" + engine.patch.groups[i].id, name = "Group: " + engine.patch.groups[i].name]);
+	return list;
+}
+
+target_stack(slot) {
+	t = std.string(slot.target);
+	return t.starts("stack:") ? desk_stack(desk.data, t.substr(6)) : None;
+}
+
+target_group_master(slot) {
+	t = std.string(slot.target);
+	if(!t.starts("group:") || !engine.fixture_menu)
+		return None;
+	return engine.fixture_menu.group_masters[t.substr(6)] ?? None;
+}
+
+fill_combo(slot) {
+	items = target_items();
+	names = [];
+	sel = 0;
+	for(i = 0; i < items.size(); i++) {
+		names.push_back(items[i].name);
+		if(items[i].id == slot.target && slot.target)
+			sel = i;
+	}
+	if(slot.target && sel == 0) {
+		names.push_back("(deleted)");
+		items.push_back([id = slot.target, name = "(deleted)"]);
+		sel = names.size() - 1;
+	}
+	slot.items = items;
+	slot.combo.items(names).selected(sel);
+}
+
+set_target(slot, index) {
+	if(index < 0 || index >= slot.items.size())
+		return;
+	id = slot.items[index].id;
+	if(id == "new")
+		id = "stack:" + desk.add_stack().id;
+	slot.target = id;
+	picked = slot.n;
+	apply_master(slot);
+	seen_revision = -1;
+}
+
+apply_master(slot) {
+	v = slot.flash_held ? 1.0 : slot.master.value();
+	s = target_stack(slot);
+	if(s)
+		desk.set_master(s.id, v);
+	gm = target_group_master(slot);
+	if(gm && math.abs(gm.value() - v) > 0.0001)
+		gm.value(v);
+}
+
+// =========================================================================
+// The columns
+// =========================================================================
+
+build_slot(n) {
+	group = "executor_" + n;
+	col = columns_area.widget().fixed_width(EX_COL_W).fixed_height(7 * (EX_ROW + EX_GAP));
+	head = col.pushbutton("Executor " + (n + 1)).anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(EX_ROW);
+	head.tooltip("Shows the cues of this executor below");
+	combo = col.combobox().anchor_left(0).anchor_right(0).anchor_top(EX_ROW + EX_GAP).fixed_height(EX_ROW);
+	combo.tooltip("What this [[executor]] plays: a [[cue stack]] (New stack makes one) or the [[group master]] of a group");
+	info = col.label("-").anchor_left(0).anchor_right(0).anchor_top(2 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW).text_color(PAL_TEXT_2);
+	bar = col.widget().anchor_left(0).anchor_right(0).anchor_top(3 * (EX_ROW + EX_GAP) - EX_GAP).fixed_height(EX_GAP);
+	master = col.controlslider("Master", group).caption("Master").value(1.0).anchor_left(0).anchor_right(0).anchor_top(3 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW);
+	master.tooltip("Stack: scales the dimmers it sends. Group: the Group master of the group. Map it to a fader\n[[wiki:Lighting-Desk#executors]]");
+	go = col.controlbutton("Go", group).caption("Go").anchor_left(0).anchor_right(0.5, "percent").anchor_top(4 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW);
+	go.tooltip("The next cue of the stack");
+	back = col.controlbutton("Back", group).caption("Back").anchor_left(0.5, "percent").anchor_right(0).anchor_top(4 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW);
+	back.tooltip("The cue before");
+	off = col.controlbutton("Off", group).caption("Off").anchor_left(0).anchor_right(0.5, "percent").anchor_top(5 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW);
+	off.tooltip("Releases the stack: it sends nothing, the lamps go back to what they had");
+	flash = col.controlbutton("Flash", group).caption("Flash").anchor_left(0.5, "percent").anchor_right(0).anchor_top(5 * (EX_ROW + EX_GAP)).fixed_height(EX_ROW);
+	flash.tooltip("While held: at full (a stack that is off starts and goes off again on release)");
+	flash.hold(true);
+	//playing the show is no edit: no steps of the undo history
+	go.undoable(false);
+	back.undoable(false);
+	off.undoable(false);
+	flash.undoable(false);
+
+	slots.push_back([n = n, target = "", items = [], col = col, head = head, combo = combo, info = info, bar = bar,
+		master = master, go = go, back = back, off = off, flash = flash, flash_held = false, flash_started = false, shown = ""]);
+	slot = slots[-1];
+	fill_combo(slot);
+	combo.on_change([n](index, text) {
+		set_target(slots[n], index);
+	});
+	head.on_change([n](v) {
+		picked = n;
+		seen_revision = -1;
+	});
+	master.callback([n](v) {
+		apply_master(slots[n]);
+	});
+	go.callback([n](v) {
+		if(!v)
+			return;
+		s = target_stack(slots[n]);
+		if(s)
+			desk.go(s.id, "go");
+	});
+	back.callback([n](v) {
+		if(!v)
+			return;
+		s = target_stack(slots[n]);
+		if(s)
+			desk.go(s.id, "back");
+	});
+	off.callback([n](v) {
+		if(!v)
+			return;
+		s = target_stack(slots[n]);
+		if(s)
+			desk.go(s.id, "off");
+	});
+	flash.callback([n](v) {
+		slot = slots[n];
+		s = target_stack(slot);
+		if(v) {
+			slot.flash_held = true;
+			if(s && !desk.stack_status(s.id).on) {
+				desk.go(s.id, "go");
+				slot.flash_started = true;
+			}
+		}
+		else {
+			slot.flash_held = false;
+			if(s && slot.flash_started)
+				desk.go(s.id, "off");
+			slot.flash_started = false;
+		}
+		apply_master(slot);
+	});
+	bar.on_draw([n]() {
+		slot = slots[n] ?? None;
+		if(!slot || !slot.bar || !desk)
+			return;
+		sz = slot.bar.size();
+		s = target_stack(slot);
+		if(!s)
+			return;
+		st = desk.stack_status(s.id);
+		if(!st.on)
+			return;
+		nvgBeginPath();
+		nvgRect(vec2f(0, 0), vec2f(sz.x * st.progress, sz.y));
+		nvgFillColor(st.progress < 1.0 ? PAL_CUE : PAL_ON);
+		nvgFill();
+	});
+	return slot;
+}
+
+build_columns() {
+	columns_area.clear_children();
+	old = slots;
+	slots = [];
+	for(n = 0; n < slot_count; n++) {
+		slot = build_slot(n);
+		if(n < old.size()) {
+			slot.target = old[n].target;
+			fill_combo(slot);
+		}
+	}
+	columns_area.parent().refresh_layout();
+}
+
+//What an executor shows: the cue it is at and the next one
+slot_text(slot) {
+	s = target_stack(slot);
+	if(s) {
+		st = desk.stack_status(s.id);
+		if(!s.cues.size())
+			return "No cues yet";
+		if(desk.playbacks.has(s.id) && desk.playbacks[s.id].pending) {
+			q = std.float(s.quantize ?? 0);
+			what = (desk.playbacks[s.id].pending_phrase ?? false) ? "phrase" : (q >= 16 ? "4 bars" : (q >= 4 ? "bar" : "beat"));
+			return "Waits for the " + what + " · " + st.cue;
+		}
+		if(!st.on)
+			return "Off · next " + desk_num_text(s.cues[0].number);
+		next = st.index + 1 < s.cues.size() ? desk_num_text(s.cues[st.index + 1].number) : desk_num_text(s.cues[0].number);
+		return st.cue + " · next " + next;
+	}
+	gm = target_group_master(slot);
+	if(gm)
+		return "Group master " + std.int(math.round(gm.value() * 100.0)) + " %";
+	return std.string(slot.target).starts("group:") ? "Group gone" : "Nothing yet";
+}
+
+// =========================================================================
+// The cue sheet of the picked executor
+// =========================================================================
+
+sheet_stack() {
+	if(picked < 0 || picked >= slots.size())
+		return None;
+	return target_stack(slots[picked]);
+}
+
+build_sheet() {
+	sheet_content.clear_children();
+	s = sheet_stack();
+	if(!s) {
+		sheet_title.caption("Cues: pick a cue stack for an executor, then click its name");
+		sheet_content.parent().refresh_layout();
+		return;
+	}
+	sheet_title.caption("Cues of " + s.name + " (Executor " + (picked + 1) + ")");
+	//When Go starts its cue: at once, or on the next beat / bar of the timeline (while it plays)
+	go_row = sheet_content.widget().fixed_height(EX_ROW).layout(nanogui.layout_horizontal());
+	go_row.label("Go starts").fixed_width(EX_SHEET_COLS[0].w + EX_SHEET_COLS[1].w).fixed_height(EX_ROW).text_color(PAL_TEXT_2);
+	quant = go_row.combobox().items(DESK_QUANTIZE_LABELS).fixed_width(EX_SHEET_COLS[2].w + EX_SHEET_COLS[3].w).fixed_height(EX_ROW);
+	quant.selected(math.max(0, patch_index_of(DESK_QUANTIZE, std.int(std.float(s.quantize ?? 0)))));
+	quant.tooltip("When Go, Back and Go to start their cue: Now, on the next beat, bar or 4 bars of the timeline while it plays (in time with the music), or at the next phrase of the DJ (DJ Link)\n[[wiki:Lighting-Desk#cues-from-the-music]]");
+	sid_q = s.id;
+	quant.on_change([sid_q](index, text) {
+		if(index >= 0 && index < DESK_QUANTIZE.size())
+			desk.set_quantize(sid_q, DESK_QUANTIZE[index]);
+	});
+	//What the stack does by itself when the DJ starts a new phrase (DJ Link): no AI needed
+	go_row.label("On a DJ phrase").alignment("right").fixed_width(EX_SHEET_COLS[4].w + EX_SHEET_COLS[5].w).fixed_height(EX_ROW).text_color(PAL_TEXT_2);
+	on_phrase = go_row.combobox().items(DESK_PHRASE_LABELS).fixed_width(EX_SHEET_COLS[6].w + EX_SHEET_COLS[7].w + EX_SHEET_COLS[8].w).fixed_height(EX_ROW);
+	on_phrase.selected(math.max(0, patch_index_of(DESK_PHRASE_MODES, std.string(s.on_phrase ?? ""))));
+	on_phrase.tooltip("While the stack is on (Go once), each new phrase of the DJ (DJ Link: rekordbox phrases of the master deck) plays the next cue (Go), or the cue named like the phrase (Cue of its name: Intro, Verse, Buildup, Drop, Break, Outro)\n[[wiki:Lighting-Desk#dj-link-phrases]]");
+	on_phrase.on_change([sid_q](index, text) {
+		if(index >= 0 && index < DESK_PHRASE_MODES.size())
+			desk.set_on_phrase(sid_q, DESK_PHRASE_MODES[index]);
+	});
+	head = sheet_content.widget().fixed_height(EX_ROW).layout(nanogui.layout_horizontal());
+	for(i = 0; i < EX_SHEET_COLS.size(); i++)
+		head.label(EX_SHEET_COLS[i].name).fixed_width(EX_SHEET_COLS[i].w).fixed_height(EX_ROW).text_color(PAL_TEXT_3);
+	if(!s.cues.size())
+		sheet_content.label("No cues yet: select lamps in the Programmer, set values, Store cue").fixed_height(EX_ROW).text_color(PAL_TEXT_3);
+	sid = s.id;
+	for(i = 0; i < s.cues.size(); i++) {
+		cue = s.cues[i];
+		cid = cue.id;
+		row = sheet_content.widget().fixed_height(EX_ROW).layout(nanogui.layout_horizontal());
+		row.label(desk_num_text(cue.number)).fixed_width(EX_SHEET_COLS[0].w).fixed_height(EX_ROW).text_color(PAL_TEXT_2)
+			.tooltip(desk_cue_count(cue) + " values (tracking: what it does not store stays as the cues before left it)");
+		//What the lamps showed when it was stored: one colour per lamp, left to right as they hang
+		look = row.widget().fixed_width(EX_SHEET_COLS[1].w).fixed_height(EX_ROW);
+		look.tooltip("What the lamps showed when this cue was stored, one colour per lamp from left to right");
+		look.attr.colors = cue_colors(cue);
+		look.on_draw([look]() {
+			draw_look(look);
+		});
+		name = row.textbox(cue.name).editable(true).alignment("left").fixed_width(EX_SHEET_COLS[2].w).fixed_height(EX_ROW);
+		name.on_change([sid, cid](text) {
+			c = find_cue(sid, cid);
+			if(c) {
+				c.name = text;
+				desk.changed();
+			}
+		});
+		fade = row.floatbox().value(std.float(cue.fade)).alignment("right").fixed_width(EX_SHEET_COLS[3].w).fixed_height(EX_ROW);
+		fade.min_value(0.0).max_value(600.0).tooltip("How long the cue fades in, seconds");
+		fade.value_callback([sid, cid](v) {
+			c = find_cue(sid, cid);
+			if(c)
+				c.fade = v;
+		});
+		delay = row.floatbox().value(std.float(cue.delay ?? 0.0)).alignment("right").fixed_width(EX_SHEET_COLS[4].w).fixed_height(EX_ROW);
+		delay.min_value(0.0).max_value(600.0).tooltip("How long the cue waits after it started before it fades, seconds");
+		delay.value_callback([sid, cid](v) {
+			c = find_cue(sid, cid);
+			if(c)
+				c.delay = v;
+		});
+		trig = row.combobox().items(DESK_TRIG_LABELS).fixed_width(EX_SHEET_COLS[5].w).fixed_height(EX_ROW);
+		trig.selected(math.max(0, patch_index_of(DESK_TRIGS, cue.trig ?? "go")));
+		trig.tooltip("How the cue starts. Go: with Go. Follow: when the cue before has faded in. Wait: seconds after the cue before started. Beats: beats of the timeline after the cue before started. Drop, Break: at the next drop or break the audio analysis hears. Phrase: at the next phrase of the DJ (DJ Link)\n[[wiki:Lighting-Desk#cues-from-the-music]]");
+		trig.on_change([sid, cid](index, text) {
+			c = find_cue(sid, cid);
+			if(c && index >= 0 && index < DESK_TRIGS.size()) {
+				c.trig = DESK_TRIGS[index];
+				desk.changed();
+			}
+		});
+		wait = row.floatbox().value(std.float(cue.trig_time ?? 0.0)).alignment("right").fixed_width(EX_SHEET_COLS[6].w).fixed_height(EX_ROW);
+		wait.min_value(0.0).max_value(9999.0).tooltip("Wait: seconds; Beats: beats after the cue before started");
+		wait.value_callback([sid, cid](v) {
+			c = find_cue(sid, cid);
+			if(c)
+				c.trig_time = v;
+		});
+		number = cue.number;
+		goto_btn = row.button("Go to").fixed_width(EX_SHEET_COLS[7].w).fixed_height(EX_ROW).tooltip("Plays this cue now (with its fade)");
+		goto_btn.on_click([sid, number]() {
+			desk.go(sid, "goto", number);
+		});
+		del = row.button("").icon(nanogui.icon("times")).danger("hover").transparent(true).fixed_width(EX_SHEET_COLS[8].w).fixed_height(EX_ROW).tooltip("Deletes this cue");
+		del.on_click([sid, number]() {
+			desk.remove_cue(sid, number);
+		});
+	}
+	sheet_content.parent().refresh_layout();
+}
+
+//The colours of the picture of a cue, ordered by where the lamps hang (left to right); [] for a cue without one
+cue_colors(cue) {
+	list = [];
+	if(!cue.has("preview"))
+		return list;
+	for(i = 0; i < cue.preview.size(); i++) {
+		e = cue.preview[i];
+		f = patch_find(engine.patch, e[0]);
+		list.push_back([x = f ? f.x : 0.0, r = e[1], g = e[2], b = e[3]]);
+	}
+	return patch_sort_by(list, "x");
+}
+
+draw_look(w) {
+	if(!w)
+		return;
+	sz = w.size();
+	colors = w.attr.colors;
+	nvgBeginPath();
+	nvgRect(vec2f(2, 4), vec2f(sz.x - 4, sz.y - 8));
+	nvgFillColor(PAL_FIELD);
+	nvgFill();
+	if(!colors || !colors.size())
+		return;
+	cw = (sz.x - 4) / colors.size();
+	for(i = 0; i < colors.size(); i++) {
+		c = colors[i];
+		nvgBeginPath();
+		nvgRect(vec2f(2 + i * cw, 4), vec2f(math.max(1.0, cw - 1.0), sz.y - 8));
+		nvgFillColor(vec4f(c.r, c.g, c.b, 1.0));
+		nvgFill();
+	}
+}
+
+find_cue(sid, cid) {
+	s = desk_stack(desk.data, sid);
+	if(!s)
+		return None;
+	for(i = 0; i < s.cues.size(); i++) {
+		if(s.cues[i].id == cid)
+			return s.cues[i];
+	}
+	return None;
+}
+
+//The sheet is built again when the stack or its cues change (not while a field of it is typed into)
+sheet_key_now() {
+	s = sheet_stack();
+	if(!s)
+		return "";
+	key = s.id + ":" + s.name;
+	for(i = 0; i < s.cues.size(); i++)
+		key += "|" + s.cues[i].id + "/" + desk_num_text(s.cues[i].number) + "/" + (s.cues[i].trig ?? "go") + "/" + (s.cues[i].has("preview") ? s.cues[i].preview.size() : 0);
+	return key;
+}
+
+// =========================================================================
+// Every frame
+// =========================================================================
+
+update(generator, tl_pos, pos_delta) {
+	if(!engine || !desk || !columns_area)
+		return;
+	if(pending_build) {
+		pending_build = false;
+		build_columns();
+		seen_revision = -1;
+	}
+	if(desk.revision != seen_revision || engine.patch_revision != seen_patch) {
+		seen_revision = desk.revision;
+		seen_patch = engine.patch_revision;
+		for(i = 0; i < slots.size(); i++) {
+			fill_combo(slots[i]);
+			if(slots[i].head.pushed() != (i == picked))
+				slots[i].head.pushed(i == picked);
+		}
+		key = sheet_key_now();
+		if(key != sheet_key) {
+			sheet_key = key;
+			build_sheet();
+		}
+	}
+	for(i = 0; i < slots.size(); i++) {
+		slot = slots[i];
+		//the master of a stack every frame (a stack made or loaded later gets it too)
+		s = target_stack(slot);
+		if(s)
+			desk.set_master(s.id, slot.flash_held ? 1.0 : slot.master.value());
+		text = slot_text(slot);
+		if(text != slot.shown) {
+			slot.shown = text;
+			slot.info.caption(text);
+		}
+	}
+}
+
+dispatcher(generator, cmd, value) {
+	return None;
+}
+
+entry(generator, area) {
+	engine = generator.engine;
+	desk = engine.desk;
+	generator.window.fixed_size(vec2f(6 * (EX_COL_W + EX_GAP) + 16, 600));
+	area.layout(None);
+
+	top = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(EX_ROW);
+	top.label("Executors").anchor_left(0).fixed_width(90).fixed_height(EX_ROW).text_color(PAL_TEXT_2);
+	count_box = top.intbox().value(slot_count).anchor_left(90).fixed_width(72).fixed_height(EX_ROW);
+	count_box.min_value(1).max_value(EX_MAX).tooltip("How many executors this page has");
+	count_box.value_callback([](v) {
+		slot_count = math.clamp(v, 1, EX_MAX);
+		pending_build = true;
+	});
+	top.label("Cue stacks of the Programmer, and Group masters. Several Executors are several pages").anchor_left(170).anchor_right(0).fixed_height(EX_ROW).text_color(PAL_TEXT_3);
+
+	cols = area.hscroll().anchor_left(0).anchor_right(0).anchor_top(EX_ROW + EX_GAP).fixed_height(7 * (EX_ROW + EX_GAP) + 16);
+	columns_area = cols.content().layout(nanogui.layout_horizontal().spacing(EX_GAP));
+
+	sheet_top = EX_ROW + EX_GAP + 7 * (EX_ROW + EX_GAP) + 20;
+	sheet_title = area.label("").anchor_left(0).anchor_right(0).anchor_top(sheet_top).fixed_height(EX_ROW).text_color(PAL_TEXT_2);
+	sheet_content = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(sheet_top + EX_ROW).anchor_bottom(0).content().layout(nanogui.layout_vertical());
+
+	build_columns();
+	pending_build = false;
+}
+
+save_state() {
+	targets = [];
+	for(i = 0; i < slots.size(); i++)
+		targets.push_back(slots[i].target);
+	return [count = slot_count, targets = targets, picked = picked];
+}
+
+//The columns are built again with their targets before the controls get their saved values (same names and groups)
+load_state(state) {
+	slot_count = math.clamp(std.int(state.count ?? 6), 1, EX_MAX);
+	picked = std.int(state.picked ?? 0);
+	targets = state.targets ?? [];
+	if(count_box)
+		count_box.value(slot_count);
+	if(columns_area) {
+		build_columns();
+		for(i = 0; i < slots.size() && i < targets.size(); i++) {
+			slots[i].target = std.string(targets[i] ?? "");
+			fill_combo(slots[i]);
+		}
+	}
+	pending_build = false;
+	seen_revision = -1;
+	sheet_key = "x";
+}

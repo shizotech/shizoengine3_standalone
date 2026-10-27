@@ -9,6 +9,8 @@ using eigen;
 #include "projects_menu"
 #include "shader_preview"
 #include "midi_controller_menu"
+#include "display_settings"
+#include "engine/generators/extensions/video/video_convert"
 
 save_in_progress = false;
 load_in_progress = false;
@@ -34,37 +36,151 @@ class assetbrowser
 	tabs = None; //the tabs of the sidebar
 	projects_tab = None;
 	managed settings = None; //the settings window (#356)
-	midi_mapping_buttons = []; //[button=, name=] the "MIDI mapping" button of every MIDI device with an input
+	managed display_page = None; //Settings > Display (#593, display_settings.shio)
+	midi_mapping_buttons = []; //[button=, name=, device=] the "MIDI mapping" button of every MIDI device with an input
+	midi_learn_btn = None; //Devices > MIDI > MIDI learn
 
-	//"Convert to HAP" of a video in the list (#278): the running jobs (nanogui.video_convert, a job is cancelled when
-	//it is dropped), the menu of the right click and the line at the bottom of the list that shows how far they are
+	//"Convert" of a video or a folder in the list (#278, #460): the running jobs (nanogui.video_convert, a job is
+	//cancelled when it is dropped), the menu of the right click and the line at the bottom of the list that shows how
+	//far they are. Formats and sizes: engine/generators/extensions/video/video_convert.shio
 	filebrowser = None;     //the list of the Assets tab
 	managed preview = None; //the preview of a shader the mouse rests on (#536, shader_preview.shio)
-	convert_jobs = [];      //[job=, name=]
+	menu_tabs = [];         //[path=, name=]: the tab name of every .menu opened so far (#575, open_menu_asset)
+	convert_jobs = [];      //[job=, name=, label=, folder=, stopped=]; folder: a job of the folder queue
 	convert_btn = None;
 	convert_status = None;
 	convert_note = "";      //what the last job said when it ended, shown for a few seconds
 	convert_note_until = 0;
 	convert_refresh = 0;
+	convert_format = 0;     //index into VIDEO_CONVERT_FORMATS: personal, style.json convert_format (#460)
+	convert_size = 0;       //index into VIDEO_CONVERT_SIZES: style.json convert_size
+	//Convert videos in a folder: one job after the other, [path=, format_index=, size_index=] waiting; what came of them so far
+	convert_queue = [];
+	convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
+	convert_pumping = false; //pump_convert_queue runs: a second caller returns (see there)
+	//The menu of the last right click: its path, whether it is a folder, the videos in it, its action entry
+	convert_menu_path = "";
+	convert_menu_folder = false;
+	convert_menu_videos = [];
+	convert_entry = None;
 
 	//Videos that VibeVJ plays (generatoritem.shio)
 	is_video_file(path) {
-		ext = fileio.file_ext(path).lowercase();
-		return ext == "mp4" || ext == "mov" || ext == "m4v" || ext == "mkv" || ext == "webm" || ext == "avi" || ext == "mxf" ||
-			ext == "mpg" || ext == "mpeg" || ext == "ts" || ext == "wmv";
+		return video_convert_is_video(path);
 	}
 
-	hap_copy_of(path) {
-		return fileio.file_dir(path) + "/" + fileio.pure_name(path) + "_hap.mov";
+	//A job is running or waiting for this copy
+	convert_busy(target) {
+		for(entry : convert_jobs) {
+			if(entry.job.target() == target)
+				return true;
+		}
+		for(item : convert_queue) {
+			if(video_convert_target(item.path, item.format_index, item.size_index) == target)
+				return true;
+		}
+		return false;
 	}
 
-	start_convert(path) {
-		job = nanogui.video_convert(path, hap_copy_of(path), "hap");
+	convert_queue_active() {
+		if(convert_queue.size() > 0)
+			return true;
+		for(entry : convert_jobs) {
+			if(entry.folder)
+				return true;
+		}
+		return false;
+	}
+
+	start_convert(path, format_index, size_index, folder) {
+		job = nanogui.video_convert(path, video_convert_target(path, format_index, size_index),
+			VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index]);
 		if(!job)
-			return;
-		convert_jobs.push_back([job = job, name = fileio.file_name(path)]);
+			return false;
+		convert_jobs.push_back([job = job, name = fileio.file_name(path), label = video_convert_label(format_index, size_index), folder = folder]);
 		convert_refresh = 0;
-		update_converts();
+		return true;
+	}
+
+	//Every video of a folder into the queue, with the format and size of now. The draw callback of the tab starts the
+	//jobs (update_converts), not this click
+	start_folder_convert(dir) {
+		if(!convert_queue_active())
+			convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
+		for(path : video_convert_folder_videos(dir)) {
+			if(convert_busy(video_convert_target(path, convert_format, convert_size)))
+				continue;
+			convert_queue.push_back([path = path, format_index = convert_format, size_index = convert_size]);
+			convert_queue_stats.total = convert_queue_stats.total + 1;
+		}
+		if(convert_queue.size() == 0 && convert_queue_stats.total == 0) {
+			convert_note = "Nothing to convert in " + fileio.file_name(dir);
+			convert_note_until = std.millis() + 8000;
+		}
+		convert_refresh = 0;
+	}
+
+	stop_folder_convert() {
+		convert_queue = [];
+		for(i = 0; i < convert_jobs.size(); i++) {
+			if(convert_jobs[i].folder) {
+				convert_jobs[i].job.cancel();
+				convert_jobs[i].stopped = true; //ends without a "failed" note
+			}
+		}
+		convert_note = "Folder conversion stopped";
+		convert_note_until = std.millis() + 8000;
+		convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
+		convert_refresh = 0;
+	}
+
+	//Starts the next job of the folder queue when none of it runs. A file that is in the format already, or whose copy
+	//exists, is left out; at most a few files are read per call, so a folder of such files does not stop the screen.
+	//fileio calls give the script to other threads while they wait (a click, the draw callback): without the flag a
+	//second pump started the next file of the folder at the same time (seen on Linux, #460)
+	pump_convert_queue() {
+		if(convert_pumping)
+			return;
+		convert_pumping = true;
+		try {
+			pump_convert_queue_step();
+		}
+		catch(e) {
+			std.warn("Folder conversion: " + e);
+		}
+		convert_pumping = false;
+	}
+
+	pump_convert_queue_step() {
+		for(entry : convert_jobs) {
+			if(entry.folder)
+				return;
+		}
+		reads = 0;
+		for(convert_queue.size() > 0 && reads < 4) {
+			item = convert_queue[0];
+			convert_queue.erase(0);
+			reads++;
+			if(video_convert_skip_reason(item.path, item.format_index, item.size_index)) {
+				convert_queue_stats.skipped = convert_queue_stats.skipped + 1;
+				continue;
+			}
+			if(start_convert(item.path, item.format_index, item.size_index, true))
+				return;
+			convert_queue_stats.failed = convert_queue_stats.failed + 1;
+		}
+		if(convert_queue.size() > 0 || convert_queue_stats.total == 0)
+			return;
+		st = convert_queue_stats;
+		convert_note = "Folder done: " + std.string(st.done) + " converted";
+		if(st.skipped)
+			convert_note = convert_note + ", " + std.string(st.skipped) + " left out (in the format already or converted before)";
+		if(st.failed)
+			convert_note = convert_note + ", " + std.string(st.failed) + " failed";
+		convert_note_until = std.millis() + 10000;
+		convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
+		if(filebrowser)
+			filebrowser.refresh();
 	}
 
 	//Called from the draw callback of the asset tab, at most four times a second
@@ -75,28 +191,140 @@ class assetbrowser
 			entry = convert_jobs[i];
 			if(!entry.job.finished()) {
 				running.push_back(entry);
-				text = text + (text ? ", " : "") + entry.name + " " + std.string(std.int(math.round(entry.job.progress() * 100))) + " %";
+				text = text + (text ? ", " : "") + entry.name + " to " + entry.label + ": " + std.string(std.int(math.round(entry.job.progress() * 100))) + " %";
 				continue;
 			}
+			if(entry.has("stopped"))
+				continue;
 			if(entry.job.ok()) {
 				convert_note = fileio.file_name(entry.job.target()) + " is ready";
-				if(filebrowser)
+				if(entry.folder)
+					convert_queue_stats.done = convert_queue_stats.done + 1;
+				if(filebrowser && !entry.folder)
 					filebrowser.refresh();
 			}
-			else
+			else {
 				convert_note = "Converting " + entry.name + " failed: " + entry.job.error();
+				if(entry.folder)
+					convert_queue_stats.failed = convert_queue_stats.failed + 1;
+			}
 			convert_note_until = std.millis() + 8000;
 		}
 		convert_jobs = running;
+		pump_convert_queue();
 
-		if(text)
-			text = "Converting to HAP: " + text;
+		st = convert_queue_stats;
+		if(text) {
+			text = "Converting " + text;
+			if(st.total > 1)
+				text = text + " (folder: " + std.string(std.int(math.min(st.done + st.skipped + st.failed + 1, st.total))) + " of " + std.string(st.total) + ")";
+		}
 		else if(convert_note && std.millis() < convert_note_until)
 			text = convert_note;
 		else
 			convert_note = "";
 
 		convert_status.caption(text).visible(text ? true : false);
+	}
+
+	save_convert_settings() {
+		try {
+			style = fileio.read_json(STYLE_FILE);
+			style.convert_format = VIDEO_CONVERT_FORMATS[convert_format].id;
+			style.convert_size = VIDEO_CONVERT_SIZES[convert_size];
+			fileio.write_json(STYLE_FILE, style);
+		}
+		catch(e) {}
+	}
+
+	//Caption, tooltip and state of the action entry of the menu, for the format and size chosen
+	update_convert_entry() {
+		if(!convert_entry)
+			return;
+		label = video_convert_label(convert_format, convert_size);
+		enabled = true;
+		caption = "";
+		tip = "";
+		if(convert_menu_folder) {
+			n = convert_menu_videos.size();
+			caption = "Convert " + std.string(n) + (n == 1 ? " video" : " videos") + " here to " + label;
+			if(n == 0) {
+				caption = "No videos in this folder";
+				enabled = false;
+			}
+			tip = "Converts the videos in this folder (not in its subfolders) to " + label + ", one after the other; the line at the bottom shows how far it is. "
+				+ "Left out: files that are " + VIDEO_CONVERT_FORMATS[convert_format].name + " already, files whose copy exists, and the copies Convert made.\n[[wiki:Video#converting]]";
+		}
+		else {
+			path = convert_menu_path;
+			target = video_convert_target(path, convert_format, convert_size);
+			caption = "Convert to " + label;
+			if(convert_busy(target)) {
+				caption = "Converting to " + label + "...";
+				enabled = false;
+			}
+			else {
+				reason = video_convert_skip_reason(path, convert_format, convert_size);
+				if(reason) {
+					caption = reason.substr(0, 1).uppercase() + reason.substr(1, reason.size() - 1);
+					enabled = false;
+				}
+			}
+			tip = "A copy in " + label + " next to the file, " + fileio.file_name(target) + ": every frame stands on its own, so it can be positioned without waiting and played backwards.\n[[wiki:Video#converting]]";
+		}
+		convert_entry.caption(caption).tooltip(tip).enabled(enabled);
+	}
+
+	//The menu of a right click on a video or a folder: format, size, the action, and Stop while a folder converts
+	fill_convert_menu(path) {
+		menu = convert_btn.popup().content();
+		menu.clear_children();
+		convert_entry = None;
+		convert_menu_path = path;
+		convert_menu_folder = fileio.is_directory(path);
+		convert_menu_videos = convert_menu_folder ? video_convert_folder_videos(path) : [];
+
+		tips = "";
+		for(f : VIDEO_CONVERT_FORMATS)
+			tips = tips + (tips ? "\n" : "") + f.tip;
+		menu.label("Format").anchor_left(4);
+		format_select = menu.combobox().fixed_height(26).items(video_convert_format_names(true)).segmented(true).anchor_left(0).anchor_right(0)
+			.tooltip(tips + "\n[[wiki:Video#converting]]");
+		format_select.selected(convert_format);
+		format_select.on_change([this](v, txt){
+			this.convert_format = v;
+			this.save_convert_settings();
+			this.update_convert_entry();
+		});
+		menu.label("Size").anchor_left(4);
+		size_select = menu.combobox().fixed_height(26).items(video_convert_size_names()).segmented(true).anchor_left(0).anchor_right(0)
+			.tooltip("Original: the size of the file. 1080p, 720p, ...: scaled down (never up, the aspect kept) so that the shorter side has at most that many pixels, e.g. 1920x1080 from 4K\n[[wiki:Video#converting]]");
+		size_select.selected(convert_size);
+		size_select.on_change([this](v, txt){
+			this.convert_size = v;
+			this.save_convert_settings();
+			this.update_convert_entry();
+		});
+
+		convert_entry = menu.button("").alignment("left").anchor_left(0).anchor_right(0).fixed_height(28).icon(nanogui.icon("exchange_alt"));
+		convert_entry.on_click([this](){
+			this.convert_btn.close();
+			if(this.convert_menu_folder)
+				this.start_folder_convert(this.convert_menu_path);
+			else
+				this.start_convert(this.convert_menu_path, this.convert_format, this.convert_size, false);
+		});
+		update_convert_entry();
+
+		if(convert_queue_active()) {
+			left = convert_queue.size() + 1;
+			stop = menu.button("Stop converting the folder (" + std.string(left) + " left)").alignment("left").anchor_left(0).anchor_right(0).fixed_height(28)
+				.icon(nanogui.icon("stop")).tooltip("Cancels the running job of the folder conversion and the files still waiting; the copies made so far stay");
+			stop.on_click([this](){
+				this.convert_btn.close();
+				this.stop_folder_convert();
+			});
+		}
 	}
 
 	//macOS: a band of this height at the top for the traffic lights, the tabs below it (0 = none, the tabs at the top)
@@ -154,6 +382,7 @@ class assetbrowser
 		page_links = settings.add_page("Links", "link");
 		page_appearance = settings.add_page("Appearance", "eye");
 		page_output = settings.add_page("Output", "desktop");
+		page_display = settings.add_page("Display", "expand_arrows_alt");
 
 		//The name of the project is shown in the top bar (generators.shio sets project_env.label)
 		set_project_label = [project_env](text){
@@ -164,8 +393,51 @@ class assetbrowser
 		settings.section(page_project, "Output size");
 		settings.note(page_project, "Saved with the project. New shaders and the mapping tools start with this size.");
 
+		//Where the size comes from (#593): the first output display of Settings > Display (it follows when displays are
+		//plugged in or out, and at another venue), or set by hand. A width or height typed in sets it to by hand
+		engine.project_size_source = page_project.controlcombo("Target Size Source", "project_ctrls").caption("Size from")
+			.items(["Output displays", "Manual"]).segmented(true).anchor_left(0).anchor_right(0).hide_config_menu()
+			.tooltip("Output displays: the size of the first output display (Settings > Display), also at another venue. Manual: the width and height below.\n[[wiki:Settings#project]]");
 		engine.project_width = page_project.controlint("Target Width", "project_ctrls").tooltip("The width of the output in pixels. New [[shader|shaders]] and the mapping tools start with this size.\n[[wiki:Settings#project]]").caption("Target width").value(1920).anchor_left(0).anchor_right(0).hide_config_menu();
 		engine.project_height = page_project.controlint("Target Height", "project_ctrls").tooltip("The height of the output in pixels. New [[shader|shaders]] and the mapping tools start with this size.\n[[wiki:Settings#project]]").caption("Target height").value(1080).anchor_left(0).anchor_right(0).hide_config_menu();
+
+		//Common sizes, 21:9 and 32:9 among them: one sets the size and Manual
+		preset_sizes = [];
+		preset_items = ["Common size…"];
+		for(group : DISPLAY_PRESETS) {
+			for(sz : group.sizes) {
+				preset_sizes.push_back(sz);
+				preset_items.push_back(display_size_text(sz[0], sz[1]));
+			}
+		}
+		size_preset = page_project.combobox().fixed_height(28).items(preset_items).anchor_left(0).anchor_right(0)
+			.tooltip("Sets the size to a common one (and Size from to Manual).\n[[wiki:Settings#project]]");
+		size_preset.selected(0);
+		size_preset.on_change([engine, preset_sizes, size_preset](v, txt) {
+			if(v <= 0)
+				return;
+			sz = preset_sizes[v - 1];
+			engine.project_size_source.value(1);
+			engine.project_width.value(sz[0]);
+			engine.project_height.value(sz[1]);
+			size_preset.selected(0);
+		});
+
+		//A size typed in by hand while it came from the displays: from now on by hand. Not while a project loads (its
+		//saved size: engine.load_project sets engine.load_in_progress, New project the one of this file, #642) or while
+		//the displays set it
+		size_by_hand = [engine](v) {
+			if(engine.load_in_progress || load_in_progress || !engine.displays || engine.displays.applying)
+				return;
+			if(engine.project_size_source.value() == 0)
+				engine.project_size_source.value(1);
+		};
+		engine.project_width.callback(size_by_hand);
+		engine.project_height.callback(size_by_hand);
+		engine.project_size_source.callback([engine](v) {
+			if(v == 0 && engine.displays)
+				engine.displays.apply_project_size();
+		});
 			
 		settings.section(page_project, "Timing");
 		settings.note(page_project, "Saved with the project.");
@@ -240,23 +512,53 @@ class assetbrowser
 		//Interface size: everything bigger or smaller, on top of the scale of the system (a 4K screen at 100 % in
 		//Linux, a projector far away). Personal, kept in the style file, applied at start up
 		settings.section(appearance_content, "Interface size");
-		settings.note(appearance_content, "Personal: the same for every project. 100 % is the scale of your system. Until you choose one, VibeVJ takes the size that suits the screen (more than 100 % on a 4K screen without system scaling).");
-		ui_sizes = [0.9, 1.0, 1.1, 1.25, 1.5, 2.0];
-		ui_now = engine.screen.ui_scale();
-		ui_index = 1;
-		for(i = 0; i < ui_sizes.size(); i++) {
-			if(math.abs(ui_sizes[i] - ui_now) < 0.01)
-				ui_index = i;
-		}
-		ui_select = appearance_content.combobox().fixed_height(28).items(["90 %", "100 %", "110 %", "125 %", "150 %", "200 %"]).segmented(true)
-			.tooltip("How big buttons, text and windows are drawn. Useful on a 4K screen without system scaling, or far from the screen.\n[[wiki:Settings#interface-size]]");
-		ui_select.selected(ui_index);
-		//At once: the views and the timeline follow the new size (on_window_resize in timeline.shio)
-		ui_select.on_change([ui_sizes, engine](v, txt) {
-			engine.screen.ui_scale(ui_sizes[v]);
+		settings.note(appearance_content, "Personal: the same for every project. 100 % is the scale of your system.");
+		settings.note(appearance_content, "Auto: 100 %, more only on a screen as dense as 4K without system scaling.");
+		ui_row = appearance_content.widget().fixed_height(28).anchor_left(0).anchor_right(0);
+		ui_slider = ui_row.slider("Size").min_value(50).max_value(200).decimals(0).unit("%")
+			.value(math.round(engine.screen.ui_scale() * 100))
+			.anchor_left(0).anchor_right(80).anchor_top(0).anchor_bottom(0)
+			.tooltip("How big buttons, text and windows are drawn, 50 to 200 %. Applied when you let go.\n[[wiki:Settings#interface-size]]");
+		ui_auto = ui_row.button("Auto").anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(70)
+			.tooltip("The size that suits this screen (see the note above).\n[[wiki:Settings#interface-size]]");
+		//In steps of 5 %. The size changes when the slider is let go: a change while dragging would move the slider
+		//under the mouse. Its caption says whether VibeVJ chose the size (Auto)
+		ui_snap = [](v) {
+			return std.int(math.round(v / 5.0)) * 5;
+		};
+		ui_caption = [ui_slider, engine]() {
+			auto_now = true;
+			try {
+				auto_now = !engine.has_ui_scale(fileio.read_json(STYLE_FILE));
+			}
+			catch(e) {}
+			ui_slider.caption(auto_now ? "Size (auto)" : "Size");
+		};
+		ui_caption();
+		ui_apply = [ui_slider, ui_snap, ui_caption, engine]() {
+			pct = ui_snap(ui_slider.value());
+			ui_slider.value(pct);
 			style = fileio.read_json(STYLE_FILE);
-			style.ui_scale = ui_sizes[v];
+			style.ui_scale = pct / 100.0;
 			fileio.write_json(STYLE_FILE, style);
+			//At once: the views and the timeline follow the new size (on_window_resize in timeline.shio)
+			engine.screen.ui_scale(pct / 100.0);
+			ui_caption();
+		};
+		ui_slider.on_mouse_button([ui_slider, ui_apply](pos, btn, down, mods) {
+			handled = ui_slider.mouse_button_default(pos, btn, down, mods);
+			if(btn == 0 && !down)
+				ui_apply();
+			return handled;
+		});
+		ui_auto.on_click([ui_slider, ui_caption, engine]() {
+			style = fileio.read_json(STYLE_FILE);
+			style.ui_scale = "auto";
+			fileio.write_json(STYLE_FILE, style);
+			scale = engine.auto_ui_scale();
+			engine.screen.ui_scale(scale);
+			ui_slider.value(math.round(scale * 100));
+			ui_caption();
 		});
 
 		settings.section(appearance_content, "Accent colour");
@@ -282,6 +584,22 @@ class assetbrowser
 		accent_reset.on_click([accent_picker, apply_accent](){
 			accent_picker.rgba(157.0 / 255.0, 133.0 / 255.0, 255.0 / 255.0, 1.0); //Shizo UI accent (design/tokens.json)
 			apply_accent(accent_picker.rgba());
+		});
+
+		//Depth (#651): sections and panels flat, or on a slightly lighter panel with light and dark edges. Personal, part of
+		//the theme in the style file
+		settings.section(appearance_content, "Depth");
+		depth_select = appearance_content.combobox().fixed_height(28).items(["Flat", "Subtle", "Strong"]).segmented(true).tooltip("How much sections and panels stand out from what is around them: flat, a subtle panel with light and dark edges, or a stronger one.\n[[wiki:Settings#depth]]");
+		depth_now = engine.screen.theme().to_json().depth;
+		depth_select.selected(depth_now == None ? 1 : math.clamp(std.int(depth_now), 0, 2));
+		depth_select.on_change([engine](v, txt) {
+			theme = engine.screen.theme();
+			theme_json = theme.to_json();
+			theme_json.depth = v;
+			theme.from_json(theme_json);
+			style = fileio.read_json(STYLE_FILE);
+			style.depth = v;
+			fileio.write_json(STYLE_FILE, style);
 		});
 
 		//Calm notches (Shizo UI): thin edges at rest that open on hover, everywhere or only in the Clipview. Personal, kept in the style file
@@ -322,6 +640,9 @@ class assetbrowser
 			if(engine.env.refresh_areas)
 				engine.env.refresh_areas();
 		});
+
+		//Display (#593): the connected displays, their role and resolution (display_settings.shio)
+		display_page = display_settings(engine, settings, page_display);
 
 		//Blackout (#538): how it comes back. Personal, kept in the style file
 		settings.section(page_output, "Blackout");
@@ -462,6 +783,10 @@ class assetbrowser
 				engine.blackout.loading = false;
 				engine.blackout.sync();
 			}
+			//A new project takes its size from the output displays (#593)
+			engine.project_size_source.value(0);
+			if(engine.displays)
+				engine.displays.apply_project_size();
 						
 			set_project_label("<New Project>");
 
@@ -571,26 +896,8 @@ class assetbrowser
 		//Pictures, videos, sound and the like are not text: they are dragged onto a view instead
 		filebrowser.on_double_click([main_menu](path){
 			ext = fileio.file_ext(path);
-			if(ext == "menu") {
-				module = std.module();
-				module.load_file(path);
-				
-				if(!module.has("entry")) {
-					std.error("Menu loader has no entry point: " + path);
-					std.free(module);
-					return false;
-				}
-				new_tab = main_menu.generators_menu.subviews.add_tab(fileio.pure_name(path), true);
-				try {
-					module.call("entry", new_tab);
-				}
-				catch(e) { return false; }
-				
-				new_tab.on_destroy([module](){
-					std.free(module);
-				});
-				return true;
-			}
+			if(ext == "menu")
+				return this.open_menu_asset(path);
 			text_files = [shio=1, glsl=1, frag=1, vert=1, fs=1, json=1, preset=1, md=1, txt=1, csv=1, ini=1, cfg=1, xml=1,
 				html=1, css=1, js=1, py=1, h=1, c=1, cpp=1, yaml=1, yml=1, MD=1, TXT=1, JSON=1];
 			if(!text_files.has(ext))
@@ -600,42 +907,32 @@ class assetbrowser
 			return true;
 		});
 
-		//Right click on a video: Convert to HAP makes name_hap.mov next to it (#278). In a HAP file every frame stands on
+		//Right click on a video: Convert makes a copy next to it (name_hap.mov, #278), in the format and size chosen in the
+		//menu (#460); on a folder it converts every video in it, one after the other. In a HAP file every frame stands on
 		//its own, so the clip can be positioned without waiting and played backwards. The menu hangs on a button of no
 		//size that is put under the cursor (like the menu of an area, singleview.shio)
 		convert_btn = asset_tab.button_popup("").side("auto").transparent(true)
 			.anchor_left(0).anchor_top(0).fixed_width(1).fixed_height(1).overlay(true);
 		convert_btn.on_screen(true).autoclose(true);
 		convert_btn.popup().content().layout(nanogui.layout_vertical());
-		convert_btn.popup().content().fixed_width(240);
+		convert_btn.popup().content().fixed_width(320);
 		convert_status = asset_tab.label("").wrap(true).anchor_left(8).anchor_right(8).anchor_bottom(6).overlay(true).visible(false);
+		try {
+			style = fileio.read_json(STYLE_FILE);
+			if(style && style.has("convert_format"))
+				convert_format = video_convert_format_index(style.convert_format);
+			if(style && style.has("convert_size"))
+				convert_size = video_convert_size_index(style.convert_size);
+		}
+		catch(e) {}
 
 		filebrowser.on_context_menu([this](pos){
 			path = this.filebrowser.path_at(pos);
-			if(!path || !this.is_video_file(path) || this.convert_btn.pushed())
+			if(!path || this.convert_btn.pushed())
 				return;
-
-			menu = this.convert_btn.popup().content();
-			menu.clear_children();
-			target = this.hap_copy_of(path);
-			busy = false;
-			for(i = 0; i < this.convert_jobs.size(); i++) {
-				if(this.convert_jobs[i].job.target() == target)
-					busy = true;
-			}
-			caption = "Convert to HAP";
-			if(busy)
-				caption = "Converting to HAP...";
-			else if(fileio.exists(target))
-				caption = "HAP copy exists: " + fileio.file_name(target);
-			entry = menu.button(caption).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28).icon(nanogui.icon("exchange_alt"));
-			entry.tooltip("A copy in [[hap|HAP]] next to the file, " + fileio.file_name(target) + ": it can be positioned without waiting and played backwards.\n[[wiki:Video#which-files-play-well]]");
-			if(busy || fileio.exists(target))
-				entry.enabled(false);
-			entry.on_click([this, path](){
-				this.convert_btn.close();
-				this.start_convert(path);
-			});
+			if(!fileio.is_directory(path) && !this.is_video_file(path))
+				return;
+			this.fill_convert_menu(path);
 
 			//2 px beside the cursor, so a second right click at the same spot does not hit the button
 			this.convert_btn.anchor_left(pos.x - 2).anchor_top(pos.y - 2);
@@ -661,7 +958,7 @@ class assetbrowser
 		});
 
 		asset_tab.on_draw([this](){
-			if(this.convert_jobs.size() == 0 && !this.convert_note)
+			if(this.convert_jobs.size() == 0 && this.convert_queue.size() == 0 && !this.convert_note)
 				return;
 			now = std.millis();
 			if(now - this.convert_refresh < 250)
@@ -678,7 +975,11 @@ class assetbrowser
 		midi_vec = ctrls_panel.collapsable("MIDI").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		
 		midi_learn_global = midi_vec.pushbutton("MIDI learn").tooltip("[[midi learn|MIDI learn]] for all devices: click a control, then move a fader or hit a pad.").latched_style("cue"); //learning waits for a MIDI message: cue (amber), not on
-		midi_learn_global.on_change([](v) {
+		this.midi_learn_btn = midi_learn_global;
+		midi_learn_global.on_change([this](v) {
+			//One learn mode at a time: the overlay maps either MIDI or Art-Net
+			if(v)
+				this.stop_artnet_learn();
 			nanogui.midi_learn(v);
 		});
 
@@ -704,11 +1005,12 @@ class assetbrowser
 			
 			if(dev.has_input()) {
 				midi_learn = dev_vec.pushbutton("MIDI mapping").tooltip("[[midi learn|MIDI learn]] for this device only: messages of other controllers are ignored.");
-				this.midi_mapping_buttons.push_back([button = midi_learn, name = dev.device_name()]);
+				this.midi_mapping_buttons.push_back([button = midi_learn, name = dev.device_name(), device = dev]);
 				midi_learn.on_change([this, dev](v) {
 					//One device maps at a time: turning one on replaces the device before it, so its button goes
 					//off too. Before, the first button stayed pressed although it no longer mapped (#374)
 					if(v) {
+						this.stop_artnet_learn();
 						for(i = 0; i < this.midi_mapping_buttons.size(); i++) {
 							entry = this.midi_mapping_buttons[i];
 							if(entry.name != dev.device_name())
@@ -730,6 +1032,10 @@ class assetbrowser
 		
 		artnet_vec = network_vec.collapsable("Art-Net").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		artnet = artnet_menu(engine, artnet_vec);
+		artnet.on_learn = [this](v) {
+			if(v)
+				this.stop_midi_learn();
+		};
 		
 		//The cards Art-Net and ShizoNet use (#501)
 		cards_vec = network_vec.collapsable("Network cards").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
@@ -747,6 +1053,20 @@ class assetbrowser
 			
 		fixtures_vec = ctrls_panel.collapsable("Fixtures").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		fixtures = fixtures_menu(engine, fixtures_vec);		
+		//The setup and the editor of the [[fixture|fixtures]] (#575): they were opened by menu files in
+		//assets/Fixtures, which is unpractical. The buttons live here, next to the lamps they set up.
+		fixture_setup_btn = fixtures_vec.button("Fixture setup").icon(nanogui.icon("th"))
+			.tooltip("Where the lamps of the [[project]] are set up: the [[fixture setup]] with the stage plan, the nodes and the universe map\n[[wiki:Output-and-Devices#set-up-your-lamps]]")
+			.anchor_left(0).anchor_right(0).fixed_height(28);
+		fixture_setup_btn.on_click([this](){
+			this.open_menu_asset("engine/menus/fixtures/setup.menu");
+		});
+		fixture_editor_btn = fixtures_vec.button("Fixture editor")
+			.tooltip("Make a [[fixture]] type: its name, its channels and their types\n[[wiki:Output-and-Devices#make-a-fixture-file]]")
+			.anchor_left(0).anchor_right(0).fixed_height(28);
+		fixture_editor_btn.on_click([this](){
+			this.open_menu_asset("engine/menus/fixtures/editor.menu");
+		});
 			
 		chat_tab = tabs.add_tab("Chat");
 		chat = chat_menu(chat_tab);
@@ -758,5 +1078,76 @@ class assetbrowser
 		//The program starts on the assets, as before the Projects tab came back; the last project opens by itself
 		tabs.set_active_tab(asset_tab);
 		
+	}
+
+	//A .menu file opens in a tab of the view bar: a double click in the list, or a button of the
+	//Devices tab (#575). A menu that is open comes to the front instead of a second tab
+	//MIDI learn and Art-Net learn share the overlay of the controls: turning one on turns the other off
+	stop_midi_learn() {
+		if(midi_learn_btn && midi_learn_btn.pushed()) {
+			midi_learn_btn.pushed(false);
+			nanogui.midi_learn(false);
+		}
+		for(i = 0; i < midi_mapping_buttons.size(); i++) {
+			entry = midi_mapping_buttons[i];
+			if(entry.button.pushed()) {
+				entry.button.pushed(false);
+				entry.device.midi_learn(false);
+			}
+		}
+	}
+
+	stop_artnet_learn() {
+		if(artnet)
+			artnet.learn(false);
+	}
+
+	open_menu_asset(path) {
+		//The tab is named by the menu_name() of the module, which is only known once it is loaded: the name a path
+		//got the last time is looked up, the file name is the guess for a menu without menu_name()
+		menu_name = fileio.pure_name(path);
+		for(i = 0; i < menu_tabs.size(); i++) {
+			if(menu_tabs[i].path == path)
+				menu_name = menu_tabs[i].name;
+		}
+		subviews = std.global("engine").menu.generators_menu.subviews;
+		for(i = 0; i < subviews.tab_count(); i++) {
+			if(subviews.tab_name(i) == menu_name) {
+				subviews.set_active_tab(subviews.tab_at(i));
+				return true;
+			}
+		}
+		//A local, and every tab frees its own module: one member for all of them destroyed the module of the menu
+		//opened before (its tab went empty) as soon as a second one opened
+		mod = std.module();
+		mod.load_file(path);
+		if(!mod.has("entry")) {
+			std.error("Menu loader has no entry point: " + path);
+			std.free(mod);
+			return false;
+		}
+		if(mod.has("menu_name"))
+			menu_name = mod.call("menu_name");
+		known = false;
+		for(i = 0; i < menu_tabs.size(); i++) {
+			if(menu_tabs[i].path == path) {
+				menu_tabs[i].name = menu_name;
+				known = true;
+			}
+		}
+		if(!known)
+			menu_tabs.push_back([path = path, name = menu_name]);
+		new_tab = subviews.add_tab(menu_name, true);
+		try {
+			mod.call("entry", new_tab);
+		}
+		catch(e) {
+			std.free(mod);
+			return false;
+		}
+		new_tab.on_destroy([mod](){
+			std.free(mod);
+		});
+		return true;
 	}
 }

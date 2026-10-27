@@ -12,6 +12,7 @@ Generators are the core processing units of the VJ application. They can generat
 |----------|-------------|--------|
 | **Math** | Waveforms, LFOs, clocks and step sequencers | SineGenerator, TriangleWave, SawtoothWave, SquareWave, NoiseGenerator, LFOSynth, LFOClock, StepChaser, PathPad |
 | **Audio** | Audio analysis that drives everything else | AudioInputAnalysis |
+| **Input** | Video devices of this computer (webcams, capture cards; on macOS the screens) | Camera |
 | **Network** | Art-Net in and out, video in (NDI, Spout), CDJs over Pro DJ Link | ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks |
 | **Utility** | Pads, button fields, envelopes and small helpers | XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld, Control-Button-Matrix, EnvelopeOutput, StepChaser, control4, quantize, textbox, value_text, Chat, broken |
 | **output** | Masks for an output | RGBMask (`legacy/` holds VideoToRGB, no longer in the asset list) |
@@ -27,6 +28,7 @@ Generators/
 ├── Math/            SineGenerator, TriangleWave, SawtoothWave, SquareWave, NoiseGenerator,
 │                    LFOSynth, LFOClock, StepChaser, PathPad
 ├── Audio/           AudioInputAnalysis
+├── Input/           Camera
 ├── Network/         ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks
 ├── Utility/         XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld,
 │                    Control-Button-Matrix, EnvelopeOutput, StepChaser, control4, quantize,
@@ -51,6 +53,10 @@ Produce waveforms from mathematical functions.
 
 ### Audio Generators
 Process audio input and generate reactive visual output based on audio analysis.
+
+### Input Generators
+- **Camera**: the picture of a webcam or capture card (nanogui.video `open_camera`, FFmpeg's input devices), with
+  resolution, frame rate, the video router and *Out*; *Test pattern* works without a camera
 
 ### Network Generators
 Handle network-based input/output:

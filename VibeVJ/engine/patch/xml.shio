@@ -1,0 +1,213 @@
+//A small XML reader (#669: the description.xml of GDTF fixture files). No validation, no namespaces, no DTD: elements,
+//attributes and text, as a tree of JSON nodes:
+//
+//  node = [tag = "DMXChannel", attrs = [Offset = "1,2", ...], children = [node, ...], text = "..."]
+//
+//xml_parse() returns a root node with tag "" whose children are the top elements. Comments, <?...?>, <!DOCTYPE>
+//are skipped, CDATA is text. Entities (&amp; &lt; &gt; &quot; &apos; &#65; &#x41;) are decoded in attribute values
+//and text. A broken document gives what could be read up to the break (an unclosed element is closed at the end).
+//Fast enough for a few MB: every step is a native find() of the next "<", ">" or quote.
+
+XML_ASCII = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
+//A numeric entity ("#65", "#x41"): the character when it is ASCII (tab, line breaks as they are), else the entity as written
+xml_char(name) {
+	code = -1;
+	try {
+		code = name.starts("#x") || name.starts("#X") ? std.int("0x" + name.substr(2)) : std.int(name.substr(1));
+	}
+	catch(e) {
+		code = -1;
+	}
+	if(code == 9)
+		return "\t";
+	if(code == 10)
+		return "\n";
+	if(code == 13)
+		return "\r";
+	if(code >= 32 && code <= 126)
+		return XML_ASCII.substr(code - 32, 1);
+	return "&" + name + ";";
+}
+
+//The entities of a value decoded
+xml_decode(s) {
+	if(s.find("&") < 0)
+		return s;
+	out = "";
+	pos = 0;
+	for(1) {
+		amp = s.find("&", pos);
+		if(amp < 0)
+			break;
+		semi = s.find(";", amp);
+		if(semi < 0 || semi - amp > 10)
+			break;
+		out += s.substr(pos, amp - pos);
+		name = s.substr(amp + 1, semi - amp - 1);
+		if(name == "amp")
+			out += "&";
+		else if(name == "lt")
+			out += "<";
+		else if(name == "gt")
+			out += ">";
+		else if(name == "quot")
+			out += "\"";
+		else if(name == "apos")
+			out += "'";
+		else if(name.starts("#"))
+			out += xml_char(name);
+		else
+			out += "&" + name + ";";
+		pos = semi + 1;
+	}
+	return out + s.substr(pos);
+}
+
+//The attributes of a start tag (the text between the tag name and ">")
+xml_parse_attrs(s) {
+	attrs = std.json();
+	pos = 0;
+	n = s.length();
+	for(pos < n) {
+		eq = s.find("=", pos);
+		if(eq < 0)
+			break;
+		name = s.substr(pos, eq - pos).trim();
+		q = s.find_first_of("\"'", eq + 1);
+		if(q < 0)
+			break;
+		quote = s[q];
+		end = s.find(quote, q + 1);
+		if(end < 0)
+			end = n;
+		if(name)
+			attrs[name] = xml_decode(s.substr(q + 1, end - q - 1));
+		pos = end + 1;
+	}
+	return attrs;
+}
+
+//The end of a tag that starts at pos ("<"): the position of its ">", quotes skipped (a ">" may be in a value)
+xml_tag_end(text, pos) {
+	for(1) {
+		p = text.find_first_of("\"'>", pos);
+		if(p < 0)
+			return -1;
+		if(text[p] == ">")
+			return p;
+		close = text.find(text[p], p + 1);
+		if(close < 0)
+			return -1;
+		pos = close + 1;
+	}
+	return -1;
+}
+
+xml_parse(text) {
+	root = [tag = "", attrs = std.json(), children = [], text = ""];
+	stack = [root];
+	pos = 0;
+	n = text.length();
+	for(pos < n) {
+		lt = text.find("<", pos);
+		if(lt < 0)
+			break;
+		if(lt > pos) {
+			chunk = text.substr(pos, lt - pos).trim();
+			if(chunk)
+				stack[-1].text += xml_decode(chunk);
+		}
+		if(text.substr(lt, 4) == "<!--") {
+			end = text.find("-->", lt + 4);
+			pos = end < 0 ? n : end + 3;
+			continue;
+		}
+		if(text.substr(lt, 9) == "<![CDATA[") {
+			end = text.find("]]>", lt + 9);
+			if(end < 0)
+				end = n;
+			stack[-1].text += text.substr(lt + 9, end - lt - 9);
+			pos = end + 3;
+			continue;
+		}
+		end = xml_tag_end(text, lt + 1);
+		if(end < 0)
+			break;
+		c = text[lt + 1];
+		if(c == "?" || c == "!") {
+			pos = end + 1;
+			continue;
+		}
+		if(c == "/") {
+			//closes the innermost open element of that name (and any unclosed one inside it)
+			name = text.substr(lt + 2, end - lt - 2).trim();
+			for(i = stack.size() - 1; i > 0; i--) {
+				if(stack[i].tag == name) {
+					for(stack.size() > i)
+						stack.pop_back();
+					break;
+				}
+			}
+			pos = end + 1;
+			continue;
+		}
+		inner = text.substr(lt + 1, end - lt - 1);
+		closed = inner.ends("/");
+		if(closed)
+			inner = inner.substr(0, inner.length() - 1);
+		space = inner.find_first_of(" \t\r\n");
+		name = space < 0 ? inner : inner.substr(0, space);
+		node = [tag = name, attrs = space < 0 ? std.json() : xml_parse_attrs(inner.substr(space + 1)), children = [], text = ""];
+		stack[-1].children.push_back(node);
+		if(!closed)
+			stack.push_back(node);
+		pos = end + 1;
+	}
+	return root;
+}
+
+//An attribute of a node, or def when it does not have it
+xml_attr(node, key, def = "") {
+	if(node && node.attrs.has(key))
+		return node.attrs[key];
+	return def;
+}
+
+//The first child element of a node with this tag, or None
+xml_child(node, tag) {
+	if(!node)
+		return None;
+	for(i = 0; i < node.children.size(); i++) {
+		if(node.children[i].tag == tag)
+			return node.children[i];
+	}
+	return None;
+}
+
+//The child elements of a node with this tag ("" = all)
+xml_children(node, tag = "") {
+	list = [];
+	if(!node)
+		return list;
+	for(i = 0; i < node.children.size(); i++) {
+		if(!tag || node.children[i].tag == tag)
+			list.push_back(node.children[i]);
+	}
+	return list;
+}
+
+//The first element below a node (depth first, the node itself not) with this tag, or None
+xml_find(node, tag) {
+	if(!node)
+		return None;
+	for(i = 0; i < node.children.size(); i++) {
+		c = node.children[i];
+		if(c.tag == tag)
+			return c;
+		f = xml_find(c, tag);
+		if(f)
+			return f;
+	}
+	return None;
+}

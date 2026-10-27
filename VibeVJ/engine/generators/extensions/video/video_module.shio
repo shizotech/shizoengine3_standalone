@@ -1,4 +1,6 @@
 #include "engine/interfaces/videorouter"
+#include "engine/generators/extensions/video/video_convert"
+#include "engine/generators/extensions/video/video_loop"
 
 managed video_router = None;
 
@@ -15,6 +17,8 @@ audio_ctrl = None;
 volume_ctrl = None;
 position_ctrl = None;
 convert_ctrl = None;
+convert_format_ctrl = None; // index into VIDEO_CONVERT_FORMATS (video_convert.shio, #460)
+convert_size_ctrl = None;   // index into VIDEO_CONVERT_SIZES
 info_label = None;
 info_text = "";
 
@@ -22,14 +26,33 @@ info_text = "";
 // slider alone for a moment, so it does not fight the hand or the modulation.
 scrub_ms = 0;
 
-// Set while update() moves the slider to where playback is: value(v, false)
-// still calls the callback (shz_slider::set_value notifies), which would seek
-// every clip to where it already is four times a second.
-showing_position = false;
-
-// "Convert to HAP" job (nanogui.video_convert) and what it said when it ended
+// "Convert" job (nanogui.video_convert), what it makes ("HAP", "ProRes 720p") and what it said when it ended
 convert_job = None;
+convert_label = "";
 convert_note = "";
+
+// Sync (#460): the clip follows the timeline (whole bars) or a CDJ deck. Index-based like every controlcombo.
+SYNC_OFF = 0;
+SYNC_BARS = 1;
+SYNC_DECK = 2;
+sync_ctrl = None;
+bars_ctrl = None;
+deck_ctrl = None;
+offset_ctrl = None;
+sync_note = "";      // what the sync does right now, in the info line
+sync_seek_ms = 0;    // last jump of the sync (jumps are rationed, long-GOP files need time for one)
+sync_speed = -1.0;   // speed the sync set last
+
+// In / out points, ping-pong and cue points (#460 point 3, video_loop.shio)
+CUE_COUNT = 8;
+in_ctrl = None;
+out_ctrl = None;
+loop_mode_ctrl = None; // VIDEO_LOOP_FORWARD / VIDEO_LOOP_PINGPONG
+cue_set_ctrl = None;
+cue_ctrls = [];
+cues = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]; // seconds, -1: not set
+loop_state = video_loop_state();
+loop_held = false; // Loop off: stopped at Out (or In backwards) until Restart, Play, a jump or a cue
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "get_default_output")
@@ -44,6 +67,56 @@ dispatcher(generator, cmd, value) {
 	}
 
 	return None;
+}
+
+def update_convert_caption();
+
+// The Speed control times the direction of ping-pong; backwards only where the clip can (the sync sets its own)
+apply_speed() {
+	if(sync_ctrl && sync_ctrl.value() != SYNC_OFF)
+		return;
+	v = speed_ctrl.value() * loop_state.dir;
+	if(v < 0 && !video.reversible())
+		v = 0;
+	video.speed(v);
+}
+
+// The clip loops by itself (seamless) over the whole of it; with In / Out or ping-pong the update() does it
+apply_loop() {
+	whole = video_loop_whole(in_ctrl.value(), out_ctrl.value()) && loop_mode_ctrl.value() == VIDEO_LOOP_FORWARD;
+	video.loop(loop_ctrl.value() && whole);
+	if(loop_mode_ctrl.value() != VIDEO_LOOP_PINGPONG && loop_state.dir != 1) {
+		loop_state.dir = 1;
+		apply_speed();
+	}
+}
+
+// Where In is, in seconds
+loop_in_seconds() {
+	frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+	return video_loop_range(video.duration(), frame, in_ctrl.value(), out_ctrl.value()).a;
+}
+
+def update_cue_caption(i);
+
+// A cue button: Set cues on stores where the clip is, else it jumps there
+cue_hit(i) {
+	if(cue_set_ctrl.value()) {
+		cues[i] = video.position();
+		update_cue_caption(i);
+		return;
+	}
+	if(cues[i] < 0 || !video.seekable())
+		return;
+	loop_held = false;
+	loop_state.seek_to = -1.0;
+	video.position(cues[i]);
+	if(play_ctrl.value())
+		video.play();
+}
+
+update_cue_caption(i) {
+	cue_ctrls[i].caption("Cue " + (i + 1) + (cues[i] >= 0 ? "  " + video_loop_time_text(cues[i]) : "  -"));
 }
 
 // Codec / size / decoder line under the controls. The GPU decoder is only known
@@ -97,20 +170,28 @@ update_info() {
 	if(convert_job) {
 		if(convert_job.finished()) {
 			if(convert_job.ok()) {
-				convert_note = "HAP copy ready: " + fileio.file_name(convert_job.target()) + " (in Assets, next to this file)";
+				convert_note = convert_label + " copy ready: " + fileio.file_name(convert_job.target()) + " (in Assets, next to this file)";
 				if(engine && engine.filebrowser)
 					engine.filebrowser.refresh();
 			}
 			else
 				convert_note = "Convert failed: " + convert_job.error();
 			convert_job = None;
-			convert_ctrl.caption("Convert to HAP");
+			update_convert_caption();
 		}
 		else
-			text = text + " - converting to HAP: " + std.string(std.int(math.round(convert_job.progress() * 100))) + " %";
+			text = text + " - converting to " + convert_label + ": " + std.string(std.int(math.round(convert_job.progress() * 100))) + " %";
 	}
 	if(convert_note)
 		text = text + " - " + convert_note;
+	if(sync_ctrl && sync_ctrl.value() != SYNC_OFF && sync_note)
+		text = text + " - " + sync_note;
+	if(in_ctrl && video.is_open() && (!video_loop_whole(in_ctrl.value(), out_ctrl.value()) || loop_mode_ctrl.value() == VIDEO_LOOP_PINGPONG)) {
+		frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+		r = video_loop_range(video.duration(), frame, in_ctrl.value(), out_ctrl.value());
+		text = text + " - " + (loop_mode_ctrl.value() == VIDEO_LOOP_PINGPONG ? (video.reversible() ? "ping-pong " : "ping-pong needs a clip that plays backwards, looping ") : "loop ") +
+			video_loop_time_text(r.a) + " to " + video_loop_time_text(r.b);
+	}
 
 	if(text != info_text) {
 		info_text = text;
@@ -118,8 +199,19 @@ update_info() {
 	}
 }
 
+// The caption of the Convert button: what a click does with the format and size chosen
+update_convert_caption() {
+	if(!convert_ctrl)
+		return;
+	if(convert_job)
+		convert_ctrl.caption("Cancel convert");
+	else
+		convert_ctrl.caption("Convert to " + video_convert_label(std.int(convert_format_ctrl.value()), std.int(convert_size_ctrl.value())));
+}
+
 // A copy every frame of which is a key frame, so it can be positioned and
-// played backwards: <name>_hap.mov next to the file.
+// played backwards, in the format and size of the options (#460):
+// <name>_hap.mov next to the file, <name>_prores_720p.mov, ...
 start_convert(generator) {
 	if(convert_job) {
 		convert_job.cancel();
@@ -127,17 +219,21 @@ start_convert(generator) {
 	}
 
 	source = generator.path;
-	target = fileio.file_dir(source) + "/" + fileio.pure_name(source) + "_hap.mov";
-	if(fileio.exists(target)) {
-		convert_note = "There is a HAP copy already: " + fileio.file_name(target);
+	format_index = std.int(convert_format_ctrl.value());
+	size_index = std.int(convert_size_ctrl.value());
+	label = video_convert_label(format_index, size_index);
+	reason = video_convert_skip_reason(source, format_index, size_index);
+	if(reason) {
+		convert_note = "No " + label + " copy made: " + reason;
 		update_info();
 		return;
 	}
 
 	convert_note = "";
-	convert_job = nanogui.video_convert(source, target, "hap");
-	if(convert_job)
-		convert_ctrl.caption("Cancel convert");
+	convert_label = label;
+	convert_job = nanogui.video_convert(source, video_convert_target(source, format_index, size_index),
+		VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index]);
+	update_convert_caption();
 	update_info();
 }
 
@@ -156,6 +252,7 @@ entry(generator, area) {
 
 	play_ctrl = control_tabs.controlbutton("Play").tooltip("Plays the clip or holds the current frame").push(1).value(1);
 	play_ctrl.callback([generator](v){
+		loop_held = false;
 		if(v && generator.is_active())
 			video.play();
 		else
@@ -165,37 +262,95 @@ entry(generator, area) {
 	// The buttons below act on a click (v = 1) only: loading a project
 	// (nanogui.deserialize_controls) calls every callback with the saved value
 	// 0, which restarted every clip, stepped it and started a conversion.
-	restart_ctrl = control_tabs.controlbutton("Restart").tooltip("Starts the clip again from its first frame");
+	restart_ctrl = control_tabs.controlbutton("Restart").tooltip("Starts the clip again from its first frame (from In when In is set)");
 	restart_ctrl.callback([](v){
 		if(!v)
 			return;
 		video.stop();
+		loop_held = false;
+		loop_state = video_loop_state();
+		apply_speed();
+		a = loop_in_seconds();
+		if(a > 0 && video.seekable()) {
+			video.position(a);
+			loop_state.seek_to = a;
+			loop_state.seek_ms = std.millis();
+		}
 		if(play_ctrl.value())
 			video.play();
 	});
 
 	// Backwards (negative) only where every frame is a key frame (HAP, ProRes,
-	// DNxHR, ...); "Convert to HAP" in the options makes such a copy.
+	// DNxHR, ...); "Convert" in the options makes such a copy.
 	speed_ctrl = control_tabs.controlslider("Speed").tooltip("-4 to 4 times normal speed. Below 0 backwards, for files in which every frame stands on its own (HAP, ProRes, DNxHR)\n[[wiki:Video#which-files-play-well]]").min(video.reversible() ? -4 : 0).max(4).value(1);
 	speed_ctrl.callback([](v){
-		if(v < 0 && !video.reversible())
-			v = 0;
-		video.speed(v);
+		apply_speed(); // (with sync on the sync sets the speed)
 	});
 
-	loop_ctrl = control_tabs.controlbutton("Loop").tooltip("On: the clip starts over at its end. Off: it stops on its last frame").push(1).value(1);
+	loop_ctrl = control_tabs.controlbutton("Loop").tooltip("On: the clip starts over at its end (at Out: from In, or ping-pong). Off: it stops on its last frame (on the last frame before Out)").push(1).value(1);
 	loop_ctrl.callback([](v){
-		video.loop(v);
+		loop_held = false;
+		apply_loop();
 	});
+
+	// In / out points and ping-pong (#460): what part of the clip loops, and how
+	loop_vec = control_tabs.controlvector("Loop points", "loop_points").expanded(false)
+		.tooltip("Loop a part of the clip: In and Out (0 to 1 through the clip), Forward or Ping-pong\n[[wiki:Video#loop-points-and-cues]]");
+	in_ctrl = loop_vec.controlslider("In").tooltip("Where the loop starts, 0 to 1 through the clip").min(0).max(1).value(0);
+	out_ctrl = loop_vec.controlslider("Out").tooltip("Where the loop ends, 0 to 1 through the clip (at least one frame after In)").min(0).max(1).value(1);
+	loop_mode_ctrl = loop_vec.controlcombo("Loop mode").items(["Forward", "Ping-pong"]).segmented(true)
+		.tooltip("Forward: at Out it jumps back to In. Ping-pong: at Out it turns round and plays backwards to In, then forward again, for clips that can play backwards (HAP, ProRes, DNxHR)\n[[wiki:Video#loop-points-and-cues]]");
+	in_ctrl.callback([](v){ apply_loop(); });
+	out_ctrl.callback([](v){ apply_loop(); });
+	loop_mode_ctrl.callback([](v){ apply_loop(); });
+
+	// Cue points (#460): up to 8 places in the clip a click (or a MIDI note) jumps to
+	cue_vec = control_tabs.controlvector("Cues", "cue_points").expanded(false)
+		.tooltip("Up to 8 places in the clip: with Set cues on a cue button stores where the clip is, with it off it jumps there. Map them to MIDI pads\n[[wiki:Video#loop-points-and-cues]]");
+	cue_set_ctrl = cue_vec.controlbutton("Set cues").push(1).value(0).tooltip("On: a cue button stores where the clip is now. Off: it jumps there");
+	cue_ctrls = [];
+	for(i = 0; i < CUE_COUNT; i++) {
+		cue = cue_vec.controlbutton("Cue " + (i + 1)).tooltip("Jumps to this cue (with Set cues on: stores where the clip is)");
+		cue.callback([i](v){
+			if(v)
+				cue_hit(i);
+		});
+		cue_ctrls.push_back(cue);
+		update_cue_caption(i);
+	}
+	clear_cues_ctrl = cue_vec.controlbutton("Clear cues").tooltip("Forgets every cue of this clip");
+	clear_cues_ctrl.callback([](v){
+		if(!v)
+			return;
+		for(i = 0; i < CUE_COUNT; i++) {
+			cues[i] = -1.0;
+			update_cue_caption(i);
+		}
+	});
+
+	sync_ctrl = control_tabs.controlcombo("SYNC").caption("Sync").items(["Off", "Bars", "Deck"]).segmented(true)
+		.tooltip("Off: the clip runs at its own speed. Bars: it is stretched to whole bars of the [[timeline]] and follows its position, also when the BPM changes. Deck: it follows the track on a CDJ (position and pitch), from a ProlinkBridge or ProlinkDecks generator\n[[wiki:Video#sync]]");
+	sync_ctrl.callback([](v){
+		sync_speed = -1.0;
+		sync_note = "";
+		if(v == SYNC_OFF)
+			apply_speed();
+	});
+
+	sync_vec = control_tabs.controlvector("Sync settings", "sync_settings").tooltip("Bars, deck and offset of the sync").expanded(false);
+	bars_ctrl = sync_vec.controlint("Bars").tooltip("Sync Bars: the clip lasts this many bars of the timeline (4 beats each)").min(1).max(64).value(4);
+	deck_ctrl = sync_vec.controlint("Deck").tooltip("Sync Deck: the CDJ the clip follows, 1 to 6. 0: the tempo master").min(0).max(6).value(0);
+	offset_ctrl = sync_vec.controlfloat("Offset").tooltip("Seconds into the clip at the start of the bars (Bars) or of the track (Deck)").unit("s").value(0);
 
 	// 0..1 through the clip: shows where playback is, and moving it (by hand,
 	// MIDI or a link) jumps there. Moved every frame it scrubs.
 	position_ctrl = control_tabs.controlslider("Position").tooltip("Where the clip is, 0 to 1. Drag it, [[link]] it or map a fader to it to scrub").min(0).max(1).value(0);
 	position_ctrl.undoable(false); //the playhead runs: a jump is no edit to take back (#350)
 	position_ctrl.callback([](v){
-		if(showing_position || !video.seekable())
+		if(!video.seekable())
 			return;
 		scrub_ms = std.millis();
+		loop_held = false;
 		video.position(v * video.duration());
 	});
 
@@ -242,12 +397,26 @@ entry(generator, area) {
 		video.volume(v);
 	});
 
-	convert_ctrl = options_vec.controlbutton("Convert to HAP").tooltip("Makes a [[hap|HAP]] copy next to the file, which can play backwards. A second click cancels\n[[wiki:Video#which-files-play-well]]");
+	// What Convert makes (#460). Index-based like every controlcombo; the button keeps its name "Convert to HAP"
+	// (saved MIDI mappings and links), its caption says the format and size.
+	convert_format_ctrl = options_vec.controlcombo("Convert format").items(video_convert_format_names(false)).value(0)
+		.tooltip("The format of the copy Convert makes. HAP: the graphics card unpacks it, the cheapest to play. HAP Q: better colours, twice the size. ProRes, DNxHR: for editing, decoded by the processor\n[[wiki:Video#converting]]");
+	convert_format_ctrl.callback([](v){
+		update_convert_caption();
+	});
+	convert_size_ctrl = options_vec.controlcombo("Convert size").items(video_convert_size_names()).value(0)
+		.tooltip("The size of the copy: Original, or scaled down (never up) so that the shorter side has at most 2160, 1080, 720 or 480 pixels\n[[wiki:Video#converting]]");
+	convert_size_ctrl.callback([](v){
+		update_convert_caption();
+	});
+
+	convert_ctrl = options_vec.controlbutton("Convert to HAP").tooltip("Makes a copy in the format and size above next to the file (name_hap.mov, ...), which can be positioned without waiting and play backwards. A second click cancels\n[[wiki:Video#converting]]");
 	convert_ctrl.callback([generator](v){
 		if(!v)
 			return;
 		start_convert(generator);
 	});
+	update_convert_caption();
 
 	info_label = control_tabs.label("").wrap(true);
 	update_info();
@@ -277,13 +446,164 @@ entry(generator, area) {
 	});
 }
 
-update(generator, tl_pos, pos_delta) {
-	// No callback: that would seek to where playback already is.
-	if(video.duration() > 0 && std.millis() - scrub_ms > 250) {
-		showing_position = true;
-		position_ctrl.value(video.position() / video.duration(), false);
-		showing_position = false;
+// The device of a ProlinkBridge / ProlinkDecks generator: they put theirs into std.global("prolink_sources"), the sync
+// only reads the decks and opens no connection of its own. A connected one first.
+prolink_source() {
+	sources = std.global("prolink_sources").get();
+	if(!sources)
+		return None;
+	found = None;
+	for(key, device : sources) {
+		if(!device)
+			continue;
+		if(device.connected())
+			return device;
+		if(!found)
+			found = device;
 	}
+	return found;
+}
+
+// Where the clip should be (seconds) and how fast it runs there, or None with sync_note saying why not.
+sync_target(generator, tl_pos) {
+	length = video.duration();
+	mode = sync_ctrl.value();
+
+	if(mode == SYNC_BARS) {
+		timeline = generator.engine ? generator.engine.timeline : std.global("timeline");
+		if(!timeline)
+			return None;
+		beats = bars_ctrl.value() * 4;
+		bpm = timeline.bpm_ctrl.value();
+		seconds = beats * 60.0 / math.max(bpm, 1.0);
+		rate = timeline.play_btn.value() ? length / seconds : 0.0;
+		sync_note = "sync: " + std.string(bars_ctrl.value()) + " bars = " + std.string(math.round(seconds * 100) / 100.0) + " s";
+		phase = tl_pos / beats;
+		return [position = (phase - math.floor(phase)) * length + offset_ctrl.value(), rate = rate];
+	}
+
+	device = prolink_source();
+	if(!device) {
+		sync_note = "sync: no CDJs, add a ProlinkBridge or ProlinkDecks generator (Network)";
+		return None;
+	}
+	deck = deck_ctrl.value();
+	player = deck == 0 ? device.master() : device.player(deck);
+	if(!player) {
+		sync_note = deck == 0 ? "sync: no tempo master" : "sync: no deck " + std.string(deck);
+		return None;
+	}
+	if(player.positionMs == None) {
+		sync_note = "sync: deck " + std.string(player.n) + " has no position (no track, or no beat grid)";
+		return None;
+	}
+	// The player extrapolates positionMs to now with its pitch, the same rate the clip runs at
+	rate = player.moving ? 1.0 + player.pitch / 100.0 : 0.0;
+	sync_note = "sync: deck " + std.string(player.n);
+	if(player.track && player.track.title)
+		sync_note = sync_note + " (" + player.track.title + ")";
+	return [position = player.positionMs / 1000.0 + offset_ctrl.value(), rate = rate];
+}
+
+// Speed and position of the clip from the sync target: the speed carries it, a small speed correction keeps it on
+// the target, a jump catches up when it is too far off (deck cued / scratched, timeline moved, clip too slow).
+update_sync(generator, tl_pos) {
+	// Play off (or ACT off) holds the frame, also with sync
+	if(sync_ctrl.value() == SYNC_OFF || !play_ctrl.value() || !generator.is_active())
+		return;
+
+	length = video.duration();
+	if(!video.is_open() || length <= 0 || !video.seekable()) {
+		sync_note = "sync needs a clip that can be positioned";
+		return;
+	}
+
+	target = sync_target(generator, tl_pos);
+	if(!target)
+		return;
+
+	position = target.position;
+	if(loop_ctrl.value())
+		position = position - math.floor(position / length) * length;
+	else
+		position = math.clamp(position, 0.0, length);
+
+	frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+	diff = position - video.position();
+	if(loop_ctrl.value()) {
+		// Around the loop point the short way counts
+		if(diff > length / 2)
+			diff = diff - length;
+		else if(diff < -length / 2)
+			diff = diff + length;
+	}
+
+	rate = target.rate;
+	if(rate > 4.0) {
+		sync_note = sync_note + ", too fast (more bars)";
+		rate = 4.0;
+	}
+
+	now = std.millis();
+	gap = video.intra_only() ? 100 : 1000;
+	if(rate == 0) {
+		// Stopped: the frame of the target (scrubbing with the timeline cursor or the jog wheel)
+		if(math.abs(diff) > frame * 0.5 && now - sync_seek_ms > gap / 2) {
+			video.position(position);
+			sync_seek_ms = now;
+		}
+	}
+	else if(math.abs(diff) > math.max(0.15, frame * 4) && now - sync_seek_ms > gap) {
+		video.position(position);
+		sync_seek_ms = now;
+	}
+	else {
+		// At most 5 % faster or slower, half the distance per second
+		rate = rate * (1.0 + math.clamp(diff * 0.5, -0.05, 0.05));
+	}
+
+	if(math.abs(rate - sync_speed) > 0.0005) {
+		video.speed(rate);
+		sync_speed = rate;
+	}
+	sync_note = sync_note + ", speed " + std.string(math.round(rate * 100) / 100.0);
+}
+
+// In / Out and ping-pong while the clip plays (video_loop.shio). Not with sync (it places the clip itself), nor when
+// the whole clip loops forward (the decoder loops by itself, seamless)
+update_loop(generator) {
+	if(loop_held || (sync_ctrl && sync_ctrl.value() != SYNC_OFF) || !play_ctrl.value() || !generator.is_active())
+		return;
+	if(!video.is_open() || !video.seekable() || video.duration() <= 0)
+		return;
+	if(video_loop_whole(in_ctrl.value(), out_ctrl.value()) && loop_mode_ctrl.value() == VIDEO_LOOP_FORWARD)
+		return;
+	frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+	dir = loop_state.dir;
+	step = video_loop_step(loop_state, video.position(), speed_ctrl.value(), video.duration(), frame, in_ctrl.value(),
+		out_ctrl.value(), loop_mode_ctrl.value(), loop_ctrl.value(), video.reversible(), video.finished(), std.millis());
+	if(step.hold) {
+		video.pause();
+		loop_held = true;
+		return;
+	}
+	if(step.dir != dir)
+		apply_speed();
+	if(!std.is_none(step.seek)) {
+		video.position(step.seek);
+		video.play(); // (after the end of the file it had stopped)
+	}
+}
+
+update(generator, tl_pos, pos_delta) {
+	update_sync(generator, tl_pos);
+	update_loop(generator);
+
+	// Shows where playback is. The false says: no callback - that would seek the clip to where
+	// it already is, four times a second (#465; a smoothed Position runs up silently as well,
+	// _testing/nanogui/slider_smooth_value_notify.shio).
+	if(video.duration() > 0 && std.millis() - scrub_ms > 250)
+		position_ctrl.value(video.position() / video.duration(), false);
 
 	update_info();
 }
@@ -299,6 +619,16 @@ save_state() {
 		audio = audio_ctrl.value(),
 		volume = volume_ctrl.value(),
 		position = video.position(),
+		sync = sync_ctrl.value(),
+		sync_bars = bars_ctrl.value(),
+		sync_deck = deck_ctrl.value(),
+		sync_offset = offset_ctrl.value(),
+		convert_format = convert_format_ctrl.value(),
+		convert_size = convert_size_ctrl.value(),
+		in_point = in_ctrl.value(),
+		out_point = out_ctrl.value(),
+		loop_mode = loop_mode_ctrl.value(),
+		cues = cues.copy(),
 	];
 }
 
@@ -306,10 +636,34 @@ load_state(state) {
 	if(!state)
 		return;
 
+	if(state.has("sync_bars"))
+		bars_ctrl.value(state.sync_bars);
+	if(state.has("sync_deck"))
+		deck_ctrl.value(state.sync_deck);
+	if(state.has("sync_offset"))
+		offset_ctrl.value(state.sync_offset);
+	if(state.has("sync"))
+		sync_ctrl.value(state.sync);
+	if(state.has("convert_format"))
+		convert_format_ctrl.value(state.convert_format);
+	if(state.has("convert_size"))
+		convert_size_ctrl.value(state.convert_size);
 	if(state.has("speed"))
 		speed_ctrl.value(state.speed);
 	if(state.has("loop"))
 		loop_ctrl.value(state.loop);
+	if(state.has("in_point"))
+		in_ctrl.value(state.in_point);
+	if(state.has("out_point"))
+		out_ctrl.value(state.out_point);
+	if(state.has("loop_mode"))
+		loop_mode_ctrl.value(state.loop_mode);
+	if(state.has("cues") && std.type(state.cues) == "json") {
+		for(i = 0; i < CUE_COUNT && i < state.cues.size(); i++) {
+			cues[i] = std.float(state.cues[i]);
+			update_cue_caption(i);
+		}
+	}
 	if(state.has("flip_y"))
 		flip_ctrl.value(state.flip_y);
 	if(state.has("hardware"))

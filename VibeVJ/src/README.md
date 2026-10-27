@@ -6,6 +6,25 @@ The `src/` directory contains the main application source code.
 
 The source code implements the menu-specific application logic, the entire layout UI of VibeVJ, and the core functionality of the VJ application.
 
+## The language: ShizoScript 3 (docs come with the app, not with this repo)
+
+Every file in `src/` is **ShizoScript 3** (`.shio`) driving the `nanogui` bindings — a custom language,
+so there is no external documentation site to guess from. The interpreter that runs it prints its own
+reference; run it in the app folder (`_shizoengine3/` in a checkout, the folder of `VibeVJ.exe` in a
+released build):
+
+```
+shz docs                 every namespace, object type and function of this build, with examples
+shz docs <keyword>       searched by plain keyword (nanogui, json, tooltip, …)
+shz mcpdocs              the reference as an MCP server on http://localhost:13338
+shz --check __init__.shio   compile check of the whole app, no GUI, no run
+```
+
+A name like `docs` is resolved with the current folder first, so `shz docs` runs
+`shizotech/system/docs/__init__.shio` unless a folder of that name sits next to the exe (then:
+`shz shizotech/system/docs`). Rules, the stdlib layout and the measurements:
+[`../AGENTS.MD`](../AGENTS.MD), section *ShizoScript 3*.
+
 ## Directory Structure
 
 ```

@@ -3,7 +3,7 @@
 A CueList shows clips as lists of cues: one list per layer, one button per cue. It is made for running a show from a
 few big buttons. Under its surface it is a [Clipview](Clipview.md): a cue is a clip, a list is a layer.
 
-![A CueList with two lists of two cues each; the first cue of the first list is live](media/cuelist.png)
+![A CueList with two lists of two cues each, the arrows and the × beside each cue; the first cue of the first list is live](media/cuelist.png)
 
 ## Open one
 
@@ -16,8 +16,16 @@ few big buttons. Under its surface it is a [Clipview](Clipview.md): a cue is a c
   the empty part of the CueList. It becomes the first cue of a new list.
 - **One more cue:** drag an asset onto a list. The cue is added at its end.
 
-There is no way to sort the cues in a list yet. To change the order, switch on *Show clipview* and move the clips
-there.
+## Change the order
+
+Beside each cue are two small arrows (tooltips *Moves this cue up*, *Moves this cue down*): the cue swaps places with
+the cue before or after it. The arrow up of the first cue and the arrow down of the last one are greyed out. Each move
+is one step of [undo](The-Screen.md#undo-and-redo) (*Move cue up*, *Move cue down*, Ctrl+Z / Ctrl+Y). A cue that is live
+stays live while it moves.
+
+The order of a list is the order of the clips in its row of the Clipview behind it, from left to right, so it is
+saved with the project. Moving a cue swaps two clips there; moving clips in *Show clipview* changes the order of the
+cues too. While *Live* is on the arrows are hidden.
 
 ## A list
 
@@ -27,8 +35,9 @@ From top to bottom:
 |---|---|
 | Name | The name of the layer. Type to rename it. |
 | Picture | The picture of the layer. |
-| *Master*, *Mix*, *Transition* | The same three controls as in the [Clipview](Clipview.md#layers); they move together with them. |
+| *Master*, *Mix*, *Transition* | The same three controls as in the [Clipview](Clipview.md#layers); they move together with them. *Transition* is in seconds with the same curve as the layer's, so both show the same number. |
 | The cues | One button per cue, with the name of its clip. Click one to start it. The cue that is live, fading in or waiting is highlighted. Clicking the live cue again does not stop it. |
+| Small arrows beside a cue | Move the cue one place up or down ([Change the order](#change-the-order)). Hidden while *Live* is on. |
 | × beside a cue | Tooltip *Remove this cue*. Deletes the cue with its clip. Hidden while *Live* is on. |
 | Chevron up, chevron down | Tooltips *Previous cue*, *Next cue*. They go round at the ends. With no cue live they do nothing. |
 | *Random* | Starts any cue of the list. |
@@ -41,7 +50,7 @@ The buttons at the bottom of a list have notches: [link](Linking.md#make-a-link)
 
 | Button | What it does |
 |---|---|
-| *Live* | Locks the lists for playing: the × of every cue is hidden, and the Clipview behind them is locked too ([Clipview](Clipview.md#live)). |
+| *Live* | Locks the lists for playing: the arrows and the × of every cue are hidden, and the Clipview behind them is locked too ([Clipview](Clipview.md#live)). |
 | *Show clipview* | Shows the Clipview behind the lists instead of the lists. The settings of a cue are only there: *Name*, *Trigger*, *Duration*, *Transition*, *Inputs*, *Macros* ([Clip settings](Clipview.md#clip-settings)). |
 | *Autoplay* | Turns *Autoplay forwards* on or off in every list: the cues play in order, one after the other, each for the *Duration* of its layer (64 beats at the start); after the last cue the list starts again. It counts the beats of the [timeline](Timeline.md), so press *Play* there. |
 | *Random* | Starts one random cue in every list at once. |

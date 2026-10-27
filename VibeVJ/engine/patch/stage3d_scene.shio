@@ -1,0 +1,406 @@
+//The stage in 3D on a nanogui.view3d (#686): the lamps of the patch as 3D objects drawn by OpenGL (depth buffer,
+//light added on top), their beams turned by pan and tilt and in the colour they are sent, where the beams land on
+//the floor (spot lights, with the gobo a lamp shows), and the 3D models of GDTF imports (#669) with the parts pan and
+//tilt turn. The fixture setup draws its 3D view with it; the maths is the one of engine/patch/stage3d.shio (the
+//camera of the view is stage3d_camera, so stage3d_project / stage3d_ray agree with the picture).
+//
+//Needs engine/patch/patch.shio, engine/patch/stage3d.shio and engine/patch/palette.shio included before it, and
+//nanogui imported.
+//
+//  scene = stage3d_scene(view);       //view: a nanogui.view3d
+//  scene.sync(lamps, menu, selected, problems);   //in view.on_prepare: brings the items up to date
+//  id = scene.lamp_at(pos);           //the lamp (its id) under a point of the view, or None
+//
+//A lamp is built in its own frame: z is where its beam goes when it does not move (up standing, down hanging,
+//leaned and turned with the lamp, as stage3d_beam_dir), x is along it (the pixels of a bar), its body below z = 0. A
+//moving head turns its yoke around z (pan) and its head around x (tilt): its beam is stage3d_beam_dir. A model of a
+//GDTF import hangs in its GDTF frame (stage3d_gdtf_frame), its parts turned as stage3d_model_parts turns them.
+//`menu` is engine.fixture_menu (the colour and pan / tilt the lamps are sent), or None.
+
+STAGE3D_BEAM_LENGTH = 8.0; //metres: a beam reaches this far, and stops at the floor
+STAGE3D_BODY_COLOR = vec4f(0.34, 0.34, 0.36, 1.0);
+STAGE3D_MODEL_COLOR = vec4f(0.5, 0.5, 0.52, 1.0);
+STAGE3D_SCENE_WHITE = [r = 0.6, g = 0.6, b = 0.6]; //a lamp that has no colour: light as it is
+
+class stage3d_scene {
+	view = None;
+	shapes = None; //the meshes every lamp shares
+	model_meshes = std.json(); //type path + time -> the meshes of its parts (a GDTF model)
+	bar_beams = std.json(); //length, width, angle -> the sheet of light of a bar
+	lamps = std.json(); //lamp id -> what is built of it (stage3d_scene_lamp)
+	floor_key = "";
+	floor_items = [];
+	floor_y1 = 6.0; //where the audience is (the label of the setup)
+	built_count = -1;
+	lights_changed = true;
+
+	__init__(view) {
+		this.view = view;
+		shapes = [
+			box = nanogui.mesh3d().box(1.0, 1.0, 1.0),
+			can = nanogui.mesh3d().cylinder(1.0, 1.0, 20),
+			disc = nanogui.mesh3d().cylinder(1.0, 1.0, 20),
+			beam = nanogui.mesh3d().cone(0.0, 1.0, -1.0, 32, false),
+			pole = nanogui.mesh3d().lines([0.0, 0.0, 0.0, 0.0, 0.0, -1.0])];
+	}
+
+	//A matrix (3 x 4, rows) that scales by (sx, sy, sz) and moves to (x, y, z)
+	scaled(sx, sy, sz, x = 0.0, y = 0.0, z = 0.0) {
+		return [sx, 0.0, 0.0, x, 0.0, sy, 0.0, y, 0.0, 0.0, sz, z];
+	}
+
+	//The frame of a lamp (z: its beam when it does not move, see the top), at its place
+	lamp_frame(f) {
+		hanging = (f.mount ?? "floor") == "hanging";
+		cx = stage3d_lamp_to_world(f, stage3d_v(1.0, 0.0, 0.0));
+		cy = stage3d_lamp_to_world(f, stage3d_v(0.0, hanging ? -1.0 : 1.0, 0.0));
+		cz = stage3d_lamp_to_world(f, stage3d_v(0.0, 0.0, hanging ? -1.0 : 1.0));
+		p = stage3d_lamp_pos(f);
+		return [cx.x, cy.x, cz.x, p.x, cx.y, cy.y, cz.y, p.y, cx.z, cy.z, cz.z, p.z];
+	}
+
+	//pan / tilt of a lamp (0..1 as sent, None: the middle) as the angles of stage3d_beam_dir: [turn, tip] in radians
+	angles(t, pt) {
+		if(!pt || std.is_none(pt.pan) || std.is_none(pt.tilt))
+			return [turn = 0.0, tip = 0.0];
+		return [turn = (pt.pan - 0.5) * t.pan_range * math.PI / 180.0, tip = (pt.tilt - 0.5) * t.tilt_range * math.PI / 180.0];
+	}
+
+	//The meshes of the parts of a GDTF model (built once per fixture file)
+	model_parts(t) {
+		k = t.path + ":" + t.time;
+		if(model_meshes.has(k))
+			return model_meshes[k];
+		list = [];
+		for(part : t.mesh.parts)
+			list.push_back(part.t.size() ? nanogui.mesh3d().triangles(part.v, part.t) : None);
+		model_meshes[k] = list;
+		return model_meshes[k];
+	}
+
+	//The sheet of light of a bar: from all its pixels (length x width at z = 0), wider by the beam angle at z = -1 (the
+	//matrix makes it STAGE3D_BEAM_LENGTH long)
+	bar_beam(length, width, angle) {
+		k = length + ":" + width + ":" + angle;
+		if(bar_beams.has(k))
+			return bar_beams[k];
+		s = STAGE3D_BEAM_LENGTH * math.tan(angle * math.PI / 360.0);
+		a = length / 2.0;
+		b = width / 2.0;
+		v = [-a, -b, 0.0, a, -b, 0.0, a, b, 0.0, -a, b, 0.0,
+			-a - s, -b - s, -1.0, a + s, -b - s, -1.0, a + s, b + s, -1.0, -a - s, b + s, -1.0];
+		t = [0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7];
+		bar_beams[k] = nanogui.mesh3d().triangles(v, t);
+		return bar_beams[k];
+	}
+
+	// =========================================================================
+	// Building
+	// =========================================================================
+
+	//The floor: a plane that the beams light, a grid of metres around the lamps and the middle lines of the stage
+	build_floor(lamps) {
+		b = patch_bounds(lamps);
+		x0 = b ? math.floor(b.min_x) - 4 : -8;
+		x1 = b ? math.ceil(b.max_x) + 4 : 8;
+		y0 = b ? math.floor(b.min_y) - 4 : -6;
+		y1 = b ? math.ceil(b.max_y) + 4 : 6;
+		k = x0 + "," + x1 + "," + y0 + "," + y1;
+		if(k == floor_key && floor_items.size())
+			return;
+		floor_key = k;
+		for(id : floor_items)
+			view.remove(id);
+		floor_items = [];
+		//(a little under the lines, so they are not hidden by it)
+		plane = nanogui.mesh3d().triangles([x0 - 6.0, y0 - 6.0, -0.003, x1 + 6.0, y0 - 6.0, -0.003, x1 + 6.0, y1 + 6.0, -0.003,
+			x0 - 6.0, y1 + 6.0, -0.003], [0, 1, 2, 0, 2, 3]);
+		floor_items.push_back(view.add(plane, [mode = "flat", color = PAL_CANVAS, receive = true, pick = false]));
+		floor_items.push_back(view.add(nanogui.mesh3d().grid(x0, y0, x1, y1, 1.0), [mode = "line", color = PAL_LINE, pick = false]));
+		middle = nanogui.mesh3d().lines([0.0, y0, 0.0, 0.0, y1, 0.0, x0, 0.0, 0.0, x1, 0.0, 0.0]);
+		floor_items.push_back(view.add(middle, [mode = "line", color = PAL_LINE_STRONG, pick = false]));
+		floor_y1 = y1;
+	}
+
+	//A lamp built: its items and what they were last set to
+	build_lamp(f) {
+		t = patch_type(f.type);
+		size = patch_lamp_size(f);
+		//(fx.. what it was set to where it stands, cr.. how it looks: -1 / "" so the first sync sets them)
+		rec = [id = f.id, type_path = t.path, type_time = t.time, root = -1, bodies = [], lens = -1, beam = -1, pan = -1, tilt = -1,
+			pole = -1, kind = size.kind, model = false, bar = size.bar, length = size.length, angle = t.beam_angle, parts = [],
+			fx = -1000000.0, fy = 0.0, fz = 0.0, frot = 0, flean = 0.0, fmount = "", cr = -1.0, cg = -1.0, cb = -1.0, cpan = -1.0,
+			ctilt = -1.0, cgobo = "", bright = 0.0, ring = -1, light = None];
+		rec.pole = view.add(shapes.pole, [mode = "line", color = PAL_LINE_STRONG, pick = false]);
+		beam_options = [mode = "light", fade = true, floor_clip = true, pick = false, visible = false];
+		r_beam = STAGE3D_BEAM_LENGTH * math.tan(t.beam_angle * math.PI / 360.0);
+
+		//a GDTF model: its parts in its GDTF frame
+		if(t.mesh) {
+			rec.model = true;
+			rec.root = view.add(None, [tag = f.id, matrix = stage3d_gdtf_frame(f)]);
+			meshes = model_parts(t);
+			ids = [];
+			for(i = 0; i < t.mesh.parts.size(); i++) {
+				part = t.mesh.parts[i];
+				parent = part.parent >= 0 && part.parent < ids.size() ? ids[part.parent] : rec.root;
+				id = view.add(meshes[i], [parent = parent, matrix = part.m, color = STAGE3D_MODEL_COLOR]);
+				ids.push_back(id);
+				if(meshes[i])
+					rec.bodies.push_back(id);
+			}
+			rec.parts = ids;
+			b = t.mesh.beam;
+			if(b && b.size() >= 4 && b[0] >= 0 && b[0] < ids.size()) {
+				extent = t.mesh.extent ?? size.length;
+				//where the light comes out: the beam goes down -z of that part
+				lens_frame = view.add(None, [parent = ids[b[0]], matrix = scaled(1.0, 1.0, 1.0, b[1], b[2], b[3])]);
+				r = math.clamp(extent * 0.09, 0.02, 0.25);
+				rec.lens = view.add(shapes.disc, [parent = lens_frame, mode = "flat", matrix = scaled(r, r, 0.01, 0.0, 0.0, -0.012)]);
+				beam_options.parent = lens_frame;
+				beam_options.matrix = scaled(r_beam, r_beam, STAGE3D_BEAM_LENGTH);
+				rec.beam = view.add(shapes.beam, beam_options);
+			}
+			return rec;
+		}
+
+		rec.root = view.add(None, [tag = f.id]);
+		s = math.clamp(size.length / 0.5, 0.3, 4.0); //(the shapes are made for a lamp of half a metre)
+		body = [parent = rec.root, color = STAGE3D_BODY_COLOR];
+		if(size.bar) {
+			l = size.length;
+			w = size.width;
+			body.matrix = scaled(l, w, 0.08, 0.0, 0.0, -0.04);
+			rec.bodies.push_back(view.add(shapes.box, body));
+			rec.lens = view.add(shapes.box, [parent = rec.root, mode = "flat", matrix = scaled(l * 0.96, w * 0.7, 0.01, 0.0, 0.0, 0.002)]);
+			//the first pixel
+			view.add(shapes.box, [parent = rec.root, mode = "flat", color = PAL_TEXT_2,
+				matrix = scaled(0.04, 0.04, 0.012, -l / 2.0 + 0.05, 0.0, 0.01)]);
+			beam_options.parent = rec.root;
+			beam_options.matrix = scaled(1.0, 1.0, -STAGE3D_BEAM_LENGTH, 0.0, 0.0, 0.01);
+			rec.beam = view.add(bar_beam(l * 0.96, w * 0.7, t.beam_angle), beam_options);
+			return rec;
+		}
+		front = 0.0; //where the light comes out (z of the frame)
+		holder = rec.root; //what the head hangs on: the yoke of a moving head
+		if(size.kind == "head") {
+			//the foot, the yoke (pan) with its two arms, the head (tilt) between them
+			body.matrix = scaled(0.36 * s, 0.24 * s, 0.06 * s, 0.0, 0.0, -0.3 * s);
+			rec.bodies.push_back(view.add(shapes.box, body));
+			rec.pan = view.add(None, [parent = rec.root]);
+			for(side : [-1.0, 1.0]) {
+				arm = [parent = rec.pan, color = STAGE3D_BODY_COLOR, matrix = scaled(0.04 * s, 0.08 * s, 0.3 * s, side * 0.17 * s, 0.0, -0.13 * s)];
+				rec.bodies.push_back(view.add(shapes.box, arm));
+			}
+			rec.tilt = view.add(None, [parent = rec.pan]);
+			holder = rec.tilt;
+			head = [parent = holder, color = STAGE3D_BODY_COLOR, matrix = scaled(0.12 * s, 0.12 * s, 0.3 * s, 0.0, 0.0, -0.15 * s)];
+			rec.bodies.push_back(view.add(shapes.can, head));
+			front = 0.15 * s;
+			rec.lens = view.add(shapes.disc, [parent = holder, mode = "flat", matrix = scaled(0.1 * s, 0.1 * s, 0.01, 0.0, 0.0, front)]);
+		}
+		else if(size.kind == "dimmer") {
+			//a box in the colour it is sent
+			rec.lens = view.add(shapes.box, [parent = rec.root, matrix = scaled(0.3 * s, 0.3 * s, 0.14 * s, 0.0, 0.0, -0.07 * s)]);
+			rec.bodies.push_back(rec.lens);
+			front = 0.0;
+		}
+		else {
+			//a par: a can, its front in the colour it is sent
+			body.matrix = scaled(0.14 * s, 0.14 * s, 0.24 * s, 0.0, 0.0, -0.2 * s);
+			rec.bodies.push_back(view.add(shapes.can, body));
+			front = 0.04 * s;
+			rec.lens = view.add(shapes.disc, [parent = holder, mode = "flat", matrix = scaled(0.12 * s, 0.12 * s, 0.01, 0.0, 0.0, front)]);
+		}
+		beam_options.parent = holder;
+		beam_options.matrix = scaled(r_beam, r_beam, -STAGE3D_BEAM_LENGTH, 0.0, 0.0, front + 0.012);
+		rec.beam = view.add(shapes.beam, beam_options);
+		return rec;
+	}
+
+	//Everything again: other lamps, other types or other kinds
+	rebuild(lamps) {
+		view.clear();
+		this.lamps = std.json();
+		floor_key = "";
+		floor_items = [];
+		build_floor(lamps);
+		for(f : lamps)
+			this.lamps[f.id] = build_lamp(f);
+	}
+
+	// =========================================================================
+	// Every frame
+	// =========================================================================
+
+	//Brings the items up to date. lamps: the fixtures of the patch; selected: ids (a ring in the accent colour);
+	//problems: a json whose keys are the ids of lamps with a problem (a ring in the danger colour). A frame in which
+	//nothing changed costs a few comparisons per lamp: what was set is kept and compared (numbers, not strings)
+	sync(lamps, menu, selected = [], problems = std.json()) {
+		//other lamps, another type of a lamp (its file read again: another time) or another kind: built again
+		same = lamps.size() == built_count;
+		for(i = 0; same && i < lamps.size(); i++) {
+			f = lamps[i];
+			if(!this.lamps.has(f.id))
+				same = false;
+			else {
+				rec = this.lamps[f.id];
+				t = patch_type(f.type);
+				same = rec.type_path == t.path && rec.type_time == t.time;
+			}
+		}
+		if(!same) {
+			rebuild(lamps);
+			built_count = lamps.size();
+			lights_changed = true;
+		}
+		moved = !same;
+		for(f : lamps) {
+			rec = this.lamps[f.id];
+			t = patch_type(f.type);
+			//where it is
+			z = f.z ?? 0.0;
+			rotation = f.rotation ?? 0;
+			lean = f.lean ?? 0.0;
+			mount = f.mount ?? "floor";
+			if(f.x != rec.fx || f.y != rec.fy || z != rec.fz || rotation != rec.frot || lean != rec.flean || mount != rec.fmount) {
+				rec.fx = f.x;
+				rec.fy = f.y;
+				rec.fz = z;
+				rec.frot = rotation;
+				rec.flean = lean;
+				rec.fmount = mount;
+				view.item(rec.root, [matrix = rec.model ? stage3d_gdtf_frame(f) : lamp_frame(f)]);
+				view.item(rec.pole, [visible = z > 0.05, matrix = scaled(1.0, 1.0, math.max(z, 0.001), f.x, f.y, z)]);
+				moved = true;
+				rec.light = None;
+			}
+			//how it looks: its colour, pan and tilt
+			c = menu ? menu.lamp_color(f) : None;
+			//a lamp without colour or dimmer channels (only movement): light as it is
+			if(!c)
+				c = STAGE3D_SCENE_WHITE;
+			pt = t.moving && menu ? menu.lamp_pan_tilt(f) : None;
+			pan = pt ? pt.pan : None;
+			tilt = pt ? pt.tilt : None;
+			gobo = t.wheels && menu ? menu.lamp_gobo(f) : None;
+			if(c.r != rec.cr || c.g != rec.cg || c.b != rec.cb || pan != rec.cpan || tilt != rec.ctilt || gobo != rec.cgobo) {
+				rec.cr = c.r;
+				rec.cg = c.g;
+				rec.cb = c.b;
+				rec.cpan = pan;
+				rec.ctilt = tilt;
+				rec.cgobo = gobo;
+				a = angles(t, pt);
+				bright = math.max(c.r, math.max(c.g, c.b));
+				rec.bright = bright;
+				lens = c.r + c.g + c.b < 0.05 ? PAL_RAISED : vec4f(c.r, c.g, c.b, 1.0);
+				if(rec.lens >= 0)
+					view.item(rec.lens, [color = lens]);
+				if(rec.beam >= 0)
+					view.item(rec.beam, [visible = bright >= 0.02, color = vec4f(math.max(c.r, 0.08), math.max(c.g, 0.08),
+						math.max(c.b, 0.08), 0.12 + 0.3 * bright)]);
+				if(rec.model)
+					set_model_pose(rec, t, a);
+				else if(rec.pan >= 0) {
+					cp = math.cos(a.turn);
+					sp = math.sin(a.turn);
+					ct = math.cos(a.tip);
+					st = math.sin(a.tip);
+					view.item(rec.pan, [matrix = [cp, sp, 0.0, 0.0, 0.0 - sp, cp, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]]);
+					view.item(rec.tilt, [matrix = [1.0, 0.0, 0.0, 0.0, 0.0, ct, st, 0.0, 0.0, 0.0 - st, ct, 0.0]]);
+				}
+				rec.light = None;
+			}
+			//the ring: selected, a problem
+			ring = selected.has_value(f.id) ? 1 : (problems.has(f.id) ? 2 : 0);
+			if(ring != rec.ring) {
+				rec.ring = ring;
+				rim = ring == 1 ? PAL_ACCENT : (ring == 2 ? PAL_DANGER : vec4f(0.0, 0.0, 0.0, 0.0));
+				for(id : rec.bodies)
+					view.item(id, [rim = rim]);
+			}
+			//where its beam lands: a spot light (a bar: three along it), made again when the lamp moved or looks other
+			if(std.is_none(rec.light)) {
+				rec.light = lamp_lights(rec, c, gobo);
+				lights_changed = true;
+			}
+		}
+		if(moved)
+			build_floor(lamps);
+		if(lights_changed) {
+			lights_changed = false;
+			spots = [];
+			for(f : lamps) {
+				for(one : this.lamps[f.id].light)
+					spots.push_back(one);
+			}
+			view.lights(spots);
+		}
+	}
+
+	//The spot lights of a lamp: where its beam lands on the floor (none while it is dark)
+	lamp_lights(rec, c, gobo) {
+		list = [];
+		if(rec.beam < 0 || rec.bright < 0.02)
+			return list;
+		m = view.world_matrix(rec.beam);
+		if(!m)
+			return list;
+		dir = stage3d_normalize(stage3d_v(0.0 - m[2], 0.0 - m[6], 0.0 - m[10]));
+		from = stage3d_v(m[3], m[7], m[11]);
+		light = [pos = from, dir = dir, angle = rec.angle, range = STAGE3D_BEAM_LENGTH,
+			color = vec4f(c.r, c.g, c.b, 0.4 + 0.8 * rec.bright)];
+		if(gobo)
+			light.gobo = gobo;
+		if(!rec.bar) {
+			list.push_back(light);
+			return list;
+		}
+		along = stage3d_normalize(stage3d_v(m[0], m[4], m[8]));
+		for(k : [-1.0, 0.0, 1.0]) {
+			one = light.copy();
+			one.pos = stage3d_add(from, stage3d_scale(along, k * rec.length / 3.0));
+			list.push_back(one);
+		}
+		return list;
+	}
+
+	//The parts of a GDTF model turned as stage3d_model_parts turns them (the pan part around its z, the tilt part around
+	//its x)
+	set_model_pose(rec, t, a) {
+		for(i : [t.pan_part, t.tilt_part]) {
+			if(i < 0 || i >= rec.parts.size())
+				continue;
+			m = t.mesh.parts[i].m;
+			if(i == t.pan_part) {
+				c = math.cos(a.turn);
+				s = math.sin(a.turn);
+				m = stage3d_mat_mul(m, [c, 0.0 - s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+			}
+			if(i == t.tilt_part) {
+				c = math.cos(0.0 - a.tip);
+				s = math.sin(0.0 - a.tip);
+				m = stage3d_mat_mul(m, [1.0, 0.0, 0.0, 0.0, 0.0, c, 0.0 - s, 0.0, 0.0, s, c, 0.0]);
+			}
+			view.item(rec.parts[i], [matrix = m]);
+		}
+	}
+
+	// =========================================================================
+	// For the setup: picking and labels
+	// =========================================================================
+
+	//The id of the lamp under a point of the view, or None
+	lamp_at(pos, slack = 6.0) {
+		hit = view.pick(pos, slack);
+		if(!hit || !hit.tag || !lamps.has(hit.tag))
+			return None;
+		return hit.tag;
+	}
+
+	//The box of a lamp on the screen ([min, max] vec2f), None when it is not in front of the camera
+	lamp_box(id) {
+		return lamps.has(id) ? view.screen_bounds(lamps[id].root) : None;
+	}
+}

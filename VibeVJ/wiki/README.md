@@ -25,6 +25,7 @@ explains what you do with them.
 | [Audio](Audio.md) | Audio Input Analysis: beat, energy, break and drop |
 | [Video](Video.md) | Video clips: playback, speed, formats |
 | [Output and devices](Output-and-Devices.md) | Shader output, NDI, Spout, Art-Net, fixtures, mapping, Prolink |
+| [Lighting desk](Lighting-Desk.md) | Programmer, palettes, cue stacks and executors for lamps and mapping, as on a lighting console |
 | [Settings](Settings.md) | Project, links, appearance, output, view scaling |
 | [Shortcuts and tips](Shortcuts-and-Tips.md) | Keys and gestures |
 | [Troubleshooting](Troubleshooting.md) | When something does not work |
@@ -35,6 +36,7 @@ explains what you do with them.
 - You want things to move: [Linking](Linking.md) and [Audio](Audio.md).
 - You play live: [Clipview](Clipview.md), [MIDI](MIDI.md) and [show mode](Timeline.md#show-mode).
 - You bring the picture out: [Output and devices](Output-and-Devices.md).
+- You run light and video together, as from a lighting console: [Lighting desk](Lighting-Desk.md).
 
 ## Words
 

@@ -4,6 +4,8 @@
 //with the mouse: what is turned, pushed or hit goes into the virtual MIDI device (device.input), so MIDI learn and the
 //learned controls get it like from hardware. What the app sends back to the device (a learned control that moves by
 //itself, MIDI backpropagate) comes in through device.on_output and moves the element: a knob follows, a pad lights.
+//An element with feedback = false ignores what comes back; color / colors (a grid) give it its own colour instead of
+//the accent, min / max the range of the value it sends (midi_layout.shio).
 //Edit mode: drag an element to move it, its lower right corner to size it (snapped to MIDI_CTRL_SNAP). Not in show mode.
 //Mappings move with the element: when an element gets another number (properties, an agent, learn_from_hardware), the
 //controls mapped to its old number on the virtual device get the new one. midi_move_mappings() moves all mappings of
@@ -57,6 +59,7 @@ class midi_controller
 	device = None;
 	layout = [name = "Virtual controller", elements = []];
 	values = [];       //"id" or "id:cell" -> 0..1
+	rgb_cache = [];    //"#rrggbb" -> [r, g, b] 0..1, so drawing does not parse the colours every frame
 	editing = false;
 	selected = "";     //id of the selected element (edit mode)
 	on_change = None;  //callback(id, cell, value): a value the controller sent
@@ -354,7 +357,7 @@ class midi_controller
 	}
 
 	is_relative(e) {
-		return e.type == "knob" && e.has("mode") && e.mode == "relative";
+		return midi_layout_is_relative(e);
 	}
 
 	//As if the element was played: stores the value and sends its message into the device
@@ -367,13 +370,13 @@ class midi_controller
 		old = values.has(k) ? values[k] : -1.0;
 		values[k] = v;
 		if(is_relative(e)) {
-			//an endless encoder sends the steps between the old and the new value (two's complement: 1..63 up, 127..65 down)
+			//an endless encoder sends the steps between the old and the new value (two's complement: 1..63 up, 127..65
+			//down; encoding offset: 64 + steps)
 			steps = std.int(v * 127.0 + 0.5) - std.int(math.max(old, 0.0) * 127.0 + 0.5);
 			if(steps == 0)
 				return true;
-			steps = math.clamp(steps, -63, 63);
 			if(device)
-				device.input(0xB0 | e.channel, e.cc, steps > 0 ? steps : 128 + steps);
+				device.input(0xB0 | e.channel, e.cc, midi_layout_step_value(e, steps));
 			if(std.is_function(on_change))
 				on_change(id, cell, v);
 			return true;
@@ -620,6 +623,17 @@ class midi_controller
 		nanogui.nvgStroke();
 	}
 
+	//The colour of an element (a pad of a grid) with alpha a: its color / colors, else the accent
+	accent(e, cell = 0, a = 1.0) {
+		hex = midi_layout_element_color(e, cell);
+		if(!hex)
+			return vec4f(MIDI_CTRL_ACCENT.x, MIDI_CTRL_ACCENT.y, MIDI_CTRL_ACCENT.z, a);
+		if(!rgb_cache.has(hex))
+			rgb_cache[hex] = midi_layout_rgb(hex);
+		rgb = rgb_cache[hex];
+		return vec4f(rgb[0], rgb[1], rgb[2], a);
+	}
+
 	text(x, y, s, size, color) {
 		nanogui.nvgFontFace("sans");
 		nanogui.nvgFontSize(size);
@@ -645,7 +659,7 @@ class midi_controller
 			else if(e.type == "xy")
 				draw_xy(e);
 			else if(e.type == "label")
-				text(e.x + e.w / 2, e.y + e.h / 2, e.label, 14, MIDI_CTRL_TEXT);
+				text(e.x + e.w / 2, e.y + e.h / 2, e.label, 14, e.has("color") ? accent(e) : MIDI_CTRL_TEXT);
 			if(editing) {
 				outline(e.x, e.y, e.w, e.h, 4, e.id == selected ? MIDI_CTRL_SELECT : MIDI_CTRL_DIM, e.id == selected ? 2 : 1);
 				//the corner that sizes it
@@ -662,7 +676,7 @@ class midi_controller
 		if(e.type == "program")
 			return "PG " + std.string(e.program);
 		if(is_relative(e))
-			return "CC " + std.string(e.cc) + " rel";
+			return "CC " + std.string(e.cc) + (midi_layout_encoding(e) == 2 ? " rel64" : " rel");
 		if(midi_layout_sends_cc(e))
 			return "CC " + std.string(e.cc);
 		if(e.type == "grid")
@@ -686,7 +700,7 @@ class midi_controller
 		if(v > 0.001) {
 			nanogui.nvgBeginPath();
 			nanogui.nvgArc(vec2f(cx, cy), r, a0, a0 + v * 1.5 * math.PI, 2);
-			nanogui.nvgStrokeColor(MIDI_CTRL_ACCENT);
+			nanogui.nvgStrokeColor(accent(e));
 			nanogui.nvgStrokeWidth(4);
 			nanogui.nvgStroke();
 		}
@@ -706,14 +720,14 @@ class midi_controller
 		t = slider_track(e);
 		v = value(e.id);
 		box(t.x, t.y, t.w, t.h, 3, MIDI_CTRL_EDGE);
-		box(t.x, t.y + t.h * (1.0 - v), t.w, t.h * v, 3, MIDI_CTRL_ACCENT);
+		box(t.x, t.y + t.h * (1.0 - v), t.w, t.h * v, 3, accent(e));
 		box(e.x + 4, t.y + t.h * (1.0 - v) - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
 		text(e.x + e.w / 2, e.y + e.h - 8, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
 	}
 
 	draw_button(e) {
 		v = value(e.id);
-		box(e.x, e.y, e.w, e.h, 6, v > 0.001 ? MIDI_CTRL_ACCENT : MIDI_CTRL_FACE);
+		box(e.x, e.y, e.w, e.h, 6, v > 0.001 ? accent(e) : MIDI_CTRL_FACE);
 		outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 1, 6, MIDI_CTRL_EDGE, 1);
 		text(e.x + e.w / 2, e.y + e.h / 2, e.label ? e.label : number_text(e), 12, MIDI_CTRL_TEXT);
 	}
@@ -728,7 +742,9 @@ class midi_controller
 			for(col = 0; col < e.cols; col++) {
 				cell = row * e.cols + col;
 				v = value(e.id, cell);
-				color = v > 0.001 ? vec4f(MIDI_CTRL_ACCENT.x, MIDI_CTRL_ACCENT.y, MIDI_CTRL_ACCENT.z, 0.35 + 0.65 * v) : MIDI_CTRL_FACE;
+				//a pad with a colour of its own shows it dimly while off, like the pads of a launchpad
+				lit = midi_layout_element_color(e, cell);
+				color = v > 0.001 ? accent(e, cell, 0.35 + 0.65 * v) : (lit ? accent(e, cell, 0.18) : MIDI_CTRL_FACE);
 				box(g.x + col * cw + 2, g.y + row * chh + 2, cw - 4, chh - 4, 4, color);
 			}
 		}
@@ -740,7 +756,7 @@ class midi_controller
 		y = e.y + (1.0 - value(e.id, 1)) * (e.h - 16);
 		nanogui.nvgBeginPath();
 		nanogui.nvgCircle(vec2f(x, y), 6);
-		nanogui.nvgFillColor(MIDI_CTRL_ACCENT);
+		nanogui.nvgFillColor(accent(e));
 		nanogui.nvgFill();
 		text(e.x + e.w / 2, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
 	}
@@ -752,14 +768,14 @@ class midi_controller
 		if(t.horizontal) {
 			mid = t.x + t.w / 2;
 			at = t.x + t.w * v;
-			box(math.min(mid, at), t.y, math.abs(at - mid), t.h, 3, MIDI_CTRL_ACCENT);
+			box(math.min(mid, at), t.y, math.abs(at - mid), t.h, 3, accent(e));
 			box(mid - 1, t.y - 6, 2, t.h + 12, 1, MIDI_CTRL_DIM);
 			box(at - 5, t.y - 8, 10, t.h + 16, 3, MIDI_CTRL_TEXT);
 		}
 		else {
 			mid = t.y + t.h / 2;
 			at = t.y + t.h * (1.0 - v);
-			box(t.x, math.min(mid, at), t.w, math.abs(at - mid), 3, MIDI_CTRL_ACCENT);
+			box(t.x, math.min(mid, at), t.w, math.abs(at - mid), 3, accent(e));
 			box(t.x - 6, mid - 1, t.w + 12, 2, 1, MIDI_CTRL_DIM);
 			box(e.x + 4, at - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
 		}

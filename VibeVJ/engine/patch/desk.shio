@@ -1,0 +1,1717 @@
+//The lighting desk (#719): what a console such as a grandMA does, on the lamps of the fixture setup (the real ones and
+//the virtual ones: MapLab slices, looks of shaders), without UI. Tested in _testing/fixture_desk.shio.
+//
+//Needs engine/patch/patch.shio and engine/patch/fx.shio included before it.
+//
+//  selection  -> programmer -> palettes -> cues of a cue stack -> executors
+//
+//- Programmer: the values set by hand, per lamp and control label: [selection = [id, ...], values = [<id> = [<label> =
+//  v]]]. It sends on top of everything else (DESK_PRIORITY_PROGRAMMER) until it is cleared.
+//- Palettes: stored values to call up on any selection. Each has values for every lamp it was stored from (`lamps`) and
+//  values by what a channel does (`generic`: a colour, a dimmer, pan, tilt, ... by the function of the channel, or a
+//  label), so a colour palette stored on one par turns every lamp with a colour that colour: pars, LED bars, slices of
+//  MapLab and looks of shaders. kind: "color", "position", "beam" or "look" (everything).
+//- Cue stacks: numbered cues that store only what changed (tracking): the state of a cue is every cue up to it merged.
+//  Go fades from what the stack sends now to the next cue in its fade time, after its delay. A cue starts by Go, or by
+//  itself (trig): "follow" when the cue before has faded in, "wait" seconds or "beats" of the timeline after the cue
+//  before started.
+//- Playback (the state of a stack while it runs, not saved): desk_go / desk_back / desk_goto / desk_off and
+//  desk_playback_values per frame. Released (off), a stack sends nothing; the controls keep what they had, or go back to
+//  what they had before the stack (the runtime keeps that, engine/patch/desk_runtime.shio).
+//- Dimmers mix HTP (the highest wins), every other channel LTP: the stack that was started last wins (desk_ltp).
+//- Command line: desk_tokens() and desk_command() run what a desk operator types: "group 2 at 50", "fixture par 1 thru 4
+//  at color red", "store cue 3 fade 2", "go", ... (DESK_HELP).
+//
+//  desk = [version, palettes = [[id, name, kind, generic = [...], lamps = [<id> = [<label> = v]]]],
+//          stacks = [[id, name, quantize, on_phrase, cues = [[id, number, name, values, fade, delay, trig, trig_time]]]],
+//          group_inputs = [<group id> = [color = true, dimmer = true, ...]]]
+
+def desk_start_palettes(d);
+def desk_programmer_lamps(prog);
+def desk_find_label(p, ids, word);
+def desk_has_value(prog, id, label);
+
+DESK_VERSION = 1;
+DESK_PRIORITY_PROGRAMMER = 2000000; //above everything (a clip preview of the Phaser sends at 999999)
+DESK_PALETTE_KINDS = ["color", "position", "beam", "look"];
+DESK_PALETTE_LABELS = ["Colour", "Position", "Beam", "Look"];
+DESK_TRIGS = ["go", "follow", "wait", "beats", "drop", "break", "phrase"];
+DESK_TRIG_LABELS = ["Go", "Follow", "Wait", "Beats", "Drop", "Break", "Phrase"];
+DESK_TRIG_TIPS = [
+	"Starts with Go",
+	"Starts when the cue before has faded in",
+	"Starts this many seconds after the cue before started",
+	"Starts this many beats of the timeline after the cue before started",
+	"Starts at the next drop of the audio analysis",
+	"Starts at the next break of the audio analysis",
+	"Starts at the next phrase of the DJ (DJ Link: the phrases rekordbox found in the track of the master deck)",
+];
+//When Go of a stack starts its cue (#719): at once, or on the next beat / bar / 4 bars of the timeline (stack.quantize,
+//beats), or at the next phrase of the DJ (DESK_QUANTIZE_PHRASE)
+DESK_QUANTIZE_PHRASE = -1;
+DESK_QUANTIZE = [0, 1, 4, 16, -1];
+DESK_QUANTIZE_LABELS = ["Now", "Next beat", "Next bar", "Next 4 bars", "Next phrase"];
+//What a stack does by itself when the DJ starts a new phrase (stack.on_phrase, DJ Link, #719): nothing, Go, or the cue
+//named like the phrase ("Drop", "Break", "Verse": Verse 1 to 6 too, "Intro", "Buildup", "Outro")
+DESK_PHRASE_MODES = ["", "go", "match"];
+DESK_PHRASE_LABELS = ["Nothing", "Go", "Cue of its name"];
+DESK_DEFAULT_FADE = 2.0;
+
+//Colours a colour palette or the command line knows by name ([r, g, b] 0..1)
+DESK_COLORS = [
+	red = [1.0, 0.0, 0.0], orange = [1.0, 0.5, 0.0], yellow = [1.0, 1.0, 0.0], green = [0.0, 1.0, 0.0],
+	cyan = [0.0, 1.0, 1.0], blue = [0.0, 0.0, 1.0], magenta = [1.0, 0.0, 1.0], pink = [1.0, 0.4, 0.7],
+	purple = [0.5, 0.0, 1.0], white = [1.0, 1.0, 1.0], warm = [1.0, 0.75, 0.45], black = [0.0, 0.0, 0.0],
+];
+//The colour palettes a new desk starts with, in this order
+DESK_START_COLORS = ["red", "orange", "yellow", "green", "cyan", "blue", "magenta", "white"];
+
+DESK_HELP = '''Select:  group <n|name>   fixture <n|name> [thru <n>]   all   + (add) / - (take out)
+         left  right  front  back  high  low  middle  lit  dark  odd  even (of the selection, or of all lamps)
+Values:  at <0-100>   full   out   at color <name|#rrggbb>   pan <0-100>   tilt <0-100>   <label> <0-100>
+Palette: palette <n|name>   store palette <colour|position|beam|look> [name]
+Cues:    store cue [<n>] [stack <name>] [fade <s>] [name <name>] [starts go|follow|wait|beats|drop|break|phrase]
+         record cue ... (what the lamps show now)
+         go   back   goto <n>   off   [stack <name>] after go/back/goto/off
+Music:   music drop|break|phrase [<name>] (as DJ Link / the audio analysis send it)   phrases go|match|off [stack <name>]
+Other:   clear   highlight   blind (program without sending)   take [<s>] (blind values live, fading)   help''';
+
+// =========================================================================
+// Small helpers
+// =========================================================================
+
+//"3", "1.5", "0.25": a number as a desk shows it
+desk_num_text(v) {
+	v = std.float(v);
+	if(math.abs(v - math.round(v)) < 0.0005)
+		return std.string(std.int(math.round(v)));
+	text = std.string(std.int(math.round(v * 1000.0)));
+	neg = v < 0.0;
+	if(neg)
+		text = text.substr(1);
+	for(text.length() < 4)
+		text = "0" + text;
+	text = text.substr(0, text.length() - 3) + "." + text.substr(text.length() - 3);
+	for(text.ends("0"))
+		text = text.substr(0, text.length() - 1);
+	return (neg ? "-" : "") + text;
+}
+
+//The texts of a list with sep between them
+desk_join(list, sep) {
+	out = "";
+	for(i = 0; i < list.size(); i++)
+		out += (i ? sep : "") + list[i];
+	return out;
+}
+
+//A word that is a number ("12", "1.5", "-3"): no warning of std.float on a word
+desk_is_number(word) {
+	word = std.string(word);
+	if(!word.length())
+		return false;
+	digits = 0;
+	dots = 0;
+	for(i = 0; i < word.length(); i++) {
+		c = word[i];
+		if(c >= "0" && c <= "9")
+			digits++;
+		else if(c == "." && dots == 0)
+			dots++;
+		else if((c == "-" || c == "+") && i == 0)
+			continue;
+		else
+			return false;
+	}
+	return digits > 0;
+}
+
+//The key of a lamp's values for the 0..1 of a percent word
+desk_percent(word) {
+	return math.clamp(std.float(word) / 100.0, 0.0, 1.0);
+}
+
+//The labels of the controls of a lamp of this type whose channel does `func` (patch_type().controls); a colour
+//("color") gives R, G and B of each colour slot (not W: the lamp puts the white part there itself)
+desk_labels_of_function(type, func) {
+	t = patch_type(type);
+	list = [];
+	if(func == "color") {
+		indices = fx_controls(type, FX_COLOR_ALL);
+		for(i = 0; i < indices.size(); i++)
+			list.push_back(t.controls[indices[i]].label);
+		return list;
+	}
+	for(i = 0; i < t.controls.size(); i++) {
+		c = t.controls[i];
+		if(c.function == func && c.kind != "RGB" && c.kind != "RGBW")
+			list.push_back(c.label);
+	}
+	return list;
+}
+
+//The function of a control of a type by its label ("" when the type has none of that label)
+desk_label_function(type, label) {
+	i = patch_control_index(type, label);
+	return i >= 0 ? patch_type(type).controls[i].function : "";
+}
+
+//Does a palette of this kind take a channel of this function
+desk_kind_takes(kind, func) {
+	if(kind == "color")
+		return func == "color" || func == "colorwheel";
+	if(kind == "position")
+		return func == "pan" || func == "tilt";
+	if(kind == "beam")
+		return func == "beam" || func == "gobo" || func == "strobe";
+	return func != "control";
+}
+
+//The value a channel has when nothing moves it: the "default" of the channel in the fixture file (#669,
+//patch_channel_default), else 0
+desk_default_value(type, label) {
+	i = patch_control_index(type, label);
+	return i >= 0 ? patch_type(type).controls[i].default : 0.0;
+}
+
+// =========================================================================
+// The desk data (saved as desk.json)
+// =========================================================================
+
+desk_new() {
+	d = [version = DESK_VERSION, palettes = [], stacks = [], group_inputs = std.json()];
+	desk_start_palettes(d);
+	return d;
+}
+
+desk_normalize(d) {
+	if(!d || std.type(d) != "json")
+		return desk_new();
+	if(!d.has("palettes") || std.type(d.palettes) != "json")
+		d.palettes = [];
+	if(!d.has("stacks") || std.type(d.stacks) != "json")
+		d.stacks = [];
+	for(i = 0; i < d.stacks.size(); i++) {
+		s = d.stacks[i];
+		if(!s.has("cues") || std.type(s.cues) != "json")
+			s.cues = [];
+	}
+	//the inputs of the groups that moved (Devices > Fixtures > Masters > Groups): group id -> [color = true, ...]
+	if(!d.has("group_inputs") || std.type(d.group_inputs) != "json")
+		d.group_inputs = std.json();
+	d.version = DESK_VERSION;
+	return d;
+}
+
+//The colour palettes Red ... White and a look Full, made once: a new desk can colour lamps right away
+desk_start_palettes(d) {
+	for(i = 0; i < DESK_START_COLORS.size(); i++) {
+		name = DESK_START_COLORS[i];
+		c = DESK_COLORS[name];
+		label = name.substr(0, 1).uppercase() + name.substr(1);
+		d.palettes.push_back([id = std.random_hash(), name = label, kind = "color",
+			generic = [color = [c[0], c[1], c[2]]], lamps = std.json()]);
+	}
+	d.palettes.push_back([id = std.random_hash(), name = "Full", kind = "look",
+		generic = [dimmer = 1.0, color = [1.0, 1.0, 1.0]], lamps = std.json()]);
+	d.palettes.push_back([id = std.random_hash(), name = "Centre", kind = "position",
+		generic = [pan = 0.5, tilt = 0.5], lamps = std.json()]);
+}
+
+// =========================================================================
+// Where lamps are: selection by place (#719)
+// =========================================================================
+
+//Words that pick lamps by where they are or what they show: of the selection, or of every lamp
+DESK_PLACES = ["left", "right", "front", "back", "high", "low", "middle", "lit", "dark", "odd", "even"];
+
+//How bright a lamp is in values ([<label> = v] of one lamp): its dimmer times its colour (the highest of R, G, B),
+//a lamp without dimmer by its colour, without colour by its dimmer. 0 without values
+desk_brightness(type, vals) {
+	if(!vals)
+		return 0.0;
+	dim = -1.0;
+	col = -1.0;
+	for(i = 0; i < vals.size(); i++) {
+		func = desk_label_function(type, vals.key(i));
+		v = std.float(vals[i]);
+		if(func == "dimmer")
+			dim = math.max(dim, v);
+		else if(func == "color")
+			col = math.max(col, v);
+	}
+	if(dim < 0.0 && col < 0.0)
+		return 0.0;
+	if(dim < 0.0)
+		return col;
+	if(col < 0.0)
+		return dim;
+	return dim * col;
+}
+
+//The lamps of ids that a place word names, in their order. current: what the lamps show ([<id> = [<label> = v]], for
+//lit and dark). left / right / front / back / high / low: the side of the middle of these lamps (front: towards the
+//audience); middle: the middle third across; odd / even: every other one (the first is odd)
+desk_filter_place(p, ids, word, current = None) {
+	lamps = [];
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(f)
+			lamps.push_back(f);
+	}
+	out = [];
+	if(!lamps.size())
+		return out;
+	b = patch_bounds(lamps);
+	cx = (b.min_x + b.max_x) / 2.0;
+	cy = (b.min_y + b.max_y) / 2.0;
+	z0 = std.float(lamps[0].z ?? 0.0);
+	z1 = z0;
+	for(i = 0; i < lamps.size(); i++) {
+		z0 = math.min(z0, std.float(lamps[i].z ?? 0.0));
+		z1 = math.max(z1, std.float(lamps[i].z ?? 0.0));
+	}
+	cz = (z0 + z1) / 2.0;
+	third = (b.max_x - b.min_x) / 6.0;
+	eps = 0.001;
+	for(i = 0; i < lamps.size(); i++) {
+		f = lamps[i];
+		z = std.float(f.z ?? 0.0);
+		take = false;
+		if(word == "left")
+			take = f.x < cx - eps;
+		else if(word == "right")
+			take = f.x > cx + eps;
+		else if(word == "front")
+			take = f.y > cy + eps;
+		else if(word == "back")
+			take = f.y < cy - eps;
+		else if(word == "high")
+			take = z > cz + eps;
+		else if(word == "low")
+			take = z < cz - eps;
+		else if(word == "middle")
+			take = math.abs(f.x - cx) <= third + eps;
+		else if(word == "odd")
+			take = i % 2 == 0;
+		else if(word == "even")
+			take = i % 2 == 1;
+		else if(word == "lit" || word == "dark") {
+			vals = current && current.has(f.id) ? current[f.id] : None;
+			lit = desk_brightness(f.type, vals) > 0.01;
+			take = word == "lit" ? lit : !lit;
+		}
+		if(take)
+			out.push_back(f.id);
+	}
+	return out;
+}
+
+//The lamps inside a rectangle of the stage plan (metres, the corners in any order), left to right
+desk_in_rect(p, x0, y0, x1, y1) {
+	ax = math.min(x0, x1);
+	bx = math.max(x0, x1);
+	ay = math.min(y0, y1);
+	by = math.max(y0, y1);
+	found = [];
+	for(i = 0; i < p.fixtures.size(); i++) {
+		f = p.fixtures[i];
+		if(f.x >= ax && f.x <= bx && f.y >= ay && f.y <= by)
+			found.push_back([id = f.id, x = f.x]);
+	}
+	found = patch_sort_by(found, "x");
+	ids = [];
+	for(i = 0; i < found.size(); i++)
+		ids.push_back(found[i].id);
+	return ids;
+}
+
+//What the lamps of ids (every lamp when empty) show now, as cue values: every channel but control channels (reset,
+//modes). current: [<id> = [<label> = v]] of the controls
+desk_snapshot(p, current, ids = None) {
+	out = std.json();
+	if(!current)
+		return out;
+	for(i = 0; i < current.size(); i++) {
+		id = current.key(i);
+		if(ids && ids.size() && !ids.has_value(id))
+			continue;
+		f = patch_find(p, id);
+		if(!f)
+			continue;
+		vals = std.json();
+		for(k = 0; k < current[i].size(); k++) {
+			label = current[i].key(k);
+			if(desk_label_function(f.type, label) == "control")
+				continue;
+			vals[label] = current[i][k];
+		}
+		if(vals.size())
+			out[id] = vals;
+	}
+	return out;
+}
+
+// =========================================================================
+// Colour from the picture (#719)
+// =========================================================================
+//
+//A picture is a small RGB image read back from the GPU: w x h pixels, 3 bytes each (0..255), rows top-down (a
+//std.buffer, or a list in a test).
+
+//The colour of the picture at u, v (0..1, v 0 at the top): [r, g, b] 0..1
+desk_picture_at(buf, w, h, u, v) {
+	x = math.clamp(std.int(u * w), 0, w - 1);
+	y = math.clamp(std.int(v * h), 0, h - 1);
+	o = (y * w + x) * 3;
+	if(o + 2 >= buf.size())
+		return [0.0, 0.0, 0.0];
+	return [buf[o] / 255.0, buf[o + 1] / 255.0, buf[o + 2] / 255.0];
+}
+
+//The colours the picture is made of, the strongest first, at most `count`: the pixels by hue (12 hues, a pixel counts
+//as much as it is saturated and bright; light grey to white counts as white), each the average of its pixels at full
+//brightness. Dark pixels do not count. [[r, g, b], ...]
+desk_picture_colors(buf, w, h, count = 4) {
+	bins = [];
+	for(i = 0; i < 13; i++)
+		bins.push_back([weight = 0.0, r = 0.0, g = 0.0, b = 0.0]);
+	n = math.min(w * h, std.int(buf.size() / 3));
+	for(i = 0; i < n; i++) {
+		r = buf[i * 3] / 255.0;
+		g = buf[i * 3 + 1] / 255.0;
+		b = buf[i * 3 + 2] / 255.0;
+		top = math.max(r, math.max(g, b));
+		low = math.min(r, math.min(g, b));
+		if(top < 0.15)
+			continue;
+		sat = (top - low) / top;
+		k = 12;
+		weight = top * 0.3;
+		if(sat >= 0.25) {
+			hue = 0.0;
+			d = top - low;
+			if(top == r)
+				hue = (g - b) / d;
+			else if(top == g)
+				hue = 2.0 + (b - r) / d;
+			else
+				hue = 4.0 + (r - g) / d;
+			hue = hue / 6.0;
+			hue = hue - math.floor(hue);
+			k = std.int(hue * 12.0 + 0.5) % 12;
+			weight = sat * top;
+		}
+		bins[k].weight += weight;
+		bins[k].r += r * weight;
+		bins[k].g += g * weight;
+		bins[k].b += b * weight;
+	}
+	order = [];
+	for(i = 0; i < bins.size(); i++) {
+		if(bins[i].weight > 0.0)
+			order.push_back([i = i, w = -bins[i].weight]);
+	}
+	order = patch_sort_by(order, "w");
+	out = [];
+	for(k = 0; k < order.size() && out.size() < count; k++) {
+		bin = bins[order[k].i];
+		c = [bin.r / bin.weight, bin.g / bin.weight, bin.b / bin.weight];
+		top = math.max(c[0], math.max(c[1], c[2]));
+		if(top > 0.0)
+			c = [c[0] / top, c[1] / top, c[2] / top];
+		out.push_back(c);
+	}
+	return out;
+}
+
+//The colour each lamp of ids takes from the picture where it hangs: across the picture as it hangs from left to right
+//(of these lamps), down the picture from the highest to the lowest (the middle row when they hang at one height).
+//Lamps without colour channels are left out. [<id> = [<label> = v]]
+desk_follow_values(p, ids, buf, w, h) {
+	out = std.json();
+	lamps = [];
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(f && desk_labels_of_function(f.type, "color").size() >= 3)
+			lamps.push_back(f);
+	}
+	if(!lamps.size())
+		return out;
+	b = patch_bounds(lamps);
+	z0 = std.float(lamps[0].z ?? 0.0);
+	z1 = z0;
+	for(i = 0; i < lamps.size(); i++) {
+		z0 = math.min(z0, std.float(lamps[i].z ?? 0.0));
+		z1 = math.max(z1, std.float(lamps[i].z ?? 0.0));
+	}
+	for(i = 0; i < lamps.size(); i++) {
+		f = lamps[i];
+		u = b.max_x > b.min_x ? (f.x - b.min_x) / (b.max_x - b.min_x) : 0.5;
+		v = z1 > z0 ? 1.0 - (std.float(f.z ?? 0.0) - z0) / (z1 - z0) : 0.5;
+		c = desk_picture_at(buf, w, h, u, v);
+		labels = desk_labels_of_function(f.type, "color");
+		vals = std.json();
+		for(k = 0; k + 2 < labels.size(); k += 3) {
+			vals[labels[k]] = c[0];
+			vals[labels[k + 1]] = c[1];
+			vals[labels[k + 2]] = c[2];
+		}
+		out[f.id] = vals;
+	}
+	return out;
+}
+
+//Colour palettes "Picture 1" ... from colours of the picture: the ones of an earlier pick are replaced. Returns how many
+desk_picture_palettes(d, colors) {
+	for(i = d.palettes.size() - 1; i >= 0; i--) {
+		if(d.palettes[i].kind == "color" && std.string(d.palettes[i].name).starts("Picture "))
+			d.palettes.erase(i);
+	}
+	for(i = 0; i < colors.size(); i++) {
+		c = colors[i];
+		d.palettes.push_back([id = std.random_hash(), name = "Picture " + (i + 1), kind = "color",
+			generic = [color = [c[0], c[1], c[2]]], lamps = std.json()]);
+	}
+	return colors.size();
+}
+
+// =========================================================================
+// Programmer
+// =========================================================================
+
+desk_programmer_new() {
+	return [selection = [], values = std.json()];
+}
+
+//Changes the selection by ids (in this order: the order of a selection is the order of the lamps on the command line):
+//mode "replace", "add", "remove", "toggle"
+desk_select(prog, ids, mode = "replace") {
+	if(mode == "replace")
+		prog.selection = [];
+	for(i = 0; i < ids.size(); i++) {
+		id = ids[i];
+		at = patch_index_of(prog.selection, id);
+		if(mode == "remove" || (mode == "toggle" && at >= 0)) {
+			if(at >= 0)
+				prog.selection.erase(at);
+		}
+		else if(at < 0)
+			prog.selection.push_back(id);
+	}
+	return prog.selection;
+}
+
+//Ids of the lamps of a list of lamps (patch fixtures)
+desk_ids(lamps) {
+	ids = [];
+	for(i = 0; i < lamps.size(); i++)
+		ids.push_back(lamps[i].id);
+	return ids;
+}
+
+//One value of the programmer
+desk_put(prog, id, label, v) {
+	if(!prog.values.has(id))
+		prog.values[id] = std.json();
+	prog.values[id][label] = math.clamp(std.float(v), 0.0, 1.0);
+}
+
+//A control (by label) of every lamp in ids that has it. Returns how many lamps took it
+desk_set(prog, p, ids, label, v) {
+	n = 0;
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(!f || patch_control_index(f.type, label) < 0)
+			continue;
+		desk_put(prog, f.id, label, v);
+		n++;
+	}
+	return n;
+}
+
+//The brightness of a colour slot of a lamp in the programmer (the highest of R, G, B), None when it has none there
+desk_color_brightness(prog, id, r, g, b) {
+	if(!desk_has_value(prog, id, r) || !desk_has_value(prog, id, g) || !desk_has_value(prog, id, b))
+		return None;
+	vals = prog.values[id];
+	return math.max(vals[r], math.max(vals[g], vals[b]));
+}
+
+//Every control of a function ("dimmer", "pan", ...) of the lamps in ids. A lamp without a dimmer takes a dimmer as the
+//brightness of its colour (a virtual dimmer, as a console does with RGB lamps): its colour in the programmer keeps its
+//hue at this brightness, white when it has none there. Returns how many lamps took it
+desk_set_function(prog, p, ids, func, v) {
+	n = 0;
+	v = math.clamp(std.float(v), 0.0, 1.0);
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(!f)
+			continue;
+		labels = desk_labels_of_function(f.type, func);
+		if(!labels.size() && func == "dimmer") {
+			labels = desk_labels_of_function(f.type, "color");
+			for(k = 0; k + 2 < labels.size(); k += 3) {
+				was = desk_color_brightness(prog, f.id, labels[k], labels[k + 1], labels[k + 2]);
+				for(c = 0; c < 3; c++) {
+					hue = std.is_none(was) || was <= 0.0 ? 1.0 : prog.values[f.id][labels[k + c]] / was;
+					desk_put(prog, f.id, labels[k + c], hue * v);
+				}
+			}
+			if(labels.size())
+				n++;
+			continue;
+		}
+		for(k = 0; k < labels.size(); k++)
+			desk_put(prog, f.id, labels[k], v);
+		if(labels.size())
+			n++;
+	}
+	return n;
+}
+
+//A colour [r, g, b] on every colour slot of the lamps in ids. A lamp without a dimmer keeps the brightness its colour
+//has in the programmer (its virtual dimmer: "at 50" then "at color red" is red at half). Returns how many lamps took it
+desk_set_color(prog, p, ids, rgb) {
+	n = 0;
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(!f)
+			continue;
+		labels = desk_labels_of_function(f.type, "color");
+		dimmed = !desk_labels_of_function(f.type, "dimmer").size();
+		for(k = 0; k + 2 < labels.size(); k += 3) {
+			bright = dimmed ? desk_color_brightness(prog, f.id, labels[k], labels[k + 1], labels[k + 2]) : None;
+			top = math.max(rgb[0], math.max(rgb[1], rgb[2]));
+			scale = std.is_none(bright) || top <= 0.0 ? 1.0 : bright / top;
+			desk_put(prog, f.id, labels[k], rgb[0] * scale);
+			desk_put(prog, f.id, labels[k + 1], rgb[1] * scale);
+			desk_put(prog, f.id, labels[k + 2], rgb[2] * scale);
+		}
+		if(labels.size())
+			n++;
+	}
+	return n;
+}
+
+//What the inputs of a group send (#719, Devices > Fixtures > Masters > Groups; a ColorSelector row with Lamps): the values of its inputs on the lamps in ids. A lamp without a dimmer takes
+//the Dimmer as the brightness of its colour: the colour of the input times the dimmer (black stays black), white times
+//the dimmer when the colour is not used. used: [color = true, dimmer = true, pan, tilt] (the inputs that moved or are
+//linked), vals: [color = [r, g, b], dimmer, pan, tilt]. Returns [<id> = [<label> = v]]
+desk_input_values(p, ids, used, vals) {
+	prog = desk_programmer_new();
+	color = used.has("color") && used.color;
+	dimmer = used.has("dimmer") && used.dimmer;
+	rgb = vals.color;
+	if(color)
+		desk_set_color(prog, p, ids, rgb);
+	if(dimmer) {
+		with_dimmer = [];
+		without = [];
+		for(i = 0; i < ids.size(); i++) {
+			f = patch_find(p, ids[i]);
+			if(f && desk_labels_of_function(f.type, "dimmer").size())
+				with_dimmer.push_back(f.id);
+			else if(f)
+				without.push_back(f.id);
+		}
+		v = math.clamp(std.float(vals.dimmer), 0.0, 1.0);
+		desk_set_function(prog, p, with_dimmer, "dimmer", v);
+		if(color) {
+			for(i = 0; i < without.size(); i++) {
+				f = patch_find(p, without[i]);
+				labels = desk_labels_of_function(f.type, "color");
+				for(k = 0; k < labels.size(); k++) {
+					if(desk_has_value(prog, f.id, labels[k]))
+						desk_put(prog, f.id, labels[k], prog.values[f.id][labels[k]] * v);
+				}
+			}
+		}
+		else
+			desk_set_function(prog, p, without, "dimmer", v);
+	}
+	funcs = ["pan", "tilt"];
+	for(i = 0; i < funcs.size(); i++) {
+		if(used.has(funcs[i]) && used[funcs[i]])
+			desk_set_function(prog, p, ids, funcs[i], vals[funcs[i]]);
+	}
+	return prog.values;
+}
+
+//The lamps of a target ("Lamps" of a ColorSelector row): "all", "group:<id>", "lamp:<id>"
+desk_target_ids(p, target) {
+	t = std.string(target ?? "");
+	if(t == "all")
+		return desk_ids(p.fixtures);
+	if(t.starts("group:")) {
+		g = patch_group(p, t.substr(6));
+		return g ? g.fixtures.copy() : [];
+	}
+	if(t.starts("lamp:"))
+		return patch_find(p, t.substr(5)) ? [t.substr(5)] : [];
+	return [];
+}
+
+//How many values the programmer has
+desk_programmer_count(prog) {
+	n = 0;
+	for(i = 0; i < prog.values.size(); i++)
+		n += prog.values[i].size();
+	return n;
+}
+
+desk_clear(prog) {
+	prog.values = std.json();
+	prog.selection = [];
+}
+
+//Has the programmer a value of this lamp and label
+desk_has_value(prog, id, label) {
+	return prog.values.has(id) && prog.values[id].has(label);
+}
+
+// =========================================================================
+// Palettes
+// =========================================================================
+
+desk_palette(d, id) {
+	for(i = 0; i < d.palettes.size(); i++) {
+		if(d.palettes[i].id == id)
+			return d.palettes[i];
+	}
+	return None;
+}
+
+//The palettes of a kind ("" for all), in their order
+desk_palettes_of(d, kind = "") {
+	list = [];
+	for(i = 0; i < d.palettes.size(); i++) {
+		if(!kind || d.palettes[i].kind == kind)
+			list.push_back(d.palettes[i]);
+	}
+	return list;
+}
+
+//A palette by its number (1.. over the palettes of the kind, or all) or its name (case does not matter)
+desk_find_palette(d, ref, kind = "") {
+	list = desk_palettes_of(d, kind);
+	if(desk_is_number(ref)) {
+		n = std.int(std.float(ref));
+		return n >= 1 && n <= list.size() ? list[n - 1] : None;
+	}
+	want = std.string(ref).lowercase();
+	for(i = 0; i < list.size(); i++) {
+		if(std.string(list[i].name).lowercase() == want)
+			return list[i];
+	}
+	return None;
+}
+
+//A new palette from the programmer values of the lamps in ids (the selection, or every lamp of the programmer when
+//none is selected) that a palette of this kind takes. Not added to the desk. None when there is nothing to store
+desk_palette_from(prog, p, kind, name, ids = None) {
+	if(std.is_none(ids) || !ids.size())
+		ids = desk_programmer_lamps(prog);
+	pal = [id = std.random_hash(), name = name, kind = kind, generic = std.json(), lamps = std.json()];
+	count = 0;
+	for(i = 0; i < ids.size(); i++) {
+		id = ids[i];
+		f = patch_find(p, id);
+		if(!f || !prog.values.has(id))
+			continue;
+		vals = prog.values[id];
+		for(k = 0; k < vals.size(); k++) {
+			label = vals.key(k);
+			func = desk_label_function(f.type, label);
+			if(!desk_kind_takes(kind, func))
+				continue;
+			if(!pal.lamps.has(id))
+				pal.lamps[id] = std.json();
+			pal.lamps[id][label] = vals[k];
+			count++;
+			//generic: the first lamp that has it gives it
+			if(func == "color") {
+				if(!pal.generic.has("color")) {
+					labels = desk_labels_of_function(f.type, "color");
+					if(labels.size() >= 3 && vals.has(labels[0]) && vals.has(labels[1]) && vals.has(labels[2]))
+						pal.generic.color = [vals[labels[0]], vals[labels[1]], vals[labels[2]]];
+				}
+			}
+			else if(func == "dimmer" || func == "pan" || func == "tilt" || func == "strobe" || func == "beam" || func == "gobo") {
+				if(!pal.generic.has(func))
+					pal.generic[func] = vals[k];
+			}
+			if(!pal.generic.has("labels"))
+				pal.generic.labels = std.json();
+			if(!pal.generic.labels.has(label))
+				pal.generic.labels[label] = vals[k];
+		}
+	}
+	return count ? pal : None;
+}
+
+//The lamps that have values in the programmer, in the order of the selection first
+desk_programmer_lamps(prog) {
+	ids = prog.selection.copy();
+	for(i = 0; i < prog.values.size(); i++) {
+		id = prog.values.key(i);
+		if(!ids.has_value(id))
+			ids.push_back(id);
+	}
+	return ids;
+}
+
+//Puts a palette into the programmer for the lamps in ids: the values stored for a lamp, else the generic ones (by what
+//a channel does, then by label). Returns how many lamps took something
+desk_palette_apply(prog, p, pal, ids) {
+	n = 0;
+	g = pal.generic ?? std.json();
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(!f)
+			continue;
+		took = false;
+		if(pal.lamps.has(f.id)) {
+			vals = pal.lamps[f.id];
+			for(k = 0; k < vals.size(); k++) {
+				if(patch_control_index(f.type, vals.key(k)) >= 0) {
+					desk_put(prog, f.id, vals.key(k), vals[k]);
+					took = true;
+				}
+			}
+		}
+		if(!took) {
+			done = [];
+			if(g.has("color") && std.type(g.color) == "json" && g.color.size() >= 3) {
+				labels = desk_labels_of_function(f.type, "color");
+				for(k = 0; k + 2 < labels.size(); k += 3) {
+					desk_put(prog, f.id, labels[k], g.color[0]);
+					desk_put(prog, f.id, labels[k + 1], g.color[1]);
+					desk_put(prog, f.id, labels[k + 2], g.color[2]);
+					done[labels[k]] = true;
+					done[labels[k + 1]] = true;
+					done[labels[k + 2]] = true;
+					took = true;
+				}
+			}
+			funcs = ["dimmer", "pan", "tilt", "strobe", "beam", "gobo"];
+			for(k = 0; k < funcs.size(); k++) {
+				func = funcs[k];
+				if(!g.has(func))
+					continue;
+				labels = desk_labels_of_function(f.type, func);
+				for(j = 0; j < labels.size(); j++) {
+					desk_put(prog, f.id, labels[j], g[func]);
+					done[labels[j]] = true;
+					took = true;
+				}
+			}
+			if(g.has("labels")) {
+				for(k = 0; k < g.labels.size(); k++) {
+					label = g.labels.key(k);
+					if(done.has(label) || patch_control_index(f.type, label) < 0)
+						continue;
+					//a label of another kind of lamp: only where the function fits the palette
+					if(!desk_kind_takes(pal.kind, desk_label_function(f.type, label)))
+						continue;
+					desk_put(prog, f.id, label, g.labels[k]);
+					took = true;
+				}
+			}
+		}
+		if(took)
+			n++;
+	}
+	return n;
+}
+
+//The colour a palette shows on its button: [r, g, b] or None
+desk_palette_color(pal) {
+	g = pal.generic ?? std.json();
+	if(g.has("color") && std.type(g.color) == "json" && g.color.size() >= 3)
+		return [r = std.float(g.color[0]), g = std.float(g.color[1]), b = std.float(g.color[2])];
+	return None;
+}
+
+// =========================================================================
+// Cue stacks
+// =========================================================================
+
+desk_stack(d, id) {
+	for(i = 0; i < d.stacks.size(); i++) {
+		if(d.stacks[i].id == id)
+			return d.stacks[i];
+	}
+	return None;
+}
+
+//A stack by its number (1..) or name
+desk_find_stack(d, ref) {
+	if(desk_is_number(ref)) {
+		n = std.int(std.float(ref));
+		return n >= 1 && n <= d.stacks.size() ? d.stacks[n - 1] : None;
+	}
+	want = std.string(ref).lowercase();
+	for(i = 0; i < d.stacks.size(); i++) {
+		if(std.string(d.stacks[i].name).lowercase() == want)
+			return d.stacks[i];
+	}
+	return None;
+}
+
+desk_stack_add(d, name = "") {
+	if(!name)
+		name = "Stack " + (d.stacks.size() + 1);
+	d.stacks.push_back([id = std.random_hash(), name = name, cues = []]);
+	return d.stacks[-1];
+}
+
+desk_stack_remove(d, id) {
+	for(i = 0; i < d.stacks.size(); i++) {
+		if(d.stacks[i].id == id) {
+			d.stacks.erase(i);
+			return true;
+		}
+	}
+	return false;
+}
+
+//Position of the cue with this number, -1 if there is none
+desk_cue_index(stack, number) {
+	for(i = 0; i < stack.cues.size(); i++) {
+		if(math.abs(stack.cues[i].number - number) < 0.0005)
+			return i;
+	}
+	return -1;
+}
+
+//The number after the last cue
+desk_next_cue_number(stack) {
+	if(!stack.cues.size())
+		return 1.0;
+	return math.floor(stack.cues[-1].number) + 1.0;
+}
+
+//Stores values into a cue: a new cue at its number (in the order of the numbers), or into the cue with that number
+//("merge": the new values on top of its old ones, "overwrite": only the new ones). Returns the cue
+desk_cue_store(stack, number, values, mode = "merge", fade = DESK_DEFAULT_FADE, name = "") {
+	number = std.float(number);
+	at = desk_cue_index(stack, number);
+	if(at >= 0) {
+		cue = stack.cues[at];
+		if(mode == "overwrite")
+			cue.values = std.json();
+		for(i = 0; i < values.size(); i++) {
+			id = values.key(i);
+			if(!cue.values.has(id))
+				cue.values[id] = std.json();
+			for(k = 0; k < values[i].size(); k++)
+				cue.values[id][values[i].key(k)] = values[i][k];
+		}
+		if(name)
+			cue.name = name;
+		return cue;
+	}
+	cue = [id = std.random_hash(), number = number, name = name ? name : "Cue " + desk_num_text(number), values = values.copy(),
+		fade = std.float(fade), delay = 0.0, trig = "go", trig_time = 0.0];
+	pos = stack.cues.size();
+	for(pos > 0 && stack.cues[pos - 1].number > number)
+		pos--;
+	stack.cues.insert(pos, cue);
+	return stack.cues[pos];
+}
+
+desk_cue_remove(stack, number) {
+	at = desk_cue_index(stack, number);
+	if(at < 0)
+		return false;
+	stack.cues.erase(at);
+	return true;
+}
+
+//How many values a cue stores
+desk_cue_count(cue) {
+	n = 0;
+	for(i = 0; i < cue.values.size(); i++)
+		n += cue.values[i].size();
+	return n;
+}
+
+//What a stack sends at a cue (tracking): every cue from the first up to this one merged, the later ones on top
+desk_tracked_state(stack, index) {
+	state = std.json();
+	for(i = 0; i <= index && i < stack.cues.size(); i++) {
+		vals = stack.cues[i].values;
+		for(k = 0; k < vals.size(); k++) {
+			id = vals.key(k);
+			if(!state.has(id))
+				state[id] = std.json();
+			for(j = 0; j < vals[k].size(); j++)
+				state[id][vals[k].key(j)] = vals[k][j];
+		}
+	}
+	return state;
+}
+
+// =========================================================================
+// Playback
+// =========================================================================
+
+//The running state of a stack (not saved): index -1 = no cue yet
+desk_playback_new(stack_id) {
+	return [stack = stack_id, on = false, index = -1, from = std.json(), to = std.json(), start = 0, fade = 0.0,
+		delay = 0.0, go_ms = 0, go_beat = 0.0, ltp = 0, pending = "", pending_number = 0.0, pending_beat = 0.0,
+		pending_phrase = false];
+}
+
+//The beat a quantized Go waits for: the next multiple of `step` beats after `beat` (step 0: now)
+desk_quantize_beat(beat, step) {
+	if(step <= 0)
+		return beat;
+	return (math.floor(beat / step + 0.0001) + 1.0) * step;
+}
+
+//Is a waiting Go due at this beat (the timeline reached the beat it waits for), or (pending_phrase) the DJ started a
+//new phrase this frame (events: desk_auto_due)
+desk_pending_due(pb, beat, events = None) {
+	if(!pb.pending)
+		return false;
+	if(pb.pending_phrase ?? false)
+		return events && events.has("phrase") && events.phrase ? true : false;
+	return beat >= pb.pending_beat - 0.0001;
+}
+
+//The LTP order: each Go of any stack gets the next number, the stack started last wins on channels other than dimmers
+DESK_LTP = [n = 0];
+desk_ltp() {
+	DESK_LTP.n = DESK_LTP.n + 1;
+	return DESK_LTP.n;
+}
+
+//How far the fade of the cue is at now_ms: 0 before its delay is over, 1 when it is done
+desk_progress(pb, now_ms) {
+	t = (now_ms - pb.go_ms) / 1000.0 - pb.delay;
+	if(t <= 0.0)
+		return pb.fade <= 0.0 && pb.delay <= 0.0 ? 1.0 : 0.0;
+	if(pb.fade <= 0.0)
+		return 1.0;
+	return math.clamp(t / pb.fade, 0.0, 1.0);
+}
+
+//What the stack sends at now_ms: [<id> = [<label> = v]], the values of the cue it fades from blended into the ones of
+//the cue it goes to. A value only in the cue it comes from (after a Goto back) is held until the fade is done
+desk_playback_values(pb, now_ms) {
+	if(!pb.on)
+		return std.json();
+	k = desk_progress(pb, now_ms);
+	if(k >= 1.0)
+		return pb.to;
+	out = std.json();
+	for(i = 0; i < pb.to.size(); i++) {
+		id = pb.to.key(i);
+		vals = pb.to[i];
+		from = pb.from.has(id) ? pb.from[id] : None;
+		out[id] = std.json();
+		for(j = 0; j < vals.size(); j++) {
+			label = vals.key(j);
+			b = vals[j];
+			a = from && from.has(label) ? from[label] : None;
+			out[id][label] = std.is_none(a) ? b : a + (b - a) * k;
+		}
+	}
+	for(i = 0; i < pb.from.size(); i++) {
+		id = pb.from.key(i);
+		if(!out.has(id))
+			out[id] = std.json();
+		for(j = 0; j < pb.from[i].size(); j++) {
+			label = pb.from[i].key(j);
+			if(!out[id].has(label))
+				out[id][label] = pb.from[i][j];
+		}
+	}
+	return out;
+}
+
+//Starts the cue at index (fading from what the stack sends now). Values of lamps the stack did not send yet start from
+//`current` ([<id> = [<label> = v]], what the controls have now; optional), else they jump. Returns the cue or None
+desk_goto_index(pb, stack, index, now_ms, beat = 0.0, current = None) {
+	if(index < 0 || index >= stack.cues.size())
+		return None;
+	from = desk_playback_values(pb, now_ms);
+	to = desk_tracked_state(stack, index);
+	if(current) {
+		for(i = 0; i < to.size(); i++) {
+			id = to.key(i);
+			if(!current.has(id))
+				continue;
+			for(j = 0; j < to[i].size(); j++) {
+				label = to[i].key(j);
+				if((!from.has(id) || !from[id].has(label)) && current[id].has(label)) {
+					if(!from.has(id))
+						from[id] = std.json();
+					from[id][label] = current[id][label];
+				}
+			}
+		}
+	}
+	cue = stack.cues[index];
+	pb.from = from;
+	pb.to = to;
+	pb.index = index;
+	pb.fade = math.max(0.0, std.float(cue.fade));
+	pb.delay = math.max(0.0, std.float(cue.delay ?? 0.0));
+	pb.go_ms = now_ms;
+	pb.go_beat = beat;
+	pb.on = true;
+	pb.ltp = desk_ltp();
+	return cue;
+}
+
+//The next cue (the first after the last one: back to the first)
+desk_go(pb, stack, now_ms, beat = 0.0, current = None) {
+	if(!stack.cues.size())
+		return None;
+	next = pb.on ? pb.index + 1 : (pb.index >= 0 ? pb.index + 1 : 0);
+	if(next >= stack.cues.size())
+		next = 0;
+	return desk_goto_index(pb, stack, next, now_ms, beat, current);
+}
+
+//The cue before (from the first: stays)
+desk_back(pb, stack, now_ms, beat = 0.0, current = None) {
+	if(!stack.cues.size())
+		return None;
+	prev = math.max(0, pb.index - 1);
+	return desk_goto_index(pb, stack, prev, now_ms, beat, current);
+}
+
+desk_goto(pb, stack, number, now_ms, beat = 0.0, current = None) {
+	return desk_goto_index(pb, stack, desk_cue_index(stack, std.float(number)), now_ms, beat, current);
+}
+
+//Values on the way from a to b ([<id> = [<label> = v]]), k 0..1: every value of b, from a where a has it (else b)
+desk_blend_values(a, b, k) {
+	out = std.json();
+	for(i = 0; i < b.size(); i++) {
+		id = b.key(i);
+		from = a && a.has(id) ? a[id] : None;
+		out[id] = std.json();
+		for(j = 0; j < b[i].size(); j++) {
+			label = b[i].key(j);
+			v = b[i][j];
+			out[id][label] = from && from.has(label) ? from[label] + (v - from[label]) * k : v;
+		}
+	}
+	return out;
+}
+
+//Released: sends nothing. The next Go starts at the first cue
+desk_off(pb) {
+	pb.on = false;
+	pb.index = -1;
+	pb.from = std.json();
+	pb.to = std.json();
+}
+
+//Does the next cue start by itself now (its trig: follow, wait, beats)
+//events: what the music did this frame ([drop = true, break = true], from the audio analysis), or None
+desk_auto_due(pb, stack, now_ms, beat, events = None) {
+	if(!pb.on || pb.index + 1 >= stack.cues.size())
+		return false;
+	next = stack.cues[pb.index + 1];
+	trig = next.trig ?? "go";
+	if(trig == "drop" || trig == "break" || trig == "phrase")
+		return events && events.has(trig) && events[trig] ? true : false;
+	if(trig == "follow")
+		return desk_progress(pb, now_ms) >= 1.0;
+	if(trig == "wait")
+		return (now_ms - pb.go_ms) / 1000.0 >= std.float(next.trig_time ?? 0.0);
+	if(trig == "beats")
+		return beat - pb.go_beat >= std.float(next.trig_time ?? 0.0);
+	return false;
+}
+
+//The cue of a stack for a phrase of the DJ (on_phrase "match"): a cue named like the phrase ("Verse 2"), else one named
+//like its group or starting with it ("verse" for Verse 1 to 6: "Verse", "Verse calm"). Case does not count. The first
+//such cue after `after` (the cue the stack is at), else from the top: several cues of a phrase take turns. -1: none
+desk_phrase_cue(stack, phrase, group = "", after = -1) {
+	phrase = std.string(phrase ?? "").lowercase().trim();
+	group = std.string(group ?? "").lowercase().trim();
+	n = stack.cues.size();
+	for(t = 0; t < 2; t++) {
+		if((t == 0 && !phrase) || (t == 1 && !group))
+			continue;
+		for(k = 0; k < n; k++) {
+			i = (after + 1 + k) % n;
+			name = std.string(stack.cues[i].name ?? "").lowercase().trim();
+			if(name && (t == 0 ? name == phrase : name.starts(group)))
+				return i;
+		}
+	}
+	return -1;
+}
+
+//What a stack does on a new phrase of the DJ (stack.on_phrase): the index of the cue to start, or -1 (nothing)
+desk_phrase_action(pb, stack, phrase, group = "") {
+	mode = std.string(stack.on_phrase ?? "");
+	if(!mode || !stack.cues.size())
+		return -1;
+	if(mode == "go") {
+		next = pb.on ? pb.index + 1 : 0;
+		return next >= stack.cues.size() ? 0 : next;
+	}
+	if(mode == "match")
+		return desk_phrase_cue(stack, phrase, group, pb.on ? pb.index : -1);
+	return -1;
+}
+
+//The group of a phrase name as DJ Link has it ("Verse 2" -> "verse", "Phrase" -> "verse", "Drop" -> "drop")
+desk_phrase_group(name) {
+	n = std.string(name ?? "").lowercase().trim();
+	for(n.size() && "0123456789 ".find(n.substr(n.size() - 1)) >= 0)
+		n = n.substr(0, n.size() - 1);
+	return n == "phrase" ? "verse" : n;
+}
+
+//A phrase of the DJ as a key that changes when a new phrase starts: the deck, the phrase and the beat it ends at (a
+//phrase that repeats, Verse 1 after Verse 1, changes too). m: device.master() of the prolink module; "" when the deck
+//does not play or the track has no phrases
+desk_phrase_key(m) {
+	if(!m || !(m.playing ?? false) || !(m.phrase ?? ""))
+		return "";
+	return std.string(m.n ?? 0) + ":" + std.string(m.phrase) + ":" + std.string(std.int(std.float(m.beat ?? 0) + std.float(m.beatsToPhrase ?? 0)));
+}
+
+//The cue a stack is at: "3 Blue" or "-"
+desk_playback_text(pb, stack) {
+	if(!pb || !pb.on || pb.index < 0 || pb.index >= stack.cues.size())
+		return "-";
+	cue = stack.cues[pb.index];
+	return desk_num_text(cue.number) + " " + cue.name;
+}
+
+//How a value of a channel mixes with what others send (FX_BLENDS): a dimmer HTP (the highest wins), the rest by
+//priority (LTP: the playback started last has the highest priority)
+desk_blend_for(func) {
+	return func == "dimmer" ? 1 : 0;
+}
+
+// =========================================================================
+// Command line
+// =========================================================================
+
+//The words of a command line: "quoted words" stay one word, + and - are words of their own
+desk_tokens(text) {
+	text = std.string(text);
+	list = [];
+	word = "";
+	quoted = false;
+	for(i = 0; i < text.length(); i++) {
+		c = text[i];
+		if(c == "\"") {
+			if(quoted) {
+				list.push_back(word);
+				word = "";
+			}
+			quoted = !quoted;
+			continue;
+		}
+		if(!quoted && (c == " " || c == "\t" || c == ",")) {
+			if(word.length())
+				list.push_back(word);
+			word = "";
+			continue;
+		}
+		if(!quoted && (c == "+" || c == "-") && !word.length() && !(i + 1 < text.length() && text[i + 1] >= "0" && text[i + 1] <= "9")) {
+			list.push_back(c);
+			continue;
+		}
+		word += c;
+	}
+	if(word.length())
+		list.push_back(word);
+	return list;
+}
+
+//A lamp by its number (1.. in the order of the fixture setup) or its name (exact, else the first that starts with it)
+desk_find_lamp(p, ref) {
+	if(desk_is_number(ref)) {
+		n = std.int(std.float(ref));
+		return n >= 1 && n <= p.fixtures.size() ? p.fixtures[n - 1] : None;
+	}
+	want = std.string(ref).lowercase();
+	for(i = 0; i < p.fixtures.size(); i++) {
+		if(std.string(p.fixtures[i].name).lowercase() == want)
+			return p.fixtures[i];
+	}
+	for(i = 0; i < p.fixtures.size(); i++) {
+		if(std.string(p.fixtures[i].name).lowercase().starts(want))
+			return p.fixtures[i];
+	}
+	return None;
+}
+
+//A group by its number (1..) or name
+desk_find_group(p, ref) {
+	if(desk_is_number(ref)) {
+		n = std.int(std.float(ref));
+		return n >= 1 && n <= p.groups.size() ? p.groups[n - 1] : None;
+	}
+	want = std.string(ref).lowercase();
+	for(i = 0; i < p.groups.size(); i++) {
+		if(std.string(p.groups[i].name).lowercase() == want)
+			return p.groups[i];
+	}
+	for(i = 0; i < p.groups.size(); i++) {
+		if(std.string(p.groups[i].name).lowercase().starts(want))
+			return p.groups[i];
+	}
+	return None;
+}
+
+//A colour by name, #rrggbb or r/g/b (0-100 each): [r, g, b] or None
+desk_parse_color(word) {
+	word = std.string(word).lowercase();
+	if(DESK_COLORS.has(word))
+		return DESK_COLORS[word].copy();
+	if(word.starts("#") && word.length() == 7) {
+		hex = "0123456789abcdef";
+		out = [];
+		for(i = 0; i < 3; i++) {
+			hi = hex.find(word[1 + i * 2]);
+			lo = hex.find(word[2 + i * 2]);
+			if(hi < 0 || lo < 0)
+				return None;
+			out.push_back((hi * 16 + lo) / 255.0);
+		}
+		return out;
+	}
+	parts = word.split("/");
+	if(parts.size() == 3 && desk_is_number(parts[0]) && desk_is_number(parts[1]) && desk_is_number(parts[2]))
+		return [desk_percent(parts[0]), desk_percent(parts[1]), desk_percent(parts[2])];
+	return None;
+}
+
+//Runs a command line. ctx: [patch, desk, prog, playbacks (stack id -> playback), now_ms, beat, stack (the id of the
+//stack Go and Store use without "stack"), current (what the controls have now, for desk_goto_index), highlight (set by
+//"highlight": true / false), changed (set when the desk data changed: save it)]
+//Returns [ok, text]: what happened, or what was wrong
+desk_command(ctx, text) {
+	words = desk_tokens(text);
+	if(!words.size())
+		return [ok = false, text = "Type a command (help lists them)"];
+	p = ctx.patch;
+	d = ctx.desk;
+	prog = ctx.prog;
+	said = [];
+	//How the next lamps go into the selection: "+" / "-" say it; else the first selection of a line replaces, the
+	//next ones add ("group 1 group 2"), and one after values replaces again ("group 1 at 50 group 2 at 0")
+	mode = "replace";
+	selected_here = false;
+	said_at_selection = 0; //said.size() when the selection was last changed
+	explicit_mode = false; //the mode came from + or -
+	i = 0;
+	for(i < words.size()) {
+		w = std.string(words[i]).lowercase();
+		next = i + 1 < words.size() ? words[i + 1] : None;
+		//values were set since the last selection: a new selection starts over (unless + or - says otherwise)
+		if(said.size() > said_at_selection && mode == "add" && !explicit_mode)
+			mode = "replace";
+		if(w == "help" || w == "?")
+			return [ok = true, text = DESK_HELP];
+		if(w == "+") {
+			mode = "add";
+			explicit_mode = true;
+			i++;
+			continue;
+		}
+		if(w == "-") {
+			mode = "remove";
+			explicit_mode = true;
+			i++;
+			continue;
+		}
+		if(w == "clear" || w == "c") {
+			desk_clear(prog);
+			said.push_back("Programmer cleared");
+			i++;
+			continue;
+		}
+		if(w == "all") {
+			desk_select(prog, desk_ids(p.fixtures), mode);
+			selected_here = true;
+			mode = "add";
+			explicit_mode = false;
+			said_at_selection = said.size();
+			i++;
+			continue;
+		}
+		if(DESK_PLACES.has_value(w)) {
+			//of what this line selected, else of every lamp ("left half": the word half is allowed after it)
+			if(selected_here && !(said.size() > said_at_selection)) {
+				prog.selection = desk_filter_place(p, prog.selection, w, ctx.current ?? None);
+			}
+			else
+				desk_select(prog, desk_filter_place(p, desk_ids(p.fixtures), w, ctx.current ?? None), mode);
+			selected_here = true;
+			mode = "add";
+			explicit_mode = false;
+			said_at_selection = said.size();
+			i++;
+			if(i < words.size() && std.string(words[i]).lowercase() == "half")
+				i++;
+			continue;
+		}
+		if(w == "group" || w == "g") {
+			if(std.is_none(next))
+				return [ok = false, text = "group needs a number or a name"];
+			g = desk_find_group(p, next);
+			if(!g)
+				return [ok = false, text = "No group " + next];
+			desk_select(prog, g.fixtures, mode);
+			selected_here = true;
+			mode = "add";
+			explicit_mode = false;
+			said_at_selection = said.size();
+			i += 2;
+			continue;
+		}
+		if(w == "fixture" || w == "f" || w == "lamp") {
+			if(std.is_none(next))
+				return [ok = false, text = "fixture needs a number or a name"];
+			f = desk_find_lamp(p, next);
+			if(!f)
+				return [ok = false, text = "No lamp " + next];
+			ids = [f.id];
+			i += 2;
+			if(i + 1 < words.size() && std.string(words[i]).lowercase() == "thru") {
+				last = desk_find_lamp(p, words[i + 1]);
+				if(!last)
+					return [ok = false, text = "No lamp " + words[i + 1]];
+				a = patch_index(p, f.id);
+				b = patch_index(p, last.id);
+				step = a <= b ? 1 : -1;
+				ids = [];
+				for(k = a; k != b + step; k += step)
+					ids.push_back(p.fixtures[k].id);
+				i += 2;
+			}
+			desk_select(prog, ids, mode);
+			selected_here = true;
+			mode = "add";
+			explicit_mode = false;
+			said_at_selection = said.size();
+			continue;
+		}
+		if(w == "blind") {
+			ctx.blind = !(ctx.blind ?? false);
+			said.push_back(ctx.blind ? "Blind: the programmer is not sent" : "Blind off");
+			i++;
+			continue;
+		}
+		if(w == "take") {
+			ctx.take = DESK_DEFAULT_FADE;
+			i++;
+			if(i < words.size() && desk_is_number(words[i])) {
+				ctx.take = std.float(words[i]);
+				i++;
+			}
+			ctx.blind = false;
+			said.push_back("Taken live");
+			continue;
+		}
+		if(w == "highlight" || w == "hl") {
+			ctx.highlight = !(ctx.highlight ?? false);
+			said.push_back(ctx.highlight ? "Highlight on" : "Highlight off");
+			i++;
+			continue;
+		}
+		//values on the selection
+		if(w == "full" || w == "out" || w == "at") {
+			if(!prog.selection.size())
+				return [ok = false, text = "Select lamps first (group, fixture or all)"];
+			if(w == "full" || w == "out") {
+				n = desk_set_function(prog, p, prog.selection, "dimmer", w == "full" ? 1.0 : 0.0);
+				said.push_back("Dimmer " + (w == "full" ? "full" : "out") + " on " + n + " lamps");
+				i++;
+				continue;
+			}
+			if(std.is_none(next))
+				return [ok = false, text = "at needs a value"];
+			nw = std.string(next).lowercase();
+			if(nw == "full" || nw == "out") {
+				n = desk_set_function(prog, p, prog.selection, "dimmer", nw == "full" ? 1.0 : 0.0);
+				said.push_back("Dimmer " + nw + " on " + n + " lamps");
+				i += 2;
+				continue;
+			}
+			if(nw == "color" || nw == "colour") {
+				if(i + 2 >= words.size())
+					return [ok = false, text = "at color needs a colour"];
+				rgb = desk_parse_color(words[i + 2]);
+				if(!rgb)
+					return [ok = false, text = "No colour " + words[i + 2] + " (a name, #rrggbb or r/g/b)"];
+				n = desk_set_color(prog, p, prog.selection, rgb);
+				said.push_back("Colour " + words[i + 2] + " on " + n + " lamps");
+				i += 3;
+				continue;
+			}
+			if(nw == "palette" || nw == "p") {
+				if(i + 2 >= words.size())
+					return [ok = false, text = "at palette needs a number or a name"];
+				pal = desk_find_palette(d, words[i + 2]);
+				if(!pal)
+					return [ok = false, text = "No palette " + words[i + 2]];
+				n = desk_palette_apply(prog, p, pal, prog.selection);
+				said.push_back("Palette " + pal.name + " on " + n + " lamps");
+				i += 3;
+				continue;
+			}
+			if(desk_is_number(nw)) {
+				n = desk_set_function(prog, p, prog.selection, "dimmer", desk_percent(nw));
+				said.push_back("Dimmer " + desk_num_text(std.float(nw)) + " % on " + n + " lamps");
+				i += 2;
+				continue;
+			}
+			rgb = desk_parse_color(nw);
+			if(rgb) {
+				n = desk_set_color(prog, p, prog.selection, rgb);
+				said.push_back("Colour " + nw + " on " + n + " lamps");
+				i += 2;
+				continue;
+			}
+			pal = desk_find_palette(d, next);
+			if(pal) {
+				n = desk_palette_apply(prog, p, pal, prog.selection);
+				said.push_back("Palette " + pal.name + " on " + n + " lamps");
+				i += 2;
+				continue;
+			}
+			return [ok = false, text = "What is " + next + "? (a value 0-100, full, out, color <name>, palette <name>)"];
+		}
+		if(w == "palette" || w == "p") {
+			if(std.is_none(next))
+				return [ok = false, text = "palette needs a number or a name"];
+			if(!prog.selection.size())
+				return [ok = false, text = "Select lamps first (group, fixture or all)"];
+			pal = desk_find_palette(d, next);
+			if(!pal)
+				return [ok = false, text = "No palette " + next];
+			n = desk_palette_apply(prog, p, pal, prog.selection);
+			said.push_back("Palette " + pal.name + " on " + n + " lamps");
+			i += 2;
+			continue;
+		}
+		if(w == "pan" || w == "tilt") {
+			if(std.is_none(next) || !desk_is_number(next))
+				return [ok = false, text = w + " needs a value 0-100"];
+			if(!prog.selection.size())
+				return [ok = false, text = "Select lamps first (group, fixture or all)"];
+			n = desk_set_function(prog, p, prog.selection, w, desk_percent(next));
+			said.push_back((w == "pan" ? "Pan " : "Tilt ") + next + " % on " + n + " lamps");
+			i += 2;
+			continue;
+		}
+		//store
+		if(w == "store" || w == "st" || w == "record" || w == "rec") {
+			recording = w == "record" || w == "rec";
+			what = std.is_none(next) ? "cue" : std.string(next).lowercase();
+			if(what == "palette" || what == "p") {
+				if(i + 2 >= words.size())
+					return [ok = false, text = "store palette needs a kind: colour, position, beam or look"];
+				kind_word = std.string(words[i + 2]).lowercase();
+				if(kind_word == "colour")
+					kind_word = "color";
+				if(!DESK_PALETTE_KINDS.has_value(kind_word))
+					return [ok = false, text = "No palette kind " + words[i + 2] + " (colour, position, beam, look)"];
+				name = i + 3 < words.size() ? words[i + 3] : DESK_PALETTE_LABELS[patch_index_of(DESK_PALETTE_KINDS, kind_word)] + " " + (desk_palettes_of(d, kind_word).size() + 1);
+				pal = desk_palette_from(prog, p, kind_word, name, prog.selection);
+				if(!pal)
+					return [ok = false, text = "Nothing in the programmer for a " + kind_word + " palette"];
+				d.palettes.push_back(pal);
+				ctx.changed = true;
+				said.push_back("Palette " + name + " stored");
+				i = words.size();
+				continue;
+			}
+			//store [cue] [<n>] [stack <name>] [fade <s>] [name <name>] [starts <go|follow|...|phrase>] [merge|overwrite]
+			k = i + 1;
+			if(k < words.size() && std.string(words[k]).lowercase() == "cue")
+				k++;
+			number = None;
+			fade = DESK_DEFAULT_FADE;
+			stack = ctx.stack ? desk_stack(d, ctx.stack) : None;
+			store_mode = "merge";
+			cue_name = "";
+			starts = "";
+			for(k < words.size()) {
+				kw = std.string(words[k]).lowercase();
+				if(desk_is_number(kw) && std.is_none(number)) {
+					number = std.float(kw);
+					k++;
+				}
+				else if(kw == "stack" && k + 1 < words.size()) {
+					stack = desk_find_stack(d, words[k + 1]);
+					if(!stack)
+						stack = desk_stack_add(d, words[k + 1]);
+					k += 2;
+				}
+				else if(kw == "fade" && k + 1 < words.size() && desk_is_number(words[k + 1])) {
+					fade = std.float(words[k + 1]);
+					k += 2;
+				}
+				else if(kw == "merge" || kw == "overwrite") {
+					store_mode = kw;
+					k++;
+				}
+				else if(kw == "name" && k + 1 < words.size()) {
+					cue_name = std.string(words[k + 1]);
+					k += 2;
+				}
+				else if(kw == "starts" && k + 1 < words.size()) {
+					starts = std.string(words[k + 1]).lowercase();
+					if(!DESK_TRIGS.has_value(starts))
+						return [ok = false, text = "A cue starts by " + desk_join(DESK_TRIGS, ", ")];
+					k += 2;
+				}
+				else
+					return [ok = false, text = "What is " + words[k] + " in store?"];
+			}
+			//record: what the lamps show now (the selection, else every lamp), effects included; store: the programmer
+			values = recording ? desk_snapshot(p, ctx.current ?? None, prog.selection) : prog.values;
+			if(!values.size())
+				return [ok = false, text = recording ? "No lamp shows anything to record" : "The programmer is empty: nothing to store"];
+			if(!stack)
+				stack = d.stacks.size() ? d.stacks[0] : desk_stack_add(d, "Main");
+			if(std.is_none(number))
+				number = desk_next_cue_number(stack);
+			cue = desk_cue_store(stack, number, values, store_mode, fade, cue_name);
+			if(starts)
+				cue.trig = starts;
+			ctx.stack = stack.id;
+			ctx.changed = true;
+			ctx.stored = cue.id;
+			said.push_back("Cue " + desk_num_text(cue.number) + (recording ? " recorded in " : " stored in ") + stack.name);
+			i = words.size();
+			continue;
+		}
+		//playback
+		//what the music did, as DJ Link and the audio analysis send it (to try cues without CDJs; an agent drives them
+		//with it too): music drop / break / phrase [<name>]
+		if(w == "music") {
+			ev = std.is_none(next) ? "" : std.string(next).lowercase();
+			if(ev != "drop" && ev != "break" && ev != "phrase")
+				return [ok = false, text = "music needs drop, break or phrase [<name>]"];
+			k = i + 2;
+			name = "";
+			if(ev == "phrase" && k < words.size()) {
+				name = std.string(words[k]);
+				k++;
+			}
+			if(!ctx.has("music"))
+				ctx.music = [];
+			ctx.music.push_back([event = ev, phrase = name]);
+			said.push_back("Music: " + ev + (name ? " " + name : ""));
+			i = k;
+			continue;
+		}
+		//what a stack does on a new phrase of the DJ: phrases go / match / off [stack <name>]
+		if(w == "phrases") {
+			mw = std.is_none(next) ? "" : std.string(next).lowercase();
+			at = mw == "off" || mw == "nothing" ? 0 : patch_index_of(DESK_PHRASE_MODES, mw);
+			if(at < 1 && !(mw == "off" || mw == "nothing"))
+				return [ok = false, text = "phrases needs go, match or off"];
+			k = i + 2;
+			stack = ctx.stack ? desk_stack(d, ctx.stack) : None;
+			if(k + 1 < words.size() && std.string(words[k]).lowercase() == "stack") {
+				stack = desk_find_stack(d, words[k + 1]);
+				if(!stack)
+					return [ok = false, text = "No stack " + words[k + 1]];
+				k += 2;
+			}
+			if(!stack && d.stacks.size())
+				stack = d.stacks[0];
+			if(!stack)
+				return [ok = false, text = "No cue stack yet: store a cue first"];
+			stack.on_phrase = DESK_PHRASE_MODES[at];
+			ctx.stack = stack.id;
+			ctx.changed = true;
+			said.push_back(stack.name + " on a DJ phrase: " + DESK_PHRASE_LABELS[at]);
+			i = k;
+			continue;
+		}
+		if(w == "go" || w == "back" || w == "goto" || w == "off") {
+			k = i + 1;
+			number = None;
+			if(w == "goto") {
+				if(k >= words.size() || !desk_is_number(words[k]))
+					return [ok = false, text = "goto needs a cue number"];
+				number = std.float(words[k]);
+				k++;
+			}
+			stack = ctx.stack ? desk_stack(d, ctx.stack) : None;
+			if(k + 1 < words.size() && std.string(words[k]).lowercase() == "stack") {
+				stack = desk_find_stack(d, words[k + 1]);
+				if(!stack)
+					return [ok = false, text = "No stack " + words[k + 1]];
+				k += 2;
+			}
+			if(!stack && d.stacks.size())
+				stack = d.stacks[0];
+			if(!stack)
+				return [ok = false, text = "No cue stack yet: store a cue first"];
+			if(!ctx.playbacks.has(stack.id))
+				ctx.playbacks[stack.id] = desk_playback_new(stack.id);
+			pb = ctx.playbacks[stack.id];
+			ctx.stack = stack.id;
+			if(w == "off") {
+				desk_off(pb);
+				said.push_back(stack.name + " off");
+			}
+			else {
+				cue = None;
+				if(w == "go")
+					cue = desk_go(pb, stack, ctx.now_ms, ctx.beat ?? 0.0, ctx.current ?? None);
+				else if(w == "back")
+					cue = desk_back(pb, stack, ctx.now_ms, ctx.beat ?? 0.0, ctx.current ?? None);
+				else
+					cue = desk_goto(pb, stack, number, ctx.now_ms, ctx.beat ?? 0.0, ctx.current ?? None);
+				if(!cue)
+					return [ok = false, text = w == "goto" ? "No cue " + desk_num_text(number) + " in " + stack.name : stack.name + " has no cues"];
+				said.push_back(stack.name + ": cue " + desk_num_text(cue.number) + " " + cue.name);
+			}
+			i = k;
+			continue;
+		}
+		//<label> <value>: a control by its name on the selection ("zoom 30", "strobe 0")
+		if(!std.is_none(next) && desk_is_number(next) && prog.selection.size()) {
+			label = desk_find_label(p, prog.selection, words[i]);
+			if(label) {
+				n = desk_set(prog, p, prog.selection, label, desk_percent(next));
+				said.push_back(label + " " + next + " % on " + n + " lamps");
+				i += 2;
+				continue;
+			}
+		}
+		return [ok = false, text = "What is " + words[i] + "? (help lists the commands)"];
+	}
+	if(selected_here && !said.size())
+		said.push_back(prog.selection.size() + (prog.selection.size() == 1 ? " lamp" : " lamps") + " selected");
+	return [ok = true, text = said.size() ? desk_join(said, " · ") : "Done"];
+}
+
+//The label of a control of the selected lamps that a word names (case does not matter; "zoom" finds "Zoom")
+desk_find_label(p, ids, word) {
+	want = std.string(word).lowercase();
+	for(i = 0; i < ids.size(); i++) {
+		f = patch_find(p, ids[i]);
+		if(!f)
+			continue;
+		t = patch_type(f.type);
+		for(k = 0; k < t.controls.size(); k++) {
+			if(std.string(t.controls[k].label).lowercase() == want)
+				return t.controls[k].label;
+		}
+	}
+	return "";
+}

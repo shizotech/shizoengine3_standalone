@@ -1,7 +1,7 @@
 FFmpeg 9.0.2 for nanogui.video (windows_x64)
 
 These are the shared libraries of an LGPL build of FFmpeg, unchanged:
-  avutil-61.dll, swresample-7.dll, swscale-10.dll, avcodec-63.dll, avformat-63.dll
+  avutil-61.dll, swresample-7.dll, swscale-10.dll, avcodec-63.dll, avformat-63.dll, avfilter-12.dll, avdevice-63.dll
 Build:   ffmpeg-n9.0.2-28-g669f5ab083-win64-lgpl-shared-9.0.zip (BtbN/FFmpeg-Builds, release autobuild-2026-10-17-20-51)
 SHA-256: 00ab3bc8fe02554bd0fffac9968bba498d1ab7e899a4871b85fbba828a50bfcc
 Source:  https://github.com/FFmpeg/FFmpeg/tree/669f5ab083

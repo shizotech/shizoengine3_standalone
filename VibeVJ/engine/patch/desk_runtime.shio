@@ -1,0 +1,1047 @@
+//The lighting desk while the program runs (#719): engine.desk. The logic is in engine/patch/desk.shio, this is what
+//sends it to the lamps every frame, saves it with the project (desk.json) and answers AI agents.
+//
+//Needs engine/interfaces/aiinterface.shio included before it.
+//
+//- Every frame (tick, at the end of the frame, after the generators): each cue stack that runs sends what its cue
+//  fades to, then the programmer, into the controls of the lamps in Devices > Fixtures (engine.fixture_menu), through
+//  fx_contribute like the Phaser: dimmers HTP, the rest LTP (the stack started last above, the programmer above all).
+//- A control the programmer or a stack sends to goes back to the value it had before when the programmer is cleared or
+//  the stack goes off, unless something else moves it (a Phaser, a link). The values the controls had before the desk
+//  sent anything (base) are saved in desk.json and put back after a load: the controls are saved with what the desk
+//  sent, and without base a group input or a stack released after a load would leave that.
+//- The masters of the stacks (set by the Executors) scale the dimmers they send (on a lamp without dimmer: its colour).
+//- The Programmer and the Executors generators show and change this; the command line (command()) does everything.
+//- DJ Link (#719): the phrases rekordbox found in the track of the master deck (Intro, Verse 1, Buildup, Drop, ...) come
+//  from the ProlinkBridge / ProlinkDecks generators (std.global("prolink_sources"), only master(): events() belongs to
+//  them). A new phrase is the music event "phrase": cues that start on it, a Go that waits for it, a stack that goes
+//  on it or plays the cue named like it (stack.on_phrase). No AI needed; an agent can do the same with "music".
+//- Group inputs (#719): Devices > Fixtures > Masters > Groups has per group Colour, Dimmer, Pan, Tilt to link into (a
+//  ColorSelector, an LFO, MIDI). An input that moved sends to the lamps of its group like a stack (dimmers HTP, the
+//  rest LTP: the input moved last wins over the stacks started before), until Release. Which inputs moved is saved
+//  in desk.json (group_inputs), their values with the controls.
+//- Inputs of generators (set_input): a ColorSelector row with Lamps sends its colour to them every frame while it runs.
+//- AI: the interface with live_path "desk": get_desk_state, desk_command (MCP: tools of their own).
+//- Thread safety: the queries of AI agents run on other threads, everything here takes the section "desk".
+
+#include "engine/patch/patch"
+#include "engine/patch/fx"
+#include "engine/patch/desk"
+
+DESK_LIVE_PATH = "desk";
+
+//What the AI interface of the desk belongs to
+class desk_ai_target {
+	get_live_path() {
+		return "desk";
+	}
+	get_relative_path() {
+		return "engine/patch/desk_runtime.shio";
+	}
+}
+
+class desk_runtime {
+	engine = None;
+	managed data = None;      //palettes and cue stacks: desk.json of the project
+	managed prog = None;      //the programmer (not saved)
+	managed playbacks = None; //stack id -> playback (desk_playback_new)
+	masters = None;           //stack id -> 0..1, the master of its executor
+	current_stack = "";       //the stack Go and Store use without "stack": the last one used
+	highlight = false;        //the selection at full (fixture_menu.set_highlight)
+	highlight_key = "";
+	revision = 0;             //goes up with every change: the Programmer and the Executors draw again
+	message = "";             //what the last command did (the Programmer shows it)
+	managed ai = None;
+	cache = None;             //lamp id -> [f, ctrls, has_dimmer]
+	cache_revision = -1;
+	before = None;            //who -> [<id> = [<label> = v]]: what a control had before who sent to it
+	base = None;              //[<id> = [<label> = v]]: what a control had before the desk sent anything to it
+	base_pending = None;      //base of a project that loads: put into the controls once they have their saved values
+	//Blind (#719): the programmer is shown (the plan of the Programmer) but not sent. Take sends it, fading in from what
+	//the lamps had: take_from, take_start (ms), take_time (s)
+	blind = false;
+	take_from = None;
+	take_start = 0;
+	take_time = 0.0;
+	events = None;            //what the music did since the last frame: [drop = true, break = true] (music_event)
+	//The colours a palette takes from the picture (#719, the Programmer's "From video"), and the colours each lamp
+	//follows while Follow video is on (lamp id -> [<label> = v]), sent between the stacks and the programmer
+	video_values = None;
+	video_ms = 0;             //when video_values came last: they stop half a second after the Programmer stops sending
+	//DJ Link: the phrase of the master deck (desk_phrase_key: changes with each new phrase; None before the first look)
+	phrase_key = None;
+	phrase_now = "";
+	phrase_group_now = "";
+	phrase_check_revision = -1; //revision phrase_wanted was worked out at
+	phrase_wanted = false;      //a stack or cue uses phrases: only then the decks are read
+	phrase_quiet_ms = 0;        //no phrase events before this (a project that loads while the DJ plays starts no cue)
+	inputs = None;              //who -> [values = [<id> = [<label> = v]], ltp, ms]: generators (ColorSelector rows)
+	group_ltp = None;           //group id -> the LTP of its inputs (when one moved last)
+
+	__init__(_engine) {
+		engine = _engine;
+		data = desk_new();
+		prog = desk_programmer_new();
+		playbacks = std.json();
+		masters = std.json();
+		cache = std.json();
+		before = std.json();
+		base = std.json();
+		events = std.json();
+		video_values = std.json();
+		inputs = std.json();
+		group_ltp = std.json();
+		phrase_quiet_ms = std.millis() + 3000;
+		engine.save_hooks["desk"] = [this]() {
+			managed _grd = std.critical_section("desk");
+			out = this.data.copy();
+			out.base = this.base.copy();
+			return out;
+		};
+		engine.load_hooks["desk"] = [this](state) {
+			this.load(state);
+		};
+		ai = AIInterface(desk_ai_target(), None, "engine/patch/desk_runtime.shio");
+		ai.add_capability("fixtures");
+		register_queries();
+	}
+
+	//A project loads: its palettes and stacks (a project without desk.json starts with the start palettes)
+	load(state) {
+		managed _grd = std.critical_section("desk");
+		base_pending = None;
+		if(state && std.type(state) == "json" && state.has("base")) {
+			base_pending = state.base;
+			state.erase("base");
+		}
+		if(!state || std.type(state) != "json" || state.size() == 0)
+			data = desk_new();
+		else
+			data = desk_normalize(state);
+		base = std.json();
+		prog = desk_programmer_new();
+		playbacks = std.json();
+		masters = std.json();
+		before = std.json();
+		group_ltp = std.json();
+		current_stack = "";
+		highlight = false;
+		phrase_key = None;
+		phrase_quiet_ms = std.millis() + 3000;
+		changed();
+	}
+
+	changed() {
+		revision++;
+	}
+
+	// =========================================================================
+	// Undo (#719): a change of the desk is a step of the undo history of VibeVJ (Ctrl+Z)
+	// =========================================================================
+
+	history() {
+		try {
+			m = engine.menu ? engine.menu.generators_menu : None;
+			return m ? m.undo_history : None;
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//What a step brings back: the palettes and stacks, and the programmer
+	snapshot() {
+		return [data = data.copy(), prog = prog.copy()];
+	}
+
+	//Back to a snapshot (undo / redo): the programmer sends again what it has then, a stack that is gone stops
+	restore(snap) {
+		managed _grd = std.critical_section("desk");
+		//the inputs of the groups are no step of the history: they stay as they are
+		inputs_now = data.group_inputs;
+		data = snap.data.copy();
+		data.group_inputs = inputs_now;
+		prog = snap.prog.copy();
+		release("programmer");
+		for(i = playbacks.size() - 1; i >= 0; i--) {
+			id = playbacks.key(i);
+			if(!desk_stack(data, id)) {
+				playbacks.erase(id);
+				release("stack:" + id);
+			}
+		}
+		changed();
+	}
+
+	//Records a step from `undo_from` (snapshot()) to now, when something changed. Not while a project loads, in show
+	//mode, or while the history undoes or redoes
+	record_step(name, undo_from) {
+		h = history();
+		if(!h || h.busy || engine.load_in_progress || nanogui.show_mode())
+			return;
+		after = snapshot();
+		if(after.data.compact_string() == undo_from.data.compact_string() && after.prog.compact_string() == undo_from.prog.compact_string())
+			return;
+		h.push(name, [this, undo_from]() { this.restore(undo_from); }, [this, after]() { this.restore(after); });
+	}
+
+	// =========================================================================
+	// The controls of the lamps
+	// =========================================================================
+
+	//[f, ctrls (one per control of the type), has_dimmer] of a lamp, or None (gone, or not built yet in the menu)
+	lamp(id) {
+		if(cache_revision != engine.patch_revision) {
+			cache = std.json();
+			cache_revision = engine.patch_revision;
+		}
+		if(cache.has(id))
+			return cache[id];
+		if(!engine.fixture_menu)
+			return None;
+		f = patch_find(engine.patch, id);
+		if(!f)
+			return None;
+		ctrls = engine.fixture_menu.lamp_controls(id);
+		if(!ctrls || !ctrls.size())
+			return None;
+		//label -> index of its control: the frame looks values up by label, without a search through the controls
+		t = patch_type(f.type);
+		at = std.json();
+		for(k = 0; k < t.controls.size(); k++)
+			at[t.controls[k].label] = k;
+		cache[id] = [f = f, ctrls = ctrls, at = at, has_dimmer = desk_labels_of_function(f.type, "dimmer").size() > 0];
+		return cache[id];
+	}
+
+	//The control of a lamp by label and what its channel does: [ctrl, function] or None
+	control(id, label) {
+		l = lamp(id);
+		if(!l)
+			return None;
+		if(!l.at.has(label))
+			return None;
+		i = l.at[label];
+		if(i >= l.ctrls.size())
+			return None;
+		return [ctrl = l.ctrls[i], function = patch_type(l.f.type).controls[i].function, has_dimmer = l.has_dimmer];
+	}
+
+	//What the controls of the lamps in values have now ([<id> = [<label> = v]] of the same labels)
+	current_of(values) {
+		out = std.json();
+		for(i = 0; i < values.size(); i++) {
+			id = values.key(i);
+			out[id] = std.json();
+			for(k = 0; k < values[i].size(); k++) {
+				c = control(id, values[i].key(k));
+				if(c)
+					out[id][values[i].key(k)] = c.ctrl.value();
+			}
+		}
+		return out;
+	}
+
+	//What the controls of every lamp have now (for a cue that starts: it fades from there)
+	current_all() {
+		out = std.json();
+		p = engine.patch;
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			l = lamp(f.id);
+			if(!l)
+				continue;
+			t = patch_type(f.type);
+			vals = std.json();
+			for(k = 0; k < t.controls.size() && k < l.ctrls.size(); k++)
+				vals[t.controls[k].label] = l.ctrls[k].value();
+			out[f.id] = vals;
+		}
+		return out;
+	}
+
+	//Sends values into the controls for this frame. master scales dimmers (and the colour of lamps without dimmer)
+	send(who, priority, values, master, frame) {
+		if(!before.has(who))
+			before[who] = std.json();
+		kept = before[who];
+		for(i = 0; i < values.size(); i++) {
+			id = values.key(i);
+			vals = values[i];
+			for(k = 0; k < vals.size(); k++) {
+				label = vals.key(k);
+				c = control(id, label);
+				if(!c)
+					continue;
+				if(!kept.has(id))
+					kept[id] = std.json();
+				if(!kept[id].has(label)) {
+					v0 = c.ctrl.value();
+					kept[id][label] = v0;
+					if(!base.has(id))
+						base[id] = std.json();
+					if(!base[id].has(label))
+						base[id][label] = v0;
+				}
+				v = vals[k];
+				if(master < 1.0 && (c.function == "dimmer" || (c.function == "color" && !c.has_dimmer)))
+					v = v * master;
+				c.ctrl.value(fx_contribute(c.ctrl, frame, who, priority, desk_blend_for(c.function), v));
+			}
+		}
+	}
+
+	//who stopped sending: its controls go back to what they had before (what still runs sends again in this frame)
+	release(who) {
+		if(!before.has(who))
+			return;
+		kept = before[who];
+		before.erase(who);
+		for(i = 0; i < kept.size(); i++) {
+			id = kept.key(i);
+			for(k = 0; k < kept[i].size(); k++) {
+				label = kept[i].key(k);
+				c = control(id, label);
+				//nobody else of the desk sends to it: back to what it had before the desk (else what who found)
+				held = false;
+				for(w = 0; w < before.size() && !held; w++)
+					held = before[w].has(id) && before[w][id].has(label);
+				v = kept[i][k];
+				if(!held && base.has(id) && base[id].has(label)) {
+					v = base[id][label];
+					base[id].erase(label);
+				}
+				if(c)
+					c.ctrl.value(v);
+			}
+		}
+	}
+
+	//After a load, once the controls have their saved values: the values they had before the desk sent to them
+	apply_base() {
+		vals = base_pending;
+		base_pending = None;
+		for(i = 0; i < vals.size(); i++) {
+			for(k = 0; k < vals[i].size(); k++) {
+				c = control(vals.key(i), vals[i].key(k));
+				if(c)
+					c.ctrl.value(vals[i][k]);
+			}
+		}
+	}
+
+	// =========================================================================
+	// Every frame
+	// =========================================================================
+
+	tick() {
+		if(!engine.fixture_menu || !engine.timeline || !engine.timeline.cursor_pos)
+			return;
+		managed _grd = std.critical_section("desk");
+		if(base_pending && !engine.load_in_progress)
+			apply_base();
+		frame = nanogui.current_context().frame_index();
+		now = std.millis();
+		beat = engine.timeline.cursor_pos.value();
+		poll_phrase();
+		new_phrase = events.has("phrase") && events.phrase;
+		for(i = 0; i < data.stacks.size(); i++) {
+			stack = data.stacks[i];
+			if(!playbacks.has(stack.id))
+				continue;
+			pb = playbacks[stack.id];
+			if(!pb.on)
+				continue;
+			//On a DJ phrase: Go, or the cue named like the phrase (instead of the trig of the next cue in this frame)
+			at = new_phrase ? desk_phrase_action(pb, stack, events.phrase_name ?? "", events.phrase_group ?? "") : -1;
+			if(at >= 0) {
+				desk_goto_index(pb, stack, at, now, beat, current_all());
+				changed();
+			}
+			//Follow, Wait, Beats, Drop, Break, Phrase: the next cue starts by itself
+			else if(desk_auto_due(pb, stack, now, beat, events)) {
+				desk_go(pb, stack, now, beat, current_all());
+				changed();
+			}
+			send("stack:" + stack.id, pb.ltp, desk_playback_values(pb, now), master_of(stack.id), frame);
+		}
+		//A Go that waits for the next beat or bar (the stack's quantize)
+		for(i = 0; i < playbacks.size(); i++) {
+			pb = playbacks[i];
+			if(!desk_pending_due(pb, beat, events))
+				continue;
+			action = pb.pending;
+			pb.pending = "";
+			pb.pending_phrase = false;
+			run_go(playbacks.key(i), action, pb.pending_number, now, beat);
+		}
+		events = std.json();
+		//The inputs of the groups (Devices > Fixtures > Masters > Groups) that moved
+		send_group_inputs(frame);
+		//The inputs of generators: like stacks, above the ones started before them were moved (stop half a second
+		//after their generator stops sending: closed or switched off)
+		for(i = inputs.size() - 1; i >= 0; i--) {
+			who = inputs.key(i);
+			if(now - inputs[i].ms > 500) {
+				inputs.erase(who);
+				release(who);
+			}
+			else
+				send(who, inputs[i].ltp, inputs[i].values, 1.0, frame);
+		}
+		//Follow picture: the colours of the picture, under the programmer (stops when nobody sends them any more: the
+		//Programmer was closed or switched off)
+		if(video_values.size() && now - video_ms > 500) {
+			video_values = std.json();
+			release("video");
+		}
+		if(video_values.size())
+			send("video", DESK_PRIORITY_PROGRAMMER - 1, video_values, 1.0, frame);
+		if(prog.values.size() && !blind) {
+			vals = prog.values;
+			//Take: fade from what the lamps had to the programmer
+			if(take_from && take_time > 0.0) {
+				k = math.clamp((now - take_start) / (take_time * 1000.0), 0.0, 1.0);
+				if(k >= 1.0)
+					take_from = None;
+				else
+					vals = desk_blend_values(take_from, prog.values, k);
+			}
+			send("programmer", DESK_PRIORITY_PROGRAMMER, vals, 1.0, frame);
+		}
+		//Highlight: the selected lamps at full
+		key = highlight ? desk_join(prog.selection, ",") : "";
+		if(key != highlight_key) {
+			highlight_key = key;
+			engine.fixture_menu.set_highlight(highlight ? prog.selection : []);
+		}
+	}
+
+	// =========================================================================
+	// What the generators and the command line do
+	// =========================================================================
+
+	//Runs a command line (desk_command): returns [ok, text]
+	command(text) {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		had_values = desk_programmer_count(prog) > 0;
+		was_on = [];
+		for(i = 0; i < playbacks.size(); i++)
+			was_on[playbacks.key(i)] = playbacks[i].on;
+		ctx = [patch = engine.patch, desk = data, prog = prog, playbacks = playbacks, now_ms = std.millis(),
+			beat = engine.timeline && engine.timeline.cursor_pos ? engine.timeline.cursor_pos.value() : 0.0,
+			stack = current_stack, current = current_all(), highlight = highlight, changed = false, blind = blind,
+			take = -1.0, stored = ""];
+		r = desk_command(ctx, text);
+		current_stack = ctx.stack ?? "";
+		if(ctx.has("music")) {
+			for(i = 0; i < ctx.music.size(); i++)
+				music_event(ctx.music[i].event, ctx.music[i].phrase);
+		}
+		highlight = ctx.highlight ? true : false;
+		if(ctx.take >= 0.0)
+			take(ctx.take);
+		else if((ctx.blind ? true : false) != blind)
+			set_blind(ctx.blind);
+		//the picture of a cue that was stored: what the lamps show now
+		if(ctx.stored) {
+			for(i = 0; i < data.stacks.size(); i++) {
+				for(k = 0; k < data.stacks[i].cues.size(); k++) {
+					if(data.stacks[i].cues[k].id == ctx.stored)
+						stamp_preview(data.stacks[i].cues[k]);
+				}
+			}
+		}
+		if(had_values && desk_programmer_count(prog) == 0)
+			release("programmer");
+		for(i = 0; i < playbacks.size(); i++) {
+			if((was_on[playbacks.key(i)] ?? false) && !playbacks[i].on)
+				release("stack:" + playbacks.key(i));
+		}
+		message = r.text;
+		//a command that stores, deletes or clears is a step of the undo history (setting values is not: too many)
+		if(ctx.changed || (had_values && desk_programmer_count(prog) == 0))
+			record_step("Desk: " + std.string(text), undo_from);
+		changed();
+		return r;
+	}
+
+	//The programmer to empty (the selection stays when keep_selection)
+	clear(keep_selection = false) {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		sel = prog.selection.copy();
+		desk_clear(prog);
+		if(keep_selection)
+			prog.selection = sel;
+		release("programmer");
+		record_step("Clear the programmer", undo_from);
+		changed();
+	}
+
+	select(ids, mode = "replace") {
+		managed _grd = std.critical_section("desk");
+		desk_select(prog, ids, mode);
+		message = "";
+		changed();
+	}
+
+	//A value of the selection: by label, by function ("dimmer", "pan", ...) or a colour [r, g, b]
+	set_label(label, v) {
+		managed _grd = std.critical_section("desk");
+		desk_set(prog, engine.patch, prog.selection, label, v);
+		message = "";
+		changed();
+	}
+	set_function(func, v) {
+		managed _grd = std.critical_section("desk");
+		desk_set_function(prog, engine.patch, prog.selection, func, v);
+		message = "";
+		changed();
+	}
+	set_color(rgb) {
+		managed _grd = std.critical_section("desk");
+		desk_set_color(prog, engine.patch, prog.selection, rgb);
+		message = "";
+		changed();
+	}
+
+	//A palette on the selection; returns how many lamps took it
+	apply_palette(id) {
+		managed _grd = std.critical_section("desk");
+		pal = desk_palette(data, id);
+		if(!pal)
+			return 0;
+		n = desk_palette_apply(prog, engine.patch, pal, prog.selection);
+		message = n ? "Palette " + pal.name + " on " + n + (n == 1 ? " lamp" : " lamps") : (prog.selection.size() ? "No lamp of the selection has what " + pal.name + " sets" : "Select lamps first");
+		changed();
+		return n;
+	}
+
+	//A new palette from the programmer; returns it or None
+	store_palette(kind, name = "") {
+		managed _grd = std.critical_section("desk");
+		if(!name)
+			name = DESK_PALETTE_LABELS[math.max(0, patch_index_of(DESK_PALETTE_KINDS, kind))] + " " + (desk_palettes_of(data, kind).size() + 1);
+		undo_from = snapshot();
+		pal = desk_palette_from(prog, engine.patch, kind, name, prog.selection);
+		if(!pal) {
+			message = "Nothing in the programmer for a " + std.string(DESK_PALETTE_LABELS[math.max(0, patch_index_of(DESK_PALETTE_KINDS, kind))]).lowercase() + " palette";
+			changed();
+			return None;
+		}
+		data.palettes.push_back(pal);
+		message = "Palette " + name + " stored";
+		record_step("Store palette " + name, undo_from);
+		changed();
+		return data.palettes[-1];
+	}
+
+	remove_palette(id) {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		for(i = 0; i < data.palettes.size(); i++) {
+			if(data.palettes[i].id == id) {
+				data.palettes.erase(i);
+				break;
+			}
+		}
+		record_step("Delete palette", undo_from);
+		changed();
+	}
+
+	rename_palette(id, name) {
+		managed _grd = std.critical_section("desk");
+		pal = desk_palette(data, id);
+		if(pal)
+			pal.name = name;
+		changed();
+	}
+
+	add_stack(name = "") {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		s = desk_stack_add(data, name);
+		record_step("New stack " + s.name, undo_from);
+		current_stack = s.id;
+		changed();
+		return s;
+	}
+
+	remove_stack(id) {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		if(playbacks.has(id)) {
+			playbacks.erase(id);
+			release("stack:" + id);
+		}
+		desk_stack_remove(data, id);
+		if(current_stack == id)
+			current_stack = "";
+		record_step("Delete stack", undo_from);
+		changed();
+	}
+
+	//The programmer into a cue of a stack (number None: the next one). Returns the cue or None
+	store_cue(stack_id, number = None, mode = "merge", fade = DESK_DEFAULT_FADE) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s) {
+			message = "Pick a cue stack first";
+			changed();
+			return None;
+		}
+		if(!desk_programmer_count(prog)) {
+			message = "The programmer is empty: nothing to store";
+			changed();
+			return None;
+		}
+		if(std.is_none(number))
+			number = desk_next_cue_number(s);
+		undo_from = snapshot();
+		cue = desk_cue_store(s, number, prog.values, mode, fade);
+		stamp_preview(cue);
+		record_step("Store cue " + desk_num_text(cue.number), undo_from);
+		current_stack = s.id;
+		message = "Cue " + desk_num_text(cue.number) + " stored in " + s.name;
+		changed();
+		return cue;
+	}
+
+	//What the lamps show now (the selection, else every lamp) as a cue: effects included, what you see is what you get
+	record_cue(stack_id, number = None, fade = DESK_DEFAULT_FADE) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s) {
+			message = "Pick a cue stack first";
+			changed();
+			return None;
+		}
+		values = desk_snapshot(engine.patch, current_all(), prog.selection);
+		if(!values.size()) {
+			message = "No lamp to record";
+			changed();
+			return None;
+		}
+		if(std.is_none(number))
+			number = desk_next_cue_number(s);
+		undo_from = snapshot();
+		cue = desk_cue_store(s, number, values, "merge", fade);
+		stamp_preview(cue);
+		record_step("Record cue " + desk_num_text(cue.number), undo_from);
+		current_stack = s.id;
+		message = "Cue " + desk_num_text(cue.number) + " recorded in " + s.name;
+		changed();
+		return cue;
+	}
+
+	remove_cue(stack_id, number) {
+		managed _grd = std.critical_section("desk");
+		undo_from = snapshot();
+		s = desk_stack(data, stack_id);
+		if(s)
+			desk_cue_remove(s, number);
+		record_step("Delete cue " + desk_num_text(number), undo_from);
+		changed();
+	}
+
+	//The values of a cue into the programmer (to change them and store again)
+	load_cue(stack_id, number) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s)
+			return;
+		at = desk_cue_index(s, number);
+		if(at < 0)
+			return;
+		vals = s.cues[at].values;
+		for(i = 0; i < vals.size(); i++) {
+			for(k = 0; k < vals[i].size(); k++)
+				desk_put(prog, vals.key(i), vals[i].key(k), vals[i][k]);
+		}
+		message = "Cue " + desk_num_text(number) + " in the programmer";
+		changed();
+	}
+
+	playback(stack_id) {
+		if(!playbacks.has(stack_id))
+			playbacks[stack_id] = desk_playback_new(stack_id);
+		return playbacks[stack_id];
+	}
+
+	//Go, Back, Off, Goto of a stack (by id). Returns the cue that starts, or None. With the stack's quantize (Next beat,
+	//Next bar) and the timeline playing, Go / Back / Goto wait for that beat (pending) and return None
+	go(stack_id, action = "go", number = 0) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s)
+			return None;
+		pb = playback(stack_id);
+		current_stack = stack_id;
+		now = std.millis();
+		beat = engine.timeline && engine.timeline.cursor_pos ? engine.timeline.cursor_pos.value() : 0.0;
+		q = std.float(s.quantize ?? 0);
+		playing = engine.timeline && engine.timeline.play_btn && engine.timeline.play_btn.value();
+		//Next phrase: waits while a deck plays a track with phrases (else at once: nothing to wait for)
+		phrased = q == DESK_QUANTIZE_PHRASE && phrase_now;
+		if(action != "off" && ((q > 0.0 && playing) || phrased)) {
+			pb.pending = action;
+			pb.pending_number = std.float(number);
+			pb.pending_beat = q > 0.0 ? desk_quantize_beat(beat, q) : 0.0;
+			pb.pending_phrase = phrased ? true : false;
+			changed();
+			return None;
+		}
+		pb.pending = "";
+		pb.pending_phrase = false;
+		return run_go(stack_id, action, number, now, beat);
+	}
+
+	//Go, Back, Off, Goto now (go() or a pending Go that is due)
+	run_go(stack_id, action, number, now, beat) {
+		s = desk_stack(data, stack_id);
+		if(!s)
+			return None;
+		pb = playback(stack_id);
+		cue = None;
+		if(action == "off") {
+			was = pb.on;
+			desk_off(pb);
+			if(was)
+				release("stack:" + stack_id);
+		}
+		else if(action == "back")
+			cue = desk_back(pb, s, now, beat, current_all());
+		else if(action == "goto")
+			cue = desk_goto(pb, s, number, now, beat, current_all());
+		else
+			cue = desk_go(pb, s, now, beat, current_all());
+		changed();
+		return cue;
+	}
+
+	//When Go of a stack starts its cue: 0 at once, 1 the next beat, 4 the next bar
+	set_quantize(stack_id, beats) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(s)
+			s.quantize = std.float(beats);
+		changed();
+	}
+
+	//The music did something: "drop" or "break" (the audio analysis, the memory cues of the DJ), "phrase" (a new phrase of
+	//the DJ, with its name: "Verse 2"). Cues that start on it start in this frame
+	music_event(name, phrase = "") {
+		managed _grd = std.critical_section("desk");
+		events[name] = true;
+		if(name == "phrase") {
+			events.phrase_name = std.string(phrase ?? "");
+			events.phrase_group = desk_phrase_group(phrase);
+		}
+	}
+
+	//Does a stack or a cue use the phrases of the DJ (only then the decks are read every frame)
+	wants_phrases() {
+		if(phrase_check_revision == revision)
+			return phrase_wanted;
+		phrase_check_revision = revision;
+		phrase_wanted = false;
+		for(i = 0; i < data.stacks.size() && !phrase_wanted; i++) {
+			s = data.stacks[i];
+			if(std.string(s.on_phrase ?? "") || std.float(s.quantize ?? 0) == DESK_QUANTIZE_PHRASE)
+				phrase_wanted = true;
+			for(k = 0; k < s.cues.size() && !phrase_wanted; k++) {
+				if((s.cues[k].trig ?? "go") == "phrase")
+					phrase_wanted = true;
+			}
+		}
+		return phrase_wanted;
+	}
+
+	//The master deck of DJ Link (a ProlinkBridge or ProlinkDecks generator publishes its device), a connected one
+	//first: its master() or None. Never events(): the generator of the device takes them
+	prolink_master() {
+		try {
+			sources = std.global("prolink_sources").get();
+			if(!sources)
+				return None;
+			found = None;
+			for(key, device : sources) {
+				if(!device)
+					continue;
+				if(device.connected()) {
+					found = device;
+					break;
+				}
+				if(!found)
+					found = device;
+			}
+			return found ? found.master() : None;
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//A new phrase of the master deck is the music event "phrase" (not the first one seen: a project that loads while
+	//the DJ plays does not start cues)
+	poll_phrase() {
+		if(!wants_phrases())
+			return;
+		m = prolink_master();
+		key = desk_phrase_key(m);
+		phrase_now = key ? std.string(m.phrase) : "";
+		phrase_group_now = key ? std.string(m.phraseGroup ?? "") : "";
+		if(std.is_none(phrase_key)) {
+			phrase_key = key;
+			return;
+		}
+		if(key != phrase_key) {
+			phrase_key = key;
+			if(key && std.millis() >= phrase_quiet_ms) {
+				events.phrase = true;
+				events.phrase_name = phrase_now;
+				events.phrase_group = phrase_group_now ? phrase_group_now : desk_phrase_group(phrase_now);
+			}
+		}
+	}
+
+	//What a stack does on a new phrase of the DJ: "" (nothing), "go", "match" (the cue named like the phrase)
+	set_on_phrase(stack_id, mode) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(s)
+			s.on_phrase = std.string(mode ?? "");
+		changed();
+	}
+
+	//An input of a group moved (Devices > Fixtures): from now on it sends, and wins over what started before (LTP)
+	group_input_moved(gid, func) {
+		managed _grd = std.critical_section("desk");
+		if(!data.group_inputs.has(gid))
+			data.group_inputs[gid] = std.json();
+		data.group_inputs[gid][func] = true;
+		group_ltp[gid] = desk_ltp();
+	}
+
+	//The inputs of a group stop sending: its lamps go back to what they had
+	release_group(gid) {
+		managed _grd = std.critical_section("desk");
+		if(data.group_inputs.has(gid))
+			data.group_inputs.erase(gid);
+		group_ltp.erase(gid);
+		release("group:" + gid);
+	}
+
+	//Every frame: what the inputs that moved have, on the lamps of their group
+	send_group_inputs(frame) {
+		if(!data.group_inputs.size())
+			return;
+		p = engine.patch;
+		for(i = data.group_inputs.size() - 1; i >= 0; i--) {
+			gid = data.group_inputs.key(i);
+			used = data.group_inputs[i];
+			g = patch_group(p, gid);
+			vals = g ? engine.fixture_menu.group_input_values(gid) : None;
+			if(!vals || !used.size())
+				continue;
+			if(!group_ltp.has(gid))
+				group_ltp[gid] = desk_ltp();
+			send("group:" + gid, group_ltp[gid], desk_input_values(p, g.fixtures, used, vals), 1.0, frame);
+		}
+	}
+
+	//A generator (a ColorSelector row with Lamps) sends values ([<id> = [<label> = v]]) every frame while it is on; moved: one of its inputs
+	//changed (it takes the LTP: wins over the stacks started before)
+	set_input(who, values, moved = false) {
+		managed _grd = std.critical_section("desk");
+		if(!values.size()) {
+			if(inputs.has(who)) {
+				inputs.erase(who);
+				release(who);
+			}
+			return;
+		}
+		if(!inputs.has(who) || moved)
+			inputs[who] = [values = values, ltp = desk_ltp(), ms = std.millis()];
+		else {
+			inputs[who].values = values;
+			inputs[who].ms = std.millis();
+		}
+	}
+
+	//Blind on: the programmer is not sent (the Programmer shows it on its plan). Off sends it again at once
+	set_blind(v) {
+		managed _grd = std.critical_section("desk");
+		was = blind;
+		blind = v ? true : false;
+		if(blind && !was)
+			release("programmer");
+		take_from = None;
+		changed();
+	}
+
+	//Takes the blind programmer live: it fades in from what the lamps show in `seconds`
+	take(seconds = DESK_DEFAULT_FADE) {
+		managed _grd = std.critical_section("desk");
+		take_from = current_of(prog.values);
+		take_start = std.millis();
+		take_time = math.max(0.0, std.float(seconds));
+		blind = false;
+		message = "Taken live" + (take_time > 0.0 ? " in " + desk_num_text(take_time) + " s" : "");
+		changed();
+	}
+
+	//The colours each lamp should follow from the picture (Follow video), or an empty json to stop
+	set_video_values(values) {
+		managed _grd = std.critical_section("desk");
+		if(!values.size() && video_values.size())
+			release("video");
+		video_values = values;
+		video_ms = std.millis();
+	}
+
+	//What the lamps show now, one colour each, for the picture of a cue: [[id, r, g, b], ...] (colour x dimmer)
+	preview_colors() {
+		out = [];
+		if(!engine.fixture_menu)
+			return out;
+		p = engine.patch;
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			light = engine.fixture_menu.lamp_light(f);
+			if(!light)
+				continue;
+			out.push_back([f.id, math.round(light.r * light.dimmer * 100.0) / 100.0, math.round(light.g * light.dimmer * 100.0) / 100.0,
+				math.round(light.b * light.dimmer * 100.0) / 100.0]);
+		}
+		return out;
+	}
+
+	//A cue gets the picture of what the lamps show when it is stored
+	stamp_preview(cue) {
+		if(cue)
+			cue.preview = preview_colors();
+	}
+
+	set_master(stack_id, v) {
+		masters[stack_id] = math.clamp(std.float(v), 0.0, 1.0);
+	}
+
+	//The master of a stack, 1 when no executor set one (not "?? 1.0": ?? takes the right side for 0 too)
+	master_of(stack_id) {
+		return masters.has(stack_id) ? masters[stack_id] : 1.0;
+	}
+
+	//What a stack is at: [on, cue (text), index, progress 0..1]
+	stack_status(stack_id) {
+		s = desk_stack(data, stack_id);
+		if(!s || !playbacks.has(stack_id))
+			return [on = false, cue = "-", index = -1, progress = 0.0];
+		pb = playbacks[stack_id];
+		return [on = pb.on, cue = desk_playback_text(pb, s), index = pb.on ? pb.index : -1, progress = pb.on ? desk_progress(pb, std.millis()) : 0.0];
+	}
+
+	// =========================================================================
+	// AI agents
+	// =========================================================================
+
+	//What an agent sees of the desk
+	describe() {
+		managed _grd = std.critical_section("desk");
+		p = engine.patch;
+		pals = [];
+		for(i = 0; i < data.palettes.size(); i++) {
+			pal = data.palettes[i];
+			pals.push_back([number = i + 1, name = pal.name, kind = pal.kind, lamps = pal.lamps.size()]);
+		}
+		stacks = [];
+		for(i = 0; i < data.stacks.size(); i++) {
+			s = data.stacks[i];
+			cues = [];
+			for(k = 0; k < s.cues.size(); k++) {
+				c = s.cues[k];
+				cues.push_back([number = c.number, name = c.name, fade = c.fade, delay = c.delay ?? 0.0, trig = c.trig ?? "go",
+					trig_time = c.trig_time ?? 0.0, values = desk_cue_count(c)]);
+			}
+			st = stack_status(s.id);
+			stacks.push_back([number = i + 1, id = s.id, name = s.name, cues = cues, on = st.on, at = st.cue,
+				master = master_of(s.id), quantize = std.float(s.quantize ?? 0), on_phrase = std.string(s.on_phrase ?? ""),
+				waiting = playbacks.has(s.id) && playbacks[s.id].pending ? playbacks[s.id].pending : ""]);
+		}
+		sel = [];
+		for(i = 0; i < prog.selection.size(); i++) {
+			f = patch_find(p, prog.selection[i]);
+			if(f)
+				sel.push_back(f.name);
+		}
+		return [palettes = pals, stacks = stacks, selection = sel, programmer_values = desk_programmer_count(prog),
+			highlight = highlight, blind = blind, follow_video = video_values.size() > 0, inputs = inputs.size(),
+			group_inputs = data.group_inputs.copy(),
+			dj_phrase = phrase_now, message = message, help = DESK_HELP];
+	}
+
+	register_queries() {
+		ai.register("get_desk_state", [], [this](args) {
+			return this.describe();
+		}, "Lighting desk: the palettes, the cue stacks with their cues and what each plays, the selection and the programmer.");
+
+		ai.register("get_lamp_values", [
+			fixtures = "array(string): Lamps by id or name (empty: every lamp)",
+		], [this](args) {
+			managed _grd = std.critical_section("desk");
+			p = this.engine.patch;
+			keys = args.has("fixtures") && std.is_json(args.fixtures) ? args.fixtures : [];
+			out = [];
+			for(i = 0; i < p.fixtures.size(); i++) {
+				f = p.fixtures[i];
+				if(keys.size() && !keys.has_value(f.id) && !keys.has_value(f.name))
+					continue;
+				l = this.lamp(f.id);
+				if(!l)
+					continue;
+				t = patch_type(f.type);
+				vals = std.json();
+				for(k = 0; k < t.controls.size() && k < l.ctrls.size(); k++)
+					vals[t.controls[k].label] = math.round(l.ctrls[k].value() * 1000.0) / 1000.0;
+				in_prog = this.prog.values.has(f.id) ? this.prog.values[f.id].size() : 0;
+				out.push_back([id = f.id, name = f.name, values = vals, programmer_values = in_prog]);
+			}
+			return [lamps = out];
+		}, "Lighting desk: what the controls of the lamps have now (0 to 1, by channel), as Devices > Fixtures sends them, and how many values of each are in the programmer.");
+
+		ai.register("set_group_input", [
+			group = "&string(): A group of the fixture setup by name or number",
+			function = ["color", "dimmer", "pan", "tilt"],
+			value = "&json(): 0 to 1, for color [r, g, b]",
+		], [this](args) {
+			g = desk_find_group(this.engine.patch, std.string(args.group ?? ""));
+			if(!g || !this.engine.fixture_menu)
+				return [ok = false, error = "No group " + std.string(args.group ?? "")];
+			if(!this.engine.fixture_menu.set_group_input(g.id, std.string(args.function ?? ""), args.value))
+				return [ok = false, error = "function is color, dimmer, pan or tilt"];
+			return [ok = true];
+		}, "Lighting desk: moves an input of a group (Devices > Fixtures > Masters > Groups) as a linked control would: the group's lamps take it like a cue stack until the group is released ('release_group'). Use it for a colour a group should hold under the cues, or to try what a link will do.");
+
+		ai.register("release_group", [
+			group = "&string(): A group of the fixture setup by name or number",
+		], [this](args) {
+			g = desk_find_group(this.engine.patch, std.string(args.group ?? ""));
+			if(!g)
+				return [ok = false, error = "No group " + std.string(args.group ?? "")];
+			this.release_group(g.id);
+			return [ok = true];
+		}, "Lighting desk: the inputs of a group stop sending, its lamps go back to what they had.");
+
+		ai.register("desk_command", [
+			command = "&string(): A command line of the desk, e.g. 'group \"Front pars\" at 50', 'all at color red', 'store cue 3 fade 2', 'go stack Main', 'clear'. 'help' lists the commands",
+		], [this](args) {
+			r = this.command(std.string(args.command ?? ""));
+			//a failure says why (the AI interface shows `error`, not `text`)
+			if(!r.ok)
+				return [ok = false, error = r.text];
+			return [ok = true, text = r.text, programmer_values = desk_programmer_count(this.prog)];
+		}, "Lighting desk: runs a command line as a lighting operator types it (select lamps, set values, palettes, store cues, go, off). Works on every lamp of the fixture setup, the virtual ones too (MapLab slices, looks of shaders).");
+	}
+}

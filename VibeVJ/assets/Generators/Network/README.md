@@ -36,7 +36,7 @@ Network generators enable communication with external devices and systems over n
 DJ Watch is the ESP32-P4 that sits in the Pro DJ Link network of the CDJs and passes tempo, beats, tracks, cues and
 waveforms on (hostname `dj-watch.local`; firmware, protocol and wiring in the repository
 [prolink-bridge](https://github.com/shizotech/prolink-bridge), its former name). The two generators below read it
-through the native module `prolink` (see `shzmodule_prolink/README.md` in the source repo). Their asset names
+through the native module `prolink` (see `modules/shzmodule_prolink/README.md` in the source repo). Their asset names
 (`ProlinkBridge`, `ProlinkDecks`) and control IDs stay, so saved projects keep working; the captions follow the Shizo UI
 writing rules (`design/wiki/Writing-and-Naming.md`).
 

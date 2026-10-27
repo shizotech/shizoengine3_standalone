@@ -1,0 +1,334 @@
+import nanogui;
+
+//The connected displays (#593): what each one is for and the resolution the picture is made in for it.
+//- Role: Control, a screen of the operator (at the FOH: it shows VibeVJ, the size of the picture does not matter for
+//  it), or Output, a projector, an LED processor or a monitor on stage (the picture is made for it). Until one is
+//  chosen, the display the window of VibeVJ is on (at the start, or when displays are plugged in or out) is Control,
+//  every other one Output.
+//- Resolution: Auto, the size the system runs the display at, or one picked in Settings > Display: for a display that
+//  reports a wrong size (a scaler, a splitter, an LED processor) or to make the picture in another size.
+//Both are personal and kept per display name in the style file (displays): at another venue the order of the displays
+//differs, their names do not. The project size follows the output displays while Settings > Project > Output size is
+//"From output displays" (apply_project_size).
+
+DISPLAY_ROLE_NAMES = ["Control", "Output"];
+DISPLAY_CHECK_MS = 1500; //how often the connected displays are compared with the last look (plugged in or out)
+
+//Common resolutions, by shape: the resolutions of a display (Settings > Display) and the presets of the project size
+DISPLAY_PRESETS = [
+	[aspect = "16:9",  sizes = [[1280, 720], [1600, 900], [1920, 1080], [2560, 1440], [3840, 2160]]],
+	[aspect = "16:10", sizes = [[1280, 800], [1440, 900], [1680, 1050], [1920, 1200], [2560, 1600]]],
+	[aspect = "21:9",  sizes = [[2560, 1080], [3440, 1440], [3840, 1600], [5120, 2160]]],
+	[aspect = "32:9",  sizes = [[3840, 1080], [5120, 1440]]],
+	[aspect = "4:3",   sizes = [[1024, 768], [1400, 1050], [1600, 1200]]],
+	[aspect = "5:4",   sizes = [[1280, 1024]]],
+];
+
+//The shape of a size as people name it: 16:9, 16:10, 21:9, 32:9, 4:3 ..., turned round for a display that stands
+//upright (9:16). 21:9 is a name, not a ratio: the panels sold as 21:9 are 2.33 to 2.42 : 1 (2560 x 1080, 3440 x 1440,
+//3840 x 1600). Any other shape as a ratio to 1 ("2.11:1")
+display_aspect(w, h) {
+	if(w <= 0 || h <= 0)
+		return "";
+	long_side = std.float(math.max(w, h));
+	short_side = std.float(math.min(w, h));
+	ratio = long_side / short_side;
+	known = [
+		[n = "1:1",   p = "1:1",   r = 1.0,          tol = 0.015],
+		[n = "5:4",   p = "4:5",   r = 1.25,         tol = 0.015],
+		[n = "4:3",   p = "3:4",   r = 4.0 / 3.0,    tol = 0.015],
+		[n = "3:2",   p = "2:3",   r = 1.5,          tol = 0.015],
+		[n = "16:10", p = "10:16", r = 1.6,          tol = 0.015],
+		[n = "16:9",  p = "9:16",  r = 16.0 / 9.0,   tol = 0.015],
+		[n = "21:9",  p = "9:21",  r = 64.0 / 27.0,  tol = 0.03],
+		[n = "32:9",  p = "9:32",  r = 32.0 / 9.0,   tol = 0.015],
+	];
+	for(k : known) {
+		if(math.abs(ratio - k.r) <= k.r * k.tol)
+			return h > w ? k.p : k.n;
+	}
+	hundredths = std.int(math.round(ratio * 100));
+	whole = std.int(hundredths / 100);
+	frac = hundredths - whole * 100;
+	return std.string(whole) + "." + (frac < 10 ? "0" : "") + std.string(frac) + ":1";
+}
+
+//"3440 × 1440", with its shape: "3440 × 1440 (21:9)"
+display_size_text(w, h, with_aspect = true) {
+	text = std.string(std.int(w)) + " × " + std.string(std.int(h));
+	aspect = display_aspect(w, h);
+	if(with_aspect && aspect)
+		text = text + " (" + aspect + ")";
+	return text;
+}
+
+class displays_manager
+{
+	engine = None;
+	//The connected displays, in the order of the system (index: for ctx.monitor_info / ctx.fullscreen):
+	//[index, store_name (the name it is kept by), name, width, height (pixels, as the system runs it), hz, scale, window (VibeVJ is on it),
+	// role (0 Control, 1 Output), role_auto, res_w, res_h (the resolution the picture is made in), res_auto]
+	connected = [];
+	signature = "";      //what was connected at the last look
+	next_check = 0;
+	listeners = [];      //functions(): called after the list changed
+	on_page_rebuild = None; //Settings > Display builds its rows again (at the end of a frame, never in a widget callback)
+	page_dirty = false;
+	applying = false;    //the project size is being set from the output displays (not a change by hand)
+
+	__init__(engine) {
+		this.engine = engine;
+		refresh();
+	}
+
+	// =========================================================================
+	// The settings in the style file
+	// =========================================================================
+
+	//[<key> = [role = "auto" / "control" / "output", width = 0 (Auto) or pixels, height = ...]]
+	stored() {
+		try {
+			style = fileio.read_json(STYLE_FILE);
+			if(style.has("displays") && std.type(style.displays) == "json")
+				return style.displays;
+		}
+		catch(e) {}
+		return std.json();
+	}
+
+	store(key, values) {
+		style = fileio.read_json(STYLE_FILE);
+		if(!style.has("displays") || std.type(style.displays) != "json")
+			style.displays = std.json();
+		if(!style.displays.has(key) || std.type(style.displays[key]) != "json")
+			style.displays[key] = std.json();
+		for(field, value : values)
+			style.displays[key][field] = value;
+		fileio.write_json(STYLE_FILE, style);
+	}
+
+	//role: 0 Control, 1 Output, -1 Auto
+	set_role(key, role) {
+		store(key, [role = role < 0 ? "auto" : (role == 1 ? "output" : "control")]);
+		refresh();
+	}
+
+	//0 x 0: Auto (the size the system runs the display at)
+	set_resolution(key, w, h) {
+		store(key, [width = std.int(w), height = std.int(h)]);
+		refresh();
+	}
+
+	// =========================================================================
+	// The connected displays
+	// =========================================================================
+
+	//Name, size and place of every display, and how many there are: a change means displays were plugged in or out, or
+	//one runs at another size now
+	read_signature() {
+		ctx = nanogui.current_context();
+		text = "";
+		try {
+			count = ctx.monitor_count();
+			text = std.string(count);
+			for(i = 0; i < count; i++) {
+				info = ctx.monitor_info(i);
+				if(info)
+					text = text + "|" + info.name + ":" + info.pixel_width + "x" + info.pixel_height + "@" + info.x + "," + info.y;
+			}
+		}
+		catch(e) {}
+		return text;
+	}
+
+	refresh() {
+		ctx = nanogui.current_context();
+		window_index = -1;
+		try {
+			window_index = engine.screen.monitor_index();
+		}
+		catch(e) {}
+		saved = stored();
+		found = [];
+		count = 0;
+		try {
+			count = ctx.monitor_count();
+		}
+		catch(e) {}
+		for(i = 0; i < count; i++) {
+			info = None;
+			try {
+				info = ctx.monitor_info(i);
+			}
+			catch(e) {}
+			if(!info)
+				continue;
+			name = info.name ? info.name : "Display " + (i + 1);
+			//Two displays of one model have the same name: the second one is "<name> (2)"
+			same = 1;
+			for(other : found) {
+				if(other.name == name)
+					same++;
+			}
+			key = same > 1 ? name + " (" + same + ")" : name;
+			s = saved.has(key) && std.type(saved[key]) == "json" ? saved[key] : std.json();
+
+			//Without the place of the window (an older nanogui): the primary display is the one of the operator
+			here = window_index >= 0 ? i == window_index : (info.has("primary") ? info.primary == 1 : i == 0);
+			role = here ? 0 : 1;
+			role_auto = true;
+			if(s.has("role") && s.role != "auto") {
+				role = s.role == "output" ? 1 : 0;
+				role_auto = false;
+			}
+			res_w = info.pixel_width;
+			res_h = info.pixel_height;
+			res_auto = true;
+			if(s.has("width") && s.has("height") && std.int(s.width) > 0 && std.int(s.height) > 0) {
+				res_w = std.int(s.width);
+				res_h = std.int(s.height);
+				res_auto = false;
+			}
+			found.push_back([
+				index = i, store_name = key, name = name,
+				width = info.pixel_width, height = info.pixel_height,
+				hz = info.refresh_rate, scale = info.has("scale") ? info.scale : 1.0,
+				window = here ? 1 : 0,
+				role = role, role_auto = role_auto ? 1 : 0,
+				res_w = res_w, res_h = res_h, res_auto = res_auto ? 1 : 0,
+			]);
+		}
+		connected = found;
+		signature = read_signature();
+		page_dirty = true;
+		for(f : listeners) {
+			try {
+				f();
+			}
+			catch(e) {
+				std.warn("Displays: " + e);
+			}
+		}
+		apply_project_size();
+	}
+
+	//At the end of every frame (__init__.shio): every DISPLAY_CHECK_MS a look at the connected displays, and the rows of
+	//Settings > Display built again when they changed
+	tick() {
+		now = std.millis();
+		if(now >= next_check) {
+			next_check = now + DISPLAY_CHECK_MS;
+			if(read_signature() != signature)
+				refresh();
+		}
+		if(page_dirty && on_page_rebuild) {
+			page_dirty = false;
+			on_page_rebuild();
+		}
+	}
+
+	find(index) {
+		for(d : connected) {
+			if(d.index == index)
+				return d;
+		}
+		return None;
+	}
+
+	outputs() {
+		result = [];
+		for(d : connected) {
+			if(d.role == 1)
+				result.push_back(d);
+		}
+		return result;
+	}
+
+	//The resolution the picture is made in for this display, in pixels: [w, h]
+	resolution(index) {
+		d = find(index);
+		if(d)
+			return [d.res_w, d.res_h];
+		try {
+			info = nanogui.current_context().monitor_info(index);
+			if(info)
+				return [info.pixel_width, info.pixel_height];
+		}
+		catch(e) {}
+		return [engine.project_width.value(), engine.project_height.value()];
+	}
+
+	//The size of the first output display, or None without one
+	output_size() {
+		outs = outputs();
+		if(outs.size() == 0)
+			return None;
+		return [outs[0].res_w, outs[0].res_h];
+	}
+
+	//The entry of a display in the Display lists of the outputs: "Display 2 · BenQ W1070 · 1920 × 1080 (16:9) · Output"
+	label(index) {
+		d = find(index);
+		if(!d)
+			return "Display " + (index + 1);
+		return "Display " + (index + 1) + " · " + d.name + " · " + display_size_text(d.res_w, d.res_h) + " · " + DISPLAY_ROLE_NAMES[d.role];
+	}
+
+	//The video modes the display supports, in pixels, largest first, one per size; [] when nanogui cannot list them
+	modes(index) {
+		result = [];
+		try {
+			listed = nanogui.current_context().monitor_modes(index);
+			for(i = listed.size() - 1; i >= 0; i--) {
+				m = listed[i];
+				if(m.pixel_width >= 640 && m.pixel_height >= 480)
+					result.push_back([w = m.pixel_width, h = m.pixel_height, hz = m.refresh_rate]);
+			}
+		}
+		catch(e) {}
+		return result;
+	}
+
+	// =========================================================================
+	// The project size (Settings > Project > Output size)
+	// =========================================================================
+
+	//"From output displays": the size of the first output display. Called after a change of the displays or of the
+	//switch, after a project was loaded and for a new project. Without an output display the size stays
+	apply_project_size() {
+		src = engine.project_size_source;
+		if(!src || !engine.project_width || !engine.project_height || src.value() != 0)
+			return;
+		size = output_size();
+		if(!size)
+			return;
+		if(engine.project_width.value() == size[0] && engine.project_height.value() == size[1])
+			return;
+		applying = true;
+		try {
+			engine.project_width.value(size[0]);
+			engine.project_height.value(size[1]);
+		}
+		catch(e) {}
+		applying = false;
+	}
+
+	//A project of a VibeVJ before #593 has no "Size from": it keeps its own size, and only one with the size every
+	//project had at the start (1920 x 1080) follows the output displays
+	project_loaded(controls) {
+		src = engine.project_size_source;
+		if(!src)
+			return;
+		has_source = false;
+		try {
+			saved = controls.project_ctrls.subnodes.project_controls.controls;
+			has_source = saved.has("project_ctrls@Target Size Source");
+		}
+		catch(e) {}
+		if(!has_source) {
+			old_default = engine.project_width.value() == 1920 && engine.project_height.value() == 1080;
+			src.value(old_default ? 0 : 1);
+		}
+		apply_project_size();
+	}
+}

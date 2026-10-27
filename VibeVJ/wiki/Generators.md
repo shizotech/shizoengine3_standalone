@@ -3,7 +3,7 @@
 A generator is the building block of VibeVJ. This page explains what a generator is, how you add one, what the buttons in
 its window header do, and how you keep its settings as a preset.
 
-![A generator window. In its header: collapse, link, power, the title, the ⋯ menu, minimize, maximize, close](media/generator-window.png)
+![A generator window. In its header: collapse, power, link, the title, the ⋯ menu, maximize, close](media/generator-window.png)
 
 ## What a generator is
 
@@ -43,17 +43,16 @@ takes back one you dropped in: see [Undo and redo](The-Screen.md#undo-and-redo).
 
 ## The window header
 
-The header runs along the top of the window. From left to right (on the right in the Windows order: minimize, maximize, close):
+The header runs along the top of the window. From left to right; on the right: *More*, maximize, close:
 
 | Button | Tooltip | What it does |
 |---|---|---|
-| Chevron | *Collapse* / *Expand* | Shrinks the window to its header and opens it again at its old size. It points down while the window is open and right while it is collapsed. The same switch as the minimize button. |
-| Link icon | *Always draw links* | Draws the cables of this generator all the time, even when *Cable view* is off: a local cable view. On at the start in a Patchview. Saved with the project. See [Seeing your links](Linking.md#seeing-your-links). |
+| Chevron | *Collapse* / *Expand* | Shrinks the window to its header and opens it again at its old size. It points down while the window is open and right while it is collapsed. Saved with the project. |
 | Power icon | *Generator active* | Switches the generator on and off. The icon is green while it runs. When it is off, the generator stops and its name is dimmed. It is a control: you can link it or map it to MIDI. |
+| Link icon | *Always draw links* | Draws the cables of this generator all the time, even when *Cable view* is off: a local cable view. On at the start in a Patchview. Saved with the project. See [Seeing your links](Linking.md#seeing-your-links). |
 | Name | | The name of the asset |
 | ⋯ | *More* | Opens the menu with the less used actions (below). |
-| Minimize | *Collapse* / *Expand* | Shrinks the window to its header. Press it again to open it. The same switch as the chevron, saved with the project. |
-| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron, *Minimize* and *Close* are hidden, and the zoom of the Patchview is set back and held. |
+| Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron and *Close* are hidden, and the zoom of the Patchview is set back and held. |
 | × | *Close* | Closes the generator. |
 
 > Screenshot to add: the header from left to right, with each button labelled.
@@ -110,7 +109,11 @@ In a Patchview (and in the *Patch* area of the timeline) you can select generato
 3. Hold Ctrl when you let go to drop copies. The originals stay where they are.
 
 - A generator that moves keeps its controls, links and MIDI mappings. Nothing is reloaded.
-- A copy has the settings of its original, but no links to other generators.
+- A copy has the settings of its original. Links between the generators you copy together are copied too: two linked
+  generators give two copies linked the same way. Links to generators you did not copy are not.
+- Ctrl + C copies the selected generators, Ctrl + V pastes them: into the Patchview the mouse was over last, the first
+  one where the mouse was. The copy stays inside VibeVJ, it is not on the clipboard of your system. A paste is one
+  step of [Undo and redo](The-Screen.md#undo-and-redo), and the pasted generators are the selection then.
 - Alt is the key of [*Settings* › *Appearance* › *Move areas with*](Settings.md#move-areas-with).
 - Ctrl + Z takes a move or a copy into an area or another Patchview back: see
   [Undo and redo](The-Screen.md#undo-and-redo). A move inside the same Patchview is not a step.

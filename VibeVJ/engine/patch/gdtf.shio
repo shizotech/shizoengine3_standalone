@@ -1,0 +1,943 @@
+//GDTF fixture files (#669): the General Device Type Format (DIN SPEC 15800) of grandMA3, Vectorworks, Capture and
+//the GDTF Share. A .gdtf file is a zip archive with a description.xml (the fixture, its geometry and its DMX modes),
+//3D models (models/3ds, models/gltf), wheel images and a thumbnail.
+//
+//An import turns every DMX mode into a fixture file of VibeVJ (assets/Fixtures/<Manufacturer>/<Fixture>/<Name> - <Mode>.json,
+//the type of a lamp is named after its file: "Sharpy - Standard"):
+//  - the channels in DMX order: 8-bit and 16-bit channels (24 and 32 bit: 16-bit plus 8-bit channels for the rest), R G B
+//    (W) of one geometry next to each other become an RGB / RGBW channel, repeated pixels one channel with a count
+//    ("batch_count"), unused addresses an 8-bit channel "Unused"
+//  - the function of each channel (patch.shio PATCH_FUNCTIONS) from its GDTF attribute (Pan, Dimmer, ColorAdd_R, ...),
+//    its "default" (0..1) from the channel function it starts in (a shutter open, pan and tilt in the middle), its
+//    "wheel" (a colour or gobo wheel: which slot each range of its values shows)
+//  - the wheels in <fixture>.wheels: the colour of each slot (CIE -> sRGB), the image of a gobo as a mask of
+//    24 x 24 cells (engine/patch/gdtf_zip.shio)
+//  - kind (head / bar / par / dimmer), pan_range, tilt_range, beam_angle and the size of the lamp (length, width in
+//    metres) from the geometry and the models
+//  - "gdtf": where it came from (file, manufacturer, fixture, mode, the models in the archive) and its 3D model: "mesh"
+//    (a .mesh file next to it, engine/patch/gdtf_mesh.shio), "pan_part" / "tilt_part" (the index of the part pan and
+//    tilt turn in it, -1: none)
+//A mode with more than one DMX break (a second start address) gives one file per break.
+//
+//Needs engine/patch/patch.shio included before it (PATCH_ROOT, patch_norm_path, patch_reload_types).
+//No UI and no module here: gdtf_read() reads the archive through engine/patch/gdtf_zip.shio (import zip) in a module
+//of its own, so this file also runs in a plain interpreter (the tests feed description.xml text to gdtf_convert()).
+
+#include "xml"
+#include "gdtf_mesh"
+
+GDTF_ZIP_SCRIPT = __DIR__ + "/gdtf_zip.shio"; //reads the archive (import zip), loaded in a module of its own
+
+// =========================================================================
+// Attributes
+// =========================================================================
+
+//Names of the GDTF colour attributes
+GDTF_COLOR_NAMES = [
+	R = "Red", G = "Green", B = "Blue", W = "White", C = "Cyan", M = "Magenta", Y = "Yellow", RY = "Amber", GY = "Lime",
+	GC = "Green-cyan", BC = "Blue-cyan", BM = "Blue-magenta", RM = "Red-magenta", WW = "Warm white", CW = "Cool white",
+	UV = "UV",
+];
+
+//R, G, B, W of an additive colour attribute ("ColorAdd_R", "ColorRGB_Red"), else ""
+gdtf_rgbw(attr) {
+	a = std.string(attr);
+	if(a.starts("ColorAdd_")) {
+		c = a.substr(9);
+		if(c == "R" || c == "G" || c == "B" || c == "W")
+			return c;
+		return "";
+	}
+	if(a == "ColorRGB_Red")
+		return "R";
+	if(a == "ColorRGB_Green")
+		return "G";
+	if(a == "ColorRGB_Blue")
+		return "B";
+	return "";
+}
+
+//"Shutter1Strobe" -> "Shutter 1 Strobe", "ColorAdd_R" -> "Red", "CTO" stays
+gdtf_attr_label(attr) {
+	a = std.string(attr);
+	for(prefix : ["ColorAdd_", "ColorSub_", "ColorRGB_"]) {
+		if(a.starts(prefix)) {
+			c = a.substr(prefix.length());
+			if(GDTF_COLOR_NAMES.has(c))
+				return GDTF_COLOR_NAMES[c];
+			return c;
+		}
+	}
+	out = "";
+	prev = "";
+	for(ch : a) {
+		lower = ch.lowercase() == ch && ch.uppercase() != ch;
+		upper = ch.uppercase() == ch && ch.lowercase() != ch;
+		digit = "0123456789".contains(ch);
+		prev_lower = prev && prev.lowercase() == prev && prev.uppercase() != prev;
+		prev_digit = prev && "0123456789".contains(prev);
+		if(ch == "_")
+			ch = " ";
+		else if(out && ((upper && (prev_lower || prev_digit)) || (digit && !prev_digit && prev != " ") || ((lower || upper) && prev_digit)))
+			out += " ";
+		out += ch;
+		prev = ch;
+	}
+	return out;
+}
+
+//The function of a channel (PATCH_FUNCTIONS) by its GDTF attribute
+gdtf_function(attr) {
+	a = std.string(attr);
+	if(a == "Pan")
+		return "pan";
+	if(a == "Tilt")
+		return "tilt";
+	//PanRotate / TiltRotate: endless rotation, its value is a speed
+	if(a.ends("Rotate") && (a.starts("Pan") || a.starts("Tilt")))
+		return "speed";
+	if(a.contains("MSpeed") || a.contains("MTime") || a == "PanTiltSpeed" || a.ends("Speed") || a.ends("Time"))
+		return "speed";
+	if(a == "Dimmer" || a == "Intensity")
+		return "dimmer";
+	if(a.starts("ColorAdd_") || a.starts("ColorSub_") || a.starts("ColorRGB_") || a.starts("HSB_") || a.starts("CIE_") ||
+		a.starts("CTO") || a.starts("CTC") || a.starts("CTB") || a.starts("Tint"))
+		return "color";
+	if(a.starts("Color") || a.starts("ColorMacro"))
+		return "colorwheel";
+	if(a.starts("Shutter") || a.starts("Strobe"))
+		return "strobe";
+	if(a.starts("Gobo") || a.starts("Prism") || a.starts("Effects") || a.starts("Anim") || a.starts("Video"))
+		return "gobo";
+	if(a.starts("Focus") || a.starts("Zoom") || a.starts("Iris") || a.starts("Frost") || a.starts("Blade") ||
+		a.starts("Shaper") || a.starts("BeamShaper") || a.starts("Beam"))
+		return "beam";
+	if(a.starts("Control") || a.starts("Reset") || a.starts("Function") || a.contains("Mode") || a.starts("Fan") ||
+		a.starts("Lamp") || a.starts("Display") || a.starts("Maintenance") || a.starts("DimmerCurve") || a == "NoFeature" ||
+		a.starts("Fixture") || a.starts("Dummy"))
+		return "control";
+	return "other";
+}
+
+// =========================================================================
+// Geometry
+// =========================================================================
+
+//Elements of <Geometries> that are no geometry
+GDTF_NOT_GEOMETRY = ["Break", "Fixture Name"];
+
+//Every geometry by its name (a name is unique in a GDTF file)
+gdtf_geometry_index(node, &index) {
+	for(c : node.children) {
+		if(GDTF_NOT_GEOMETRY.has_value(c.tag) || !c.attrs.has("Name"))
+			continue;
+		if(!index.has(c.attrs.Name))
+			index[c.attrs.Name] = c;
+		gdtf_geometry_index(c, index);
+	}
+}
+
+//The names of a geometry and every geometry below it
+gdtf_geometry_names(node, &names) {
+	if(node.attrs.has("Name"))
+		names.push_back(node.attrs.Name);
+	for(c : node.children) {
+		if(!GDTF_NOT_GEOMETRY.has_value(c.tag))
+			gdtf_geometry_names(c, names);
+	}
+}
+
+def gdtf_add_instance(ch, geometry, breaks, &out);
+def gdtf_channel_default(ch);
+def gdtf_axis_part(instances, attr);
+def gdtf_channel_wheel(ch);
+def gdtf_dmx_value(text);
+
+//The DMX channels of a mode on the geometry tree of the mode, as the GDTF says (DIN SPEC 15800, DMXChannel): a
+//channel of a geometry once; a channel of a geometry a GeometryReference points at once per reference, its offset
+//moved by the DMXOffset of the Break of the reference (an "Overwrite" channel takes the last Break).
+//  [dmx_break, offsets (absolute, coarse first), attribute, geometry (name of the instance), node (the DMXChannel)]
+gdtf_mode_instances(node, by_geometry, index, &out) {
+	if(node.tag == "GeometryReference") {
+		template = index.has(xml_attr(node, "Geometry")) ? index[xml_attr(node, "Geometry")] : None;
+		if(!template)
+			return;
+		names = [];
+		gdtf_geometry_names(template, names);
+		breaks = xml_children(node, "Break");
+		for(name : names) {
+			if(!by_geometry.has(name))
+				continue;
+			for(ch : by_geometry[name])
+				gdtf_add_instance(ch, xml_attr(node, "Name"), breaks, out);
+		}
+		return;
+	}
+	name = xml_attr(node, "Name");
+	if(name && by_geometry.has(name)) {
+		for(ch : by_geometry[name])
+			gdtf_add_instance(ch, name, None, out);
+	}
+	for(c : node.children) {
+		if(!GDTF_NOT_GEOMETRY.has_value(c.tag))
+			gdtf_mode_instances(c, by_geometry, index, out);
+	}
+}
+
+gdtf_add_instance(ch, geometry, breaks, &out) {
+	offset_text = std.string(xml_attr(ch, "Offset", "None")).trim();
+	if(!offset_text || offset_text == "None")
+		return; //a virtual channel: no DMX
+	offsets = [];
+	for(part : offset_text.split(",")) {
+		v = std.int(part.trim());
+		if(v > 0)
+			offsets.push_back(v);
+	}
+	if(!offsets.size())
+		return;
+	brk_text = std.string(xml_attr(ch, "DMXBreak", "1"));
+	brk = 1;
+	shift = 0;
+	if(brk_text == "Overwrite") {
+		if(breaks && breaks.size()) {
+			brk = std.int(xml_attr(breaks[-1], "DMXBreak", "1"));
+			shift = std.int(xml_attr(breaks[-1], "DMXOffset", "1")) - 1;
+		}
+	}
+	else {
+		brk = math.max(1, std.int(brk_text));
+		if(breaks) {
+			for(b : breaks) {
+				if(std.int(xml_attr(b, "DMXBreak", "1")) == brk) {
+					shift = std.int(xml_attr(b, "DMXOffset", "1")) - 1;
+					break;
+				}
+			}
+		}
+	}
+	for(i = 0; i < offsets.size(); i++)
+		offsets[i] = offsets[i] + shift;
+	logical = xml_child(ch, "LogicalChannel");
+	attr = xml_attr(logical, "Attribute", "");
+	if(!attr) {
+		//GDTF 1.0: the attribute is in the first channel function
+		attr = xml_attr(xml_child(logical, "ChannelFunction"), "Attribute", "Dummy");
+	}
+	out.push_back([dmx_break = brk, offsets = offsets, attribute = attr, geometry = geometry, node = ch,
+		default = gdtf_channel_default(ch), wheel = gdtf_channel_wheel(ch)]);
+}
+
+//A channel function that picks a slot of a colour wheel ("Color1", "Color2WheelIndex", ...) or a gobo wheel ("Gobo1",
+//"Gobo2PosRotate", ...); others name a wheel too (a prism, a shutter of some files) but show no colour or gobo
+gdtf_wheel_attribute(attr) {
+	a = std.string(attr);
+	if(a.starts("Gobo"))
+		return true;
+	return a.starts("Color") && a.length() > 5 && "0123456789".contains(a.substr(5, 1));
+}
+
+//Which slot of a wheel a channel shows where (a colour wheel, a gobo wheel): [name (of the wheel), ranges = [[from
+//(0..1), slot (1 = the first slot, 0 = none: spinning, open, ...)], ...] by from]; None when it has no wheel
+gdtf_channel_wheel(ch) {
+	name = "";
+	ranges = [];
+	for(lc : xml_children(ch, "LogicalChannel")) {
+		for(cf : xml_children(lc, "ChannelFunction")) {
+			wheel = xml_attr(cf, "Wheel", "");
+			if(!wheel || (name && wheel != name) || !gdtf_wheel_attribute(xml_attr(cf, "Attribute", "")))
+				continue;
+			name = wheel;
+			sets = xml_children(cf, "ChannelSet");
+			if(!sets.size())
+				ranges.push_back([gdtf_dmx_value(xml_attr(cf, "DMXFrom", "0/1")), 0]);
+			for(cs : sets)
+				ranges.push_back([gdtf_dmx_value(xml_attr(cs, "DMXFrom", "0/1")), std.int(xml_attr(cs, "WheelSlotIndex", "0"))]);
+		}
+	}
+	if(!name)
+		return None;
+	//by where they start
+	sorted = [];
+	for(r : ranges) {
+		j = sorted.size();
+		for(j > 0 && sorted[j - 1][0] > r[0])
+			j--;
+		sorted.insert(j, r);
+	}
+	return [name = name, ranges = sorted];
+}
+
+//A colour of GDTF ("x,y,Y": CIE 1931) as [r, g, b] 0..1 (sRGB, the brightest part 1: the colour of a filter, not how
+//much light it lets through)
+gdtf_cie_rgb(text) {
+	parts = std.string(text).split(",");
+	if(parts.size() < 2)
+		return [1.0, 1.0, 1.0];
+	x = std.float(parts[0]);
+	y = std.float(parts[1]);
+	if(y <= 0.0001)
+		return [1.0, 1.0, 1.0];
+	X = x / y;
+	Z = (1.0 - x - y) / y;
+	lin = [3.2406 * X - 1.5372 - 0.4986 * Z, -0.9689 * X + 1.8758 + 0.0415 * Z, 0.0557 * X - 0.2040 + 1.0570 * Z];
+	top = 0.0;
+	for(c : lin)
+		top = math.max(top, c);
+	out = [];
+	for(c : lin) {
+		v = math.clamp(top > 0.0 ? c / top : 1.0, 0.0, 1.0);
+		v = v <= 0.0031308 ? 12.92 * v : 1.055 * math.pow(v, 1.0 / 2.4) - 0.055;
+		out.push_back(math.round(math.clamp(v, 0.0, 1.0) * 1000.0) / 1000.0);
+	}
+	return out;
+}
+
+//The wheels of the file: [[name, slots = [[name, color [r, g, b], media (the image in the archive, "")]]]]; slot n of
+//a channel's ranges is slots[n - 1]
+gdtf_wheels(ft, archive_names) {
+	list = [];
+	for(w : xml_children(xml_child(ft, "Wheels"), "Wheel")) {
+		slots = [];
+		for(sl : xml_children(w, "Slot")) {
+			media = "";
+			want = std.string(xml_attr(sl, "MediaFileName", "")).lowercase();
+			if(want) {
+				for(n : archive_names) {
+					ln = std.string(n).lowercase();
+					if(ln.starts("wheels/") && fileio.pure_name(n).lowercase() == want)
+						media = n;
+				}
+			}
+			slots.push_back([name = xml_attr(sl, "Name", ""), color = gdtf_cie_rgb(xml_attr(sl, "Color", "")), media = media]);
+		}
+		list.push_back([name = xml_attr(w, "Name", ""), slots = slots]);
+	}
+	return list;
+}
+
+//A DMX value of GDTF ("32768/2": the value and its bytes) as 0..1; 0 for "None" or something else
+gdtf_dmx_value(text) {
+	parts = std.string(text).split("/");
+	if(parts.size() != 2)
+		return 0.0;
+	bytes = math.clamp(std.int(parts[1].trim()), 1, 4);
+	full = 1.0;
+	for(i = 0; i < bytes; i++)
+		full *= 256.0;
+	return math.clamp(std.float(parts[0].trim()) / (full - 1.0), 0.0, 1.0);
+}
+
+//The value a channel has when nothing else sets it (0..1): the Default of the channel function it starts in
+//(InitialFunction: "<geometry>_<attribute>.<logical channel>.<channel function>"), else of its first one (GDTF 1.0: the
+//Default of the DMXChannel)
+gdtf_channel_default(ch) {
+	init = std.string(xml_attr(ch, "InitialFunction", ""));
+	want = "";
+	if(init) {
+		parts = init.split(".");
+		want = parts[parts.size() - 1];
+	}
+	first = None;
+	for(lc : xml_children(ch, "LogicalChannel")) {
+		for(cf : xml_children(lc, "ChannelFunction")) {
+			if(!cf.attrs.has("Default"))
+				continue;
+			if(!first)
+				first = cf;
+			if(want && xml_attr(cf, "Name") == want)
+				return gdtf_dmx_value(cf.attrs.Default);
+		}
+	}
+	if(ch.attrs.has("Default"))
+		return gdtf_dmx_value(ch.attrs.Default);
+	return first ? gdtf_dmx_value(first.attrs.Default) : 0.0;
+}
+
+//Degrees a head turns over the whole range of its Pan / Tilt channel (PhysicalTo - PhysicalFrom of the channel
+//function of that attribute), 0 when the file does not say (or leaves the default 0 .. 1 of a value without a unit)
+gdtf_range(instances, attr) {
+	best = 0.0;
+	for(inst : instances) {
+		if(inst.attribute != attr)
+			continue;
+		//the widest of its functions of that attribute (a channel can have more, some without a range)
+		for(lc : xml_children(inst.node, "LogicalChannel")) {
+			for(cf : xml_children(lc, "ChannelFunction")) {
+				if(xml_attr(cf, "Attribute") != attr)
+					continue;
+				from = std.float(xml_attr(cf, "PhysicalFrom", "0"));
+				to = std.float(xml_attr(cf, "PhysicalTo", "0"));
+				best = math.max(best, math.abs(to - from));
+			}
+		}
+		break;
+	}
+	return best >= 10.0 ? best : 0.0;
+}
+
+//The first Beam geometry of a mode (references followed)
+gdtf_first_beam(node, index, depth = 0) {
+	if(!node || depth > 32)
+		return None;
+	if(node.tag == "Beam")
+		return node;
+	if(node.tag == "GeometryReference") {
+		name = xml_attr(node, "Geometry");
+		return index.has(name) ? gdtf_first_beam(index[name], index, depth + 1) : None;
+	}
+	for(c : node.children) {
+		b = gdtf_first_beam(c, index, depth + 1);
+		if(b)
+			return b;
+	}
+	return None;
+}
+
+// =========================================================================
+// One DMX mode -> the channels of a fixture file
+// =========================================================================
+
+GDTF_FINE_NAMES = ["", "fine", "ultra", "uber"];
+
+//The channels of one DMX break: what is on each address, from 1 to the last one used. Each entry:
+//  [name, type (8-bit / 16-bit), function, attribute, geometry, rgbw (R/G/B/W or ""), fine, default (0..1; the fine and
+//   ultra bytes of a channel split up: 0)]
+gdtf_break_channels(instances) {
+	at = std.json(); //address -> [instance, byte]
+	last = 0;
+	for(inst : instances) {
+		for(b = 0; b < inst.offsets.size(); b++) {
+			key = std.string(inst.offsets[b]);
+			if(!at.has(key))
+				at[key] = [inst = inst, byte = b];
+			last = math.max(last, inst.offsets[b]);
+		}
+	}
+	list = [];
+	addr = 1;
+	for(addr <= last) {
+		key = std.string(addr);
+		if(!at.has(key)) {
+			list.push_back([name = "Unused", type = "8-bit", function = "other", attribute = "", geometry = "", rgbw = "", fine = "",
+				default = 0.0, wheel = None]);
+			addr++;
+			continue;
+		}
+		e = at[key];
+		inst = e.inst;
+		func = gdtf_function(inst.attribute);
+		if(e.byte == 0 && inst.offsets.size() >= 2 && inst.offsets[1] == addr + 1) {
+			list.push_back([name = "", type = "16-bit", function = func, attribute = inst.attribute, geometry = inst.geometry, rgbw = "",
+				fine = "", default = inst.default, wheel = inst.wheel]);
+			addr += 2;
+			continue;
+		}
+		fine = e.byte > 0 ? GDTF_FINE_NAMES[math.min(e.byte, 3)] : "";
+		list.push_back([name = "", type = "8-bit", function = func, attribute = inst.attribute, geometry = inst.geometry,
+			rgbw = e.byte == 0 && inst.offsets.size() == 1 ? gdtf_rgbw(inst.attribute) : "", fine = fine,
+			default = e.byte == 0 ? inst.default : 0.0, wheel = e.byte == 0 ? inst.wheel : None]);
+		addr++;
+	}
+	return list;
+}
+
+//R G B (W) of one geometry next to each other: one RGB / RGBW channel
+gdtf_group_colors(list) {
+	out = [];
+	i = 0;
+	for(i < list.size()) {
+		c = list[i];
+		if(c.rgbw == "R" && i + 2 < list.size() && list[i + 1].rgbw == "G" && list[i + 2].rgbw == "B" &&
+			list[i + 1].geometry == c.geometry && list[i + 2].geometry == c.geometry) {
+			w = i + 3 < list.size() && list[i + 3].rgbw == "W" && list[i + 3].geometry == c.geometry;
+			defaults = [c.default, list[i + 1].default, list[i + 2].default];
+			if(w)
+				defaults.push_back(list[i + 3].default);
+			out.push_back([name = "", type = w ? "RGBW" : "RGB", function = "color", attribute = w ? "RGBW" : "RGB", geometry = c.geometry,
+				rgbw = "", fine = "", default = defaults, wheel = None]);
+			i += w ? 4 : 3;
+			continue;
+		}
+		out.push_back(c);
+		i++;
+	}
+	return out;
+}
+
+//"Pixel 12" -> "Pixel", "Zone1pixel 3" -> "Zone1pixel" (what repeated geometries have in common)
+gdtf_base_name(name) {
+	n = std.string(name).trim();
+	end = n.length();
+	for(end > 0 && "0123456789".contains(n.substr(end - 1, 1)))
+		end--;
+	return n.substr(0, end).trim();
+}
+
+//Names for the channels: the attribute ("Pan", "Red", "Shutter 1"), the geometry in front when two channels have the
+//same attribute ("Zone 1 Red", "Zone 2 Red"), "fine" / "ultra" after a byte of a wider channel that is not next to it;
+//no "/" or "@" (a control of Devices > Fixtures cannot have them)
+gdtf_name_channels(list) {
+	counts = std.json();
+	for(c : list) {
+		if(!c.attribute)
+			continue;
+		key = c.attribute + "|" + c.fine;
+		counts[key] = (counts.has(key) ? counts[key] : 0) + 1;
+	}
+	for(c : list) {
+		if(!c.attribute) {
+			c.name = "Unused";
+			continue;
+		}
+		label = c.type == "RGB" || c.type == "RGBW" ? c.type : gdtf_attr_label(c.attribute);
+		if(counts[c.attribute + "|" + c.fine] > 1 && c.geometry)
+			label = c.type == "RGB" || c.type == "RGBW" ? c.geometry : c.geometry + " " + label;
+		if(c.fine)
+			label += " " + c.fine;
+		//"/" and "@" may not be in the name of a control (Devices > Fixtures makes one per channel); custom attributes
+		//have them ("Pattern Step / Speed")
+		c.name = label.replace("/", "-").replace("@", "-").compress_whitespace();
+	}
+	//still the same name twice (the same attribute twice on one geometry): a number after it
+	seen = std.json();
+	for(c : list) {
+		if(!seen.has(c.name)) {
+			seen[c.name] = 1;
+			continue;
+		}
+		seen[c.name] = seen[c.name] + 1;
+		c.name = c.name + " " + seen[c.name];
+	}
+	return list;
+}
+
+//Repeated channels next to each other (the pixels of a bar: the same type and attribute on "Pixel 1", "Pixel 2", ...)
+//become one channel with a count, named by what their geometries have in common
+gdtf_batch_channels(list) {
+	out = [];
+	i = 0;
+	for(i < list.size()) {
+		c = list[i];
+		base = gdtf_base_name(c.geometry);
+		n = 1;
+		if(c.attribute && base && base != c.geometry) {
+			for(i + n < list.size()) {
+				d = list[i + n];
+				if(d.type != c.type || d.attribute != c.attribute || d.fine != c.fine || gdtf_base_name(d.geometry) != base ||
+					d.geometry == c.geometry)
+					break;
+				n++;
+			}
+		}
+		if(n > 1) {
+			name = c.type == "RGB" || c.type == "RGBW" ? base : base + " " + gdtf_attr_label(c.attribute);
+			out.push_back([name = name, type = c.type, function = c.function, attribute = c.attribute, geometry = base, rgbw = "",
+				fine = c.fine, count = n, default = c.default, wheel = c.wheel]);
+			i += n;
+			continue;
+		}
+		c.count = 1;
+		out.push_back(c);
+		i++;
+	}
+	return out;
+}
+
+//The channel list of a fixture file (as the fixture editor writes it)
+gdtf_file_channels(list) {
+	type_ids = ["8-bit", "16-bit", "RGB", "RGBW"];
+	chans = [];
+	for(c : list) {
+		chan = [name = c.name, type = c.type, type_id = patch_index_of(type_ids, c.type), batch_count = c.count,
+			byte_count = patch_kind_bytes(c.type), function = c.function];
+		//"default": 0..1 (RGB / RGBW: one per colour), only when it is not 0
+		if(std.is_list(c.default)) {
+			any = false;
+			for(d : c.default) {
+				if(d > 0.0)
+					any = true;
+			}
+			if(any) {
+				chan.default = [];
+				for(d : c.default)
+					chan.default.push_back(math.round(d * 100000.0) / 100000.0);
+			}
+		}
+		else if(c.default > 0.0)
+			chan.default = math.round(c.default * 100000.0) / 100000.0;
+		//the slots of its wheel by its value (the wheels are in the .wheels file next to it)
+		if(c.wheel) {
+			ranges = [];
+			for(r : c.wheel.ranges)
+				ranges.push_back([math.round(r[0] * 100000.0) / 100000.0, r[1]]);
+			chan.wheel = [name = c.wheel.name, ranges = ranges];
+		}
+		chans.push_back(chan);
+	}
+	return chans;
+}
+
+// =========================================================================
+// The whole file
+// =========================================================================
+
+//A name that can be a file name
+gdtf_file_name(name) {
+	n = std.string(name).trim();
+	for(ch : ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"])
+		n = n.replace(ch, "-");
+	for(n.ends("."))
+		n = n.substr(0, n.length() - 1);
+	n = n.trim();
+	return n ? n : "Default";
+}
+
+//The fixture files of a description.xml (its text): [name, manufacturer, fixture_type_id, files = [[mode, dmx_break,
+//file (name of the JSON file, without folder: "<Name> - <Mode>.json"), data (the JSON of the fixture file), channels (footprint)], ...],
+//problems = [text, ...]]. models: [[name, file, length, width, height]] of the <Models>; archive_names (the entries of
+//the archive, or []) turn a model's File into its path in the archive.
+gdtf_convert(xml_text, archive_names = []) {
+	root = xml_parse(xml_text);
+	gdtf = xml_child(root, "GDTF");
+	ft = xml_child(gdtf, "FixtureType");
+	result = [name = "", manufacturer = "", fixture_type_id = "", files = [], problems = [], geometries = std.json(),
+		model_by_name = std.json(), wheels = []];
+	if(!ft) {
+		result.problems.push_back("No <GDTF><FixtureType> in description.xml: not a GDTF file.");
+		return result;
+	}
+	result.name = xml_attr(ft, "LongName") ? xml_attr(ft, "LongName") : xml_attr(ft, "Name");
+	if(!result.name)
+		result.name = "Fixture";
+	//the start of the file names: the short name ("JDC 1"), the type of a lamp is named after its file
+	file_prefix = xml_attr(ft, "Name") ? xml_attr(ft, "Name") : (xml_attr(ft, "ShortName") ? xml_attr(ft, "ShortName") : result.name);
+	result.manufacturer = xml_attr(ft, "Manufacturer", "");
+	result.fixture_type_id = xml_attr(ft, "FixtureTypeID", "");
+
+	geometries = xml_child(ft, "Geometries");
+	index = std.json();
+	if(geometries)
+		gdtf_geometry_index(geometries, index);
+
+	//the models, by name (sizes in metres, the file of the mesh in the archive)
+	models = [];
+	model_by_name = std.json();
+	for(m : xml_children(xml_child(ft, "Models"), "Model")) {
+		file = xml_attr(m, "File", "");
+		path = "";
+		if(file) {
+			for(n : archive_names) {
+				ln = std.string(n).lowercase();
+				if(ln.starts("models/") && fileio.pure_name(n).lowercase() == file.lowercase() &&
+					(ln.ends(".glb") || ln.ends(".3ds") || ln.ends(".gltf") || ln.ends(".obj"))) {
+					path = n;
+					if(ln.ends(".glb"))
+						break; //glTF is the newer and simpler format: prefer it
+				}
+			}
+		}
+		entry = [name = xml_attr(m, "Name"), file = path, primitive = xml_attr(m, "PrimitiveType", ""),
+			length = std.float(xml_attr(m, "Length", "0")), width = std.float(xml_attr(m, "Width", "0")),
+			height = std.float(xml_attr(m, "Height", "0"))];
+		models.push_back(entry);
+		model_by_name[entry.name] = entry;
+	}
+
+	modes = xml_children(xml_child(ft, "DMXModes"), "DMXMode");
+	if(!modes.size())
+		result.problems.push_back("The file has no DMX modes.");
+	mode_names = std.json();
+	for(mode : modes) {
+		mode_name = std.string(xml_attr(mode, "Name", "Default")).trim();
+		if(!mode_name)
+			mode_name = "Default";
+		mode_root = index.has(xml_attr(mode, "Geometry")) ? index[xml_attr(mode, "Geometry")] : None;
+		if(!mode_root && geometries) {
+			tops = [];
+			for(c : geometries.children) {
+				if(!GDTF_NOT_GEOMETRY.has_value(c.tag))
+					tops.push_back(c);
+			}
+			if(tops.size() == 1)
+				mode_root = tops[0];
+		}
+		if(!mode_root) {
+			result.problems.push_back("Mode '" + mode_name + "': its geometry '" + xml_attr(mode, "Geometry") + "' is not in the file.");
+			continue;
+		}
+		by_geometry = std.json();
+		for(ch : xml_children(xml_child(mode, "DMXChannels"), "DMXChannel")) {
+			g = xml_attr(ch, "Geometry", "");
+			if(!by_geometry.has(g))
+				by_geometry[g] = [];
+			by_geometry[g].push_back(ch);
+		}
+		instances = [];
+		gdtf_mode_instances(mode_root, by_geometry, index, instances);
+
+		//one file per DMX break
+		breaks = [];
+		for(inst : instances) {
+			if(breaks.has_value(inst.dmx_break))
+				continue;
+			j = breaks.size();
+			for(j > 0 && breaks[j - 1] > inst.dmx_break)
+				j--;
+			breaks.insert(j, inst.dmx_break);
+		}
+		if(!breaks.size()) {
+			result.problems.push_back("Mode '" + mode_name + "' has no DMX channels.");
+			continue;
+		}
+
+		//what the lamp is and how big: the same for every break of the mode
+		pan = gdtf_range(instances, "Pan");
+		tilt = gdtf_range(instances, "Tilt");
+		beam = gdtf_first_beam(mode_root, index);
+		beam_angle = beam ? std.float(xml_attr(beam, "BeamAngle", "0")) : 0.0;
+		root_model = model_by_name.has(xml_attr(mode_root, "Model")) ? model_by_name[xml_attr(mode_root, "Model")] : None;
+
+		for(brk : breaks) {
+			part = [];
+			for(inst : instances) {
+				if(inst.dmx_break == brk)
+					part.push_back(inst);
+			}
+			list = gdtf_break_channels(part);
+			list = gdtf_group_colors(list);
+			list = gdtf_name_channels(list);
+			list = gdtf_batch_channels(list);
+			chans = gdtf_file_channels(list);
+
+			footprint = 0;
+			moving = false;
+			color_geometries = [];
+			for(c : list) {
+				footprint += patch_kind_bytes(c.type) * c.count;
+				if(c.function == "pan" || c.function == "tilt")
+					moving = true;
+				if(c.function == "color") {
+					for(k = 0; k < c.count; k++) {
+						g = c.count > 1 ? c.geometry + " " + k : c.geometry;
+						if(!color_geometries.has_value(g))
+							color_geometries.push_back(g);
+					}
+				}
+			}
+			kind = moving ? "head" : (color_geometries.size() >= 2 ? "bar" : (color_geometries.size() == 1 ? "par" : "dimmer"));
+
+			data = [type = "fixture", channels = chans, kind = kind];
+			if(moving && pan > 0.0)
+				data.pan_range = pan;
+			if(moving && tilt > 0.0)
+				data.tilt_range = tilt;
+			if(beam_angle > 0.0)
+				data.beam_angle = beam_angle;
+			if(root_model) {
+				long = math.max(root_model.length, root_model.width);
+				short = math.min(root_model.length, root_model.width);
+				if(long >= 0.05)
+					data.length = long;
+				if(short >= 0.02)
+					data.width = short;
+			}
+			data.gdtf = [manufacturer = result.manufacturer, fixture = result.name, mode = mode_name, dmx_break = brk,
+				fixture_type_id = result.fixture_type_id, file = "", models = models, root = xml_attr(mode_root, "Name"),
+				pan_part = gdtf_axis_part(instances, "Pan"), tilt_part = gdtf_axis_part(instances, "Tilt")];
+
+			file = gdtf_file_name(file_prefix + " - " + mode_name);
+			if(breaks.size() > 1)
+				file += " (break " + brk + ")";
+			//two modes with the same name: a number after the second
+			low = file.lowercase();
+			if(mode_names.has(low)) {
+				mode_names[low] = mode_names[low] + 1;
+				file += " " + mode_names[low];
+			}
+			else
+				mode_names[low] = 1;
+			result.files.push_back([mode = mode_name, dmx_break = brk, file = file + ".json", data = data, channels = footprint]);
+		}
+	}
+	result.wheels = gdtf_wheels(ft, archive_names); //for the .wheels file (gdtf_import)
+	result.geometries = index; //for the 3D models (gdtf_import)
+	result.model_by_name = model_by_name;
+	return result;
+}
+
+//The geometry a Pan / Tilt channel turns (the part of the 3D model that turns with it), "" without one
+gdtf_axis_part(instances, attr) {
+	for(inst : instances) {
+		if(inst.attribute == attr)
+			return inst.geometry;
+	}
+	return "";
+}
+
+// =========================================================================
+// Import: archive -> fixture files
+// =========================================================================
+
+//The entries of the archive, its description.xml, its 3D models and its wheel images as masks: [names, xml, files,
+//gobos, error]. tmp: a file the images are written to for bitmap.load. Through engine/patch/gdtf_zip.shio in a
+//module of its own (it imports zip): without the zip package the setup still loads, only the import says why it fails.
+gdtf_read(path, tmp = "") {
+	res = [names = [], xml = "", files = std.json(), gobos = std.json(), error = ""];
+	mod = std.module();
+	try {
+		mod.load_file(GDTF_ZIP_SCRIPT);
+	}
+	catch(e) {
+		res.error = "The GDTF import needs the zip package (shizotech/packages/zip): " + e;
+		std.free(mod);
+		return res;
+	}
+	if(!mod.has("gdtf_zip_read")) {
+		res.error = "The GDTF import needs the zip package (shizotech/packages/zip), it could not be loaded.";
+		std.free(mod);
+		return res;
+	}
+	try {
+		r = mod.call("gdtf_zip_read", path, tmp);
+		res.names = r.names;
+		res.xml = r.xml;
+		res.files = r.files;
+		res.gobos = r.gobos;
+		res.error = r.error;
+	}
+	catch(e) {
+		res.error = "Cannot read " + path + ": " + e;
+	}
+	std.free(mod);
+	return res;
+}
+
+//Is the path inside the folder (both relative to the app, with "/")?
+gdtf_inside(path, folder) {
+	p = patch_norm_path(path).lowercase();
+	f = patch_norm_path(folder).lowercase();
+	if(!f.ends("/"))
+		f += "/";
+	return p.starts(f);
+}
+
+//Imports a .gdtf file: writes a fixture file per DMX mode into <fixtures>/<Manufacturer>/<Fixture>/ and keeps the
+//.gdtf there too (a .gdtf that is already in the fixture folder stays where it is). Files of an earlier import of the
+//same fixture are written again. fixtures: the folder of the fixture types, relative to PATCH_ROOT.
+//  [ok, error, name, manufacturer, folder, gdtf (where the .gdtf is now), types = [[path, mode, channels], ...],
+//   problems = [...]]
+gdtf_import(path, fixtures = "assets/Fixtures") {
+	out = [ok = false, error = "", name = "", manufacturer = "", folder = "", gdtf = "", types = [], problems = []];
+	src = patch_norm_path(path);
+	full = fileio.exists(PATCH_ROOT + src) ? PATCH_ROOT + src : src;
+	if(!fileio.exists(full) || !fileio.is_file(full)) {
+		out.error = "No file " + path + ".";
+		return out;
+	}
+	archive = gdtf_read(full, PATCH_ROOT + patch_norm_path(fixtures) + "/.gdtf_wheel.tmp");
+	if(archive.error) {
+		out.error = archive.error;
+		return out;
+	}
+	conv = gdtf_convert(archive.xml, archive.names);
+	out.name = conv.name;
+	out.manufacturer = conv.manufacturer;
+	out.problems = conv.problems;
+	if(!conv.files.size()) {
+		out.error = conv.problems.size() ? conv.problems[0] : "Nothing to import in " + path + ".";
+		return out;
+	}
+	maker = gdtf_file_name(conv.manufacturer ? conv.manufacturer : "GDTF");
+	folder = patch_norm_path(fixtures) + "/" + maker + "/" + gdtf_file_name(conv.name);
+	fileio.mkdir(PATCH_ROOT + folder);
+	out.folder = folder;
+
+	//the .gdtf next to its modes (the 3D models are in it), unless it is in the fixture folder already
+	rel = patch_norm_path(fileio.relative_path_cwd(full));
+	base = patch_norm_path(PATCH_ROOT);
+	in_app = rel.lowercase().starts(base.lowercase()) ? rel.substr(base.length()) : ""; //relative to PATCH_ROOT
+	gdtf_path = "";
+	if(in_app && gdtf_inside(in_app, fixtures))
+		gdtf_path = in_app;
+	else {
+		gdtf_path = folder + "/" + gdtf_file_name(fileio.pure_name(full)) + ".gdtf";
+		fileio.copy(full, PATCH_ROOT + gdtf_path);
+	}
+	out.gdtf = gdtf_path;
+
+	//the 3D models: one .mesh per geometry tree the modes use (trees that only differ in their names once: the JDC1 has
+	//a tree per mode). The fixture files name the parts pan and tilt turn by their index.
+	meshes = std.json(); //root -> [file, parts (names, in the order of the model)]
+	written = []; //[text, file]
+	cache = std.json();
+	for(f : conv.files) {
+		root_name = f.data.gdtf.root;
+		if(meshes.has(root_name) || !conv.geometries.has(root_name))
+			continue;
+		meshes[root_name] = [file = "", parts = []];
+		model = None;
+		try {
+			model = gdtf_build_model(conv.geometries[root_name], conv.model_by_name, archive.files, cache);
+		}
+		catch(e) {
+			out.problems.push_back("The 3D model of " + root_name + " could not be read: " + e);
+			model = None;
+		}
+		if(!model)
+			continue;
+		names = [];
+		for(part : model.parts) {
+			names.push_back(part.name);
+			part.name = "";
+		}
+		meshes[root_name].parts = names;
+		text = std.string(model);
+		for(w : written) {
+			if(w.text == text)
+				meshes[root_name].file = w.file;
+		}
+		if(meshes[root_name].file)
+			continue;
+		for(i = 0; i < names.size(); i++)
+			model.parts[i].name = names[i];
+		mesh_file = gdtf_file_name(conv.name) + (written.size() ? " " + (written.size() + 1) : "") + ".mesh";
+		fileio.write_json(PATCH_ROOT + folder + "/" + mesh_file, model);
+		written.push_back([text = text, file = mesh_file]);
+		meshes[root_name].file = mesh_file;
+	}
+
+	//the wheels: their slots with the colour of each and the gobo of its image as a mask (engine/patch/gdtf_zip.shio)
+	wheels_file = "";
+	if(conv.wheels.size()) {
+		wheels = [];
+		for(w : conv.wheels) {
+			slots = [];
+			for(sl : w.slots) {
+				gobo = sl.media && archive.gobos.has(sl.media) ? archive.gobos[sl.media] : "";
+				slots.push_back([name = sl.name, color = sl.color, gobo = gobo]);
+			}
+			wheels.push_back([name = w.name, slots = slots]);
+		}
+		wheels_file = gdtf_file_name(conv.name) + ".wheels";
+		fileio.write_json(PATCH_ROOT + folder + "/" + wheels_file, [version = 1, size = 24, wheels = wheels]);
+	}
+
+	for(f : conv.files) {
+		f.data.gdtf.file = gdtf_path;
+		f.data.gdtf.wheels = wheels_file;
+		m = meshes.has(f.data.gdtf.root) ? meshes[f.data.gdtf.root] : [file = "", parts = []];
+		f.data.gdtf.mesh = m.file;
+		f.data.gdtf.pan_part = patch_index_of(m.parts, f.data.gdtf.pan_part);
+		f.data.gdtf.tilt_part = patch_index_of(m.parts, f.data.gdtf.tilt_part);
+		type_path = folder + "/" + f.file;
+		fileio.write_json(PATCH_ROOT + type_path, f.data);
+		out.types.push_back([path = type_path, mode = f.mode, channels = f.channels, dmx_break = f.dmx_break]);
+	}
+	//the types read now (a re-import changed them), not by the next draw that needs one (a file read suspends a draw)
+	patch_reload_types();
+	for(t : out.types)
+		patch_type(t.path);
+	out.ok = true;
+	return out;
+}

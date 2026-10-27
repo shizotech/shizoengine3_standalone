@@ -61,7 +61,7 @@ menu. A view without it still shows up, with a plain square icon.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | folder name without `.asset` | Name on the tile, in the header of an area and in the menu |
-| `icon` | `square` | A name for `nanogui.icon()` (see `shzmodule_nanogui/context_nano.cpp`) |
+| `icon` | `square` | A name for `nanogui.icon()` (see `modules/shzmodule_nanogui/context_nano.cpp`) |
 | `order` | 100 | Position among the tiles and in the menu, lowest first |
 | `toolbar` | `true` | `false`: not offered in an empty area, not under *Replace view with* and not listed in the *Assets* tab (the two splits) |
 | `description` | empty | Purpose on the tile (two short lines) and second line of its tooltip |

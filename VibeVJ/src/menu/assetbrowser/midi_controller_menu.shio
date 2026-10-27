@@ -5,8 +5,9 @@
 //MIDI like a plugged in controller) and a window with knobs, faders, buttons and pads that play it with the mouse.
 //MIDI learn works against it with no hardware; a real controller is mapped by the same learn later.
 //- The layout is saved with the project (virtual_controller.json); a new project starts with midi_layout_default().
-//- Edit: move and size elements, add, delete, properties (label, channel, CC / note, mode, rows / cols). Not in show
-//  mode: there the controller is played, not changed.
+//- Edit: move and size elements, add, delete, properties (label, channel, CC / note, mode, rows / cols, the range of
+//  the value, the encoding of an endless knob, feedback, colour). Not in show mode: there the controller is played, not
+//  changed.
 //- AI agents: the queries of midi_controller_ai.shio (live_path "virtual_controller").
 //- With a real controller: "From hardware" gives the selected element the number of a knob or pad moved on it (the
 //  controls mapped to the element come along), "Move mappings" moves every mapping of the virtual device to the real
@@ -116,13 +117,16 @@ class midi_controller_menu
 		//like the network cards: kept in the style file, not in the project
 		//os_platform(): "windows ...", "macos", on Linux the name of the distribution
 		platform = std.os_platform().lowercase();
-		linux = !platform.starts("windows") && !platform.starts("mac");
+		mac = platform.starts("mac");
+		linux = !platform.starts("windows") && !mac;
+		// a port of the system: the ALSA sequencer on Linux, a CoreMIDI source and destination on macOS (#555)
+		os_port_here = linux || mac;
 		port_btn = bar.pushbutton("System port").icon(nanogui.icon("external_link_alt")).fixed_width(140);
-		if(linux)
+		if(os_port_here)
 			port_btn.tooltip("Other programs (a DAW, another VJ tool) see " + MIDI_CONTROLLER_DEVICE + " as a MIDI port: they get what you play here, "
 				+ "and what they send comes in like from a controller.\n[[wiki:MIDI#other-programs]]");
 		else
-			port_btn.enabled(false).tooltip("Only on Linux for now. On Windows a virtual port needs a driver: loopMIDI makes one, and VibeVJ lists it as a device.\n[[wiki:MIDI#other-programs]]");
+			port_btn.enabled(false).tooltip("Only on Linux and macOS. On Windows a virtual port needs a driver: loopMIDI makes one, and VibeVJ lists it as a device.\n[[wiki:MIDI#other-programs]]");
 		port_btn.on_change([this](v) {
 			if(!this.port_changing)
 				this.set_os_port(v, true);
@@ -141,7 +145,7 @@ class midi_controller_menu
 			this.controller.set_layout(state && std.is_json(state) && state.has("elements") ? state : midi_layout_default());
 		};
 
-		if(linux) {
+		if(os_port_here) {
 			try {
 				style = fileio.read_json(STYLE_FILE);
 				if(style && style.has("virtual_midi_port") && style.virtual_midi_port)
@@ -184,7 +188,8 @@ class midi_controller_menu
 		port_btn.pushed(ok);
 		port_changing = false;
 		if(on && !ok)
-			note("No port of the system: the ALSA sequencer is not there (snd-seq).");
+			note(std.os_platform().lowercase().starts("mac") ? "No port of the system: CoreMIDI refused it (see the log)."
+				: "No port of the system: the ALSA sequencer is not there (snd-seq).");
 		else
 			note(ok ? "Other programs see " + MIDI_CONTROLLER_DEVICE + " as a MIDI port now." : "");
 		if(!remember)
@@ -285,8 +290,11 @@ class midi_controller_menu
 			form.push_back([id = "channel", label = "MIDI channel (1-16)", type = "int", default = std.string(e.channel + 1)]);
 			if(midi_layout_sends_cc(e))
 				form.push_back([id = "cc", label = e.type == "xy" ? "CC of x" : "CC (0-127)", type = "int", default = std.string(e.cc)]);
-			if(e.type == "knob")
+			if(e.type == "knob") {
 				form.push_back([id = "mode", label = "Mode: absolute or relative (an endless encoder: steps)", type = "text", default = e.has("mode") ? e.mode : "absolute"]);
+				form.push_back([id = "encoding", label = "Steps of a relative knob: twos (1 up, 127 down) or offset (65 up, 63 down)", type = "text",
+					default = e.has("encoding") ? e.encoding : "twos"]);
+			}
 			if(e.type == "program")
 				form.push_back([id = "program", label = "Program (0-127)", type = "int", default = std.string(e.program)]);
 			if(e.type == "bend")
@@ -302,7 +310,21 @@ class midi_controller_menu
 				form.push_back([id = "note", label = "Note (0-127)", type = "int", default = std.string(e.note)]);
 			if(e.type == "button" || e.type == "pad")
 				form.push_back([id = "mode", label = "Mode: momentary or toggle", type = "text", default = e.mode]);
+			//the range of the value it sends (midi_layout_range); a note: the velocity
+			r = midi_layout_range(e);
+			if(e.type != "program" && !midi_layout_is_relative(e)) {
+				top = e.type == "bend" ? "16383" : "127";
+				if(midi_layout_sends_notes(e))
+					form.push_back([id = "max", label = "Velocity of a hit (1-127)", type = "int", default = std.string(r[1])]);
+				else {
+					form.push_back([id = "min", label = "Value at the bottom (min, 0-" + top + ")", type = "int", default = std.string(r[0])]);
+					form.push_back([id = "max", label = "Value at the top (max, 0-" + top + ")", type = "int", default = std.string(r[1])]);
+				}
+			}
+			form.push_back([id = "feedback", label = "Follows VibeVJ (what mapped controls send back): yes or no", type = "text",
+				default = e.has("feedback") && !e.feedback ? "no" : "yes"]);
 		}
+		form.push_back([id = "color", label = "Colour (#rrggbb, empty: the accent)", type = "text", default = e.has("color") ? e.color : ""]);
 		//the tool window stays above everything, also above the form: hidden while the form is open
 		tool.window.visible(false);
 		res = None;
@@ -321,9 +343,40 @@ class midi_controller_menu
 			fields.channel = fields.channel - 1;
 		if(fields.has("spring"))
 			fields.spring = std.string(fields.spring).trim().lowercase() != "no";
-		if(e.type == "knob" && fields.has("mode") && std.string(fields.mode).trim().lowercase() != "relative") {
-			fields.erase("mode");
-			remove.push_back("mode");
+		if(e.type == "knob" && fields.has("mode")) {
+			mode = std.string(fields.mode).trim().lowercase();
+			if(mode != "relative" && mode != "increment" && mode != "endless") {
+				fields.erase("mode");
+				remove.push_back("mode");
+			}
+		}
+		//what is the default is not written into the layout
+		if(fields.has("encoding") && std.string(fields.encoding).trim().lowercase() == "twos") {
+			fields.erase("encoding");
+			remove.push_back("encoding");
+		}
+		if(fields.has("feedback")) {
+			if(midi_layout_flag(fields.feedback, true)) {
+				fields.erase("feedback");
+				remove.push_back("feedback");
+			}
+			else
+				fields.feedback = false;
+		}
+		if(fields.has("color") && !std.string(fields.color).trim()) {
+			fields.erase("color");
+			remove.push_back("color");
+		}
+		if(fields.has("max")) {
+			top = e.type == "bend" ? 16383 : 127;
+			lo = fields.has("min") ? std.int(fields.min) : 0;
+			if(lo == 0 && std.int(fields.max) == top) {
+				for(k : ["min", "max"]) {
+					if(fields.has(k))
+						fields.erase(k);
+					remove.push_back(k);
+				}
+			}
 		}
 		controller.set_element(e.id, fields, remove);
 		if(e.type != "label")

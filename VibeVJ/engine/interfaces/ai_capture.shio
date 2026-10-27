@@ -1,0 +1,167 @@
+//Pictures for AI agents (#670): a capture of the screen, of a generator or of only its picture (a camera), and a look
+//through a camera after lamps were set to test values. One place for the Chat agent (tools vibevj_capture and
+//vibevj_camera_capture of the vibevj skill, which hand the PNG to the model with inject_visual_prompt) and the MCP server
+//(the same tools, the PNG as an image in the tool result, engine/interfaces/mcp_bridge.shio).
+//
+//The engine owns one (engine.ai_capture). A generator says which widget is "its picture" with the dispatch command
+//"get_capture_widget" (the Camera: its video, without the panel); without one the picture is its window.
+//
+//Works from any thread: widget.capture() renders the widget offscreen after the next frame and waits for it. The PNGs
+//go to .capture/ in the folder of VibeVJ.
+
+AI_CAPTURE_DIR = ".capture";
+AI_CAPTURE_DEFAULT_WIDTH = 1024;
+//Time from a DMX value to the camera picture: the lamp (a moving head needs most), the camera and its buffer
+AI_CAPTURE_DEFAULT_WAIT_MS = 600;
+AI_CAPTURE_MAX_WAIT_MS = 10000;
+AI_CAPTURE_CAMERA_ASSET = "Camera.asset";
+
+class AICapture {
+
+	engine = None;
+
+	__init__(_engine) {
+		engine = _engine;
+	}
+
+	//The generator of a live_path (engine.ai_interfaces knows every generator, from any thread); None if there is none
+	generator(live_path) {
+		registry = engine.ai_interfaces;
+		for(i = 0; registry && i < registry.size(); i++) {
+			iface = registry[i];
+			if(!iface || !iface.target)
+				continue;
+			try {
+				if(iface.target.get_live_path() == live_path)
+					return iface.target;
+			}
+			catch(e) {}
+		}
+		return None;
+	}
+
+	//Every Camera generator: [[live_path, status], ...] (status: get_camera_status of the generator)
+	cameras() {
+		list = [];
+		registry = engine.ai_interfaces;
+		for(i = 0; registry && i < registry.size(); i++) {
+			iface = registry[i];
+			if(!iface || !iface.target || !iface.has_query("get_camera_status"))
+				continue;
+			status = iface.query("get_camera_status", None, "capture");
+			list.push_back([live_path = iface.target.get_live_path(), status = status.ok ? status.value : status.error]);
+		}
+		return list;
+	}
+
+	//The camera generator to look through: the one of live_path, else the only one with a picture (or the only one)
+	camera(live_path = None) {
+		if(live_path) {
+			g = generator(live_path);
+			if(!g)
+				std.runtime_error("No generator with live_path '" + live_path + "' (vibevj_list_generators lists them).");
+			return g;
+		}
+		list = cameras();
+		if(!list.size())
+			std.runtime_error("There is no Camera generator. Add assets/Generators/Input/" + AI_CAPTURE_CAMERA_ASSET +
+				" to a view (e.g. add_item of a Patchview) and pick the camera with its query set_camera (list_cameras lists them).");
+		with_picture = [];
+		for(c : list) {
+			if(std.is_json(c.status) && c.status.picture)
+				with_picture.push_back(c);
+		}
+		if(with_picture.size() == 1)
+			return generator(with_picture[0].live_path);
+		if(list.size() == 1)
+			return generator(list[0].live_path);
+		paths = [];
+		for(c : list)
+			paths.push_back(c.live_path);
+		std.runtime_error("There are " + list.size() + " Camera generators, pass the live_path of one: " + paths.combine_string(", ").removesuffix(", "));
+		return None;
+	}
+
+	//Saves a PNG and returns [path, absolute_path, width, height, what]. live_path empty: the whole VibeVJ window.
+	//picture: only the picture of the generator (get_capture_widget), else its whole window with the controls.
+	//width: pixels of the PNG (None: one pixel per window unit; the picture of a camera is sampled at that size)
+	capture(live_path = None, picture = false, width = None) {
+		widget = None;
+		what = "";
+		if(live_path) {
+			g = generator(live_path);
+			if(!g)
+				std.runtime_error("No generator with live_path '" + live_path + "' (vibevj_list_generators lists them).");
+			if(picture) {
+				try {
+					widget = g.dispatch("get_capture_widget");
+				}
+				catch(e) {
+					widget = None;
+				}
+			}
+			what = widget ? "picture of " + live_path : "window of " + live_path;
+			if(!widget)
+				widget = g.window;
+		}
+		else {
+			widget = engine.screen;
+			what = "VibeVJ window";
+		}
+		if(!widget)
+			std.runtime_error("The " + what + " has nothing to capture.");
+
+		//size(), not width(): width() of a video widget is the width of its video
+		units = widget.size().x;
+		if(units <= 0)
+			std.runtime_error("The " + what + " has no size: it is not laid out (a collapsed window or a hidden view). Show it in a view first.");
+		scale = 1.0;
+		if(width && std.int(width) > 0)
+			scale = math.clamp(std.float(width) / std.float(units), 0.1, 16.0);
+
+		fileio.mkdir(AI_CAPTURE_DIR);
+		path = AI_CAPTURE_DIR + "/" + std.random_hash(8) + ".png";
+		size = widget.capture(path, scale);
+		if(!size)
+			std.runtime_error("The capture of the " + what + " failed, see the log of VibeVJ.");
+		absolute = path;
+		try {
+			absolute = fileio.absolute_path(path);
+		}
+		catch(e) {}
+		return [path = path, absolute_path = absolute, width = size.x, height = size.y, what = what];
+	}
+
+	//Looks through a camera: optionally sets lamps to test values first (set_fixture_test of the fixture setup), waits
+	//until the camera can see it, then captures the picture of the camera. Returns the capture plus the camera status and
+	//what the lamps send (fixture_test)
+	camera_capture(live_path = None, test = None, wait_ms = None, width = AI_CAPTURE_DEFAULT_WIDTH, caller = "capture") {
+		g = camera(live_path);
+		cam_path = g.get_live_path();
+		status = g.ai_interface.query("get_camera_status", None, caller);
+		if(status.ok && !status.value.picture) {
+			s = status.value;
+			std.runtime_error("The camera of " + cam_path + " has no picture: " + (s.status ? s.status : "no camera picked") +
+				". Pick one with set_camera (list_cameras lists them).");
+		}
+
+		result = [];
+		if(test && test.has("fixtures") && test.fixtures) {
+			r = engine.patch_ai.query("set_fixture_test", test, caller);
+			if(!r.ok)
+				std.runtime_error("set_fixture_test: " + r.error);
+			result.fixture_test = r.value;
+			if(std.is_none(wait_ms))
+				wait_ms = AI_CAPTURE_DEFAULT_WAIT_MS;
+		}
+		wait = std.is_none(wait_ms) ? 0 : math.clamp(std.int(wait_ms), 0, AI_CAPTURE_MAX_WAIT_MS);
+		if(wait > 0)
+			std.sleep(wait);
+
+		shot = capture(cam_path, true, width);
+		shot.merge(result);
+		if(status.ok)
+			shot.camera = status.value;
+		return shot;
+	}
+}

@@ -335,8 +335,39 @@ file, line and column inside the kernel.
   free and one compare serves `i32` and `i64`. Constants and arguments are written into the register image once
   per launch; nothing is allocated while a kernel runs.
 - **Optimizer** (`kopt` in the compiler, on the bytecode): every value first gets its own virtual register; pure
-  instructions that only depend on arguments and constants (`w * 3`, `h - 1`, the address of the lane frame) move
-  into a *prologue* that runs once per lane runner (each thread of a launch, on its own frame), repeated pure instructions in a basic block are removed (`i - row` used three times), repeated
+  instructions that only depend on arguments and constants (`w * 3`, `h - 1`, the address of a pointer parameter)
+  move into a *prologue* that runs once per lane runner (each thread of a launch, on its own frame); an address
+  built from the *lane frame* does not: the prologue runs once per lane runner and its registers are broadcast
+  to every lane of a batch, so a frame address computed there is lane 0's frame for the whole batch (the batch
+  interpreter gets per lane frames on fix/queue-run24). Repeated pure instructions in a basic block are removed
+  (`i - row` used three times), an instruction of a loop that is pure and whose sources
+  are fixed when the loop is entered (the `begin + slice` of a loop condition, `gid * 256u` in the loop preamble)
+  moves in front of the loop header and runs once per loop entry instead of once per iteration. The unchecked
+  address op `ADDRU` of a local array is the one instruction with a pointer operand the pass admits: a preheader
+  is main code, which the batch interpreter runs lane by lane and the scalar interpreter one lane at a time, so
+  the address of the lane frame is computed once per loop entry and once per lane - a frame address never moves
+  into the prologue of `hoist()`, which runs once per lane runner and broadcasts its registers to every lane of
+  a batch. The checked `ADDR` of an access stays inside the loop: hoisting an op that traps above a zero-trip
+  loop traps on a path that never ran. With the frame address fixed in front of the header it is an invariant
+  source for the strength reduction below, which is what lets it reach a local-array index (a value freed by
+  such a hoist is picked up by the next round, and the hoists per loop are capped: a hoisted value is live
+  across the whole loop and the allocator has no spilling), and the scaled index of a loop is strength reduced: `src[i * 4u + 1u]`, `part[p * 256u + gid]` and
+   `src[y * 1024 + x]` compute their address as a counter times a constant plus a value that does not change
+   (the code generator emits the same shape as the `i << 2` of a local array index, which the gate refuses
+   when the counter is 32 bit and the address 64 bit - see the open points), so
+   the address of the next iteration is the address of this one plus `K * step`: the multiply and the add move in
+  front of the header, one `ADDI` of `K * step` per iteration carries the address in a virtual register of its
+  own, and the address of the load stops going through a multiply (7 instructions per iteration become 6,
+  11-16 % of the loop time measured against the same loop with the multiply removed by hand, for one
+  register more, and a nested loop computes the address of its row
+  once per outer iteration). Everything the gate of that pass does not understand keeps its multiply inside the
+  loop: a counter with a second definition in the loop, a step that is not a constant `ADDI`, a jump landing
+  behind the step (a `continue` that skips it), a loop without a unique preheader, a factor that is not a
+  constant, a product feeding a memory operand directly, a product with two consumers, an index read outside the
+  loop, and counter, product and consumer in different integer classes - the 32 bit instructions wrap and
+  canonicalize mod 2^32, the 64 bit ones mod 2^64, and the carried register is the consumer's own `ADDI_<t>`, so
+  it wraps exactly like the computation it replaces. `_testing/kernels_strength.shio` pins the disassembly of
+  all of it and runs every kernel in every interpreter against the same values. Repeated
   loads of a block are merged while no store comes in between, bounds checks that an earlier access of the block
   did for the same index are dropped (`p[b] = p[b] + 1` checks once), unused pure instructions are dropped, and a
   liveness based register allocator packs the virtual registers (the LUT
@@ -378,12 +409,33 @@ memory. The JIT removes that, with exactly the semantics of the VM:
   the C library in both, so they give the same results on the same machine.
 - **Cache**: the library is stored as `k_<hash>.so` / `.dll` in `SHZ_KERNEL_CACHE`, else
   `$XDG_CACHE_HOME/shizoscript/kernels`, `~/.cache/shizoscript/kernels` or
-  `%LOCALAPPDATA%\shizoscript\kernels`. The hash covers the C source, the compiler command, the flags and the
-  JIT version, so a changed kernel or compiler never loads a stale library. It is compiled into a temporary
-  name and renamed, so concurrent processes never load a half written file. A kernel takes ~75 ms to compile
-  (one time per machine), loading it from the cache takes a few milliseconds. The cache directory is trusted
-  like the interpreter itself (its libraries are loaded and run): point `SHZ_KERNEL_CACHE` only at a
-  directory that only you can write.
+  `%LOCALAPPDATA%\shizoscript\kernels`. The hash covers the C source, the compiler command, the
+  flags and the JIT version, so a changed kernel, compiler or flag set never loads a stale
+  library; the ahead of time hash of the same kernel covers the source and the JIT version only
+  (below), so AOT code is portable between compilers and machines. A library is compiled into a
+  temporary name and renamed, so concurrent processes never load a half written file. The files of
+  a compile (the generated `.c`, the object file, the import library, the half written library)
+  live in the `tmp` subdirectory of the cache and are removed with the compile; every name carries
+  the process id of the compiling process, `k_<hash>.p<pid>.<counter>`, so parallel processes never
+  share a file. When a process first resolves the cache directory (in `cache_dir`, issue #591) it
+  sweeps the cache: files of compiles whose process is gone are removed (a name with a live process
+  id is never touched); names without a `p<pid>` part - the layouts before, `k_<hash>.<pid>.<counter>`
+  and `k_<hash>.<counter>.<pid>`, where the pid cannot be told from the counter (a counter of 1 is the
+  pid of init) - count as untagged and go when they are older than 10 minutes; and only the newest
+  libraries are kept, `SHZ_KERNEL_CACHE_MAX` of them (default 64, 0 keeps
+  everything). The sweep runs in the directory resolution and not on the compile, so a process
+  that only **loads** cached libraries - and never compiles - cleans the cache too, and
+  `std.kernel_cache_dir()` resolves (and, for the first call of a process, sweeps) it - a trigger
+  that needs no C compiler. `std.kernel_jit_compiler()` resolves it as well, and the first resolution
+  keeps its directory for the whole process: a script that sets `SHZ_KERNEL_CACHE` with `std.set_env()`
+  must do so before it calls either (`std.kernel_jit()` does not resolve it; #714, 2026-10-26). The cache therefore stays bounded and a run that ends while compiles
+  are still running leaves nothing in the cache directory. A kernel takes ~75 ms to compile (one time per machine), loading it from the cache
+  takes a few milliseconds. The cache directory is trusted like the interpreter itself (its
+  libraries are loaded and run): point `SHZ_KERNEL_CACHE` only at a directory that only you can
+  write. Tests: `_testing/kernels.shio`, `_testing/kernels_bitmap.shio`,
+  `_testing/kernels_licm.shio` (the loop-invariant code motion of the optimizer, issue #222),
+  `_testing/kernel_jit_cache_222.shio` (the sweep, issue #591),
+  `_testing/kernel_jit_cache_names_591.shio` (the sweep and the library names, with child processes).
 - **Policy** (`std.kernel_jit(...)`, initial value from `SHZ_KERNEL_JIT`):
   - `auto` (default): the first launch of a kernel starts compiling it on the script's thread pool and runs on
     the VM; the launches after the library is loaded run native code (also when it comes from the cache, loading
@@ -419,8 +471,46 @@ runs on the JIT / VM as usual. The file is independent of file names and paths. 
   multiply-add (`-ffp-contract=off`, `/fp:precise`). Its kernels register themselves at startup
   (`shzk_aot_register`), no dynamic loading is needed.
 
-The generated code has the exact semantics of the VM (bounds checks, traps, the order of reductions), like the
-JIT. `std.kernel_jit("off")` turns ahead of time code off as well.
+**What the hash of a kernel covers (issue #222).** `shzk_aot_hash()` is a 64 bit FNV-1a over
+exactly these bytes: the JIT version string (`shzk-jit-1`), a newline, the C prelude
+(`SHZK_JIT_PRELUDE`, the support code in front of the kernels) and the generated C text of the
+kernel function. Nothing else: not the C compiler, not its command line, not its optimization
+flags, not the CPU, not the operating system, not the file name of the script, and not the
+bytecode itself (the generated C is a function of the bytecode and of the version of the code
+generator). Consequences:
+
+- an AOT library built on machine A is used on machine B: same interpreter, same kernel source,
+  and the C compiler that built the library does not matter - as long as the library fits the
+  target (same OS, CPU and ABI). The same kernel compiled with gcc on Linux and with `cl` on
+  Windows carries the same hash, so one `kernels.so` per target is enough.
+- the flags of that compiler are not in the hash, so they have to be the documented ones: fused
+  multiply-add changes the results of the generated code (`-ffp-contract=off`, `/fp:precise`).
+  The hash says the kernel is the same C, not that it was built with the same flags.
+- what invalidates it: an interpreter whose code generator or prelude differs (a new version), a
+  bumped `SHZK_JIT_VERSION`, or a kernel whose source changed. Those kernels simply do not match
+  and run on the JIT / VM.
+- the JIT cache file name covers the same C source **plus** the compiler command and the flags, so
+  a JIT library is never shared between two compilers: `SHZ_KERNEL_CC=cl` and
+  `SHZ_KERNEL_CC=cl.exe` produce two JIT libraries with one and the same AOT hash.
+
+**The prelude is an ABI, not just text (issue #222).** The generated C is compiled into a separate library,
+so every struct it shares with the interpreter is part of the boundary: `SHZK_JIT_PRELUDE` mirrors
+`shzk_ptr` as its own `kptr { base, count, stride, bytes, lane_stride }`, and the interpreter hands its
+`std::vector<shzk_ptr>` to that code as a `kptr*` (the same pointer, cast). Two rules follow:
+**a new member goes at the END of both structs**, and the **element size** is part of the contract, not
+only the field offsets. A 32-byte `kptr` indexing a 40-byte `shzk_ptr` array reads `ptrs[1]` out of the
+wrong slot — measured on `fix/queue-run24` after `lane_stride` had been added to `shzk_ptr` alone: base
+`NULL`, count = a pointer value, so the bounds check passed and the store went to page 0. Every
+multi-pointer kernel died with `0xC0000005` under the JIT while the VM tests stayed green, because only
+the JIT path performs the cast. The C++ side is pinned by the `static_assert`s on the mirror struct in
+`shz_kernel_jit.cpp`, the generated text and the behaviour by `_testing/kernels_jit_abi_222.shio`, and the
+same prelude text is what `std.kernel_aot_source()` emits, so the AOT library carries the same layout.
+Because the prelude is inside `shzk_aot_hash()` and inside the JIT cache file name, changing it invalidates
+every cached JIT library and every shipped AOT library — they stop matching and are rebuilt. An ABI change
+therefore needs no `SHZK_JIT_VERSION` bump, and a library built against the old layout is never picked up.
+
+The generated code has the exact semantics of the VM (bounds checks, traps, the order of
+reductions), like the JIT. `std.kernel_jit("off")` turns ahead of time code off as well.
 
 ---
 
@@ -492,7 +582,27 @@ Reading the numbers:
 - The JIT and ahead of time libraries on Windows (`cl` / `clang`) and macOS are implemented but not tested yet
   (Linux x64 with gcc is); the build into the interpreter is tested on Linux x64 (g++), not on an ESP32 yet.
 - The optimizer merges loads and drops repeated bounds checks inside a basic block only; loads are not moved
-  out of loops (a store through any pointer may change them, the same buffer can be passed twice).
+  out of loops (a store through any pointer may change them, the same buffer can be passed twice). Pure
+  instructions are hoisted out of loops, the unchecked address op `ADDRU` of a local array included
+  (#222, `_testing/kernels_licm.shio`, `_testing/kernels_addrhoist.shio`);
+  trapping ones (`/`, `%`, a checked access, the checked `ADDR`, float to int) stay inside, because a loop
+  that never runs must not run them, and no frame address moves into the prologue, whose registers are
+  broadcast to every lane of a batch. The frame address of a loop that indexes a local array lands in the
+  preheader of that loop, one instruction per iteration less for every local array access, and fixed in
+  front of the header it is an invariant source for the strength reduction, which therefore reaches the
+  index of a local array driven by a 64 bit counter (nine instructions per iteration become seven and the
+  address of the load stops going through a multiply); the 64 bit address of a local array indexed by a
+  32 bit counter stays refused. Measured on this box in an interleaved in-process A/B against a control loop
+  whose code is identical in both builds (min of 9 rounds): the histogram loop that counts into a local
+  `bins[256]` 243 -> 231 ms and the loop with the 64 bit index 278 -> 236 ms, about -10 % of the control-loop
+  ratio, while the identical control loop itself drifted by 5.7 % - so the op counts are the proof and the
+  milliseconds only the direction (section 8: the benchmarks on this machine move by 10-20 % between runs).
+- The strength reduction is the product of a loop counter with a constant only. A scale factor that is a
+  parameter (`src[i * k]`), an index built from a load (`src[data[i] * 4u]`), a 64 bit address driven by a 32
+  bit counter (a local array indexed by a `u32`) and a product that is the index operand of the access directly
+  (`src[i * 4u]`, where no instruction is saved) stay as they are, and every rewrite of the instruction stream
+  changes `shzk_aot_hash()`: the cached JIT libraries and the shipped ahead of time library stop matching and
+  have to be regenerated.
 - Struct, vector and array variables live in frame memory, not in registers (the JIT's C compiler keeps them
   in registers where it can, the VM loads and stores them).
 - A per-lane arena if kernels should ever allocate.

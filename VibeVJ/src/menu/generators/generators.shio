@@ -26,7 +26,8 @@ class generators
 	managed window = None;
 	managed subviews = None;
 	managed workspaces = []; //one per view tab: [tab=, node=, view=, main=]; the order on screen is the tab bar's
-	                         //A tab in a window of its own (multi window) also has window= (its screen), holder= and note=
+	                         //A tab in a window of its own (multi window) also has window= (its screen), holder=, frame=
+	                         //(its title bar, make_window_frame) and note=
 
 	eng = None;
 	sidebar_btn = None;
@@ -97,6 +98,7 @@ class generators
 		subviews = window.tabwidget();
 		subviews.anchor(0).anchor_bottom(5);
 		subviews.closeable(true).movable(true);
+		subviews.document_tabs(true); //the main document tabs: the active one in the canvas colour (#297, design/README.md)
 		subviews.header_height(bar_height);
 		subviews.tab_height(tab_height);
 		//A press takes a tab, the release brings it to the front: in between it can be dragged down into an area of
@@ -260,6 +262,8 @@ class generators
 			handled = engine.screen.keyboard_default(key, scancode, action, mods);
 			//Undo / redo, when nothing that has the focus used the key itself (a code editor, a mapping editor)
 			if(!handled && action == 1 && this.history_key(letter, mods))
+				return true;
+			if(!handled && action == 1 && this.clipboard_key(letter, mods))
 				return true;
 			//Save and the transport: also when a button or a slider that was clicked last only swallowed the key
 			if(action == 1 && (!handled || key_absorbed(engine.screen)) && this.app_key(key, mods, letter))
@@ -600,6 +604,30 @@ class generators
 				for(k = 0; k < tiles.size(); k++)
 					picker.push_back(tiles[k]);
 			}
+			//The areas of the view tab in front, where they are on the screen (window units) and what they hold (uid
+			//and asset of the view, "" in an empty area): a test clicks into an area without knowing the window size
+			//(the Mac smoke test, #552)
+			//path: the address of the area the MCP layout tools take (area_list)
+			paths = [];
+			front_ws = current_workspace();
+			if(front_ws) {
+				addressed = area_list(front_ws);
+				for(i = 0; i < addressed.size(); i++)
+					paths[addressed[i].area.uid] = addressed[i].path;
+			}
+			placed = [];
+			for(i = 0; i < shown.size(); i++) {
+				box = shown[i].container;
+				pos = box.absolute_position();
+				held = shown[i].item;
+				placed.push_back([
+					uid = held ? held.uid : "",
+					path = paths.has(shown[i].uid) ? paths[shown[i].uid] : "",
+					asset = held ? held.get_relative_path() : "",
+					visible = box.visible_recursive() ? 1 : 0,
+					x = std.int(pos.x), y = std.int(pos.y), w = std.int(box.width()), h = std.int(box.height()),
+				]);
+			}
 			maximized = eng.env.maximized_view;
 			maximized_uid = "";
 			if(maximized && maximized.item)
@@ -610,14 +638,98 @@ class generators
 				assets = assets,
 				maximized = maximized_uid,
 				picker = picker,
+				areas = placed,
 				undo = undo_history ? undo_history.undo_name() : "",
 				redo = undo_history ? undo_history.redo_name() : "",
+				windows = window_overview(),
 			];
 		}
 		catch(e) {
 			//A view that is freed right now (a load, a view closed outside a step)
 			return [busy = 1, error = std.string(e)];
 		}
+	}
+
+	//Every area of a view tab with its address, for the MCP layout tools (engine/interfaces/mcp_layout.shio, #344):
+	//[area=, path=]. The path is "" for the area of the tab itself, below it the index of the area in its split or of
+	//the tab in its Tabview at each level ("1/0"), as describe() nests them (views of a split, tabs of a Tabview)
+	area_list(ws) {
+		list = [];
+		area_list_below(ws.view, "", list);
+		return list;
+	}
+
+	area_list_below(view, path, list) {
+		list.push_back([area = view, path = path]);
+		if(!view.item || !view.item.module || !view.item.module.has("get_view"))
+			return;
+		for(i = 0; i < 256; i++) {
+			child = view.item.module.call("get_view", i);
+			if(!child)
+				break;
+			area_list_below(child, path == "" ? std.string(i) : path + "/" + std.string(i), list);
+		}
+	}
+
+	//What the picker of an empty area offers (singleview.show_picker), as data for the MCP layout tools (#344): the
+	//views [name=, path=, kind="view"], then the layouts (presets of the splits, kind "layout") and the presets of the
+	//views (kind "preset")
+	picker_choices() {
+		list = [];
+		all_views = view_assets();
+		for(i = 0; i < all_views.size(); i++) {
+			if(all_views[i].toolbar)
+				list.push_back([name = all_views[i].name, path = all_views[i].path, kind = "view"]);
+		}
+		for(i = 0; i < all_views.size(); i++) {
+			presets_dir = all_views[i].path + "/presets";
+			if(!fileio.exists(presets_dir))
+				continue;
+			files = fileio.files(presets_dir, false);
+			for(j = 0; j < files.size(); j++) {
+				preset_path = presets_dir + "/" + fileio.file_name(files[j]);
+				if(preset_path.ends(".preset"))
+					list.push_back([name = fileio.pure_name(files[j]), path = preset_path, kind = all_views[i].toolbar ? "preset" : "layout"]);
+			}
+		}
+		return list;
+	}
+
+	//The view windows (multi window) for layout_overview: where each one is, its state, whether its bar shows and where
+	//the buttons of the bar are (window coordinates). The smoke test drives and checks them with it (#614)
+	window_overview() {
+		list = [];
+		for(i = 0; i < workspaces.size(); i++) {
+			ws = workspaces[i];
+			if(!ws.window)
+				continue;
+			scr = ws.window;
+			pos = scr.window_position();
+			size = scr.screen_size();
+			buttons = [];
+			f = ws.frame;
+			if(f) {
+				names = ["mark", "min_btn", "max_btn", "full_btn", "close_btn"];
+				for(k = 0; k < names.size(); k++) {
+					b = f[names[k]];
+					if(!b)
+						continue;
+					bp = b.absolute_position();
+					buttons[names[k]] = [x = std.int(bp.x + b.width() / 2), y = std.int(bp.y + b.height() / 2)];
+				}
+			}
+			list.push_back([
+				guid = ws.node.guid(),
+				name = subviews.tab_name(ws.tab),
+				x = std.int(pos.x), y = std.int(pos.y), w = std.int(size.x), h = std.int(size.y),
+				maximized = scr.maximized() ? 1 : 0,
+				fill = scr.fill_monitor() ? 1 : 0,
+				bar = f && f.bar.visible() ? 1 : 0,
+				views_top = std.int(ws.holder.position().y),
+				buttons = buttons,
+			]);
+		}
+		return list;
 	}
 
 	//Keeps what is needed to make a generator again: a step is about to delete it
@@ -686,6 +798,7 @@ class generators
 			if(!ws)
 				ws = add_workspace(d.name, d.guid, false, false);
 			subviews.tab_name(ws.tab, d.name);
+			window_named(ws);
 			kept.push_back(ws);
 			build_layout(ws.view, d.root, pool);
 		}
@@ -789,7 +902,9 @@ class generators
 		for(k = copies.size() - 1; k >= 0; k--) {
 			c = copies[k];
 			view = patch_view(c.view);
-			kept = view ? view.remove_generator(c.guid) : None;
+			//With its links: the links among copies (#348) come back with the redo. The copies go last first, so a
+			//link between two of them is kept once, by the one made after the other
+			kept = view ? view.remove_generator(c.guid, true) : None;
 			if(std.is_none(kept))
 				std.warn("Undo: a copied generator or its view no longer exists, it is skipped");
 			else
@@ -1074,6 +1189,45 @@ class generators
 		//The widget that had the focus can be gone with the area: the views keep the focus for the next key
 		views_window.focus(true);
 		return true;
+	}
+
+	//Ctrl+C / Ctrl+V of generators (#348), when nothing that has the focus used the key (a text field keeps its own).
+	//Ctrl+C copies the selection of the Patchview the mouse was over last, else of the one that has a selection;
+	//Ctrl+V pastes into the Patchview the mouse was over last, else into the one the copy came from. false: the key
+	//stays free (no Patchview, nothing selected, nothing copied)
+	clipboard_key(letter, mods, from_ws = None) {
+		if(mods != 2 || (letter != "c" && letter != "v") || nanogui.show_mode())
+			return false;
+		views_window = from_ws ? from_ws.holder : window;
+		if(!views_window.focused())
+			return false;
+		env = std.global("engine").env;
+		views = env.patch_views;
+		if(!views)
+			return false;
+		hovered = None;
+		for(i = 0; i < views.size(); i++) {
+			if(views[i].uid == env.hovered_patch_uid && views[i].area.visible_recursive())
+				hovered = views[i];
+		}
+		if(letter == "c") {
+			if(hovered) {
+				if(hovered.copy_selection())
+					return true;
+			}
+			for(i = 0; i < views.size(); i++) {
+				if(views[i].area.visible_recursive() && views[i].copy_selection())
+					return true;
+			}
+			return false;
+		}
+		if(hovered)
+			return hovered.paste();
+		for(i = 0; i < views.size(); i++) {
+			if(views[i].uid == env.generator_clipboard_view && views[i].area.visible_recursive())
+				return views[i].paste();
+		}
+		return false;
 	}
 
 	//A zoom key for the canvas the mouse was over last; false when there is none (the key stays free)
@@ -1365,8 +1519,7 @@ class generators
 			return;
 
 		subviews.tab_name(index, res.values.name);
-		if(ws.window)
-			ws.window.window_title(window_caption(ws));
+		window_named(ws);
 	}
 
 	close_tab(index) {
@@ -1442,14 +1595,24 @@ class generators
 			std.error("Cannot open a window of its own for the view tab \"" + subviews.tab_name(ws.tab) + "\" on this system");
 			return false;
 		}
+		//Like the main window it runs without the frame of the system: its own bar is the title bar (make_window_frame),
+		//the outer 5 px resize it. Without the frame Windows puts the window into the full screen, and X11 gives it the
+		//room the frame had: back to its own size, so a saved window does not grow with every load
+		scr.decorated(0);
+		scr.resize_border(5);
+		if(scr.fill_monitor())
+			scr.fill_monitor(false);
+		scr.screen_size(vec2f(width, height));
 		if(rect)
 			scr.window_position(vec2f(rect.x, rect.y));
 
 		holder = scr.window("");
-		holder.anchor(0).movable(false).margin(0);
+		holder.anchor(0).anchor_top(bar_height).movable(false).margin(0);
 
 		ws.window = scr;
 		ws.holder = holder;
+		ws.clean_fill = false;
+		ws.frame = make_window_frame(ws, scr);
 		ws.node.move_to(holder);
 		ws.node.anchor(0);
 
@@ -1473,6 +1636,8 @@ class generators
 			handled = scr.keyboard_default(key, scancode, action, mods);
 			if(!handled && action == 1 && this.history_key(letter, mods))
 				return true;
+			if(!handled && action == 1 && this.clipboard_key(letter, mods, ws))
+				return true;
 			if(action == 1 && (!handled || key_absorbed(scr)) && this.app_key(key, mods, letter))
 				return true;
 			return handled;
@@ -1487,10 +1652,15 @@ class generators
 			follow(target);
 		});
 
-		//The window manager of X11 leaves the full screen of F11 later: the frame comes back once it has
+		//Maximized, restored, full screen (also by the system: Windows fills the monitor when the bar is dragged to its
+		//top): the bar follows. The window manager of X11 leaves the full screen of F11 later: the bar comes back once
+		//it has
 		scr.on_maximize([this, ws](maximized){
-			if(ws.window && !ws.window.fill_monitor())
+			if(!ws.window)
+				return;
+			if(!ws.window.fill_monitor())
 				this.finish_leaving_fill(ws);
+			this.sync_window_frame(ws);
 		});
 
 		holder.on_mouse_enter([this](pos, enter){
@@ -1509,15 +1679,16 @@ class generators
 		return true;
 	}
 
-	//F11 in a view window: its views fill the monitor the window is on (a second monitor, a projector), without the
-	//frame of the system. F11 again brings the frame back, at the place and size from before
+	//F11 in a view window: its views fill the monitor the window is on (a second monitor, a projector), without its bar:
+	//only the views show. F11 again brings the bar back, at the place and size from before
 	toggle_window_fill(ws) {
 		scr = ws.window;
 		if(!scr)
 			return;
 		if(!scr.fill_monitor() && !ws.leaving_fill) {
 			ws.rect_before_fill = window_rect(ws);
-			scr.decorated(0);
+			ws.clean_fill = true;
+			sync_window_frame(ws);
 			scr.fill_monitor(true);
 			return;
 		}
@@ -1529,16 +1700,115 @@ class generators
 	}
 
 	finish_leaving_fill(ws) {
-		if(!ws.leaving_fill || !ws.window)
+		if(!ws.window)
+			return;
+		//Out of the full screen, also one the system put it in: the bar shows again
+		ws.clean_fill = false;
+		sync_window_frame(ws);
+		if(!ws.leaving_fill)
 			return;
 		ws.leaving_fill = false;
 		scr = ws.window;
-		scr.decorated(1);
 		r = ws.rect_before_fill;
 		ws.rect_before_fill = None;
 		if(r) {
 			scr.screen_size(vec2f(r.w, r.h));
 			scr.window_position(vec2f(r.x, r.y));
+		}
+	}
+
+	//The title bar of a view window, in the style of the top bar of the main window:
+	//  [⧉ View window] tab name  … free space …  [minimize] [maximize] [full screen] [close]
+	//A line in the accent along its top edge and the mark at its left end tell it from the main window at a glance. Its
+	//free space moves the window; the close button brings the views back into their tab (back_from_window).
+	//Returns [bar=, name=, mark=, min_btn=, max_btn=, full_btn= (None without a full screen), close_btn=]
+	make_window_frame(ws, scr) {
+		theme = eng.screen.theme().to_json();
+		bg = theme.window_header_gradient_top;
+		bg_color = bg ? vec4f(bg.r, bg.g, bg.b, 1.0) : vec4f(0.098, 0.098, 0.106, 1.0);
+		ac = theme.accent_color;
+		accent = ac ? vec4f(ac.r, ac.g, ac.b, 1.0) : vec4f(0.616, 0.522, 1.0, 1.0);
+
+		//overlay: the window of the views gets the focus with every click into them, the bar stays on top all the same
+		bar = scr.window("");
+		bar.anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(bar_height).movable(false).margin(0).overlay(true);
+
+		//Everything lies on the surface: a widget that gets the focus moves on top of its siblings, a surface beside the
+		//buttons would then cover them
+		surface = bar.widget_solid().background_color(bg_color).anchor(0);
+		//A press the buttons do not take (free space, the name) moves the window, as the free space of the top bar does
+		surface.on_mouse_button([scr, surface](pos, btn, down, mods){
+			if(surface.mouse_button_default(pos, btn, down, mods))
+				return true;
+			if(down && btn == 0)
+				scr.begin_drag();
+			return false;
+		});
+		surface.widget_solid().background_color(accent).anchor_top(0).anchor_left(0).anchor_right(0).fixed_height(2);
+
+		mark = surface.button("View window").icon(nanogui.icon("external_link_alt")).transparent(true).text_color(accent)
+			.alignment("left").anchor_top(btn_top).anchor_left(6).fixed_width(136).fixed_height(btn_size)
+			.tooltip("A view window: the views of a tab in a window of their own, for a second monitor or a projector. A click brings the main window to the front.\n[[wiki:The-Screen#view-windows]]");
+		mark.on_click([this](){
+			this.eng.screen.focus_window();
+		});
+
+		name = surface.label(subviews.tab_name(ws.tab)).font_size(15).alignment("left")
+			.anchor_top(0).anchor_left(150).anchor_right(4 + btn_step * 4 + 8).fixed_height(bar_height);
+
+		//From the right: close, full screen, maximize, minimize, as in the main window
+		close_btn = surface.button("").icon(nanogui.icon("times")).danger("hover")
+			.tooltip("Close the window: its views go back into their tab in the main window, as they are")
+			.anchor_top(btn_top).anchor_right(4).fixed_width(btn_size).fixed_height(btn_size);
+		close_btn.on_click([this, ws](){
+			this.back_from_window(ws);
+		});
+
+		x = 4 + btn_step;
+		full_btn = None;
+		if(scr.fill_monitor_available()) {
+			full_btn = surface.button("").icon(nanogui.icon("expand"))
+				.tooltip("Full screen for the show: the views fill the monitor, without this bar (F11). F11 leads back.\n[[wiki:The-Screen#view-windows]]")
+				.anchor_top(btn_top).anchor_right(x).fixed_width(btn_size).fixed_height(btn_size);
+			full_btn.on_click([this, ws](){
+				this.toggle_window_fill(ws);
+			});
+			x += btn_step;
+		}
+
+		max_btn = surface.button("").icon(nanogui.icon("window_maximize")).tooltip("Maximize")
+			.anchor_top(btn_top).anchor_right(x).fixed_width(btn_size).fixed_height(btn_size);
+		max_btn.on_click([scr](){
+			scr.maximized(!scr.maximized());
+		});
+		x += btn_step;
+
+		min_btn = surface.button("").icon(nanogui.icon("window_minimize")).tooltip("Minimize")
+			.anchor_top(btn_top).anchor_right(x).fixed_width(btn_size).fixed_height(btn_size);
+		min_btn.on_click([scr](){
+			scr.iconify();
+		});
+
+		return [bar = bar, name = name, mark = mark, min_btn = min_btn, max_btn = max_btn, full_btn = full_btn, close_btn = close_btn];
+	}
+
+	//The bar of a view window follows its state: hidden in the full screen of F11 (only the views show, for a show),
+	//there in every other state, also in a full screen the system chose; the icons say where the buttons lead
+	sync_window_frame(ws) {
+		f = ws.frame;
+		scr = ws.window;
+		if(!f || !scr)
+			return;
+		f.bar.visible(!ws.clean_fill);
+		ws.holder.anchor_top(ws.clean_fill ? 0 : bar_height);
+
+		maximized = scr.maximized();
+		f.max_btn.icon(nanogui.icon(maximized ? "window_restore" : "window_maximize"));
+		f.max_btn.tooltip(maximized ? "Restore" : "Maximize");
+		if(f.full_btn) {
+			full = scr.fill_monitor();
+			f.full_btn.icon(nanogui.icon(full ? "compress" : "expand"));
+			f.full_btn.tooltip(full ? "Leave the full screen (F11)" : "Full screen for the show: the views fill the monitor, without this bar (F11). F11 leads back.\n[[wiki:The-Screen#view-windows]]");
 		}
 	}
 
@@ -1553,8 +1823,10 @@ class generators
 			ws.note.visible(false);
 		ws.window = None;
 		ws.holder = None;
+		ws.frame = None;
 		ws.rect_before_fill = None;
 		ws.leaving_fill = false;
+		ws.clean_fill = false;
 		scr.close_window();
 
 		active_area = "";
@@ -1574,6 +1846,15 @@ class generators
 		pos = ws.window.window_position();
 		size = ws.window.screen_size();
 		return [x = pos.x, y = pos.y, w = size.x, h = size.y];
+	}
+
+	//The tab of a view window got another name (rename, undo): its window says it too, in the bar and to the system
+	window_named(ws) {
+		if(!ws.window)
+			return;
+		ws.window.window_title(window_caption(ws));
+		if(ws.frame)
+			ws.frame.name.caption(subviews.tab_name(ws.tab));
 	}
 
 	window_caption(ws) {

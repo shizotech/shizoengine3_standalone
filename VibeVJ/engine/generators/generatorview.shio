@@ -1,5 +1,6 @@
 
 #include "generatoritem"
+#include "copy_links"
 
 //Selecting and dragging generators (#348):
 //- A click on the header of a generator selects it, Ctrl or Shift + click adds one or takes it away again, a frame
@@ -8,6 +9,8 @@
 //- Alt + drag on a generator (the grab modifier, nanogui.grab_modifier) drags it out, with the others that are
 //  selected: into another view of this kind they move as they are (controls, links and MIDI mappings stay), an area
 //  takes them as views (singleview). Ctrl held at the drop leaves copies.
+//- Ctrl+C / Ctrl+V copy the selected generators (generators.shio, clipboard_key). A copy has the settings of its
+//  original; the links among the copied generators are copied with them, links to the others are not.
 //A Patchview is a canvas (make_canvas): a dot grid that windows snap to, a zoom chip in its corner (Ctrl+0 shows
 //everything, Ctrl+1 is 100 %), panning that stops a little past the edges, and new generators that come in as big as
 //their content and on a free spot
@@ -18,6 +21,7 @@ DEFAULT_WINDOW_W = 400;   //generatoritem's size before the asset sets its own
 DEFAULT_WINDOW_H = 300;
 MARQUEE_COLOR = vec4f(0.616, 0.522, 1.0, 0.10);      //the inside of the frame
 MARQUEE_EDGE_COLOR = vec4f(0.616, 0.522, 1.0, 0.85); //its edge, 1 px
+PASTE_OFFSET = 32;        //Ctrl+V without the mouse over the canvas: the copies land this far right of and below the originals
 
 class generatorview
 {
@@ -34,6 +38,7 @@ class generatorview
 	marquee_from = None;
 	marquee_to = None;
 	marquee_base = []; //what stays selected under a frame pulled with Shift or Ctrl
+	mouse_at = None;   //where the mouse was on the canvas last: Ctrl+V pastes there
 	
 	grid_size = 0.0;
 	managed zoom_chip = None; //only on a canvas
@@ -55,13 +60,18 @@ class generatorview
 		
 		area.content().fixed_size(vec2f(16999,16999));
 		
+		//Generators or an asset (#346): anything else (a clip, an area) gets the red outline of the screen and is not
+		//dropped
 		area.content().on_dragdrop_hover([this](payload, pos) {
-			return true;
+			return this.takes_drop(payload);
 		});
 		
 		area.content().on_dragdrop([this, area](payload, pos) {
+			if(!this.takes_drop(payload))
+				return false;
+
 			//Generators dragged out of a view like this one (#348): they move here, Ctrl leaves copies
-			if(payload.generators)
+			if(payload.has("generators") && payload.generators)
 				return this.drop_generators(pos);
 
 			path = fileio.relative_path_cwd(payload.path);
@@ -237,6 +247,15 @@ class generatorview
 	// Dragging generators to another view
 	// =========================================================================
 
+	//What the canvas takes: generators dragged out of a Patchview, or an asset (a payload with a path)
+	takes_drop(payload) {
+		if(!std.is_json(payload))
+			return false;
+		if(payload.has("generators") && payload.generators)
+			return true;
+		return payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
+	}
+
 	//Alt + drag on a generator: it leaves with the others that are selected
 	start_drag(item) {
 		if(nanogui.show_mode())
@@ -285,6 +304,9 @@ class generatorview
 		//[view, guid]. Moves inside one view only change positions and are no step
 		step_moves = [];
 		step_copies = [];
+		//The copies and what they were made of, for their links among themselves
+		snaps = [];
+		copies = [];
 		for(i = 0; i < drag.guids.size(); i++) {
 			guid = drag.guids[i];
 			if(!source.items.has(guid))
@@ -296,7 +318,10 @@ class generatorview
 			target = vec2f(pos.x + at.x - origin.x, pos.y + at.y - origin.y);
 
 			if(copy) {
-				made = copy_generator(gen, target);
+				snap = snapshot_generator(gen);
+				made = copy_snapshot(snap, target);
+				snaps.push_back(snap);
+				copies.push_back(made);
 				if(made) {
 					moved.push_back(made.guid);
 					step_copies.push_back([view = uid, guid = made.guid]);
@@ -315,6 +340,7 @@ class generatorview
 				step_moves.push_back([guid = gen.guid, from = source.uid, from_pos = [x = at.x, y = at.y], to = uid, to_pos = [x = now.x, y = now.y]]);
 			}
 		}
+		link_copies(snaps, copies);
 
 		//One step of the history: the history runs it in the main program, by the uids and guids, as this view may
 		//be gone by then (generators.shio, generator_step)
@@ -385,23 +411,82 @@ class generatorview
 		return made;
 	}
 
-	//A copy of a generator at pos: a new one of the same asset with the state and the controls of the original, as a
-	//clip copied with Ctrl in the Clipview. Links to other generators are not copied
-	copy_generator(gen, pos) {
+	//What a copy of a generator is made of, as data (a paste still works when the original is gone): the asset, the
+	//state and the controls of the original, where it was, the path of its node and its links to other generators
+	//(node.serialize_json(true): "global", the local side relative, the other side by its full path)
+	snapshot_generator(gen) {
 		state = gen.save_state();
-		node_state = gen.node.serialize_json(false);
-		made = add_generator(area, gen.get_relative_path(), pos);
+		state.erase("x");
+		state.erase("y");
+		state.erase("guid");
+		pos = gen.window.position();
+		return [path = gen.get_relative_path(), state = state, node = gen.node.serialize_json(false),
+			node_path = gen.node.get_full_path(), x = pos.x, y = pos.y, links = node_links_outside(gen.node)];
+	}
+
+	//A copy of a generator at pos: a new one of the same asset with the state and the controls of the original, as a
+	//clip copied with Ctrl in the Clipview. Its links to other generators come with link_copies (copy_links.shio)
+	copy_snapshot(snap, pos) {
+		made = add_generator(area, snap.path, pos);
 		if(!made)
 			return None;
 		try {
-			state.erase("x");
-			state.erase("y");
-			state.erase("guid");
-			made.load_state(state);
-			made.node.deserialize_json(node_state, true);
+			made.load_state(snap.state.copy());
+			made.node.deserialize_json(snap.node, true);
 		}
 		catch(e) {}
 		return made;
+	}
+
+	// =========================================================================
+	// Ctrl+C / Ctrl+V (#348)
+	// =========================================================================
+	//The clipboard is the program's (engine.env.generator_clipboard), not the system's: copies taken in one Patchview
+	//can be pasted into another one
+
+	//Ctrl+C: the selected generators go to the clipboard. false: nothing is selected here
+	copy_selection() {
+		snaps = [];
+		for(i = 0; i < selection.size(); i++) {
+			if(items.has(selection[i]))
+				snaps.push_back(snapshot_generator(items[selection[i]]));
+		}
+		if(snaps.size() == 0)
+			return false;
+		env = std.global("engine").env;
+		env.generator_clipboard = snaps;
+		env.generator_clipboard_view = uid;
+		return true;
+	}
+
+	//Ctrl+V: copies of what is on the clipboard, with the links they had among themselves, as one step. They keep their
+	//arrangement: the first lands at the mouse when it was over this canvas last, else a little beside its original.
+	//The copies are the selection then. false: the clipboard is empty
+	paste() {
+		env = std.global("engine").env;
+		snaps = env.generator_clipboard;
+		if(!snaps || snaps.size() == 0 || nanogui.show_mode())
+			return false;
+		at = !std.is_none(mouse_at) && env.hovered_patch_uid == uid
+			? mouse_at : vec2f(snaps[0].x + PASTE_OFFSET, snaps[0].y + PASTE_OFFSET);
+		made = [];
+		step_copies = [];
+		for(i = 0; i < snaps.size(); i++) {
+			dup = copy_snapshot(snaps[i], vec2f(at.x + snaps[i].x - snaps[0].x, at.y + snaps[i].y - snaps[0].y));
+			made.push_back(dup);
+			if(dup)
+				step_copies.push_back([view = uid, guid = dup.guid]);
+		}
+		link_copies(snaps, made);
+		if(step_copies.size() > 0)
+			history_step("Paste " + (step_copies.size() == 1 ? "generator" : "generators"), [], step_copies, []);
+
+		select_none();
+		for(i = 0; i < made.size(); i++) {
+			if(made[i])
+				select(made[i].guid);
+		}
+		return true;
 	}
 
 	dispatch(cmd, value) {
@@ -576,10 +661,11 @@ class generatorview
 		});
 		refresh_zoom_chip();
 
-		//The keys (generators.shio) zoom the canvas the mouse was over last
+		//The keys (generators.shio) zoom the canvas the mouse was over last, Ctrl+V pastes there
 		content = area.content();
 		content.on_mouse_motion([this, content](pos, rel, btn, mods){
 			std.global("engine").env.hovered_patch_uid = this.uid;
+			this.mouse_at = pos;
 			return content.mouse_motion_default(pos, rel, btn, mods);
 		});
 	}

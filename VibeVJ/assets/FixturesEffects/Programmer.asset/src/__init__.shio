@@ -1,0 +1,815 @@
+//Programmer (#719): the programmer of a lighting desk for the lamps of the fixture setup, the virtual ones too (slices
+//of MapLab, looks of shaders). A view onto engine.desk (engine/patch/desk_runtime.shio): every Programmer shows the same.
+//
+//- Top: the command line ("group 1 at 50", "all at color red", "store cue 3", "go"; help lists it), Highlight (the
+//  selection at full) and Clear (programmer and selection empty, the lamps go back to what they had).
+//- Left: the selection. A click on a group or a lamp selects it, Ctrl+click adds it or takes it out.
+//- Middle: the values of the selection: Dimmer, Colour, Pan, Tilt and every other channel the selected lamps have. A
+//  value set here is in the programmer (its name in the accent colour) and sends above everything else until Clear.
+//  Below: Store cue puts the programmer into a cue of a cue stack (tracking: only what is in the programmer).
+//- Right: the palettes by kind (Colour, Position, Beam, Look). A click calls one up on the selection, + stores the
+//  programmer as a new one, Store then a click on a palette stores into it, Delete then a click deletes it.
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/fx"
+#include "engine/patch/desk"
+#include "engine/patch/palette"
+#include "engine/interfaces/videorouter"
+
+def show_values();
+def set_mode(mode);
+def pick(ids);
+def plan_map();
+def update_picture();
+def fill_pic_combo();
+def connect_picture();
+def set_follow(on);
+
+PR_ROW = 28;
+PR_ICON_LIGHTBULB = 0xf0eb; //Font Awesome codes nanogui.icon() has no name for
+PR_ICON_ERASER = 0xf12d;
+PR_GAP = 4;
+PR_SIDE_W = 220;
+PR_PAL_W = 300;
+PR_LABEL_W = 92;
+PR_TILE_H = 40;
+PR_TILE_COLS = 3;
+PR_TITLE_H = 24;
+PR_MAX_ROWS = 48; //values shown at most (a selection of many bars has hundreds of channels)
+PR_PLAN_H = 240;   //the stage plan above the values
+PR_PIC_W = 16;     //the picture is read back this small: enough for its colours and a colour per lamp
+PR_PIC_H = 9;
+PR_PIC_SRC = R"(
+#version 330 core
+
+uniform sampler2D input;
+
+void main()
+{
+    fragColor = texture(input, v_uv);
+}
+)";
+
+engine = None;
+desk = None;
+managed cmd_box = None;
+managed status = None;
+managed highlight_btn = None;
+managed blind_btn = None;
+managed sel_content = None;
+managed values_content = None;
+managed plan = None;
+managed pic_combo = None;
+managed pic_shader = None;
+managed follow_btn = None;
+managed pal_view = None;
+managed stack_combo = None;
+managed cue_box = None;
+managed fade_box = None;
+managed store_btn = None;
+managed delete_btn = None;
+
+seen_patch = -1;      //engine.patch_revision the selection list was built at
+seen_desk = -1;       //engine.desk.revision the values and palettes show
+seen_selection = "x"; //the selection the value rows were built for
+sel_buttons = [];     //[[btn, ids], ...] of the selection list
+value_rows = [];      //[[kind, key, caption (label), slider or picker, first lamp, label of it], ...]
+stack_ids = [];       //the stack ids of the items of stack_combo ("" = New stack)
+pal_mode = "";        //"" call up, "store" store into, "delete" delete
+tiles = [];           //where the palette tiles are drawn: [[x, y, w, h, kind, id], ...] (id "" = the + of a kind)
+pal_height = 0;
+pic_source = "";      //the name of the Video router the picture comes from
+pic_names = [];       //the router names of the items of pic_combo after the first
+follow_ids = [];      //the lamps that follow the picture (Follow picture on), [] off
+pic_wanted = false;   //Colours from picture was clicked: make the palettes when the picture is there
+plan_drag = None;     //a drag on the plan: [x, y] where it started (widget pixels), or None
+plan_drag_to = None;
+setting_values = false; //while the rows are set from the desk: their callbacks do not write back
+
+// =========================================================================
+// Selection
+// =========================================================================
+
+//A click on a group or lamp: replace the selection, with Ctrl add or take out
+pick(ids) {
+	ctrl = engine.screen.modifier_ctrl() || engine.screen.modifier_shift();
+	if(!ctrl) {
+		desk.select(ids, "replace");
+		return;
+	}
+	//all of them selected already: take them out, else add them
+	all_in = ids.size() > 0;
+	for(i = 0; i < ids.size(); i++) {
+		if(!desk.prog.selection.has_value(ids[i]))
+			all_in = false;
+	}
+	desk.select(ids, all_in ? "remove" : "add");
+}
+
+build_selection() {
+	sel_content.clear_children();
+	sel_buttons = [];
+	p = engine.patch;
+	add = [](caption, ids, tip) {
+		btn = sel_content.pushbutton(caption).fixed_height(PR_ROW).alignment("left").tooltip(tip);
+		btn.on_change([ids, btn](v) {
+			pick(ids);
+		});
+		sel_buttons.push_back([btn = btn, ids = ids]);
+	};
+	sel_content.label("Groups").fixed_height(PR_TITLE_H).text_color(PAL_TEXT_2);
+	add("All lamps", desk_ids(p.fixtures), "Every lamp of the [[fixture setup]], the virtual ones too");
+	for(i = 0; i < p.groups.size(); i++) {
+		g = p.groups[i];
+		add(g.name, g.fixtures.copy(), "The " + g.fixtures.size() + " lamps of this group, in its order. Ctrl+click adds them to the selection");
+	}
+	sel_content.label("Lamps").fixed_height(PR_TITLE_H).text_color(PAL_TEXT_2);
+	for(i = 0; i < p.fixtures.size(); i++) {
+		f = p.fixtures[i];
+		add((i + 1) + "  " + f.name, [f.id], patch_type(f.type).name + (patch_is_virtual(f) ? " (virtual)" : "") + ". Ctrl+click adds it to the selection");
+	}
+	if(!p.fixtures.size())
+		sel_content.label("No lamps yet: Devices > Fixtures > Fixture setup").wrap(true).fixed_width(PR_SIDE_W - 16).text_color(PAL_TEXT_3);
+	sel_content.parent().refresh_layout();
+}
+
+//The pushed state of the selection buttons follows the selection
+show_selection() {
+	sel = desk.prog.selection;
+	for(i = 0; i < sel_buttons.size(); i++) {
+		ids = sel_buttons[i].ids;
+		on = ids.size() > 0;
+		for(k = 0; k < ids.size(); k++) {
+			if(!sel.has_value(ids[k])) {
+				on = false;
+				break;
+			}
+		}
+		if(sel_buttons[i].btn.pushed() != on)
+			sel_buttons[i].btn.pushed(on);
+	}
+}
+
+// =========================================================================
+// The stage plan: pick lamps where they hang (#719)
+// =========================================================================
+
+//How metres of the stage plan map to pixels of the plan: [scale, ox, oy] (x px = ox + x m * scale, y px = oy + y m * scale;
+//y towards the audience is down)
+plan_map() {
+	s = plan.size();
+	b = patch_bounds(engine.patch.fixtures);
+	if(!b)
+		b = [min_x = -4.0, min_y = -4.0, max_x = 4.0, max_y = 4.0];
+	pad = 1.0;
+	span_x = math.max(1.0, b.max_x - b.min_x + 2.0 * pad);
+	span_y = math.max(1.0, b.max_y - b.min_y + 2.0 * pad);
+	scale = math.min(s.x / span_x, s.y / span_y);
+	ox = s.x / 2.0 - (b.min_x + b.max_x) / 2.0 * scale;
+	oy = s.y / 2.0 - (b.min_y + b.max_y) / 2.0 * scale;
+	return [scale = scale, ox = ox, oy = oy];
+}
+
+//The colour a lamp shows on the plan: the programmer's (Blind: what will be sent), else what it is sent now
+plan_color(f) {
+	if(desk.blind && desk.prog.values.has(f.id)) {
+		vals = desk.prog.values[f.id];
+		labels = desk_labels_of_function(f.type, "color");
+		r = 1.0;
+		g = 1.0;
+		b = 1.0;
+		if(labels.size() >= 3) {
+			r = vals.has(labels[0]) ? vals[labels[0]] : 1.0;
+			g = vals.has(labels[1]) ? vals[labels[1]] : 1.0;
+			b = vals.has(labels[2]) ? vals[labels[2]] : 1.0;
+		}
+		dims = desk_labels_of_function(f.type, "dimmer");
+		d = dims.size() && vals.has(dims[0]) ? vals[dims[0]] : 1.0;
+		return [r = r * d, g = g * d, b = b * d];
+	}
+	light = engine.fixture_menu ? engine.fixture_menu.lamp_light(f) : None;
+	if(!light)
+		return [r = 0.3, g = 0.3, b = 0.3];
+	return [r = light.r * light.dimmer, g = light.g * light.dimmer, b = light.b * light.dimmer];
+}
+
+draw_plan() {
+	//a last frame while the Programmer is freed (a project loads): its widgets are gone already
+	if(!plan || !engine || !desk)
+		return;
+	s = plan.size();
+	nvgBeginPath();
+	nvgRect(vec2f(0, 0), vec2f(s.x, s.y));
+	nvgFillColor(PAL_CANVAS);
+	nvgFill();
+	p = engine.patch;
+	if(!p.fixtures.size()) {
+		pal_text(vec2f(s.x / 2.0, s.y / 2.0), "No lamps yet", 13, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+		return;
+	}
+	m = plan_map();
+	//where the audience is
+	pal_text(vec2f(s.x / 2.0, s.y - 10), "Audience", 11, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+	sel = desk.prog.selection;
+	for(i = 0; i < p.fixtures.size(); i++) {
+		f = p.fixtures[i];
+		x = m.ox + f.x * m.scale;
+		y = m.oy + f.y * m.scale;
+		c = plan_color(f);
+		r = patch_is_virtual(f) ? 7.0 : 9.0;
+		nvgBeginPath();
+		if(patch_is_virtual(f))
+			nvgRect(vec2f(x - r, y - r * 0.6), vec2f(r * 2.0, r * 1.2));
+		else
+			nvgCircle(vec2f(x, y), r);
+		nvgFillColor(vec4f(c.r, c.g, c.b, 1.0));
+		nvgFill();
+		nvgStrokeColor(sel.has_value(f.id) ? PAL_ACCENT : PAL_LINE_STRONG);
+		nvgStrokeWidth(sel.has_value(f.id) ? 2.5 : 1.0);
+		nvgStroke();
+	}
+	if(desk.blind)
+		pal_badge(vec2f(40, 14), "Blind", PAL_CUE);
+	//the rectangle of a drag
+	if(plan_drag && plan_drag_to) {
+		nvgBeginPath();
+		nvgRect(vec2f(math.min(plan_drag.x, plan_drag_to.x), math.min(plan_drag.y, plan_drag_to.y)),
+			vec2f(math.abs(plan_drag_to.x - plan_drag.x), math.abs(plan_drag_to.y - plan_drag.y)));
+		nvgFillColor(pal_alpha(PAL_ACCENT, 0.12));
+		nvgFill();
+		nvgStrokeColor(PAL_ACCENT);
+		nvgStrokeWidth(1.0);
+		nvgStroke();
+	}
+}
+
+//A click picks the lamp under it (Ctrl: adds it or takes it out), a drag the lamps in its rectangle; a click on nothing
+//with Ctrl does nothing, without it empties the selection
+plan_release(a, b) {
+	m = plan_map();
+	if(math.abs(a.x - b.x) + math.abs(a.y - b.y) < 4.0) {
+		best = None;
+		best_d = 14.0;
+		p = engine.patch;
+		for(i = 0; i < p.fixtures.size(); i++) {
+			f = p.fixtures[i];
+			dx = m.ox + f.x * m.scale - a.x;
+			dy = m.oy + f.y * m.scale - a.y;
+			d = math.sqrt(dx * dx + dy * dy);
+			if(d < best_d) {
+				best_d = d;
+				best = f;
+			}
+		}
+		if(best)
+			pick([best.id]);
+		else if(!(engine.screen.modifier_ctrl() || engine.screen.modifier_shift()))
+			desk.select([], "replace");
+		return;
+	}
+	ids = desk_in_rect(engine.patch, (a.x - m.ox) / m.scale, (a.y - m.oy) / m.scale, (b.x - m.ox) / m.scale, (b.y - m.oy) / m.scale);
+	pick(ids);
+}
+
+// =========================================================================
+// Values of the selection
+// =========================================================================
+
+//The rows for the selected lamps: [kind, key, caption, lamp, label] with kind "function" (key: dimmer, pan, tilt),
+//"color" or "label" (key: the label)
+value_row_specs() {
+	p = engine.patch;
+	specs = [];
+	seen = [];
+	has_func = [];
+	sel = desk.prog.selection;
+	for(i = 0; i < sel.size(); i++) {
+		f = patch_find(p, sel[i]);
+		if(!f)
+			continue;
+		funcs = ["dimmer", "color", "pan", "tilt"];
+		for(k = 0; k < funcs.size(); k++) {
+			labels = desk_labels_of_function(f.type, funcs[k]);
+			if(labels.size() && !has_func.has(funcs[k]))
+				has_func[funcs[k]] = [lamp = f.id, label = labels[0]];
+		}
+	}
+	//a lamp without dimmer is dimmed by its colour (desk_set_function)
+	if(!has_func.has("dimmer") && has_func.has("color"))
+		has_func["dimmer"] = has_func["color"];
+	if(has_func.has("dimmer"))
+		specs.push_back([kind = "function", ref = "dimmer", caption = "Dimmer", lamp = has_func.dimmer.lamp, label = has_func.dimmer.label]);
+	if(has_func.has("color"))
+		specs.push_back([kind = "color", ref = "color", caption = "Colour", lamp = has_func.color.lamp, label = has_func.color.label]);
+	if(has_func.has("pan"))
+		specs.push_back([kind = "function", ref = "pan", caption = "Pan", lamp = has_func.pan.lamp, label = has_func.pan.label]);
+	if(has_func.has("tilt"))
+		specs.push_back([kind = "function", ref = "tilt", caption = "Tilt", lamp = has_func.tilt.lamp, label = has_func.tilt.label]);
+	for(i = 0; i < sel.size() && specs.size() < PR_MAX_ROWS; i++) {
+		f = patch_find(p, sel[i]);
+		if(!f)
+			continue;
+		t = patch_type(f.type);
+		for(k = 0; k < t.controls.size() && specs.size() < PR_MAX_ROWS; k++) {
+			c = t.controls[k];
+			if(c.function == "dimmer" || c.function == "pan" || c.function == "tilt" || c.kind == "RGB" || c.kind == "RGBW")
+				continue;
+			if(seen.has(c.label))
+				continue;
+			seen[c.label] = true;
+			specs.push_back([kind = "label", ref = c.label, caption = c.label, lamp = f.id, label = c.label]);
+		}
+	}
+	return specs;
+}
+
+//What a row shows: the programmer value of its lamp, else what the control has now
+row_value(row, label = "") {
+	label = label ? label : row.label;
+	if(desk_has_value(desk.prog, row.lamp, label))
+		return desk.prog.values[row.lamp][label];
+	c = desk.control(row.lamp, label);
+	return c ? c.ctrl.value() : 0.0;
+}
+
+build_values() {
+	values_content.clear_children();
+	value_rows = [];
+	specs = value_row_specs();
+	if(!specs.size()) {
+		values_content.label(desk.prog.selection.size() ? "The selected lamps have no channels" : "Select lamps on the left, or type on the command line: group 1, fixture 3 thru 6, all").wrap(true).fixed_width(360).text_color(PAL_TEXT_3);
+		values_content.parent().refresh_layout();
+		return;
+	}
+	for(i = 0; i < specs.size(); i++) {
+		spec = specs[i];
+		row = values_content.widget().fixed_height(spec.kind == "color" ? PR_ROW * 4 : PR_ROW);
+		caption = row.label(spec.caption).anchor_left(0).fixed_width(PR_LABEL_W).fixed_height(PR_ROW).text_color(PAL_TEXT_2);
+		entry = [kind = spec.kind, ref = spec.ref, caption = caption, lamp = spec.lamp, label = spec.label, widget = None];
+		if(spec.kind == "color") {
+			picker = row.color_selector().anchor_left(PR_LABEL_W).anchor_right(0).anchor_top(0).anchor_bottom(PR_GAP);
+			picker.tooltip("The colour of every colour of the selected lamps (RGBW: the white part goes to W)");
+			picker.on_color_change([](col) {
+				if(!setting_values)
+					desk.set_color([col.x, col.y, col.z]);
+			});
+			entry.widget = picker;
+		}
+		else {
+			sl = row.slider("").anchor_left(PR_LABEL_W).anchor_right(0).fixed_height(PR_ROW);
+			sl.min_value(0.0).max_value(1.0);
+			key = spec.ref;
+			kind = spec.kind;
+			sl.tooltip(kind == "function" ? "Sets " + spec.caption + " of every selected lamp that has it, into the programmer" : "Sets " + key + " of every selected lamp that has it, into the programmer");
+			sl.value_callback([key, kind](v) {
+				if(setting_values)
+					return;
+				if(kind == "function")
+					desk.set_function(key, v);
+				else
+					desk.set_label(key, v);
+			});
+			entry.widget = sl;
+		}
+		value_rows.push_back(entry);
+	}
+	values_content.parent().refresh_layout();
+	show_values();
+}
+
+//The rows show the values and which of them are in the programmer
+show_values() {
+	setting_values = true;
+	for(i = 0; i < value_rows.size(); i++) {
+		row = value_rows[i];
+		in_prog = false;
+		if(row.kind == "color") {
+			labels = [];
+			f = patch_find(engine.patch, row.lamp);
+			if(f)
+				labels = desk_labels_of_function(f.type, "color");
+			if(labels.size() >= 3) {
+				in_prog = desk_has_value(desk.prog, row.lamp, labels[0]);
+				row.widget.rgb(row_value(row, labels[0]), row_value(row, labels[1]), row_value(row, labels[2]));
+			}
+		}
+		else {
+			in_prog = desk_has_value(desk.prog, row.lamp, row.label);
+			row.widget.value(row_value(row));
+		}
+		row.caption.text_color(in_prog ? PAL_ACCENT : PAL_TEXT_2);
+	}
+	setting_values = false;
+}
+
+// =========================================================================
+// Palettes
+// =========================================================================
+
+//The tiles of the palettes: per kind a title, the palettes, then a + to store a new one
+layout_tiles(width) {
+	tiles = [];
+	y = 0.0;
+	tile_w = (width - PR_GAP * (PR_TILE_COLS - 1)) / PR_TILE_COLS;
+	for(k = 0; k < DESK_PALETTE_KINDS.size(); k++) {
+		kind = DESK_PALETTE_KINDS[k];
+		tiles.push_back([x = 0.0, y = y, w = width, h = PR_TITLE_H, kind = kind, id = "", title = DESK_PALETTE_LABELS[k]]);
+		y += PR_TITLE_H;
+		list = desk_palettes_of(desk.data, kind);
+		n = list.size() + 1;
+		for(i = 0; i < n; i++) {
+			col = i % PR_TILE_COLS;
+			row = std.int(i / PR_TILE_COLS);
+			tile = [x = col * (tile_w + PR_GAP), y = y + row * (PR_TILE_H + PR_GAP), w = tile_w, h = PR_TILE_H, kind = kind,
+				id = i < list.size() ? list[i].id : "+", title = i < list.size() ? list[i].name : "+", color = None];
+			if(i < list.size())
+				tile.color = desk_palette_color(list[i]);
+			tiles.push_back(tile);
+		}
+		y += std.int((n + PR_TILE_COLS - 1) / PR_TILE_COLS) * (PR_TILE_H + PR_GAP) + PR_GAP;
+	}
+	return y;
+}
+
+draw_palettes() {
+	if(!pal_view || !desk)
+		return;
+	s = pal_view.size();
+	for(i = 0; i < tiles.size(); i++) {
+		t = tiles[i];
+		if(!t.id) {
+			pal_text(vec2f(t.x, t.y + t.h / 2.0), t.title, 14, PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE);
+			continue;
+		}
+		nvgBeginPath();
+		nvgRoundedRect(vec2f(t.x, t.y), vec2f(t.w, t.h), 3.0);
+		plus = t.id == "+";
+		fill = plus ? PAL_FIELD : PAL_CONTROL;
+		if(!plus && t.color)
+			fill = vec4f(t.color.r * 0.85, t.color.g * 0.85, t.color.b * 0.85, 1.0);
+		nvgFillColor(fill);
+		nvgFill();
+		//store / delete: every palette outlined in the colour of what a click does
+		if(!plus && pal_mode) {
+			nvgStrokeColor(pal_mode == "store" ? PAL_CUE : PAL_DANGER);
+			nvgStrokeWidth(2.0);
+			nvgStroke();
+		}
+		ink = PAL_TEXT;
+		if(!plus && t.color && (t.color.r * 0.3 + t.color.g * 0.59 + t.color.b * 0.11) > 0.55)
+			ink = PAL_CANVAS;
+		if(plus)
+			ink = PAL_TEXT_3;
+		pal_text(vec2f(t.x + t.w / 2.0, t.y + t.h / 2.0), t.title, plus ? 18 : 13, ink, PAL_ALIGN_CENTER_MIDDLE);
+	}
+}
+
+click_tile(pos) {
+	for(i = 0; i < tiles.size(); i++) {
+		t = tiles[i];
+		if(!t.id || pos.x < t.x || pos.x > t.x + t.w || pos.y < t.y || pos.y > t.y + t.h)
+			continue;
+		if(t.id == "+") {
+			desk.store_palette(t.kind);
+			return true;
+		}
+		if(pal_mode == "delete") {
+			desk.remove_palette(t.id);
+			set_mode("");
+			return true;
+		}
+		if(pal_mode == "store") {
+			//into this palette: the programmer values replace its values
+			pal = desk_palette(desk.data, t.id);
+			fresh = desk_palette_from(desk.prog, engine.patch, t.kind, pal ? pal.name : "", desk.prog.selection);
+			if(pal && fresh) {
+				undo_from = desk.snapshot();
+				pal.generic = fresh.generic;
+				pal.lamps = fresh.lamps;
+				desk.message = "Palette " + pal.name + " stored";
+				desk.record_step("Store palette " + pal.name, undo_from);
+			}
+			else
+				desk.message = "Nothing in the programmer for this palette";
+			desk.changed();
+			set_mode("");
+			return true;
+		}
+		desk.apply_palette(t.id);
+		return true;
+	}
+	return false;
+}
+
+set_mode(mode) {
+	pal_mode = mode;
+	if(store_btn)
+		store_btn.pushed(mode == "store");
+	if(delete_btn)
+		delete_btn.pushed(mode == "delete");
+}
+
+// =========================================================================
+// Cue stacks
+// =========================================================================
+
+fill_stacks() {
+	items = [];
+	stack_ids = [];
+	sel = -1;
+	for(i = 0; i < desk.data.stacks.size(); i++) {
+		s = desk.data.stacks[i];
+		items.push_back(s.name);
+		stack_ids.push_back(s.id);
+		if(s.id == desk.current_stack)
+			sel = i;
+	}
+	items.push_back("New stack");
+	stack_ids.push_back("");
+	if(sel < 0)
+		sel = desk.data.stacks.size() ? 0 : items.size() - 1;
+	stack_combo.items(items).selected(sel);
+}
+
+//Store cue (the programmer) or Record (what the lamps show now) into the stack of the list
+store_cue(recording) {
+	index = stack_combo.selected();
+	id = index >= 0 && index < stack_ids.size() ? stack_ids[index] : "";
+	if(!id)
+		id = desk.add_stack().id;
+	number = cue_box.value();
+	if(recording)
+		desk.record_cue(id, number > 0.0 ? number : None, fade_box.value());
+	else
+		desk.store_cue(id, number > 0.0 ? number : None, "merge", fade_box.value());
+	cue_box.value(0.0);
+}
+
+// =========================================================================
+// Colour from the picture (#719)
+// =========================================================================
+
+fill_pic_combo() {
+	routers = get_video_routers();
+	items = ["Pick a picture…"];
+	pic_names = [];
+	sel = 0;
+	for(i = 0; i < routers.size(); i++) {
+		items.push_back(routers[i].name);
+		pic_names.push_back(routers[i].name);
+		if(routers[i].name == pic_source)
+			sel = i + 1;
+	}
+	pic_combo.items(items).selected(sel);
+}
+
+//The picture of the router named pic_source into the sampler (None when it is gone)
+connect_picture() {
+	routers = get_video_routers();
+	src = None;
+	for(i = 0; i < routers.size(); i++) {
+		if(routers[i].name == pic_source)
+			src = routers[i].output_ctrl.value();
+	}
+	pic_shader.input("input", src);
+}
+
+//The picture read back (16 x 9, RGB bytes), or None while it is not there yet
+picture() {
+	if(!pic_shader || !pic_source)
+		return None;
+	buf = pic_shader.pixel_buffer();
+	if(!buf || buf.size() < PR_PIC_W * PR_PIC_H * 3)
+		return None;
+	return buf;
+}
+
+set_follow(on) {
+	if(on) {
+		follow_ids = desk.prog.selection.copy();
+		if(!follow_ids.size())
+			follow_ids = desk_ids(engine.patch.fixtures);
+		desk.message = "Follow picture: " + follow_ids.size() + " lamps";
+	}
+	else {
+		follow_ids = [];
+		desk.set_video_values(std.json());
+		desk.message = "";
+	}
+	desk.changed();
+}
+
+//Every frame: Follow picture sends the colours of the picture, Colours from picture makes its palettes once it is there
+update_picture() {
+	if(!pic_wanted && !follow_ids.size())
+		return;
+	buf = picture();
+	if(!buf)
+		return;
+	if(pic_wanted) {
+		pic_wanted = false;
+		undo_from = desk.snapshot();
+		n = desk_picture_palettes(desk.data, desk_picture_colors(buf, PR_PIC_W, PR_PIC_H, 6));
+		desk.message = n ? n + " colour palettes from the picture (Picture 1 …)" : "The picture is dark: no colours";
+		desk.record_step("Colours from picture", undo_from);
+		desk.changed();
+	}
+	if(follow_ids.size())
+		desk.set_video_values(desk_follow_values(engine.patch, follow_ids, buf, PR_PIC_W, PR_PIC_H));
+}
+
+// =========================================================================
+// Every frame
+// =========================================================================
+
+update(generator, tl_pos, pos_delta) {
+	if(!engine || !desk || !sel_content)
+		return;
+	update_picture();
+	if(engine.patch_revision != seen_patch) {
+		seen_patch = engine.patch_revision;
+		build_selection();
+		seen_selection = "x";
+	}
+	if(desk.revision != seen_desk) {
+		seen_desk = desk.revision;
+		key = desk_join(desk.prog.selection, ",");
+		if(key != seen_selection) {
+			seen_selection = key;
+			build_values();
+		}
+		else
+			show_values();
+		show_selection();
+		pal_height = layout_tiles(pal_view.width() > 0 ? pal_view.width() : PR_PAL_W - 16);
+		pal_view.fixed_height(math.max(40, pal_height));
+		pal_view.parent().refresh_layout();
+		fill_stacks();
+		count = desk_programmer_count(desk.prog);
+		head = desk.prog.selection.size() + (desk.prog.selection.size() == 1 ? " lamp" : " lamps") + " selected · " + count + (count == 1 ? " value" : " values") + " in the programmer";
+		status.caption(desk.message ? head + " · " + desk.message : head);
+		if(highlight_btn.pushed() != desk.highlight)
+			highlight_btn.pushed(desk.highlight);
+		if(blind_btn.pushed() != desk.blind)
+			blind_btn.pushed(desk.blind);
+		if(follow_btn.pushed() != (follow_ids.size() > 0))
+			follow_btn.pushed(follow_ids.size() > 0);
+	}
+}
+
+entry(generator, area) {
+	engine = generator.engine;
+	desk = engine.desk;
+	generator.window.fixed_size(vec2f(1180, 760));
+	area.layout(None);
+
+	//Top: the command line, Highlight, Clear
+	top = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(PR_ROW);
+	cmd_box = top.textbox("").editable(true).alignment("left").anchor_left(0).anchor_right(4 * 104 + 4 * PR_GAP).fixed_height(PR_ROW)
+		.placeholder("Command: group 1 at 50 · all at color red · palette 2 · store cue 3 · go · help");
+	cmd_box.tooltip("The command line of the [[programmer]], as on a lighting console. Enter runs it. help lists the commands\n[[wiki:Lighting-Desk#the-command-line]]");
+	cmd_box.on_change([](text) {
+		if(!text)
+			return;
+		desk.command(text);
+		cmd_box.value("");
+	});
+	blind_btn = top.pushbutton("Blind").anchor_right(3 * (104 + PR_GAP)).fixed_width(104).fixed_height(PR_ROW);
+	blind_btn.tooltip("Program without changing the show: the programmer is not sent, the plan above the values shows it. Take sends it\n[[wiki:Lighting-Desk#blind-and-take]]");
+	blind_btn.on_change([](v) { desk.set_blind(v); });
+	take_btn = top.button("Take").anchor_right(2 * (104 + PR_GAP)).fixed_width(104).fixed_height(PR_ROW);
+	take_btn.tooltip("Sends the programmer live, fading in from what the lamps show in the Fade of the store row (Blind goes off)");
+	take_btn.on_click([]() { desk.take(fade_box.value()); });
+	highlight_btn = top.pushbutton("Highlight").icon(PR_ICON_LIGHTBULB).anchor_right(104 + PR_GAP).fixed_width(104).fixed_height(PR_ROW);
+	highlight_btn.tooltip("The selected lamps at full (white, intensity full) to find them in the rig");
+	highlight_btn.on_change([](v) {
+		desk.highlight = v ? true : false;
+		desk.changed();
+	});
+	clear_btn = top.button("Clear").icon(PR_ICON_ERASER).danger("hover").anchor_right(0).fixed_width(104).fixed_height(PR_ROW);
+	clear_btn.tooltip("Empties the programmer and the selection: the lamps go back to what they had (cue stacks, the Phaser, their sliders)");
+	clear_btn.on_click([]() {
+		desk.clear();
+	});
+	status = area.label("").anchor_left(0).anchor_right(0).anchor_top(PR_ROW + PR_GAP).fixed_height(20).text_color(PAL_TEXT_3);
+
+	body_top = PR_ROW + PR_GAP + 24;
+
+	//Left: the selection
+	sel_content = area.vscroll().anchor_left(0).anchor_top(body_top).anchor_bottom(0).fixed_width(PR_SIDE_W).content().layout(nanogui.layout_vertical());
+
+	//Right: the palettes
+	pal_side = area.widget().anchor_right(0).anchor_top(body_top).anchor_bottom(0).fixed_width(PR_PAL_W);
+	//From the picture: a Video router, its colours as palettes, lamps that follow it
+	pic_combo = pal_side.combobox().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(PR_ROW);
+	pic_combo.tooltip("The picture colours come from: any shader, video or MapLab output whose Video router is on\n[[wiki:Lighting-Desk#colour-from-the-picture]]");
+	pic_combo.on_open([]() { fill_pic_combo(); });
+	pic_combo.on_change([](index, text) {
+		pic_source = index >= 1 && index - 1 < pic_names.size() ? pic_names[index - 1] : "";
+		connect_picture();
+	});
+	pic_row = pal_side.widget().anchor_left(0).anchor_right(0).anchor_top(PR_ROW + PR_GAP).fixed_height(PR_ROW);
+	pic_btn = pic_row.button("Colours from picture").anchor_left(0).anchor_right(0.5, "percent").fixed_height(PR_ROW);
+	pic_btn.tooltip("Colour palettes Picture 1 … of the colours the picture is made of now, the strongest first (the ones of the last click are replaced)");
+	pic_btn.on_click([]() {
+		pic_wanted = true;
+		if(!pic_source) {
+			desk.message = "Pick a picture first";
+			desk.changed();
+		}
+	});
+	follow_btn = pic_row.pushbutton("Follow picture").anchor_left(0.5, "percent").anchor_right(0).fixed_height(PR_ROW);
+	follow_btn.tooltip("The selected lamps (none selected: all) take the colour of the picture where they hang, live: left to right across the picture, high to low down it. The programmer stays above it");
+	follow_btn.on_change([](v) { set_follow(v); });
+	pic_shader = pal_side.shader().visible(false).fixed_height(20);
+	pic_shader.fragment_source(PR_PIC_SRC);
+	pic_shader.render_size(vec2i(PR_PIC_W, PR_PIC_H));
+	pic_shader.keep_aspect_ratio(false);
+	pic_shader.pixel_readback(true);
+	pic_shader.output_component_format("uint8");
+	pic_shader.output_pixel_format("rgb");
+	pic_top = 2 * (PR_ROW + PR_GAP) + PR_GAP;
+	pal_bar = pal_side.widget().anchor_left(0).anchor_right(0).anchor_top(pic_top).fixed_height(PR_ROW);
+	store_btn = pal_bar.pushbutton("Store").anchor_left(0).anchor_right(0.5, "percent").fixed_height(PR_ROW);
+	store_btn.tooltip("Then click a palette: the programmer values are stored into it (+ stores a new one)");
+	store_btn.on_change([](v) { set_mode(v ? "store" : ""); });
+	delete_btn = pal_bar.pushbutton("Delete").danger("hover").anchor_left(0.5, "percent").anchor_right(0).fixed_height(PR_ROW);
+	delete_btn.tooltip("Then click a palette to delete it");
+	delete_btn.on_change([](v) { set_mode(v ? "delete" : ""); });
+	pal_content = pal_side.vscroll().anchor_left(0).anchor_right(0).anchor_top(pic_top + PR_ROW + PR_GAP).anchor_bottom(0).content().layout(nanogui.layout_vertical());
+	pal_view = pal_content.widget().fixed_width(PR_PAL_W - 16).fixed_height(200);
+	pal_view.tooltip("[[palette|Palettes]]: a click calls one up on the selection. They set every lamp by what its channels do, so Red colours pars, LED bars, slices of MapLab and looks of shaders alike\n[[wiki:Lighting-Desk#palettes]]");
+	pal_view.on_draw([]() { draw_palettes(); });
+	pal_view.on_mouse_button([](pos, button, down, mods) {
+		if(button != 0 || !down)
+			return false;
+		return click_tile(vec2f(pos.x, pos.y));
+	});
+
+	//Middle: the values, then Store cue
+	middle = area.widget().anchor_left(PR_SIDE_W + 8).anchor_right(PR_PAL_W + 8).anchor_top(body_top).anchor_bottom(0);
+	store_row = middle.widget().anchor_left(0).anchor_right(0).anchor_bottom(0).fixed_height(PR_ROW);
+	//fixed widths from the right, the stack takes the rest: the numbers stay readable on a small window (#719, Mac test)
+	store_w = 92;
+	record_w = 80;
+	fade_w = 104;
+	cue_w = 92;
+	stack_combo = store_row.combobox().anchor_left(0).anchor_right(store_w + record_w + fade_w + cue_w + 4 * PR_GAP).fixed_height(PR_ROW);
+	stack_combo.tooltip("The [[cue stack]] Store cue and Record store into (New stack: makes one). The [[executor|Executors]] play them");
+	cue_box = store_row.floatbox().value(0.0).caption("Cue").alignment("right").anchor_right(store_w + record_w + fade_w + 3 * PR_GAP).fixed_width(cue_w).fixed_height(PR_ROW);
+	cue_box.min_value(0.0).max_value(9999.0);
+	cue_box.tooltip("The number of the cue: 0 = the next one after the last. A cue with this number takes the new values on top of its own");
+	fade_box = store_row.floatbox().value(DESK_DEFAULT_FADE).caption("Fade s").alignment("right").anchor_right(store_w + record_w + 2 * PR_GAP).fixed_width(fade_w).fixed_height(PR_ROW);
+	fade_box.min_value(0.0).max_value(600.0);
+	fade_box.tooltip("Fade of a new cue in seconds: how long it takes to get there");
+	record_btn = store_row.button("Record").anchor_right(store_w + PR_GAP).fixed_width(record_w).fixed_height(PR_ROW);
+	record_btn.tooltip("Stores what the lamps show now as a cue, effects included (a Phaser at this moment): the selection, or every lamp when none is selected. What you see is what you get\n[[wiki:Lighting-Desk#record-what-you-see]]");
+	record_btn.on_click([]() { store_cue(true); });
+	store_cue_btn = store_row.button("Store cue").anchor_right(0).fixed_width(store_w).fixed_height(PR_ROW);
+	store_cue_btn.tooltip("Stores the programmer as a cue of the stack: only the values in the programmer (tracking: the rest stays as the cues before left it)\n[[wiki:Lighting-Desk#cue-stacks]]");
+	store_cue_btn.on_click([]() { store_cue(false); });
+	plan = middle.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(PR_PLAN_H);
+	plan.tooltip("The stage from above, the audience at the bottom: click a lamp or a slice to select it, Ctrl+click adds it, drag a rectangle around several. In Blind it shows the programmer\n[[wiki:Lighting-Desk#pick-on-the-stage]]");
+	plan.on_draw([]() { draw_plan(); });
+	plan.on_mouse_button([](pos, button, down, mods) {
+		if(button != 0)
+			return false;
+		if(down) {
+			plan_drag = vec2f(pos.x, pos.y);
+			plan_drag_to = None;
+			return true;
+		}
+		if(plan_drag) {
+			plan_release(plan_drag, plan_drag_to ? plan_drag_to : vec2f(pos.x, pos.y));
+			plan_drag = None;
+			plan_drag_to = None;
+		}
+		return true;
+	});
+	plan.on_mouse_drag([](pos, rel, button, mods) {
+		if(!plan_drag)
+			return false;
+		o = plan.position();
+		plan_drag_to = vec2f(pos.x - o.x, pos.y - o.y);
+		return true;
+	});
+	values_content = middle.vscroll().anchor_left(0).anchor_right(0).anchor_top(PR_PLAN_H + PR_GAP).anchor_bottom(PR_ROW + PR_GAP).content().layout(nanogui.layout_vertical());
+}
+
+save_state() {
+	return [picture = pic_source];
+}
+
+load_state(state) {
+	seen_desk = -1;
+	pic_source = std.string(state.picture ?? "");
+	if(pic_combo) {
+		fill_pic_combo();
+		connect_picture();
+	}
+}

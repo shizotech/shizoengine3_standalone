@@ -21,6 +21,27 @@
 //   vibevj_query, vibevj_lock_generator, vibevj_unlock_generator,
 //   vibevj_activity, vibevj_list_links
 //
+//   vibevj_load_project, vibevj_save_project: a project loaded / saved as the
+//   Projects tab does it (tests, #634). They run on the render thread
+//   (engine.env.mcp_render_step, taken in the on_frame_finished of the engine)
+//   and return when the load / save is done, with its errors and warnings
+//
+//   vibevj_capture, vibevj_list_cameras, vibevj_camera_capture (#670): a PNG
+//   of the screen, a generator or the picture of a Camera generator (after
+//   lamps were held at test values), as an image in the tool result plus its
+//   file (engine/interfaces/ai_capture.shio; image 0: only the file, for
+//   models that take no images in tool results)
+//   the layout actions of the mouse (#344, engine/interfaces/mcp_layout.shio):
+//   vibevj_split_area, vibevj_close_area, vibevj_move_view,
+//   vibevj_set_area_view, vibevj_view_tab, vibevj_set_split_sizes, vibevj_undo.
+//   On the render thread too, through the code of the head, menu, drop and top
+//   bar of the views (one undo step each); they return the layout as
+//   vibevj_describe_layout does, with what they did in 'result'
+//
+//   with "debug_input": 1 in configs/mcp_server.json only (tests, #552):
+//   vibevj_debug_input, vibevj_debug_widgets, vibevj_debug_capture
+//   (engine/interfaces/mcp_debug_input.shio)
+//
 // Safety for live use:
 //   - tool calls run on the HTTP server's script threads, not in the render loop
 //   - server.enabled = false (Pause) rejects everything, allow_writes = false
@@ -32,6 +53,9 @@
 
 #include "mcp/mcp_server"
 #include "aiinterface"
+#include "ai_capture"
+#include "mcp_debug_input"
+#include "mcp_layout"
 
 // nanogui.all_links / nanogui.cable_place for vibevj_list_links
 import nanogui;
@@ -57,6 +81,19 @@ last change. vibevj_lock_generator reserves a generator for your changes.
 
 vibevj_list_links lists the links between controls (what drives what).
 
+vibevj_load_project / vibevj_save_project open and save a project of the
+projects folder, as the Projects tab does. Only when the user asks for it: a
+load replaces everything that is open.
+
+The layout of the views (vibevj_describe_layout reads it): vibevj_split_area,
+vibevj_close_area, vibevj_move_view (move, copy, swap, into a view tab of its
+own), vibevj_set_area_view (a view into an empty area, as its picker),
+vibevj_view_tab (add, select, close, rename), vibevj_set_split_sizes (the line
+between two areas), vibevj_undo. Each is one undo step, as with the mouse, and
+returns the new layout. An area is named by its path in the view tab ('' the
+whole tab, '1/0': index in the split or the Tabview at each level) or by the uid
+of the view in it. Closing never deletes: the view moves into a view tab.
+
 The fixture setup (the lamps of the rig with their Art-Net node, universe, DMX
 address and place on the stage plan, groups for Phasers, nodes added by IP) has
 the live_path "fixture_setup": list_fixtures, list_fixture_types, add_fixtures,
@@ -64,7 +101,17 @@ set_fixture, address_fixtures, remove_fixtures, list_fixture_groups,
 add_fixture_group, set_fixture_group, list_artnet_nodes, add_artnet_node,
 get_dmx_universe, get_dmx_conflicts (lamps and LEDMapper segments that write the
 same channels), highlight_fixtures (find lamps in the rig). Check
-get_dmx_conflicts after changing addresses.
+get_dmx_conflicts after changing addresses. set_fixture_test holds lamps at
+test values (dimmer, color, pan / tilt, ...) until clear_fixture_test;
+get_fixture_values shows what they send, set_fixture_values keeps values for
+good (as the sliders of Devices > Fixtures).
+
+Seeing: vibevj_capture returns a picture of the screen or a generator.
+vibevj_camera_capture looks through a Camera generator (vibevj_list_cameras;
+its queries list_cameras / set_camera pick the camera) and can set lamps to
+test values first: set a lamp, look, correct it in the fixture setup, look
+again. Clear the tests (clear_fixture_test) when you are done. The resource
+vibevj://skills/vibevj_live describes the workflows.
 )";
 
 VIBEVJ_MCP_STATIC_TOOLS = [
@@ -77,7 +124,94 @@ VIBEVJ_MCP_STATIC_TOOLS = [
 	"vibevj_activity",
 	"vibevj_describe_layout",
 	"vibevj_list_links",
+	"vibevj_load_project",
+	"vibevj_save_project",
+	"vibevj_capture",
+	"vibevj_list_cameras",
+	"vibevj_camera_capture",
+	"vibevj_split_area",
+	"vibevj_close_area",
+	"vibevj_move_view",
+	"vibevj_set_area_view",
+	"vibevj_view_tab",
+	"vibevj_set_split_sizes",
+	"vibevj_undo",
 ];
+
+// A tool result with an image (#670): what a tool of VibeVJMCPServer.image_tools returns. The server sends the PNG as an
+// image content block next to the text of info (with the path of the file); image = false: the text only
+VIBEVJ_MCP_IMAGE_PREFIX = "vibevj-image:";
+
+// The MCP server of the stdlib with image results: every other tool goes through mcpserver.call_tool unchanged. A tool
+// of image_tools returns image_result(); call_tool of the base turns that into text, this puts the image in
+class VibeVJMCPServer : mcpserver {
+	// tool name -> true
+	image_tools = [];
+	// token -> [png (buffer), info (json)], until the result is sent
+	pending_images = [];
+	// refresh(): rebuilds the query tools when engine.ai_interfaces changed (VibeVJMCPBridge.refresh_tools). Run before
+	// tools/list and before a call of a name the server does not have, so a generator added a moment ago has its tools
+	// at once: the watcher of the bridge looks only once a second (smoke phase fixturecam: add_item of a Camera, then
+	// set_camera failed with "Unknown tool" in 2 of 3 runs)
+	refresh = None;
+
+	refresh_now() {
+		if(!refresh)
+			return;
+		try {
+			refresh();
+		}
+		catch(e) {
+			std.warn("MCP: refreshing the tools failed: " + e);
+		}
+	}
+
+	list_tools() {
+		refresh_now();
+		return super.list_tools();
+	}
+
+	add_image_tool(tool_name, description, parameters, callback, with_context = false) {
+		image_tools[tool_name] = true;
+		add_tool(tool_name, description, parameters, callback, with_context);
+	}
+
+	// What an image tool returns: a token, its PNG waits in pending_images
+	image_result(png_path, info, image = true) {
+		if(!image)
+			return info;
+		token = std.random_hash(12);
+		pending_images[token] = [png = fileio.read_file(png_path), info = info];
+		return VIBEVJ_MCP_IMAGE_PREFIX + token;
+	}
+
+	call_tool(tool_name, args, ctx) {
+		if(tool_name && !has_tool(tool_name))
+			refresh_now();
+		r = super.call_tool(tool_name, args, ctx);
+		if(!image_tools.has(tool_name) || !r.ok || !r.result.has("content") || r.result.has("isError"))
+			return r;
+		text = std.string(r.result.content[0].text ?? "");
+		if(!text.starts(VIBEVJ_MCP_IMAGE_PREFIX))
+			return r;
+		token = text.substr(VIBEVJ_MCP_IMAGE_PREFIX.length());
+		entry = pending_images[token] ?? None;
+		pending_images.erase(token);
+		if(!entry)
+			return r;
+		r.result.content = [
+			[type = "image", data = std.base64_encode(entry.png), mimeType = "image/png"],
+			[type = "text", text = mcp_value_text(entry.info)],
+		];
+		return r;
+	}
+}
+
+// How long vibevj_load_project / vibevj_save_project wait for the render thread: a heavy project loads for a minute
+// with software OpenGL
+VIBEVJ_MCP_PROJECT_TIMEOUT = 600000;
+// How long a call of the render thread waits for an autosave, a load or another such call to end before it gives up
+VIBEVJ_MCP_BUSY_WAIT = 120000;
 
 vibevj_mcp_is_static_tool(name) {
 	for(i = 0; i < VIBEVJ_MCP_STATIC_TOOLS.size(); i++) {
@@ -114,6 +248,23 @@ vibevj_mcp_normalized(ctrl) {
 
 VIBEVJ_MCP_LINK_TYPES = ["Absolute", "Normalized", "Inverted"];
 
+// Render thread, once per frame (on_frame_finished of the engine): the load or save of vibevj_load_project /
+// vibevj_save_project and the actions of the layout tools (VibeVJMCPBridge.render_call), where a click in the Projects
+// tab or on the views runs them too
+vibevj_mcp_project_tick(engine) {
+	s = engine.env.mcp_render_step;
+	if(!s || s.finished)
+		return;
+	engine.env.mcp_render_step = None;
+	try {
+		s.result = s.fn();
+	}
+	catch(e) {
+		s.error = std.string(e);
+	}
+	s.finished = true;
+}
+
 class VibeVJMCPBridge {
 
 	server = None;
@@ -124,6 +275,9 @@ class VibeVJMCPBridge {
 	allow_writes = true;
 	// 0 = no limit
 	max_calls_per_second = 20;
+	// true: the debug tools (synthetic input, widgets, capture) are served. Only from configs/mcp_server.json
+	debug_input = false;
+	input = None;
 	call_times = [];
 
 	// Generated query tools: name -> [signature, args, description, access]
@@ -132,6 +286,9 @@ class VibeVJMCPBridge {
 
 	watching = false;
 	watcher = None;
+
+	// vibevj_load_project / vibevj_save_project and the layout tools: one at a time (render_call)
+	render_call_running = false;
 
 	__init__(port = VIBEVJ_MCP_DEFAULT_PORT) {
 		this.port = port;
@@ -161,23 +318,32 @@ class VibeVJMCPBridge {
 
 		// Register everything before the port is bound, so the first client
 		// already sees the complete tool list
-		server = mcpserver("VibeVJ", port, None, false);
+		server = VibeVJMCPServer("VibeVJ", port, None, false);
 		
 		server.set_instructions(VIBEVJ_MCP_INSTRUCTIONS);
 		server.tool_filter = [this](tool_name, args, ctx) {
 			return this.filter_call(tool_name, args, ctx);
 		};
+		server.refresh = [this]() {
+			this.refresh_tools();
+		};
 
 		add_static_tools();
+		add_layout_tools();
+		if(debug_input)
+			add_debug_tools();
 
 		if(fileio.exists(".agent/skills/vibevj/SKILL.md"))
 			server.add_resource_file("vibevj://skills/vibevj", "vibevj skill", "How to operate VibeVJ (the skill of the in-app Chat agent).", ".agent/skills/vibevj/SKILL.md");
+		if(fileio.exists(".agent/skills/vibevj_live/SKILL.md"))
+			server.add_resource_file("vibevj://skills/vibevj_live", "vibevj_live skill", "Driving the running VibeVJ: queries, control paths, building a show, the fixture setup and testing lamps with a camera.", ".agent/skills/vibevj_live/SKILL.md");
 
 		refresh_tools(true);
 		
 		if(!server.start()) {
 			error = server.error;
 			server.tool_filter = None;
+			server.refresh = None;
 			server.clear_tools();
 			server = None;
 			query_tools = [];
@@ -205,12 +371,19 @@ class VibeVJMCPBridge {
 	stop() {
 		watching = false;
 
+		if(input) {
+			if(std.global("engine").env.debug_input == input)
+				std.global("engine").env.debug_input = None;
+			input = None;
+		}
+
 		if(!server)
 			return;
 
 		server.stop();
 		// The callbacks capture this bridge, drop them so nothing keeps it alive
 		server.tool_filter = None;
+		server.refresh = None;
 		server.clear_tools();
 		server = None;
 		query_tools = [];
@@ -427,11 +600,271 @@ class VibeVJMCPBridge {
 	}
 
 	// =========================================================================
+	// Projects (vibevj_load_project, vibevj_save_project, #634)
+	// =========================================================================
+
+	// A project name: one folder in projects/, nothing that leaves it
+	project_name_arg(name) {
+		n = std.string(name ?? "").trim();
+		if(!n)
+			std.runtime_error("No project name.");
+		if(n.contains("/") || n.contains("\\") || n.contains(":") || n.starts("."))
+			std.runtime_error("'" + n + "' is not a project name: the name of a folder in projects/, without / \\ : and not starting with a dot.");
+		return n;
+	}
+
+	// Runs fn on the render thread (as a click in the Projects tab or on the views would) and waits for it, then until
+	// the layout has settled. Returns what fn returned, the errors and warnings logged meanwhile (by any thread: views
+	// load in threads) and the seconds it took. A runtime error of fn becomes the error of the tool
+	render_call(fn) {
+		engine = std.global("engine");
+		//An autosave (every few minutes, at the end of a frame) or another call of a client: it is waited for a while
+		t_wait = std.millis();
+		for((engine.load_in_progress || engine.save_in_progress || render_call_running) && std.millis() - t_wait < VIBEVJ_MCP_BUSY_WAIT)
+			std.sleep(20);
+		if(engine.load_in_progress || engine.save_in_progress)
+			std.runtime_error("A project is loading or saving right now, try again when it is done.");
+		if(render_call_running)
+			std.runtime_error("Another project or layout call of the MCP server runs right now, try again when it is done.");
+		render_call_running = true;
+		capture = std.log_capture("warn error");
+		t0 = std.millis();
+		s = VibeVJDebugStep(fn, 0);
+		engine.env.mcp_render_step = s;
+		for(!s.finished && std.millis() - t0 < VIBEVJ_MCP_PROJECT_TIMEOUT)
+			std.sleep(5);
+		if(engine.env.mcp_render_step == s)
+			engine.env.mcp_render_step = None;
+
+		// The views lay out what they loaded in the next frames: wait while a step of the layout runs
+		busy = s.finished ? project_layout_busy() : true;
+		for(busy && s.finished && std.millis() - t0 < VIBEVJ_MCP_PROJECT_TIMEOUT) {
+			std.sleep(50);
+			busy = project_layout_busy();
+		}
+		capture.stop();
+		render_call_running = false;
+
+		errors = [];
+		warnings = [];
+		msgs = capture.read(true, true);
+		for(i = 0; msgs && i < msgs.size(); i++) {
+			p = log_parse(msgs[i][1]);
+			// a level of a call stack, without the text of its error
+			if(p.kind == "runtime" && p.text == "")
+				continue;
+			text = (p.text ? p.text : "(no text)") + (p.place ? " (" + p.place + ")" : "");
+			if(msgs[i][0] == "error")
+				errors.push_back(text);
+			else
+				warnings.push_back(text);
+		}
+
+		if(!s.finished)
+			std.runtime_error("The render loop did not run the call within " + (VIBEVJ_MCP_PROJECT_TIMEOUT / 1000) + " s (is a dialog open?).");
+		if(s.error)
+			std.runtime_error(s.error);
+		return [result = s.result, errors = errors, warnings = warnings, busy = busy ? 1 : 0, seconds = (std.millis() - t0) / 1000.0];
+	}
+
+	// A step of the layout runs (vibevj_describe_layout says busy). No views (yet): nothing to wait for
+	project_layout_busy() {
+		menu = std.global("engine").menu;
+		if(!menu || !menu.generators_menu)
+			return false;
+		try {
+			o = menu.generators_menu.layout_overview();
+			return o.has("busy") && o.busy ? true : false;
+		}
+		catch(e) {}
+		return false;
+	}
+
+	load_project(name) {
+		name = project_name_arg(name);
+		dir = "projects/" + name;
+		// engine.load_project would say these in a dialog, which waits for a person
+		if(!fileio.is_directory(dir))
+			std.runtime_error("No project " + name + " (no folder " + dir + ").");
+		format = project_format(dir);
+		if(format > PROJECT_FORMAT)
+			std.runtime_error("Project " + name + " has format " + format + ", this VibeVJ reads up to " + PROJECT_FORMAT + ".");
+		engine = std.global("engine");
+		if(!engine.env.load_project)
+			std.runtime_error("The Projects tab is not set up yet.");
+
+		r = render_call([engine, name]() {
+			return engine.env.load_project(name);
+		});
+		if(!r.result)
+			std.runtime_error("Project " + name + " was not loaded: " + (r.errors.size() ? r.errors[0] : "see the log of VibeVJ"));
+		return [project = name, folder = dir, errors = r.errors, warnings = r.warnings, busy = r.busy, seconds = r.seconds];
+	}
+
+	// name: Save as… with this name; empty: Save under the name the project has
+	save_project(name = None) {
+		if(name)
+			name = project_name_arg(name);
+		else
+			name = std.global("project").name;
+		if(!name)
+			std.runtime_error("The project has no name yet, pass one.");
+		engine = std.global("engine");
+
+		r = render_call([engine, name]() {
+			engine.save_project(name);
+			//A first save creates the project folder: it shows up in the Projects tab (as with Save of the tab)
+			engine.env.recent_dirty = true;
+			return true;
+		});
+		dir = "projects/" + name;
+		if(!fileio.exists(dir + "/controls.json"))
+			std.runtime_error("Project " + name + " was not saved: " + (r.errors.size() ? r.errors[0] : "see the log of VibeVJ"));
+		return [project = name, folder = dir, errors = r.errors, warnings = r.warnings, seconds = r.seconds];
+	}
+
+	// =========================================================================
+	// Layout (the vibevj_ layout tools, engine/interfaces/mcp_layout.shio, #344)
+	// =========================================================================
+
+	// action(gm, args) runs on the render thread, as a click on the views would. Returns the layout afterwards as
+	// vibevj_describe_layout does, with what the action did in 'result' (and the errors and warnings logged meanwhile)
+	layout_call(action, args) {
+		gm = vibevj_layout_menu();
+		r = render_call([action, gm, args]() {
+			return action(gm, args);
+		});
+		o = gm.layout_overview();
+		for(i = 0; i < 200 && o.has("busy") && o.busy; i++) {
+			std.sleep(50);
+			o = gm.layout_overview();
+		}
+		done = std.is_json(r.result) ? r.result : [];
+		if(r.errors.size())
+			done.errors = r.errors;
+		if(r.warnings.size())
+			done.warnings = r.warnings;
+		done.seconds = r.seconds;
+		o.result = done;
+		return o;
+	}
+
+	add_layout_tools() {
+		area_doc = "The area: its path in the view tab ('' = the whole view tab, '0', '1/0': the index of the area in its split or of the tab in its Tabview at each level, as vibevj_describe_layout nests them; 'areas' there has the path of each area of the tab in front), or the uid of the view it holds (a leaf 'uid', 'assets') or the guid of its split / Tabview.";
+		tab_doc = "View tab of the area: its guid, its name or its place in the top bar (0 = the first); empty = the view tab in front (with a uid in 'area': any).";
+		returns = " Returns the layout as vibevj_describe_layout does, with 'result': what was done (action, the new places as [tab, tab_name, path], 'undo': the step it made, 'changed').";
+
+		server.add_tool(
+			"vibevj_split_area",
+			"Splits an area as Split right / Split down of its head (Ctrl+E, Ctrl+Shift+E) do: what it holds stays, a new empty area appears beside it (its picker shows). With 'view' the new area gets that view, as a drop on the edge of the area. An area in a split of the same direction adds one more area to that split. One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "string(): " + area_doc,
+				direction = "enum(right,down,left,up): Where the new area goes (default right).",
+				ratio = "float(0.05,0.95): The share the new area gets of the room the split area had (default 0.5).",
+				view = "string(): A view for the new area: a name of the picker (Patchview, Clipview, a preset) or an asset path (assets/Views/Patchview.asset). Empty: the new area is empty.",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_split(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_close_area",
+			"Closes an area as Close area of its menu (Ctrl+W) does: closing never deletes, the view in it moves into a view tab of its own in the top bar ('result.view' says where), and the split it was in dissolves when one area is left. An area that is a tab of a Tabview closes that tab (its view goes to a view tab too; the last tab stays, empty). The area of a whole view tab does not close (vibevj_view_tab). One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "&string(): " + area_doc,
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_close(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_move_view",
+			"Moves the view of an area as a drag of its head does: onto another area, in the middle as a tab (into an empty area it fills it), on an edge as a split. Nothing is reloaded: state, links and MIDI mappings stay. mode copy: a copy lands there and the view stays (Ctrl at the drop; onto its own area with an edge zone it duplicates to that side). mode swap: the two areas exchange their views (Swap with of the menu, zone not used). mode new_tab: the view moves into a view tab of its own (Move to new tab of the menu, to not used). One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "&string(): The area whose view moves. " + area_doc,
+				to_tab = "string(): View tab of the target area (default: the one of the moved area).",
+				to = "string(): The target area, as 'area'.",
+				zone = "enum(center,left,right,top,bottom): Where on the target it lands (default center).",
+				mode = "enum(move,copy,swap,new_tab): Default move.",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_move(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_set_area_view",
+			"Puts a view into an area as a click on a tile of the picker of an empty area ('What goes here?') does. Nothing is overwritten: a filled area needs mode tab (the view becomes a tab beside what is there, as a drop in the middle) or mode replace (Replace view with of the menu: the old view moves into a view tab of its own). One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "string(): " + area_doc,
+				view = "&string(): The view: a name of the picker (Patchview, Clipview, CueList, a layout or preset) or an asset path (assets/Views/Patchview.asset, a .preset file).",
+				mode = "enum(empty,tab,replace): Default empty (the area must be empty).",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_set_view(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_view_tab",
+			"The view tabs of the top bar: add (as +, comes to the front; one undo step), select (as a click on the tab, brings it to the front; no undo step), rename (as a double click; one undo step), close (as its close button: deletes the views in it, so only with delete_views 1, after the user said so; vibevj_undo brings them back; the last view tab stays)." + returns,
+			[
+				action = "&enum(add,select,close,rename): What to do.",
+				tab = "string(): The view tab (select, close, rename): its guid, its name or its place in the top bar (0 = the first).",
+				name = "string(): The name (rename; add: default View 2, View 3, ...).",
+				delete_views = "int(0,1): close: 1 deletes the views of the tab with it.",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_view_tab(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_set_split_sizes",
+			"Sets the shares of the areas of a split as dragging the line between two of them does (one undo step 'Resize areas'). Either sizes (a share per area, scaled to add up to 1) or divider + position (the line after area 'divider' goes to 'position' of the split; the two areas beside it share their room and each keeps at least 72 px, as with the mouse)." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "string(): The split: its area (the 'split' node of vibevj_describe_layout), as 'area' of the other tools. " + area_doc,
+				sizes = "array(number): A share per area of the split, left to right / top to bottom.",
+				divider = "int(0,255): Which line: 0 = the one after the first area (default 0).",
+				position = "float(0,1): Where the line goes, 0 - 1 of the split.",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_split_sizes(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_undo",
+			"Undo (or redo) of the top bar, Ctrl+Z / Ctrl+Y: takes back the last step of the one undo history of the program. That is the last layout step, but also a link, a value, a generator or a clip a user changed after it: the name of the step that goes is 'undo' of vibevj_describe_layout (redo: 'redo'); check it first." + returns,
+			[redo = "int(0,1): 1 = redo the step that was taken back last."],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_undo(gm, a); }, args);
+			}
+		);
+	}
+
+	// =========================================================================
 	// Call filter (rate limit, read only mode)
 	// =========================================================================
 
 	is_write_call(tool_name, args) {
 		if(tool_name == "vibevj_lock_generator" || tool_name == "vibevj_unlock_generator")
+			return true;
+		if(tool_name == "vibevj_debug_input" || tool_name == "vibevj_debug_capture")
+			return true;
+		if(tool_name == "vibevj_load_project" || tool_name == "vibevj_save_project")
+			return true;
+		// sets lamps to test values first
+		if(tool_name == "vibevj_camera_capture" && args.geti("fixtures"))
+			return true;
+		if(vibevj_layout_is_tool(tool_name))
 			return true;
 
 		if(tool_name == "vibevj_query") {
@@ -593,7 +1026,7 @@ class VibeVJMCPBridge {
 
 		server.add_tool(
 			"vibevj_describe_layout",
-			"Describes the layout of every view tab: splits, Tabviews, empty areas and the view in each area (its asset in 'assets', by uid), the view tab in front, the maximized area and the next undo / redo step. Read only.",
+			"Describes the layout of every view tab: splits, Tabviews, empty areas and the view in each area (its asset in 'assets', by uid), the view tab in front, the maximized area, the areas of the view tab in front ('areas': path, uid, asset, place on the screen), the next undo / redo step and the view tabs in windows of their own ('windows': place, size, maximized, full screen, whether the bar shows, its buttons). Read only; vibevj_split_area, vibevj_move_view, ... change it.",
 			None,
 			[this](svr, args) {
 				menu = std.global("engine").menu;
@@ -609,6 +1042,120 @@ class VibeVJMCPBridge {
 			[filter = "string(): Only links whose area, generator or control names (of either end) contain this text, case-insensitive."],
 			[this](svr, args) {
 				return this.list_links(args.geti("filter"));
+			}
+		);
+
+		server.add_tool(
+			"vibevj_load_project",
+			"Loads a project of the projects folder, as a click on it in the Projects tab does: what is open is replaced, unsaved changes are lost. Returns when the load is done and the layout has settled: the folder, the errors and warnings logged meanwhile, 'busy' 1 when a step of the layout was still running at the end, the seconds it took.",
+			[name = "&string(): Name of the project (a folder in projects/)."],
+			[this](svr, args) {
+				return this.load_project(args.name);
+			}
+		);
+
+		server.add_image_tool(
+			"vibevj_capture",
+			"Returns a picture (PNG) of the VibeVJ window, of the window of a generator with its controls, or (picture 1) of only the picture of a generator, e.g. what a Camera generator sees. The text part has the file (path, absolute_path) and its size. Read only.",
+			[
+				live_path = "string(): Live path of the generator (vibevj_list_generators); empty = the whole VibeVJ window.",
+				picture = "int(0,1): 1 = only the picture of the generator, without its controls (default 0).",
+				width = "int(64,4096): Width of the PNG in pixels (default: one pixel per window unit).",
+				image = "int(0,1): 0 = no image in the result, only the file (for models that take no images in tool results). Default 1.",
+			],
+			[this](svr, args) {
+				shot = std.global("engine").ai_capture.capture(args.geti("live_path"), args.geti("picture") ? true : false, args.geti("width"));
+				return svr.image_result(shot.path, shot, (args.has("image") ? args.image : 1) ? true : false);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_list_cameras",
+			"Lists the Camera generators (assets/Generators/Input/Camera.asset) with their live_path and what each shows (camera, picture, size). Their queries list_cameras and set_camera pick the camera. Read only.",
+			None,
+			[this](svr, args) {
+				return [cameras = std.global("engine").ai_capture.cameras()];
+			}
+		);
+
+		server.add_image_tool(
+			"vibevj_camera_capture",
+			"Looks through a camera: a picture (PNG) of what a Camera generator sees. With fixtures and values the lamps are first held at test values (as set_fixture_test of the fixture setup) and the picture is taken wait_ms later: set a lamp, look where its light lands, correct the fixture setup, look again. The lamps stay held until clear_fixture_test. The text part has the file, the camera status and what the lamps send.",
+			[
+				live_path = "string(): Live path of the Camera generator, empty = the only one (vibevj_list_cameras).",
+				fixtures = "array(string): Lamps (ids or names) to set before the picture (fixture setup, list_fixtures).",
+				values = "any(): What these lamps send, as an object: a function (dimmer, pan, tilt, strobe, ...) or a control label with a value 0..1, color [r, g, b], pan_degrees / tilt_degrees. Example: {\"dimmer\": 1, \"color\": [1, 0, 0], \"pan\": 0.5, \"tilt\": 0.25}",
+				dark_others = "int(0,1): 1 holds every other lamp dark (dimmer and colour 0), to see only these lamps.",
+				wait_ms = "int(0,10000): Milliseconds from setting the lamps to the picture (default 600 when lamps are set, else 0).",
+				width = "int(64,4096): Width of the PNG in pixels (default 1024).",
+				image = "int(0,1): 0 = no image in the result, only the file. Default 1.",
+			],
+			[this](svr, args, ctx) {
+				test = None;
+				if(args.geti("fixtures"))
+					test = [fixtures = args.fixtures, values = args.geti("values") ?? [], dark_others = args.geti("dark_others") ?? 0];
+				shot = std.global("engine").ai_capture.camera_capture(args.geti("live_path"), test, args.geti("wait_ms"),
+					args.geti("width") ?? AI_CAPTURE_DEFAULT_WIDTH, this.caller_of(ctx));
+				return svr.image_result(shot.path, shot, (args.has("image") ? args.image : 1) ? true : false);
+			},
+			true
+		);
+
+		server.add_tool(
+			"vibevj_save_project",
+			"Saves the open project, as Save in the Projects tab does; with a name as Save as… does (the project has that name from then on). Returns the folder, the errors and warnings logged meanwhile and the seconds it took.",
+			[name = "string(): Save as this name (a folder in projects/); empty = under the name the project has."],
+			[this](svr, args) {
+				return this.save_project(args.geti("name"));
+			}
+		);
+	}
+
+	// Tools for tests (#552): input as from a user, without the mouse and keyboard of the OS. Only with debug_input
+	add_debug_tools() {
+		engine = std.global("engine");
+		if(!engine.screen)
+			return;
+		input = VibeVJDebugInput(engine.screen);
+		engine.env.debug_input = input;
+		std.warn("MCP: debug input is on (debug_input in " + "configs/mcp_server.json): clients can type and click in VibeVJ");
+
+		server.add_tool(
+			"vibevj_debug_input",
+			"DEBUG: sends input into the VibeVJ window as a user gives it, through the window's own event path (focus, drag and drop, undo work as with a real mouse); the real mouse pointer is not moved. Coordinates are window units (as vibevj_describe_layout and vibevj_debug_widgets report them). One event per frame. Event types: move {x,y}; press / release {x?,y?,button?,mods?}; click {x?,y?,button?,mods?,count?}; drag {x,y,x2,y2,button?,mods?,drop_mods?,steps?} (mods held from the press, drop_mods at the release: Ctrl at the drop copies); scroll {x?,y?,dx?,dy?}; key {keys} (\"ctrl+z\", \"ctrl+shift+e\", \"return\", \"escape\"; ctrl is the Ctrl of the program, Command on a Mac); key_down / key_up {keys} (hold a modifier over several events); text {text} (printable ASCII) or {codepoints}; wait {ms?,frames?}. button: left (default), right, middle. Returns the mouse position and the widget under it.",
+			[events = "&any(): The events as a list of objects, e.g. [{\"type\": \"click\", \"x\": 400, \"y\": 300}, {\"type\": \"key\", \"keys\": \"ctrl+e\"}]."],
+			[this](svr, args) {
+				return this.input.events(args.events);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_debug_widgets",
+			"DEBUG: lists the visible widgets of the VibeVJ window whose text (caption, title, value) or tooltip contains 'text' (case-insensitive), with their type and place in window units: x, y, w, h, the middle cx, cy and hit (1: a click at the middle reaches this widget, nothing lies over it). Without text and type: every widget that has a text or tooltip.",
+			[
+				text = "string(): Part of the text or tooltip to look for.",
+				type = "string(): Part of the widget type (nanogui.button, nanogui.window, ...).",
+				max = "int(1,5000): At most this many widgets (default 200).",
+			],
+			[this](svr, args) {
+				count = args.has("max") ? std.int(args.max) : 200;
+				return [widgets = this.input.widgets(args.geti("text"), args.geti("type"), count)];
+			}
+		);
+
+		server.add_tool(
+			"vibevj_debug_capture",
+			"DEBUG: saves a PNG of the whole VibeVJ window (after its next frame) and returns its path and size in pixels.",
+			[
+				path = "&string(): The PNG file to write (relative to the folder of VibeVJ, or absolute).",
+				scale = "float(0.1,4): Pixels per window unit (default 1).",
+			],
+			[this](svr, args) {
+				scale = args.has("scale") ? std.float(args.scale) : 1.0;
+				size = std.global("engine").screen.capture(args.path, scale);
+				if(!size)
+					std.runtime_error("The capture failed, see the log of VibeVJ.");
+				return [path = args.path, width = size.x, height = size.y];
 			}
 		);
 	}

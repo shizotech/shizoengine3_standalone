@@ -1,0 +1,102 @@
+// In / out points and ping-pong of a video clip (#460 point 3): what the clip has to do in this frame, worked out from
+// where it is. No widgets: video_module.shio calls video_loop_step() from its update() and does what it answers,
+// _testing/video_loop.shio checks it without a clip.
+//
+// The loop runs over the frames from In to Out: [a, b) in seconds, a = in * length, b = out * length (at least one
+// frame long). A frame that starts at p is the last one of the range when p + frame >= b.
+//   Forward:   at Out it jumps back to In (backwards: at In to the last frame before Out).
+//   Ping-pong: at Out it turns round and plays backwards to In, there forward again. Only for clips that can play
+//              backwards (video.reversible()); others loop forward.
+//   Loop off:  it stops on the last frame before Out (backwards: on In).
+// A position before In (playing forward) is left alone: a cue point or a jump there plays on into the range.
+
+VIDEO_LOOP_FORWARD = 0;
+VIDEO_LOOP_PINGPONG = 1;
+VIDEO_LOOP_EPS = 0.000001;
+VIDEO_LOOP_SEEK_WAIT_MS = 300; //a jump that has not shown yet is not checked again before this
+
+//What the loop remembers between frames: the direction of ping-pong (1 forward, -1 backwards) and the last jump
+video_loop_state() {
+	return [dir = 1, seek_to = -1.0, seek_ms = 0];
+}
+
+//The range in seconds: [a, b], at least one frame
+video_loop_range(length, frame, in_point, out_point) {
+	a = math.clamp(in_point, 0.0, 1.0) * length;
+	b = math.clamp(out_point, 0.0, 1.0) * length;
+	if(b < a + frame)
+		b = math.min(length, a + frame);
+	if(b < a + frame)
+		a = math.max(0.0, b - frame);
+	return [a = a, b = b];
+}
+
+//True when In / Out leave the whole clip: then the clip loops by itself (seamless) and nothing has to be done
+video_loop_whole(in_point, out_point) {
+	return in_point <= VIDEO_LOOP_EPS && out_point >= 1.0 - VIDEO_LOOP_EPS;
+}
+
+//One frame of the loop. pos: where the clip is (s), speed: the Speed control (its sign: which way the clip runs before
+//ping-pong turns it), finished: the clip stopped at an end of the file. Answers [seek (None or seconds), dir (1 / -1:
+//the direction ping-pong wants, times |speed|), hold (stop here: loop off at an end)]
+video_loop_step(state, pos, speed, length, frame, in_point, out_point, mode, loop, reversible, finished, now_ms) {
+	out = [seek = None, dir = state.dir, hold = false];
+	if(length <= 0 || frame <= 0)
+		return out;
+	if(mode != VIDEO_LOOP_PINGPONG || !reversible)
+		state.dir = 1;
+	out.dir = state.dir;
+	//a jump that has not shown yet
+	if(state.seek_to >= 0) {
+		if(math.abs(pos - state.seek_to) < frame * 0.5 || now_ms - state.seek_ms > VIDEO_LOOP_SEEK_WAIT_MS)
+			state.seek_to = -1.0;
+		else
+			return out;
+	}
+	r = video_loop_range(length, frame, in_point, out_point);
+	forward = speed * state.dir >= 0;
+	at_out = pos + frame >= r.b - VIDEO_LOOP_EPS || (finished && forward);
+	at_in = pos <= r.a + VIDEO_LOOP_EPS || (finished && !forward);
+	last = math.max(r.a, r.b - frame); //the start of the last frame of the range
+
+	if(speed == 0)
+		return out;
+	if(forward && at_out) {
+		if(!loop)
+			out.hold = true;
+		else if(mode == VIDEO_LOOP_PINGPONG && reversible) {
+			state.dir = -state.dir;
+			out.dir = state.dir;
+			//beyond Out (Out was moved under it): back to the last frame first
+			if(pos > last + frame * 0.5)
+				out.seek = last;
+		}
+		else
+			out.seek = r.a;
+	}
+	else if(!forward && at_in) {
+		if(!loop)
+			out.hold = true;
+		else if(mode == VIDEO_LOOP_PINGPONG && reversible) {
+			state.dir = -state.dir;
+			out.dir = state.dir;
+			if(pos < r.a - frame * 0.5)
+				out.seek = r.a;
+		}
+		else
+			out.seek = last;
+	}
+	if(!std.is_none(out.seek)) {
+		state.seek_to = out.seek;
+		state.seek_ms = now_ms;
+	}
+	return out;
+}
+
+//"0:12.4" for the caption of a cue point
+video_loop_time_text(seconds) {
+	tenths = std.int(math.round(math.max(0.0, seconds) * 10)); //(rounded first: 59.96 is 1:00.0, not 0:60.0)
+	m = std.int(tenths / 600);
+	whole = std.int((tenths % 600) / 10);
+	return std.string(m) + ":" + (whole < 10 ? "0" : "") + whole + "." + (tenths % 10);
+}

@@ -174,7 +174,7 @@ child is done.
 
 ### `send_file(path, caption)`
 
-Sends a file to the owner's chat (Telegram) as a document. Chat messages are short; a result that
+Sends a file to the owner's chat as a document. Chat messages are short; a result that
 is long or benefits from layout — a report, a table, a comparison, a presentation — goes into a
 file (HTML or Markdown look best) that you send with `send_file`, and your `signal()` report says
 in a few lines what is in it. A report that is too long for a message is attached as a file
@@ -552,6 +552,14 @@ signal(event = "FAILED",
 Your report is the only thing the parent reads. It must carry the state of the work: files
 touched, APIs produced, verification performed, open problems. The parent must be able to continue
 from your report alone.
+
+---
+
+# Execution speed
+
+Work fast, log workflows, avoid blockers.
+Do not reinvent the wheel for execution flows, log what works, follow proven paths.
+Optimize timing and execution speed of your workflows on the go.
 
 ---
 

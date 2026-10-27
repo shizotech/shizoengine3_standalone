@@ -1,0 +1,683 @@
+// ============================================================================
+// mcp_layout.shio — the layout actions of the views as MCP tools (#344)
+//
+// What a user does with the mouse on the layout, for agents: split an area,
+// close it, move / copy / swap a view, put a view into an empty area (the
+// picker), view tabs (add, select, close, rename), the line between two areas,
+// undo / redo. Each action goes through the code the head, the menu, the drop or
+// the top bar of the views run (engine/generators/singleview.shio,
+// src/menu/generators/generators.shio), so it is the same one step of the undo
+// history as with the mouse.
+//
+// The functions here run on the render thread (VibeVJMCPBridge.layout_call, as
+// vibevj_load_project does), take the generators menu (the layout) and the
+// arguments of the tool and return what they did; the bridge adds the layout
+// as vibevj_describe_layout returns it. A wrong argument is a runtime error
+// with a message for the agent (a tool result with isError), nothing changes.
+//
+// An area is named by its path in its view tab: "" is the area of the view tab
+// itself, below it the index of the area in its split or of the tab in its
+// Tabview at each level ("1", "1/0"), as describe_layout nests them (views of a
+// split, tabs of a Tabview); or by the uid of the view it holds (describe_layout:
+// the uid of a leaf, 'assets', 'areas') or the guid of its split / Tabview.
+// A view tab: its guid, its name or its place in the top bar (0 = the first);
+// empty = the view tab in front.
+// ============================================================================
+
+VIBEVJ_LAYOUT_TOOLS = [
+	"vibevj_split_area",
+	"vibevj_close_area",
+	"vibevj_move_view",
+	"vibevj_set_area_view",
+	"vibevj_view_tab",
+	"vibevj_set_split_sizes",
+	"vibevj_undo",
+];
+
+VIBEVJ_LAYOUT_DIGITS = "0123456789";
+
+vibevj_layout_is_tool(name) {
+	for(i = 0; i < VIBEVJ_LAYOUT_TOOLS.size(); i++) {
+		if(VIBEVJ_LAYOUT_TOOLS[i] == name)
+			return true;
+	}
+	return false;
+}
+
+// The generators menu of the program: the views and their layout
+vibevj_layout_menu() {
+	engine = std.global("engine");
+	menu = engine ? engine.menu : None;
+	if(!menu || !menu.generators_menu)
+		std.runtime_error("The views are not set up yet.");
+	return menu.generators_menu;
+}
+
+// Show mode (#285) locks the layout while performing, as for the mouse
+vibevj_layout_unlocked() {
+	if(nanogui.show_mode())
+		std.runtime_error("Show mode is on: the layout is locked while performing (Show in the timeline bar). Nothing was changed.");
+}
+
+// An argument as text, "" for none
+vibevj_layout_text(value) {
+	if(std.is_none(value))
+		return "";
+	return std.string(value).trim();
+}
+
+vibevj_layout_flag(value) {
+	if(std.is_none(value))
+		return false;
+	if(std.is_string(value))
+		return value == "1" || value.lowercase() == "true";
+	return value ? true : false;
+}
+
+// Only digits and "/": an area path
+vibevj_layout_is_path(text) {
+	for(c : text) {
+		if(c != "/" && VIBEVJ_LAYOUT_DIGITS.find(c) < 0)
+			return false;
+	}
+	return true;
+}
+
+vibevj_layout_is_index(text) {
+	if(text == "")
+		return false;
+	for(c : text) {
+		if(VIBEVJ_LAYOUT_DIGITS.find(c) < 0)
+			return false;
+	}
+	return true;
+}
+
+vibevj_layout_tab_name(gm, ws) {
+	return gm.subviews.tab_name(ws.tab);
+}
+
+// The view tabs as text for a message: "Views" (guid), ...
+vibevj_layout_tab_names(gm) {
+	ordered = gm.ordered_workspaces();
+	text = "";
+	for(i = 0; i < ordered.size(); i++)
+		text += (i ? ", " : "") + std.string(i) + " \"" + vibevj_layout_tab_name(gm, ordered[i]) + "\" (" + ordered[i].node.guid() + ")";
+	return text;
+}
+
+// A view tab by its guid, name or place in the top bar; empty: the one in front
+vibevj_layout_tab(gm, tab) {
+	ordered = gm.ordered_workspaces();
+	key = vibevj_layout_text(tab);
+	if(key == "") {
+		front = gm.front_workspace();
+		if(front)
+			return front;
+		if(ordered.size() > 0)
+			return ordered[0];
+		std.runtime_error("There is no view tab.");
+	}
+	for(i = 0; i < ordered.size(); i++) {
+		if(ordered[i].node.guid() == key)
+			return ordered[i];
+	}
+	for(i = 0; i < ordered.size(); i++) {
+		if(vibevj_layout_tab_name(gm, ordered[i]) == key)
+			return ordered[i];
+	}
+	for(i = 0; i < ordered.size(); i++) {
+		if(vibevj_layout_tab_name(gm, ordered[i]).lowercase() == key.lowercase())
+			return ordered[i];
+	}
+	if(vibevj_layout_is_index(key)) {
+		index = std.int(key);
+		if(index < ordered.size())
+			return ordered[index];
+	}
+	std.runtime_error("No view tab '" + key + "'. The view tabs: " + vibevj_layout_tab_names(gm) + " (a guid, a name or the place in the top bar, 0 = the first).");
+	return None;
+}
+
+// What an area holds, for a message
+vibevj_layout_area_text(area) {
+	if(!area.item)
+		return "empty";
+	if(area.is_split())
+		return "a split";
+	if(area.is_tabs())
+		return "a Tabview";
+	return area.item_meta().name;
+}
+
+// The areas of a view tab as text for a message: "" (a split), "0" (Patchview), ...
+vibevj_layout_area_paths(gm, ws) {
+	list = gm.area_list(ws);
+	text = "";
+	for(i = 0; i < list.size(); i++)
+		text += (i ? ", " : "") + "'" + list[i].path + "' (" + vibevj_layout_area_text(list[i].area) + ")";
+	return text;
+}
+
+// An area: [ws=, area=, path=]. area is a path in the view tab tab, or the uid of the view it holds / the guid of its
+// split or Tabview (in any view tab, or only in tab when it is given). what: the name of the argument, for a message
+vibevj_layout_area(gm, tab, area, what = "area") {
+	key = vibevj_layout_text(area);
+	if(key == "/")
+		key = "";
+	if(key.starts("/"))
+		key = key.substr(1);
+	if(key.ends("/"))
+		key = key.substr(0, std.len(key) - 1);
+
+	if(key != "" && !vibevj_layout_is_path(key)) {
+		tabs = vibevj_layout_text(tab) == "" ? gm.ordered_workspaces() : [vibevj_layout_tab(gm, tab)];
+		for(t = 0; t < tabs.size(); t++) {
+			list = gm.area_list(tabs[t]);
+			for(i = 0; i < list.size(); i++) {
+				held = list[i].area.item;
+				if(held && (held.uid == key || held.guid == key))
+					return [ws = tabs[t], area = list[i].area, path = list[i].path];
+			}
+		}
+		std.runtime_error("No area holds a view with the uid or guid '" + key + "' (" + what + "). Name an area by its path in the view tab ('' = the whole tab, '1/0' ...) or by the uid of its view (vibevj_describe_layout).");
+	}
+
+	ws = vibevj_layout_tab(gm, tab);
+	list = gm.area_list(ws);
+	for(i = 0; i < list.size(); i++) {
+		if(list[i].path == key)
+			return [ws = ws, area = list[i].area, path = key];
+	}
+	std.runtime_error("The view tab \"" + vibevj_layout_tab_name(gm, ws) + "\" has no area '" + key + "' (" + what + "). Its areas: " + vibevj_layout_area_paths(gm, ws) + ".");
+	return None;
+}
+
+// Where an area is now: [tab=, tab_name=, path=], None when it is gone
+vibevj_layout_place(gm, area_uid) {
+	ordered = gm.ordered_workspaces();
+	for(t = 0; t < ordered.size(); t++) {
+		list = gm.area_list(ordered[t]);
+		for(i = 0; i < list.size(); i++) {
+			if(list[i].area.uid == area_uid)
+				return [tab = ordered[t].node.guid(), tab_name = vibevj_layout_tab_name(gm, ordered[t]), path = list[i].path];
+		}
+	}
+	return None;
+}
+
+// Where the view with that uid is now (the area that holds it): [tab=, tab_name=, path=, uid=], None when it is gone
+vibevj_layout_place_of_view(gm, view_uid) {
+	ordered = gm.ordered_workspaces();
+	for(t = 0; t < ordered.size(); t++) {
+		list = gm.area_list(ordered[t]);
+		for(i = 0; i < list.size(); i++) {
+			held = list[i].area.item;
+			if(held && held.uid == view_uid)
+				return [tab = ordered[t].node.guid(), tab_name = vibevj_layout_tab_name(gm, ordered[t]), path = list[i].path, uid = view_uid];
+		}
+	}
+	return None;
+}
+
+// The uids of every view in the layout (leaves: not the splits and Tabviews)
+vibevj_layout_view_uids(gm) {
+	uids = [];
+	ordered = gm.ordered_workspaces();
+	for(t = 0; t < ordered.size(); t++) {
+		leaves = [];
+		ordered[t].view.collect_leaves(leaves);
+		for(i = 0; i < leaves.size(); i++) {
+			if(leaves[i].item)
+				uids[leaves[i].item.uid] = true;
+		}
+	}
+	return uids;
+}
+
+// The views that are in the layout now and were not in before (vibevj_layout_view_uids), with their place
+vibevj_layout_new_views(gm, before) {
+	found = [];
+	now = vibevj_layout_view_uids(gm);
+	for(i = 0; i < now.size(); i++) {
+		uid = now.key(i);
+		if(!before.has(uid)) {
+			place = vibevj_layout_place_of_view(gm, uid);
+			if(place)
+				found.push_back(place);
+		}
+	}
+	return found;
+}
+
+vibevj_layout_state(gm) {
+	return gm.describe_all().compact_string();
+}
+
+// What an action did: the step it added to the undo history and whether the layout changed
+vibevj_layout_done(gm, before, result) {
+	result.changed = vibevj_layout_state(gm) != before ? 1 : 0;
+	result.undo = gm.undo_history ? gm.undo_history.undo_name() : "";
+	return result;
+}
+
+// The view for an area: an asset path (assets/Views/Patchview.asset, a preset) or a name the picker of an empty area
+// shows (Patchview, a layout, a preset)
+vibevj_layout_view_path(gm, view) {
+	key = vibevj_layout_text(view);
+	if(key == "")
+		std.runtime_error("No view: pass an asset path (assets/Views/Patchview.asset) or a name of the picker (Patchview, Clipview, a preset).");
+	choices = gm.picker_choices();
+	for(i = 0; i < choices.size(); i++) {
+		if(choices[i].name == key || choices[i].path == key)
+			return choices[i].path;
+	}
+	for(i = 0; i < choices.size(); i++) {
+		if(choices[i].name.lowercase() == key.lowercase())
+			return choices[i].path;
+	}
+	path = key.replace("\\", "/");
+	if(fileio.exists(path))
+		return path;
+	names = "";
+	for(i = 0; i < choices.size(); i++)
+		names += (i ? ", " : "") + choices[i].name + (choices[i].kind != "view" ? " (" + choices[i].kind + ")" : "");
+	std.runtime_error("No view '" + key + "': not a name of the picker and no such asset. The picker offers: " + names + ". An asset path is relative to the folder of VibeVJ (assets/Views/Patchview.asset).");
+	return None;
+}
+
+// =============================================================================
+// vibevj_split_area: Split right / Split down of the head, Ctrl+E; with a view as a drop on the edge of the area
+// =============================================================================
+
+VIBEVJ_LAYOUT_ZONES = [right = "right", left = "left", down = "bottom", bottom = "bottom", up = "top", top = "top"];
+// The names of the steps, as the head and the menu of an area name them (left and up only come from a drop there)
+VIBEVJ_LAYOUT_SPLIT_NAMES = [right = "Split right", bottom = "Split down", left = "Split left", top = "Split up"];
+
+vibevj_layout_split(gm, args) {
+	vibevj_layout_unlocked();
+	place = vibevj_layout_area(gm, args.geti("tab"), args.geti("area"));
+	v = place.area;
+	direction = vibevj_layout_text(args.geti("direction")).lowercase();
+	if(direction == "")
+		direction = "right";
+	if(!VIBEVJ_LAYOUT_ZONES.has(direction))
+		std.runtime_error("No direction '" + direction + "': right, down, left or up.");
+	zone = VIBEVJ_LAYOUT_ZONES[direction];
+
+	if(!v.can_split())
+		std.runtime_error("Area '" + place.path + "' cannot be split: it is in a view that sits as a window in a Patchview, only the areas of a view tab are split.");
+	if(v.is_split())
+		std.runtime_error("Area '" + place.path + "' is a split: split one of its areas ('" + (place.path == "" ? "" : place.path + "/") + "0', ...).");
+
+	ratio = -1.0;
+	if(!std.is_none(args.geti("ratio"))) {
+		ratio = std.float(args.geti("ratio"));
+		if(ratio < 0.05 || ratio > 0.95)
+			std.runtime_error("ratio is the share of the new area, 0.05 to 0.95.");
+	}
+	path = None;
+	if(vibevj_layout_text(args.geti("view")) != "")
+		path = vibevj_layout_view_path(gm, args.geti("view"));
+
+	before = vibevj_layout_state(gm);
+	new_first = zone == "left" || zone == "top";
+	name = path ? "Add view" : VIBEVJ_LAYOUT_SPLIT_NAMES[zone];
+	made = [area = None];
+	gm.layout_step(name, [v, zone, path, ratio, new_first, &made](){
+		//As split_empty and a drop on the edge do
+		v.restore_maximized();
+		v.last_added = None;
+		v.split(path, zone);
+		added = v.last_added;
+		made.area = added;
+		//The new area and its neighbour (the one that holds what was here) share their room as asked
+		if(!added || ratio < 0.0 || !added.owner || !added.owner.is_split())
+			return;
+		split_module = added.owner.item.module;
+		sizes = split_module.call("get_sizes");
+		other = new_first ? added.slot + 1 : added.slot - 1;
+		if(other < 0 || other >= sizes.size() || added.slot >= sizes.size())
+			return;
+		total = sizes[added.slot] + sizes[other];
+		sizes[added.slot] = total * ratio;
+		sizes[other] = total - total * ratio;
+		split_module.call("set_sizes", sizes);
+	});
+
+	if(!made.area)
+		std.runtime_error("Area '" + place.path + "' was not split (see the log of VibeVJ).");
+	result = [action = name, area = vibevj_layout_place(gm, made.area.uid)];
+	if(made.area.owner)
+		result.split_area = vibevj_layout_place(gm, made.area.owner.uid);
+	if(path) {
+		result.view = path;
+		result.view_loaded = made.area.item ? 1 : 0;
+	}
+	return vibevj_layout_done(gm, before, result);
+}
+
+// =============================================================================
+// vibevj_close_area: Close area of the head and the menu, Ctrl+W; in a Tabview the close button of the tab
+// =============================================================================
+
+vibevj_layout_close(gm, args) {
+	vibevj_layout_unlocked();
+	place = vibevj_layout_area(gm, args.geti("tab"), args.geti("area"));
+	v = place.area;
+	if(!v.owner)
+		std.runtime_error("Area '" + place.path + "' is the whole view tab \"" + vibevj_layout_tab_name(gm, place.ws) + "\": it does not close. Delete the view tab (vibevj_view_tab, action close) or move its view (vibevj_move_view).");
+	if(v.is_split())
+		std.runtime_error("Area '" + place.path + "' is a split: close its areas one by one, the split dissolves when one area is left.");
+
+	view_uid = v.item ? v.item.uid : "";
+	before = vibevj_layout_state(gm);
+	name = "Close area";
+	if(v.in_tab) {
+		holder = v.owner;
+		if(!holder.is_tabs() || !holder.item.module.has("close_tab_of"))
+			std.runtime_error("Area '" + place.path + "' is a tab, but its Tabview cannot close tabs.");
+		name = "Close tab";
+		gm.layout_step(name, [holder, v](){
+			holder.item.module.call("close_tab_of", v.uid);
+		});
+	}
+	else
+		v.close_area();
+
+	result = [action = name];
+	//Closing never deletes: the view is in a view tab of its own now
+	if(view_uid != "")
+		result.view = vibevj_layout_place_of_view(gm, view_uid);
+	return vibevj_layout_done(gm, before, result);
+}
+
+// =============================================================================
+// vibevj_move_view: a view dragged by its head onto another area (move, Ctrl at the drop: copy), Swap with and
+// Move to new tab of the menu of an area
+// =============================================================================
+
+VIBEVJ_LAYOUT_DROP_ZONES = [center = "center", middle = "center", tab = "center", left = "left", right = "right", top = "top", up = "top", bottom = "bottom", down = "bottom"];
+
+vibevj_layout_move(gm, args) {
+	vibevj_layout_unlocked();
+	place = vibevj_layout_area(gm, args.geti("tab"), args.geti("area"));
+	source = place.area;
+	mode = vibevj_layout_text(args.geti("mode")).lowercase();
+	if(mode == "")
+		mode = "move";
+	if(mode != "move" && mode != "copy" && mode != "swap" && mode != "new_tab")
+		std.runtime_error("No mode '" + mode + "': move, copy, swap or new_tab.");
+	if(!source.item)
+		std.runtime_error("Area '" + place.path + "' is empty: there is no view to move.");
+
+	view_uid = source.item.uid;
+	before = vibevj_layout_state(gm);
+	before_views = vibevj_layout_view_uids(gm);
+
+	if(mode == "new_tab") {
+		if(!source.owner || source.in_tab)
+			std.runtime_error("Move to new tab is for an area in a split. " + (source.in_tab ? "Close the tab of the Tabview (vibevj_close_area): its view moves into a view tab of its own." : "Area '' is a view tab already."));
+		source.move_to_tab();
+		result = [action = "Move to new tab", view = vibevj_layout_place_of_view(gm, view_uid)];
+		return vibevj_layout_done(gm, before, result);
+	}
+
+	//The target: in the view tab of the source unless to_tab says another one
+	to_tab = vibevj_layout_text(args.geti("to_tab"));
+	to = vibevj_layout_text(args.geti("to"));
+	if(to_tab == "" && to == "")
+		std.runtime_error("Where to: pass 'to' (an area path or the uid of the view in it) and, for another view tab, 'to_tab'.");
+	target_place = None;
+	if(to_tab == "" && (to == "" || vibevj_layout_is_path(to)))
+		target_place = vibevj_layout_area(gm, place.ws.node.guid(), to, "to");
+	else
+		target_place = vibevj_layout_area(gm, to_tab, to, "to");
+	target = target_place.area;
+
+	if(mode == "swap") {
+		if(!target.item)
+			std.runtime_error("Area '" + target_place.path + "' is empty: Swap with needs two areas with a view. Move the view there instead (mode move).");
+		if(target.uid == source.uid || source.is_inside(target.uid) || target.is_inside(source.uid))
+			std.runtime_error("Swap with needs two areas apart: one lies in the other.");
+		source.swap_with(target);
+		result = [action = "Swap areas", view = vibevj_layout_place_of_view(gm, view_uid)];
+		if(target.item)
+			result.other = vibevj_layout_place_of_view(gm, target.item.uid);
+		return vibevj_layout_done(gm, before, result);
+	}
+
+	zone_name = vibevj_layout_text(args.geti("zone")).lowercase();
+	if(zone_name == "")
+		zone_name = "center";
+	if(!VIBEVJ_LAYOUT_DROP_ZONES.has(zone_name))
+		std.runtime_error("No zone '" + zone_name + "': center (as a tab, or into an empty area), left, right, top or bottom (split).");
+	zone = VIBEVJ_LAYOUT_DROP_ZONES[zone_name];
+	if(target.is_split())
+		std.runtime_error("Area '" + target_place.path + "' is a split: drop onto one of its areas ('" + (target_place.path == "" ? "" : target_place.path + "/") + "0', ...).");
+	if(mode == "move" && target.is_inside(source.uid))
+		std.runtime_error("A view does not move onto its own area or into an area it holds. mode copy duplicates it to a side of its area.");
+
+	//As a drag of the head of the area and a drop on the target (singleview.start_drag, take_drops)
+	source.restore_maximized();
+	env = std.global("engine").env;
+	if(mode == "copy") {
+		env.dragged_view = None;
+		target.step("Move view", [target, source, zone](){
+			target.drop_copy(source, zone);
+		});
+	}
+	else {
+		env.dragged_view = source;
+		target.step("Move view", [target, zone](){
+			target.drop_view(zone);
+		});
+		env.dragged_view = None;
+	}
+
+	result = [action = mode == "copy" ? "Copy view" : "Move view", view = vibevj_layout_place_of_view(gm, view_uid)];
+	if(mode == "copy") {
+		made = vibevj_layout_new_views(gm, before_views);
+		result.duplicate = made.size() > 0 ? made[0] : None;
+	}
+	return vibevj_layout_done(gm, before, result);
+}
+
+// =============================================================================
+// vibevj_set_area_view: a tile of the picker of an empty area ("What goes here?"); as a tab (a drop in the middle);
+// Replace view with of the menu of an area
+// =============================================================================
+
+vibevj_layout_set_view(gm, args) {
+	vibevj_layout_unlocked();
+	place = vibevj_layout_area(gm, args.geti("tab"), args.geti("area"));
+	v = place.area;
+	mode = vibevj_layout_text(args.geti("mode")).lowercase();
+	if(mode == "")
+		mode = "empty";
+	if(mode != "empty" && mode != "tab" && mode != "replace")
+		std.runtime_error("No mode '" + mode + "': empty, tab or replace.");
+	path = vibevj_layout_view_path(gm, args.geti("view"));
+
+	if(v.is_split())
+		std.runtime_error("Area '" + place.path + "' is a split: name one of its areas ('" + (place.path == "" ? "" : place.path + "/") + "0', ...).");
+	if(mode == "empty" && v.item)
+		std.runtime_error("Area '" + place.path + "' holds " + vibevj_layout_area_text(v) + ": nothing is overwritten. mode tab adds the view as a tab, mode replace puts it in place of the view (which moves into a view tab of its own), vibevj_split_area with 'view' puts it beside.");
+	if(mode == "replace" && v.is_tabs())
+		std.runtime_error("Area '" + place.path + "' is a Tabview: Replace view is for an area with one view. Name one of its tabs ('" + (place.path == "" ? "" : place.path + "/") + "0', ...) or add the view as a tab (mode tab).");
+
+	before = vibevj_layout_state(gm);
+	before_views = vibevj_layout_view_uids(gm);
+	old_uid = v.item ? v.item.uid : "";
+	name = "Add view";
+	if(!v.item)
+		v.pick(path);
+	else if(mode == "tab") {
+		v.step(name, [v, path](){
+			v.drop_path(path, "center");
+		});
+	}
+	else {
+		name = "Replace view";
+		v.replace_view(path);
+	}
+
+	made = vibevj_layout_new_views(gm, before_views);
+	if(made.size() == 0)
+		std.runtime_error("The view " + path + " did not load (see the log of VibeVJ).");
+	result = [action = name, view = made[0], path = path];
+	if(old_uid != "" && mode == "replace")
+		result.replaced = vibevj_layout_place_of_view(gm, old_uid);
+	return vibevj_layout_done(gm, before, result);
+}
+
+// =============================================================================
+// vibevj_view_tab: the view tabs of the top bar: + (add), a click (select), the close button (close), a double click
+// (rename)
+// =============================================================================
+
+vibevj_layout_view_tab(gm, args) {
+	action = vibevj_layout_text(args.geti("action")).lowercase();
+	name = vibevj_layout_text(args.geti("name"));
+	before = vibevj_layout_state(gm);
+
+	if(action == "add") {
+		vibevj_layout_unlocked();
+		if(name == "")
+			name = gm.free_tab_name();
+		made = [ws = None];
+		gm.layout_step("Add tab", [gm, name, &made](){
+			made.ws = gm.add_workspace(name, "", true, false);
+		});
+		if(!made.ws)
+			std.runtime_error("No view tab was added (see the log of VibeVJ).");
+		return vibevj_layout_done(gm, before, [action = "Add tab", tab = made.ws.node.guid(), tab_name = name]);
+	}
+
+	if(action != "select" && action != "close" && action != "rename")
+		std.runtime_error("No action '" + action + "': add, select, close or rename.");
+	if(vibevj_layout_text(args.geti("tab")) == "")
+		std.runtime_error("Which view tab: pass 'tab' (its guid, its name or its place in the top bar, 0 = the first). The view tabs: " + vibevj_layout_tab_names(gm) + ".");
+	ws = vibevj_layout_tab(gm, args.geti("tab"));
+	guid = ws.node.guid();
+
+	if(action == "select") {
+		//A click on the tab: no step of the undo history. A view tab in a window of its own: its window comes forward
+		gm.subviews.set_active_tab(ws.tab);
+		if(ws.window)
+			ws.window.focus_window();
+		return vibevj_layout_done(gm, before, [action = "Select tab", tab = guid, tab_name = vibevj_layout_tab_name(gm, ws)]);
+	}
+
+	vibevj_layout_unlocked();
+	if(action == "rename") {
+		if(name == "")
+			std.runtime_error("No name: pass the new 'name' of the view tab.");
+		gm.layout_step("Rename tab", [gm, ws, name](){
+			gm.subviews.tab_name(ws.tab, name);
+			gm.window_named(ws);
+		});
+		return vibevj_layout_done(gm, before, [action = "Rename tab", tab = guid, tab_name = name]);
+	}
+
+	//close: as the close button of the tab after "yes" to its question; the last view tab stays
+	if(gm.ordered_workspaces().size() <= 1)
+		std.runtime_error("\"" + vibevj_layout_tab_name(gm, ws) + "\" is the last view tab: it stays, the program always has a place for views.");
+	if(ws.view.item && !vibevj_layout_flag(args.geti("delete_views")))
+		std.runtime_error("The view tab \"" + vibevj_layout_tab_name(gm, ws) + "\" holds views: closing it deletes them (the user is asked first). Pass delete_views 1 when the user wants that (vibevj_undo brings them back), or move them out first (vibevj_move_view).");
+	tab_name = vibevj_layout_tab_name(gm, ws);
+	gm.layout_step("Delete tab", [gm, ws](){
+		//Undo makes the views of the tab again from what is kept here (generators.close_tab)
+		gm.bury_views(ws.view);
+		gm.remove_workspace(ws);
+	});
+	return vibevj_layout_done(gm, before, [action = "Delete tab", tab = guid, tab_name = tab_name]);
+}
+
+// =============================================================================
+// vibevj_set_split_sizes: the line between two areas dragged (splitpanes.shio: one step "Resize areas")
+// =============================================================================
+
+vibevj_layout_split_sizes(gm, args) {
+	vibevj_layout_unlocked();
+	place = vibevj_layout_area(gm, args.geti("tab"), args.geti("area"));
+	v = place.area;
+	if(!v.is_split()) {
+		hint = "";
+		if(v.owner && v.owner.is_split()) {
+			holder = vibevj_layout_place(gm, v.owner.uid);
+			if(holder)
+				hint = " The split that holds it is area '" + holder.path + "'.";
+		}
+		std.runtime_error("Area '" + place.path + "' is not a split." + hint);
+	}
+	split_module = v.item.module;
+	count = split_module.call("view_count");
+	sizes = args.geti("sizes");
+	divider = args.geti("divider");
+	position = args.geti("position");
+
+	if(!std.is_none(sizes)) {
+		if(!std.is_list(sizes) || sizes.size() != count)
+			std.runtime_error("sizes needs " + count + " numbers, one share per area of the split.");
+		total = 0.0;
+		for(i = 0; i < sizes.size(); i++) {
+			share = std.float(sizes[i]);
+			if(share < 0.0)
+				std.runtime_error("sizes: a share below 0.");
+			total += share;
+		}
+		if(total <= 0.0)
+			std.runtime_error("sizes: the shares add up to 0.");
+	}
+	else {
+		if(std.is_none(position))
+			std.runtime_error("Pass 'sizes' (a share per area) or 'position' (where the line goes, 0 - 1 of the split) with 'divider' (which line, 0 = the one after the first area).");
+		divider = std.is_none(divider) ? 0 : std.int(divider);
+		if(divider < 0 || divider >= count - 1)
+			std.runtime_error("The split has " + (count - 1) + " line(s) between its areas: divider 0" + (count > 2 ? " to " + (count - 2) : "") + ".");
+		position = std.float(position);
+		if(position < 0.0 || position > 1.0)
+			std.runtime_error("position is 0 - 1 of the split.");
+	}
+
+	//A maximized area gives the room back first, as when its head is dragged
+	maximized = std.global("engine").env.maximized_view;
+	if(maximized)
+		maximized.restore_maximized();
+
+	before = vibevj_layout_state(gm);
+	drag = gm.layout_drag_begin();
+	if(std.is_none(drag))
+		std.runtime_error("The layout is busy (a step or a load runs): try again.");
+	if(!std.is_none(sizes))
+		split_module.call("set_sizes", sizes);
+	else
+		split_module.call("move_grip", divider, position);
+	gm.layout_drag_end("Resize areas", drag);
+
+	return vibevj_layout_done(gm, before, [action = "Resize areas", split_area = place.path, sizes = split_module.call("get_sizes")]);
+}
+
+// =============================================================================
+// vibevj_undo: Undo / Redo of the top bar, Ctrl+Z / Ctrl+Y (the one history of the program: layout, links, values,
+// generators and clips, #350)
+// =============================================================================
+
+vibevj_layout_undo(gm, args) {
+	if(nanogui.show_mode())
+		std.runtime_error("Show mode is on: undo is locked while performing. Nothing was changed.");
+	steps = gm.undo_history;
+	if(!steps)
+		std.runtime_error("There is no undo history yet.");
+	redo = vibevj_layout_flag(args.geti("redo"));
+	name = redo ? steps.redo_name() : steps.undo_name();
+	if(name == "")
+		std.runtime_error(redo ? "Nothing to redo." : "Nothing to undo.");
+	before = vibevj_layout_state(gm);
+	if(redo)
+		steps.redo();
+	else
+		steps.undo();
+	return vibevj_layout_done(gm, before, [action = redo ? "Redo" : "Undo", step = name, redo_next = steps.redo_name()]);
+}

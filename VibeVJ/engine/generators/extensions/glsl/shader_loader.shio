@@ -1,5 +1,6 @@
 
 #include "engine/interfaces/videorouter"
+#include "engine/interfaces/display_output"
 
 import nanogui;
 import subprocess;
@@ -13,21 +14,7 @@ managed video_router = None;
 last_monitor_index = -1;
 monitor_out = None; //the shader of the display output that copies the picture (picture_fit: stretch, fit, fill)
 
-//How the picture fills a display whose shape differs: 0 Stretch (as before), 1 Fit (bars, nothing cut off), 2 Fill
-//(nothing empty, the edges cut off). The copy shader of the output does it, with the sizes of both
-MONITOR_COPY_SHADER = "uniform sampler2D in_texture; uniform vec2 shz_out_size; uniform int shz_fit;\n" +
-	"void main(){\n" +
-	"  vec2 uv = v_uv;\n" +
-	"  vec2 src = vec2(textureSize(in_texture, 0));\n" +
-	"  if(shz_fit != 0 && src.x > 0.0 && src.y > 0.0 && shz_out_size.x > 0.0 && shz_out_size.y > 0.0) {\n" +
-	"    float a = (src.x / src.y) / (shz_out_size.x / shz_out_size.y);\n" +
-	"    vec2 k = a > 1.0 ? vec2(1.0, a) : vec2(1.0 / a, 1.0);\n" +
-	"    if(shz_fit == 2) k = a > 1.0 ? vec2(1.0 / a, 1.0) : vec2(1.0, a);\n" +
-	"    uv = (v_uv - 0.5) * k + 0.5;\n" +
-	"    if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }\n" +
-	"  }\n" +
-	"  fragColor = texture(in_texture, uv);\n" +
-	"}";
+//How the picture fills a display, the copy shader and the Display lists: engine/interfaces/display_output.shio (#601)
 last_frame_index = -1;
 
 uniforms = [];
@@ -37,6 +24,7 @@ is_shadertoy = false;
 
 size_x = None;
 size_y = None;
+size_mode = None; //Settings > Render > Size: 0 Custom, 1 Project
 
 default_input = None;
 default_output = None;
@@ -313,7 +301,7 @@ entry(generator, area, shader_dir) {
 	
 	//Output controls
 	output_vec = ctrls_tab.controlvector("Outputs", "ctrls").expanded(false);	
-	output_vec.tooltip("Where the picture goes: a display, the [[video router]], Spout or NDI\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+	output_vec.tooltip("Where the picture goes: a display, the [[video router]], Spout / Syphon or NDI\n[[wiki:Output-and-Devices#outputs-tab-control]]");
 	
 	monitor_vec = output_vec.controlvector("Monitor", "output_ctrls_monitor").expanded(false);
 	monitor_vec.tooltip("Show the picture on a display or projector\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
@@ -321,20 +309,18 @@ entry(generator, area, shader_dir) {
 	//The name of the display that was chosen, kept with the project: at another venue the order of the displays
 	//differs, the output goes to the display with that name or stays off (no fallback onto the screen of the program)
 	monitor_name = monitor_vec.controltext("monitor_name", "output_ctrls_monitor").caption("Display name").hide_config_menu();
+	//Empty: a text control of an older nanogui starts with its own name as text, and a new shader looked for a display
+	//called "monitor_name" and left every output off (#593, #600)
+	monitor_name.value("");
 	monitor_name.visible(false);
 	monitor_select = monitor_vec.controlcombo("monitor_select", "output_ctrls_monitor").caption("Display");
-	monitor_fit = monitor_vec.controlcombo("monitor_fit", "output_ctrls_monitor").caption("Picture").items(["Stretch", "Fit", "Fill"]).segmented(true); //index-based
-	monitor_fit.tooltip("When the picture and the display have another shape: Stretch fills the display and distorts it, Fit shows all of it with black bars, Fill fills the display and cuts the edges off\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
+	monitor_fit = monitor_vec.controlcombo("monitor_fit", "output_ctrls_monitor").caption("Picture").items(DISPLAY_FIT_ITEMS).segmented(true); //index-based
+	monitor_fit.tooltip(DISPLAY_FIT_TOOLTIP + "\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
 	monitor_type.tooltip("Fullscreen covers the display; Window opens a window you can move");
 	monitor_select.tooltip("The display that shows the picture; Off closes it\n[[wiki:Output-and-Devices#show-the-picture-on-a-display-or-projector]]");
+	//Each display with its name, the resolution the picture is made in for it and its role (Settings > Display, #593)
 	monitor_select.on_open([monitor_select](){
-		ctx = nanogui.current_context();
-		items = ["Off"];
-		for(i = 0; i < ctx.monitor_count(); i++) {
-			info = ctx.monitor_info(i);
-			items.push_back("Display " + (i+1) + (info && info.name ? " · " + info.name : ""));
-		}
-		monitor_select.items(items);
+		monitor_select.items(display_output_items());
 	});
 	
 	mon_cb = monitor_select.on_open();
@@ -360,10 +346,12 @@ entry(generator, area, shader_dir) {
 			video_router.name = v;
 	});
 	
-	spout_vec = output_vec.controlvector("SPOUT", "output_ctrls_spout").caption("Spout").expanded(false);
-	spout_enable = spout_vec.controlbutton("Enable SPOUT", "spout").caption("Enable Spout").push(1);
-	spout_name = spout_vec.controltext("SpoutName", "spout").caption("Spout name").hide_config_menu();
-	spout_vec.tooltip("Send the picture to other programs on this computer (Windows only)\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+	// Spout on Windows, Syphon on macOS (#264): the same controls and IDs, only the captions differ
+	share = std.os_platform().lowercase().starts("mac") ? "Syphon" : "Spout";
+	spout_vec = output_vec.controlvector("SPOUT", "output_ctrls_spout").caption(share).expanded(false);
+	spout_enable = spout_vec.controlbutton("Enable SPOUT", "spout").caption("Enable " + share).push(1);
+	spout_name = spout_vec.controltext("SpoutName", "spout").caption(share + " name").hide_config_menu();
+	spout_vec.tooltip("Send the picture to other programs on this computer (Spout on Windows, Syphon on macOS)\n[[wiki:Output-and-Devices#outputs-tab-control]]");
 	spout_name.tooltip("The name the other program finds the picture by");
 	
 	spout_enable.callback([spout_name, monitor_select](v){
@@ -397,27 +385,11 @@ entry(generator, area, shader_dir) {
 			return;
 		
 		ctx = nanogui.current_context();
-		count = ctx.monitor_count();
 		//A display by its name: the one the project was made with, wherever it is in the list now. A saved display
 		//that is not connected leaves the output off; it does not land on the screen of the program
 		if(index > 0) {
-			wanted = monitor_name.value();
-			found = -1;
-			if(wanted) {
-				for(i = 0; i < count; i++) {
-					info = ctx.monitor_info(i);
-					if(info && info.name == wanted && found < 0)
-						found = i + 1;
-				}
-				//The same name twice (two displays of one model): the place in the list decides
-				if(index <= count) {
-					here = ctx.monitor_info(index - 1);
-					if(here && here.name == wanted)
-						found = index;
-				}
-			}
-			if(index > count || (wanted && found < 0)) {
-				std.warn("Display output: \"" + (wanted ? wanted : "Display " + index) + "\" is not connected, the output stays off");
+			found = display_output_pick(index, monitor_name.value());
+			if(found == 0) {
 				last_monitor_index = 0;
 				monitor_select.value(0, false); //no second round through this callback
 				if(monitor_screen) {
@@ -427,7 +399,7 @@ entry(generator, area, shader_dir) {
 				monitor_out = None;
 				return;
 			}
-			if(found > 0 && found != index) {
+			if(found != index) {
 				monitor_select.value(found, false);
 				index = found;
 			}
@@ -450,10 +422,15 @@ entry(generator, area, shader_dir) {
 		if(mon_info && mon_info.name)
 			monitor_name.value(mon_info.name);
 		
-		//In pixels: macOS gives a Retina display's size in points, the shader rendered at half its resolution (#260)
-		if(mon_info) {
-			size_x.value(mon_info.pixel_width);
-			size_y.value(mon_info.pixel_height);
+		//A shader with its own size (Custom) renders in the resolution of the display (Settings > Display: Auto is the
+		//size in pixels; macOS gives a Retina display's size in points, the shader rendered at half its resolution,
+		//#260). With the size of the project it keeps that: the project size follows the output displays, and setting
+		//Width / Height here while they are linked to the project made the size depend on what changed last (#593)
+		if(mon_info && size_mode && size_mode.value() == 0) {
+			displays = std.global("engine").displays;
+			res = displays ? displays.resolution(index) : [mon_info.pixel_width, mon_info.pixel_height];
+			size_x.value(res[0]);
+			size_y.value(res[1]);
 		}
 	
 		monitor_screen = ctx.fullscreen(index, "shizoengine_output", !monitor_type.value());
@@ -464,25 +441,8 @@ entry(generator, area, shader_dir) {
 			monitor_select.value(0);
 		});
 
-		shader = monitor_screen.shader();
-		shader.anchor(0);
-		fb = monitor_screen.framebuffer_size();
-		shader.render_size(eigen.vec2i(fb[0], fb[1]));
-		shader.fragment_source(MONITOR_COPY_SHADER);
-		shader.input("in_texture", shaders[0].shader);
-		shader.uniform("shz_out_size", vec2f(fb[0], fb[1]));
-		shader.uniform("shz_fit", std.int(monitor_fit.value()));
-		monitor_out = shader;
-
-		//The output window can change its size (Window mode, a display that changes its resolution): the copy renders
-		//at the new size, so the picture stays sharp and keeps its shape
-		monitor_screen.on_window_resize([](new_size, old_size){
-			if(!monitor_screen || !monitor_out)
-				return;
-			fb = monitor_screen.framebuffer_size();
-			monitor_out.render_size(eigen.vec2i(fb[0], fb[1]));
-			monitor_out.uniform("shz_out_size", vec2f(fb[0], fb[1]));
-		});
+		//The copy at the size of the display, also after its window changes (Window mode, another resolution)
+		monitor_out = display_output_copy(monitor_screen, shaders[0].shader, monitor_fit.value());
 		
 	});
 

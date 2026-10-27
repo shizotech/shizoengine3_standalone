@@ -1,0 +1,259 @@
+//Effects over lamps (#655): what the Phaser computes, without UI. Tested in _testing/fixture_fx.shio.
+//
+//Needs engine/patch/patch.shio included before it.
+//
+//- Attributes: besides one control of the lamps (a label of patch_type().controls, as before), a phaser can move
+//  several controls together:
+//    "@position"      the first Pan and Tilt channel: shapes such as a circle or a figure 8 (moving heads)
+//    "@color:<slot>"  R, G and B of one colour slot ("@color:*" every colour slot of the lamp): fades and rainbows
+//- Blend: how phasers on the same control combine in a frame. Lower priorities first, then each one on top of the
+//  result: Priority replaces it (the one with the higher priority wins, as before #655), Highest keeps the higher value
+//  (HTP), Add adds, Multiply scales, Lowest keeps the lower value.
+
+FX_POSITION = "@position";
+FX_COLOR = "@color:";
+FX_COLOR_ALL = "@color:*";
+
+FX_BLENDS = ["Priority", "Highest", "Add", "Multiply", "Lowest"];
+FX_BLEND_TIPS = [
+	"Replaces what phasers with a lower priority send",
+	"The higher value wins (HTP)",
+	"Adds its value to what phasers with a lower priority send",
+	"Scales what phasers with a lower priority send (a dimmer wave over a colour chase)",
+	"The lower value wins",
+];
+
+FX_SHAPES = ["Circle", "Figure 8", "Pan sweep", "Tilt sweep", "Square", "Random"];
+FX_COLOR_MODES = ["Fade", "Rainbow"];
+FX_PLAIN_COLOR_NAMES = ["color", "colour", "rgb", "rgbw"]; //names of a colour slot that say nothing more
+
+// =========================================================================
+// Attributes
+// =========================================================================
+
+//The name of a colour slot from the label of its red control: "RGB - R (2)" -> "RGB (2)"
+fx_color_slot_name(label) {
+	return std.string(label).replace(" - R", "");
+}
+
+//"Colour RGB (2)"; a slot with a name that only says it is a colour ("color", "RGB"): "Colour"
+fx_color_label(slot) {
+	if(FX_PLAIN_COLOR_NAMES.has_value(std.string(slot).lowercase()))
+		return "Colour";
+	return "Colour " + slot;
+}
+
+//What a phaser can move on the lamps of a target: [[id, label, kind ("single", "position", "color"), function], ...].
+//The combined ones first (Position, Colour), then every single control the lamps have in common.
+fx_attributes(p, target) {
+	singles = patch_target_attributes(p, target);
+	list = [];
+	has_pan = false;
+	has_tilt = false;
+	colors = []; //slot names with R, G and B everywhere
+	for(i = 0; i < singles.size(); i++) {
+		a = singles[i];
+		if(a.function == "pan")
+			has_pan = true;
+		if(a.function == "tilt")
+			has_tilt = true;
+		label = std.string(a.label);
+		if((a.kind == "RGB" || a.kind == "RGBW") && label.contains(" - R")) {
+			slot = fx_color_slot_name(label);
+			if(!colors.has_value(slot))
+				colors.push_back(slot);
+		}
+	}
+	if(has_pan && has_tilt)
+		list.push_back([id = FX_POSITION, label = "Position (Pan + Tilt)", kind = "position", function = "position"]);
+	if(colors.size() > 1)
+		list.push_back([id = FX_COLOR_ALL, label = "Colour (all " + colors.size() + " pixels)", kind = "color", function = "color"]);
+	for(i = 0; i < colors.size(); i++)
+		list.push_back([id = FX_COLOR + colors[i], label = fx_color_label(colors[i]), kind = "color", function = "color"]);
+	for(i = 0; i < singles.size(); i++)
+		list.push_back([id = singles[i].label, label = singles[i].label, kind = "single", function = singles[i].function]);
+	return list;
+}
+
+//The kind of an attribute id
+fx_attribute_kind(id) {
+	id = std.string(id);
+	if(id == FX_POSITION)
+		return "position";
+	if(id.starts(FX_COLOR))
+		return "color";
+	return "single";
+}
+
+//What an attribute id is called in a list
+fx_attribute_label(id) {
+	id = std.string(id);
+	if(id == FX_POSITION)
+		return "Position";
+	if(id == FX_COLOR_ALL)
+		return "Colour";
+	if(id.starts(FX_COLOR))
+		return fx_color_label(id.substr(FX_COLOR.length()));
+	return id;
+}
+
+//The controls of a lamp of this type that an attribute moves, as indices into patch_type(type).controls:
+//  single:   [index]
+//  position: [pan, tilt]
+//  color:    [r, g, b, r, g, b, ...] (one triple per colour slot)
+//An empty list when the lamp does not have it.
+fx_controls(type, id) {
+	t = patch_type(type);
+	id = std.string(id);
+	kind = fx_attribute_kind(id);
+	if(kind == "position") {
+		pan = -1;
+		tilt = -1;
+		for(i = 0; i < t.controls.size(); i++) {
+			if(pan < 0 && t.controls[i].function == "pan")
+				pan = i;
+			if(tilt < 0 && t.controls[i].function == "tilt")
+				tilt = i;
+		}
+		return pan >= 0 && tilt >= 0 ? [pan, tilt] : [];
+	}
+	if(kind == "color") {
+		slot = id.substr(FX_COLOR.length());
+		list = [];
+		for(i = 0; i < t.controls.size(); i++) {
+			c = t.controls[i];
+			if((c.kind != "RGB" && c.kind != "RGBW") || c.comp != 0 || i + 2 >= t.controls.size())
+				continue;
+			//(by the label, as fx_attributes names it: "RGB - R (1)" -> "RGB (1)")
+			if(slot != "*" && fx_color_slot_name(c.label) != slot)
+				continue;
+			list.push_back(i);
+			list.push_back(i + 1);
+			list.push_back(i + 2);
+		}
+		return list;
+	}
+	i = patch_control_index(type, id);
+	return i >= 0 ? [i] : [];
+}
+
+// =========================================================================
+// Shapes and colours
+// =========================================================================
+
+fx_hash(n) {
+	x = math.sin(n * 12.9898 + 78.233) * 43758.5453;
+	return x - math.floor(x);
+}
+
+//A position shape at pos (0..1 of a cycle): [x, y] -1..1 (x: pan, y: tilt). cycle and lamp pick the step of Random.
+fx_position(shape, pos, cycle = 0, lamp = 0) {
+	a = 2.0 * math.PI * pos;
+	if(shape == 1)
+		return [x = math.sin(a), y = math.sin(2.0 * a)];
+	if(shape == 2)
+		return [x = math.sin(a), y = 0.0];
+	if(shape == 3)
+		return [x = 0.0, y = math.sin(a)];
+	if(shape == 4) {
+		//the corners one after the other, along the sides
+		side = math.min(3, std.int(math.floor(pos * 4.0)));
+		f = pos * 4.0 - side;
+		corners = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [-1.0, -1.0]];
+		c0 = corners[side];
+		c1 = corners[side + 1];
+		return [x = c0[0] + (c1[0] - c0[0]) * f, y = c0[1] + (c1[1] - c0[1]) * f];
+	}
+	if(shape == 5)
+		return [x = fx_hash(cycle * 31.0 + lamp * 7.0) * 2.0 - 1.0, y = fx_hash(cycle * 17.0 + lamp * 13.0 + 5.0) * 2.0 - 1.0];
+	return [x = math.sin(a), y = math.cos(a)];
+}
+
+//Pan and tilt (0..1) of a shape around a centre: size 1 reaches from 0 to 1
+fx_pan_tilt(shape, pos, center_pan, center_tilt, size, cycle = 0, lamp = 0) {
+	o = fx_position(shape, pos, cycle, lamp);
+	return [pan = math.clamp(center_pan + o.x * size * 0.5, 0.0, 1.0), tilt = math.clamp(center_tilt + o.y * size * 0.5, 0.0, 1.0)];
+}
+
+//HSV (all 0..1) as [r, g, b]
+fx_hsv(h, s, v) {
+	h = h - math.floor(h);
+	i = std.int(math.floor(h * 6.0));
+	f = h * 6.0 - i;
+	p = v * (1.0 - s);
+	q = v * (1.0 - s * f);
+	t = v * (1.0 - s * (1.0 - f));
+	i = i % 6;
+	if(i == 0)
+		return [r = v, g = t, b = p];
+	if(i == 1)
+		return [r = q, g = v, b = p];
+	if(i == 2)
+		return [r = p, g = v, b = t];
+	if(i == 3)
+		return [r = p, g = q, b = v];
+	if(i == 4)
+		return [r = t, g = p, b = v];
+	return [r = v, g = p, b = q];
+}
+
+//The colour of a colour phaser: mode 0 mixes a (at w 0) and b (at w 1); mode 1 (Rainbow) runs through the hues over
+//the cycle (pos), w is the brightness. a, b: [r, g, b] 0..1
+fx_color(mode, w, pos, a, b) {
+	w = math.clamp(w, 0.0, 1.0);
+	if(mode == 1)
+		return fx_hsv(pos, 1.0, w);
+	return [r = a.r + (b.r - a.r) * w, g = a.g + (b.g - a.g) * w, b = a.b + (b.b - a.b) * w];
+}
+
+// =========================================================================
+// Blend
+// =========================================================================
+
+//What a control gets from several phasers in a frame: entries [[priority, blend (index of FX_BLENDS), value], ...] in the
+//order they came. Lower priorities first (equal ones in their order), each blended on top of the ones before; the
+//first one is taken as it is.
+fx_mix(entries) {
+	if(!entries.size())
+		return 0.0;
+	sorted = patch_sort_by(entries, "priority");
+	result = sorted[0].value;
+	for(i = 1; i < sorted.size(); i++) {
+		e = sorted[i];
+		if(e.blend == 1)
+			result = math.max(result, e.value);
+		else if(e.blend == 2)
+			result = math.min(1.0, result + e.value);
+		else if(e.blend == 3)
+			result = result * e.value;
+		else if(e.blend == 4)
+			result = math.min(result, e.value);
+		else
+			result = e.value;
+	}
+	return result;
+}
+
+//One phaser's value for a control in this frame (frame: the frame index of the screen, who: the phaser). Keeps what
+//the phasers sent this frame on the control (ctrl.attr, shared by every Phaser generator) and returns the mix of them.
+//ctrl: the control, or anything with an `attr` JSON (a test). Always through ctrl.attr.<key>: a variable that holds
+//ctrl.attr inside a function is a copy of it, the writes would not reach the control.
+fx_contribute(ctrl, frame, who, priority, blend, value) {
+	if(ctrl.attr.fx_frame != frame) {
+		ctrl.attr.fx_frame = frame;
+		ctrl.attr.fx_entries = [];
+	}
+	entries = ctrl.attr.fx_entries.copy();
+	//the same phaser twice in a frame (a generator copied in a frame could): its last value
+	found = false;
+	for(i = 0; i < entries.size(); i++) {
+		if(entries[i].who == who) {
+			entries[i] = [who = who, priority = priority, blend = blend, value = value];
+			found = true;
+		}
+	}
+	if(!found)
+		entries.push_back([who = who, priority = priority, blend = blend, value = value]);
+	ctrl.attr.fx_entries = entries;
+	return fx_mix(entries);
+}

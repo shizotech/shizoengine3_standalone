@@ -2,6 +2,26 @@
 
 This documentation covers the shader format used in the engine, based on the implementation in `engine/generators/extensions/glsl/shader_loader.shio`.
 
+## The other half is ShizoScript 3 — its docs ship with the app
+
+A `.glsl` asset is GLSL for the pixels, but its controls, its `//@` annotations, its passes and anything
+dynamic around it are driven by **ShizoScript 3** (`.shio`) — a custom language of this engine, with no
+external documentation site. The interpreter that loads your shader prints the reference of everything
+it knows; run it in the app folder (`_shizoengine3/` in a checkout, the folder of `VibeVJ.exe` in a
+released build; `shz` on an installed system):
+
+```
+shz docs                every namespace / object type / function, parameters, description, examples
+shz docs <keyword>      searched by plain keyword (e.g. shader, uniform, bitmap)
+shz mcpdocs             the reference as an MCP server on http://localhost:13338 (agent tools)
+shz --check <file>      compile a .shio without running it
+```
+
+`shizotech/system/miniagent/skills/shizoscript/SKILL.md` is the language guide for AI agents, next to it
+`docs/nanogui.md` for the UI and texture side. A command name resolves with the current folder first,
+so a folder of that name next to the exe shadows `shz docs` — then use `shz shizotech/system/docs`.
+Resolution rules and the measurements: [`../../AGENTS.MD`](../../AGENTS.MD), section *ShizoScript 3*.
+
 ---
 
 ## 1. Directory Structure
@@ -45,7 +65,9 @@ MyShader.glsl/
    - give every `//@slider`, `//@float`, `//@int`, `//@rgb` and `//@rgba` a `value=`: without it the control starts at 0,
      a colour black, and the shader looks broken until someone moves it.
 
-   Check: `python3 compile_scripts/check_glsl.py` (needs `glslangValidator`, it also runs in CI).
+   Check: `python3 compile_scripts/check_glsl.py` (needs `glslangValidator`, it also runs in CI). Without
+   `glslangValidator` installed it still assembles every asset exactly like the loader does and runs the
+   static checks (core-profile built-ins, annotations), and it prints that the compiler step was skipped.
 
 ---
 
@@ -215,6 +237,21 @@ uniform int trigger;
 ```
 - UI: Push button (non-toggle)
 - Default value: `1` (pressed)
+
+#### Text Control
+
+```glsl
+//@text prefix=char slots=16 count=char_count value="HTTP" displayname="Text"
+uniform int text;
+```
+- UI: Editable text field
+- Parameters: `prefix` (the int uniforms that receive the character codes: `<prefix>1` .. `<prefix><slots>`.
+  Default: the name of the uniform below the annotation), `slots` (how many characters, default 16),
+  `count` (an int uniform that receives the number of characters), `value` (the start text)
+- The engine sends the ASCII code of every character (a character outside the printable ASCII range becomes a
+  space, code 32, and characters past `slots` are dropped) and the length into `count`; the shader reads its
+  text from those int uniforms. The uniform below the annotation only names the field (#566: `//@text` was not
+  parsed, so `Text.glsl` showed one block instead of "HTTP")
 
 ---
 
@@ -423,7 +460,7 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 | **Passes** | Additional `.glsl` files in `src/` |
 | **Includes** | `#include path.glsl` relative to `src/` |
 | **Inputs** | `uniform sampler2D`, auto-binding by name |
-| **Annotations** | `//@settings`, `//@slider`, `//@float`, `//@int`, `//@vec2/3/4`, `//@ivec2/3/4`, `//@slidervec2/3/4`, `//@rgb`, `//@rgba`, `//@enum`, `//@button`, `//@pushbutton` |
+| **Annotations** | `//@settings`, `//@slider`, `//@float`, `//@int`, `//@vec2/3/4`, `//@ivec2/3/4`, `//@slidervec2/3/4`, `//@rgb`, `//@rgba`, `//@enum`, `//@button`, `//@pushbutton`, `//@text` |
 | **Shadertoy** | Auto-detected via `mainImage` function |
 
 ---
