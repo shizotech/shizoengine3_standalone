@@ -1,0 +1,321 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  architecture_selftest.shio — the architecture board without LLM and web
+//
+//  Usage:  shz architecture_selftest.shio      (from system/miniagent)
+//
+//  The model file (load, save, normalize, a broken file), the merge of a new
+//  analysis (positions and pending edits survive), the pending edits (checks,
+//  preview, drop with dependents, commit), the texts for the workers, and the
+//  jobs on a fake host: analyze -> merged, plan -> stored and outdated after an
+//  edit, apply -> the edits become the model, a failed apply keeps them, one job
+//  at a time, a restart marks an open job lost. Also the --web command line.
+//  Exits with code 0 when every check passes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "architecture"
+#include "web_ui"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+// the Megamind surface the board uses
+class FakeHost {
+	added = [];
+	known = [];
+	listeners = [];
+	refuse = false;
+
+	add_task(name, goal, role = "adaptive") {
+		if(refuse)
+			return None;
+		id = "t" + std.string(added.size() + 1);
+		added.push_back([taskid = id, name = name, goal = goal, role = role]);
+		known.push_back(id);
+		return id;
+	}
+
+	inspect_task(taskid) {
+		for(k : known) {
+			if(k == taskid)
+				return [taskid = taskid, state = "implement"];
+		}
+		return "Not found.";
+	}
+
+	add_task_finished_listener(cb) {
+		listeners.push_back(cb);
+	}
+
+	finish(taskid, state, report = "done") {
+		for(cb : listeners)
+			cb([taskid = taskid, state = state, report = report]);
+	}
+}
+
+ROOT = __DIR__ + "/.selftest_architecture";
+
+clean() {
+	if(fileio.exists(ROOT)) {
+		for(f : fileio.files(ROOT, true)) {
+			try { fileio.remove(ROOT + "/" + f); } catch(e) {}
+		}
+	}
+	arch_mkdir(ROOT);
+}
+
+ANALYSIS = [
+	project = "demo",
+	summary = "A demo program.",
+	nodes = [
+		[id = "app", label = "App", kind = "ui", group = "front", purpose = "the window"],
+		[id = "core", label = "Core", kind = "module", group = "back", path = "src/core.cpp", purpose = "the logic"],
+		[label = "Data Store", kind = "data", group = "back"],
+	],
+	edges = [
+		[source = "app", target = "core", kind = "calls", label = "run()"],
+		["from" = "core", "to" = "data-store", kind = "data"],
+		[source = "core", target = "nowhere"],
+	],
+];
+
+std.print("\n── model ──");
+clean();
+
+m = arch_normalize(ANALYSIS);
+check("nodes normalized", m.nodes.size() == 3, std.string(m.nodes));
+check("an id is made from the label", arch_find(m.nodes, "data-store") >= 0, std.string(m.nodes));
+check("edges with from/to are read", arch_find(m.edges, "core>data-store:data") >= 0, std.string(m.edges));
+check("an edge to an unknown node is dropped", m.edges.size() == 2, std.string(m.edges));
+check("unknown kinds fall back", arch_norm_node([label = "X", kind = "weird"]).kind == "module");
+check("validate: the analysis names an unknown node", arch_validate(ANALYSIS).size() == 1, std.string(arch_validate(ANALYSIS)));
+check("validate: no nodes", arch_validate([nodes = []]).size() == 1);
+check("validate: duplicate ids", arch_validate([nodes = [[id = "a"], [id = "a"]]]).size() == 1);
+check("slug", arch_slug("Router API (v2)") == "router-api-v2", arch_slug("Router API (v2)"));
+
+path = ROOT + "/architecture.json";
+check("missing file -> empty model", arch_load(path).nodes.size() == 0);
+check("save", arch_save(path, m));
+m2 = arch_load(path);
+check("load what was saved", m2.nodes.size() == 3 && m2.edges.size() == 2 && m2.project == "demo", std.string(m2));
+fileio.write_text(path, "{ not json");
+m3 = arch_load(path);
+check("a broken file gives an empty model", m3.nodes.size() == 0);
+corrupt = false;
+for(f : fileio.files(ROOT, false)) {
+	if(std.string(f).contains("corrupt"))
+		corrupt = true;
+}
+check("a broken file is kept as .corrupt-*", corrupt, std.string(fileio.files(ROOT, false)));
+
+std.print("\n── merge ──");
+m.nodes[0].x = 100.0;
+m.nodes[0].y = 50.0;
+r = arch_add_edit(m, [op = "add_node", node = [label = "Cache", kind = "data"]]);
+check("an edit before the re-sync", r.ok, std.string(r));
+again = [nodes = [[id = "app", label = "App 2", kind = "ui"], [id = "net", label = "Net", kind = "service"]], edges = [[source = "app", target = "net", kind = "network"]]];
+mm = arch_merge_analysis(m, again);
+check("the new analysis replaces the nodes", mm.nodes.size() == 2 && mm.nodes[0].label == "App 2", std.string(mm.nodes));
+check("a node that stays keeps its position", mm.nodes[0].x == 100.0 && mm.nodes[0].y == 50.0, std.string(mm.nodes[0]));
+check("pending edits survive the re-sync", mm.pending.size() == 1);
+check("the revision counts up", mm.revision == m.revision + 1);
+check("project kept when the analysis has none", mm.project == "demo");
+
+std.print("\n── edits ──");
+m = arch_normalize(ANALYSIS);
+r = arch_add_edit(m, [op = "add_node", node = [label = "Core", kind = "service", purpose = "second core"]]);
+check("add_node: a taken id gets a suffix", r.ok && r.edit.node.id == "core-2", std.string(r));
+new_id = r.edit.node.id;
+r = arch_add_edit(m, [op = "add_edge", edge = [source = "app", target = new_id, kind = "events", label = "notify"]]);
+check("add_edge to a pending node", r.ok, std.string(r));
+r = arch_add_edit(m, [op = "add_edge", edge = [source = "app", target = "app"]]);
+check("add_edge: no self loop", !r.ok);
+r = arch_add_edit(m, [op = "add_edge", edge = [source = "app", target = "ghost"]]);
+check("add_edge: unknown node refused", !r.ok && r.error.contains("ghost"), std.string(r));
+r = arch_add_edit(m, [op = "add_edge", edge = [source = "app", target = "core", kind = "calls"]]);
+check("add_edge: an existing connection is refused", !r.ok, std.string(r));
+r = arch_add_edit(m, [op = "update_node", target = "core", node = [purpose = "the new logic", kind = "service"]]);
+check("update_node", r.ok, std.string(r));
+r = arch_add_edit(m, [op = "update_node", target = "core", node = std.json()]);
+check("update_node without fields refused", !r.ok);
+r = arch_add_edit(m, [op = "remove_node", target = "data-store", note = "use the cache"]);
+check("remove_node", r.ok, std.string(r));
+r = arch_add_edit(m, [op = "add_edge", edge = [source = "core", target = "data-store"]]);
+check("an edge to a removed node is refused", !r.ok, std.string(r));
+r = arch_add_edit(m, [op = "bogus"]);
+check("unknown op refused", !r.ok);
+
+pv = arch_preview(m);
+check("preview: new node marked add", pv.nodes[arch_find(pv.nodes, new_id)].pending == "add");
+ci = arch_find(pv.nodes, "core");
+check("preview: changed node marked update + before", pv.nodes[ci].pending == "update" && pv.nodes[ci].purpose == "the new logic" && pv.nodes[ci].before.purpose == "the logic", std.string(pv.nodes[ci]));
+check("preview: removed node marked remove", pv.nodes[arch_find(pv.nodes, "data-store")].pending == "remove");
+check("preview: its edges marked remove", pv.edges[arch_find(pv.edges, "core>data-store:data")].pending == "remove");
+check("preview does not change the model", m.nodes.size() == 3 && m.nodes[1].purpose == "the logic");
+
+md = arch_edits_markdown(m);
+check("edits as markdown", md.contains("ADD node") && md.contains("CONNECT") && md.contains("CHANGE node") && md.contains("REMOVE node") && md.contains("use the cache"), md);
+FILES = [model = "M.json", changes = "C.md", plan = "P.md", previous = ""];
+pg = arch_plan_goal(m, FILES);
+check("plan goal names the plan, model and change files and the edits", pg.contains("P.md") && pg.contains("M.json") && pg.contains("C.md") && pg.contains("ADD node"), pg);
+check("plan goal with feedback", arch_plan_goal(m, FILES, "smaller steps").contains("smaller steps"));
+FILES.previous = "OLD.md";
+check("a revision names the previous plan file", arch_plan_goal(m, FILES, "smaller steps").contains("OLD.md"));
+ag = arch_apply_goal(m, m.pending, FILES);
+check("apply goal tells not to edit the graph", ag.contains("Do not edit " + FILES.model), ag);
+check("the model is a file reference, not pasted", !ag.contains("the window") && ag.contains("M.json") && ag.contains("search_in_file"), ag);
+check("a small change set is not split", !arch_needs_split(m, m.pending) && ag.contains("small") && !ag.contains("split it"), ag);
+cm = arch_changes_markdown(m, m.pending);
+check("the change list has every edit, the groups and the touched nodes", cm.contains("REMOVE node") && cm.contains("## Groups") && cm.contains("App (ui): the window"), cm);
+
+// a big change set: more than ARCH_SPLIT_EDITS edits over two groups
+big = arch_normalize(ANALYSIS);
+for(k = 0; k < ARCH_SPLIT_EDITS + 2; k++)
+	arch_add_edit(big, [op = "add_node", node = [label = "Part " + std.string(k), group = (k % 2 ? "front" : "back"), purpose = "part number " + std.string(k)]]);
+groups = arch_edit_groups(big, big.pending);
+check("edits are grouped by the group of their node", groups.size() == 2 && groups[0].group == "back" && groups[0].numbers.size() == 4, std.string(groups));
+check("more than ARCH_SPLIT_EDITS edits are split", arch_needs_split(big, big.pending));
+bg = arch_apply_goal(big, big.pending, FILES);
+check("the split prompt tells to delegate one start_task per group", bg.contains("split it") && bg.contains("start_task") && bg.contains("max_running_agents") && bg.contains("back: edits 1, 3, 5, 7"), bg);
+check("the prompt lists at most ARCH_SUMMARY_LINES edits", ARCH_SPLIT_EDITS + 2 <= ARCH_SUMMARY_LINES || bg.contains("more in `C.md`"), bg);
+many = arch_normalize(ANALYSIS);
+for(k = 0; k < ARCH_SUMMARY_LINES + 3; k++)
+	arch_add_edit(many, [op = "add_node", node = [label = "Item " + std.string(k)]]);
+mg = arch_apply_goal(many, many.pending, FILES);
+check("edits past ARCH_SUMMARY_LINES are only in the change file", mg.contains("... and 3 more in `C.md`") && !mg.contains("Item " + std.string(ARCH_SUMMARY_LINES + 2)), mg);
+long_note = "";
+for(k = 0; k < 300; k++)
+	long_note += "a long note line ";
+few = arch_normalize(ANALYSIS);
+arch_add_edit(few, [op = "update_node", target = "core", node = [purpose = "x"], note = long_note + long_note + long_note]);
+check("a long change list is split even with few edits", few.pending.size() == 1 && arch_needs_split(few, few.pending), std.string(arch_changes_markdown(few, few.pending).length()));
+check("a long plan is split", arch_needs_split(m, m.pending, long_note + long_note + long_note));
+pgb = arch_plan_goal(big, FILES);
+check("the plan of a split set is researched in subtasks too", pgb.contains("split it") && pgb.contains("one section per group"), pgb);
+check("analyze goal has the format", arch_analyze_goal("A.json").contains("A.json") && arch_analyze_goal("A.json").contains("\"edges\""));
+
+add_id = m.pending[0].id;
+n = arch_remove_edit(m, add_id);
+check("dropping an added node drops the edge to it", n == 2 && m.pending.size() == 2, std.string(n) + " " + std.string(m.pending));
+
+ids = [];
+for(p : m.pending)
+	ids.push_back(p.id);
+n = arch_commit_edits(m, ids);
+check("commit applies the edits", n == 2 && m.pending.size() == 0, std.string(n));
+check("commit: node changed", m.nodes[arch_find(m.nodes, "core")].kind == "service");
+check("commit: node and its edges removed", arch_find(m.nodes, "data-store") < 0 && arch_find(m.edges, "core>data-store:data") < 0, std.string(m.edges));
+check("commit leaves no preview marks", !m.nodes[arch_find(m.nodes, "core")].has("pending"));
+
+std.print("\n── board jobs ──");
+clean();
+host = FakeHost();
+board = ArchitectureBoard(host, ROOT);
+check("board on an empty space", board.model.nodes.size() == 0 && board.state().nodes.size() == 0);
+
+r = board.analyze();
+check("analyze starts a worker task", r.ok && host.added.size() == 1 && host.added[0].goal.contains("architecture.analysis.json"), std.string(r));
+check("the job task has the role adaptive", host.added[0].role == "adaptive", std.string(host.added[0]));
+r2 = board.analyze();
+check("one job at a time", !r2.ok, std.string(r2));
+check("the job shows the live task state", board.state().job.state == "implement", std.string(board.state().job));
+
+fileio.write_text(board.analysis_path, std.string(ANALYSIS).replace("\"nowhere\"", "\"app\""));
+host.finish(r.taskid, "finished", "mapped it");
+check("a finished analysis is merged", board.model.nodes.size() == 3 && board.model.job.state == "finished", std.string(board.model.job));
+check("... and saved", arch_load(board.path).nodes.size() == 3);
+check("... with history", board.model.history.size() == 1);
+
+r = board.analyze();
+fileio.write_text(board.analysis_path, "[1, 2");
+host.finish(r.taskid, "finished");
+check("an invalid analysis fails the job, the model stays", board.model.job.state == "failed" && board.model.nodes.size() == 3 && board.model.job.error != "", std.string(board.model.job));
+
+r = board.review_plan();
+check("no plan without pending edits", !r.ok);
+r = board.apply();
+check("no apply without pending edits", !r.ok);
+
+r = board.add_edit([op = "add_node", node = [label = "Cache", kind = "data", group = "back"]]);
+check("board.add_edit", r.ok && board.model.pending.size() == 1, std.string(r));
+check("the edit is saved", arch_load(board.path).pending.size() == 1);
+r = board.add_edit([op = "add_edge", edge = [source = "core", target = "cache", kind = "data"]]);
+check("board.add_edit edge", r.ok, std.string(r));
+
+r = board.review_plan("keep it small");
+check("review plan starts a task with the edits", r.ok && host.added[host.added.size() - 1].goal.contains("CONNECT") && host.added[host.added.size() - 1].goal.contains("keep it small"), std.string(r));
+check("the board wrote the change list", arch_read_text(board.changes_path).contains("ADD node") && host.added[host.added.size() - 1].goal.contains(board.changes_path), arch_read_text(board.changes_path));
+fileio.write_text(board.plan_path, "# Plan\n1. add cache.cpp\n");
+host.finish(r.taskid, "finished", "plan written");
+check("the plan is stored", board.model.plan.text.contains("cache.cpp") && !board.model.plan.outdated, std.string(board.model.plan));
+
+r = board.add_edit([op = "update_node", target = "app", node = [purpose = "the main window"]]);
+check("an edit after the plan marks it outdated", r.ok && board.model.plan.outdated, std.string(board.model.plan));
+
+r = board.apply();
+check("apply starts a task with the plan file", r.ok && host.added[host.added.size() - 1].goal.contains(board.plan_path) && arch_read_text(board.plan_path).contains("add cache.cpp"), std.string(r));
+check("apply task: role adaptive", host.added[host.added.size() - 1].role == "adaptive");
+r2 = board.add_edit([op = "add_node", node = [label = "Late"]]);
+check("no edits while Apply runs", !r2.ok, std.string(r2));
+host.finish(r.taskid, "failed", "the build broke");
+check("a failed apply keeps the edits pending", board.model.pending.size() == 3 && board.model.job.state == "failed" && board.model.job.error.contains("build broke"), std.string(board.model.job));
+
+r = board.apply();
+host.finish(r.taskid, "finished", "implemented");
+check("a finished apply commits the edits", board.model.pending.size() == 0 && arch_find(board.model.nodes, "cache") >= 0 && arch_find(board.model.edges, "core>cache:data") >= 0, std.string(board.model.nodes));
+check("... the plan is cleared", !board.model.plan.has("text"));
+check("... and saved", arch_load(board.path).nodes.size() == 4);
+
+check("a task of someone else is ignored", !board.on_task_finished([taskid = "other", state = "finished"]));
+
+moved = board.set_layout([app = [10, 20], cache = [30, 40], ghost = [1, 1]]);
+check("layout: known nodes move", moved == 2 && board.model.nodes[arch_find(board.model.nodes, "app")].x == 10.0, std.string(moved));
+r = board.add_edit([op = "add_node", node = [label = "Queue"]]);
+moved = board.set_layout([queue = [5, 6]]);
+check("layout: a pending node keeps its position in its edit", moved == 1 && board.model.pending[0].node.x == 5.0, std.string(board.model.pending));
+check("discard", board.discard_edits() == 1 && board.model.pending.size() == 0);
+
+host.refuse = true;
+r = board.analyze();
+check("a refused task is an error", !r.ok, std.string(r));
+host.refuse = false;
+
+r = board.analyze();
+host2 = FakeHost();
+board2 = ArchitectureBoard(host2, ROOT, "planner");
+check("after a restart an unknown open job is lost", board2.model.job.state == "lost", std.string(board2.model.job));
+board2.analyze();
+check("the role of the job tasks can be set", host2.added[0].role == "planner", std.string(host2.added));
+
+std.print("\n── --web command line ──");
+o = web_ui_parse(["--web"]);
+check("--web", o.web && o.port == 13337 && std.string(o.api_token) == "", std.string(o));
+o = web_ui_parse(["--config", "gpu", "--web", "--port", "8080", "--api-token", "x"]);
+check("--web --port --api-token", o.web && o.port == 8080 && o.api_token == "x", std.string(o));
+o = web_ui_parse(["--web=9000", "--agentspace", "/tmp/space"]);
+check("--web=<port>", o.web && o.port == 9000, std.string(o));
+o = web_ui_parse(["--port", "1234"]);
+check("no --web", !o.web, std.string(o));
+check("the web options no longer carry an architecture role", !o.has("architecture_role"), std.string(o));
+check("--architecture-role is ignored", !web_ui_parse(["--web", "--architecture-role", "coder"]).has("architecture_role"));
+d = web_ui_chat_delta([tool_start = [name = "start_task", args = [name = "Sushi"]]]);
+check("the model-side tool action is not shown twice", std.is_none(web_ui_chat_delta([tool = [name = "start_task", args = [name = "Sushi"]]])));
+check("chat delta of a tool call", d.text.contains("start_task") && d.text.contains("Sushi"), std.string(d));
+check("chat delta of text", web_ui_chat_delta([text = "hi"]).text == "hi");
+check("no chat delta for other actions", std.is_none(web_ui_chat_delta([milestone = "x"])));
+
+clean();
+try { fileio.remove(ROOT); } catch(e) {}
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+std.exitprocess(failed ? 1 : 0);

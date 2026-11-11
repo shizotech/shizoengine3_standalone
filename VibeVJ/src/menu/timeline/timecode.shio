@@ -1,0 +1,843 @@
+//Timecode and clock sync of the main timeline (#680, steps 3 and 4), for shows that run to a fixed timeline or to the
+//tempo of another program. The button TC in the bar, its popup: the source, the MIDI input, the offset, the output.
+//Sources the timeline chases (follows):
+//- MIDI Time Code from a MIDI input (a DAW, a show controller, a lighting desk). The MIDI module decodes the quarter
+//  frames and the full frame messages of every input (nanogui.midi_timecode(), modules/shzmodule_nanogui/mididevice.h):
+//  the time of the master, whether it runs, its frame rate (24, 25, 29.97 drop frame, 30).
+//- MIDI clock from a MIDI input (step 4): 24 clocks a beat, Start / Continue / Stop and the Song Position Pointer
+//  (nanogui.midi_clock()). The BPM of the timeline follows the tempo of the clock (measured over a beat, smoothed),
+//  the cursor is the song position in beats (no offset).
+//- LTC, SMPTE timecode as audio (step 4): the audio analysis (Generators/Audio/AudioInputAnalysis.asset, its subprocess
+//  engine/processes/audio_process.shio) reads it on each channel of its input with simpleaudio.ltc() and sends each
+//  frame here (ltc_message). It needs an Audio Input Analysis generator in the project. Forwards and backwards.
+//Chasing: with timecode the cursor is (timecode - offset) * BPM / 60 beats. The master starts: Play, from where it is.
+//It stops: the timeline stops there. It locates (a full frame, a song position, or a jump of the time while it runs):
+//the cursor jumps. While both run, each frame the step of the cursor (nudge_factor, which the engine multiplies its
+//step with) is set so the cursor lands on the master of that frame: a master that runs a little fast or slow, or
+//uneven frames of the program, leave no drift, and the step of the frame (pos_delta of the loops and the sync) is the
+//real one. Further off than TC_JUMP_SECONDS it jumps.
+//Output (step 4): VibeVJ as the master. MIDI clock (with Start / Continue / Stop and song positions) and / or MTC
+//(quarter frames, a full frame where it starts or jumps) go to a MIDI output: the C++ sender of the device
+//(mididevice.send_sync) runs on a thread of its own and is told every frame where the timeline is (after_move). The
+//timecode it sends is offset + cursor * 60 / BPM. To the virtual MIDI device it comes in as its input (and goes to its
+//port of the system on Linux and macOS).
+//Test sources: VibeVJ plays MTC into its virtual MIDI device (Shizo Virtual MIDI) and MIDI clock into a second one
+//(Shizo Test Clock), for show prep without a master and for the tests (MCP send_test_timecode, send_test_clock).
+
+TC_JUMP_SECONDS = 0.25;  //further off than this the cursor jumps; closer, it catches up by its steps
+TC_STEP_MAX = 3.0;       //a step of the cursor at most 3 times the step of a frame at the tempo
+TC_TEST_DEVICE = "Shizo Virtual MIDI";
+TC_TEST_CLOCK_DEVICE = "Shizo Test Clock";
+TC_SOURCES = ["mtc", "clock", "ltc"];
+TC_SOURCE_NAMES = ["MIDI Time Code", "MIDI clock", "LTC (audio input)"];
+TC_RATES = ["24", "25", "29.97df", "30"];
+TC_LTC_STALE = 0.3;      //seconds without an LTC message while it ran: stopped (the analysis went away)
+
+//Frames per second of a rate name of MTC
+tc_fps(rate) {
+	if(rate == "24")
+		return 24.0;
+	if(rate == "29.97df" || rate == "29.97")
+		return 30000.0 / 1001.0;
+	if(rate == "30")
+		return 30.0;
+	return 25.0;
+}
+
+//The rate code of MTC (0 = 24, 1 = 25, 2 = 29.97 drop frame, 3 = 30)
+tc_rate_code(rate) {
+	if(rate == "24")
+		return 0;
+	if(rate == "29.97df" || rate == "29.97")
+		return 2;
+	if(rate == "30")
+		return 3;
+	return 1;
+}
+
+//Seconds of a timecode. Drop frame skips the frame numbers 0 and 1 of each minute but every tenth
+tc_seconds(h, m, s, f, rate) {
+	if(tc_rate_code(rate) == 2) {
+		minutes = h * 60 + m;
+		frame = (h * 3600 + m * 60 + s) * 30 + f - 2 * (minutes - std.int(math.floor(minutes / 10.0)));
+		return frame * 1001.0 / 30000.0;
+	}
+	return h * 3600.0 + m * 60.0 + s + f / tc_fps(rate);
+}
+
+//Only the digits 0 - 9, at least one
+tc_digits(text) {
+	if(text == "")
+		return false;
+	for(c : text) {
+		if("0123456789".find(c) < 0)
+			return false;
+	}
+	return true;
+}
+
+//A timecode as text, "hh:mm:ss:ff" (";" before the frames of drop frame) or seconds ("12.5"), in seconds at a rate.
+//None when it is neither
+tc_parse(text, rate) {
+	t = std.string(text).trim();
+	parts = t.replace(";", ":").split(":");
+	if(parts.size() == 1) {
+		whole = t.split(".");
+		if(whole.size() > 2 || !tc_digits(whole[0]) || (whole.size() == 2 && !tc_digits(whole[1])))
+			return None;
+		return std.float(t);
+	}
+	if(parts.size() != 4)
+		return None;
+	n = [];
+	for(i = 0; i < 4; i++) {
+		p = parts[i].trim();
+		if(!tc_digits(p))
+			return None;
+		n.push_back(std.int(p));
+	}
+	return tc_seconds(n[0], n[1], n[2], n[3], rate);
+}
+
+//A number as text with one or two decimals ("100.9", "72.85")
+tc_num(v, decimals = 1) {
+	scale = decimals == 1 ? 10 : 100;
+	m = std.int(math.round(math.abs(v) * scale));
+	frac = m % scale;
+	return (v < 0.0 && m > 0 ? "-" : "") + std.string(std.int(math.floor(m / std.float(scale)))) + "." + (decimals == 2 && frac < 10 ? "0" : "") + std.string(frac);
+}
+
+//The position of a value in a list, -1 when it is not in it
+tc_index(list, v) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == v)
+			return i;
+	}
+	return -1;
+}
+
+//The labels of a frame number at a rate: [h, m, s, f]
+tc_label(frame, rate) {
+	frame = std.int(frame);
+	fps = std.int(math.round(tc_fps(rate)));
+	if(tc_rate_code(rate) == 2) {
+		d = std.int(math.floor(frame / 17982.0));
+		mm = frame - d * 17982;
+		frame = frame + 18 * d + (mm > 1 ? 2 * std.int(math.floor((mm - 2) / 1798.0)) : 0);
+	}
+	f = frame % fps;
+	secs = std.int(math.floor(frame / std.float(fps)));
+	return [std.int(math.floor(secs / 3600.0)) % 24, std.int(math.floor(secs / 60.0)) % 60, secs % 60, f];
+}
+
+tc_text(seconds, rate) {
+	l = tc_label(math.floor(seconds * tc_fps(rate) + 0.0001), rate);
+	pad = [](v){ return v < 10 ? "0" + v : std.string(v); };
+	return pad(l[0]) + ":" + pad(l[1]) + ":" + pad(l[2]) + (tc_rate_code(rate) == 2 ? ";" : ":") + pad(l[3]);
+}
+
+//MTC played into the virtual MIDI device: quarter frames as the time goes, a full frame at a locate
+class timecode_sender
+{
+	device = None;
+	rate = "25";
+	speed = 1.0;        //1: real time; a little more or less: a master that runs fast or slow
+	playing = false;
+	base = 0.0;         //seconds of the timecode where it started
+	started = 0;        //std.millis() at the start
+	sent = 0;           //quarter frames sent since the start
+	first_frame = 0;    //the frame number of the start (even: a sequence of eight quarter frames is two frames)
+
+	__init__() {
+		device = nanogui.virtual_midi_device(TC_TEST_DEVICE);
+	}
+
+	//The full frame message of a time: the receiver locates there
+	locate(seconds, rate_name) {
+		rate = rate_name;
+		l = tc_label(math.floor(seconds * tc_fps(rate) + 0.0001), rate);
+		device.input([0xF0, 0x7F, 0x7F, 0x01, 0x01, tc_rate_code(rate) * 32 + l[0], l[1], l[2], l[3], 0xF7]);
+		base = seconds;
+		if(playing)
+			play(seconds, rate, speed);
+	}
+
+	play(seconds, rate_name, at_speed = 1.0) {
+		rate = rate_name;
+		speed = at_speed;
+		frame = std.int(math.floor(seconds * tc_fps(rate) + 0.0001));
+		first_frame = frame - frame % 2;
+		base = first_frame / tc_fps(rate);
+		started = std.millis();
+		sent = 0;
+		playing = true;
+	}
+
+	stop() {
+		if(!playing)
+			return;
+		base = now();
+		playing = false;
+	}
+
+	now() {
+		if(!playing)
+			return base;
+		return base + (std.millis() - started) / 1000.0 * speed;
+	}
+
+	//Every frame: the quarter frames that are due (four per frame of the timecode)
+	tick() {
+		if(!playing)
+			return;
+		due = std.int(math.floor((now() - base) * tc_fps(rate) * 4.0));
+		//After a stall of the program it does not catch up with hundreds at once: it goes on from a new sequence
+		if(due - sent > 64)
+			sent = due - due % 8;
+		for(sent < due) {
+			piece = sent % 8;
+			l = tc_label(first_frame + 2 * std.int(math.floor(sent / 8.0)), rate);
+			nib = [l[3] % 16, std.int(math.floor(l[3] / 16.0)), l[2] % 16, std.int(math.floor(l[2] / 16.0)),
+				l[1] % 16, std.int(math.floor(l[1] / 16.0)), l[0] % 16, std.int(math.floor(l[0] / 16.0)) % 2 + tc_rate_code(rate) * 2];
+			device.input(0xF1, piece * 16 + nib[piece]);
+			sent++;
+		}
+	}
+}
+
+//LTC from the audio analysis (#680 step 4): its messages, as a state of the same shape as nanogui.midi_timecode()
+class ltc_input
+{
+	msg = None;
+	at = 0;           //std.millis() of the last message
+	messages = 0;
+
+	message(m) {
+		msg = m;
+		at = std.millis();
+		messages++;
+	}
+
+	age() {
+		return (std.millis() - at) / 1000.0;
+	}
+
+	//None before any. While it runs the time goes on from the last frame (at most 0.15 s), backwards too
+	state() {
+		if(!msg)
+			return None;
+		a = age();
+		run = msg.running && a < TC_LTC_STALE;
+		t = msg.time;
+		if(run)
+			t += (msg.reverse ? -1.0 : 1.0) * math.min(a, 0.15) * (msg.speed ?? 1.0);
+		return [time = math.max(0.0, t), running = run ? 1 : 0, rate = msg.rate, fps = tc_fps(msg.rate), text = msg.text,
+			locates = msg.locates ?? 0, reverse = msg.reverse ? 1 : 0, speed = msg.speed ?? 1.0, channel = msg.channel ?? 0,
+			age = a, device = "LTC"];
+	}
+}
+
+//Test LTC (#680 step 4): the messages the audio analysis sends when it reads LTC, made here every frame, for rehearsing
+//and testing the chase of LTC without a sound (MCP send_test_ltc). The audio path itself: _testing/ltc_audio_process.shio
+class ltc_test_source
+{
+	playing = false;
+	rate = "25";
+	reverse = false;
+	base = 0.0;
+	started = 0;
+	locates = 0;
+
+	now() {
+		if(!playing)
+			return base;
+		return math.max(0.0, base + (reverse ? -1.0 : 1.0) * (std.millis() - started) / 1000.0);
+	}
+
+	set(at, rate_name, play, backwards) {
+		if(!std.is_none(at) && math.abs(at - now()) > 0.1)
+			locates++;
+		base = std.is_none(at) ? now() : at;
+		rate = rate_name;
+		reverse = backwards ? true : false;
+		playing = play ? true : false;
+		started = std.millis();
+	}
+
+	message() {
+		t = now();
+		return [type = "ltc", time = t, running = playing ? 1 : 0, reverse = reverse ? 1 : 0, rate = rate, text = tc_text(t, rate), speed = 1.0,
+			locates = locates, channel = 0];
+	}
+}
+
+class timecode_chase
+{
+	timeline = None;        //the timeline (timeline.shio)
+	on = false;
+	source = "mtc";         //what it chases: "mtc", "clock" (MIDI clock) or "ltc"
+	device = "";            //the MIDI input of MTC and MIDI clock, "" = whichever sends it
+	offset_text = "00:00:00:00"; //the timecode at beat 0
+	state = None;           //what the source said last
+	was_running = false;
+	locates = -1;
+	last_target = -1.0;
+	error = 0.0;            //seconds the cursor is off the master after the step of this frame (+: behind)
+	tick_at = 0;            //std.millis() of the last tick: the cursor was moved then, a target read later is further on
+	sender = None;          //test timecode
+	ltc = None;             //LTC from the audio analysis
+	ltc_test = None;        //test LTC (send_test_ltc)
+	//The output (VibeVJ as the master)
+	out_device = "";        //the MIDI output, "" = none
+	out_clock = false;      //send MIDI clock
+	out_mtc = false;        //send MTC
+	out_rate = "25";        //the frame rate of the MTC sent
+	out_dev = None;         //the device object of out_device
+	out_sent = None;        //what send_sync returned last
+	managed btn = None;
+	managed chase_btn = None;
+	managed kind_box = None;
+	managed source_box = None;
+	managed offset_box = None;
+	managed status_label = None;
+	managed test_btn = None;
+	managed out_box = None;
+	managed out_clock_btn = None;
+	managed out_mtc_btn = None;
+	managed out_rate_box = None;
+	managed out_label = None;
+	sources = [];
+	outputs = [];
+	ticks = 0;
+
+	__init__(tl, bar) {
+		timeline = tl;
+		ltc = ltc_input();
+		btn = bar.button_popup("TC").side("top").fixed_width(44)
+			.tooltip("[[timecode|Timecode]] and clock: the timeline follows MIDI Time Code, MIDI clock or LTC (a DAW, a show controller), or sends MIDI clock and MTC as the master.\n[[wiki:Timeline#timecode]]");
+		btn.autoclose(true);
+		pop = btn.popup().content().layout(nanogui.layout_vertical());
+		pop.fixed_width(330);
+		chase_btn = pop.controlbutton("CHASE").caption("Chase").push(true).anchor_left(0).anchor_right(0).fixed_height(28);
+		chase_btn.get_button().tooltip("On: the timeline plays, stops and jumps with the source below (MIDI clock: its tempo too). MIDI-mappable.");
+		chase_btn.undoable(false);
+		chase_btn.callback([this](v){
+			this.set_on(v ? true : false);
+		});
+		pop.label("Source").font_size(13).fixed_height(18);
+		kind_box = pop.combobox().anchor_left(0).anchor_right(0).fixed_height(26).items(TC_SOURCE_NAMES)
+			.tooltip("MIDI Time Code or MIDI clock from the MIDI input below, or LTC (timecode as sound) that the Audio Input Analysis generator reads on its input");
+		kind_box.on_change([this](index, text){
+			if(index >= 0 && index < TC_SOURCES.size())
+				this.set_source(TC_SOURCES[index]);
+		});
+		pop.label("MIDI input").font_size(13).fixed_height(18);
+		source_box = pop.combobox().anchor_left(0).anchor_right(0).fixed_height(26)
+			.tooltip("Where MIDI Time Code or MIDI clock comes from. Any: the input that sent it last");
+		source_box.on_open([this](){
+			this.fill_sources();
+		});
+		source_box.on_change([this](index, text){
+			if(index >= 0 && index < this.sources.size())
+				this.device = this.sources[index];
+		});
+		pop.label("Offset: the timecode at beat 0").font_size(13).fixed_height(18);
+		offset_box = pop.textbox(offset_text).editable(true).alignment("left").anchor_left(0).anchor_right(0).fixed_height(26)
+			.tooltip("hh:mm:ss:ff (or seconds). A show that starts at 01:00:00:00 has its first beat there. For MTC and LTC, and for the MTC sent; MIDI clock counts from the start of the song.");
+		offset_box.on_change([this](text){
+			this.set_offset(text);
+		});
+		status_label = pop.label("No timecode yet").font_size(13).fixed_height(24);
+		test_btn = pop.pushbutton("Send test timecode").anchor_left(0).anchor_right(0).fixed_height(26)
+			.tooltip("Plays MTC from the offset at 25 fps into the virtual MIDI device (" + TC_TEST_DEVICE + "): rehearse the chase without a master. Select that input above or Any.");
+		test_btn.on_change([this](v){
+			if(v)
+				this.test_sender().play(this.offset_seconds("25"), "25");
+			else if(this.sender)
+				this.sender.stop();
+		});
+
+		//VibeVJ as the master (#680 step 4)
+		pop.label("Send (VibeVJ as the master)").font_size(13).fixed_height(22);
+		out_box = pop.combobox().anchor_left(0).anchor_right(0).fixed_height(26)
+			.tooltip("The MIDI output VibeVJ sends MIDI clock and / or MTC to, as the master of another program or device");
+		out_box.on_open([this](){
+			this.fill_outputs();
+		});
+		out_box.on_change([this](index, text){
+			if(index >= 0 && index < this.outputs.size())
+				this.set_output(this.outputs[index], this.out_clock, this.out_mtc, this.out_rate);
+		});
+		row = pop.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
+		out_clock_btn = row.pushbutton("MIDI clock").fixed_width(110)
+			.tooltip("Sends MIDI clock (24 a beat, at the BPM), Start / Continue / Stop with Play and Stop, and the song position where the timeline is");
+		out_clock_btn.on_change([this](v){
+			this.set_output(this.out_device, v ? true : false, this.out_mtc, this.out_rate);
+		});
+		out_mtc_btn = row.pushbutton("MTC").fixed_width(70)
+			.tooltip("Sends MIDI Time Code: quarter frames while the timeline plays, a full frame where it starts or jumps. The timecode is the offset plus the position at the BPM");
+		out_mtc_btn.on_change([this](v){
+			this.set_output(this.out_device, this.out_clock, v ? true : false, this.out_rate);
+		});
+		out_rate_box = row.combobox().fixed_width(110).items(TC_RATES).tooltip("The frame rate of the MTC sent");
+		out_rate_box.on_change([this](index, text){
+			if(index >= 0 && index < TC_RATES.size())
+				this.set_output(this.out_device, this.out_clock, this.out_mtc, TC_RATES[index]);
+		});
+		out_label = pop.label("").font_size(13).fixed_height(20);
+		out_rate_box.selected(tc_index(TC_RATES, out_rate));
+		fill_sources();
+		fill_outputs();
+		show_output();
+	}
+
+	test_sender() {
+		if(!sender)
+			sender = timecode_sender();
+		return sender;
+	}
+
+	set_on(v) {
+		on = v;
+		if(chase_btn.value() != (v ? 1 : 0))
+			chase_btn.value(v ? 1 : 0);
+		was_running = false;
+		locates = -1;
+		last_target = -1.0;
+		error = 0.0;
+		btn.badge(v ? "on" : (out_device != "" && (out_clock || out_mtc) ? "out" : ""));
+		if(!v)
+			timeline.window_caption_tc("");
+	}
+
+	set_source(kind) {
+		if(tc_index(TC_SOURCES, kind) < 0)
+			return false;
+		source = kind;
+		i = tc_index(TC_SOURCES, kind);
+		if(kind_box.selected() != i)
+			kind_box.selected(i);
+		was_running = false;
+		locates = -1;
+		last_target = -1.0;
+		return true;
+	}
+
+	set_offset(text) {
+		if(std.is_none(tc_parse(text, "25"))) {
+			offset_box.value(offset_text);
+			return false;
+		}
+		offset_text = std.string(text).trim();
+		if(offset_box.value() != offset_text)
+			offset_box.value(offset_text);
+		locates = -1; //the cursor goes to the timecode again
+		return true;
+	}
+
+	set_device(name) {
+		device = name ?? "";
+		fill_sources();
+	}
+
+	//The offset in seconds at the rate of the timecode: the start of the song that plays when it has a timecode (the
+	//songs of a show, #680 step 5, By TC), else the offset of the popup
+	offset_seconds(rate) {
+		if(timeline.shows) {
+			s = timeline.shows.offset_seconds(rate);
+			if(!std.is_none(s))
+				return s;
+		}
+		v = tc_parse(offset_text, rate);
+		return std.is_none(v) ? 0.0 : v;
+	}
+
+	//The MIDI inputs (Any first), the one chosen selected
+	fill_sources() {
+		names = ["Any MIDI input"];
+		sources = [""];
+		n = nanogui.midi_device_count();
+		for(i = 0; i < n; i++) {
+			name = nanogui.midi_device_name(i);
+			if(tc_index(sources, name) < 0) {
+				names.push_back(name);
+				sources.push_back(name);
+			}
+		}
+		if(device != "" && tc_index(sources, device) < 0) {
+			names.push_back(device + " (not connected)");
+			sources.push_back(device);
+		}
+		source_box.items(names);
+		source_box.selected(math.max(0, tc_index(sources, device)));
+	}
+
+	//The MIDI outputs (Off first), the one chosen selected
+	fill_outputs() {
+		names = ["Off: send nothing"];
+		outputs = [""];
+		n = nanogui.midi_device_count();
+		for(i = 0; i < n; i++) {
+			name = nanogui.midi_device_name(i);
+			if(tc_index(outputs, name) < 0) {
+				names.push_back(name);
+				outputs.push_back(name);
+			}
+		}
+		if(out_device != "" && tc_index(outputs, out_device) < 0) {
+			names.push_back(out_device + " (not connected)");
+			outputs.push_back(out_device);
+		}
+		out_box.items(names);
+		out_box.selected(math.max(0, tc_index(outputs, out_device)));
+	}
+
+	chasing() {
+		return on;
+	}
+
+	// =========================================================================
+	// The output: MIDI clock and MTC sent
+	// =========================================================================
+
+	set_output(name, clock, mtc, rate) {
+		name = name ?? "";
+		if(tc_index(TC_RATES, rate) < 0)
+			rate = "25";
+		//The device before stops: Stop to its receivers
+		if(out_dev && (name != out_device || (!clock && !mtc))) {
+			out_dev.send_sync([clock = 0, mtc = 0, playing = 0]);
+			out_dev = None;
+		}
+		out_device = name;
+		out_clock = clock ? true : false;
+		out_mtc = mtc ? true : false;
+		out_rate = rate;
+		out_sent = None;
+		if(out_clock_btn.pushed() != out_clock)
+			out_clock_btn.pushed(out_clock);
+		if(out_mtc_btn.pushed() != out_mtc)
+			out_mtc_btn.pushed(out_mtc);
+		if(out_rate_box.selected() != tc_index(TC_RATES, out_rate))
+			out_rate_box.selected(tc_index(TC_RATES, out_rate));
+		fill_outputs();
+		btn.badge(on ? "on" : (out_device != "" && (out_clock || out_mtc) ? "out" : ""));
+		show_output();
+		return true;
+	}
+
+	sending() {
+		return out_device != "" && (out_clock || out_mtc);
+	}
+
+	//Every frame after the engine moved the cursor (__init__.shio): where the timeline is now, for the sender's thread
+	after_move() {
+		if(!sending())
+			return;
+		if(!out_dev || ticks % 30 == 0) {
+			out_dev = nanogui.midi_device(out_device);
+			if(!out_dev)
+				return;
+		}
+		bpm = math.max(1.0, timeline.bpm_ctrl.value());
+		cur = timeline.cursor_pos.value();
+		out_sent = out_dev.send_sync([clock = out_clock ? 1 : 0, mtc = out_mtc ? 1 : 0, rate = out_rate,
+			playing = timeline.play_btn.value() ? 1 : 0, bpm = bpm, beat = cur,
+			time = offset_seconds(out_rate) + cur * 60.0 / bpm]);
+		if(ticks % 15 == 0)
+			show_output();
+	}
+
+	show_output() {
+		text = "";
+		if(!sending())
+			text = "Sends nothing";
+		else if(!out_dev && !nanogui.midi_device(out_device))
+			text = out_device + " is not connected";
+		else {
+			what = (out_clock ? "MIDI clock" : "") + (out_clock && out_mtc ? " + " : "") + (out_mtc ? "MTC " + out_rate : "");
+			text = "Sends " + what + (out_sent ? "  ·  " + (out_sent.playing ? "playing" : "stopped") : "");
+		}
+		if(out_label.caption() != text)
+			out_label.caption(text);
+	}
+
+	output_json() {
+		return [device = out_device, clock = out_clock ? true : false, mtc = out_mtc ? true : false, rate = out_rate, sent = out_sent];
+	}
+
+	// =========================================================================
+	// Chasing
+	// =========================================================================
+
+	ltc_message(msg) {
+		ltc.message(msg);
+	}
+
+	//What the source says: [running, target (the beat the cursor goes to), locates, ...], None before anything came
+	read_source() {
+		name = device == "" ? None : device;
+		if(source == "clock") {
+			c = nanogui.midi_clock(name);
+			if(!c)
+				return None;
+			return [running = c.running ? true : false, target = c.position, locates = c.locates, clock = c];
+		}
+		tc = source == "ltc" ? ltc.state() : nanogui.midi_timecode(name);
+		if(!tc)
+			return None;
+		bpm = math.max(1.0, timeline.bpm_ctrl.value());
+		return [running = tc.running ? true : false, target = (tc.time - offset_seconds(tc.rate)) * bpm / 60.0, locates = tc.locates, tc = tc,
+			reverse = tc.has("reverse") && tc.reverse ? true : false];
+	}
+
+	//Every frame, before the engine moves the cursor (__init__.shio)
+	tick() {
+		tick_at = std.millis();
+		if(sender)
+			sender.tick();
+		if(ltc_test && (ltc_test.playing || ticks % 10 == 0))
+			ltc.message(ltc_test.message());
+		ticks++;
+		if(!on) {
+			if(ticks % 15 == 0 && btn.popup().visible()) {
+				show_status(read_source(), false);
+				show_output();
+			}
+			return;
+		}
+		src = read_source();
+		//The songs of a show (#680, step 5): the timecode picks the song; its start is the offset, its BPM the tempo
+		if(src && src.has("tc") && timeline.shows && timeline.shows.follow_timecode(src.tc.time, src.tc.rate))
+			src = read_source();
+		state = src;
+		if(ticks % 6 == 0)
+			show_status(src, true);
+		if(!src)
+			return;
+		//MIDI clock: the tempo of the timeline is the tempo of the clock
+		if(src.has("clock") && src.clock.clock && src.clock.bpm > 0.0) {
+			b = math.round(src.clock.bpm * 100.0) / 100.0;
+			if(math.abs(timeline.bpm_ctrl.value() - b) >= 0.01)
+				timeline.bpm_ctrl.value(b);
+		}
+		bpm = math.max(1.0, timeline.bpm_ctrl.value());
+		target = src.target;
+		cur = timeline.cursor_pos.value();
+		error = (target - cur) * 60.0 / bpm;
+		if(src.running) {
+			//Started: Play, from where the master is
+			if(!timeline.play_btn.value() || !was_running) {
+				timeline.cursor_pos.value(target);
+				if(!timeline.play_btn.value())
+					timeline.play_btn.value(1);
+				timeline.nudge_factor = 0.0; //it is there already
+				error = 0.0;
+			}
+			else {
+				//The step that lands the cursor on the master: the engine adds BPM / (60 * fps) times nudge_factor
+				//(the fps of the engine's context: nanogui.current_context() is another one and had other numbers)
+				step = bpm / (60.0 * math.max(1.0, std.global("engine").ctx.real_fps()));
+				nudge = (target - cur) / step;
+				//LTC played backwards (#680 step 4): the cursor steps back
+				lo = src.has("reverse") && src.reverse ? -TC_STEP_MAX : 0.0;
+				hi = lo < 0.0 ? 0.0 : TC_STEP_MAX;
+				if(nudge < lo || nudge > hi) {
+					//A jump of the master, or far off: the cursor jumps. Close: it waits or catches up in a few steps
+					if(math.abs(error) > TC_JUMP_SECONDS) {
+						timeline.cursor_pos.value(target);
+						nudge = 0.0;
+						cur = target;
+					}
+					else
+						nudge = math.clamp(nudge, lo, hi);
+				}
+				timeline.nudge_factor = nudge;
+				error = (target - cur - nudge * step) * 60.0 / bpm;
+			}
+		}
+		else {
+			//Stopped: the timeline stops where the master stands; a locate (full frame, song position) moves the cursor
+			if(was_running && timeline.play_btn.value())
+				timeline.play_btn.value(0);
+			if(was_running || src.locates != locates || target != last_target)
+				timeline.cursor_pos.value(target);
+		}
+		was_running = src.running;
+		locates = src.locates;
+		last_target = target;
+	}
+
+	source_name() {
+		return TC_SOURCE_NAMES[math.max(0, tc_index(TC_SOURCES, source))];
+	}
+
+	show_status(src, chasing) {
+		text = "";
+		caption = "";
+		if(!src) {
+			if(source == "ltc")
+				text = "No LTC yet (an Audio Input Analysis generator reads it)";
+			else
+				text = "No " + (source == "clock" ? "MIDI clock" : "timecode") + " yet" + (device != "" ? " from " + device : "");
+			caption = source == "clock" ? "Clock: none" : "TC: no timecode";
+		}
+		else if(src.has("clock")) {
+			c = src.clock;
+			text = "Clock  ·  " + tc_num(c.bpm) + " BPM  ·  beat " + tc_num(c.position, 2)
+				+ "  ·  " + (c.running ? "running" : (c.clock ? "stopped" : "no clock")) + (chasing && c.running ? "  ·  off by " + std.int(math.round(error * 1000.0)) + " ms" : "  ·  " + c.device);
+			caption = "Clock " + tc_num(c.bpm) + " BPM";
+		}
+		else {
+			tc = src.tc;
+			text = tc_text(tc.time, tc.rate) + "  ·  " + tc.rate + " fps  ·  " + (tc.running ? (tc.has("reverse") && tc.reverse ? "backwards" : "running") : "stopped")
+				+ (chasing && tc.running ? "  ·  off by " + std.int(math.round(error * 1000.0)) + " ms" : "  ·  " + tc.device);
+			caption = (source == "ltc" ? "LTC " : "TC ") + tc_text(tc.time, tc.rate) + " (" + tc.rate + ")";
+		}
+		if(status_label.caption() != text)
+			status_label.caption(text);
+		timeline.window_caption_tc(chasing ? caption : "");
+	}
+
+	status_json() {
+		src = read_source();
+		st = [ok = true, on = on, source = source, device = device, offset = offset_text, position = timeline.cursor_pos.value(),
+			playing = timeline.play_btn.value() ? true : false, bpm = timeline.bpm_ctrl.value(), output = output_json(),
+			frame_age_seconds = (std.millis() - tick_at) / 1000.0, fps = std.global("engine").ctx.real_fps()];
+		st.timecode = source == "clock" ? None : (src ? src.tc : None);
+		st.clock = nanogui.midi_clock(device == "" ? None : device);
+		st.ltc = ltc.state();
+		if(src) {
+			st.target_beat = src.target;
+			st.error_seconds = error;
+			st.running = src.running;
+			if(src.has("tc")) {
+				st.offset_seconds = offset_seconds(src.tc.rate);
+				st.text = tc_text(src.tc.time, src.tc.rate);
+			}
+		}
+		if(sender)
+			st.test = [playing = sender.playing ? true : false, rate = sender.rate, time = sender.now()];
+		if(timeline.shows)
+			st.song = timeline.shows.song_json(timeline.shows.songs[timeline.shows.active]);
+		return st;
+	}
+
+	save_state() {
+		return [device = device, offset = offset_text, source = source, out_device = out_device, out_clock = out_clock ? 1 : 0,
+			out_mtc = out_mtc ? 1 : 0, out_rate = out_rate];
+	}
+
+	load_state(states) {
+		set_device(states && states.has("device") ? states.device : "");
+		set_offset(states && states.has("offset") ? states.offset : "00:00:00:00");
+		set_source(states && states.has("source") ? states.source : "mtc");
+		set_output(states && states.has("out_device") ? states.out_device : "",
+			states && states.has("out_clock") ? std.int(states.out_clock) != 0 : false,
+			states && states.has("out_mtc") ? std.int(states.out_mtc) != 0 : false,
+			states && states.has("out_rate") ? states.out_rate : "25");
+	}
+
+	// For AI agents (the live_path timeline)
+	register_queries(ai) {
+		ai.register("get_timecode", [], [this](args){
+			return this.status_json();
+		}, "The timecode / clock sync of the main timeline: on (chasing), source (mtc, clock or ltc), device (the MIDI input, empty: any), offset (the timecode at beat 0), position (the cursor of the last frame), frame_age_seconds (how long ago that frame moved it), fps (the frames a second the chase steps with), playing (the timeline plays), bpm, running (the source plays), timecode (MTC or LTC coming in: time in seconds, running, rate, text, locates, device; None before any), clock (MIDI clock coming in: bpm, running, position in beats, clock, locates, device; None before any), ltc (the LTC the audio analysis reads), target_beat (where the cursor goes, read now: frame_age_seconds after position), error_seconds (how far the cursor is off after the step of the last frame), output (what VibeVJ sends: device, clock, mtc, rate, sent = counts of the messages), test (the test timecode VibeVJ sends).", "read");
+
+		ai.register("set_timecode", [
+			on = "int(0,1): Chase (1) or not (0): the timeline plays, stops and jumps with the source (MIDI clock: its tempo too).",
+			source = "enum(mtc,clock,ltc): What it chases: MIDI Time Code or MIDI clock from the MIDI input, or LTC the Audio Input Analysis generator reads in the sound.",
+			device = "string(): The MIDI input MTC / MIDI clock comes from (a name of the MIDI devices); empty: any input.",
+			offset = "string(): The timecode at beat 0, hh:mm:ss:ff or seconds (MTC, LTC and the MTC sent).",
+		], [this](args){
+			if(args.has("source") && !this.set_source(std.string(args.source)))
+				return [ok = false, error = "source must be mtc, clock or ltc."];
+			if(args.has("device"))
+				this.set_device(std.string(args.device));
+			if(args.has("offset") && !this.set_offset(std.string(args.offset)))
+				return [ok = false, error = "offset must be hh:mm:ss:ff or seconds."];
+			if(args.has("on"))
+				this.set_on(std.int(args.on) ? true : false);
+			return this.status_json();
+		}, "Sets the timecode / clock chase of the main timeline: on, the source, the MIDI input, the offset. With timecode the cursor is (timecode - offset) * BPM / 60; with MIDI clock it is the song position and the BPM follows the clock.");
+
+		ai.register("set_timecode_output", [
+			device = "string(): The MIDI output VibeVJ sends to (a name of the MIDI devices, also the virtual one); empty: none.",
+			clock = "int(0,1): Send MIDI clock (24 a beat at the BPM, Start / Continue / Stop, song positions).",
+			mtc = "int(0,1): Send MIDI Time Code (quarter frames while it plays, a full frame where it starts or jumps).",
+			rate = "enum(24,25,29.97df,30): The frame rate of the MTC sent.",
+		], [this](args){
+			this.set_output(args.has("device") ? std.string(args.device) : this.out_device,
+				args.has("clock") ? std.int(args.clock) != 0 : this.out_clock,
+				args.has("mtc") ? std.int(args.mtc) != 0 : this.out_mtc,
+				args.has("rate") ? std.string(args.rate) : this.out_rate);
+			return [ok = true, output = this.output_json()];
+		}, "VibeVJ as the master: sends MIDI clock and / or MTC of the main timeline to a MIDI output (the timecode sent is offset + position * 60 / BPM). To the virtual MIDI device it comes in as its input (get_timecode clock / timecode with that device).");
+
+		ai.register("send_test_timecode", [
+			time = "string(): Where the timecode starts or locates to: hh:mm:ss:ff or seconds. Default: where it is.",
+			rate = "string(): 24, 25, 29.97df or 30. Default 25.",
+			play = "int(0,1): Play (1, quarter frames from time on) or stop (0).",
+			locate = "int(0,1): 1: a full frame message at time (a locate; while it plays it goes on from there).",
+			speed = "float(0.5,2): How fast it runs against the clock (1: real time), to try a master that runs fast or slow.",
+		], [this](args){
+			s = this.test_sender();
+			rate = args.has("rate") ? std.string(args.rate) : s.rate;
+			at = args.has("time") ? tc_parse(args.time, rate) : s.now();
+			if(std.is_none(at))
+				return [ok = false, error = "time must be hh:mm:ss:ff or seconds."];
+			if(args.has("locate") && std.int(args.locate))
+				s.locate(at, rate);
+			if(args.has("play")) {
+				if(std.int(args.play))
+					s.play(at, rate, args.has("speed") ? std.float(args.speed) : 1.0);
+				else
+					s.stop();
+			}
+			else if(args.has("speed"))
+				s.speed = std.float(args.speed);
+			return [ok = true, device = TC_TEST_DEVICE, playing = s.playing ? true : false, rate = s.rate, time = s.now()];
+		}, "Plays MIDI Time Code into the virtual MIDI device (" + TC_TEST_DEVICE + "), as a timecode master would: for rehearsing and testing the chase without one (set_timecode device \"" + TC_TEST_DEVICE + "\" or any).");
+
+		ai.register("send_test_ltc", [
+			time = "string(): Where the timecode is: hh:mm:ss:ff or seconds. Default: where it is.",
+			rate = "enum(24,25,29.97df,30): The frame rate. Default 25.",
+			play = "int(0,1): Runs (1) or stands (0).",
+			reverse = "int(0,1): 1: runs backwards.",
+			off = "int(0,1): 1: no test LTC any more.",
+		], [this](args){
+			if(args.has("off") && std.int(args.off)) {
+				this.ltc_test = None;
+				return [ok = true];
+			}
+			if(!this.ltc_test)
+				this.ltc_test = ltc_test_source();
+			t = this.ltc_test;
+			rate = args.has("rate") ? std.string(args.rate) : t.rate;
+			at = args.has("time") ? tc_parse(args.time, rate) : None;
+			if(args.has("time") && std.is_none(at))
+				return [ok = false, error = "time must be hh:mm:ss:ff or seconds."];
+			t.set(at, rate, args.has("play") ? std.int(args.play) : t.playing, args.has("reverse") ? std.int(args.reverse) : t.reverse);
+			return [ok = true, ltc = t.message()];
+		}, "Test LTC: the chase gets the messages the Audio Input Analysis sends when it reads LTC in the sound, made every frame (forwards or backwards), for rehearsing and testing the chase of LTC without a sound (set_timecode source \"ltc\").");
+
+		ai.register("send_test_clock", [
+			bpm = "float(20,999): The tempo of the clock. Default 120.",
+			play = "int(0,1): Play (1: Start / Continue and the clocks count on) or stop (0: Stop; the clocks go on).",
+			beat = "float(): The song position in beats (sent as a song position; while it plays a jump). Default: on from where it is.",
+			off = "int(0,1): 1: no clock at all any more.",
+		], [this](args){
+			dev = nanogui.virtual_midi_device(TC_TEST_CLOCK_DEVICE);
+			st = [clock = 1];
+			if(args.has("off") && std.int(args.off))
+				st = [clock = 0, playing = 0];
+			if(args.has("bpm"))
+				st.bpm = std.float(args.bpm);
+			if(args.has("play"))
+				st.playing = std.int(args.play);
+			if(args.has("beat"))
+				st.beat = std.float(args.beat);
+			return [ok = true, device = TC_TEST_CLOCK_DEVICE, sent = dev.send_sync(st)];
+		}, "Plays MIDI clock into the virtual MIDI device " + TC_TEST_CLOCK_DEVICE + ", as a DAW would: for rehearsing and testing the chase of MIDI clock without one (set_timecode source \"clock\", device \"" + TC_TEST_CLOCK_DEVICE + "\" or any).");
+	}
+}

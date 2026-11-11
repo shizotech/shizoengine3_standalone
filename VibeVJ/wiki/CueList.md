@@ -12,9 +12,14 @@ few big buttons. Under its surface it is a [Clipview](Clipview.md): a cue is a c
 
 ## Add cues
 
+A new CueList has no list yet. In its place it shows one empty column, *New list*, with the hint where the cues go.
+
 - **A new list:** drag an asset (a shader, a generator, a picture, a [video](Video.md)) from the *Assets* tab onto
-  the empty part of the CueList. It becomes the first cue of a new list.
+  the empty column or the empty part of the CueList. It becomes the first cue of a new list; the empty column goes
+  away. When the last cue of the last list is removed, it comes back.
 - **One more cue:** drag an asset onto a list. The cue is added at its end.
+- **Generators of a Patchview:** Alt + drag them onto the CueList like an asset. They move into the cue (Ctrl when
+  you let go: copies of them). See [Select and move generators](Generators.md#select-and-move-generators).
 
 ## Change the order
 
@@ -59,8 +64,23 @@ The buttons at the bottom of a list have notches: [link](Linking.md#make-a-link)
 
 ## Macros
 
-The sliders *Macro 1* … *Macro 8* at the bottom are not connected to anything yet. *(Planned.)* For macros that work
-today, see [Macros](Clipview.md#macros) of the Clipview.
+The sliders *Macro 1* … *Macro 8* at the bottom are one set of faders for every cue: each one sets the macro of the
+same number of the running cue (*Macro 1* … *Macro 8* in its [clip settings](Clipview.md#clip-settings)).
+
+1. In each cue, link its *Macro 1* … *Macro 8* to the effect values you want to play with (*Show clipview*, then the
+   clip settings; see [Linking](Linking.md)).
+2. Move the faders at the bottom of the CueList, or map them to your controller (see [MIDI](MIDI.md)).
+
+- A fader sets that macro of the running cue of every list, and of the cue that is fading in.
+- When a cue starts, it gets the values of the faders: the faders stay where they are and the new cue follows them.
+  Its own macro values are overwritten.
+- A fader takes over once it was moved. A fader you never moved leaves the macros of the cues alone, so cues keep
+  the values you set in their clip settings (and projects of before keep working as they did). Which faders were
+  moved is saved with the CueList.
+- A list with no running cue gets nothing; the next cue that starts there gets the values.
+
+This is the other way round from the [macros of a layer](Clipview.md#macros) in the Clipview, which jump to the values
+of the clip that starts.
 
 ## What is saved
 

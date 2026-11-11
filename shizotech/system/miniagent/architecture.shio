@@ -1,0 +1,1352 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  architecture.shio — the architecture graph of the codebase a node works on
+//
+//  One file, .agentspace/architecture.json, holds a high-level model of the
+//  program: nodes (modules, files, services, ...) with a one-line purpose and
+//  edges (calls, data, includes, events, network) between them. The web page
+//  (web/architecture/) draws it as a node graph; edits made there are PENDING
+//  until the owner presses Apply, and only worker agents change the code.
+//
+//      first use      "Analyze"     a worker reads the codebase and writes
+//                                   .agentspace/architecture.analysis.json; the
+//                                   board merges it into architecture.json
+//                                   (positions and pending edits survive a re-sync)
+//      editing        add / change / remove nodes and edges -> model.pending
+//      "Review plan"  a worker reads the code and writes a plan for the pending
+//                     edits (.agentspace/architecture_plan.md), no code changes;
+//                     feedback on the plan makes a revised plan
+//      "Apply"        a worker implements the pending edits (with the plan);
+//                     when it finishes, the edits become part of the model
+//
+//  The board uses the node's own task system: every job is a Megamind task
+//  (host.add_task), its end arrives through host.add_task_finished_listener.
+//  Contract and file format: architecture_spec.md. Tests: architecture_selftest.shio
+//
+//      #include "architecture"
+//      board = ArchitectureBoard(host, ".agentspace");
+//      board.state();                      // model + preview + job, for the web page
+//      board.add_edit([op = "add_node", node = [label = "Cache", purpose = "..."]]);
+//      board.review_plan();  board.apply();  board.analyze();
+// ═════════════════════════════════════════════════════════════════════════════
+
+ARCH_VERSION = 1;
+ARCH_FILE = "architecture.json";
+ARCH_ANALYSIS_FILE = "architecture.analysis.json";
+ARCH_PLAN_FILE = "architecture_plan.md";
+ARCH_NODE_KINDS = ["module", "file", "service", "ui", "data", "external", "test", "config"];
+ARCH_EDGE_KINDS = ["calls", "data", "includes", "events", "network"];
+ARCH_OPS = ["add_node", "update_node", "remove_node", "add_edge", "update_edge", "remove_edge"];
+ARCH_JOB_KINDS = ["analyze", "plan", "apply"];
+ARCH_HISTORY_KEPT = 50;
+ARCH_LOCK = "miniagent_architecture";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  small helpers (a missing member of a json is added on read: check has())
+// ─────────────────────────────────────────────────────────────────────────────
+
+arch_get(obj, key, def = None) {
+	if(!std.is_json(obj))
+		return def;
+	if(!obj.has(key))
+		return def;
+	v = obj[key];
+	if(std.is_none(v))
+		return def;
+	return v;
+}
+
+arch_str(obj, key, def = "") {
+	v = arch_get(obj, key, None);
+	if(std.is_none(v))
+		return def;
+	return std.string(v).strip();
+}
+
+arch_is_list(v) {
+	if(!std.is_json(v))
+		return false;
+	if(v.size() == 0)
+		return true;
+	return std.is_list(v);
+}
+
+arch_is_map(v) {
+	if(!std.is_json(v))
+		return false;
+	if(v.size() == 0)
+		return true;
+	return !std.is_list(v);
+}
+
+arch_empty_list() {
+	l = [];
+	l.clear();
+	return l;
+}
+
+arch_in(list, value) {
+	for(x : list) {
+		if(x == value)
+			return true;
+	}
+	return false;
+}
+
+// "Router API" -> "router-api" (ids are lowercase letters, digits and - _ .)
+arch_slug(text) {
+	out = "";
+	dash = false;
+	for(c : std.string(text).lowercase()) {
+		ok = (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "_" || c == ".";
+		if(ok) {
+			out += c;
+			dash = false;
+		}
+		else if(!dash && out) {
+			out += "-";
+			dash = true;
+		}
+	}
+	for(out.ends("-"))
+		out = out.substr(0, out.length() - 1);
+	if(!out)
+		out = "node";
+	if(out.length() > 48)
+		out = out.substr(0, 48);
+	return out;
+}
+
+arch_mkdir(path) {
+	try {
+		if(path && !fileio.exists(path))
+			fileio.mkdir(path);
+	}
+	catch(e) {}
+	return fileio.exists(path);
+}
+
+// write tmp + rename: a reader never sees a half written file
+arch_write_atomic(path, text) {
+	dir = fileio.file_dir(path);
+	if(dir)
+		arch_mkdir(dir);
+
+	tmp = path + ".tmp-" + std.random_hash(6);
+
+	if(!fileio.write_text(tmp, text))
+		return false;
+
+	if(fileio.rename(tmp, path))
+		return true;
+
+	try { fileio.remove(tmp); } catch(e) {}
+	return false;
+}
+
+arch_remove(path) {
+	try {
+		if(fileio.exists(path))
+			fileio.remove(path);
+	}
+	catch(e) {}
+}
+
+arch_read_text(path) {
+	if(!fileio.exists(path))
+		return "";
+	try {
+		return std.string(fileio.read_string(path));
+	}
+	catch(e) {}
+	return "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  the model
+// ─────────────────────────────────────────────────────────────────────────────
+
+arch_new_model() {
+	m = std.json();
+	m.version = ARCH_VERSION;
+	m.project = "";
+	m.summary = "";
+	m.revision = 0;
+	m.analyzed_at = "";
+	m.nodes = arch_empty_list();
+	m.edges = arch_empty_list();
+	m.pending = arch_empty_list();
+	m.plan = std.json();
+	m.job = std.json();
+	m.history = arch_empty_list();
+	return m;
+}
+
+// one node: [id, label, kind, group, path, purpose, x?, y?]
+arch_norm_node(n) {
+	if(!arch_is_map(n))
+		return None;
+
+	label = arch_str(n, "label", arch_str(n, "name", ""));
+	id = arch_str(n, "id", "");
+	if(!id && label)
+		id = arch_slug(label);
+	if(!id)
+		return None;
+	if(!label)
+		label = id;
+
+	kind = arch_str(n, "kind", arch_str(n, "type", "module")).lowercase();
+	if(!arch_in(ARCH_NODE_KINDS, kind))
+		kind = "module";
+
+	out = std.json();
+	out.id = id;
+	out.label = label;
+	out.kind = kind;
+	out.group = arch_str(n, "group", "");
+	out.path = arch_str(n, "path", "");
+	out.purpose = arch_str(n, "purpose", arch_str(n, "description", ""));
+
+	if(n.has("x") && n.has("y") && !std.is_none(n.x) && !std.is_none(n.y)) {
+		out.x = std.float(n.x);
+		out.y = std.float(n.y);
+	}
+	return out;
+}
+
+// one edge: [id, source, target, kind, label] ("from" / "to" are read too)
+arch_norm_edge(e) {
+	if(!arch_is_map(e))
+		return None;
+
+	src = arch_str(e, "source", arch_str(e, "from", ""));
+	dst = arch_str(e, "target", arch_str(e, "to", ""));
+	if(!src || !dst)
+		return None;
+
+	kind = arch_str(e, "kind", arch_str(e, "type", "calls")).lowercase();
+	if(!arch_in(ARCH_EDGE_KINDS, kind))
+		kind = "calls";
+
+	out = std.json();
+	out.id = arch_str(e, "id", "");
+	if(!out.id)
+		out.id = src + ">" + dst + ":" + kind;
+	out.source = src;
+	out.target = dst;
+	out.kind = kind;
+	out.label = arch_str(e, "label", "");
+	return out;
+}
+
+arch_find(list, id) {
+	for(i, x : list) {
+		if(std.string(x.id) == id)
+			return i;
+	}
+	return -1;
+}
+
+// Defaults for every field, nodes and edges normalized, duplicates and edges to
+// unknown nodes dropped. Pending edits, plan, job and history are kept as they are.
+arch_normalize(raw) {
+	m = arch_new_model();
+	if(!arch_is_map(raw))
+		return m;
+
+	m.project = arch_str(raw, "project", "");
+	m.summary = arch_str(raw, "summary", "");
+	m.revision = std.int(arch_get(raw, "revision", 0));
+	m.analyzed_at = arch_str(raw, "analyzed_at", "");
+
+	for(n : arch_get(raw, "nodes", [])) {
+		nn = arch_norm_node(n);
+		if(nn && arch_find(m.nodes, nn.id) < 0)
+			m.nodes.push_back(nn);
+	}
+
+	for(e : arch_get(raw, "edges", [])) {
+		ee = arch_norm_edge(e);
+		if(!ee)
+			continue;
+		if(arch_find(m.nodes, ee.source) < 0 || arch_find(m.nodes, ee.target) < 0)
+			continue;
+		if(arch_find(m.edges, ee.id) >= 0)
+			continue;
+		m.edges.push_back(ee);
+	}
+
+	if(arch_is_list(arch_get(raw, "pending", None))) {
+		for(p : raw.pending) {
+			if(arch_is_map(p) && arch_str(p, "id", "") && arch_in(ARCH_OPS, arch_str(p, "op", "")))
+				m.pending.push_back(p);
+		}
+	}
+	if(arch_is_map(arch_get(raw, "plan", None)))
+		m.plan = raw.plan;
+	if(arch_is_map(arch_get(raw, "job", None)))
+		m.job = raw.job;
+	if(arch_is_list(arch_get(raw, "history", None))) {
+		for(h : raw.history)
+			m.history.push_back(h);
+	}
+	return m;
+}
+
+// Problems of an analysis / a model file: [] when it is fine
+arch_validate(raw) {
+	errors = [];
+	if(!arch_is_map(raw)) {
+		errors.push_back("the architecture is not a json object");
+		return errors;
+	}
+	if(!arch_is_list(arch_get(raw, "nodes", None)) || !raw.nodes.size()) {
+		errors.push_back("'nodes' must be a non-empty list");
+		return errors;
+	}
+	ids = std.json();
+	for(i, n : raw.nodes) {
+		nn = arch_norm_node(n);
+		if(!nn) {
+			errors.push_back("node " + std.string(i) + " has no id / label");
+			continue;
+		}
+		if(ids.has(nn.id))
+			errors.push_back("node id '" + nn.id + "' is used twice");
+		ids[nn.id] = 1;
+	}
+	if(arch_get(raw, "edges", None) && !arch_is_list(raw.edges)) {
+		errors.push_back("'edges' must be a list");
+		return errors;
+	}
+	for(i, e : arch_get(raw, "edges", [])) {
+		ee = arch_norm_edge(e);
+		if(!ee) {
+			errors.push_back("edge " + std.string(i) + " needs source and target");
+			continue;
+		}
+		if(!ids.has(ee.source))
+			errors.push_back("edge " + std.string(i) + ": unknown source '" + ee.source + "'");
+		if(!ids.has(ee.target))
+			errors.push_back("edge " + std.string(i) + ": unknown target '" + ee.target + "'");
+	}
+	return errors;
+}
+
+// -> the model (an empty one when the file is missing); a broken file is kept as
+//    <file>.corrupt-<ms> for a human and an empty model is returned
+arch_load(path) {
+	if(!fileio.exists(path))
+		return arch_new_model();
+
+	raw = None;
+	try {
+		raw = std.json(arch_read_text(path), true);
+	}
+	catch(e) {
+		raw = None;
+	}
+
+	// every file this module writes has "nodes": anything else is not a model
+	if(!arch_is_map(raw) || !raw.has("nodes")) {
+		bad = path + ".corrupt-" + std.string(std.millis());
+		try { fileio.rename(path, bad); } catch(e) {}
+		std.error("[architecture] ", path, " could not be read, moved to ", bad);
+		return arch_new_model();
+	}
+	return arch_normalize(raw);
+}
+
+arch_save(path, model) {
+	return arch_write_atomic(path, std.string(model));
+}
+
+// Re-sync: the new analysis replaces nodes, edges, project and summary. A node that
+// keeps its id keeps its position on the page; pending edits, plan and history stay.
+arch_merge_analysis(model, analysis) {
+	fresh = arch_normalize(analysis);
+	out = arch_normalize(model);
+
+	for(n : fresh.nodes) {
+		i = arch_find(out.nodes, n.id);
+		if(i >= 0 && out.nodes[i].has("x") && !n.has("x")) {
+			n.x = out.nodes[i].x;
+			n.y = out.nodes[i].y;
+		}
+	}
+
+	out.nodes = fresh.nodes;
+	out.edges = fresh.edges;
+	if(fresh.project)
+		out.project = fresh.project;
+	if(fresh.summary)
+		out.summary = fresh.summary;
+	out.revision = std.int(out.revision) + 1;
+	out.analyzed_at = std.timestamp();
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  pending edits
+//
+//  [id, op, node | edge | target, note, created]
+//    add_node     node = [label, kind, group, path, purpose]  (id from the label)
+//    update_node  target = node id, node = the changed fields
+//    remove_node  target = node id (its edges go with it)
+//    add_edge     edge = [source, target, kind, label]
+//    update_edge  target = edge id, edge = the changed fields
+//    remove_edge  target = edge id
+// ─────────────────────────────────────────────────────────────────────────────
+
+def arch_apply_one(nodes, edges, p, mark);
+
+// nodes and edges with the pending edits applied (the page shows this), every
+// changed element carries pending = add | update | remove and edit = the edit id
+arch_preview(model) {
+	nodes = [];
+	edges = [];
+	for(n : model.nodes)
+		nodes.push_back(n.copy());
+	for(e : model.edges)
+		edges.push_back(e.copy());
+
+	for(p : model.pending)
+		arch_apply_one(nodes, edges, p, true);
+
+	return [nodes = nodes, edges = edges];
+}
+
+// apply one edit to the lists; mark = keep removed elements, marked (preview)
+arch_apply_one(nodes, edges, p, mark) {
+	op = arch_str(p, "op", "");
+	target = arch_str(p, "target", "");
+	pid = arch_str(p, "id", "");
+
+	if(op == "add_node") {
+		n = arch_norm_node(arch_get(p, "node", None));
+		if(!n || arch_find(nodes, n.id) >= 0)
+			return false;
+		if(mark) {
+			n.pending = "add";
+			n.edit = pid;
+		}
+		nodes.push_back(n);
+		return true;
+	}
+
+	if(op == "update_node") {
+		i = arch_find(nodes, target);
+		if(i < 0)
+			return false;
+		ch = arch_get(p, "node", std.json());
+		for(k : ["label", "kind", "group", "path", "purpose"]) {
+			if(arch_is_map(ch) && ch.has(k) && !std.is_none(ch[k])) {
+				v = std.string(ch[k]).strip();
+				if(k == "kind" && !arch_in(ARCH_NODE_KINDS, v))
+					continue;
+				if(mark && std.string(nodes[i][k]) != v) {
+					if(!nodes[i].has("before"))
+						nodes[i].before = std.json();
+					nodes[i].before[k] = nodes[i][k];
+				}
+				nodes[i][k] = v;
+			}
+		}
+		if(mark && !nodes[i].has("pending")) {
+			nodes[i].pending = "update";
+			nodes[i].edit = pid;
+		}
+		return true;
+	}
+
+	if(op == "remove_node") {
+		i = arch_find(nodes, target);
+		if(i < 0)
+			return false;
+		if(mark) {
+			nodes[i].pending = "remove";
+			nodes[i].edit = pid;
+			for(e : edges) {
+				if(e.source == target || e.target == target) {
+					e.pending = "remove";
+					e.edit = pid;
+				}
+			}
+			return true;
+		}
+		nodes.erase(i);
+		for(j = edges.size() - 1; j >= 0; j--) {
+			if(edges[j].source == target || edges[j].target == target)
+				edges.erase(j);
+		}
+		return true;
+	}
+
+	if(op == "add_edge") {
+		e = arch_norm_edge(arch_get(p, "edge", None));
+		if(!e || arch_find(nodes, e.source) < 0 || arch_find(nodes, e.target) < 0)
+			return false;
+		if(arch_find(edges, e.id) >= 0)
+			return false;
+		if(mark) {
+			e.pending = "add";
+			e.edit = pid;
+		}
+		edges.push_back(e);
+		return true;
+	}
+
+	if(op == "update_edge") {
+		i = arch_find(edges, target);
+		if(i < 0)
+			return false;
+		ch = arch_get(p, "edge", std.json());
+		for(k : ["kind", "label"]) {
+			if(arch_is_map(ch) && ch.has(k) && !std.is_none(ch[k])) {
+				v = std.string(ch[k]).strip();
+				if(k == "kind" && !arch_in(ARCH_EDGE_KINDS, v))
+					continue;
+				edges[i][k] = v;
+			}
+		}
+		if(mark && !edges[i].has("pending")) {
+			edges[i].pending = "update";
+			edges[i].edit = pid;
+		}
+		return true;
+	}
+
+	if(op == "remove_edge") {
+		i = arch_find(edges, target);
+		if(i < 0)
+			return false;
+		if(mark) {
+			edges[i].pending = "remove";
+			edges[i].edit = pid;
+			return true;
+		}
+		edges.erase(i);
+		return true;
+	}
+
+	return false;
+}
+
+// Check and store one edit -> [ok, id | error]. The edit is checked against the
+// preview (a new edge may connect a node that is itself still pending).
+arch_add_edit(model, edit) {
+	if(!arch_is_map(edit))
+		return [ok = false, error = "the edit is not a json object"];
+
+	op = arch_str(edit, "op", "");
+	if(!arch_in(ARCH_OPS, op))
+		return [ok = false, error = "unknown op '" + op + "' (" + ARCH_OPS.combine_string(", ").removesuffix(", ") + ")"];
+
+	pv = arch_preview(model);
+	p = std.json();
+	p.id = "e" + std.string(std.millis()) + "-" + std.random_hash(4);
+	p.op = op;
+	p.note = arch_str(edit, "note", "");
+	p.created = std.millis();
+
+	if(op == "add_node") {
+		n = arch_norm_node(arch_get(edit, "node", None));
+		if(!n)
+			return [ok = false, error = "add_node needs node.label"];
+		// a new id when the label is taken
+		base = n.id;
+		for(k = 2; arch_find(pv.nodes, n.id) >= 0; k++)
+			n.id = base + "-" + std.string(k);
+		n.erase("x");
+		n.erase("y");
+		pos = arch_get(edit, "node", std.json());
+		if(pos.has("x") && pos.has("y")) {
+			n.x = std.float(pos.x);
+			n.y = std.float(pos.y);
+		}
+		p.node = n;
+	}
+	else if(op == "update_node" || op == "remove_node") {
+		target = arch_str(edit, "target", "");
+		i = arch_find(pv.nodes, target);
+		if(i < 0)
+			return [ok = false, error = "unknown node '" + target + "'"];
+		if(arch_str(pv.nodes[i], "pending", "") == "remove")
+			return [ok = false, error = "node '" + target + "' is already removed by a pending edit"];
+		if(arch_str(pv.nodes[i], "pending", "") == "add")
+			return [ok = false, error = "node '" + target + "' is a pending new node: change or drop that edit instead"];
+		p.target = target;
+		if(op == "update_node") {
+			ch = arch_get(edit, "node", None);
+			if(!arch_is_map(ch) || !ch.size())
+				return [ok = false, error = "update_node needs the changed fields in node"];
+			p.node = std.json();
+			for(k : ["label", "kind", "group", "path", "purpose"]) {
+				if(ch.has(k) && !std.is_none(ch[k]))
+					p.node[k] = std.string(ch[k]).strip();
+			}
+			if(!p.node.size())
+				return [ok = false, error = "update_node: nothing to change"];
+		}
+	}
+	else if(op == "add_edge") {
+		e = arch_norm_edge(arch_get(edit, "edge", None));
+		if(!e)
+			return [ok = false, error = "add_edge needs edge.source and edge.target"];
+		if(e.source == e.target)
+			return [ok = false, error = "an edge needs two different nodes"];
+		for(nid : [e.source, e.target]) {
+			i = arch_find(pv.nodes, nid);
+			if(i < 0)
+				return [ok = false, error = "unknown node '" + nid + "'"];
+			if(arch_str(pv.nodes[i], "pending", "") == "remove")
+				return [ok = false, error = "node '" + nid + "' is removed by a pending edit"];
+		}
+		if(arch_find(pv.edges, e.id) >= 0)
+			return [ok = false, error = "this connection exists already"];
+		p.edge = e;
+	}
+	else {
+		target = arch_str(edit, "target", "");
+		i = arch_find(pv.edges, target);
+		if(i < 0)
+			return [ok = false, error = "unknown edge '" + target + "'"];
+		if(arch_str(pv.edges[i], "pending", "") == "add")
+			return [ok = false, error = "edge '" + target + "' is a pending new edge: drop that edit instead"];
+		p.target = target;
+		if(op == "update_edge") {
+			ch = arch_get(edit, "edge", None);
+			if(!arch_is_map(ch))
+				return [ok = false, error = "update_edge needs the changed fields in edge"];
+			p.edge = std.json();
+			for(k : ["kind", "label"]) {
+				if(ch.has(k) && !std.is_none(ch[k]))
+					p.edge[k] = std.string(ch[k]).strip();
+			}
+			if(!p.edge.size())
+				return [ok = false, error = "update_edge: nothing to change"];
+		}
+	}
+
+	model.pending.push_back(p);
+	return [ok = true, id = p.id, edit = p];
+}
+
+// Drop a pending edit; edits that depend on it (an edge to a node it adds) go too.
+// -> the number of edits removed
+arch_remove_edit(model, edit_id) {
+	i = arch_find(model.pending, edit_id);
+	if(i < 0)
+		return 0;
+
+	p = model.pending[i];
+	model.pending.erase(i);
+	removed = 1;
+
+	if(arch_str(p, "op", "") == "add_node") {
+		nid = p.node.id;
+		for(j = model.pending.size() - 1; j >= 0; j--) {
+			q = model.pending[j];
+			dep = false;
+			if(arch_str(q, "target", "") == nid)
+				dep = true;
+			if(arch_get(q, "edge", None) && (arch_str(q.edge, "source", "") == nid || arch_str(q.edge, "target", "") == nid))
+				dep = true;
+			if(dep) {
+				model.pending.erase(j);
+				removed++;
+			}
+		}
+	}
+	return removed;
+}
+
+// The edits become part of the model (after a worker implemented them).
+// -> the number of edits applied
+arch_commit_edits(model, edit_ids) {
+	applied = 0;
+	keep = [];
+	for(p : model.pending) {
+		if(arch_in(edit_ids, p.id)) {
+			if(arch_apply_one(model.nodes, model.edges, p, false))
+				applied++;
+		}
+		else
+			keep.push_back(p);
+	}
+	model.pending = keep;
+	return applied;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  texts for the workers
+// ─────────────────────────────────────────────────────────────────────────────
+
+arch_node_line(n) {
+	s = "`" + n.id + "` " + n.label + " (" + n.kind;
+	if(n.path)
+		s += ", " + n.path;
+	s += ")";
+	if(n.purpose)
+		s += ": " + n.purpose;
+	return s;
+}
+
+arch_label_of(model, id) {
+	pv = arch_preview(model);
+	i = arch_find(pv.nodes, id);
+	return i >= 0 ? pv.nodes[i].label + " (`" + id + "`)" : "`" + id + "`";
+}
+
+// the pending edits as a Markdown list
+arch_edits_markdown(model, edits = None) {
+	list = edits ?? model.pending;
+	out = "";
+	for(i, p : list) {
+		op = arch_str(p, "op", "");
+		line = std.string(i + 1) + ". ";
+		if(op == "add_node")
+			line += "ADD node " + arch_node_line(p.node);
+		else if(op == "update_node") {
+			line += "CHANGE node " + arch_label_of(model, p.target) + ":";
+			for(k, v : p.node)
+				line += " " + k + " -> \"" + std.string(v) + "\";";
+		}
+		else if(op == "remove_node")
+			line += "REMOVE node " + arch_label_of(model, p.target) + " and its connections";
+		else if(op == "add_edge") {
+			line += "CONNECT " + arch_label_of(model, p.edge.source) + " -[" + p.edge.kind + "]-> " + arch_label_of(model, p.edge.target);
+			if(p.edge.label)
+				line += " (\"" + p.edge.label + "\")";
+		}
+		else if(op == "update_edge") {
+			line += "CHANGE connection `" + p.target + "`:";
+			for(k, v : p.edge)
+				line += " " + k + " -> \"" + std.string(v) + "\";";
+		}
+		else if(op == "remove_edge")
+			line += "REMOVE connection `" + p.target + "`";
+		if(arch_str(p, "note", ""))
+			line += "\n   Note from the owner: " + p.note;
+		out += line + "\n";
+	}
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  context of a job: the prompt stays small, the details are files
+//
+//  A worker never gets the whole model or the whole change set pasted into its
+//  prompt. It gets a short summary and file paths it reads in pieces (read_file
+//  with start_line / end_line, search_in_file): architecture.json, the change list
+//  (architecture_changes.md, written by the board: every edit in full, grouped,
+//  with the nodes it touches) and the plan. Above ARCH_SPLIT_EDITS edits, or a
+//  change list / plan longer than ARCH_SPLIT_CHARS, the job is SPLIT: the worker
+//  coordinates and delegates one start_task per group of edits; the node runs
+//  them in parallel up to max_running_agents of the model config (agent_slots).
+//  The conversation itself is compacted by openai_compact when it fills up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+ARCH_CHANGES_FILE = "architecture_changes.md";
+ARCH_PREV_PLAN_FILE = "architecture_plan.previous.md";
+ARCH_SPLIT_EDITS = 6;
+ARCH_SPLIT_CHARS = 12000;
+ARCH_SUMMARY_LINES = 12;
+
+// the node ids an edit touches
+arch_edit_nodes(model, p) {
+	op = arch_str(p, "op", "");
+	if(op == "add_node")
+		return [p.node.id];
+	if(op == "update_node" || op == "remove_node")
+		return [arch_str(p, "target", "")];
+	if(op == "add_edge")
+		return [p.edge.source, p.edge.target];
+	// update_edge / remove_edge: the ends of that edge
+	pv = arch_preview(model);
+	i = arch_find(pv.edges, arch_str(p, "target", ""));
+	if(i >= 0)
+		return [pv.edges[i].source, pv.edges[i].target];
+	return [];
+}
+
+// the edits by the group of the first node they touch:
+// [[group, numbers = [1, 4], nodes = [...]], ...] in the order they first appear
+arch_edit_groups(model, edits) {
+	pv = arch_preview(model);
+	out = [];
+	for(i, p : edits) {
+		ids = arch_edit_nodes(model, p);
+		g = "";
+		if(ids.size()) {
+			j = arch_find(pv.nodes, ids[0]);
+			if(j >= 0)
+				g = arch_str(pv.nodes[j], "group", "");
+		}
+		if(!g)
+			g = "(no group)";
+		k = -1;
+		for(n, x : out) {
+			if(x.group == g)
+				k = n;
+		}
+		if(k < 0) {
+			out.push_back([group = g, numbers = [], nodes = []]);
+			k = out.size() - 1;
+		}
+		out[k].numbers.push_back(i + 1);
+		for(id : ids) {
+			if(!arch_in(out[k].nodes, id))
+				out[k].nodes.push_back(id);
+		}
+	}
+	return out;
+}
+
+arch_numbers(list) {
+	s = "";
+	for(i, n : list)
+		s += (i ? ", " : "") + std.string(n);
+	return s;
+}
+
+// architecture_changes.md: every edit in full, the groups, the nodes they touch
+arch_changes_markdown(model, edits) {
+	pv = arch_preview(model);
+	out = "# Pending architecture changes (" + std.string(edits.size()) + ")\n\n" +
+		"Numbers are the edit numbers the job prompt refers to.\n\n" +
+		arch_edits_markdown(model, edits) + "\n## Groups\n\n";
+	groups = arch_edit_groups(model, edits);
+	for(g : groups)
+		out += "- " + g.group + ": edits " + arch_numbers(g.numbers) + "\n";
+
+	out += "\n## The nodes these changes touch\n\n";
+	touched = [];
+	for(g : groups) {
+		for(id : g.nodes) {
+			if(!arch_in(touched, id))
+				touched.push_back(id);
+		}
+	}
+	for(id : touched) {
+		i = arch_find(pv.nodes, id);
+		if(i < 0)
+			continue;
+		out += "- " + arch_node_line(pv.nodes[i]) + "\n";
+		for(e : pv.edges) {
+			if(e.source == id || e.target == id)
+				out += "  - " + e.source + " -[" + e.kind + "]-> " + e.target + (e.label ? " (" + e.label + ")" : "") + "\n";
+		}
+	}
+	return out;
+}
+
+// too much for one context: the job is split into subtasks
+arch_needs_split(model, edits, plan_text = "") {
+	if(edits.size() > ARCH_SPLIT_EDITS)
+		return true;
+	if(arch_changes_markdown(model, edits).length() > ARCH_SPLIT_CHARS)
+		return true;
+	return std.string(plan_text ?? "").length() > ARCH_SPLIT_CHARS;
+}
+
+// what every job prompt starts with: the project in short, the files, the edits
+// as one line each (at most ARCH_SUMMARY_LINES, the rest only in the file)
+// files: [model, changes, plan] paths
+arch_job_context(model, edits, files) {
+	text = "# Context\n";
+	if(model.project)
+		text += "Project: " + model.project + ". ";
+	if(model.summary)
+		text += model.summary;
+	text += "\n\nThe architecture model (" + std.string(model.nodes.size()) + " nodes, " + std.string(model.edges.size()) + " connections) is `" + files.model + "`. " +
+		"Do not read it whole: search_in_file for the node ids you need and read_file with start_line / end_line around them.\n";
+	if(edits.size()) {
+		text += "Every change in full, grouped, with the nodes it touches: `" + files.changes + "` (read it in pieces when it is long).\n\n" +
+			"# The " + std.string(edits.size()) + " changes in short\n";
+		lines = arch_edits_markdown(model, edits).split("\n");
+		shown = 0;
+		for(l : lines) {
+			if(!l || l.starts(" "))
+				continue;
+			if(shown >= ARCH_SUMMARY_LINES)
+				break;
+			text += (l.length() > 160 ? l.substr(0, 157) + "..." : l) + "\n";
+			shown++;
+		}
+		if(edits.size() > shown)
+			text += "... and " + std.string(edits.size() - shown) + " more in `" + files.changes + "`.\n";
+	}
+	return text + "\n";
+}
+
+// how to work: alone, or split into one subtask per group of edits
+arch_split_rules(model, edits, files, what) {
+	if(!arch_needs_split(model, edits, arch_read_text(files.plan))) {
+		return "This change set is small: do the work yourself. Use start_task only for parts that are clearly independent.\n";
+	}
+	text = "# This change set is too big for one context: split it\n" +
+		"You coordinate and do not " + what + " everything yourself. Delegate with start_task, one subtask per group below " +
+		"(a group with more than " + std.string(ARCH_SPLIT_EDITS) + " edits: one subtask per edit). " +
+		"Give each subtask only its edit numbers, the path `" + files.changes + "` and the files it touches - never paste the whole change list or the model. " +
+		"Start the independent groups together: the node runs them in parallel up to its max_running_agents limit. " +
+		"Keep only the short results in your context; put the parts together yourself at the end.\n\n";
+	for(g : arch_edit_groups(model, edits))
+		text += "- " + g.group + ": edits " + arch_numbers(g.numbers) + "\n";
+	return text + "\n";
+}
+
+arch_format_help() {
+	return "{\n" +
+		"  \"project\": \"short project name\",\n" +
+		"  \"summary\": \"two or three sentences: what the program does and how it is built\",\n" +
+		"  \"nodes\": [\n" +
+		"    {\"id\": \"router-api\", \"label\": \"Router API\", \"kind\": \"module\", \"group\": \"network\",\n" +
+		"     \"path\": \"src/router_api.cpp\", \"purpose\": \"one line: what it is for\"}\n" +
+		"  ],\n" +
+		"  \"edges\": [\n" +
+		"    {\"source\": \"router-api\", \"target\": \"node\", \"kind\": \"calls\", \"label\": \"start_task\"}\n" +
+		"  ]\n" +
+		"}\n" +
+		"kind of a node: " + ARCH_NODE_KINDS.combine_string(", ").removesuffix(", ") + "\n" +
+		"kind of an edge: " + ARCH_EDGE_KINDS.combine_string(", ").removesuffix(", ") + " (source uses / sends to target)\n";
+}
+
+arch_analyze_goal(out_path) {
+	return "Analyze the codebase in the current working directory and write a high-level architecture model of it as JSON.\n\n" +
+		"This model is shown to the owner as a node graph: it is the map they use to understand and redesign the program, so it must be correct and readable at a glance.\n\n" +
+		"# What to do\n" +
+		"1. Look at the layout of the repository, the build files, entry points and the main modules (read enough code to know what each part does and what it uses; do not read every file).\n" +
+		"   A large repository (many top-level parts): delegate one start_task per top-level part that returns its nodes and edges in short, and merge them yourself; keep your own context for the overview.\n" +
+		"2. Pick 8 to 40 nodes at the level a new developer needs: modules, important files, services/processes, UIs, data stores, external systems. Group them with `group` (a subsystem name).\n" +
+		"3. Add the edges that matter: who calls / includes / sends data or events to whom.\n" +
+		"4. Write the JSON (only JSON, no comments) to `" + out_path + "` in exactly this format:\n\n" +
+		arch_format_help() + "\n" +
+		"Ids: lowercase, letters digits and dashes, unique. Every edge must name existing node ids. Purposes are one line each.\n" +
+		"5. Do not change any other file. Then finalize(signal='finished', result='two-line summary').\n";
+}
+
+// files: [model, changes, plan, previous] (previous: the last plan, for a revision)
+arch_plan_goal(model, files, feedback = "") {
+	edits = model.pending;
+	text = "Write an implementation plan for changes the owner made in the architecture graph of this codebase. Do NOT change any code in this task.\n\n" +
+		arch_job_context(model, edits, files);
+
+	if(feedback && arch_str(files, "previous", ""))
+		text += "# Revision\nYour previous plan is `" + files.previous + "`. The owner's feedback on it:\n" + feedback + "\n\nRevise the plan with this feedback.\n\n";
+	else if(feedback)
+		text += "# The owner's notes\n" + feedback + "\n\n";
+
+	text += arch_split_rules(model, edits, files, "research") +
+		"# What to do\n" +
+		"1. Read the code the changes touch.\n" +
+		"2. Write the plan as Markdown to `" + files.plan + "`: for each change (by its number) what will be done, in which files, the order, risks and open questions. Short and concrete; the owner reads it before pressing Apply. A split change set: one section per group, so Apply can hand each section to one subtask.\n" +
+		"3. Do not change any other file. Finalize(signal='finished', result='one-paragraph summary of the plan').\n";
+	return text;
+}
+
+// files: [model, changes, plan] (plan: "" when there is none)
+arch_apply_goal(model, edits, files) {
+	text = "Implement changes the owner made in the architecture graph of this codebase.\n\n" +
+		arch_job_context(model, edits, files);
+
+	if(arch_str(files, "plan", "") && fileio.exists(files.plan))
+		text += "The plan the owner reviewed is `" + files.plan + "`: follow it (read it in pieces when it is long).\n\n";
+
+	text += arch_split_rules(model, edits, files, "implement") +
+		"# What to do\n" +
+		"Implement every change in the code (new modules / files, changed responsibilities, new or removed connections), keep the build and the tests working, and follow the conventions of the repository.\n" +
+		"Do not edit " + files.model + ": the graph is updated when you finalize(signal='finished', result=...). finalize(signal='failed', result=...) if a change cannot be done; finalize(signal='question', result=...) if the owner has to decide something.\n";
+	return text;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ArchitectureBoard — the model file + the jobs on the node's worker pool
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ArchitectureBoard {
+	root = ".agentspace";
+	path = "";
+	analysis_path = "";
+	plan_path = "";
+	changes_path = "";
+	prev_plan_path = "";
+	role = "adaptive";		// the role of the job tasks (Megamind.add_task)
+	host = None;
+	model = None;
+
+	__init__(_host, _root = ".agentspace", _role = "adaptive", _recover_jobs = true) {
+		host = _host;
+		role = std.string(_role ?? "adaptive");
+		if(!role)
+			role = "adaptive";
+		root = std.string(_root ?? ".agentspace");
+		for(root.length() > 1 && (root.ends("/") || root.ends("\\")))
+			root = root.substr(0, root.length() - 1);
+		path = root + "/" + ARCH_FILE;
+		analysis_path = root + "/" + ARCH_ANALYSIS_FILE;
+		plan_path = root + "/" + ARCH_PLAN_FILE;
+		changes_path = root + "/" + ARCH_CHANGES_FILE;
+		prev_plan_path = root + "/" + ARCH_PREV_PLAN_FILE;
+		model = arch_load(path);
+
+		// a job of an earlier run whose task this node does not know is lost
+		if(_recover_jobs && job_open() && !task_known(model.job.taskid)) {
+			model.job.state = "lost";
+			model.job.error = "the node was restarted while the job ran";
+			model.job.finished = std.millis();
+			save();
+		}
+
+		if(host) {
+			try {
+				host.add_task_finished_listener([this](task) { this.on_task_finished(task); });
+			}
+			catch(e) {
+				std.error("[architecture] the host has no task finished listener: ", e);
+			}
+		}
+	}
+
+	save() {
+		return arch_save(path, model);
+	}
+
+	reload() {
+		model = arch_load(path);
+	}
+
+	exists() {
+		return fileio.exists(path);
+	}
+
+	task_known(taskid) {
+		if(!host || !taskid)
+			return false;
+		info = None;
+		try {
+			info = host.inspect_task(taskid);
+		}
+		catch(e) {
+			return false;
+		}
+		return std.is_json(info);
+	}
+
+	job_open() {
+		st = arch_str(model.job, "state", "");
+		return st == "planned" || st == "research" || st == "implement" || st == "running";
+	}
+
+	// the job with the live task state of the node
+	job_state() {
+		j = model.job.copy();
+		if(job_open() && host) {
+			try {
+				info = host.inspect_task(j.taskid);
+				if(std.is_json(info) && arch_str(info, "state", ""))
+					j.state = arch_str(info, "state", "");
+			}
+			catch(e) {}
+		}
+		return j;
+	}
+
+	// everything the web page shows
+	state() {
+		cs = std.critical_section_named(ARCH_LOCK);
+		pv = arch_preview(model);
+		out = [
+			file = path,
+			analyzed = json.bool(fileio.exists(path) && model.nodes.size() > 0),
+			project = model.project,
+			summary = model.summary,
+			revision = model.revision,
+			analyzed_at = model.analyzed_at,
+			nodes = pv.nodes,
+			edges = pv.edges,
+			pending = model.pending.copy(),
+			plan = model.plan.copy(),
+			job = job_state(),
+			history = model.history.copy(),
+		];
+		cs.release();
+		return out;
+	}
+
+	add_edit(edit) {
+		cs = std.critical_section_named(ARCH_LOCK);
+		model = arch_load(path);
+		if(arch_str(model.job, "kind", "") == "apply" && job_open()) {
+			cs.release();
+			return [ok = false, error = "an Apply job is running: wait until it is done"];
+		}
+		res = arch_add_edit(model, edit);
+		if(res.ok) {
+			// the plan was written for other edits
+			if(arch_str(model.plan, "text", ""))
+				model.plan.outdated = json.bool(true);
+			save();
+		}
+		cs.release();
+		return res;
+	}
+
+	remove_edit(edit_id) {
+		cs = std.critical_section_named(ARCH_LOCK);
+		n = arch_remove_edit(model, edit_id);
+		if(n) {
+			if(arch_str(model.plan, "text", ""))
+				model.plan.outdated = json.bool(true);
+			save();
+		}
+		cs.release();
+		return n;
+	}
+
+	discard_edits() {
+		cs = std.critical_section_named(ARCH_LOCK);
+		n = model.pending.size();
+		model.pending = arch_empty_list();
+		model.plan = std.json();
+		save();
+		cs.release();
+		return n;
+	}
+
+	// positions from the page: [[id, x, y], ...] or {id: [x, y]}
+	set_layout(positions) {
+		cs = std.critical_section_named(ARCH_LOCK);
+		n = 0;
+		if(std.is_json(positions)) {
+			for(k, v : positions) {
+				id = "";
+				x = 0.0;
+				y = 0.0;
+				if(arch_is_map(v)) {
+					id = arch_str(v, "id", std.string(k));
+					x = std.float(arch_get(v, "x", 0));
+					y = std.float(arch_get(v, "y", 0));
+				}
+				else if(std.is_json(v) && v.size() >= 2) {
+					id = std.string(k);
+					x = std.float(v[0]);
+					y = std.float(v[1]);
+				}
+				else
+					continue;
+				i = arch_find(model.nodes, id);
+				if(i >= 0) {
+					model.nodes[i].x = x;
+					model.nodes[i].y = y;
+					n++;
+					continue;
+				}
+				// a pending new node keeps its position in its edit
+				for(p : model.pending) {
+					if(arch_str(p, "op", "") == "add_node" && p.node.id == id) {
+						p.node.x = x;
+						p.node.y = y;
+						n++;
+					}
+				}
+			}
+		}
+		if(n)
+			save();
+		cs.release();
+		return n;
+	}
+
+	_start_job(kind, name, goal, extra = None) {
+		if(!host)
+			return [ok = false, error = "no node to run the job on"];
+		if(job_open())
+			return [ok = false, error = "the " + arch_str(model.job, "kind", "") + " job is still running"];
+
+		taskid = host.add_task(name, goal, role);
+		if(!taskid)
+			return [ok = false, error = "the node did not accept the task"];
+
+		j = std.json();
+		j.kind = kind;
+		j.taskid = taskid;
+		j.name = name;
+		j.state = "planned";
+		j.started = std.millis();
+		j.report = "";
+		j.error = "";
+		if(arch_is_map(extra)) {
+			for(k, v : extra)
+				j[k] = v;
+		}
+		model.job = j;
+		save();
+		return [ok = true, taskid = taskid, job = j];
+	}
+
+	// first use and "Re-sync"
+	analyze() {
+		cs = std.critical_section_named(ARCH_LOCK);
+		arch_remove(analysis_path);
+		res = _start_job("analyze", "Architecture-Analysis", arch_analyze_goal(analysis_path));
+		cs.release();
+		return res;
+	}
+
+	// "Review plan" (feedback: the owner's comments on the previous plan)
+	review_plan(feedback = "") {
+		cs = std.critical_section_named(ARCH_LOCK);
+		if(!model.pending.size()) {
+			cs.release();
+			return [ok = false, error = "there are no pending changes to plan"];
+		}
+		ids = [];
+		for(p : model.pending)
+			ids.push_back(p.id);
+		fb = std.string(feedback ?? "").strip();
+		// a revision reads the last plan from its own file; the worker writes the new one
+		prev = "";
+		if(fb && arch_str(model.plan, "text", "")) {
+			arch_write_atomic(prev_plan_path, model.plan.text);
+			prev = prev_plan_path;
+		}
+		arch_remove(plan_path);
+		arch_write_atomic(changes_path, arch_changes_markdown(model, model.pending));
+		files = [model = path, changes = changes_path, plan = plan_path, previous = prev];
+		res = _start_job("plan", "Architecture-Plan", arch_plan_goal(model, files, fb), [edit_ids = ids, feedback = fb, split = json.bool(arch_needs_split(model, model.pending))]);
+		cs.release();
+		return res;
+	}
+
+	// "Apply": the pending edits (all of them) go to a worker
+	apply() {
+		cs = std.critical_section_named(ARCH_LOCK);
+		if(!model.pending.size()) {
+			cs.release();
+			return [ok = false, error = "there are no pending changes to apply"];
+		}
+		ids = [];
+		edits = [];
+		for(p : model.pending) {
+			ids.push_back(p.id);
+			edits.push_back(p);
+		}
+		arch_write_atomic(changes_path, arch_changes_markdown(model, edits));
+		// the reviewed plan is the file the worker reads
+		plan_file = "";
+		if(arch_str(model.plan, "text", "")) {
+			arch_write_atomic(plan_path, model.plan.text);
+			plan_file = plan_path;
+		}
+		files = [model = path, changes = changes_path, plan = plan_file];
+		res = _start_job("apply", "Architecture-Apply", arch_apply_goal(model, edits, files), [edit_ids = ids, split = json.bool(arch_needs_split(model, edits, arch_str(model.plan, "text", "")))]);
+		cs.release();
+		return res;
+	}
+
+	// host.add_task_finished_listener: the end of a job (worker thread)
+	on_task_finished(task) {
+		if(!std.is_json(task))
+			return false;
+
+		cs = std.critical_section_named(ARCH_LOCK);
+		if(!arch_str(model.job, "taskid", "") || arch_str(task, "taskid", "") != model.job.taskid) {
+			cs.release();
+			return false;
+		}
+
+		st = arch_str(task, "state", "failed");
+		kind = arch_str(model.job, "kind", "");
+		model.job.finished = std.millis();
+		model.job.report = arch_str(task, "report", "");
+		model.job.state = st;
+		model.job.error = "";
+
+		if(st == "finished") {
+			if(kind == "analyze")
+				_finish_analysis();
+			else if(kind == "plan")
+				_finish_plan();
+			else if(kind == "apply")
+				_finish_apply();
+		}
+		else if(st == "question") {
+			model.job.error = "the worker has a question: " + model.job.report;
+		}
+		else {
+			model.job.error = model.job.report ? model.job.report : "the task ended as " + st;
+		}
+
+		save();
+		cs.release();
+		return true;
+	}
+
+	_finish_analysis() {
+		text = arch_read_text(analysis_path);
+		if(!text) {
+			model.job.state = "failed";
+			model.job.error = "the worker did not write " + analysis_path;
+			return;
+		}
+		raw = None;
+		try {
+			raw = std.json(text, true);
+		}
+		catch(e) {
+			raw = None;
+		}
+		errors = arch_validate(raw);
+		if(errors.size()) {
+			model.job.state = "failed";
+			model.job.error = "the analysis is not valid: " + errors.combine_string("; ").removesuffix("; ");
+			return;
+		}
+		model = arch_merge_analysis(model, raw);
+		model.job.nodes = model.nodes.size();
+		model.job.edges = model.edges.size();
+		_history("analyze", model.job.report);
+	}
+
+	_finish_plan() {
+		text = arch_read_text(plan_path).strip();
+		if(!text)
+			text = model.job.report;
+		p = std.json();
+		p.text = text;
+		p.edit_ids = arch_get(model.job, "edit_ids", []);
+		p.created = std.millis();
+		p.taskid = model.job.taskid;
+		p.feedback = arch_str(model.job, "feedback", "");
+		p.outdated = json.bool(false);
+		// edits added or dropped while the plan was written
+		now_ids = [];
+		for(q : model.pending)
+			now_ids.push_back(q.id);
+		if(std.string(now_ids) != std.string(p.edit_ids))
+			p.outdated = json.bool(true);
+		model.plan = p;
+	}
+
+	_finish_apply() {
+		ids = arch_get(model.job, "edit_ids", []);
+		n = arch_commit_edits(model, ids);
+		model.job.applied = n;
+		model.revision = std.int(model.revision) + 1;
+		model.plan = std.json();
+		_history("apply", model.job.report, ids.size());
+	}
+
+	_history(kind, report, edits = 0) {
+		h = std.json();
+		h.kind = kind;
+		h.time = std.millis();
+		h.taskid = model.job.taskid;
+		h.report = report;
+		h.edits = edits;
+		model.history.push_back(h);
+		for(model.history.size() > ARCH_HISTORY_KEPT)
+			model.history.erase(0);
+	}
+}

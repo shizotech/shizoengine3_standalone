@@ -39,6 +39,17 @@ AREA_TILE_HOT_COLOR = vec4f(0.160, 0.160, 0.175, 1.0);
 AREA_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
 AREA_TEXT_3 = vec4f(0.369, 0.369, 0.388, 1.0);
 AREA_MARK_COLOR = vec4f(0.616, 0.522, 1.0, 1.0);     //accent
+AREA_COVER_COLOR = vec4f(0.043, 0.043, 0.047, 1.0);  //the empty area, over it while a layout is built into it (#873)
+
+//A split, a Tabview or a whole layout (undo, redo) is built in steps, and the screen draws between them: every file the
+//new asset reads lets it draw. While one is built no area shows its picker; the areas that are still empty get it
+//when the last build ends (#873). The count is in engine.env, which the areas of every module share
+layout_building() {
+	engine = std.global("engine");
+	if(!engine || !engine.env)
+		return false;
+	return (engine.env.layout_building ?? 0) > 0;
+}
 
 //The views in assets/Views: [path=, name=, icon=, order=, toolbar=, description=], sorted by "order" of their view.json.
 //"toolbar": false keeps a view out of the picker of an empty area (the split views: an area is split with its head)
@@ -120,6 +131,7 @@ class singleview
 	item = None;
 
 	managed picker = None;    //"What goes here?", only while the area is empty
+	managed cover = None;     //hides the steps while a split or a Tabview is built into this area (#873)
 	picker_targets = [];      //[name=, button=] the tiles of the picker, for picker_tiles()
 	managed head = None;      //the head of the area
 	managed hot = None;       //the top edge that shows the head of a filled area
@@ -354,6 +366,43 @@ class singleview
 		return old;
 	}
 
+	//While action builds a split or a Tabview into this area, a cover hides its steps (an empty area, the window of the
+	//split asset with its own head, pickers) and no area shows its picker (layout_building). Then the areas that are
+	//still empty get theirs. Returns what action returns, an error of action goes on after the cover is gone
+	build(action) {
+		building(true);
+		result = None;
+		failed = None;
+		try {
+			result = action();
+		}
+		catch(e) {
+			failed = e;
+		}
+		building(false);
+		if(!layout_building())
+			refresh_tree();
+		if(!std.is_none(failed))
+			std.runtime_error(failed);
+		return result;
+	}
+
+	//on: one more build runs, this area is covered. Off: that build ended (restore_layout of generators.shio covers
+	//the view tabs with it during undo and redo)
+	building(on) {
+		engine = std.global("engine");
+		if(engine && engine.env) {
+			count = (engine.env.layout_building ?? 0) + (on ? 1 : -1);
+			engine.env.layout_building = count > 0 ? count : 0;
+		}
+		if(!on) {
+			cover = None;
+			return;
+		}
+		if(!cover)
+			cover = container.widget_solid().background_color(AREA_COVER_COLOR).anchor(0).overlay(true);
+	}
+
 	//Moves a generator that lives in another area into this one
 	attach(gen) {
 		gen.window.move_to(area);
@@ -374,6 +423,12 @@ class singleview
 	//edge, the new view into the half at the edge: the asset at path, or gen, a view that moves here from another
 	//area. Without both that half stays empty (Split right / Split down)
 	split(path, zone, gen = None) {
+		return build([this, path, zone, gen](){
+			return this.split_steps(path, zone, gen);
+		});
+	}
+
+	split_steps(path, zone, gen) {
 		side_by_side = zone == "left" || zone == "right";
 		new_first = zone == "left" || zone == "top";
 
@@ -443,6 +498,12 @@ class singleview
 		//The area of a tab: its Tabview gets one more tab, not a Tabview inside the tab (#362)
 		if(in_tab && owner && owner.is_tabs())
 			return owner.add_as_tab(path, gen);
+		return build([this, path, gen](){
+			return this.tab_steps(path, gen);
+		});
+	}
+
+	tab_steps(path, gen) {
 
 		name = fileio.pure_name(gen ? gen.get_relative_path() : path);
 
@@ -804,6 +865,15 @@ class singleview
 	//The area of a tab: the tab is named after what the area holds now. only_new: only a tab that still has the name
 	//a new tab gets, not one the user (or a drop) named
 	name_tab(only_new = false) {
+		//The area of a view tab of the top bar (#755): the tab is named after a generator in it. A view (Patchview,
+		//split, Tabview) leaves the name, it is a part of the layout and not what the tab shows
+		if(workspace) {
+			env = std.global("engine").env;
+			path = item ? item.get_relative_path().replace("\\", "/") : "";
+			if(item && env.name_view_tab && !path.starts(VIEWS_DIR + "/"))
+				env.name_view_tab(uid, fileio.pure_name(path), only_new);
+			return;
+		}
 		if(!in_tab || !item || !owner || !owner.is_tabs() || !owner.item.module.has("set_tab_name_of"))
 			return;
 		owner.item.module.call("set_tab_name_of", uid, fileio.pure_name(item.get_relative_path()), only_new);
@@ -875,14 +945,16 @@ class singleview
 		});
 	}
 
-	//Only this destroys a view, after a question
-	delete_view() {
+	//Only this destroys a view, after a question (ask false: the user was asked already, vibevj_delete_view)
+	delete_view(ask = true) {
 		if(locked() || !item)
 			return;
 
-		accept = area.screen().modal_yes_no("Delete \"" + item_meta().name + "\" and everything in it?", "Delete view?");
-		if(accept != "yes")
-			return;
+		if(ask) {
+			accept = area.screen().modal_yes_no("Delete \"" + item_meta().name + "\" and everything in it?", "Delete view?");
+			if(accept != "yes")
+				return;
+		}
 
 		step("Delete view", [this](){
 			this.restore_maximized();
@@ -1669,7 +1741,7 @@ class singleview
 	}
 
 	show_picker() {
-		if(picker)
+		if(picker || layout_building())
 			return;
 
 		picker_targets = [];

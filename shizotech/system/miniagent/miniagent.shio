@@ -28,8 +28,12 @@ class miniagent
 	role = "";
 	filesystem = None;
 	filesystem_virtual = None; //For temporary agent artifacts, store in memory rather than cluttering the disk
-	env = []; 			//Env for the current agent
+	env = []; 			//Env for the current agent (unique for each agent)
 	env_shared = []; 	//Shared across all (sub) agents
+	
+	compaction_treshold = 0.8;
+	
+	//Might be obsolete...
 	action_history = [];
 	modified_files = [];
 
@@ -41,6 +45,10 @@ class miniagent
 	
 	running = false;
 	stopped = false;
+	
+	//The result of the task, usually set through finalize(), if the agent doesnt have/call finalize, its the returned text by the run itself.
+	task_result = None;
+	use_finalize = false; //Set true if this agent role uses the finalize exit point.
 	
 	//agent_slots.shio: this agent holds a max_running_agents slot / lent it to a child
 	_slot_held = false;
@@ -102,15 +110,6 @@ class miniagent
 			}
 		};
 		
-		llm_api.on_analysis = [this](txt)
-		{
-			if(std.is_function(on_action)) {
-				on_action([
-					text = txt,
-				]);
-			}
-		};
-		
 		llm_api.on_tool = [this](toolname, toolargs)
 		{
 			if(std.is_function(on_action)) {
@@ -123,7 +122,7 @@ class miniagent
 			}
 		};
 		
-		llm_api.on_analysis = [this](txt) {
+		llm_api.on_reason = [this](txt) {
 			if(std.is_function(on_action)) {
 				on_action([
 					reasoning = txt,
@@ -131,9 +130,16 @@ class miniagent
 			}
 		};
 		
+		llm_api.on_usage = [this](usage) {
+			ctx_perc = usage.total_tokens / std.float(model_config.max_tokens);
+			if(ctx_perc >= compaction_treshold)
+				std.print("compaction...");
+				task_update("<!---SYTEM MESSAGE---!>\nYOUR CONTEXT IS ABOUT TO RUN OUT!\nYOU HAVE TO EXIT THE CURRENT TURN IMMEDIATELY.\nWRITE A HANDOVER TO CONTINUE WORK IN A NEW RUN _OR_ EXIT WITH A SHORT NOTICE.");
+		};
+		
 		add_tool(
-			"sleep",
-			"Sleep for a while to wait for an event.",
+			"wait",
+			"Sleep for a while.",
 			[
 				duration = "&int(1,600): Duration in *SECONDS*",
 				//context = "&string(): Context for this action",
@@ -260,6 +266,10 @@ class miniagent
 		return final_skills;
 	}
 	
+	set_reasoning_effort(effort) {
+		llm_api.set_reasoning_effort(effort);
+	}
+	
 	add_image_url(img_url) { return llm_api.add_image_url(img_url); }
 	add_image_raw(raw_image_data, img_type = "png") { return llm_api.add_image_raw(raw_image_data, img_type); }
 	add_image(path) { return llm_api.add_image(path); }
@@ -270,150 +280,172 @@ class miniagent
 		//flag, never the stop of an ancestor. A subagent whose parent was stopped
 		//must not start generating again.
 		if(ancestor_stopped()) {
-			stopped = true;
-			return [
-				ok=false,
-				stopped=true,
-				reports=[],
-				error="The agent was stopped by its parent before the task started.",
-			];
+			return finalize_run("failed", "The agent was stopped by its parent before the task started.");
 		}
 
 		if(!continue_task)
-			env["task"] = prompt;
-			env["text"] = "";
-			env["text_capture"] = "";
-			env.reports = [];
-		
+			env.task = prompt;
+			env.text = "";
+			env.text_capture = "";
+
+		initial_prompt = prompt;
+
 		running = true;
 		stopped = false;
-		
+		_injected_prompt = None;
+
+		//First, check if chat history needs compaction
+		if(model_config.max_tokens) {
+			total_tokens = llm_api.context.token_count_prompt(prompt);
+			if(total_tokens > model_config.max_tokens/2) {
+				std.print("compacting...");
+				
+				handover = compact_handover();
+				
+				if(!handover)
+					std.print("no handover.");
+					return finalize_run("failed", "Cannot compact the chat history.");
+						
+				prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover for context:\n\n" + handover;				
+			}
+		}
+
 		try
 		{
-			first_run = true;
+			do_run = true;
 			res = None;
-			
+
 			start_time = std.millis();
-			
+
 			//Since qwen models dont support images in tool responses (?) yet
 			//Maybe switch to anthropic messages API...
-			for(first_run || _injected_image) {
-				first_run = false;
+			for(do_run && !stopped) {
+				//Prepare run
+				do_run = false;
+				task_result = None;
+
+				//Run
+				res = llm_api.task(prompt);
 				
-				if(_injected_image)
+				if(_injected_prompt && !stopped) {
+					prompt = _injected_prompt;
+					initial_prompt = prompt;
+					_injected_prompt = None;
+					do_run = true;
+					continue;
+				}
+
+				if(_injected_image && !stopped) {
 					add_image_raw(_injected_image.raw_image, _injected_image.image_type);
 					prompt = _injected_image.prompt;
 					_injected_image = None;
-					
-				res = llm_api.task(prompt);
+					do_run = true;
+					continue;
+				}
+
+				if(use_finalize) {
+					//One special failure case, the model might exit before emitting a finalize() tool call, in that case,
+					//Call the model one more time to make sure it was not a transmission error
+					if(!task_result && !stopped) {
+						res = llm_api.task("<---SYTEM MESSAGE--->\nYou ended the turn without calling 'finalize()'. Always use 'finalize' at the end of a turn.");
+						if(_injected_prompt && !stopped) {
+							prompt = _injected_prompt;
+							initial_prompt = prompt;
+							_injected_prompt = None;
+							do_run = true;
+							continue;
+						}
+						
+						//Still no task result could mean the max context length was reached, try to get a recovery handover...
+						if(!task_result && !stopped) {
+							std.print("recovery handover...");
+							handover = compact_handover(1);				
+							if(!handover)
+								std.print("recovery failed.");
+								return finalize_run("failed", "Cannot compact the chat history.");												
+							prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover for context:\n\n" + handover;				
+							do_run = true;
+							continue;
+						}
+					}
+
+					if(!task_result) {
+						if(stopped)
+							return finalize_run("failed", "Agent was stopped during its run.");
+						return finalize_run("failed", "The agent did not report anything.");
+					}
+
+					//A 'continue' finalize is a hand-over: stop this generation, reset the
+					//context and run the handover prompt inside the same task.
+					if(task_result.signal == "continue" && task_result.from_tool && !ancestor_stopped()) {
+						clear_chat();
+						prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover task, work has already begun.\nNotes from the previous agent:\n\n" + std.string(task_result.result ?? "");
+						task_result = None;
+						stopped = false;
+						running = true;
+						do_run = true;
+						continue;
+					}
+
+					//finished / failed / question: terminal, return the result below
+					do_run = false;
+				}
 			}
-			
+
 			delta_time = std.millis() - start_time;
 
-			running = false;
-
-			if(env.use_finalize) {
-				
-				if(env.reports.size()) {
-					return [
-						ok=true, 
-						reports=env.reports,
-						execution_time_ms=delta_time,
-					];
-				}
-				else {
-					
-					//res returned something so agent must be alive, force it to report...
-					//Never while stopped: stop() means generation ends now, and
-					//firing another request here is exactly how a stopped agent
-					//kept talking.
-					if(env.reports.size() == 0 && !stopped)
-						llm_api.task("Summarize your last actions so far with ONE SINGLE call to finalize()!\nDo not write or call anything else!");
-					
-					//Still no reports, but we have some text from the agent, return that
-					if(env.reports.size() == 0) {
-						if(stopped) {
-							return [
-								ok=false,
-								stopped=true,
-								reports=[],
-								error="Agent was stopped.",
-								execution_time_ms=delta_time,
-							];
-						}
-
-						return [
-							ok=true, 
-							reports=[[report=res]], 
-							execution_time_ms=delta_time
-						];
-					}
-					
-					return [
-						ok=true, 
-						reports=env.reports,
-						execution_time_ms=delta_time,
-					];	
-				}
+			//A finalize() result wins over the generic stop/finished fallback:
+			//finalize_run() sets the stop flag, so a stopped check first would
+			//overwrite the model's own signal.
+			if(task_result) {
+				task_result.execution_time_ms = delta_time;
+				return task_result;
 			}
-			else if(res) {
-				return [
-					ok=true, 
-					reports=[[report=res]],
-					execution_time_ms=delta_time,
-				];		
+
+			if(stopped) {
+				return finalize_run("failed", "Agent was stopped during its run.");
 			}
-			
-			//Stopped and nothing to show: report the stop, never a crash, and never
-			//start another generation on the way out.
-			if(stopped)
-				return [
-					ok=false,
-					stopped=true,
-					reports=[],
-					error="Agent was stopped.",
-					execution_time_ms=delta_time,
-				];
-			
-			return [ok=false, error="Agent returned nothing (maybe crashed).", execution_time_ms=delta_time];	
+
+			return finalize_run("finished", res);
 		}
 		catch(e)
 		{
-			running = false;
-			std.error("Task failed: ", e);
-			return [
-				ok=false,
-				error="The task failed to execute correctly (crash).",
-			];
+			return finalize_run("failed", e);
 		}
+	}
+
+	task_update(prompt) {
+		if(!prompt)
+			return None;
+		if(!running) {
+			std.error("Cannot update task - no task running.");
+			return None;
+		}
+		_injected_prompt = prompt;
+		//Ends the current generation only; the running task continues with the
+		//injected prompt and its own task_result.
+		stop(false);
+		return None;
 	}
 
 	single_task(prompt) {
 		result = task(prompt);
-		if(result.ok) {
-			return result.reports[0].report;
+		if(std.is_json(result) && result.signal == "finished") {
+			return std.string(result.result ?? "");
 		}
 		return "";
-	}
-
-	send_prompt(prompt) {
-		if(!running)
-			return task(prompt);
-		
-		//Stop the currently running task, then inject the new user prompt
-		//Harness should handle instructions for the agent to continue working if this was injected mid-task
-		stop();
-		wait_finish();
-		return task(prompt, true);
 	}
 
 	//Stop this agent and, top-down, the whole agent tree below it.
 	//Every child created through subagent()/simple_agent() is registered in
 	//_child_agents, and a child's own stop() recurses into its children, so one
 	//call here reaches every descendant that can generate.
-	stop()
+	stop(reset_states = true)
 	{
-		stopped = true;
+		if(reset_states) {
+			stopped = true;
+			running = false;
+		}
 		
 		try {
 			if(llm_api && std.is_function(llm_api.stop))
@@ -436,6 +468,76 @@ class miniagent
 			}
 			catch(e) { }		
 		}
+	}
+	
+	compact_handover(start_stage = 0) {
+		//This is multiple stages because compacting is not that straight forward:
+		//1. First, try to make the AI write a normal handover
+		//2. If that didnt work, the context is likely full, compact reasoning traces and tool calls and try again...
+		//3. Finally, if that also didnt work, try to remove messages in between user messages (but keep those)
+		//4. If that didnt work, the user's prompt are likely too long, exit
+		
+		if(use_finalize) {
+			compaction_run = start_stage;
+			for(1) {
+				
+				//TODO: check that this logic is right
+				if(compaction_run == 1) {
+					//Stage 1, truncate reasoning only
+					m = llm_api.context.body.messages;
+					for(i = 0; i < m.size(); i++) {
+						if(m[i].role == "assistant" && m[i].reasoning_content) {
+							if(m[i].reasoning_content.length() > 1024)
+								m[i].reasoning_content = m[i].reasoning_content.substr(0,1024) + "...";
+						}
+					}
+				}
+				else if(compaction_run == 2) {
+					//Compress tools?
+					m = llm_api.context.body.messages;
+					for(i = 0; i < m.size(); i++) {
+						if(m[i].role == "tool" && m[i].content) {
+							if(m[i].content.length() > 1024)
+								m[i].content = m[i].content.substr(0,1024) + "...";
+						}
+					}
+				}
+				else if(compaction_run == 3)
+					return None;
+				
+				compaction_chat = export_chat();
+				res = llm_api.task("<!---SYTEM MESSAGE---!>\nWrite a handover for a fresh agent.\nInclude previous tasks and work done.\nThe new agent must understand what has happened so far.\nPass the handover via 'finalize' as report.");
+				if(task_result && task_result.result) {
+					res = std.string(task_result.result ?? "");
+					clear_chat();
+					task_result = None;
+					return res;
+				}
+				
+				//Reset chat
+				import_chat(compaction_chat);						
+				compaction_run++;
+			}
+		}
+		else {
+			//TODO: non-finalize variant (just take text response from the AI)
+			std.print("compaction not implemented for this system-role.");
+		}
+
+		return None;
+	}
+	
+	//Usually called by the agent itself, but can also be called from the outside.
+	//Forcefully ends a turn with a signal and a result. from_tool distinguishes a
+	//model's finalize()/finish() call from an external stop that ended the turn.
+	finalize_run(signal, result, from_tool = false) {
+		stop();
+		task_result = [
+			signal=signal,
+			result=result,
+			from_tool=json.bool(from_tool),
+		];
+		return task_result;
 	}
 	
 	//True when any agent above this one in the tree was stopped.
@@ -534,61 +636,9 @@ class miniagent
 			description = description,
 		];
 	}
-	
-	add_finalize_tool(create_report = true) {
-		
-		if(env.use_finalize)
-			return;
-		
-		if(create_report) {	
-			add_tool(
-				"finalize",
-				"Exit / Terminate execution.",
-				[
-					report_manifest = "&string(): The report manifest formatted in markdown",
-					conversation_title = "&string(): Short sentence describing the current conversation",
-				],
-				[this](agt, args)
-				{
-					this.stop();
-					
-					this.env.reports.push_back([report=args.report_manifest, time=std.millis(), time_str=std.timestamp()]);
-					
-					this.env.conversation_title = args.conversation_title;
-					
-					return "Report submitted, stop now.";
-				}
-			);
-		}
-		else {
-			add_tool(
-				"finalize",
-				"Exit / Terminate execution.",
-				[
-					conversation_title = "&string(): Short single sentence describing the current conversation",
-					assistant_answer = "&string(): Final answer of the assistant to the user.",
-				],
-				[this](agt, args)
-				{
-					this.stop();
-					this.env.conversation_title = args.conversation_title;
-					this.env.reports.push_back([report=args.assistant_answer, time=std.millis(), time_str=std.timestamp()]);
-					return "Stop now.";
-				}
-			);
-		}
-		
-		env.use_finalize = true;
-		
-		llm_api.context.body.messages[0].content += "\n\n" + (create_report ? AGENT_FINALIZE_PROMPT : AGENT_FINALIZE_PROMPT_SIMPLE);
-	}
-	
+
 	set_history(history) {
 		llm_api.context.body.messages = history;
-	}
-	
-	set_reasoning_effort(effort) {
-		llm_api.set_reasoning_effort(effort);
 	}
 	
 	//Full history with system prompt
@@ -624,6 +674,13 @@ class miniagent
 		import_chat(None);
 	}
 	
+	add_finalize(
+		signals = ["continue", "finished", "failed", "question"],
+		description = "Use this at the end of each turn: emit continue, finished, failed or question with the report.\nIf your context is exhausted or after long continous runs with alot of work left, call this tool with a 'continue' signal and a handover report to continue with a fresh context (erases all history including the user messages, must include the goal/initial user task when 'continue'!)."
+	) {
+		agt_add_finalize(this);
+		use_finalize = true;
+	}	
 	add_read_tools() {
 		agt_add_read_tools(this);
 	}
@@ -802,6 +859,7 @@ class miniagent
 	}
 	
 	_injected_image = None;
+	_injected_prompt = None;
 }
 
 create_miniagent(cfg, system_role)

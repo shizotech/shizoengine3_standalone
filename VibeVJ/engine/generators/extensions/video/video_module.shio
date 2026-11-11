@@ -15,10 +15,12 @@ flip_ctrl = None;
 hw_ctrl = None;
 audio_ctrl = None;
 volume_ctrl = None;
+pitch_ctrl = None;  // the sound at the other forward speeds too, pitched (#460)
 position_ctrl = None;
 convert_ctrl = None;
 convert_format_ctrl = None; // index into VIDEO_CONVERT_FORMATS (video_convert.shio, #460)
 convert_size_ctrl = None;   // index into VIDEO_CONVERT_SIZES
+convert_replace_ctrl = None; // 0: a copy, 1: replace the original (#460)
 info_label = None;
 info_text = "";
 
@@ -30,6 +32,8 @@ scrub_ms = 0;
 convert_job = None;
 convert_label = "";
 convert_note = "";
+convert_source = "";     // the file of the job; with convert_replacing the converted file takes its place when done
+convert_replacing = false;
 
 // Sync (#460): the clip follows the timeline (whole bars) or a CDJ deck. Index-based like every controlcombo.
 SYNC_OFF = 0;
@@ -54,9 +58,78 @@ cues = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]; // seconds, -1: not set
 loop_state = video_loop_state();
 loop_held = false; // Loop off: stopped at Out (or In backwards) until Restart, Play, a jump or a cue
 
+// Sound of the clip for the audio analysis (#460 point 4): AudioInputAnalysis with Source "Video clips" takes it
+analysis_ctrl = None;
+
+// Pre-listen and the level (#460 point 5): the sound to the pre-listen output (headphones, Settings > Sound) instead of
+// the main one, and how loud the clip is as an output control. The level falls back slowly like a meter.
+LEVEL_FALL_PER_SECOND = 1.5;
+prelisten_ctrl = None;
+level_ctrl = None;
+level_value = 0.0;
+level_ms = 0;
+
+// Jog (#460 point 10): a jog wheel or an endless encoder (MIDI relative) moves the clip by frames. The clip holds while
+// it turns or while Jog touch is held, and plays on JOG_RELEASE_MS after the last step.
+JOG_RELEASE_MS = 200;
+JOG_STEPS = 63.5;     // the knob goes -1..1: a step of a relative MIDI mapping (1/127 of the range) is 1 / 63.5
+JOG_RECENTRE = 0.5;   // beyond this the knob goes back to the middle, so the steps never run into its end
+jog_ctrl = None;
+jog_touch_ctrl = None;
+jog_step_ctrl = None;
+jog_last = 0.0;       // the knob value the last step was counted from
+jog_ms = 0;           // time of the last step
+jog_active = false;   // the jog holds the clip
+jog_resume = false;   // it played when the jog took it
+jog_pos = 0.0;        // where the jog has put the clip (seconds; the seek may still be on its way)
+
+def loop_in_seconds();
+def video_reopen(generator, path);
+
+// Where the clip was when "Replace the original" closed it (video_release), None while it is not replaced
+replace_resume = None;
+
 dispatcher(generator, cmd, value) {
 	if(cmd == "get_default_output")
 		return output;
+
+	// A clip on the timeline (#680) starts at In, as far into the video as the cursor is into the clip. Not with sync,
+	// which places the video itself
+	if(cmd == "clip_start") {
+		if(sync_ctrl && sync_ctrl.value() != SYNC_OFF)
+			return None;
+		if(video.is_open() && video.seekable() && video.duration() > 0) {
+			clip_at = loop_in_seconds() + std.float(value.seconds) * speed_ctrl.value();
+			video.position(clip_at - math.floor(clip_at / video.duration()) * video.duration());
+		}
+		return None;
+	}
+
+	// How long a clip of the timeline plays this video (#680, step 3): the seconds from In to Out at the Speed. None
+	// while the video is not open (the timeline asks again)
+	if(cmd == "clip_length") {
+		if(!video.is_open() || video.duration() <= 0)
+			return None;
+		frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+		r = video_loop_range(video.duration(), frame, in_ctrl.value(), out_ctrl.value());
+		speed = math.abs(speed_ctrl.value());
+		return (r.b - r.a) / (speed > 0.01 ? speed : 1.0);
+	}
+
+	// "Replace the original" (#460, video_replace_finish in video_convert.shio): the file is closed while it is swapped
+	// (Windows cannot rename an open file; the last picture stays), then the new one is opened where the clip was. A
+	// clip in a Clipview layer or on the timeline gets both twice (from its wrapper and directly): the second does nothing
+	if(cmd == "video_release") {
+		if(video.is_open()) {
+			replace_resume = [position = video.position()];
+			video.close();
+		}
+		return None;
+	}
+	if(cmd == "video_reopen") {
+		video_reopen(generator, std.string(value));
+		return None;
+	}
 
 	// ACT off stops decoding, ACT on resumes when Play is on.
 	if(cmd == "active") {
@@ -152,12 +225,16 @@ update_info() {
 
 		// Sound: only when the file has some
 		if(video.has_audio()) {
-			if(!video.audio())
+			if(!video.audio() && !video.prelisten())
 				text = text + ", sound off";
 			else if(video.audio_error())
 				text = text + ", sound: " + video.audio_error();
 			else
 				text = text + ", sound";
+			if(video.audio_analysis())
+				text = text + " (to the audio analysis)";
+			if(video.prelisten())
+				text = text + (video.audio_error() ? "" : ", pre-listen");
 		}
 		else if(!video.seekable())
 			text = text + ", no position control";
@@ -169,15 +246,24 @@ update_info() {
 
 	if(convert_job) {
 		if(convert_job.finished()) {
-			if(convert_job.ok()) {
-				convert_note = convert_label + " copy ready: " + fileio.file_name(convert_job.target()) + " (in Assets, next to this file)";
+			job = convert_job;
+			convert_job = None; // (the swap below reopens this clip, which updates the info line again)
+			if(job.ok() && convert_replacing) {
+				done = video_replace_finish(engine, convert_source, job.target(), convert_label);
+				convert_note = video_replace_note(convert_source, done);
+				if(engine && engine.filebrowser)
+					engine.filebrowser.refresh();
+			}
+			else if(job.ok()) {
+				convert_note = convert_label + " copy ready: " + fileio.file_name(job.target()) + " (in Assets, next to this file)";
 				if(engine && engine.filebrowser)
 					engine.filebrowser.refresh();
 			}
 			else
-				convert_note = "Convert failed: " + convert_job.error();
-			convert_job = None;
+				convert_note = "Convert failed: " + job.error();
 			update_convert_caption();
+			update_info();
+			return;
 		}
 		else
 			text = text + " - converting to " + convert_label + ": " + std.string(std.int(math.round(convert_job.progress() * 100))) + " %";
@@ -205,6 +291,8 @@ update_convert_caption() {
 		return;
 	if(convert_job)
 		convert_ctrl.caption("Cancel convert");
+	else if(convert_replace_ctrl && convert_replace_ctrl.value() == 1)
+		convert_ctrl.caption("Replace with " + video_convert_label(std.int(convert_format_ctrl.value()), std.int(convert_size_ctrl.value())));
 	else
 		convert_ctrl.caption("Convert to " + video_convert_label(std.int(convert_format_ctrl.value()), std.int(convert_size_ctrl.value())));
 }
@@ -221,20 +309,98 @@ start_convert(generator) {
 	source = generator.path;
 	format_index = std.int(convert_format_ctrl.value());
 	size_index = std.int(convert_size_ctrl.value());
+	replace = convert_replace_ctrl.value() == 1;
 	label = video_convert_label(format_index, size_index);
-	reason = video_convert_skip_reason(source, format_index, size_index);
+	reason = video_convert_skip_reason(source, format_index, size_index, replace);
 	if(reason) {
-		convert_note = "No " + label + " copy made: " + reason;
+		convert_note = (replace ? "Not replaced by " + label : "No " + label + " copy made") + ": " + reason;
 		update_info();
 		return;
 	}
 
 	convert_note = "";
 	convert_label = label;
-	convert_job = nanogui.video_convert(source, video_convert_target(source, format_index, size_index),
-		VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index]);
+	convert_source = source;
+	convert_replacing = replace;
+	convert_job = nanogui.video_convert(source, video_convert_job_target(source, format_index, size_index, replace),
+		VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index], replace);
 	update_convert_caption();
 	update_info();
+}
+
+// After "Replace the original" (video_release closed the file): the file at path (the replacement, or the original
+// again when the swap failed), where the clip was. A converted file can play backwards now: Speed goes below 0 again
+video_reopen(generator, path) {
+	if(video.is_open() && video.filename() == path)
+		return;
+	video.open(path);
+	speed_ctrl.min(video.reversible() ? -4 : 0);
+	apply_loop();
+	apply_speed();
+	if(replace_resume && video.seekable() && replace_resume.position > 0)
+		video.position(replace_resume.position);
+	replace_resume = None;
+	if(play_ctrl.value() && generator.is_active())
+		video.play();
+	else
+		video.pause();
+	update_info();
+}
+
+// The jog takes the clip: it holds it where it is (not with sync, which places the clip itself)
+jog_begin() {
+	if(jog_active)
+		return true;
+	if((sync_ctrl && sync_ctrl.value() != SYNC_OFF) || !video.is_open() || !video.seekable() || video.duration() <= 0)
+		return false;
+	jog_active = true;
+	jog_resume = play_ctrl.value() && video.playing();
+	jog_pos = video.position();
+	loop_held = false;
+	video.pause();
+	return true;
+}
+
+// Let go: the knob back to the middle, the clip plays on when it played before
+jog_end(generator) {
+	jog_active = false;
+	jog_ctrl.value(0, false);
+	jog_last = 0.0;
+	if(jog_resume && play_ctrl.value() && generator.is_active())
+		video.play();
+	jog_resume = false;
+}
+
+// The Jog knob moved (MIDI steps, a link or the mouse): the clip moves by Jog step frames per step
+jog_turn(v) {
+	delta = v - jog_last;
+	jog_last = v;
+	if(math.abs(v) > JOG_RECENTRE) {
+		jog_ctrl.value(0, false);
+		jog_last = 0.0;
+	}
+	if(delta == 0 || !jog_begin())
+		return;
+	frame = video.fps() > 0 ? 1.0 / video.fps() : 1.0 / 30.0;
+	jog_pos = math.clamp(jog_pos + delta * JOG_STEPS * jog_step_ctrl.value() * frame, 0.0, video.duration());
+	video.position(jog_pos);
+	jog_ms = std.millis();
+	scrub_ms = jog_ms;
+	position_ctrl.value(jog_pos / video.duration(), false);
+}
+
+// Every frame: the jog lets go JOG_RELEASE_MS after the last step (not while Jog touch is held)
+update_jog(generator) {
+	if(!jog_active) {
+		if(jog_ctrl.value() != 0) { // a value loaded with the project, or the knob let go
+			jog_ctrl.value(0, false);
+			jog_last = 0.0;
+		}
+		return;
+	}
+	if(jog_touch_ctrl.value() || std.millis() - jog_ms < JOG_RELEASE_MS)
+		return;
+	jog_end(generator);
 }
 
 entry(generator, area) {
@@ -249,6 +415,12 @@ entry(generator, area) {
 	video.anchor_left(250).anchor_top(0).anchor_bottom(25).anchor_right(0);
 
 	output = control_tabs.control("OUT").caption("Out").tooltip("The picture of the clip: [[link]] it into an input\n[[wiki:Video#controls]]").as_output(true);
+
+	// #460: how loud the sound of the clip is, 0 to 1 (after Volume), to link into anything. Needs Audio, Pre-listen or
+	// Audio analysis on (otherwise the sound is not decoded)
+	level_ctrl = control_tabs.controlslider("LEVEL").caption("Level").min(0).max(1).value(0).as_output(true)
+		.tooltip("How loud the sound of the clip is right now, 0 to 1 (after Volume): [[link]] it into anything. Needs Audio, Pre-listen or Audio analysis on\n[[wiki:Video#sound]]");
+	level_ctrl.undoable(false);
 
 	play_ctrl = control_tabs.controlbutton("Play").tooltip("Plays the clip or holds the current frame").push(1).value(1);
 	play_ctrl.callback([generator](v){
@@ -354,6 +526,28 @@ entry(generator, area) {
 		video.position(v * video.duration());
 	});
 
+	// Jog (#460): a knob without end. Map a jog wheel or an endless encoder to it as Relative (MIDI learn, the config
+	// menu of the control); dragged with the mouse (up / down) it scrubs as well
+	jog_ctrl = control_tabs.controlslider("Jog").style("knob").min(-1).max(1).value(0)
+		.tooltip("Turn it to move the clip frame by frame, like the jog wheel of a DJ player: the clip holds while it turns and plays on when it stops. Map a jog wheel or an endless encoder to it as Relative (MIDI)\n[[wiki:Video#jog]]");
+	jog_ctrl.undoable(false).no_load_callbacks();
+	jog_ctrl.callback([](v){
+		jog_turn(v);
+	});
+	jog_vec = control_tabs.controlvector("Jog settings", "jog_settings").expanded(false)
+		.tooltip("Touch of the jog wheel and how far one step moves the clip\n[[wiki:Video#jog]]");
+	jog_touch_ctrl = jog_vec.controlbutton("Jog touch")
+		.tooltip("Held (the touch note of a jog wheel, or the mouse): the clip holds, and plays on when it is let go");
+	jog_touch_ctrl.undoable(false).no_load_callbacks();
+	jog_touch_ctrl.callback([generator](v){
+		if(v)
+			jog_begin();
+		else if(jog_active)
+			jog_end(generator);
+	});
+	jog_step_ctrl = jog_vec.controlfloat("Jog step").unit("frames").min(0.1).max(100).value(1)
+		.tooltip("How many frames one step of the jog wheel moves the clip (1: frame by frame)");
+
 	step_back_ctrl = control_tabs.controlbutton("Frame back").tooltip("Stops the clip and goes one frame back");
 	step_back_ctrl.callback([](v){
 		if(!v)
@@ -386,8 +580,9 @@ entry(generator, area) {
 		video.hardware(v);
 	});
 
-	// Sound of the clip: off at the start, plays at speed 1 forward (silent paused, at other speeds and backwards)
-	audio_ctrl = options_vec.controlbutton("Audio").tooltip("Plays the sound of the clip while it plays forward at normal speed, to the default output of the computer\n[[wiki:Video#controls]]").push(1).value(0);
+	// Sound of the clip: off at the start, plays at speed 1 forward (silent paused and backwards; at other speeds only
+	// with Pitch, #460)
+	audio_ctrl = options_vec.controlbutton("Audio").tooltip("Plays the sound of the clip while it plays forward at normal speed (at other speeds with Pitch), on the main output (Settings > Sound; the default output of the computer unless another is chosen)\n[[wiki:Video#controls]]").push(1).value(0);
 	audio_ctrl.callback([](v){
 		video.audio(v);
 	});
@@ -395,6 +590,23 @@ entry(generator, area) {
 	volume_ctrl = options_vec.controlslider("Volume").tooltip("How loud the sound of this clip is").min(0).max(1).value(1);
 	volume_ctrl.callback([](v){
 		video.volume(v);
+	});
+
+	// #460: the sound of the clip as input of the audio analysis (AudioInputAnalysis, Source "Video clips")
+	analysis_ctrl = options_vec.controlbutton("Audio analysis").tooltip("Sends the sound of the clip to the audio analysis (AudioInputAnalysis with Source Video clips): BPM, beat, FFT and energy follow the clip. Works with Audio off too\n[[wiki:Video#sound-for-the-audio-analysis]]").push(1).value(0);
+	analysis_ctrl.callback([](v){
+		video.audio_analysis(v);
+	});
+
+	// #460: the sound to the pre-listen output (headphones) instead of the main output, with Audio off too
+	prelisten_ctrl = options_vec.controlbutton("Pre-listen").tooltip("Plays the sound of the clip on the pre-listen output (headphones, Settings > Sound) instead of the main output, also with Audio off: hear a clip before the audience does\n[[wiki:Video#pre-listen]]").push(1).value(0);
+	prelisten_ctrl.callback([](v){
+		video.prelisten(v);
+	});
+
+	pitch_ctrl = options_vec.controlbutton("Pitch").tooltip("The sound plays at the other speeds too, higher when faster and lower when slower, like a turntable (0.1 to 4 times, forward). Off: only at normal speed\n[[wiki:Video#controls]]").push(1).value(0);
+	pitch_ctrl.callback([](v){
+		video.pitch(v);
 	});
 
 	// What Convert makes (#460). Index-based like every controlcombo; the button keeps its name "Convert to HAP"
@@ -410,7 +622,14 @@ entry(generator, area) {
 		update_convert_caption();
 	});
 
-	convert_ctrl = options_vec.controlbutton("Convert to HAP").tooltip("Makes a copy in the format and size above next to the file (name_hap.mov, ...), which can be positioned without waiting and play backwards. A second click cancels\n[[wiki:Video#converting]]");
+	// #460: Convert puts the result in the place of the file (the original goes to _originals/ next to it)
+	convert_replace_ctrl = options_vec.controlcombo("Convert result").items(["Copy", "Replace"]).segmented(true).value(0)
+		.tooltip("Copy: Convert makes a copy next to the file (name_hap.mov). Replace: the converted file takes the place of this one (clip.mp4 becomes clip.mov) after it was checked, every clip of the project that plays it follows, and the original is kept in the folder _originals next to it\n[[wiki:Video#replace-the-original]]");
+	convert_replace_ctrl.callback([](v){
+		update_convert_caption();
+	});
+
+	convert_ctrl = options_vec.controlbutton("Convert to HAP").tooltip("Makes a copy in the format and size above next to the file (name_hap.mov, ...), or replaces the file with it (Convert result), which can be positioned without waiting and play backwards. A second click cancels\n[[wiki:Video#converting]]");
 	convert_ctrl.callback([generator](v){
 		if(!v)
 			return;
@@ -572,7 +791,7 @@ update_sync(generator, tl_pos) {
 // In / Out and ping-pong while the clip plays (video_loop.shio). Not with sync (it places the clip itself), nor when
 // the whole clip loops forward (the decoder loops by itself, seamless)
 update_loop(generator) {
-	if(loop_held || (sync_ctrl && sync_ctrl.value() != SYNC_OFF) || !play_ctrl.value() || !generator.is_active())
+	if(loop_held || jog_active || (sync_ctrl && sync_ctrl.value() != SYNC_OFF) || !play_ctrl.value() || !generator.is_active())
 		return;
 	if(!video.is_open() || !video.seekable() || video.duration() <= 0)
 		return;
@@ -596,6 +815,7 @@ update_loop(generator) {
 }
 
 update(generator, tl_pos, pos_delta) {
+	update_jog(generator);
 	update_sync(generator, tl_pos);
 	update_loop(generator);
 
@@ -604,6 +824,17 @@ update(generator, tl_pos, pos_delta) {
 	// _testing/nanogui/slider_smooth_value_notify.shio).
 	if(video.duration() > 0 && std.millis() - scrub_ms > 250)
 		position_ctrl.value(video.position() / video.duration(), false);
+
+	// Level: the peak of the sound, falling back at LEVEL_FALL_PER_SECOND
+	now = std.millis();
+	fall = level_ms > 0 ? (now - level_ms) / 1000.0 * LEVEL_FALL_PER_SECOND : 1.0;
+	level_ms = now;
+	level = math.max(video.audio_peak(), level_value - fall);
+	level = math.clamp(level, 0.0, 1.0);
+	if(level != level_value) {
+		level_value = level;
+		level_ctrl.value(level);
+	}
 
 	update_info();
 }
@@ -618,6 +849,10 @@ save_state() {
 		hardware = hw_ctrl.value(),
 		audio = audio_ctrl.value(),
 		volume = volume_ctrl.value(),
+		audio_analysis = analysis_ctrl.value(),
+		prelisten = prelisten_ctrl.value(),
+		jog_step = jog_step_ctrl.value(),
+		pitch = pitch_ctrl.value(),
 		position = video.position(),
 		sync = sync_ctrl.value(),
 		sync_bars = bars_ctrl.value(),
@@ -625,6 +860,7 @@ save_state() {
 		sync_offset = offset_ctrl.value(),
 		convert_format = convert_format_ctrl.value(),
 		convert_size = convert_size_ctrl.value(),
+		convert_replace = convert_replace_ctrl.value(),
 		in_point = in_ctrl.value(),
 		out_point = out_ctrl.value(),
 		loop_mode = loop_mode_ctrl.value(),
@@ -648,6 +884,8 @@ load_state(state) {
 		convert_format_ctrl.value(state.convert_format);
 	if(state.has("convert_size"))
 		convert_size_ctrl.value(state.convert_size);
+	if(state.has("convert_replace"))
+		convert_replace_ctrl.value(state.convert_replace);
 	if(state.has("speed"))
 		speed_ctrl.value(state.speed);
 	if(state.has("loop"))
@@ -670,8 +908,16 @@ load_state(state) {
 		hw_ctrl.value(state.hardware);
 	if(state.has("volume"))
 		volume_ctrl.value(state.volume);
+	if(state.has("pitch"))
+		pitch_ctrl.value(state.pitch);
 	if(state.has("audio"))
 		audio_ctrl.value(state.audio);
+	if(state.has("audio_analysis"))
+		analysis_ctrl.value(state.audio_analysis);
+	if(state.has("prelisten"))
+		prelisten_ctrl.value(state.prelisten);
+	if(state.has("jog_step"))
+		jog_step_ctrl.value(state.jog_step);
 	if(state.has("playing"))
 		play_ctrl.value(state.playing);
 	if(state.has("position") && video.seekable())

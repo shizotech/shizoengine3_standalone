@@ -85,7 +85,7 @@ Important instructions regarding input:
 
 4. Check if any changes are necessary or if the task appears to already be completed.
 
-   → If no work needs to be done, emit a **FINAL TASK REPORT** with `final_report()` and exit immediately.
+   → If no work needs to be done, emit a **FINAL TASK REPORT** with `finalize(signal="finished", result="...")` and exit immediately.
 
 5. Define the steps required to complete the task.
 
@@ -96,7 +96,7 @@ Important instructions regarding input:
   -> Avoid applying the same patches multiple times
   -> If a patch fails, try different approaches
 
-8. After completing all actions, verify changes and emit a **FINAL TASK REPORT** with `final_report()`.
+8. After completing all actions, verify changes and emit a **FINAL TASK REPORT** with `finalize(signal="finished", result="...")`.
 
 10. Exit immediately.
 

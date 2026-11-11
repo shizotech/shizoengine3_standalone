@@ -76,6 +76,9 @@ macOS instead (see [On a Mac](#on-a-mac) below):
 - **View tabs:** each tab is its own work area. **+** adds an empty one. Double-click a tab to rename it, drag it to move
   it along the bar, click its × to delete it (a tab with views in it asks first). The last view tab stays. The tabs and
   their names are saved with the project. A view that you close in an area gets a tab of its own here.
+- **Drop an asset on the bar** (from the sidebar) to open it in a new view tab. A tab that still has the name it got
+  (*Views*, *View 2*, …) takes the name of the generator you put into it; a view (a Patchview, a split, a Tabview) leaves
+  the name as it is, and so does a name you gave the tab.
 - A tab comes to the front when you let go of it, not when you press it. So you can take a tab that is not in front and
   drag it down into an area of the tab you are looking at: see [Moving a view](#moving-a-view).
 - **Free space:** moves the window, see [The program window](#the-program-window).
@@ -88,14 +91,18 @@ Views are not chosen in the top bar. An empty area offers them, a filled one has
 
 ### The Help window
 
-The Help window shows the pages of this wiki, listed at its left side. It floats above the program like the
-*Settings* window: drag its header to move it, close it with its × or with Esc.
+The Help window shows the pages of this wiki, listed at its left side. Turn the mouse wheel over the list to reach the
+pages further down; a page you open by a link, the search or *Back* scrolls into view in the list. The window floats
+above the program like the *Settings* window: drag its header to move it, close it with its × or with Esc.
 
 ![The Help window: a link in the text shows what is behind it](media/help-window.png)
 
 - **Links:** a word in the accent colour leads to another page or to a part of this one. Rest the mouse on it and a
   tooltip shows what is behind it; click it to go there. The list "See also" at the end of a page is made of buttons
   that do the same.
+- **Words of the glossary:** a word with a dotted line below it is a term of the *Glossary*. Rest the mouse on it to
+  read what it means; click it (or press F1 on it) to go to the part of the wiki that explains it. Only the first use
+  of a word in each part of a page has the line.
 - **Back:** the arrow at the left of the header goes back to where you followed the last link.
 - **Search:** type words into the field above the list and press Enter. The page *Search* lists every part of the wiki
   and every term of the glossary that has all the words, the ones with a word in their heading first; click one to go
@@ -113,13 +120,15 @@ Rest the mouse on a button or a control and its tooltip says what it does.
 
 ![A tooltip with a word as a link, and the tooltip of that word on top of it](media/tooltip.png)
 
-- **Words as links:** a word shown as a link in a tooltip (for example *area*) has a tooltip of its own. Rest the
-  mouse on the tooltip for a second until its edge turns violet (it is locked now), then on the word. That tooltip
-  can have links again.
+- **Words as links:** a word shown as a link in a tooltip (for example *area*) has a tooltip of its own. Keep the mouse
+  on the button or control for a second, until the edge of its tooltip turns violet (it is locked now), then move into
+  the tooltip and rest on the word. That tooltip can have links again.
 - ***More in the wiki (F1)*:** many tooltips end with this link. Click it, and the Help window opens at the part
   that explains the thing.
 - **F1** does the same at once, without waiting for the tooltip: put the mouse on a button and press F1.
 - A locked tooltip closes when the mouse leaves it, with a click on its text, or with Esc.
+
+![The tooltip of Split right locks, then the tooltip of the word area opens on top of it](media/tooltip-lock.gif)
 
 All gestures are on [Shortcuts and tips](Shortcuts-and-Tips.md#tooltips).
 
@@ -280,10 +289,12 @@ The ⋯ button of the header and a right click in the area open the same menu. I
 
 ### Dropping an asset
 
+![TriangleWave dropped on the right edge of an area (Split right), then SawtoothWave on the middle of the left one (Add as tab)](media/drop-asset.gif)
+
 Dropping onto a filled area never replaces what is there. While you drag an asset from the sidebar, the area shows where
 the drop lands:
 
-- **Edge** (the outer quarter of a side): *Split left / right / up / down*. The area splits; what was there moves into
+- **Edge** (the outer quarter of a side, at most 96 px, at least 24 px): *Split left / right / up / down*. The area splits; what was there moves into
   the other half as it is (same controls, links and MIDI mappings), the new one goes to the side you dropped on.
 - **Middle:** *Add as tab*. A Tabview gets one more tab, also when you drop on what one of its tabs shows; anything else
   becomes the first tab of a new Tabview, next to the new one.
@@ -295,6 +306,9 @@ the drop lands:
 - **A red outline:** the place under the mouse does not take what you drag (a clip over a Patchview, a generator over
   the grid of a Clipview). Letting go there does nothing.
 - **Esc** while you drag cancels it: nothing is dropped, wherever you let go.
+- **The hint bar** at the bottom of the window lists these keys while you are over an area: *Edge: split · Middle: as
+  tab · Ctrl: copy · Esc: cancel*. It names only what that place does: no edges over an empty area, no *Ctrl* for an
+  asset (Ctrl copies a view or generators you move), and no bar where the drop is refused.
 
 ### Moving a view
 
@@ -347,14 +361,17 @@ and a project saved with view windows opens their views in their tabs.
 
 ### Undo and redo
 
+![Split right with the button in the header of the area, then undone and redone with the buttons of the top bar](media/undo-split.gif)
+
 Ctrl + Z takes back the last change of the layout, of a link or of a value, Ctrl + Y (or Ctrl + Shift + Z) does it
 again. The two buttons in the top bar do the same; their tooltips name the step.
 
 - **What it covers:** splitting, moving, swapping, duplicating and closing areas, the line between two areas you
   dragged or double-clicked, adding, replacing and deleting views, the view tabs (add, rename, delete, dragged to another
-  place in the bar), also the tabs of a Tabview, and generators you dragged out of a Patchview, into an area or into another Patchview, moved or
-  copied ([Select and move generators](Generators.md#select-and-move-generators)). Undo deletes a copy; redo makes it
-  again with the settings it had.
+  place in the bar), also the tabs of a Tabview, and generators you dragged out of a Patchview, into an area, another
+  Patchview, a Clipview cell, a CueList or the timeline, moved or copied
+  ([Select and move generators](Generators.md#select-and-move-generators)). Undo deletes a copy; redo makes it again
+  with the settings it had. A generator moved into a clip goes back into its Patchview, alive, with its links.
 - **Generators and clips:** a generator you dragged from the sidebar into a Patchview, or deleted with its × (undo
   makes it again with its settings and its links), and in a [Clipview](Clipview.md#move-copy-delete) a clip you made,
   moved or copied, an asset you stacked onto a clip and an entry you removed from its stack (the clip goes with its
@@ -450,13 +467,13 @@ With *Snap windows* on, the views above get smaller or bigger as you move the ba
 | Chevron | Closes the timeline to a bar |
 | Link | *Cable view* on or off. The small violet bubble counts the local cable views; rest the mouse on it and the broken link on its right half ends them all. See [Linking](Linking.md#seeing-your-links). |
 | Lock | Show mode. See [Timeline](Timeline.md). |
-| Play, Stop, Follow | Transport. Stop also goes back to the start. |
+| Play, Stop, Follow, Loop | Transport. Stop also goes back to the start. Loop repeats the loop range. |
 | *BPM*, *Tap* | Tempo, and tap tempo |
 | *Beat*, *Bar* | Where the playhead is |
-| *View* | *Timeline*, or *Loops* / *Patch*: a free area for generator windows. Windows there snap to a grid. |
+| *View* | *Timeline* (the lanes with their clips, see [Timeline](Timeline.md#clips-and-lanes)), or *Loops* / *Patch*: a free area for generator windows. Windows there snap to a grid. |
 | *Snap windows* | Keeps the views and the timeline stacked |
 
-*Loops* is its own area: the loop rows on the grid, clocked by the loop clock and startable, stoppable and resettable as learnable controls (see [Timeline](Timeline.md#loops)). *Patch* shows the patch.
+*Loops* is its own area: the loop rows, each with its controls (start, stop, reset as learnable controls) and a timeline of its own with lanes, clips and envelopes (see [Timeline](Timeline.md#loop-timelines)). *Patch* shows the patch.
 
 ## See also
 

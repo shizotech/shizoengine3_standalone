@@ -14,7 +14,7 @@ Source shaders generate visuals independently - they don't require input texture
 | **Audio** | Audio-reactive source shaders |
 | **Basic** | Fundamental generator shaders |
 | **Examples** | Reference and example source shaders |
-| **Objects** | Object-based generator shaders |
+| **Objects** | Foreground objects: photoreal eye catchers that move with the music (Monolith, Prism, Ferrofluid, LavaLamp) |
 | **Patterns** | Pattern generation source shaders |
 | **Sequences** | Sequence-based generator shaders |
 | **Simulations** | Simulation and procedural generation shaders |

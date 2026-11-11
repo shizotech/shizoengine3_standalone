@@ -105,8 +105,9 @@ shizonet.use_interfaces(["physical", "wg0"]);      // the network cards and wg0
 shizonet.use_interfaces("all");            // default
 ```
 
-- With a selection every broadcast (ArtPoll, ArtSync, beacons, streams) goes to the directed broadcast addresses of the
-  selected interfaces that are up, 255.255.255.255 is not used. A selection without an interface sends no broadcasts.
+- Every broadcast (ArtPoll, ArtSync, beacons, streams) goes to the directed broadcast addresses of the used interfaces
+  that are up, also without a selection (#587), 255.255.255.255 is not used. A selection without an interface sends
+  no broadcasts.
 - Packets from the network of an interface that is not selected are dropped (the node does not find or accept devices
   there). Loopback and routed networks (not on any interface of this machine) are always accepted.
 - Unicast to known devices (found before, or added with `add_artnet_device(ip)`) is not filtered: the system routes it.
@@ -119,7 +120,15 @@ shizonet.use_interfaces("all");            // default
 - `description`: Windows: the adapter ("Intel(R) Ethernet ..."), macOS: the name in the network settings ("Wi-Fi",
   "Thunderbolt 1", "USB 10/100/1000 LAN"; in the system language), Linux: empty.
 - `up`: macOS also needs a link (the media status): a Thunderbolt / Ethernet port without a cable is down.
-- The socket is still bound to all interfaces (`INADDR_ANY`).
+- One socket per used interface, bound to its unicast address (`127.0.0.1` for the machine itself): broadcasts and
+  replies leave through the interface of their destination, packets arrive on the socket of the network they came
+  from (#587). Without this, broadcasts would leave through the interface of the default route only, and a machine
+  with several networks would answer on the wrong one. Interfaces that come up later are picked up at the next
+  start of the node (the sockets are bound once).
+- Linux and macOS deliver no broadcast to a socket bound to a unicast address (Windows does). There each interface
+  also gets a receive-only socket bound to its directed broadcast, and one socket is bound to 255.255.255.255, at the
+  same port. Without them two nodes did not find each other, not even on one machine (`shizonet.shio`, 2026-10-29).
+  The addresses differ, so there is no SO_REUSEADDR and a second node still finds the port taken (#674).
 - VibeVJ: *Devices* › *Network* › *Network cards*, kept in `engine/style.json` (`network_interfaces`).
 - Test: `_testing/shizonet_interfaces.shio`.
 

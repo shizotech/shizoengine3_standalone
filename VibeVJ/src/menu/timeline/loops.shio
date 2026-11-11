@@ -4,34 +4,49 @@
 //- Start, Stop, Reset, /2, x2 and Length are midicontrols (MIDI learn, links), in a node named after the loop's guid,
 //  so their MIDI mappings and links are saved in controls.json like every control.
 //- Phase is an output (0..1 over one turn) that can be linked to anything that should follow the loop.
-//- The envelope (the graph on the right) is read at the loop's phase; its value goes out of Envelope, also an output.
+//- The envelope (the graph under the controls) is read at the loop's phase; its value goes out of Envelope, also an
+//  output.
 //- Every loop is a time source of nanogui: a synced control can follow it instead of the main timeline (Env tab of
 //  its options, Source). nanogui gets the loops by guid (nanogui.sync_sources) and each frame their turns
 //  (nanogui.sync_source, in update()).
+//- #680: every loop is also a timeline with lanes, clips, blending and envelopes, the same as the main timeline
+//  (timeline_clips.shio): on the right of its row. Its cursor runs over its range (the turn of the loop) while the loop
+//  runs; a stopped loop plays no clips. Its picture is at its port Out. The Clip panel at the right of the view is
+//  shared by the loops.
 //The loops are saved with the project (engine.save_hooks["loops"]); the load hook runs before the controls are loaded,
 //so the controls of the loops and the controls that follow them find each other.
+//Deleting a loop is a step of the undo history (#680, step 3): undo makes it again in its place with its timeline, its
+//controls, links and MIDI mappings. Steps of the undo history made on the loop before it was deleted do nothing then.
 
-LOOP_ROW_H = 132;
-LOOP_LEFT_W = 360;
+LOOP_ROW_H = 196;
+LOOP_LEFT_W = 300;
 
 class loops_view
 {
-	managed area = None;  //shown while the view switch of the timeline is on Loops
-	managed list = None;  //the rows
-	loops = [];           //[clock=, row=, graph=, phase_ctrl=, env_ctrl=, length_ctrl=, rate_label=]
+	managed area = None;   //shown while the view switch of the timeline is on Loops
+	managed scroll = None;
+	managed list = None;   //the rows
+	panel = None;          //the Clip panel of the loop timelines (timeline_panel)
+	loops = [];            //[clock=, row=, node=, graph=, phase_ctrl=, env_ctrl=, length_ctrl=, rate_label=, name_box=, tlw=, clips=]
 	timeline = None;
 
 	__init__(parent, tl) {
 		timeline = tl;
 		area = parent.widget().anchor(0).visible(false);
-		list = area.vscroll().anchor(0).content().widget().layout(nanogui.layout_vertical()).anchor(0);
+		scroll = area.vscroll().anchor(0);
+		list = scroll.content().widget().layout(nanogui.layout_vertical()).anchor(0);
+		panel = timeline_panel(area);
+		panel.on_width = [this](w){
+			this.scroll.anchor_right(w);
+			this.area.refresh_layout();
+		};
 
 		bar = list.widget().anchor_left(0).anchor_right(0).fixed_height(30).layout(nanogui.layout_horizontal());
-		add_btn = bar.button("+ Loop").fixed_width(90).tooltip("A new [[loop]]: a timeline of its own, 4 [[beat|beats]] long, that turns along the main timeline.\n[[wiki:Timeline#loops]]");
+		add_btn = bar.button("+ Loop").fixed_width(90).tooltip("A new [[loop]]: a timeline of its own, 4 [[beat|beats]] long, that turns along the main timeline. Drop clips onto its lanes as on the main timeline.\n[[wiki:Timeline#loops]]");
 		add_btn.on_click([this](){
 			this.add_loop(None);
 		});
-		bar.label("  Synced controls can follow a loop: options of the control, Env, Source.").font_size(13).text_color(vec4f(1, 1, 1, 0.5));
+		bar.label("  Drop assets onto the lanes of a loop. Synced controls can follow a loop: options of the control, Env, Source.").font_size(13).text_color(vec4f(1, 1, 1, 0.5));
 	}
 
 	// =========================================================================
@@ -54,41 +69,60 @@ class loops_view
 		left = node.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(LOOP_LEFT_W).layout(nanogui.layout_vertical());
 
 		head = left.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
-		name_box = head.textbox(clock.name).editable(true).fixed_width(LOOP_LEFT_W - 40).tooltip("The name of the [[loop]], as the Source of synced controls shows it");
-		del_btn = head.button("").icon(nanogui.icon("trash_alt")).fixed_width(30).tooltip("Delete this [[loop]]. Controls that followed it stand still.");
+		name_box = head.textbox(clock.name).editable(true).fixed_width(LOOP_LEFT_W - 100).tooltip("The name of the [[loop]], as the Source of synced controls shows it");
+		//Chase (#680 step 4): the turn follows the place of the main timeline (and so a timecode or MIDI clock it chases)
+		chase_btn = head.controlbutton("CHASE").caption("Chase").push(true).fixed_width(58);
+		chase_btn.get_button().tooltip("Chase: while it runs, the [[loop]] is where the main timeline is in its turns (as if it had run from beat 0), not counting on by itself. When the timeline chases a timecode or MIDI clock (TC), a locate of the master moves the loop too.\n[[wiki:Timeline#loop-timelines]]");
+		chase_btn.value(clock.chase ? 1 : 0);
+		del_btn = head.button("").icon(nanogui.icon("trash_alt")).fixed_width(30).tooltip("Delete this [[loop]] with its clips. Controls that followed it stand still.");
 
 		buttons = left.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
-		start_btn = buttons.controlbutton("START").caption("Start").fixed_width(60);
-		stop_btn = buttons.controlbutton("STOP").caption("Stop").fixed_width(60);
-		reset_btn = buttons.controlbutton("RESET").caption("Reset").fixed_width(64);
-		half_btn = buttons.controlbutton("HALF").caption("/2").fixed_width(40);
-		double_btn = buttons.controlbutton("DOUBLE").caption("x2").fixed_width(40);
-		rate_label = buttons.label("").font_size(13).fixed_width(100);
-		start_btn.get_button().tooltip("Start the [[loop]]: it turns with the main timeline, from where the main timeline is (loops meet on the bars). [[midi learn|MIDI learn]] and links work.");
-		stop_btn.get_button().tooltip("Stop the [[loop]]: it stands still where it is.");
+		start_btn = buttons.controlbutton("START").caption("Start").fixed_width(56);
+		stop_btn = buttons.controlbutton("STOP").caption("Stop").fixed_width(56);
+		reset_btn = buttons.controlbutton("RESET").caption("Reset").fixed_width(60);
+		half_btn = buttons.controlbutton("HALF").caption("/2").fixed_width(38);
+		double_btn = buttons.controlbutton("DOUBLE").caption("x2").fixed_width(38);
+		rate_label = buttons.label("").font_size(13).fixed_width(40);
+		start_btn.get_button().tooltip("Start the [[loop]]: it turns with the main timeline, from where the main timeline is (loops meet on the bars), and its clips play. [[midi learn|MIDI learn]] and links work.");
+		stop_btn.get_button().tooltip("Stop the [[loop]]: it stands still where it is, its clips stop.");
 		reset_btn.get_button().tooltip("Back to the start of the turn, now.");
 		half_btn.get_button().tooltip("Half as fast: one turn takes twice as long.");
 		double_btn.get_button().tooltip("Twice as fast: one turn takes half as long.");
 
 		length_ctrl = left.controlint("LENGTH").caption("Beats").value(std.int(clock.length)).anchor_left(0).anchor_right(0).fixed_height(24)
-			.tooltip("How many [[beat|beats]] one turn of the [[loop]] takes");
+			.tooltip("How many [[beat|beats]] one turn of the [[loop]] takes: the range in the ruler of its timeline");
 		phase_ctrl = left.controlslider("PHASE").caption("Phase").min(0).max(1).value(clock.phase()).as_output(true).anchor_left(0).anchor_right(0).fixed_height(24)
 			.tooltip("Where the [[loop]] is in its turn, 0 to 1. [[link|Link]] it to anything that should follow the loop.");
 		env_ctrl = left.controlslider("ENVELOPE").caption("Envelope").min(0).max(1).value(0).as_output(true).anchor_left(0).anchor_right(0).fixed_height(24)
-			.tooltip("The envelope on the right at the loop's phase. [[link|Link]] it to the controls it should drive.");
+			.tooltip("The envelope below at the loop's phase. [[link|Link]] it to the controls it should drive.");
 
-		graph = node.widget().anchor_left(LOOP_LEFT_W + 8).anchor_right(4).anchor_top(4).anchor_bottom(4).graph("Envelope").anchor(0);
+		graph = left.graph("Envelope").anchor_left(0).anchor_right(0).fixed_height(56);
 		graph.envelope_mode(true);
 		graph.editable(true);
 		graph.points(d && d.has("envelope") ? d.envelope : [[0.0, 0.0, 0.0], [0.5, 1.0, 0.0], [1.0, 0.0, 0.0]]);
 		graph.tooltip("The envelope of the [[loop]]: drag the points, double click adds one. Read once per turn, its value goes out of Envelope.");
 
-		entry = [clock = clock, row = row, graph = graph, phase_ctrl = phase_ctrl, env_ctrl = env_ctrl, length_ctrl = length_ctrl, rate_label = rate_label];
+		//The timeline of the loop (#680): lanes with clips and envelopes, its cursor runs over the turn
+		tl_box = node.widget().anchor_left(LOOP_LEFT_W + 6).anchor_right(4).anchor_top(2).anchor_bottom(2);
+		tlw = tl_box.timeline(clock.name).anchor(0);
+		clips = timeline_clips(timeline, tl_box, tlw, [clock = clock, prefix = clock.guid, title = clock.name, panel = panel, ai = false]);
+		tlw.tooltip("The timeline of the [[loop]]: drop assets onto its lanes. The range in the ruler is one turn; Shift + drag there draws another.\n[[wiki:Timeline#loop-timelines]]");
+
+		entry = [clock = clock, row = row, node = node, graph = graph, phase_ctrl = phase_ctrl, env_ctrl = env_ctrl, length_ctrl = length_ctrl,
+			rate_label = rate_label, name_box = name_box, tlw = tlw, clips = clips, chase_btn = chase_btn];
 		loops.push_back(entry);
+		clips.on_range = [this, entry](c){
+			if(entry.length_ctrl.value() != std.int(c.length))
+				entry.length_ctrl.value(std.int(c.length));
+			this.fit(entry);
+		};
 
 		start_btn.callback([this, clock](v){
 			if(v)
 				clock.start(this.main_pos());
+		});
+		chase_btn.callback([clock](v){
+			clock.chase = v ? true : false;
 		});
 		stop_btn.callback([clock](v){
 			if(v)
@@ -110,27 +144,114 @@ class loops_view
 				this.show_rate(entry);
 			}
 		});
-		length_ctrl.callback([clock](v){
+		length_ctrl.callback([this, clock, entry](v){
 			clock.set_length(v);
+			this.fit(entry);
 		});
-		name_box.on_change([this, clock](text){
-			clock.name = text;
-			this.publish();
+		name_box.on_change([this, entry](text){
+			this.rename(entry, text);
 		});
 		guid = clock.guid;
 		del_btn.on_click([this, guid](){
-			this.remove_loop(guid);
+			if(!nanogui.show_mode())
+				this.delete_loop(guid);
 		});
 
+		if(d && d.has("timeline"))
+			clips.load_state(d.timeline);
 		show_rate(entry);
+		fit(entry);
 		publish();
 		return entry;
+	}
+
+	//The ruler of a loop shows its turn and a little more, beat 0 at the left edge
+	fit(entry) {
+		c = entry.clock;
+		vis = math.max(4.0, (c.offset + c.length) * 1.125);
+		entry.tlw.visible_beats(vis);
+		entry.tlw.view_center(entry.tlw.visible_beats() * 0.5);
+	}
+
+	rename(entry, text) {
+		entry.clock.name = text;
+		entry.clips.title = text;
+		entry.tlw.caption(text);
+		if(entry.name_box.value() != text)
+			entry.name_box.value(text);
+		publish();
+	}
+
+	//The bin of a loop (and the MCP query): the loop goes, a step of the undo history
+	delete_loop(guid) {
+		snap = loop_snapshot(guid);
+		if(!snap || !remove_loop(guid))
+			return false;
+		step("Delete loop", [this, snap](){ this.restore_loop(snap); }, [this, guid](){ this.remove_loop(guid); });
+		return true;
+	}
+
+	//What restore_loop makes a loop again of: its place, its data (as saved with the project, with its timeline), the
+	//controls of its row and of its lane heads with their links and MIDI mappings
+	loop_snapshot(guid) {
+		for(i = 0; i < loops.size(); i++) {
+			e = loops[i];
+			if(e.clock.guid != guid)
+				continue;
+			d = e.clock.save();
+			d.envelope = e.graph.points();
+			d.timeline = e.clips.save_state();
+			heads = std.json();
+			for(k = 0; k < e.clips.lanes.size(); k++)
+				heads[std.string(e.clips.lanes[k].id)] = e.clips.lanes[k].node.serialize_json(true);
+			return [index = i, data = d, node = e.node.serialize_json(true), heads = heads];
+		}
+		return None;
+	}
+
+	restore_loop(snap) {
+		//Its generators, nodes and lanes of before have the same names and guids: they have to be gone first
+		for(!area.screen().garbage_cleared()) {
+			std.sleep(0);
+		}
+		e = add_loop(snap.data);
+		//Back in its place: the rows after it go behind it
+		at = math.clamp(snap.index, 0, loops.size() - 1);
+		if(at < loops.size() - 1) {
+			loops.erase(loops.size() - 1);
+			loops.insert(at, e);
+			for(i = at + 1; i < loops.size(); i++)
+				loops[i].row.bring_to_front();
+			list.refresh_layout();
+		}
+		try {
+			e.node.deserialize_json(snap.node, true);
+			for(k = 0; k < e.clips.lanes.size(); k++) {
+				id = std.string(e.clips.lanes[k].id);
+				if(snap.heads.has(id))
+					e.clips.lanes[k].node.deserialize_json(snap.heads[id], true);
+			}
+		}
+		catch(err) {}
+		publish();
+		return e;
+	}
+
+	//One step of the undo history of the program, after the action ran
+	step(name, undo_fn, redo_fn) {
+		eng = std.global("engine");
+		gm = timeline && timeline.menu ? timeline.menu.generators_menu : None;
+		h = gm ? gm.undo_history : None;
+		if(!h || h.busy || gm.recording || eng.load_in_progress)
+			return;
+		h.push(name, undo_fn, redo_fn);
 	}
 
 	remove_loop(guid) {
 		for(i = 0; i < loops.size(); i++) {
 			if(loops[i].clock.guid == guid) {
 				row = loops[i].row;
+				loops[i].clips.dispose();
 				loops.erase(i);
 				std.free(row);
 				publish();
@@ -143,10 +264,35 @@ class loops_view
 	clear() {
 		for(loops.size() > 0) {
 			row = loops[0].row;
+			loops[0].clips.dispose();
 			loops.erase(0);
 			std.free(row);
 		}
 		publish();
+	}
+
+	//A loop by its guid, its name or its index (an int or a number in a string); None when there is none
+	find(key) {
+		for(i = 0; i < loops.size(); i++) {
+			if(loops[i].clock.guid == key || loops[i].clock.name == key)
+				return loops[i];
+		}
+		k = std.is_string(key) ? (std.string(std.int(key)) == key ? std.int(key) : -1) : std.int(key);
+		return k >= 0 && k < loops.size() ? loops[k] : None;
+	}
+
+	loop_json(entry) {
+		j = entry.clips.clock_json(entry.clock);
+		j.lanes = entry.clips.lanes.size();
+		j.clips = entry.clips.clips.size();
+		return j;
+	}
+
+	list_json() {
+		out = [];
+		for(i = 0; i < loops.size(); i++)
+			out.push_back(loop_json(loops[i]));
+		return out;
 	}
 
 	show_rate(entry) {
@@ -172,10 +318,12 @@ class loops_view
 
 	//delta: how far the main timeline moved in this frame, in beats (0 while it stops)
 	update(delta) {
+		grown = false;
+		pos = main_pos();
 		for(i = 0; i < loops.size(); i++) {
 			e = loops[i];
 			c = e.clock;
-			c.advance(delta);
+			c.advance(delta, pos);
 			ph = c.phase();
 			nanogui.sync_source(c.guid, c.turns);
 			if(e.phase_ctrl.value() != ph)
@@ -184,7 +332,17 @@ class loops_view
 			if(e.env_ctrl.value() != env)
 				e.env_ctrl.value(env);
 			e.graph.cursor(ph);
+			//Its timeline: the clips under its cursor play, its envelopes drive their controls
+			e.clips.tick();
+			//The row grows with the lanes of its timeline
+			h = math.max(LOOP_ROW_H, e.clips.needed_height() + 6);
+			if(e.row.fixed_height() != h) {
+				e.row.fixed_height(h);
+				grown = true;
+			}
 		}
+		if(grown)
+			scroll.refresh_layout();
 	}
 
 	// =========================================================================
@@ -196,6 +354,7 @@ class loops_view
 		for(i = 0; i < loops.size(); i++) {
 			d = loops[i].clock.save();
 			d.envelope = loops[i].graph.points();
+			d.timeline = loops[i].clips.save_state();
 			out.push_back(d);
 		}
 		return [loops = out];
@@ -203,9 +362,17 @@ class loops_view
 
 	//states: what save_state returned, None for a new project
 	load_state(states) {
+		had = loops.size() > 0;
 		clear();
 		if(!states || !states.has("loops"))
 			return;
+		//The generators of the loops before go with the next frame; the loops of this project make theirs with the
+		//same guids
+		if(had) {
+			for(!area.screen().garbage_cleared()) {
+				std.sleep(0);
+			}
+		}
 		for(i = 0; i < states.loops.size(); i++)
 			add_loop(states.loops[i]);
 	}

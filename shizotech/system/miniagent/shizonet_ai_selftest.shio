@@ -107,19 +107,20 @@ req_prompt(svc, request_id) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ai_stub_receptionist — the miniagent handle a Megamind exposes as
-//  `host.receptionist`: send_prompt() is the follow-up channel of a running
+//  `host.receptionist`: task_update() is the follow-up channel of a running
 //  turn (it stops the generation, keeps the chat and continues with the new
 //  user message), so the selftest can observe what ai_request_update injects.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class ai_stub_receptionist {
 
-	prompts = [];			// every message injected through send_prompt
+	prompts = [];			// every message injected through task_update
 	stops = 0;
+	running = false;
 
-	send_prompt(msg) {
+	task_update(msg) {
 		prompts.push_back(msg);
-		return [ok = true, reports = [[report = "injected: " + msg]], execution_time_ms = 1];
+		return None;
 	}
 
 	stop() {
@@ -161,15 +162,37 @@ class ai_stub_host {
 	tasks_failed = [];
 
 	_notify_cb = None;
+	_notify_listeners = [];
 	_task_finish_cb = None;
+	_task_finish_listeners = [];
+	_file_cb = None;
+	_file_listeners = [];
+
+	refuse_task_add = false;          // add_task returns "" (empty = refused)
+	refuse_task_add_json = false;     // add_task returns [ok = false, ...]
 
 	on_notify(cb) { _notify_cb = cb; }
+	add_notify_listener(cb) { _notify_listeners.push_back(cb); }
 	on_task_finished(cb) { _task_finish_cb = cb; }
+	add_task_finished_listener(cb) { _task_finish_listeners.push_back(cb); }
+	on_file(cb) { _file_cb = cb; }
+	add_file_listener(cb) { _file_listeners.push_back(cb); }
 	on_action(cb) { }
 
 	notify_user(msg) {
 		if(_notify_cb)
 			_notify_cb(msg);
+
+		for(i = 0; i < _notify_listeners.size(); i++)
+			_notify_listeners[i](msg);
+	}
+
+	emit_file(f) {
+		if(_file_cb)
+			_file_cb(f);
+
+		for(i = 0; i < _file_listeners.size(); i++)
+			_file_listeners[i](f);
 	}
 
 	// A prompt starting with SLOW keeps the receptionist busy, so the test can
@@ -177,6 +200,7 @@ class ai_stub_host {
 	// second request to stay queued while a follow-up is applied to it.
 	request(prompt, on_finish_cb = None, on_action_cb = None) {
 		_receptionist_active = true;
+		receptionist.running = true;
 
 		if(on_action_cb) {
 			on_action_cb([text = "thinking: "]);
@@ -198,6 +222,7 @@ class ai_stub_host {
 		];
 
 		_receptionist_active = false;
+		receptionist.running = false;
 
 		if(on_finish_cb)
 			on_finish_cb(result);
@@ -215,6 +240,12 @@ class ai_stub_host {
 	}
 
 	add_task(name, goal) {
+		if(refuse_task_add)
+			return "";
+
+		if(refuse_task_add_json)
+			return [ok = false, error = "no worker slot"];
+
 		taskid = std.random_hash(16);
 		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
 		return taskid;
@@ -259,18 +290,25 @@ class ai_stub_host {
 		return "Not found.";
 	}
 
-	// Move a planned task to finished and fire the Megamind hook.
-	finish_task(taskid, state = "finished", report = "stub report") {
+	// Move a planned task to finished and fire the Megamind hooks.
+	finish_task(taskid, state = "finished", report = "stub report", ok_value = None) {
 		for(i = 0; i < tasks_scheduled.size(); i++) {
 			if(tasks_scheduled[i].taskid == taskid) {
 				task = tasks_scheduled[i];
 				tasks_scheduled.erase(i);
 				task.state = state;
 				task.report = report;
+
+				if(!std.is_none(ok_value))
+					task.ok = ok_value;
+
 				tasks_finished.push_back(task);
 
 				if(_task_finish_cb)
 					_task_finish_cb(task);
+
+				for(j = 0; j < _task_finish_listeners.size(); j++)
+					_task_finish_listeners[j](task);
 
 				return true;
 			}
@@ -367,6 +405,22 @@ std.print("ShizoNet AI protocol selftest\n\n");
 host = ai_stub_host();
 goals_host = ai_stub_host_goals();
 stub_router = ai_stub_router();
+
+// Legacy hooks set BEFORE ai_node_attach: the ShizoNet service must add its
+// listeners, not overwrite these single slots.
+legacy_counts = [notify = 0, task = 0, file = 0];
+
+host.on_notify([legacy_counts](msg) {
+	legacy_counts.notify++;
+});
+
+host.on_task_finished([legacy_counts](task) {
+	legacy_counts.task++;
+});
+
+host.on_file([legacy_counts](f) {
+	legacy_counts.file++;
+});
 
 node_server = shizonet.server(NODE_NAME);
 router_server = shizonet.server(ROUTER_NAME);
@@ -597,6 +651,17 @@ check("ai_task_add planned", std.is_json(add) && add.state == "planned" && add.n
 taskid = ai_str(add.taskid, "");
 check("ai_task_add taskid", taskid.length() > 0, taskid);
 
+// A refused dispatch is ok=false, never a task with an empty id.
+host.refuse_task_add = true;
+ref_add = dev.get(AI_CMD_TASK_ADD, [name = "Refused", goal = "refuse me"], AI_TIMEOUT_CONTROL);
+check("ai_task_add with an empty taskid -> ok=false", std.is_json(ref_add) && !ref_add.ok, std.string(ref_add));
+host.refuse_task_add = false;
+
+host.refuse_task_add_json = true;
+ref_add_json = dev.get(AI_CMD_TASK_ADD, [name = "Refused JSON", goal = "refuse me too"], AI_TIMEOUT_CONTROL);
+check("ai_task_add with [ok=false] -> ok=false", std.is_json(ref_add_json) && !ref_add_json.ok, std.string(ref_add_json));
+host.refuse_task_add_json = false;
+
 tasks = dev.get(AI_CMD_TASKS, [], AI_TIMEOUT_CONTROL);
 listed = false;
 
@@ -638,13 +703,40 @@ check("task_finished state", std.is_json(te) && te.state == "finished");
 check("task_finished report", std.is_json(te) && te.report == "all good");
 check("task_finished node name", std.is_json(te) && te.node == NODE_NAME);
 check("task_finished time", std.is_json(te) && te.time > 0);
+check("the legacy on_task_finished hook still receives", legacy_counts.task == 1, std.string(legacy_counts));
+
+// A JSON task with ok=false or state=lost is not a live task.
+lost_add = dev.get(AI_CMD_TASK_ADD, [name = "Lost me", goal = "lost task"], AI_TIMEOUT_CONTROL);
+lostid = ai_str(lost_add.taskid, "");
+check("lost task added", std.is_json(lost_add) && lost_add.ok && lostid.length() > 0, std.string(lost_add));
+check("stub host marked the task lost", host.finish_task(lostid, "lost", "gone"));
+
+lost_task = dev.get(AI_CMD_TASK, [taskid = lostid], AI_TIMEOUT_CONTROL);
+check("ai_task of a lost task -> ok=false", std.is_json(lost_task) && !lost_task.ok, std.string(lost_task));
+
+failed_add = dev.get(AI_CMD_TASK_ADD, [name = "Failed me", goal = "failed task"], AI_TIMEOUT_CONTROL);
+failedid = ai_str(failed_add.taskid, "");
+check("failed task added", std.is_json(failed_add) && failed_add.ok && failedid.length() > 0, std.string(failed_add));
+check("stub host marked the task failed", host.finish_task(failedid, "finished", "bad", json.bool(false)));
+
+failed_task = dev.get(AI_CMD_TASK, [taskid = failedid], AI_TIMEOUT_CONTROL);
+check("ai_task with ok=false -> ok=false", std.is_json(failed_task) && !failed_task.ok, std.string(failed_task));
 
 host.notify_user("ping from the node");
 check("notify event reached the router", wait_for([stub_router]() { return stub_router.count_kind("notify") > 0; }, 5000), std.string(stub_router.events));
+check("the legacy on_notify hook still receives", legacy_counts.notify == 1, std.string(legacy_counts));
 
 ne = stub_router.last_of("notify");
 check("notify message", std.is_json(ne) && ne.message == "ping from the node", std.string(ne));
 check("notify node name", std.is_json(ne) && ne.node == NODE_NAME);
+
+host.emit_file([name = "probe.txt", bytes = 5, caption = "probe", data = "abcde"]);
+check("file event reached the router", wait_for([stub_router]() { return stub_router.count_kind("file") > 0; }, 5000), std.string(stub_router.events));
+check("the legacy on_file hook still receives", legacy_counts.file == 1, std.string(legacy_counts));
+
+fe = stub_router.last_of("file");
+check("file event name", std.is_json(fe) && fe.name == "probe.txt", std.string(fe));
+check("file event caption", std.is_json(fe) && fe.caption == "probe", std.string(fe));
 
 check("node counted the pushed events", node.counters.events_sent > 0, std.string(node.counters));
 

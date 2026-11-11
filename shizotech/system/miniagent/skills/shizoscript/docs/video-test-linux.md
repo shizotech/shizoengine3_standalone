@@ -311,7 +311,9 @@ Not done: no Raspberry Pi here (#470).
   no picture after the test's 500 ms (`valid=0`, no error). Not seen again in the 22 runs since; the decoder
   itself delivers the first NVDEC frame of such a clip in about 20 ms, also with the GPU idle. (#471)
 - The FFmpeg mirror release `shizotech/shizoscript3/releases/tag/ffmpeg-9.0.2-lgpl-shared` does not exist yet
-  (404); `fetch_ffmpeg.shio` falls back to BtbN, which deletes old builds after a while. (#468)
+  (404), and BtbN deleted the pinned autobuild on 2026-11-02 (404 too). `fetch_ffmpeg.shio` takes the libraries from
+  the release repo first (`release/shizotech/packages/nanogui/native/<platform>/ffmpeg/`, when its README names the
+  hash; `_testing/fetch_release.sh` fills `release/`), then tries the URLs. (#468)
 - `controlslider.value(v, false)` calls the value callback anyway (see fix 5), for every script that uses it (#466).
 - `deserialize_controls` runs the callbacks of momentary buttons on every project load (see fix 4); other scripts
   than the video generator may have the same problem, e.g. CueList *Random* (#467).

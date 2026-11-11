@@ -56,7 +56,7 @@ AI_MAX_KEPT = 200;
 
 AI_REFRESH_MS = 5000;			// AINodeInfo / AIRouterInfo refresh period
 AI_REAPER_MS = 1000;			// finished-request sweep period
-AI_REQUEST_TTL_MS = 120000;		// keep a finished request this long for re-polls
+AI_REQUEST_TTL_MS = 3600000;	// keep a finished request this long for re-polls (1 hour)
 AI_WORKER_IDLE_MS = 25;			// worker sleep on an empty queue
 AI_UPDATE_MS = 50;				// follow-up (ai_request_update) apply period
 
@@ -129,7 +129,7 @@ ai_trim(list, max_keep) {
 		list.erase(0);
 }
 
-// A Megamind overview, always with the four task groups present and no
+// A Node overview, always with the four task groups present and no
 // object members (a task's `worker` is a miniagent, it must never go on the wire).
 ai_norm_overview(ov) {
 	if(!std.is_json(ov))
@@ -176,7 +176,7 @@ ai_task_copy(task) {
 	return cpy;
 }
 
-// Flatten a Megamind overview into one task list (same shape as node_api).
+// Flatten a Node overview into one task list (same shape as node_api).
 ai_task_list(ov) {
 	ov = ai_norm_overview(ov);
 	list = [];
@@ -199,19 +199,40 @@ ai_task_list(ov) {
 	return list;
 }
 
+// Node.tasks() is the authoritative flattened list; the overview fallback keeps
+// stub hosts (and older shapes) working.
+ai_host_tasks(host) {
+	try {
+		if(std.is_function(host.tasks))
+			return host.tasks();
+	}
+	catch(e) {}
+
+	return ai_task_list(ai_host_overview(host));
+}
+
 // Node info json for the AINodeInfo prop / ai_info reply (see router_api.md).
 // Every host read is defensive: this runs on the refresh thread every
 // AI_REFRESH_MS, so a host missing a member must never take the transport down.
 ai_node_info(host, opts = None) {
 	ov = ai_host_overview(host);
 
-	name = ai_name(ai_opt(opts, "name", ""), "AI Node");
+	name = ai_name(ai_opt(opts, "name", ""), "");
+
+	if(name.empty()) {
+		try {
+			name = ai_name(host.name, "AI Node");
+		}
+		catch(e) {
+			name = "AI Node";
+		}
+	}
 
 	model = ai_opt_str(opts, "model", "");
 
 	if(model.empty()) {
 		try {
-			model = ai_str(host.receptionist.model_config.name);
+			model = ai_str(host.cfg.name);
 		}
 		catch(e) {
 			model = "";
@@ -221,37 +242,63 @@ ai_node_info(host, opts = None) {
 	workers = 0;
 
 	try {
-		workers = host.worker_threads.size();
+		workers = std.int(host.max_workers);
 	}
 	catch(e) {
 		workers = 0;
 	}
 
+	// compatibility for stub hosts that still expose the old worker_threads shape
+	if(!workers) {
+		try {
+			workers = host.worker_threads.size();
+		}
+		catch(e) {
+			workers = 0;
+		}
+	}
+
 	queued = 0;
 
 	try {
-		queued = host.request_queue.size();
+		if(host.receptionist)
+			queued = host.receptionist.queue.size();
+		else
+			queued = host.request_queue.size();
 	}
 	catch(e) {
-		queued = 0;
+		try {
+			queued = host.request_queue.size();
+		}
+		catch(e2) {
+			queued = 0;
+		}
 	}
 
 	active = false;
 
 	try {
-		active = host._receptionist_active ? true : false;
+		if(host.receptionist)
+			active = host.receptionist._active ? true : false;
+		else
+			active = host._receptionist_active ? true : false;
 	}
 	catch(e) {
-		active = false;
+		try {
+			active = host._receptionist_active ? true : false;
+		}
+		catch(e2) {
+			active = false;
+		}
 	}
 
-	// Does this node run a goal scheduler at all? Megamind.goals (goal_engine.shio)
+	// Does this node run a goal scheduler at all? Node.goals (goal_engine.shio)
 	// is set by node.shio only for an .agentspace node, so the presence of the
 	// member IS the answer: no file scan, no call into the scheduler (this runs on
 	// the refresh thread). The router needs it to tell the user "node Z has no
 	// goal system" before it delegates a scheduling request.
 	//
-	// host["goals"], not host.goals: this runs with every host shape (a Megamind,
+	// host["goals"], not host.goals: this runs with every host shape (a Node,
 	// a stub host class, a plain json in the selftest, None on a router service)
 	// and a member access that mixes those shapes resolves to the wrong one (the
 	// access is resolved per site). The index access hits the class member, the
@@ -266,6 +313,13 @@ ai_node_info(host, opts = None) {
 		has_goals = false;
 	}
 
+	node_running = true;
+
+	try {
+		node_running = host.running ? true : false;
+	}
+	catch(e) {}
+
 	running = ov.tasks.size();
 	planned = ov.tasks_scheduled.size();
 
@@ -277,6 +331,7 @@ ai_node_info(host, opts = None) {
 		tags = ai_opt_list(opts, "tags"),
 		model = model,
 		max_workers = workers,
+		running = node_running ? 1 : 0,
 		busy = (active || queued > 0 || running > 0) ? true : false,
 		tasks_running = running,
 		tasks_planned = planned,
@@ -339,7 +394,7 @@ ai_router_info(server, router, opts = None) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AiService — the attach handle. One instance per shizonet server, "node"
-//  runs the AI node service on a Megamind host, "router" receives ai_event.
+//  runs the AI node service on a Node host, "router" receives ai_event.
 //  The handle is what ai_node_attach / ai_router_attach return: .stop() tears
 //  the service down, .info() / .requests / .counters are live state.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,7 +403,7 @@ class AiService {
 
 	kind = "node";
 	server = None;
-	host = None;			// node side: the Megamind
+	host = None;			// node side: the Node
 	router = None;			// router side: the Router
 	opts = [];
 	running = false;
@@ -476,46 +531,91 @@ class AiService {
 		});
 	}
 
-	// Megamind hooks: every notify / finished task is pushed to the routers.
+	// Node hooks: every notify / finished task is pushed to the routers.
+	// The hooks are additive (Node.add_*_listener), so the web API's own
+	// listeners stay registered; stub hosts without the additive API use the
+	// legacy single slot as a fallback.
 	hook_host() {
+		notify_cb = [this](msg) {
+			push_event([kind = "notify", message = ai_str(msg)]);
+		};
+
+		notify_registered = false;
+
 		try {
-			host.on_notify([this](msg) {
-				push_event([kind = "notify", message = ai_str(msg)]);
-			});
+			if(std.is_function(host.add_notify_listener)) {
+				host.add_notify_listener(notify_cb);
+				notify_registered = true;
+			}
 		}
-		catch(e) {
-			std.error("ai_node_attach: host.on_notify not available");
+		catch(e) {}
+
+		if(!notify_registered) {
+			try {
+				host.on_notify(notify_cb);
+			}
+			catch(e) {
+				std.error("ai_node_attach: host.on_notify not available");
+			}
 		}
 
 		//send_file of the node's agents: the document goes to the routers like a notify
-		try {
-			host.on_file([this](f) {
-				push_event([
-					kind = "file",
-					name = ai_str(f.name),
-					bytes = std.int(f.bytes ?? 0),
-					caption = ai_str(f.caption),
-					data = ai_str(f.data),
-				]);
-			});
-		}
-		catch(e) {
-			//optional: a host without send_file support (older Megamind, test stubs)
-		}
+		file_cb = [this](f) {
+			push_event([
+				kind = "file",
+				name = ai_str(f.name),
+				bytes = std.int(f.bytes ?? 0),
+				caption = ai_str(f.caption),
+				data = ai_str(f.data),
+			]);
+		};
+
+		file_registered = false;
 
 		try {
-			host.on_task_finished([this](task) {
-				push_event([
-					kind = "task_finished",
-					taskid = ai_str(task.taskid),
-					name = ai_str(task.name),
-					state = ai_str(task.state),
-					report = ai_str(task.report),
-				]);
-			});
+			if(std.is_function(host.add_file_listener)) {
+				host.add_file_listener(file_cb);
+				file_registered = true;
+			}
 		}
-		catch(e) {
-			std.error("ai_node_attach: host.on_task_finished not available");
+		catch(e) {}
+
+		if(!file_registered) {
+			try {
+				host.on_file(file_cb);
+			}
+			catch(e) {
+				//optional: a host without send_file support (older Node, test stubs)
+			}
+		}
+
+		task_cb = [this](task) {
+			push_event([
+				kind = "task_finished",
+				taskid = ai_str(task.taskid),
+				name = ai_str(task.name),
+				state = ai_str(task.state),
+				report = ai_str(task.report),
+			]);
+		};
+
+		task_registered = false;
+
+		try {
+			if(std.is_function(host.add_task_finished_listener)) {
+				host.add_task_finished_listener(task_cb);
+				task_registered = true;
+			}
+		}
+		catch(e) {}
+
+		if(!task_registered) {
+			try {
+				host.on_task_finished(task_cb);
+			}
+			catch(e) {
+				std.error("ai_node_attach: host.on_task_finished not available");
+			}
 		}
 	}
 
@@ -611,8 +711,8 @@ class AiService {
 	}
 
 	// Apply the recorded ai_request_update follow-ups (router_api.md):
-	//   generating -> inject into the live receptionist conversation, the same
-	//                 mechanism Megamind.update_task uses for a running worker
+	//   generating -> continue the live receptionist turn with the message
+	//                 (Node.update_receptionist, on the receptionist thread)
 	//   queued     -> append to the stored prompt, part of the task at start
 	//   done/error/stopped/reaped -> dropped (the handler already answered not found)
 	apply_updates() {
@@ -642,11 +742,30 @@ class AiService {
 			if(status != "generating")
 				continue;
 
-			// a host without a receptionist member (stub hosts) must not take the
-			// service down: the update is simply skipped.
+			// A Node continues the running turn with the message on its own
+			// receptionist thread (Node.update_receptionist). Calling
+			// receptionist.task_update() from here also updates the running
+			// task, but must check `running` first: no task means nothing to update.
+			handled = false;
 			try {
-				if(std.is_function(host.receptionist.send_prompt))
-					host.receptionist.send_prompt(message);
+				if(std.is_function(host.update_receptionist)) {
+					host.update_receptionist(message);
+					handled = true;
+				}
+			}
+			catch(e) {
+				handled = false;
+			}
+
+			if(handled)
+				continue;
+
+			// hosts without update_receptionist (stub hosts): miniagent.task_update
+			// on the live receptionist task; a host without a receptionist member
+			// must not take the service down.
+			try {
+				if(std.is_function(host.receptionist.task_update) && host.receptionist.running)
+					host.receptionist.task_update(message);
 			}
 			catch(e) {
 				// no receptionist handle / the injection failed: nothing to do
@@ -767,11 +886,17 @@ class AiService {
 		if(prompt.empty())
 			return [ok = false, error = "missing 'prompt'"];
 
+		workspace = ai_field(data, "workspace");
+		if(workspace.empty())
+			workspace = ai_field(data, "workspace_id");
+		workspace = workspace.strip();
+
 		request_id = std.random_hash(24);
 
 		requests[request_id] = [
 			id = request_id,
 			prompt = prompt,
+			workspace = workspace,
 			status = "queued",
 			queue = [],
 			result = None,
@@ -893,7 +1018,7 @@ class AiService {
 		return [ok = true, overview = ai_host_overview(host)];
 	}
 
-	// The node's goal scheduler (Megamind.goals, goal_engine.shio). A run is
+	// The node's goal scheduler (Node.goals, goal_engine.shio). A run is
 	// queued for the scheduler's own thread; a status change is a folder move.
 	handle_goals(dev, data) {
 		sch = None;
@@ -948,7 +1073,7 @@ class AiService {
 	}
 
 	handle_tasks(dev, data) {
-		return [ok = true, tasks = ai_task_list(ai_host_overview(host))];
+		return [ok = true, tasks = ai_host_tasks(host)];
 	}
 
 	handle_task(dev, data) {
@@ -971,6 +1096,14 @@ class AiService {
 		if(std.is_none(task_info) || std.is_string(task_info))
 			return [ok = false, error = "not found", taskid = taskid];
 
+		// A failed / lost task is not a live task: the router must not treat it
+		// as a queued or running task.
+		if(task_info.has("ok") && !task_info.ok)
+			return [ok = false, error = ai_str(task_info.error ?? "task failed"), taskid = taskid];
+
+		if(ai_str(task_info.state).lowercase() == "lost")
+			return [ok = false, error = "not found", taskid = taskid];
+
 		return [ok = true, task = ai_task_copy(task_info)];
 	}
 
@@ -985,19 +1118,44 @@ class AiService {
 		if(name.empty())
 			name = "Task-" + std.random_hash(6);
 
+		workspace = ai_field(data, "workspace");
+		if(workspace.empty())
+			workspace = ai_field(data, "workspace_id");
+		workspace = workspace.strip();
+
 		taskid = None;
 
 		try {
-			taskid = host.add_task(name, goal);
+			if(workspace.empty())
+				taskid = host.add_task(name, goal);
+			else
+				taskid = host.add_task(name, goal, "adaptive", workspace);
 		}
 		catch(e) {
 			taskid = None;
 		}
 
+		// A refused dispatch is an error, not a task with an empty id.
 		if(std.is_none(taskid))
 			return [ok = false, error = "add_task failed"];
 
-		return [ok = true, taskid = std.string(taskid), name = name, state = "planned"];
+		if(std.is_json(taskid)) {
+			if(!taskid.ok)
+				return [ok = false, error = ai_str(taskid.error ?? "add_task failed")];
+
+			taskid = taskid.taskid;
+		}
+
+		taskid = ai_str(taskid, "").strip();
+
+		if(taskid.empty())
+			return [ok = false, error = "add_task refused (empty taskid)"];
+
+		reply = [ok = true, taskid = taskid, name = name, state = "planned"];
+		if(workspace)
+			reply.workspace_id = workspace;
+
+		return reply;
 	}
 
 	handle_task_update(dev, data) {
@@ -1044,7 +1202,7 @@ class AiService {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Node side: register the AI service on a shizonet server.
-//  host is a Megamind(). Handlers never block: they enqueue and return.
+//  host is a Node(). Handlers never block: they enqueue and return.
 //  opts: [name, description, capabilities, tags]
 // ─────────────────────────────────────────────────────────────────────────────
 ai_node_attach(server, host, opts = None) {

@@ -22,17 +22,18 @@ Shaders follow the format documented in [SHADER_GUIDE.MD](SHADER_GUIDE.MD):
 ```
 Shaders/
 ├── Effects/              # Visual effect shaders
-│   ├── Backgrounds/      # Background shaders
 │   ├── Color/            # Color manipulation effects
 │   ├── Examples/         # Example shaders
-│   ├── Exciters/         # Exciter/effects shaders
-│   ├── Feedback/         # Feedback loop shaders
+│   ├── Exciters/         # Strobe, chromatic, glitch
+│   ├── Feedback&Blur/    # Feedback loops, blurs, frame cache
 │   ├── Glow&Light/       # Glow and lighting effects
 │   ├── Kaleidoscope/     # Kaleidoscope effects
-│   ├── Morph/            # Morphing effects
-│   ├── Patterns/         # Pattern generation effects
+│   ├── Mapping/          # Projection mapping helpers
+│   ├── Morph&Mirror/     # Displacement, mirror, morph, instancing
 │   ├── Retro/            # Retro/vintage effects
-│   └── Utility/          # Effect utilities
+│   ├── Utility/          # Effect utilities
+│   ├── Video3D/          # Picture into 3D or time: RuttEtra, PointCloud, Voxels, SlitScan, Datamosh
+│   └── basic/, morph/    # Older distortion and cloning effects
 ├── Sources/              # Source/generator shaders
 │   ├── 3D/               # 3D rendering shaders
 │   ├── Audio/            # Audio-reactive shaders

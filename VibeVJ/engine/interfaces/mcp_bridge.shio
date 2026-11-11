@@ -33,7 +33,8 @@
 //   models that take no images in tool results)
 //   the layout actions of the mouse (#344, engine/interfaces/mcp_layout.shio):
 //   vibevj_split_area, vibevj_close_area, vibevj_move_view,
-//   vibevj_set_area_view, vibevj_view_tab, vibevj_set_split_sizes, vibevj_undo.
+//   vibevj_set_area_view, vibevj_view_tab, vibevj_set_split_sizes,
+//   vibevj_maximize_area, vibevj_duplicate_view, vibevj_delete_view, vibevj_undo.
 //   On the render thread too, through the code of the head, menu, drop and top
 //   bar of the views (one undo step each); they return the layout as
 //   vibevj_describe_layout does, with what they did in 'result'
@@ -89,7 +90,9 @@ The layout of the views (vibevj_describe_layout reads it): vibevj_split_area,
 vibevj_close_area, vibevj_move_view (move, copy, swap, into a view tab of its
 own), vibevj_set_area_view (a view into an empty area, as its picker),
 vibevj_view_tab (add, select, close, rename), vibevj_set_split_sizes (the line
-between two areas), vibevj_undo. Each is one undo step, as with the mouse, and
+between two areas), vibevj_maximize_area, vibevj_duplicate_view,
+vibevj_delete_view (only when the user asks: the only one that deletes),
+vibevj_undo. Each is one undo step, as with the mouse (maximize is none), and
 returns the new layout. An area is named by its path in the view tab ('' the
 whole tab, '1/0': index in the split or the Tabview at each level) or by the uid
 of the view in it. Closing never deletes: the view moves into a view tab.
@@ -105,6 +108,30 @@ get_dmx_conflicts after changing addresses. set_fixture_test holds lamps at
 test values (dimmer, color, pan / tilt, ...) until clear_fixture_test;
 get_fixture_values shows what they send, set_fixture_values keeps values for
 good (as the sliders of Devices > Fixtures).
+
+The main timeline (clips on lanes, the loop, the transport) has the live_path
+"timeline": get_timeline, add_timeline_clip (an asset onto a lane, from a beat,
+for some beats), set_timeline_clip, remove_timeline_clip, set_timeline_lane
+(blend mode, Mix), set_timeline_loop, set_transport (play, position, bpm). A
+clip runs only while the playhead is inside it. Envelopes of a lane drive any
+control through a link: add_timeline_envelope (lane, target full_path, points
+[[beat, value, curve]]), set_timeline_envelope, remove_timeline_envelope. The
+loop timelines of the view Loops are timelines too: get_timeline_loops,
+add_loop_timeline, set_loop_timeline (running, beats), remove_loop_timeline,
+and every timeline query takes loop (guid or name) for one of them. Lanes:
+add_timeline_lane, remove_timeline_lane, move_timeline_lane, set_timeline_lane
+name. Several clips: select_timeline_clips, copy_timeline_clips (paste at a
+beat, or duplicate), paste_timeline_clips. Overlapping clips of a lane
+crossfade. MIDI Time Code: set_timecode (on, device, offset hh:mm:ss:ff at beat
+0), get_timecode; send_test_timecode plays MTC into the virtual MIDI device.
+Fades of a clip: set_timeline_clip fade_in, fade_out, curve. Envelope points:
+edit_timeline_envelope_points (select, move, copy, paste, delete). Cues (flags
+that run an action when the playhead passes them: a Clipview clip, a desk
+command, a MIDI message, a loop, a song, any query): get_timeline_cues,
+add_timeline_cue, set_timeline_cue, remove_timeline_cue. A show of songs (each
+its own timeline, picked by hand, MIDI or the timecode they start at):
+get_timeline_songs, add_timeline_song, set_timeline_song, select_timeline_song,
+remove_timeline_song; every timeline query takes song.
 
 Seeing: vibevj_capture returns a picture of the screen or a generator.
 vibevj_camera_capture looks through a Camera generator (vibevj_list_cameras;
@@ -136,6 +163,9 @@ VIBEVJ_MCP_STATIC_TOOLS = [
 	"vibevj_view_tab",
 	"vibevj_set_split_sizes",
 	"vibevj_undo",
+	"vibevj_maximize_area",
+	"vibevj_duplicate_view",
+	"vibevj_delete_view",
 ];
 
 // A tool result with an image (#670): what a tool of VibeVJMCPServer.image_tools returns. The server sends the PNG as an
@@ -712,13 +742,15 @@ class VibeVJMCPBridge {
 		engine = std.global("engine");
 
 		r = render_call([engine, name]() {
-			engine.save_project(name);
+			//false when a file could not be written or a save / load was running (an old controls.json then
+			//looked like a successful save)
+			saved = engine.save_project(name) ? true : false;
 			//A first save creates the project folder: it shows up in the Projects tab (as with Save of the tab)
 			engine.env.recent_dirty = true;
-			return true;
+			return saved;
 		});
 		dir = "projects/" + name;
-		if(!fileio.exists(dir + "/controls.json"))
+		if(!r.result || !fileio.exists(dir + "/controls.json"))
 			std.runtime_error("Project " + name + " was not saved: " + (r.errors.size() ? r.errors[0] : "see the log of VibeVJ"));
 		return [project = name, folder = dir, errors = r.errors, warnings = r.warnings, seconds = r.seconds];
 	}
@@ -837,6 +869,43 @@ class VibeVJMCPBridge {
 			],
 			[this](svr, args) {
 				return this.layout_call([](gm, a) { return vibevj_layout_split_sizes(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_maximize_area",
+			"Maximizes an area as Maximize of its head and menu (Ctrl+Space) does: every split above it gives it all of its room, the other areas shrink to their headers. One area at a time: another maximized area is restored first. restore 1: the maximized area gives the room back (Restore the layout; 'maximized' of vibevj_describe_layout names it). No undo step: only the shares of the splits change, a save stores the layout restored." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "string(): " + area_doc + " Not needed with restore 1.",
+				restore = "int(0,1): 1 = restore the layout instead of maximizing.",
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_maximize(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_duplicate_view",
+			"Duplicates the view of an area as Duplicate of its menu does: a copy, set as the view is (controls, what is in it), in a new area to its right ('result.duplicate' says where). The copy is a view of its own with new generators, not linked to the first. One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "&string(): " + area_doc,
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_duplicate(gm, a); }, args);
+			}
+		);
+
+		server.add_tool(
+			"vibevj_delete_view",
+			"Deletes the view of an area and everything in it, as Delete view… of its menu after 'yes' to its question: the only layout action that deletes, so only when the user asked for it (closing, vibevj_close_area, keeps the view in a view tab). The area goes and its split dissolves; a tab of a Tabview or the area of a whole view tab stays, empty. vibevj_undo brings the view back. One undo step." + returns,
+			[
+				tab = "string(): " + tab_doc,
+				area = "&string(): " + area_doc,
+			],
+			[this](svr, args) {
+				return this.layout_call([](gm, a) { return vibevj_layout_delete(gm, a); }, args);
 			}
 		);
 
@@ -1026,7 +1095,7 @@ class VibeVJMCPBridge {
 
 		server.add_tool(
 			"vibevj_describe_layout",
-			"Describes the layout of every view tab: splits, Tabviews, empty areas and the view in each area (its asset in 'assets', by uid), the view tab in front, the maximized area, the areas of the view tab in front ('areas': path, uid, asset, place on the screen), the next undo / redo step and the view tabs in windows of their own ('windows': place, size, maximized, full screen, whether the bar shows, its buttons). Read only; vibevj_split_area, vibevj_move_view, ... change it.",
+			"Describes the layout of every view tab: splits, Tabviews, empty areas and the view in each area (its asset in 'assets', by uid), the view tab in front, the maximized area, the areas of the view tab in front ('areas': path, uid, asset, place on the screen), the next undo / redo step, the view tabs in windows of their own ('windows': place, size, maximized, full screen, whether the bar shows, its buttons) and 'show_mode' (1 while show mode locks the layout: the layout tools and undo refuse then; only the user leaves it, by holding the lock of the timeline bar or Ctrl+L). Read only; vibevj_split_area, vibevj_move_view, ... change it.",
 			None,
 			[this](svr, args) {
 				menu = std.global("engine").menu;
@@ -1122,7 +1191,7 @@ class VibeVJMCPBridge {
 
 		server.add_tool(
 			"vibevj_debug_input",
-			"DEBUG: sends input into the VibeVJ window as a user gives it, through the window's own event path (focus, drag and drop, undo work as with a real mouse); the real mouse pointer is not moved. Coordinates are window units (as vibevj_describe_layout and vibevj_debug_widgets report them). One event per frame. Event types: move {x,y}; press / release {x?,y?,button?,mods?}; click {x?,y?,button?,mods?,count?}; drag {x,y,x2,y2,button?,mods?,drop_mods?,steps?} (mods held from the press, drop_mods at the release: Ctrl at the drop copies); scroll {x?,y?,dx?,dy?}; key {keys} (\"ctrl+z\", \"ctrl+shift+e\", \"return\", \"escape\"; ctrl is the Ctrl of the program, Command on a Mac); key_down / key_up {keys} (hold a modifier over several events); text {text} (printable ASCII) or {codepoints}; wait {ms?,frames?}. button: left (default), right, middle. Returns the mouse position and the widget under it.",
+			"DEBUG: sends input into the VibeVJ window as a user gives it, through the window's own event path (focus, drag and drop, undo work as with a real mouse); the real mouse pointer is not moved. Coordinates are window units (as vibevj_describe_layout and vibevj_debug_widgets report them). One event per frame. Event types: move {x,y}; press / release {x?,y?,button?,mods?}; click {x?,y?,button?,mods?,count?}; drag {x,y,x2,y2,button?,mods?,drop_mods?,steps?} (mods held from the press, drop_mods at the release: Ctrl at the drop copies); scroll {x?,y?,dx?,dy?}; key {keys} (\"ctrl+z\", \"ctrl+shift+e\", \"return\", \"escape\"; ctrl is the Ctrl of the program, Command on a Mac); key_down / key_up {keys} (hold a modifier over several events); text {text} (printable ASCII) or {codepoints}; wait {ms?,frames?}. button: left (default), right, middle. Returns the mouse position, the widget under it and, while a drag and drop is held, dragdrop: its hint bar and its ghost at the cursor (title, the names it lists, copy: Ctrl shows the + Copy badge; #348).",
 			[events = "&any(): The events as a list of objects, e.g. [{\"type\": \"click\", \"x\": 400, \"y\": 300}, {\"type\": \"key\", \"keys\": \"ctrl+e\"}]."],
 			[this](svr, args) {
 				return this.input.events(args.events);

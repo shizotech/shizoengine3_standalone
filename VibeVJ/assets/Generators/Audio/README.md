@@ -16,7 +16,9 @@ Audio generators analyze audio input and convert it into parameters that can dri
 
 The `AudioInputAnalysis.asset` generator provides:
 - Audio input source selection (*Source*): *Sound card*, *DJ Watch (USB)* = microphone or line-in of DJ Watch (the ESP32 formerly called prolink-bridge) on USB, *DJ Watch (network)* = the same from a relay ESP32 over ShizoNet. For DJ Watch the analysis subprocess gets the samples instead of opening the sound card (firmware command `audio mic|line`, see prolink-bridge `docs/relay-und-audio.md`). The user wiki explains them: [Audio](../../../wiki/Audio.md#source)
-- Frequency analysis (FFT)
+- Frequency analysis (FFT), as a texture (*FFT texture*): row 0 the spectrum (512 log spaced bands), row 1 the waveform.
+  Every shader with a sampler `AUDIO` or `WAVE` that nothing else feeds gets it by itself while the analysis runs
+  (`engine.audio_texture`, read by `engine/generators/extensions/glsl/shader_loader.shio`, #586)
 - Amplitude detection
 - Feature extraction for reactive visuals
 

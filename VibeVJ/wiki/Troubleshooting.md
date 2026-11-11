@@ -4,8 +4,7 @@ Common problems and what to do. Most of them come down to three things: a power 
 still on, or a device that VibeVJ cannot see. When something goes wrong, VibeVJ says so at the bottom right and keeps
 the message in [the log](#the-log).
 
-> Screenshot to add: a generator window with its power button off (grey icon, dimmed title) next to the same window with the
-> power button on (green icon).
+![The power button off (grey icon, dimmed name) and on (green icon)](media/power-off-on.png)
 
 ## A generator does nothing
 
@@ -58,6 +57,7 @@ assets, the right-click menus, undo, *Paste settings*, *Reload module* and *Exit
 
 1. Find the green lock in the timeline bar, right of the link button.
 2. Press and **hold** it for about half a second, then let go. A short click does not leave show mode, on purpose.
+   Holding **Ctrl + L** (Cmd + L on a Mac) for half a second does the same.
 
 If only one Clipview is locked, its [*Live*](Clipview.md#live) button is on.
 
@@ -139,6 +139,16 @@ line of Prolink Bridge and Prolink Decks shows what the computer sees in the DJ 
 | "Network card Ethernet 2 (listen only)" | *Listen only* is on: tempo and beats only, no titles, waveforms or cues. |
 | "Network card Ethernet 2: the computer's broadcasts go into the DJ network…" | ShizoNet and Art-Net broadcasts of this computer would go out through the DJ card. Give the light/VJ card priority: see [Without DJ Watch](Output-and-Devices.md#without-dj-watch-network-card). |
 | "Network card Ethernet 2 lost its address (cable?)" | The cable was pulled or the card was switched off. VibeVJ opens it again by itself. |
+
+### Denon players
+
+| Message | What to do |
+|---|---|
+| "Looking for CDJs and Denon players on all network cards…" | No player has shown up yet. Check the cable and the switch; Windows: allow VibeVJ through the firewall (also for *Public* networks). Denon players: StageLinQ has to be allowed on them. |
+| "UDP port 51337: … (does another StageLinQ program run on this computer …?)" | Another program holds the StageLinQ port and does not share it. Close it (Engine DJ, SoundSwitch, Now Playing ...). |
+| The deck shows title and BPM, but no waveform or cues | The data comes from the Engine library on the medium. The track is not analysed in Engine DJ, the library is still being copied (only on players that cannot hand out parts of a file; DJ Watch program: *Devices*, "library USB 1: 40 %"), or the medium has an old Engine Prime 1.x library (export it again with Engine DJ 2 or newer). |
+| "not in the Engine library of USB 1" (DJ Watch program, *Messages*) | The file is on the stick but not in its library: add it in Engine DJ and export again. |
+| A deck has the wrong number | The deck number is the *player number* set on the player. Two players with the same number: the second takes the next free one. |
 
 ## A video does not play
 

@@ -649,6 +649,16 @@ desk_target_ids(p, target) {
 	}
 	if(t.starts("lamp:"))
 		return patch_find(p, t.substr(5)) ? [t.substr(5)] : [];
+	//several lamps in an order of their own (a lane of an effect timeline from a selection, #755)
+	if(t.starts("lamps:")) {
+		ids = [];
+		parts = t.substr(6).split(",");
+		for(i = 0; i < parts.size(); i++) {
+			if(parts[i] && patch_find(p, parts[i]))
+				ids.push_back(parts[i]);
+		}
+		return ids;
+	}
 	return [];
 }
 
@@ -954,6 +964,231 @@ desk_tracked_state(stack, index) {
 }
 
 // =========================================================================
+// Effect timelines (#755): a cue that plays keyframes and waveforms
+// =========================================================================
+
+//A cue can carry a timeline: [length = beats, loop = true, lanes = [lane, ...]]. While its stack plays that cue the
+//timeline runs from the Go of the cue (after its delay), in beats of the BPM, whether the timeline of VibeVJ plays or
+//not, and its values go over the values of the cue: a lane of the dimmer of some lamps wins over the cue's dimmer of
+//those lamps. The fade of the cue fades into the timeline as into any cue.
+//  lane = [id, name, target ("group:<id>", "lamp:<id>", "all"), attr ("dimmer", "color", "pan", "tilt", any function of
+//          a channel, or "label:<channel label>"), keys = [[t = beat, v = 0..1 or [r, g, b], curve], ...],
+//          wave = [shape, period = beats, amp, center], spread = 0..1]
+//- keys: the value at a beat; from a key to the next the curve of the first: "step" (holds), "linear", "smooth" (eases
+//  in and out). Before the first key its value, after the last its value; a looping timeline goes from the last key
+//  round to the first.
+//- wave (shape not "none", a lane that is no colour): center + amp * the shape at t / period, instead of the keys. Sine,
+//  triangle, square: -1..1; saw rises from -1 to 1; random: a new value each period.
+//- spread: the lamps of the target one after the other, each this part of the length (keys) or of the period (wave)
+//  later than the one before: 0 all together, 1 spread over all of it (a chase).
+DESK_CURVES = ["step", "linear", "smooth"];
+DESK_WAVES = ["none", "sine", "saw", "square", "triangle", "random"];
+DESK_TL = [p = None, bpm = 120.0]; //the patch and the BPM the timelines run with (set by the runtime every frame)
+
+desk_timeline_new(length = 8.0) {
+	return [length = std.float(length), loop = true, lanes = []];
+}
+
+desk_lane_new(target, attr, name = "") {
+	return [id = std.random_hash(), name = name, target = target, attr = attr, keys = [],
+		wave = [shape = "none", period = 4.0, amp = 0.5, center = 0.5], spread = 0.0];
+}
+
+//The key at beat t (one within 1/64 beat is replaced), the keys kept in order of their beat. Returns its index
+desk_lane_set_key(lane, t, v, curve = "linear") {
+	t = math.max(0.0, std.float(t));
+	if(std.type(v) != "json")
+		v = math.clamp(std.float(v), 0.0, 1.0);
+	key = [t = t, v = v, curve = curve];
+	for(i = 0; i < lane.keys.size(); i++) {
+		if(math.abs(lane.keys[i].t - t) < 1.0 / 64.0) {
+			lane.keys[i] = key;
+			return i;
+		}
+		if(lane.keys[i].t > t) {
+			lane.keys.insert(i, key);
+			return i;
+		}
+	}
+	lane.keys.push_back(key);
+	return lane.keys.size() - 1;
+}
+
+desk_lane_remove_key(lane, index) {
+	if(index >= 0 && index < lane.keys.size())
+		lane.keys.erase(index);
+}
+
+//A curve of k 0..1
+desk_curve(curve, k) {
+	if(curve == "step")
+		return 0.0;
+	if(curve == "smooth")
+		return k * k * (3.0 - 2.0 * k);
+	return k;
+}
+
+//Between a and b (numbers or [r, g, b]) at k
+desk_mix(a, b, k) {
+	if(std.type(a) == "json") {
+		out = [];
+		for(i = 0; i < a.size(); i++)
+			out.push_back(a[i] + ((std.type(b) == "json" && i < b.size() ? b[i] : a[i]) - a[i]) * k);
+		return out;
+	}
+	if(std.type(b) == "json")
+		return a;
+	return a + (b - a) * k;
+}
+
+//From the key a to the key b that comes span beats later, at beats in after a
+desk_key_step(a, b, span, in) {
+	k = span > 0.0 ? math.clamp(in / span, 0.0, 1.0) : 0.0;
+	return desk_mix(a.v, b.v, desk_curve(a.curve ?? "linear", k));
+}
+
+//The value of keys at beat t of a timeline of length (loop: from the last key round to the first). None without keys
+desk_keys_value(keys, t, length, loop) {
+	n = keys.size();
+	if(n == 0)
+		return None;
+	if(n == 1)
+		return keys[0].v;
+	if(t < keys[0].t) {
+		if(!loop)
+			return keys[0].v;
+		a = keys[n - 1];
+		return desk_key_step(a, keys[0], length - a.t + keys[0].t, t + length - a.t);
+	}
+	for(i = 0; i + 1 < n; i++) {
+		if(t < keys[i + 1].t)
+			return desk_key_step(keys[i], keys[i + 1], keys[i + 1].t - keys[i].t, t - keys[i].t);
+	}
+	a = keys[n - 1];
+	if(!loop)
+		return a.v;
+	return desk_key_step(a, keys[0], length - a.t + keys[0].t, t - a.t);
+}
+
+//A waveform at beat t: center + amp * the shape, 0..1
+desk_wave_value(wave, t) {
+	period = math.max(0.001, std.float(wave.period));
+	ph = t / period;
+	f = ph - math.floor(ph);
+	shape = wave.shape;
+	s = 0.0;
+	if(shape == "sine")
+		s = math.sin(f * 6.283185307);
+	else if(shape == "saw")
+		s = 2.0 * f - 1.0;
+	else if(shape == "square")
+		s = f < 0.5 ? 1.0 : -1.0;
+	else if(shape == "triangle")
+		s = f < 0.5 ? 4.0 * f - 1.0 : 3.0 - 4.0 * f;
+	else if(shape == "random") {
+		x = math.sin(math.floor(ph) * 12.9898 + 78.233) * 43758.5453;
+		s = 2.0 * (x - math.floor(x)) - 1.0;
+	}
+	return math.clamp(std.float(wave.center) + std.float(wave.amp) * s, 0.0, 1.0);
+}
+
+//The value of a lane at beat t (of a timeline of length), None when it has nothing to send
+desk_lane_value(lane, t, length, loop) {
+	if(lane.attr != "color" && lane.has("wave") && lane.wave && (lane.wave.shape ?? "none") != "none")
+		return desk_wave_value(lane.wave, t);
+	return desk_keys_value(lane.keys, t, length, loop);
+}
+
+//The beat of a timeline of length at t beats after its start: round again (loop) or held at the end
+desk_timeline_time(t, length, loop) {
+	if(loop)
+		return t - math.floor(t / length) * length;
+	return math.clamp(t, 0.0, length);
+}
+
+//A lamp without dimmer that has no colour in prog yet takes the colour of base (for a dimmer lane over a cue)
+desk_seed_color(prog, p, id, base) {
+	if(!base.has(id) || (prog.values.has(id) && prog.values[id].size()))
+		return;
+	f = patch_find(p, id);
+	if(!f || desk_labels_of_function(f.type, "dimmer").size())
+		return;
+	labels = desk_labels_of_function(f.type, "color");
+	for(k = 0; k < labels.size(); k++) {
+		if(base[id].has(labels[k]))
+			desk_put(prog, id, labels[k], base[id][labels[k]]);
+	}
+}
+
+//What a timeline sends t beats after its start: [<id> = [<label> = v]]. Colour lanes first, so a dimmer lane scales
+//the colour of a lamp without a dimmer (as "at color red" then "at 50" on the command line). base: what the cue sends
+//under the timeline ([<id> = [<label> = v]]): a dimmer lane on a lamp without dimmer and without a colour lane dims the
+//colour the cue gives it, not white
+desk_timeline_values(tl, p, t, base = None) {
+	prog = desk_programmer_new();
+	if(!tl || !p)
+		return prog.values;
+	length = math.max(0.0001, std.float(tl.length));
+	loop = tl.has("loop") ? (tl.loop ? true : false) : true; //(not ??: it takes false as missing)
+	tt = desk_timeline_time(t, length, loop);
+	for(pass = 0; pass < 2; pass++) {
+		for(l = 0; l < tl.lanes.size(); l++) {
+			lane = tl.lanes[l];
+			is_color = lane.attr == "color";
+			if((pass == 0) != is_color)
+				continue;
+			ids = desk_target_ids(p, lane.target);
+			n = ids.size();
+			waved = !is_color && lane.has("wave") && lane.wave && (lane.wave.shape ?? "none") != "none";
+			spread = std.float(lane.spread ?? 0.0);
+			for(i = 0; i < n; i++) {
+				shift = n > 1 ? spread * i / n * (waved ? std.float(lane.wave.period) : length) : 0.0;
+				v = desk_lane_value(lane, desk_timeline_time(tt - shift, length, loop || waved), length, loop);
+				if(std.is_none(v))
+					continue;
+				one = [ids[i]];
+				if(!is_color && lane.attr == "dimmer" && base)
+					desk_seed_color(prog, p, ids[i], base);
+				if(is_color)
+					desk_set_color(prog, p, one, v);
+				else if(std.string(lane.attr).starts("label:"))
+					desk_set(prog, p, one, std.string(lane.attr).substr(6), v);
+				else
+					desk_set_function(prog, p, one, lane.attr, v);
+			}
+		}
+	}
+	return prog.values;
+}
+
+//The beats a playback has played its cue (from its Go, after the delay), in the BPM
+desk_timeline_beats(pb, now_ms, bpm) {
+	s = (now_ms - pb.go_ms) / 1000.0 - pb.delay;
+	return math.max(0.0, s) * std.float(bpm) / 60.0;
+}
+
+//The timeline of the cue a playback plays (None when it has none)
+desk_playing_timeline(pb, stack) {
+	if(!stack || pb.index < 0 || pb.index >= stack.cues.size())
+		return None;
+	cue = stack.cues[pb.index];
+	return cue.has("timeline") && cue.timeline && cue.timeline.lanes.size() ? cue.timeline : None;
+}
+
+//b over a, both [<id> = [<label> = v]] (a is not changed)
+desk_over(a, b) {
+	out = a.copy();
+	for(i = 0; i < b.size(); i++) {
+		id = b.key(i);
+		if(!out.has(id))
+			out[id] = std.json();
+		for(j = 0; j < b[i].size(); j++)
+			out[id][b[i].key(j)] = b[i][j];
+	}
+	return out;
+}
+
+// =========================================================================
 // Playback
 // =========================================================================
 
@@ -999,17 +1234,22 @@ desk_progress(pb, now_ms) {
 }
 
 //What the stack sends at now_ms: [<id> = [<label> = v]], the values of the cue it fades from blended into the ones of
-//the cue it goes to. A value only in the cue it comes from (after a Goto back) is held until the fade is done
-desk_playback_values(pb, now_ms) {
+//the cue it goes to. A value only in the cue it comes from (after a Goto back) is held until the fade is done.
+//stack: the stack of the playback, for the timeline of its cue (#755; it runs with DESK_TL.p and DESK_TL.bpm)
+desk_playback_values(pb, now_ms, stack = None) {
 	if(!pb.on)
 		return std.json();
+	to = pb.to;
+	tl = desk_playing_timeline(pb, stack);
+	if(tl && DESK_TL.p)
+		to = desk_over(pb.to, desk_timeline_values(tl, DESK_TL.p, desk_timeline_beats(pb, now_ms, DESK_TL.bpm), pb.to));
 	k = desk_progress(pb, now_ms);
 	if(k >= 1.0)
-		return pb.to;
+		return to;
 	out = std.json();
-	for(i = 0; i < pb.to.size(); i++) {
-		id = pb.to.key(i);
-		vals = pb.to[i];
+	for(i = 0; i < to.size(); i++) {
+		id = to.key(i);
+		vals = to[i];
 		from = pb.from.has(id) ? pb.from[id] : None;
 		out[id] = std.json();
 		for(j = 0; j < vals.size(); j++) {
@@ -1037,7 +1277,7 @@ desk_playback_values(pb, now_ms) {
 desk_goto_index(pb, stack, index, now_ms, beat = 0.0, current = None) {
 	if(index < 0 || index >= stack.cues.size())
 		return None;
-	from = desk_playback_values(pb, now_ms);
+	from = desk_playback_values(pb, now_ms, stack);
 	to = desk_tracked_state(stack, index);
 	if(current) {
 		for(i = 0; i < to.size(); i++) {

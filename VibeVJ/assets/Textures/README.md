@@ -10,6 +10,9 @@ Texture assets are loaded and bound to shader uniforms as `sampler2D` inputs. Th
 
 | File | Description |
 |------|-------------|
+| `mapping_mask_facade.png` | Example mask for projection mapping: the windows of a facade, white on black (#586) |
+| `mapping_mask_objects.png` | Example mask: objects on a stage (boxes, a ball, a pyramid, a sign with a hole) |
+| `mapping_idmap_boxes.png` | Example ID map: every face of two boxes and a pyramid in a flat colour of its own (*RegionChase*) |
 | `noisegrey.png` | Greyscale noise texture |
 | `sky.png` | Sky image texture |
 | `sky2.png` | Alternative sky texture |

@@ -19,6 +19,10 @@ uniform float TRANSITION;
 //an empty Layer 1 made the whole output black (#574). A clip fading in on an empty layer fades from that picture.
 uniform int LAYER_EMPTY;
 
+//How a crossfade into the clip of iChannel2 weighs the two clips (set by the timeline, #680 step 5): 0 linear, 1 equal
+//power (cos / sin: no dip of the brightness in the middle), 2 S curve. The Clipview leaves it at 0
+uniform int XFADE_CURVE;
+
 //The layer over the layers below: c1 the layers below, c2 the clip of this layer
 vec4 blend_layer(vec4 c1, vec4 c2)
 {
@@ -103,7 +107,19 @@ void mainImage( out vec4 fragColor, in vec2 p )
 		return;
 	}
 
-	c2 = (1.0 - TRANSITION) * c2 + c3 * TRANSITION;
+	float wa = 1.0 - TRANSITION;
+	float wb = TRANSITION;
+	if(XFADE_CURVE == 1)
+	{
+		wa = cos(TRANSITION * 1.5707963);
+		wb = sin(TRANSITION * 1.5707963);
+	}
+	else if(XFADE_CURVE == 2)
+	{
+		wb = TRANSITION * TRANSITION * (3.0 - 2.0 * TRANSITION);
+		wa = 1.0 - wb;
+	}
+	c2 = wa * c2 + c3 * wb;
 
 	fragColor = blend_layer(c1, c2);
 }

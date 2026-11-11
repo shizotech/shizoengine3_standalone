@@ -1,0 +1,544 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  workspaces_selftest.shio — store/settings checks + minimal agent protocol
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "workspaces"
+#include "miniagent"
+
+passed = 0;
+failed = 0;
+
+check(cond, label) {
+    if(cond) {
+        passed++;
+        std.print("ok " + label);
+    } else {
+        failed++;
+        std.print("FAIL " + label);
+    }
+}
+
+class FakeServer {
+    routes = [];
+
+    route(method, path, callback) {
+        routes.push_back([method = method, path = path]);
+    }
+}
+
+class BufferedExitProcess {
+    lines = [];
+
+    __init__(buffered_lines) {
+        lines = buffered_lines;
+    }
+
+    running() { return false; }
+
+    read_line(pipe, timeout = 0) {
+        if(pipe == "stdout" && lines.size()) {
+            out_line = lines[0];
+            lines.erase(0);
+            return out_line;
+        }
+        return "";
+    }
+}
+
+class PumpTestManager : SessionManager {
+    spawn(sid) {
+        s = sessions[sid];
+        s.status = "failed";
+        return false;
+    }
+}
+
+test_root = std.user_path() + "/miniagent/workspaces_selftest_" + std.random_hash(8);
+test_root = fileio.absolute_path(test_root);
+
+if(fileio.exists(test_root))
+    fileio.remove(test_root);
+
+store = WorkspaceStore(test_root);
+
+check(store.settings().max_sessions == 2, "default max_sessions is 2");
+
+res = store.set_settings(3);
+check(res.ok && store.settings().max_sessions == 3, "settings update to 3");
+
+check(store.list().size() >= 1, "root workspace exists");
+
+root_ws = store.get("root");
+check(!std.is_none(root_ws) && root_ws.path == test_root, "root workspace path");
+
+safe_arch_path = test_root + "/safe_architecture_test";
+fileio.mkdir(safe_arch_path);
+safe_board = ArchitectureBoard(None, safe_arch_path, "adaptive", false);
+safe_board.model.job = [kind = "plan", taskid = "external-job", state = "running", started = std.millis()];
+safe_board.save();
+safe_reload = ArchitectureBoard(None, safe_arch_path, "adaptive", false);
+check(safe_reload.state().job.state == "running", "read-only architecture board does not mark external jobs lost");
+
+shared_arch_path = test_root + "/shared_architecture_test";
+fileio.mkdir(shared_arch_path);
+board_a = ArchitectureBoard(None, shared_arch_path, "adaptive", false);
+board_b = ArchitectureBoard(None, shared_arch_path, "adaptive", false);
+edit_a = board_a.add_edit([op = "add_node", node = [label = "First node", kind = "module"]]);
+edit_b = board_b.add_edit([op = "add_node", node = [label = "Second node", kind = "file"]]);
+shared_view = ArchitectureBoard(None, shared_arch_path, "adaptive", false).state();
+check(edit_a.ok && edit_b.ok && shared_view.pending.size() == 2, "architecture proposals preserve edits from another board instance");
+
+alpha = store.create("alpha", "", "");
+check(alpha.ok && fileio.is_directory(alpha.workspace.path), "create workspace alpha");
+check(fileio.is_directory(alpha.workspace.path + "/.megamind"), "alpha .megamind");
+check(fileio.is_directory(alpha.workspace.path + "/.megamind/sessions"), "alpha sessions dir");
+check(!fileio.exists(alpha.workspace.path + "/.megamind/tasks"), "new workspace has no second goal store under .megamind");
+check(fileio.is_directory(alpha.workspace.path + "/.agentspace/goals/proposed"), "new workspace initializes .agentspace goal folders");
+check(fileio.exists(alpha.workspace.path + "/.agentspace/preferences/scheduling.md"), "new workspace gets goal-engine scheduling preferences");
+
+beta = store.create("beta", "", alpha.workspace.id);
+check(beta.ok && fileio.is_directory(beta.workspace.path), "create nested beta");
+check(beta.workspace.parent == alpha.workspace.id, "beta parent is alpha");
+check(fileio.is_directory(beta.workspace.path + "/.megamind/architecture"), "beta architecture dir");
+check(fileio.is_directory(beta.workspace.path + "/.agentspace/goals/active"), "new subworkspace initializes .agentspace goal folders");
+check(fileio.exists(beta.workspace.path + "/.agentspace/preferences/scheduling.md"), "new subworkspace gets goal-engine scheduling preferences");
+check(!fileio.exists(test_root + "/.agentspace"), "synthetic root does not get a project goal engine");
+legacy_goal_dir = alpha.workspace.path + "/.megamind/tasks/goals/proposed/legacy-goal";
+goal_mkdir(legacy_goal_dir);
+legacy_goal_text = "---\nid: legacy-goal\ntitle: Legacy goal\nschedule:\n  type: recurring\n  every: 5m\n---\nImported goal.\n";
+fileio.write_text(legacy_goal_dir + "/goal.md", legacy_goal_text);
+goal_mkdir(alpha.workspace.path + "/.megamind/tasks/preferences");
+fileio.write_text(alpha.workspace.path + "/.megamind/tasks/preferences/scheduling.md", "timezone: UTC\n");
+fileio.remove(beta.workspace.path + "/.agentspace/preferences/scheduling.md");
+reloaded_store = WorkspaceStore(test_root);
+check(fileio.exists(beta.workspace.path + "/.agentspace/preferences/scheduling.md"), "workspace reload fills missing goal-engine template files");
+check(fileio.read_string(alpha.workspace.path + "/.agentspace/goals/proposed/legacy-goal/goal.md") == legacy_goal_text, "legacy task goal is imported to .agentspace");
+check(fileio.read_string(alpha.workspace.path + "/.agentspace/preferences/scheduling.md").contains("UTC"), "legacy custom scheduling preferences replace fresh template defaults");
+check(fileio.exists(legacy_goal_dir + "/goal.md"), "legacy goal source stays intact as a migration backup");
+
+tree = store.tree();
+check(std.is_json(tree) && tree.children.size() >= 1, "tree has children");
+
+alpha_in_tree = false;
+
+for(c : tree.children) {
+    if(c.id == alpha.workspace.id)
+        alpha_in_tree = true;
+}
+
+check(alpha_in_tree, "tree contains alpha");
+
+beta_in_tree = false;
+
+for(c : tree.children) {
+    if(c.id != alpha.workspace.id)
+        continue;
+
+    for(g : c.children) {
+        if(g.id == beta.workspace.id)
+            beta_in_tree = true;
+    }
+}
+
+check(beta_in_tree, "tree nests beta below alpha");
+
+del_parent = store.delete(alpha.workspace.id);
+check(!del_parent.ok, "delete parent refused while child exists");
+
+del_child = store.delete(beta.workspace.id);
+check(del_child.ok, "delete beta");
+
+del_alpha = store.delete(alpha.workspace.id);
+check(del_alpha.ok, "delete alpha after beta");
+
+check(!std.is_none(store.get("root")), "root remains after deletes");
+
+// ── manager migrates legacy chat and starts a history-aware worker ──────────
+proto = store.create("protocol", "", "");
+proto_dir = proto.workspace.path;
+config_path = proto_dir + "/config.json";
+
+fileio.write_json(config_path, [
+    url = "",
+    token = "",
+    name = "",
+    max_tokens = 128000,
+    max_running_agents = 0,
+], true, true);
+
+proto_cfg = ModelConfig();
+proto_cfg.load(config_path, false);
+read_test_path = proto_dir + "/read_file_selftest.txt";
+fileio.write_text(read_test_path, "workspace file contents\nsecond line\n");
+read_test_agent = miniagent(proto_cfg, "adaptive");
+read_test_agent.filesystem = fileio.container(proto_dir);
+read_test_result = read_test_agent.llm_api.tools.tool_callbacks["read_file"]([path = "read_file_selftest.txt"]);
+check(read_test_result.ok && read_test_result.content.contains("workspace file contents"), "read_file works in workspace without optional line-number argument");
+legacy_manager = SessionManager(store, config_path);
+legacy_id = "legacy-history-selftest";
+legacy_manager.sessions[legacy_id] = [
+    id = legacy_id,
+    workspace_id = proto.workspace.id,
+    title = "legacy session",
+    mode = "normal",
+    status = "done",
+    prompt = "Earlier question",
+    events = [
+        [type = "user", text = "Earlier question"],
+        [type = "delta", action = [text = "draft response"]],
+        [type = "done", report = "Earlier answer"],
+    ],
+    token_usage = 0,
+    created = std.millis(),
+    updated = std.millis(),
+    role = "adaptive",
+    report = "Earlier answer",
+    error = "",
+    seq = 3,
+    attempts = 0,
+];
+
+started = legacy_manager.spawn(legacy_id);
+proc = legacy_manager.procs[legacy_id];
+check(started && proc.running(), "workspace manager started worker");
+
+history_path = legacy_manager.session_dir(legacy_id) + "/chat.json";
+saved_history = fileio.read_json(history_path, true);
+check(std.is_json(saved_history) && saved_history.size() == 2, "legacy session events migrated to chat.json");
+
+line = proc.read_line("stdout", 8000);
+data = None;
+
+try {
+    data = std.json(line, true);
+} catch(e) {
+    data = None;
+}
+
+check(std.is_json(data) && std.string(data.type) == "ready" && std.string(data.session_id) == legacy_id, "ready protocol line");
+check(std.is_json(data) && std.int(data.history_messages) == 2, "worker imports saved session chat before accepting prompts");
+
+save_threads = [];
+save_results = [];
+for(i = 0; i < 16; i++) {
+    save_results.push_back(false);
+    save_threads.push_back(std.thread([legacy_manager, legacy_id, save_results, i]() {
+        save_results[i] = legacy_manager.save_session(legacy_id);
+    }));
+    save_threads[i].run();
+}
+for(t : save_threads)
+    t.join();
+saved_session = fileio.read_json(legacy_manager.session_path(legacy_id), true);
+saves_ok = std.is_json(saved_session);
+for(result : save_results)
+    saves_ok = saves_ok && result;
+check(saves_ok, "concurrent session snapshots serialize without colliding on the atomic temp file");
+
+stop_msg = [type = "stop"];
+proc.write_line(stop_msg.compact_string());
+
+for(i = 0; i < 100; i++) {
+    if(!proc.running())
+        break;
+    std.sleep(50);
+}
+
+check(proc.exited() || !proc.running(), "agent exited after stop line");
+
+if(proc.running())
+    proc.kill();
+
+full_history = [];
+for(i = 0; i < WS_EVENT_KEPT + 20; i++)
+    full_history.push_back([role = "user", content = "Question " + std.string(i)]);
+fileio.write_json(history_path, full_history, true, true);
+legacy_state = legacy_manager.sessions[legacy_id].copy();
+legacy_state.events = [];
+for(i = 0; i < WS_EVENT_KEPT; i++)
+    legacy_state.events.push_back([seq = i + 21, type = "delta", action = [text = "recent"]]);
+legacy_state.chat_history_size_at_prompt = full_history.size();
+legacy_manager.sessions[legacy_id] = legacy_state;
+legacy_manager.live_texts[legacy_id] = "partial current answer";
+legacy_manager.live_text_seqs[legacy_id] = legacy_state.seq;
+loaded_full_history = legacy_manager.session_chat_history(legacy_id);
+loaded_live_session = legacy_manager.get_session(legacy_id);
+loaded_live_state = legacy_manager.session_live_state(legacy_id);
+check(std.is_list(loaded_full_history) && loaded_full_history.size() == WS_EVENT_KEPT + 20, "session chat history is not limited by the rolling event buffer");
+check(loaded_live_state.text == "partial current answer" && loaded_live_state.seq == legacy_state.seq && !loaded_live_session.has("live_text"), "live text snapshot stays available without bloating workspace session lists");
+
+// ── SessionManager check: spawn, read ready status, enforce max, stop ─────
+sid = "";
+cfg = ModelConfig();
+
+if(!cfg.load(config_path, false)) {
+    check(false, "load selftest config for SessionManager");
+} else {
+    recovery_id = "recovered-finished-session";
+    recovery_dir = proto_dir + "/.megamind/sessions/" + recovery_id;
+    fileio.mkdir(recovery_dir);
+    fileio.write_json(recovery_dir + "/chat.json", [
+        [role = "user", content = "Recover this completed turn."],
+        [role = "assistant", content = "The work completed."],
+    ], true, true);
+    fileio.write_json(recovery_dir + "/chat.json.result.json", [
+        prompt = "Recover this completed turn.",
+        status = "finished",
+        report = "Completed before restart.",
+        history_size = 2,
+        token_usage = 12,
+        completed = std.millis(),
+    ], true, true);
+    fileio.write_json(recovery_dir + "/session.json", [
+        workspace_id = proto.workspace.id,
+        title = "recovered completed session",
+        mode = "normal",
+        status = "running",
+        prompt = "Recover this completed turn.",
+        events = [],
+        chat_history_size_at_prompt = 0,
+        token_usage = 0,
+        created = std.millis(),
+        updated = std.millis(),
+        role = "adaptive",
+        report = "",
+        error = "",
+        seq = 0,
+        attempts = 0,
+    ], true, true);
+
+    manager = SessionManager(store, config_path);
+    recovered = manager.get_session(recovery_id);
+    check(recovered.status == "done" && recovered.report == "Completed before restart." && recovered.error == "", "restart recovers a durable worker completion instead of reporting an interruption");
+    mres = manager.create_session(proto.workspace.id, "manager-test", "normal", "", "adaptive", "high");
+
+    check(mres.ok, "session manager create");
+    check(mres.ok && mres.session.reasoning_effort == "high", "session reasoning effort is persisted and returned");
+    check(!manager.create_session(proto.workspace.id, "invalid-effort", "normal", "", "adaptive", "extreme").ok, "invalid reasoning effort is refused");
+
+    active_task_id = "active-task-selftest";
+    manager.sessions[active_task_id] = [
+        id = active_task_id,
+        workspace_id = proto.workspace.id,
+        title = "active task selftest",
+        status = "running",
+        report = "",
+        error = "",
+        token_usage = 3,
+        updated = std.millis(),
+    ];
+    active_task_found = false;
+    for(task : manager.host_tasks(proto.workspace.id)) {
+        if(task.taskid == active_task_id)
+            active_task_found = task.active && task.state == "running";
+    }
+    check(active_task_found, "task API marks a running worker as active");
+    missing_task = manager.inspect_task("missing-task");
+    check(std.is_json(missing_task) && !missing_task.ok && missing_task.state == "lost" && missing_task.error == "not found", "unknown task is canonical lost");
+    manager.sessions[active_task_id].status = "done";
+
+    sid = mres.ok ? mres.session.id : "";
+    stats_snapshot = manager.stats();
+    check(std.is_json(stats_snapshot.session_status) && stats_snapshot.session_status.has(sid), "stats expose per-session status");
+    mstatus = "";
+
+    for(i = 0; i < 100; i++) {
+        s = manager.get_session(sid);
+
+        if(!s)
+            break;
+
+        mstatus = s.status;
+
+        if(mstatus == "waiting" || mstatus == "running")
+            break;
+
+        std.sleep(100);
+    }
+
+    check(mstatus == "waiting" || mstatus == "running", "session manager ready status");
+
+    store.set_settings(1);
+    second = manager.create_session(proto.workspace.id, "second", "normal", "", "adaptive");
+    check(!second.ok, "max_sessions enforced");
+    store.set_settings(3);
+
+    notify_count = 0;
+    manager.add_task_finished_listener([&notify_count](task) {
+        if(task.taskid == sid)
+            notify_count++;
+    });
+
+    check(manager.stop_session(sid), "session manager stop");
+
+    stopped = manager.get_session(sid);
+    check(!std.is_none(stopped) && stopped.status == "stopped", "session stopped");
+    check(notify_count == 1, "stopped session reports exactly one terminal event");
+    loaded_session = SessionManager(store, config_path).get_session(sid);
+    check(!std.is_none(loaded_session) && loaded_session.status == "stopped", "saved session loaded from .megamind");
+    check(!std.is_none(loaded_session) && loaded_session.reasoning_effort == "high", "session reasoning effort survives manager reload");
+    effort_change = manager.set_reasoning_effort(sid, "low");
+    check(effort_change.ok && effort_change.session.reasoning_effort == "low", "session manager changes reasoning effort");
+    check(!manager.set_reasoning_effort(sid, "extreme").ok, "invalid reasoning effort change is refused");
+    reloaded_effort = SessionManager(store, config_path).get_session(sid);
+    check(!std.is_none(reloaded_effort) && reloaded_effort.reasoning_effort == "low", "changed reasoning effort survives manager reload");
+    deleted_session_dir = manager.session_dir(sid);
+    deleted_session = manager.delete_session(sid);
+    check(deleted_session.ok && std.is_none(manager.get_session(sid)) && !fileio.exists(deleted_session_dir), "session deletion removes its stored conversation");
+
+    active_delete = manager.create_session(proto.workspace.id, "delete-active-test", "normal", "", "adaptive");
+    active_delete_dir = active_delete.ok ? manager.session_dir(active_delete.session.id) : "";
+    active_delete_res = active_delete.ok ? manager.delete_session(active_delete.session.id) : [ok = false];
+    check(active_delete_res.ok && !fileio.exists(active_delete_dir), "deleting a running session stops its worker and removes its files");
+
+    auto = store.create("auto-delete", "", "");
+    check(auto.ok, "create auto-delete workspace");
+
+    auto_sid = "auto-delete-session";
+    auto_data = [
+        id = auto_sid,
+        workspace_id = auto.workspace.id,
+        title = "auto delete session",
+        mode = "normal",
+        reasoning_effort = "medium",
+        status = "stopped",
+        prompt = "",
+        events = [],
+        chat_history_size_at_prompt = 0,
+        token_usage = 0,
+        created = std.millis(),
+        updated = std.millis(),
+        role = "adaptive",
+        report = "",
+        error = "",
+        seq = 0,
+        attempts = 0,
+    ];
+    auto_dir = auto.workspace.path + "/.megamind/sessions/" + auto_sid;
+    fileio.mkdir(auto_dir);
+    fileio.write_json(auto_dir + "/session.json", auto_data, true, true);
+    manager.sessions[auto_sid] = auto_data.copy();
+    manager.live_texts[auto_sid] = "";
+    manager.live_text_seqs[auto_sid] = 0;
+
+    auto_ctx = WorkspaceRegistry(config_path, "");
+    auto_ctx.store = store;
+    auto_ctx.manager = manager;
+    auto_ctx.workspaces = [];
+    auto_ctx.ensure(auto.workspace);
+    auto_delete = workspaces_delete_workspace(auto_ctx, auto.workspace.id);
+    check(auto_delete.ok, "workspace delete succeeds with sessions");
+    check(auto_delete.sessions_removed.size() == 1 && auto_delete.sessions_removed[0] == auto_sid, "workspace delete removes its sessions");
+    check(std.is_none(manager.get_session(auto_sid)), "auto-deleted session leaves the manager");
+    check(!fileio.exists(auto_dir), "auto-deleted session files are removed");
+    check(std.is_none(store.get(auto.workspace.id)), "workspace registry entry removed");
+    check(fileio.is_directory(auto.workspace.path), "workspace project files stay on disk");
+
+    drain_manager = PumpTestManager(store, cfg);
+    drain_id = "buffered-output-test";
+    drain_session = [
+        id = drain_id,
+        workspace_id = "",
+        title = "buffered output test",
+        mode = "normal",
+        status = "running",
+        prompt = "must not be replayed",
+        events = [],
+        token_usage = 0,
+        created = std.millis(),
+        updated = std.millis(),
+        role = "adaptive",
+        report = "",
+        error = "",
+        seq = 0,
+        attempts = 0,
+    ];
+    drain_manager.sessions[drain_id] = drain_session;
+    drain_manager.procs[drain_id] = BufferedExitProcess([
+        [type = "delta", action = [text = "last fragment"]].compact_string(),
+        [type = "done", status = "finished", report = "complete", token_usage = 7].compact_string(),
+    ]);
+    drain_manager.pump(drain_id);
+    drained = drain_manager.get_session(drain_id);
+    check(drained.status == "done" && drained.events.size() == 2 && drained.events[0].action.text == "last fragment" && drained.events[1].type == "done", "buffered final delta and done are drained before process restart");
+
+    error_manager = PumpTestManager(store, cfg);
+    error_id = "agent-error-test";
+    error_session = drain_session.copy();
+    error_session.id = error_id;
+    error_session.events = [];
+    error_session.seq = 0;
+    error_session.status = "running";
+    error_manager.sessions[error_id] = error_session;
+    error_lines = [];
+    expected_live_text = "full response prefix ";
+    error_lines.push_back([type = "delta", action = [text = expected_live_text]].compact_string());
+    for(i = 0; i < WS_EVENT_KEPT + 5; i++) {
+        chunk = "chunk-" + std.string(i) + " ";
+        expected_live_text += chunk;
+        error_lines.push_back([type = "delta", action = [text = chunk]].compact_string());
+    }
+    error_lines.push_back([type = "error", message = "agent startup failed"].compact_string());
+    error_manager.procs[error_id] = BufferedExitProcess(error_lines);
+    error_manager.pump(error_id);
+    failed_session = error_manager.get_session(error_id);
+    live_state = error_manager.session_live_state(error_id);
+    check(failed_session.status == "failed" && failed_session.events.size() == WS_EVENT_KEPT && failed_session.events[WS_EVENT_KEPT - 2].type == "error" && failed_session.events[WS_EVENT_KEPT - 1].type == "done", "agent errors terminate with a bounded replay event window");
+    check(live_state.text == expected_live_text, "the complete current response survives more than 300 deltas without truncation");
+}
+
+check(ws_title_from("  Reply with ok  ", 48) == "Reply with ok", "title inference from prompt");
+legacy_chat = ws_chat_from_events([
+    [type = "user", text = "first question"],
+    [type = "delta", action = [text = "draft response"]],
+    [type = "done", report = "first answer"],
+    [type = "user", text = "follow-up"],
+    [type = "delta", action = [text = "second answer"]],
+]);
+check(legacy_chat.size() == 4 && legacy_chat[0].role == "user" && legacy_chat[1].content == "first answer" && legacy_chat[2].content == "follow-up" && legacy_chat[3].content == "second answer", "legacy session events migrate to user and assistant history");
+
+req_query = [headers = [], query_params = [token = "abc"]];
+check(node_api_authorized(req_query, "abc"), "query token accepted for SSE");
+check(!node_api_authorized(req_query, "wrong"), "wrong query token refused");
+
+fake = FakeServer();
+runtime = WorkspaceRegistry(config_path, "");
+api = workspaces_api_register(fake, cfg, "", runtime);
+
+check(!std.is_none(api.store) && !std.is_none(api.manager), "api register returns store and manager");
+check(fake.routes.size() >= 20, "workspace API routes registered");
+delete_session_route = false;
+delete_workspace_route = false;
+for(route : fake.routes) {
+    if(route.method == "DELETE" && route.path == "^/api/sessions/([0-9a-zA-Z_-]+)$")
+        delete_session_route = true;
+    if(route.method == "DELETE" && route.path == "^/api/workspaces/([0-9a-zA-Z_-]+)$")
+        delete_workspace_route = true;
+}
+check(delete_session_route, "session deletion route is registered");
+check(delete_workspace_route, "workspace deletion route is registered");
+run_goal_route = false;
+for(route : fake.routes) {
+    if(route.method == "POST" && route.path == "^/api/workspaces/([0-9a-zA-Z_-]+)/goals/([0-9a-zA-Z_-]+)/run$")
+        run_goal_route = true;
+}
+check(run_goal_route, "goal-engine run route is registered");
+    effort_route = false;
+    for(route : fake.routes) {
+        if(route.method == "POST" && route.path == "^/api/sessions/([0-9a-zA-Z_-]+)/effort$")
+            effort_route = true;
+    }
+    check(effort_route, "session effort route is registered");
+
+if(fileio.exists(test_root))
+    fileio.remove(test_root);
+
+std.print("workspaces_selftest: " + std.string(passed) + " passed, " + std.string(failed) + " failed");
+
+if(failed) {
+    std.print("FAIL");
+    std.exitprocess(1);
+}
+
+std.print("PASSED");
+std.exitprocess(0);

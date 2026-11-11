@@ -51,6 +51,8 @@ project:
 3. Let go over the control that should receive. It gets a stronger outline while you are over it, and the label at the
    cable end says *link*.
 
+![Making a link: from the right notch of Output of one SineGenerator onto Gain of another](media/link-make.gif)
+
 - You can also start from the left notch. The result is the same: the link goes from the row where you start to the
   row where you let go.
 - A control cannot link to itself.
@@ -60,7 +62,7 @@ project:
 
 ### Hold and drag
 
-![Hold and drag, top to bottom: press, the row opens after the hold, dragging onto Bias, the link is made](media/hold-and-drag.png)
+![Hold and drag: press on Frequency and hold, drag onto Bias of the other generator, let go](media/hold-and-drag.gif)
 
 Made for touch screens, works with the mouse too.
 

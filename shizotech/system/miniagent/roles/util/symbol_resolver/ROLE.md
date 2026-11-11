@@ -106,7 +106,8 @@ You MUST return the result via:
 
 ```
 finalize({
-  result: <raw code skeleton>
+  symbol_definition: <raw code skeleton>,
+  symbol_path: <path>
 })
 ```
 
@@ -114,7 +115,7 @@ finalize({
 
 ## Output Rules
 
-- Raw code only inside `result`
+- Raw code only inside `symbol_definition`
 - No markdown
 - No explanations
 - No extra metadata outside `finalize()`
@@ -134,7 +135,8 @@ If any of the following occur:
 
 ```
 finalize({
-  result: ""
+  symbol_definition: "",
+  symbol_path: ""
 })
 ```
 

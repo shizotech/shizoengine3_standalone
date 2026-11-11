@@ -1,0 +1,122 @@
+// Filter generator (the Filter, Envelope and Slope CHOPs of TouchDesigner): cleans or reads a jumpy value
+// Lag smooths a value in rise and fall times; this one has the other kinds of filters:
+//   One euro: removes the jitter of a value that stands still (a shaky sensor, a noisy fader) and still follows a
+//             fast move at once. Cutoff: how smooth when still (lower = smoother), Speed response: how much a move
+//             opens it up (the 1 euro filter of Casiez, Roussel and Vogel)
+//   Average:  the mean of the last Window seconds
+//   Median:   the middle value of the last Window seconds: single spikes are gone, steps stay sharp
+//   Envelope: follows the peaks: rises at once (or in Attack seconds), falls in Release seconds (an envelope follower
+//             on the audio energy gives a pump that does not flicker)
+//   Slope:    how fast Input moves, 0 to 1 (its change per second times Gain): a fader moved fast gives a burst
+// Counts real time, not beats, so it works while the timeline stands still. The Output stays within 0 .. 1.
+import nanogui;
+
+mode = None;
+in = None;
+cutoff = None;
+beta = None;
+window = None;
+attack = None;
+release = None;
+gain = None;
+out = None;
+
+value = 0.0;
+deriv = 0.0;        // One euro: the smoothed change per second
+last_in = 0.0;
+samples = [];       // Average / Median: [ms, value] of the last Window seconds
+last_ms = -1;
+
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
+
+	mode = area.controlcombo("Mode").tooltip("One euro: removes jitter, follows fast moves. Average and Median of the last Window seconds (Median removes spikes). Envelope: follows the peaks. Slope: how fast Input moves");
+	mode.items(["One euro", "Average", "Median", "Envelope", "Slope"]); //index-based (0 = one euro, ...): new kinds only at the end
+	in = area.controlslider("Input").tooltip("The value to filter. [[link]] something into it: a sensor, a fader, the audio energy");
+	cutoff = area.controlslider("Cutoff").unit("Hz").min(0.05).max(10).value(1.0).tooltip("One euro: how smooth the Output is while Input stands still. Lower: smoother, but slower");
+	beta = area.controlslider("Speed response").min(0).max(10).value(1.0).tooltip("One euro: how much a fast move opens the filter, so the Output keeps up. 0: a plain smoothing");
+	window = area.controlslider("Window").unit("s").min(0.05).max(5).value(0.5).tooltip("Average and Median: how many seconds of Input they look at");
+	attack = area.controlslider("Attack").unit("s").min(0).max(2).value(0).tooltip("Envelope: seconds to rise to a new peak. 0: at once");
+	release = area.controlslider("Release").unit("s").min(0).max(10).value(0.8).tooltip("Envelope: seconds to fall back from a peak");
+	gain = area.controlslider("Gain").min(0).max(20).value(2.0).tooltip("Slope: the change per second times Gain is the Output");
+
+	out = area.controlslider("Output").as_output(true).tooltip("The filtered value, 0 to 1. A [[pure output]]: [[link]] it into what should move\n[[wiki:Assets#generators--math]]");
+}
+
+// Share of the way a low-pass of `hz` goes in dt seconds (the alpha of the 1 euro filter)
+lowpass_alpha(hz, dt) {
+	tau = 1.0 / (2.0 * math.PI * math.max(hz, 0.001));
+	return 1.0 / (1.0 + tau / dt);
+}
+
+update(generator, tl_pos, pos_delta) {
+	now = std.millis();
+	x = std.float(in.value());
+	if(last_ms < 0) {
+		last_ms = now;
+		value = x;
+		last_in = x;
+		out.value(math.clamp(value, 0.0, 1.0));
+		return;
+	}
+	dt = (now - last_ms) / 1000.0;
+	if(dt <= 0.0)
+		return;
+	last_ms = now;
+	// A stall (a project load, a dialog) is no jump
+	if(dt > 0.25)
+		dt = 0.25;
+
+	m = mode.value();
+	if(m == 1 || m == 2) {
+		samples.push_back([ms = now, v = x]);
+		keep_ms = window.value() * 1000.0;
+		for(samples.size() > 1 && now - samples[0].ms > keep_ms)
+			samples.erase(0);
+		if(m == 1) {
+			total = 0.0;
+			for(s : samples)
+				total += s.v;
+			value = total / samples.size();
+		}
+		else {
+			vals = [];
+			for(s : samples)
+				vals.push_back(s.v);
+			vals.sort();
+			k = vals.size();
+			value = (k % 2 == 1) ? vals[(k - 1) / 2] : (vals[k / 2 - 1] + vals[k / 2]) * 0.5;
+		}
+	}
+	else {
+		if(samples.size())
+			samples = [];
+		if(m == 3) {
+			if(x > value) {
+				a = attack.value();
+				value = a <= 0.0001 ? x : value + (x - value) * (1.0 - math.exp(-3.0 * dt / a));
+			}
+			else {
+				r = release.value();
+				value = r <= 0.0001 ? x : math.max(x, value - dt / r);
+			}
+		}
+		else if(m == 4) {
+			speed = math.abs(x - last_in) / dt;
+			target = math.clamp(speed * gain.value() * 0.1, 0.0, 1.0);
+			// a little smoothing: one frame of a fast move is not a flicker
+			value += (target - value) * (1.0 - math.exp(-dt / 0.05));
+		}
+		else {
+			dx = (x - last_in) / dt;
+			deriv += (dx - deriv) * lowpass_alpha(1.0, dt);
+			hz = cutoff.value() + beta.value() * math.abs(deriv);
+			value += (x - value) * lowpass_alpha(hz, dt);
+		}
+	}
+	last_in = x;
+
+	v = math.clamp(value, 0.0, 1.0);
+	if(out.value() != v)
+		out.value(v);
+}

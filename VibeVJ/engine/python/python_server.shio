@@ -1,0 +1,936 @@
+// The Python server of VibeVJ (#853 step 1): a Python script runs in a process of its own and the host calls its
+// functions through a framed message queue over the stdin / stdout pipes of that process. Large binary data
+// (textures) goes through shared memory (ipc.shared_memory) instead of the pipe. A crash, an exception or a hang of
+// the Python side never takes the host with it: a call gets an error reply (the exception and its traceback, the exit
+// code and the end of stderr of a process that died, a timeout) and the server can be started again.
+//
+// The protocol: docs/python-server.md. The Python side: shz_python_server.py next to this file.
+//
+//   #include "engine/python/python_server"
+//   server = PythonServer("assets/Python/hands.py", [timeout = 5000]);
+//   if(!server.start())
+//       std.warn(server.last_error());
+//   r = server.call("process", [0.5], pixels, [out_size = w * h * 4]);   // blocks up to the timeout
+//   if(r.ok) { ... r.result ... r.binary ... } else std.warn(r.error);
+//   server.call_async("process", [0.5], [this](r) { ... }, pixels);      // the callback runs in poll()
+//   server.on_event([](ev) { std.print(ev.name, ev.data); });
+//   server.stop();
+//
+// Callbacks (replies of call_async, events, on_exit, on_stderr) run inside poll(): a std.thread of the server calls it
+// every pump_ms, a VibeVJ asset can also call it from its per frame update. stop() ends that thread; a server that is
+// not stopped keeps its process until the host ends.
+
+import subprocess;
+import ipc;
+
+PYSRV_DIR = __DIR__;
+PYSRV_PROTOCOL = 1;
+PYSRV_MAGIC = "SHZPY1";
+PYSRV_RESERVE = 512;	// bytes over pipe_budget for the small frames of the host (ping, shm_release)
+PYSRV_SERVERS = 0;	// servers made in this script: part of the names of their shared memory segments
+
+// The commands tried for the Python executable when none is given (the .py assets get a uv venv first, py_env.shio)
+pysrv_default_pythons() {
+	if(subprocess.platform() == "windows")
+		return ["python", "python3"];
+	return ["python3", "python"];
+}
+
+// The first command of candidates (a string or a list: a command with arguments, e.g. ["uv", "run", "python"])
+// that runs a Python 3.9 or newer; "" when none does. None tries pysrv_default_pythons().
+pysrv_find_python(candidates = None) {
+	if(candidates == None)
+		candidates = pysrv_default_pythons();
+	if(std.is_string(candidates))
+		candidates = [candidates];
+	for(cand : candidates) {
+		var cmd = [];
+		if(std.is_string(cand))
+			cmd.push(cand);
+		else {
+			for(part : cand)
+				cmd.push(part);
+		}
+		var exe = std.string(cmd[0]);
+		if((exe.contains("/") || exe.contains("\\")) && !fileio.exists(exe))
+			continue;
+		cmd.push("-c");
+		cmd.push("import sys; sys.stdout.write('ok' if sys.version_info >= (3, 9) else 'old')");
+		var p = subprocess.process();
+		p.pipes(true, true, true);
+		p.terminate_on_destroy(true);
+		if(!p.start(cmd))
+			continue;
+		var res = p.communicate("", 15000);
+		if(res.returncode === 0 && res.stdout.strip() == "ok")
+			return cand;
+	}
+	return "";
+}
+
+// One frame: "SHZPY1 <header bytes> <payload bytes>\n", the header (compact JSON), the payload
+pysrv_frame(header, payload = "") {
+	body = header.compact_string();
+	return PYSRV_MAGIC + " " + std.string(body.length()) + " " + std.string(payload.length()) + "\n" + body + payload;
+}
+
+// A request of the host and what became of it
+class PysrvCall {
+	id = 0;
+	kind = "call";		// call or ping
+	name = "";
+	frame = "";		// the bytes for the pipe
+	deadline = 0;
+	timeout = 0;
+	sent_at = 0;
+	callback = None;
+	segs = [];		// names of the segments it holds until its reply
+	out_seg = None;
+	in_pipe = 0;		// bytes of it in the pipe that have no reply yet
+	done = 0;
+	answer = None;
+}
+
+// A shared memory segment of the pool
+class PysrvSegment {
+	mem = None;		// ipc.shared_memory
+	name = "";
+	capacity = 0;
+	busy = 0;		// the id of the call that uses it, 0 = free
+	mapped = 0;		// the Python process has it open
+	serial = 0;
+}
+
+class PythonServer {
+	// ---- settings (the options of the constructor) ----
+	script_path = "";
+	python_cmd = None;		// a string, a list (command with arguments) or None: pysrv_find_python()
+	work_dir = "";
+	env_list = [];			// "KEY=VALUE" for the process, added to the inherited environment
+	call_timeout = 10000;		// ms a call waits for its reply
+	start_timeout = 20000;		// ms start() waits for the hello of the Python side (imports can be slow)
+	stop_grace = 2000;		// ms stop() waits for the process to end before it is killed
+	inline_max = 4096;		// binary data up to this many bytes goes through the pipe, more through shared memory
+	pipe_budget = 3072;		// bytes of requests without a reply in the stdin pipe (a Windows pipe buffers 4 KiB)
+	pump_ms = 2;			// ms between the polls of the pump thread, 0 = no pump (poll() by hand)
+	pool_free_max = 8;		// free segments kept for the next calls
+	stderr_keep = 16384;		// bytes of stderr kept for last_error() / stderr_tail()
+
+	// ---- state ----
+	proc = None;
+	status = "stopped";		// stopped, starting, running, dead
+	hello_info = None;
+	err_text = "";
+	exit_value = None;
+	last_pid = 0;
+	started_at = 0;
+	stopping = 0;
+	load_failed = "";
+	rx = "";			// bytes of stdout that are no whole frame yet
+	err_tail = "";
+	err_partial = "";
+	next_id = 1;
+	open_calls = std.json();	// id -> PysrvCall, sent or waiting in outbox
+	late_calls = std.json();	// id -> PysrvCall that timed out while the Python side had it
+	outbox = [];			// PysrvCall not written yet (pipe budget, or the server is still starting)
+	ping_box = [];			// pings not written yet: they go first and may use PYSRV_RESERVE
+	in_pipe_bytes = 0;
+	release_later = [];		// segment names to tell the Python side to close
+	event_cbs = [];
+	exit_cbs = [];
+	stderr_cbs = [];
+	segments = std.json();		// name -> PysrvSegment
+	seg_serial = 0;
+	seg_prefix = "";
+	pumping = 0;
+
+	// script: the .py file. options (all optional): [python = "python3" | ["uv", "run", "python"], cwd = "",
+	// env = ["KEY=VALUE"], timeout = 10000, start_timeout = 20000, stop_grace = 2000, inline_max = 4096,
+	// pipe_budget = 3072, pump_ms = 2]
+	__init__(script, options = None) {
+		script_path = script;
+		PYSRV_SERVERS++;
+		seg_prefix = "shzpy" + std.random_hash(8) + "_" + std.string(PYSRV_SERVERS) + "_";
+		if(options) {
+			if(options.has("python"))
+				python_cmd = options["python"];
+			if(options.has("cwd"))
+				work_dir = options["cwd"];
+			if(options.has("env"))
+				env_list = options["env"];
+			if(options.has("timeout"))
+				call_timeout = options["timeout"];
+			if(options.has("start_timeout"))
+				start_timeout = options["start_timeout"];
+			if(options.has("stop_grace"))
+				stop_grace = options["stop_grace"];
+			if(options.has("inline_max"))
+				inline_max = options["inline_max"];
+			if(options.has("pipe_budget"))
+				pipe_budget = options["pipe_budget"];
+			if(options.has("pump_ms"))
+				pump_ms = options["pump_ms"];
+		}
+	}
+
+	__deinit__() {
+		pumping = 0;
+		if(proc) {
+			stopping = 1;
+			proc.kill();
+			proc = None;
+		}
+		drop_segments(false);
+	}
+
+	// ---- the API ----
+
+	// Starts the Python process. wait: wait for its hello (true, default) and return whether it runs; false returns
+	// at once (state() is "starting", calls wait in the queue until the hello).
+	start(wait = 1) {
+		if(status == "running" || status == "starting")
+			return true;
+		reset_state();
+		if(python_cmd == None || python_cmd == "") {
+			python_cmd = pysrv_find_python();
+			if(python_cmd == "") {
+				python_cmd = None;
+				err_text = "no Python 3.9 or newer found (tried " + pysrv_default_pythons().combine_string(", ").removesuffix(", ") + ")";
+				return false;
+			}
+		}
+		var cmd = [];
+		if(std.is_string(python_cmd))
+			cmd.push(python_cmd);
+		else {
+			for(part : python_cmd)
+				cmd.push(part);
+		}
+		cmd.push("-u");
+		cmd.push(PYSRV_DIR + "/shz_python_server.py");
+		cmd.push(script_path);
+		var env_all = [];
+		for(e : env_list)
+			env_all.push(e);
+		env_all.push("PYTHONUNBUFFERED=1");
+		env_all.push("PYTHONIOENCODING=utf-8");
+
+		// A path that is not there: said here, without the runtime error start() logs
+		var exe = std.string(cmd[0]);
+		if((exe.contains("/") || exe.contains("\\")) && !fileio.exists(exe)) {
+			err_text = "could not start " + exe + ": the file does not exist";
+			return false;
+		}
+		var p = subprocess.process();
+		p.pipes(true, true, true);
+		p.terminate_on_destroy(true);
+		if(!p.start(cmd, work_dir, false, env_all)) {
+			err_text = "could not start " + std.string(cmd[0]) + ": " + p.error();
+			return false;
+		}
+		proc = p;
+		last_pid = p.pid();
+		status = "starting";
+		started_at = std.millis();
+		start_pump();
+		if(!wait)
+			return true;
+		for(status == "starting") {
+			poll();
+			if(status != "starting")
+				break;
+			std.sleep(2);
+		}
+		return status == "running";
+	}
+
+	// Asks the Python side to end (it finishes the call it runs), waits up to grace_ms, then kills it.
+	// Calls without a reply get kind "stopped". Returns the exit code.
+	stop(grace_ms = -1) {
+		if(grace_ms < 0)
+			grace_ms = stop_grace;
+		if(!proc) {
+			if(status != "dead")
+				status = "stopped";
+			pumping = 0;
+			return exit_value;
+		}
+		stopping = 1;
+		if(proc.running()) {
+			// The end of stdin alone ends it too; the frame only when the pipe has room (no write may block)
+			var hdr = std.json();
+			hdr.kind = "shutdown";
+			var bye = pysrv_frame(hdr);
+			if(status == "running" && in_pipe_bytes + bye.length() <= pipe_budget + PYSRV_RESERVE)
+				proc.write(bye);
+			proc.close_stdin();
+			var until = std.millis() + grace_ms;
+			for(proc && proc.running() && std.millis() < until) {
+				read_pipes();
+				std.sleep(5);
+			}
+		}
+		if(proc && proc.running())
+			proc.kill();
+		if(proc)
+			proc.wait(2000);
+		if(proc)
+			ended();
+		return exit_value;
+	}
+
+	// Kills the process at once (also one that hangs). Calls without a reply get kind "died".
+	kill() {
+		if(!proc)
+			return exit_value;
+		if(proc.running())
+			proc.kill();
+		proc.wait(2000);
+		if(err_text == "")
+			err_text = "the Python server was killed";
+		ended();
+		return exit_value;
+	}
+
+	// stop() and start() again (also after the process died)
+	restart(wait = 1) {
+		stop();
+		return start(wait);
+	}
+
+	// Calls the function name of the script and waits for its reply (up to the timeout). args: a list (positional
+	// arguments), an object (keyword arguments) or None. binary: a std.buffer / binary value / string, the handler
+	// gets it as the keyword argument binary. options: [timeout = ms, out_size = bytes of binary data the reply may
+	// bring back through shared memory]. The reply: [ok, kind, result, error, error_type, traceback, binary, ms, id,
+	// name]; kind is ok, exception, timeout, died, stopped, not_running or error.
+	call(name, args = None, binary = None, options = None) {
+		var rec = make_call(name, args, binary, options, None);
+		for(!rec.done) {
+			poll();
+			if(rec.done)
+				break;
+			std.sleep(1);
+		}
+		return rec.answer;
+	}
+
+	// The same without waiting: callback(reply) runs in a later poll(). When the server does not run it runs at
+	// once, before call_async returns. Returns the id of the call.
+	call_async(name, args = None, callback = None, binary = None, options = None) {
+		var rec = make_call(name, args, binary, options, callback);
+		return rec.id;
+	}
+
+	// The time of a round trip to the Python process in ms, -1 when it does not answer. The reader thread of the
+	// Python side answers, also while a call of the script runs.
+	ping(timeout_ms = 2000) {
+		var rec = make_call("", None, None, [timeout = timeout_ms, ping = true], None);
+		for(!rec.done) {
+			poll();
+			if(rec.done)
+				break;
+			std.sleep(1);
+		}
+		if(!rec.answer.ok)
+			return -1;
+		return rec.answer.ms;
+	}
+
+	// cb(event): event is [name, data, binary] of shz.emit() of the Python side
+	on_event(cb) {
+		event_cbs.push(cb);
+		return this;
+	}
+
+	// cb(info) when the process ended: [code, error, stderr]
+	on_exit(cb) {
+		exit_cbs.push(cb);
+		return this;
+	}
+
+	// cb(line) for every line the Python side writes to stderr (print() of the script goes there)
+	on_stderr(cb) {
+		stderr_cbs.push(cb);
+		return this;
+	}
+
+	// True while the process runs (starting or running)
+	alive() {
+		return proc != None && (status == "running" || status == "starting") && proc.running();
+	}
+
+	// stopped, starting, running or dead
+	state() {
+		return status;
+	}
+
+	// Why the server is not running: the start failed, the script raised while it loaded, the process ended
+	// (exit code and the end of stderr), it was killed. Empty while it runs.
+	last_error() {
+		return err_text;
+	}
+
+	exit_code() {
+		return exit_value;
+	}
+
+	pid() {
+		return last_pid;
+	}
+
+	// The hello of the Python side: [protocol, pid, python, executable, script, handlers]
+	info() {
+		return hello_info;
+	}
+
+	stderr_tail() {
+		return err_tail;
+	}
+
+	// Calls without a reply yet
+	pending() {
+		return open_calls.size();
+	}
+
+	// Reads what the process wrote and runs the callbacks of the replies and events, notices the end of the
+	// process and the timeouts of calls, writes waiting requests. Returns the number of frames it read.
+	poll() {
+		if(!proc)
+			return 0;
+		var count = read_pipes();
+		if(!proc)
+			return count;
+		if(!proc.running()) {
+			// The frames written before the end are still in the pipe
+			count += read_pipes();
+			if(proc)
+				ended();
+			return count;
+		}
+		if(status == "starting" && std.millis() > started_at + start_timeout) {
+			err_text = "the Python server did not start in " + std.string(start_timeout) + " ms";
+			kill();
+			return count;
+		}
+		check_timeouts();
+		flush();
+		return count;
+	}
+
+	// ---- inside ----
+
+	reset_state() {
+		status = "stopped";
+		hello_info = None;
+		err_text = "";
+		exit_value = None;
+		stopping = 0;
+		load_failed = "";
+		rx = "";
+		err_tail = "";
+		err_partial = "";
+		open_calls = std.json();
+		late_calls = std.json();
+		outbox = [];
+		ping_box = [];
+		in_pipe_bytes = 0;
+		release_later = [];
+	}
+
+	start_pump() {
+		if(pumping || pump_ms <= 0)
+			return;
+		pumping = 1;
+		// The thread holds the server through me until pumping ends (a [this] capture does not hold it: a server
+		// dropped after stop() was freed under the sleeping thread, "class not valid", #853 step 2). It is not kept
+		// in a member either: server -> thread -> server would keep both after the thread ended
+		var me = this;
+		var pump = std.thread([me]() {
+			for(me.pumping) {
+				me.poll();
+				std.sleep(me.pump_ms);
+			}
+		});
+		pump.run();
+	}
+
+	// A reply the host makes itself (timeout, died, ...)
+	host_reply(rec, kind_name, text) {
+		return [ok = false, kind = kind_name, result = None, error = text, error_type = "", traceback = "", binary = None, ms = 0, id = rec.id, name = rec.name];
+	}
+
+	finish(rec, answer_json) {
+		if(rec.done)
+			return;
+		rec.done = 1;
+		rec.answer = answer_json;
+		open_calls.remove(std.string(rec.id));
+		if(rec.callback) {
+			try {
+				rec.callback(answer_json);
+			}
+			catch(e) {
+				std.warn("Python server: the callback of '" + rec.name + "' failed: " + e);
+			}
+		}
+	}
+
+	make_call(name, args, binary, options, callback) {
+		var rec = PysrvCall();
+		rec.id = next_id;
+		next_id++;
+		rec.name = name;
+		rec.callback = callback;
+		rec.segs = [];
+		var tmo = call_timeout;
+		var out_bytes = 0;
+		var is_ping = false;
+		if(options) {
+			if(options.has("timeout"))
+				tmo = options["timeout"];
+			if(options.has("out_size"))
+				out_bytes = options["out_size"];
+			if(options.has("ping"))
+				is_ping = options["ping"];
+		}
+		rec.timeout = tmo;
+		rec.deadline = std.millis() + tmo;
+		if(status != "running" && status != "starting") {
+			var why = "the Python server is not running";
+			if(err_text != "")
+				why += ": " + err_text;
+			finish(rec, host_reply(rec, "not_running", why));
+			return rec;
+		}
+
+		var hdr = std.json();
+		var payload = "";
+		if(is_ping) {
+			rec.kind = "ping";
+			hdr.kind = "ping";
+			hdr.id = rec.id;
+		}
+		else {
+			hdr.kind = "call";
+			hdr.id = rec.id;
+			hdr.name = name;
+			hdr.args = args;
+			hdr.timeout_ms = tmo;
+			if(binary != None) {
+				var nbytes = binary.size();
+				var seg = None;
+				if(nbytes > inline_max)
+					seg = take_segment(nbytes, rec);
+				if(seg) {
+					seg.mem.write(binary, 0);
+					hdr.binary = [shm = seg.name, offset = 0, size = nbytes, capacity = seg.capacity];
+				}
+				else {
+					payload = std.is_string(binary) ? binary : binary.string();
+					hdr.binary = [inline = true, size = nbytes];
+				}
+			}
+			if(out_bytes > 0) {
+				var oseg = take_segment(out_bytes, rec);
+				if(oseg) {
+					rec.out_seg = oseg;
+					hdr.out = [shm = oseg.name, capacity = oseg.capacity];
+				}
+			}
+			// Arguments too big for the pipe go through shared memory as well
+			if(hdr.compact_string().length() > inline_max) {
+				var wrap = std.json();
+				wrap.args = args;
+				var text = wrap.compact_string();
+				var aseg = take_segment(text.length(), rec);
+				if(aseg) {
+					aseg.mem.write(text, 0);
+					hdr.args = None;
+					hdr.args_blob = [shm = aseg.name, offset = 0, size = text.length(), capacity = aseg.capacity];
+				}
+			}
+		}
+		rec.frame = pysrv_frame(hdr, payload);
+		open_calls[std.string(rec.id)] = rec;
+		if(is_ping)
+			ping_box.push(rec);
+		else
+			outbox.push(rec);
+		flush();
+		return rec;
+	}
+
+	// Writes waiting requests while the pipe has room: never more unanswered bytes than pipe_budget (one request
+	// alone may be bigger), so a write never blocks on a Python process that stopped reading.
+	flush() {
+		if(status != "running" || !proc || !proc.running())
+			return;
+		if(release_later.size() > 0 && in_pipe_bytes < pipe_budget) {
+			// No reply: the reader thread of the Python side takes it out of the pipe at once
+			var hdr = std.json();
+			hdr.kind = "shm_release";
+			hdr.names = release_later;
+			release_later = [];
+			proc.write(pysrv_frame(hdr));
+		}
+		for(ping_box.size() > 0) {
+			var prec = ping_box[0];
+			if(in_pipe_bytes + prec.frame.length() > pipe_budget + PYSRV_RESERVE)
+				break;
+			ping_box.erase(0);
+			if(prec.done)
+				continue;
+			if(!write_request(prec))
+				return;
+		}
+		for(outbox.size() > 0) {
+			var rec = outbox[0];
+			if(in_pipe_bytes > 0 && in_pipe_bytes + rec.frame.length() > pipe_budget)
+				break;
+			outbox.erase(0);
+			if(rec.done)
+				continue;
+			if(!write_request(rec))
+				return;
+		}
+	}
+
+	// False when the write failed: the process is gone, poll() notices it and fails the calls
+	write_request(rec) {
+		// A process that ended (killed, a crash) has no reader of the pipe: the subprocess module logs a write to it
+		// as an error ("process stdin pipe is closed", not catchable). Asked first; poll() then reports the end
+		if(!proc.running())
+			return false;
+		var written = proc.write(rec.frame);
+		if(written === None || written < rec.frame.length()) {
+			rec.frame = "";
+			return false;
+		}
+		rec.in_pipe = rec.frame.length();
+		rec.frame = "";
+		rec.sent_at = std.millis();
+		in_pipe_bytes += rec.in_pipe;
+		return true;
+	}
+
+	// Reads stdout and stderr, runs the frames. Returns their number.
+	read_pipes() {
+		var count = 0;
+		var chunk = proc.read("stdout", -1);
+		if(chunk)
+			rx += chunk;
+		read_stderr();
+		for(proc) {
+			var nl = rx.find("\n");
+			if(nl < 0) {
+				if(rx.length() > 64)
+					protocol_error("no frame header in '" + rx.substr(0, 64) + "'");
+				break;
+			}
+			var parts = rx.substr(0, nl).split(" ");
+			if(parts.size() != 3 || parts[0] != PYSRV_MAGIC) {
+				protocol_error("no frame header in '" + rx.substr(0, nl < 64 ? nl : 64) + "'");
+				break;
+			}
+			var hlen = std.int(parts[1]);
+			var plen = std.int(parts[2]);
+			var need = nl + 1 + hlen + plen;
+			if(rx.length() < need)
+				break;
+			var hdr = std.json();
+			if(!hdr.from_string(rx.substr(nl + 1, hlen))) {
+				protocol_error("the header of a frame is no JSON: '" + rx.substr(nl + 1, hlen < 200 ? hlen : 200) + "'");
+				break;
+			}
+			var payload = plen > 0 ? rx.substr(nl + 1 + hlen, plen) : "";
+			rx = rx.substr(need);
+			count++;
+			handle_frame(hdr, payload);
+		}
+		return count;
+	}
+
+	read_stderr() {
+		if(!proc)
+			return;
+		var chunk = proc.read("stderr", -1);
+		if(!chunk)
+			return;
+		err_tail += chunk;
+		if(err_tail.length() > stderr_keep)
+			err_tail = err_tail.substr(err_tail.length() - stderr_keep);
+		if(stderr_cbs.size() == 0)
+			return;
+		err_partial += chunk;
+		var lines = err_partial.split("\n");
+		err_partial = lines[lines.size() - 1];
+		for(i = 0; i < lines.size() - 1; i++) {
+			var line = lines[i].removesuffix("\r");
+			for(cb : stderr_cbs) {
+				try {
+					cb(line);
+				}
+				catch(e) {
+					std.warn("Python server: an on_stderr callback failed: " + e);
+				}
+			}
+		}
+	}
+
+	// The bytes of a blob descriptor of a frame: the inline payload or the contents of a segment
+	blob_of(desc, payload) {
+		if(desc == None)
+			return None;
+		if(desc.has("inline") && desc["inline"]) {
+			var b = std.buffer();
+			b.append(payload);
+			return b;
+		}
+		if(desc.has("shm") && segments.has(desc["shm"])) {
+			var seg = segments[desc["shm"]];
+			return seg.mem.read(desc["offset"] ??? 0, desc["size"]);
+		}
+		return None;
+	}
+
+	handle_frame(hdr, payload) {
+		var what = hdr["kind"];
+		if(what == "reply" || what == "pong") {
+			var key = std.string(hdr["id"]);
+			if(hdr.has("mapped")) {
+				for(nm : hdr["mapped"])
+					mark_mapped(nm);
+			}
+			if(late_calls.has(key)) {
+				// The reply of a call that timed out: only its segments and its bytes in the pipe are freed
+				var rec = late_calls[key];
+				late_calls.remove(key);
+				in_pipe_bytes -= rec.in_pipe;
+				release_segments(rec);
+				return;
+			}
+			if(!open_calls.has(key))
+				return;
+			var rec = open_calls[key];
+			in_pipe_bytes -= rec.in_pipe;
+			rec.in_pipe = 0;
+			if(what == "pong") {
+				release_segments(rec);
+				finish(rec, [ok = true, kind = "ok", result = None, error = "", error_type = "", traceback = "", binary = None, ms = std.millis() - rec.sent_at, id = rec.id, name = ""]);
+				return;
+			}
+			var okay = hdr["ok"] ? true : false;
+			var bin = None;
+			if(hdr.has("binary"))
+				bin = blob_of(hdr["binary"], payload);
+			release_segments(rec);
+			var answer = [ok = okay, kind = okay ? "ok" : "exception", result = hdr["result"] ??? None, error = hdr["error"] ??? "",
+				error_type = hdr["error_type"] ??? "", traceback = hdr["traceback"] ??? "", binary = bin, ms = hdr["ms"] ??? 0,
+				id = rec.id, name = rec.name];
+			finish(rec, answer);
+			return;
+		}
+		if(what == "event") {
+			bin = None;
+			if(hdr.has("binary"))
+				bin = blob_of(hdr["binary"], payload);
+			var ev = [name = hdr["name"] ??? "", data = hdr["data"] ??? None, binary = bin];
+			for(cb : event_cbs) {
+				try {
+					cb(ev);
+				}
+				catch(e) {
+					std.warn("Python server: an on_event callback failed: " + e);
+				}
+			}
+			return;
+		}
+		if(what == "hello") {
+			if(hdr["protocol"] != PYSRV_PROTOCOL) {
+				protocol_error("the Python side speaks protocol " + std.string(hdr["protocol"]) + ", this host " + std.string(PYSRV_PROTOCOL));
+				return;
+			}
+			if(!hdr["ok"]) {
+				load_failed = hdr["error"] ??? "the script failed to load";
+				if(hdr.has("traceback") && hdr["traceback"] != "")
+					load_failed += "\n" + hdr["traceback"];
+				return;
+			}
+			hello_info = hdr;
+			if(status == "starting")
+				status = "running";
+			flush();
+			return;
+		}
+		if(what == "error") {
+			std.warn("Python server: " + std.string(hdr["error"] ??? ""));
+			return;
+		}
+	}
+
+	// The stream is broken: nothing after it can be trusted
+	protocol_error(text) {
+		err_text = "protocol error: " + text;
+		rx = "";
+		kill();
+	}
+
+	check_timeouts() {
+		var now = std.millis();
+		var expired = [];
+		for(k, rec : open_calls) {
+			if(!rec.done && now > rec.deadline)
+				expired.push(rec);
+		}
+		for(rec : expired) {
+			if(rec.in_pipe > 0) {
+				// The Python side has it: its segments and its bytes stay taken until its reply comes late
+				late_calls[std.string(rec.id)] = rec;
+			}
+			else
+				release_segments(rec);
+			var what = rec.kind == "ping" ? "the ping" : "the call '" + rec.name + "'";
+			finish(rec, host_reply(rec, "timeout", what + " got no reply in " + std.string(rec.timeout) + " ms"));
+		}
+	}
+
+	// The process has ended: every call without a reply gets an error, the segments go
+	ended() {
+		if(!proc)
+			return;
+		read_stderr();
+		var code = proc.returncode();
+		exit_value = code;
+		proc = None;
+		pumping = 0;
+		var kind_name = "died";
+		if(stopping && load_failed == "") {
+			status = "stopped";
+			kind_name = "stopped";
+			if(err_text == "" && code !== 0 && code !== None)
+				err_text = "the Python server ended with exit code " + std.string(code) + " when it was stopped";
+		}
+		else {
+			status = "dead";
+			if(load_failed != "")
+				err_text = "the Python script failed to load: " + load_failed;
+			else if(err_text == "") {
+				err_text = "the Python server ended with exit code " + std.string(code);
+				if(code !== None && code < 0)
+					err_text += " (signal " + std.string(-code) + ")";
+			}
+			var tail = err_tail.strip();
+			if(tail != "" && load_failed == "") {
+				if(tail.length() > 2000)
+					tail = "..." + tail.substr(tail.length() - 2000);
+				err_text += "\nstderr:\n" + tail;
+			}
+		}
+		var why = kind_name == "stopped" ? "the Python server was stopped" : err_text;
+		var failing = [];
+		for(k, rec : open_calls)
+			failing.push(rec);
+		for(rec : failing)
+			finish(rec, host_reply(rec, kind_name, why));
+		open_calls = std.json();
+		late_calls = std.json();
+		outbox = [];
+		ping_box = [];
+		in_pipe_bytes = 0;
+		release_later = [];
+		drop_segments(false);
+		var info_json = [code = code, error = err_text, stderr = err_tail];
+		for(cb : exit_cbs) {
+			try {
+				cb(info_json);
+			}
+			catch(e) {
+				std.warn("Python server: an on_exit callback failed: " + e);
+			}
+		}
+	}
+
+	// ---- the segment pool ----
+
+	// A free segment of at least nbytes for the call rec (a new one when none is free): None when shared memory
+	// fails, the data then goes through the pipe
+	take_segment(nbytes, rec) {
+		var best = None;
+		for(k, sg : segments) {
+			if(!sg.busy && sg.capacity >= nbytes && (best == None || sg.capacity < best.capacity))
+				best = sg;
+		}
+		if(best == None) {
+			var cap = ((nbytes + 65535) / 65536) * 65536;
+			seg_serial++;
+			var nm = seg_prefix + std.string(seg_serial);
+			mem = ipc.shared_memory();
+			if(!mem.create(nm, cap)) {
+				std.warn("Python server: no shared memory of " + std.string(cap) + " bytes: " + mem.error());
+				return None;
+			}
+			best = PysrvSegment();
+			best.mem = mem;
+			best.name = nm;
+			best.capacity = cap;
+			best.serial = seg_serial;
+			segments[nm] = best;
+		}
+		best.busy = rec.id;
+		rec.segs.push(best.name);
+		return best;
+	}
+
+	// The Python side has opened it: the name can go (POSIX), the memory stays while either side maps it, also when
+	// one of them crashes
+	mark_mapped(nm) {
+		if(!segments.has(nm))
+			return;
+		var seg = segments[nm];
+		if(seg.mapped)
+			return;
+		seg.mapped = 1;
+		seg.mem.unlink();
+	}
+
+	release_segments(rec) {
+		for(nm : rec.segs) {
+			if(segments.has(nm))
+				segments[nm].busy = 0;
+		}
+		rec.segs = [];
+		rec.out_seg = None;
+		trim_pool();
+	}
+
+	// Keeps at most pool_free_max free segments, the newest
+	trim_pool() {
+		var free_list = [];
+		for(k, sg : segments) {
+			if(!sg.busy)
+				free_list.push(sg);
+		}
+		for(free_list.size() > pool_free_max) {
+			var oldest = 0;
+			for(i = 1; i < free_list.size(); i++) {
+				if(free_list[i].serial < free_list[oldest].serial)
+					oldest = i;
+			}
+			var sg = free_list[oldest];
+			free_list.erase(oldest);
+			if(sg.mapped)
+				release_later.push(sg.name);
+			sg.mem.close();
+			segments.remove(sg.name);
+		}
+	}
+
+	drop_segments(tell_python) {
+		for(k, sg : segments) {
+			if(tell_python && sg.mapped)
+				release_later.push(sg.name);
+			sg.mem.close();
+		}
+		segments = std.json();
+	}
+}

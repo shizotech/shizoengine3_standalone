@@ -69,6 +69,9 @@ Tips:
   (tab *Main*), or map a helper control and link it on with a *Normalized* or *Inverted* link. Both are on
   [Linking](Linking.md#the-options-of-a-control).
 - To smooth a jumpy knob, set *smoothing* there.
+- **MIDI Time Code and the clock** (system messages: timecode, clock, Start, Continue, Stop, song position) are no
+  values: MIDI learn never takes them and no control follows them. The timeline follows MIDI Time Code or MIDI clock
+  from an input and sends both to an output: see [Timecode](Timeline.md#timecode).
 
 ## The MIDI tab in the options
 
@@ -104,7 +107,7 @@ Knobs, faders, buttons and pads on the screen that send MIDI like a controller. 
 show without hardware: the mappings belong to the device *Shizo Virtual MIDI*, and they work the moment you play the
 virtual controller.
 
-![The virtual controller: the standard layout (8 knobs, 8 faders, 4 buttons, 4 x 8 pads) with a pitch bend, three program buttons, an endless knob and a pressure fader added](media/virtual-controller.png)
+![The virtual controller: the standard layout (8 knobs, 8 faders, 4 buttons, 4 x 8 pads), some of it played](media/virtual-controller.png)
 
 Open it with *Virtual controller* in the sidebar, tab *Devices*, section *MIDI*. The device *Shizo Virtual MIDI* is
 listed there like a plugged in controller, with its own *MIDI mapping* button.
@@ -121,10 +124,32 @@ listed there like a plugged in controller, with its own *MIDI mapping* button.
 | Pressure | Channel pressure (aftertouch) of its channel | Press on the track; it goes back to 0 when you let go. |
 | Program | A program change (0-127) | Click. The button of the program that is chosen lights, also when the program comes from VibeVJ. |
 
-To map a control, use [MIDI learn](#map-a-control-with-midi-learn) as with a real controller: *MIDI learn* on, click
-the overlay of the control, then turn a knob or hit a pad of the virtual controller.
-
 When a mapped control changes in VibeVJ, the element follows: the knob turns, the pad lights (*MIDI backpropagate*).
+
+### Learn in two clicks
+
+Map a control to an element without turning on MIDI learn first:
+
+1. Right-click the element (a knob, a fader, a pad, ...). It gets an amber frame, and every control in VibeVJ shows
+   its amber learn overlay, as in [MIDI learn](#map-a-control-with-midi-learn). The line at the bottom of the window
+   says which element waits.
+2. Click the control that the element should move. It is mapped at once and keeps its value; the element shows that
+   value. The line at the bottom says what was mapped, for example *Frequency now follows knob1 (CC 21 on channel 1)*.
+
+![Learn in two clicks: knob K1 waits (amber frame), the controls of a generator show their learn overlays](media/virtual-controller-learn.png)
+
+To map many controls, click *Learn* in the window. While it is on (amber), a left click on an element picks it
+instead of playing it, and the overlays stay on. Both orders work:
+
+- the element first, then the control;
+- the control first (its overlay turns amber), then the element.
+
+Click the same element again to let it go. **Esc** lets go of the element or control that waits; a second Esc ends
+*Learn*. A control that already had a mapping gets the new one. Pads map one by one: right-click the pad you mean.
+An *XY* maps its x. In [show mode](#show-mode) nothing is picked, and show mode ends *Learn*.
+
+The old way works too: *MIDI learn* on, click the overlay of the control, then turn a knob or hit a pad of the
+virtual controller.
 
 ### Change the layout
 
@@ -138,6 +163,14 @@ Click *Edit* (not in [show mode](#show-mode): there the controller is played, no
   It also has the extras of the next section: the range of the value, the steps of an endless knob, *Follows VibeVJ*
   and the colour.
 - The bin deletes the selected element, *Default* brings the standard layout back.
+
+### Colours
+
+The controller takes the colours of VibeVJ: the faces, tracks and texts of the theme, and the accent colour
+(*Settings › Appearance*) for what the elements send. Pick another accent and the controller changes with the rest of
+the program at once. An element with its own *Colour* (below) keeps it.
+
+![The same layout with two accent colours](media/virtual-controller-theme.png)
 
 ### Range, steps, feedback and colour
 

@@ -1,15 +1,18 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  node_api.shio — JSON Web API for the Megamind node host
+//  node_api.shio — JSON Web API for the Node host
 //
 //  #include "node_api"
 //
-//  api = node_api_start(host, cfg, port, api_token = "");   // returns the
-//                                                            webserver object
+//  api = node_api_start(host, cfg, port, api_token = "", web_root = "");
+//                                                    // returns the webserver object
+//                                                    // web_root: pages served at /,
+//                                                    // the API index moves to /api
 //  api.stop();
 //
-//  `host` is a Megamind() (see megamind.shio): the receptionist router plus the
-//  worker pool. This module exposes it as a plain JSON web API so a node can be
-//  driven from any machine in the network.
+//  `host` is a Node() (see node.shio): the WorkspaceRegistry, the node's own
+//  Workspace, the receptionist connector and the ShizoNet service. This module
+//  exposes it as a plain JSON web API so a node can be driven from any machine
+//  in the network.
 //
 //  Every answer uses the same envelope (as the miniagent dashboard API):
 //
@@ -21,10 +24,10 @@
 //   GET     /                               API index
 //   GET     /api/health                     liveness probe (never needs a token)
 //   GET     /api/status                     node, model and task statistics
-//   GET     /api/overview                   raw mind overview
+//   GET     /api/overview                   raw Node overview
 //   GET     /api/tasks                      flattened task list
 //   GET     /api/task/<id>                  inspect one task
-//   POST    /api/task                       {name, goal}   -> {taskid, name}
+//   POST    /api/task                       {name, goal, workspace?} -> {taskid, name}
 //   PUT     /api/task/<id>                  {message}      -> follow-up for a task
 //   DELETE  /api/task/<id>                                   -> stop a task
 //   POST    /api/request                    {prompt}       -> {request_id}
@@ -173,6 +176,11 @@ node_api_authorized(req, api_token) {
             token = auth.strip();
     }
 
+    // EventSource cannot send headers. The browser dashboard passes the token
+    // as ?token=<t> on the SSE URL, so accept it there as well.
+    if(token.empty())
+        token = node_api_get(req.query_params, "token");
+
     return token == expected;
 }
 
@@ -203,15 +211,36 @@ node_api_task_list(ov) {
     return list;
 }
 
+// Node.tasks() is the authoritative flattened list; the overview fallback keeps
+// stub hosts (and older shapes) working.
+node_api_tasks(host) {
+    try {
+        if(std.is_function(host.tasks))
+            return host.tasks();
+    } catch(e) {}
+
+    return node_api_task_list(host.get_overview());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Server
 // ─────────────────────────────────────────────────────────────────────────────
 
-node_api_start(host, cfg, port, api_token = "") {
+// web_root: a folder of web pages served at / (shz miniagent --web, web_ui.shio);
+// the API index moves to /api then. web_protect optionally filters static files.
+node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = None) {
     port = std.int(port);
     api_token = std.string(api_token);
+    web_root = std.string(web_root ?? "");
 
     server = webserver.http_server(port);
+
+    if(web_root) {
+        if(web_protect)
+            server.static("", web_root, web_protect);
+        else
+            server.static("", web_root);
+    }
 
     // API state. All of these are shared by reference with the route lambdas.
     requests = [];          // request_id -> request state
@@ -220,12 +249,34 @@ node_api_start(host, cfg, port, api_token = "") {
     counters = [requests_total = 0, requests_done = 0, requests_error = 0];
     started_at = std.millis();
 
-    host.on_notify([notifications](msg) {
+    notify_handler = [notifications](msg) {
         notifications.push_back([message = std.string(msg), time = std.millis()]);
         node_api_trim(notifications);
-    });
+    };
 
-    host.on_task_finished([events](task) {
+    // Node hooks are additive: use add_*_listener when the host offers it,
+    // so the ShizoNet service keeps its own hook. A stub host without the
+    // additive API falls back to the legacy single slot.
+    notify_registered = false;
+
+    try {
+        if(std.is_function(host.add_notify_listener)) {
+            host.add_notify_listener(notify_handler);
+            notify_registered = true;
+        }
+    }
+    catch(e) {}
+
+    if(!notify_registered) {
+        try {
+            host.on_notify(notify_handler);
+        }
+        catch(e) {
+            std.error("node_api: host.on_notify not available");
+        }
+    }
+
+    task_finished_handler = [events](task) {
         events.push_back([
             time = std.millis(),
             taskid = task.taskid,
@@ -234,17 +285,36 @@ node_api_start(host, cfg, port, api_token = "") {
             report = task.report,
         ]);
         node_api_trim(events);
-    });
+    };
+
+    task_finished_registered = false;
+
+    try {
+        if(std.is_function(host.add_task_finished_listener)) {
+            host.add_task_finished_listener(task_finished_handler);
+            task_finished_registered = true;
+        }
+    }
+    catch(e) {}
+
+    if(!task_finished_registered) {
+        try {
+            host.on_task_finished(task_finished_handler);
+        }
+        catch(e) {
+            std.error("node_api: host.on_task_finished not available");
+        }
+    }
 
     // Preflight for browser clients.
     server.route("OPTIONS", "^.*$", [](req, writer) {
         return [status_code = 204, headers = node_api_headers(), body = ""];
     });
 
-    // GET / — API index
-    server.route("GET", "^/$", [port](req, writer) {
+    // GET / — API index (GET /api when the web pages are served at /)
+    server.route("GET", web_root ? "^/api/?$" : "^/$", [port](req, writer) {
         return node_api_ok([
-            name = "megamind-node-api",
+            name = "node-api",
             version = NODE_API_VERSION,
             port = port,
             endpoints = [
@@ -253,7 +323,7 @@ node_api_start(host, cfg, port, api_token = "") {
                 [method = "GET", path = "/api/overview"],
                 [method = "GET", path = "/api/tasks"],
                 [method = "GET", path = "/api/task/<id>"],
-                [method = "POST", path = "/api/task", body = "name, goal"],
+                [method = "POST", path = "/api/task", body = "name, goal, workspace?"],
                 [method = "PUT", path = "/api/task/<id>", body = "message"],
                 [method = "DELETE", path = "/api/task/<id>"],
                 [method = "POST", path = "/api/request", body = "prompt"],
@@ -279,16 +349,44 @@ node_api_start(host, cfg, port, api_token = "") {
         ]);
     });
 
-    // GET /api/status — node statistics
+    // GET /api/status — Node statistics
     server.route("GET", "^/api/status$", [host, cfg, requests, notifications, events, counters, port, started_at, api_token](req, writer) {
         if(!node_api_authorized(req, api_token))
             return node_api_err("Unauthorized", 401);
 
         ov = host.get_overview();
 
+        node_name = "node-api";
+        try {
+            node_name = node_api_str(host.name, "node-api");
+        } catch(e) {}
+
+        workers = 0;
+        try {
+            workers = std.int(host.max_workers);
+        } catch(e) {}
+
+        workspace_stats = None;
+        try {
+            if(host.registry && host.registry.manager)
+                workspace_stats = host.registry.manager.stats();
+        } catch(e) {}
+
+        receptionist_active = false;
+        receptionist_queued = 0;
+        try {
+            if(host.receptionist) {
+                receptionist_active = host.receptionist._active ? true : false;
+                receptionist_queued = host.receptionist.queue.size();
+            } else {
+                receptionist_active = host._receptionist_active ? true : false;
+                receptionist_queued = host.request_queue.size();
+            }
+        } catch(e) {}
+
         return node_api_ok([
             node = [
-                name = "megamind-node-api",
+                name = node_name,
                 version = NODE_API_VERSION,
                 port = port,
                 running = json.bool(host.running),
@@ -302,10 +400,11 @@ node_api_start(host, cfg, port, api_token = "") {
                 max_running_agents = cfg.max_running_agents,
             ],
             receptionist = [
-                active = json.bool(host._receptionist_active),
-                queued = host.request_queue.size(),
+                active = json.bool(receptionist_active),
+                queued = receptionist_queued,
             ],
-            workers = host.worker_threads.size(),
+            workers = workers,
+            workspace_stats = workspace_stats,
             tasks = [
                 running = ov.tasks.size(),
                 planned = ov.tasks_scheduled.size(),
@@ -336,7 +435,7 @@ node_api_start(host, cfg, port, api_token = "") {
         if(!node_api_authorized(req, api_token))
             return node_api_err("Unauthorized", 401);
 
-        return node_api_ok(node_api_task_list(host.get_overview()));
+        return node_api_ok(node_api_tasks(host));
     });
 
     // GET /api/task/<id>
@@ -353,7 +452,7 @@ node_api_start(host, cfg, port, api_token = "") {
         return node_api_ok(info);
     });
 
-    // POST /api/task — {name, goal}
+    // POST /api/task — {name, goal, workspace?}
     server.route("POST", "^/api/task$", [host, api_token](req, writer) {
         if(!node_api_authorized(req, api_token))
             return node_api_err("Unauthorized", 401);
@@ -373,9 +472,44 @@ node_api_start(host, cfg, port, api_token = "") {
         if(name.strip().empty())
             name = "Task-" + std.random_hash(6);
 
-        taskid = host.add_task(name, goal);
+        workspace = node_api_get(body, "workspace");
+        if(workspace.empty())
+            workspace = node_api_get(body, "workspace_id");
+        workspace = workspace.strip();
 
-        return node_api_ok([taskid = taskid, name = name, state = "planned"]);
+        role = node_api_get(body, "role");
+        if(role.empty())
+            role = "adaptive";
+
+        taskid = None;
+
+        try {
+            if(workspace.empty())
+                taskid = host.add_task(name, goal);
+            else
+                taskid = host.add_task(name, goal, role, workspace);
+        } catch(e) {
+            return node_api_err("add_task failed: " + std.string(e), 503);
+        }
+
+        // An empty id is a refused dispatch, not a task.
+        if(std.is_json(taskid)) {
+            if(!taskid.ok)
+                return node_api_err(node_api_str(taskid.error, "add_task failed"), 503);
+
+            taskid = taskid.taskid;
+        }
+
+        taskid = node_api_str(taskid, "").strip();
+
+        if(taskid.empty())
+            return node_api_err("add_task refused (empty taskid)", 503);
+
+        reply = [taskid = taskid, name = name, state = "planned"];
+        if(workspace)
+            reply.workspace_id = workspace;
+
+        return node_api_ok(reply);
     });
 
     // PUT /api/task/<id> — {message}
@@ -547,6 +681,7 @@ node_api_start(host, cfg, port, api_token = "") {
         }
 
         if(!writer.write_header(200, "text/event-stream", node_api_headers([
+            "Content-Type" = "text/event-stream; charset=utf-8",
             "Cache-Control" = "no-cache",
             "Connection" = "keep-alive",
             "X-Accel-Buffering" = "no",

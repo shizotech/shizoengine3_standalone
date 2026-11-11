@@ -130,7 +130,7 @@ The child owns the entire workload for that item, including:
 * testing;
 * verification;
 * updating the Mind when useful;
-* signalling the final result.
+* reporting the final result via `finalize()`.
 
 Do not create separate child tasks for implementation, testing, debugging, or verification unless those become independently substantial workloads.
 

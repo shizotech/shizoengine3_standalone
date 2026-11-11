@@ -1,0 +1,871 @@
+// The Python environments of the .py assets (#853 step 3): a venv per dependency set, made by uv on first use.
+//
+// An asset declares what it needs in its asset.json:
+//     "python": {"version": "3.12", "dependencies": ["numpy>=1.26", "mediapipe==0.10.*"]}
+// or in a requirements.txt in the asset folder (next to asset.json or next to src/__init__.py). Nothing declared: the
+// default Python (PYENV_DEFAULT_PYTHON) without packages.
+//
+// The key of an environment is a hash of the Python version and the sorted dependencies: assets with the same
+// dependencies share one, other dependencies make a new one. The environments live in the cache folder (pyenv_cache_root(),
+// not in the asset folder, which may be read-only or part of the repository):
+//     <cache>/venvs/<key>/            the venv (bin/python, Windows Scripts\python.exe); vibevj_env.json in it is
+//                                     written last: a venv without it is half built and is made again
+//     <cache>/venvs/<key>.lock        while one is built (another VibeVJ waits for it)
+//     <cache>/python/                 the Pythons uv installs (UV_PYTHON_INSTALL_DIR)
+//     <cache>/uv-cache/               uv's download cache (UV_CACHE_DIR)
+//     <cache>/tools/uv-<version>/     uv, when VibeVJ downloaded it
+// Nothing goes into the user's own uv folders. Deleting the cache folder (VibeVJ closed) removes all of it.
+//
+// uv: the "uv" of configs/python.json, else the uv on the PATH, else the one in tools/, else it is downloaded from the
+// GitHub release of astral-sh/uv (PYENV_UV_VERSION, the SHA-256 of PYENV_UV_BUILDS checked before it is used).
+//
+// The build runs in a process of its own (py_env_build.shio: shz runs it, it runs uv), never on the render thread:
+// pyenv_for_script() starts it or joins the one that runs for the same key, pyenv_poll() reads its progress. A test or
+// a tool can call pyenv_build() directly (it blocks). The details: docs/python-server.md, step 3.
+
+import subprocess;
+
+PYENV_DIR = __DIR__;
+PYENV_FORMAT = 1;			// part of every key: a change of how an environment is made gives new ones
+PYENV_DEFAULT_PYTHON = "3.12";		// the Python of an asset that names none
+PYENV_MARKER = "vibevj_env.json";	// in the venv, written only after it was built and checked
+PYENV_LOCK_STALE_MS = 30000;		// a lock not refreshed for this long belongs to a build that was killed
+
+// uv. To update: a new version here and the SHA-256 of each archive from its .sha256 file in the release
+// (https://github.com/astral-sh/uv/releases/download/<version>/<archive>.sha256), or print them with
+// shz _shizoengine3/engine/python/py_env_build.shio --uv-hashes <version>
+PYENV_UV_VERSION = "0.13.6";
+PYENV_UV_URL = "https://github.com/astral-sh/uv/releases/download/";
+PYENV_UV_BUILDS = [
+	"linux_x64" = ["archive" = "uv-x86_64-unknown-linux-musl.tar.gz", "sha256" = "5d61f26b6c7213779eda90edc6971ea6b0b796bfb8d49a574c8ad69b59838548"],
+	"linux_arm64" = ["archive" = "uv-aarch64-unknown-linux-musl.tar.gz", "sha256" = "819692e404d23e5aae6bc44c0e260f1f5492fd1910ab4693b2c650f926dbe800"],
+	"macos_arm64" = ["archive" = "uv-aarch64-apple-darwin.tar.gz", "sha256" = "60fbd5c8a1ed681845eea28d9d622fcde03c51e91a43465b64a1e17db1ed3472"],
+	"macos_x64" = ["archive" = "uv-x86_64-apple-darwin.tar.gz", "sha256" = "63ba17fdda55ad1a230d4b37fc6017ffa10c23688c83818bd3bfdf914c652a02"],
+	"windows_x64" = ["archive" = "uv-x86_64-pc-windows-msvc.zip", "sha256" = "a2a8820d5eea32f08ef467ef3b7f66883a9b076d5737a2fc2fbb5f458d1bb50f"],
+	"windows_arm64" = ["archive" = "uv-aarch64-pc-windows-msvc.zip", "sha256" = "c2426c0c8e28b53d8c440e47a18d96ad4db51e159866c0e81435b196d7f0081c"]
+];
+
+PYENV_ARCH = "";			// uname -m once per script
+
+// ---- processes ----
+
+// Runs cmd (a list) to its end and returns [code, out, err, error]; code -1 when it did not start (error says why) or
+// was killed after timeout_ms. on_line(stream, line) gets every line of stdout / stderr while it runs, tick() is called
+// about every 50 ms (the lock of a build)
+pyenv_run(cmd, env = None, cwd = "", on_line = None, timeout_ms = 0, tick = None) {
+	var res = [code = -1, out = "", err = "", error = ""];
+	var p = subprocess.process();
+	p.pipes(true, true, true);
+	p.terminate_on_destroy(true);
+	var started = false;
+	try {
+		started = env ? p.start(cmd, cwd, false, env) : p.start(cmd, cwd, false);
+	}
+	catch(e) {
+		res.error = e;
+		return res;
+	}
+	if(!started) {
+		res.error = p.error();
+		if(res.error == "")
+			res.error = "could not start " + std.string(cmd[0]);
+		return res;
+	}
+	p.close_stdin();
+	var t0 = std.millis();
+	var pend = ["", ""];
+	for(1) {
+		var done = p.exited();
+		var chunks = [p.read("stdout"), p.read("stderr")];
+		for(i, c : chunks) {
+			if(c == "")
+				continue;
+			if(i == 0)
+				res.out += c;
+			else
+				res.err += c;
+			if(on_line) {
+				var text = pend[i] + std.string(c).replace("\r", "\n");
+				var parts = text.split("\n");
+				pend[i] = parts.pop_back();
+				for(part : parts)
+					on_line(i == 0 ? "stdout" : "stderr", part);
+			}
+		}
+		if(done)
+			break;
+		if(timeout_ms > 0 && std.millis() - t0 > timeout_ms) {
+			p.kill();
+			res.error = "timed out after " + std.string(timeout_ms) + " ms";
+			return res;
+		}
+		if(tick)
+			tick();
+		std.sleep(50);
+	}
+	if(on_line) {
+		for(i, rest : pend) {
+			if(rest != "")
+				on_line(i == 0 ? "stdout" : "stderr", rest);
+		}
+	}
+	res.code = p.poll() ??? -1;
+	return res;
+}
+
+// ---- small helpers ----
+
+pyenv_os() {
+	return subprocess.platform();
+}
+
+// x64 or arm64 (what uv is downloaded for)
+pyenv_arch() {
+	if(PYENV_ARCH != "")
+		return PYENV_ARCH;
+	var a = "";
+	if(pyenv_os() == "windows")
+		a = std.string(std.system_path("%PROCESSOR_ARCHITECTURE%")).uppercase();
+	else {
+		var r = pyenv_run(["uname", "-m"]);
+		a = std.string(r.out).strip().lowercase();
+	}
+	PYENV_ARCH = (a == "arm64" || a == "aarch64") ? "arm64" : "x64";
+	return PYENV_ARCH;
+}
+
+// The key of PYENV_UV_BUILDS for this machine: linux_x64, macos_arm64, windows_x64, ...
+pyenv_target() {
+	return pyenv_os() + "_" + pyenv_arch();
+}
+
+pyenv_exe(name) {
+	return pyenv_os() == "windows" ? name + ".exe" : name;
+}
+
+// The python of a venv: Scripts\python.exe on Windows, bin/python elsewhere
+pyenv_venv_python(venv) {
+	if(pyenv_os() == "windows")
+		return venv + "/Scripts/python.exe";
+	return venv + "/bin/python";
+}
+
+// 8 hex digits of a number below 2^32
+pyenv_hex32(n) {
+	var digits = "0123456789abcdef";
+	var s = "";
+	for(i = 0; i < 8; i++) {
+		s = digits.substr(n % 16, 1) + s;
+		n = std.int(n / 16);
+	}
+	return s;
+}
+
+// 16 hex digits: two 32 bit FNV-1a hashes of the UTF-8 bytes (different start values). No cryptography: a name
+pyenv_hash(text) {
+	var b = std.buffer();
+	b.append(std.string(text));
+	var h1 = 2166136261;
+	var h2 = 3735928559;
+	for(x : b) {
+		h1 = ((h1 ^ x) * 16777619) & 0xFFFFFFFF;
+		h2 = ((h2 ^ x) * 16777619) & 0xFFFFFFFF;
+		h2 = (h2 ^ 0x5bd1e995) & 0xFFFFFFFF;
+	}
+	return pyenv_hex32(h1) + pyenv_hex32(h2);
+}
+
+// A line of uv without the line end (uv runs with NO_COLOR: no colour codes)
+pyenv_clean_line(line) {
+	return std.string(line).replace("\r", "").rtrim();
+}
+
+// ---- what an asset declares ----
+
+// The asset folder of a script: Name.py/ of Name.py/src/__init__.py (or Name.py/__init__.py); "" for a single file
+pyenv_asset_root(script_path) {
+	var dir = fileio.file_dir(script_path);
+	if(fileio.file_name(dir) == "src") {
+		var up = fileio.file_dir(dir);
+		if(up.ends(".py"))
+			return up;
+	}
+	if(dir.ends(".py") && fileio.file_name(script_path) == "__init__.py")
+		return dir;
+	return "";
+}
+
+// The requirement lines of a requirements.txt: no comments, no empty lines. Options (-r, --index-url) are left out
+// with a problem: they belong in uv's own configuration
+pyenv_read_requirements(path, problems) {
+	var deps = [];
+	var text = std.string(fileio.read_string(path)).replace("\r", "");
+	for(line : text.split("\n")) {
+		var t = std.string(line);
+		var hash_at = t.find(" #");
+		if(t.starts("#"))
+			t = "";
+		else if(hash_at >= 0)
+			t = t.substr(0, hash_at);
+		t = t.strip();
+		if(t == "")
+			continue;
+		if(t.starts("-")) {
+			problems.push_back(fileio.file_name(path) + ": the option \"" + t + "\" is ignored (only package lines)");
+			continue;
+		}
+		deps.push_back(t);
+	}
+	return deps;
+}
+
+// What the script needs: [python, dependencies, problems, sources, declared]. python "" = the default.
+// dependencies sorted and without doubles (the key does not depend on their order)
+pyenv_spec(script_path) {
+	var spec = [python = "", dependencies = [], problems = [], sources = [], declared = false];
+	var root = pyenv_asset_root(script_path);
+	if(root == "")
+		return spec;
+	var deps = [];
+	var aj = root + "/asset.json";
+	if(fileio.exists(aj)) {
+		var info = None;
+		try {
+			info = fileio.read_json(aj);
+		}
+		catch(e) {
+			spec.problems.push_back("asset.json: " + e);
+		}
+		if(std.is_json(info) && info.has("python")) {
+			var py = info["python"];
+			if(std.is_json(py) && !std.is_list(py)) {
+				if(py.has("version") && py["version"] != None)
+					spec.python = std.string(py["version"]).strip();
+				if(py.has("dependencies")) {
+					if(std.is_list(py["dependencies"])) {
+						for(d : py["dependencies"])
+							deps.push_back(std.string(d).strip());
+					}
+					else
+						spec.problems.push_back("asset.json: python.dependencies is no list of strings");
+				}
+				spec.sources.push_back(aj);
+			}
+			else
+				spec.problems.push_back("asset.json: \"python\" is no object ({\"version\": ..., \"dependencies\": [...]})");
+		}
+	}
+	for(req : [root + "/requirements.txt", root + "/src/requirements.txt"]) {
+		if(fileio.exists(req)) {
+			for(d : pyenv_read_requirements(req, spec.problems))
+				deps.push_back(d);
+			spec.sources.push_back(req);
+		}
+	}
+	var seen = std.json();
+	var clean = [];
+	for(d : deps) {
+		if(d == "" || seen.has(d))
+			continue;
+		seen[d] = 1;
+		clean.push_back(d);
+	}
+	clean.sort();
+	spec.dependencies = clean;
+	spec.declared = spec.python != "" || clean.size() > 0;
+	return spec;
+}
+
+// The key of an environment: Python version and dependencies (sorted), 16 hex digits
+pyenv_key(python, dependencies) {
+	var text = "vibevj-pyenv " + std.string(PYENV_FORMAT) + "\npython " + std.string(python).strip() + "\n";
+	var sorted_deps = [];
+	for(d : dependencies)
+		sorted_deps.push_back(std.string(d).strip());
+	sorted_deps.sort();
+	for(d : sorted_deps)
+		text += d + "\n";
+	return pyenv_hash(text);
+}
+
+// ---- configuration and folders ----
+
+// configs/python.json of the app (python: a Python for every asset instead of uv, cache: the cache folder, uv: the uv
+// to use, default_python: the version of an asset that names none), with the fields of over on top
+pyenv_config(over = None) {
+	var cfg = std.json();
+	try {
+		if(fileio.exists("configs/python.json")) {
+			var j = fileio.read_json("configs/python.json");
+			if(std.is_json(j) && !std.is_list(j))
+				cfg = j;
+		}
+	}
+	catch(e) {}
+	if(std.is_json(over)) {
+		for(k, v : over)
+			cfg[k] = v;
+	}
+	return cfg;
+}
+
+// The cache folder: "cache" of the configuration, else Windows %LOCALAPPDATA%\VibeVJ\python, macOS
+// ~/Library/Caches/VibeVJ/python, Linux ~/.cache/VibeVJ/python
+pyenv_cache_root(cfg = None) {
+	if(std.is_json(cfg) && cfg.has("cache") && std.is_string(cfg["cache"]) && cfg["cache"] != "")
+		return fileio.absolute_path(cfg["cache"]).replace("\\", "/");
+	var os = pyenv_os();
+	if(os == "windows") {
+		var la = std.string(std.system_path("%LOCALAPPDATA%"));
+		if(la != "" && !la.contains("%"))
+			return la.replace("\\", "/") + "/VibeVJ/python";
+		return std.string(std.local_app_cache("VibeVJ", "python")).replace("\\", "/");
+	}
+	if(os == "macos")
+		return std.home() + "/Library/Caches/VibeVJ/python";
+	return std.home() + "/.cache/VibeVJ/python";
+}
+
+pyenv_env_dir(root, env_key) {
+	return root + "/venvs/" + env_key;
+}
+
+pyenv_lock_path(root, env_key) {
+	return root + "/venvs/" + env_key + ".lock";
+}
+
+// The marker of a built environment, None when it is not (completely) there
+pyenv_ready(root, env_key) {
+	var dir = pyenv_env_dir(root, env_key);
+	var marker = dir + "/" + PYENV_MARKER;
+	if(!fileio.exists(marker) || !fileio.exists(pyenv_venv_python(dir)))
+		return None;
+	try {
+		var m = fileio.read_json(marker);
+		if(std.is_json(m) && m.has("env_key") && m["env_key"] == env_key)
+			return m;
+	}
+	catch(e) {}
+	return None;
+}
+
+// The environment uv runs with: its folders under the cache, only Pythons uv installed (not the system's)
+pyenv_uv_env(root) {
+	return [
+		"UV_CACHE_DIR=" + root + "/uv-cache",
+		"UV_PYTHON_INSTALL_DIR=" + root + "/python",
+		"UV_PYTHON_BIN_DIR=" + root + "/python-bin",
+		"UV_PYTHON_PREFERENCE=only-managed",
+		"UV_NO_PROGRESS=1",
+		"NO_COLOR=1",
+		"VIRTUAL_ENV="
+	];
+}
+
+// The version of a uv command ("0.13.6"), "" when it does not run
+pyenv_uv_version(cmd) {
+	var r = pyenv_run([cmd, "--version"], None, "", None, 20000);
+	var out = std.string(r.out).strip();
+	if(r.code !== 0 || !out.starts("uv "))
+		return "";
+	var parts = out.split(" ");
+	return parts.size() > 1 ? std.string(parts[1]) : "";
+}
+
+// Lower-case hex SHA-256 of a file with the tools of the system (sha256sum, shasum, certutil, openssl); "" without one
+pyenv_sha256(path) {
+	var os = pyenv_os();
+	var cmds = [];
+	if(os == "windows")
+		cmds = [["certutil", "-hashfile", path.replace("/", "\\"), "SHA256"]];
+	else if(os == "macos")
+		cmds = [["shasum", "-a", "256", path], ["openssl", "dgst", "-sha256", "-r", path]];
+	else
+		cmds = [["sha256sum", path], ["shasum", "-a", "256", path], ["openssl", "dgst", "-sha256", "-r", path]];
+	for(c : cmds) {
+		var r = pyenv_run(c, None, "", None, 120000);
+		if(r.code !== 0)
+			continue;
+		// "<hash>  <file>"; certutil: a line of its own, old versions with spaces between the bytes
+		for(line : std.string(r.out).replace("\r", "").split("\n")) {
+			var t = std.string(line).strip();
+			var h = os == "windows" ? t.replace(" ", "") : std.string(t.split(" ")[0]);
+			h = h.lowercase();
+			if(h.length() == 64 && h.find_first_not_of("0123456789abcdef") == -1)
+				return h;
+		}
+	}
+	return "";
+}
+
+// ---- uv ----
+
+// The folder VibeVJ keeps its own uv in
+pyenv_uv_tools_dir(root) {
+	return root + "/tools/uv-" + PYENV_UV_VERSION;
+}
+
+// A uv that runs, without a download: [path, version, origin] or None.
+// opts: uv (a path or command that wins), no_path (true: not the one on the PATH; the test of the download)
+pyenv_find_uv(root, opts = None) {
+	var o = std.is_json(opts) ? opts : std.json();
+	if(o.has("uv") && std.is_string(o["uv"]) && o["uv"] != "") {
+		var v = pyenv_uv_version(o["uv"]);
+		if(v != "")
+			return [path = o["uv"], version = v, origin = "configured"];
+	}
+	if(!(o.has("no_path") && o["no_path"])) {
+		var vp = pyenv_uv_version("uv");
+		if(vp != "")
+			return [path = "uv", version = vp, origin = "PATH"];
+	}
+	var own = pyenv_uv_tools_dir(root) + "/" + pyenv_exe("uv");
+	if(fileio.exists(own)) {
+		var vo = pyenv_uv_version(own);
+		if(vo != "")
+			return [path = own, version = vo, origin = "download"];
+	}
+	return None;
+}
+
+// The executable of uv in an unpacked release: at the top (Windows zip) or in the one folder of the archive
+pyenv_find_in_unpacked(dir, name) {
+	if(fileio.exists(dir + "/" + name))
+		return dir + "/" + name;
+	for(sub : fileio.dirs(dir)) {
+		var full = std.string(sub);
+		if(!full.contains("/") && !full.contains("\\"))
+			full = dir + "/" + full;
+		if(fileio.exists(full + "/" + name))
+			return full + "/" + name;
+	}
+	return "";
+}
+
+// Downloads uv of PYENV_UV_VERSION into the tools folder: [ok, path, version, error].
+// opts: uv_url (the folder of the archives instead of the release), uv_sha256 (the expected hash instead of the one of
+// PYENV_UV_BUILDS: the test gives a wrong one)
+pyenv_fetch_uv(root, opts = None, out = None) {
+	var o = std.is_json(opts) ? opts : std.json();
+	var target = pyenv_target();
+	if(!PYENV_UV_BUILDS.has(target))
+		return [ok = false, error = "uv has no build for " + target + " here: install uv yourself (https://docs.astral.sh/uv/) or name it in configs/python.json"];
+	var build = PYENV_UV_BUILDS[target];
+	var want = o.has("uv_sha256") ? std.string(o["uv_sha256"]) : build["sha256"];
+	var base = o.has("uv_url") ? std.string(o["uv_url"]) : PYENV_UV_URL + PYENV_UV_VERSION + "/";
+	var url = base + build["archive"];
+	var dest = pyenv_uv_tools_dir(root);
+	var tmp = dest + ".download";
+	if(fileio.exists(tmp))
+		fileio.remove(tmp);
+	fileio.mkdir(tmp + "/unpacked");
+	var archive = tmp + "/" + build["archive"];
+	if(out)
+		out("status", "Downloading uv " + PYENV_UV_VERSION);
+	var r = pyenv_run(["curl", "-L", "--fail", "--silent", "--show-error", "--retry", "2", "-o", archive, url], None, "", None, 300000);
+	if(r.code !== 0) {
+		fileio.remove(tmp);
+		var why = std.string(r.err).strip();
+		if(why == "")
+			why = r.error;
+		return [ok = false, error = "uv could not be downloaded (" + url + "): " + why];
+	}
+	var got = pyenv_sha256(archive);
+	if(got != want) {
+		fileio.remove(tmp);
+		if(got == "")
+			return [ok = false, error = "the SHA-256 of the uv download could not be computed (no sha256sum / shasum / certutil)"];
+		return [ok = false, error = "the uv download has the wrong SHA-256 " + got + " (expected " + want + "): not used"];
+	}
+	var tar = "tar";
+	if(pyenv_os() == "windows") {
+		// tar of Windows (bsdtar, unpacks .zip too), not the GNU tar of Git or MSYS2 that may come first in PATH
+		var sys_tar = std.string(std.system_path("%SystemRoot%\\System32\\tar.exe"));
+		if(!sys_tar.contains("%") && fileio.exists(sys_tar))
+			tar = sys_tar;
+	}
+	r = pyenv_run([tar, "-xf", archive, "-C", tmp + "/unpacked"], None, "", None, 120000);
+	var exe = pyenv_find_in_unpacked(tmp + "/unpacked", pyenv_exe("uv"));
+	if(r.code !== 0 || exe == "") {
+		fileio.remove(tmp);
+		return [ok = false, error = "the uv download could not be unpacked: " + std.string(r.err).strip()];
+	}
+	if(fileio.exists(dest))
+		fileio.remove(dest);
+	fileio.mkdir(dest);
+	fileio.copy(exe, dest + "/" + pyenv_exe("uv"));
+	fileio.remove(tmp);
+	var path = dest + "/" + pyenv_exe("uv");
+	var v = pyenv_uv_version(path);
+	if(v == "")
+		return [ok = false, error = "the downloaded uv does not run (" + path + ")"];
+	return [ok = true, path = path, version = v];
+}
+
+// A uv: found or downloaded. [ok, path, version, origin, error]
+pyenv_get_uv(root, opts = None, out = None) {
+	var found = pyenv_find_uv(root, opts);
+	if(found) {
+		found.ok = true;
+		return found;
+	}
+	var o = std.is_json(opts) ? opts : std.json();
+	if(o.has("no_download") && o["no_download"])
+		return [ok = false, error = "no uv found (not on the PATH, none in " + pyenv_uv_tools_dir(root) + ")"];
+	var got = pyenv_fetch_uv(root, opts, out);
+	if(got.ok)
+		got.origin = "download";
+	return got;
+}
+
+// ---- the build (blocking: in the build process or a test) ----
+
+pyenv_lock_fresh(path, stale_ms = PYENV_LOCK_STALE_MS) {
+	if(!fileio.exists(path))
+		return false;
+	try {
+		var j = fileio.read_json(path);
+		var t = std.int(j["time"] ?? 0);
+		var age = std.millis() - t;
+		return age >= -stale_ms && age < stale_ms;
+	}
+	catch(e) {}
+	return false;
+}
+
+// The first line of an error of uv: "error: ..." or the line with the cross of its error tree; else the last line
+pyenv_uv_error_line(err) {
+	var lines = [];
+	for(l : std.string(err).replace("\r", "").split("\n")) {
+		var t = pyenv_clean_line(l).strip();
+		if(t != "")
+			lines.push_back(t);
+	}
+	for(i, t : lines) {
+		if(t.starts("error:")) {
+			var msg0 = t.substr(6).strip();
+			// uv 0.13: the reason on the next line ("cause: ...", older "Caused by: ...")
+			if(i + 1 < lines.size()) {
+				var nxt = std.string(lines[i + 1]);
+				if(nxt.starts("cause:") || nxt.starts("Caused by:"))
+					return msg0.removesuffix(":") + ": " + nxt.removeprefix("cause:").removeprefix("Caused by:").strip();
+			}
+			return msg0;
+		}
+		if(t.starts("×") || t.starts("x ")) {
+			var msg = t.removeprefix("×").removeprefix("x ").strip();
+			// the reason is on the next line (╰─▶ ...)
+			if(i + 1 < lines.size()) {
+				var why = std.string(lines[i + 1]).removeprefix("╰─▶").strip();
+				if(why != "")
+					return msg.removesuffix(":") + ": " + why;
+			}
+			return msg;
+		}
+	}
+	return lines.size() > 0 ? lines[lines.size() - 1] : "";
+}
+
+// The last lines of a text, for the detail of an error
+pyenv_tail(text, n = 25) {
+	var lines = std.string(text).replace("\r", "").split("\n");
+	var start = math.max(lines.size() - n, 0);
+	var s = "";
+	for(i = start; i < lines.size(); i++) {
+		var t = pyenv_clean_line(lines[i]);
+		if(t != "")
+			s += t + "\n";
+	}
+	return s.strip();
+}
+
+// Builds the environment of python + dependencies under root (nothing when it is there) and returns
+// [ok, kind, python, version, venv, env_key, error, detail, uv, uv_from]. kind of an error: uv (no uv), python (the
+// Python could not be installed), deps (a package that does not resolve or install), check, lock.
+// out(kind, text): "status" (what it does now) and "progress" (the last line of uv) while it runs.
+// opts: uv, no_path, no_download, uv_url, uv_sha256 (pyenv_get_uv), timeout_ms (of one uv call, default 30 min),
+// lock_stale_ms (when the lock of another build counts as left by a killed one, default PYENV_LOCK_STALE_MS)
+pyenv_build(root, python, dependencies, opts = None, out = None) {
+	var o = std.is_json(opts) ? opts : std.json();
+	var env_key = pyenv_key(python, dependencies);
+	var venv = pyenv_env_dir(root, env_key);
+	var res = [ok = false, kind = "", python = pyenv_venv_python(venv), version = "", venv = venv, env_key = env_key,
+		error = "", detail = "", uv = "", uv_from = ""];
+	var say = [out](kind, text) {
+		if(out)
+			out(kind, text);
+	};
+	var m = pyenv_ready(root, env_key);
+	if(m) {
+		res.ok = true;
+		res.version = m["version"] ?? "";
+		return res;
+	}
+	fileio.mkdir(root + "/venvs");
+	var lock = pyenv_lock_path(root, env_key);
+	// Another VibeVJ builds it: wait for its end (its lock goes stale when it was killed)
+	var stale = std.int(o["lock_stale_ms"] ?? PYENV_LOCK_STALE_MS);
+	if(pyenv_lock_fresh(lock, stale)) {
+		say("status", "Waiting for another VibeVJ that installs this environment");
+		for(pyenv_lock_fresh(lock, stale))
+			std.sleep(1000);
+		m = pyenv_ready(root, env_key);
+		if(m) {
+			res.ok = true;
+			res.version = m["version"] ?? "";
+			return res;
+		}
+	}
+	var last_beat = 0;
+	var beat = [lock, &last_beat]() {
+		if(std.millis() - last_beat < 5000)
+			return;
+		last_beat = std.millis();
+		try {
+			fileio.write_json(lock, [time = last_beat]);
+		}
+		catch(e) {}
+	};
+	beat();
+	var fail = [&res, venv, lock](kind, error, detail = "") {
+		res.ok = false;
+		res.kind = kind;
+		res.error = error;
+		res.detail = detail;
+		// no half environment stays
+		if(fileio.exists(venv))
+			fileio.remove(venv);
+		if(fileio.exists(lock))
+			fileio.remove(lock);
+		return res;
+	};
+
+	say("status", "Getting uv");
+	var uv = pyenv_get_uv(root, o, say);
+	if(!uv.ok)
+		return fail("uv", uv.error);
+	res.uv = uv.version;
+	res.uv_from = uv.origin;
+	var env = pyenv_uv_env(root);
+	var timeout = std.int(o["timeout_ms"] ?? 1800000);
+	var progress = [out](stream, line) {
+		var t = pyenv_clean_line(line).strip();
+		if(t != "" && !t.starts("warning:") && out)
+			out("progress", t);
+	};
+
+	// A venv that has no marker is what a killed build left
+	if(fileio.exists(venv))
+		fileio.remove(venv);
+
+	var find = pyenv_run([uv.path, "python", "find", python], env, root, None, 60000);
+	if(find.code === 0)
+		say("status", "Making the environment (Python " + python + ")");
+	else
+		say("status", "Installing Python " + python);
+	var r = pyenv_run([uv.path, "venv", "--no-project", "--python", python, venv], env, root, progress, timeout, beat);
+	if(r.code !== 0) {
+		var why = pyenv_uv_error_line(r.err);
+		if(why == "")
+			why = r.error;
+		return fail("python", "Python " + python + " could not be installed: " + why, pyenv_tail(r.err));
+	}
+	var vpy = pyenv_venv_python(venv);
+	if(dependencies.size() > 0) {
+		var names = "";
+		for(d : dependencies)
+			names += (names == "" ? "" : ", ") + d;
+		say("status", "Installing dependencies: " + names);
+		var cmd = [uv.path, "pip", "install", "--python", vpy];
+		for(d : dependencies)
+			cmd.push_back(d);
+		r = pyenv_run(cmd, env, root, progress, timeout, beat);
+		if(r.code !== 0) {
+			var why2 = pyenv_uv_error_line(r.err);
+			if(why2 == "")
+				why2 = r.error;
+			return fail("deps", "The dependencies could not be installed: " + why2, pyenv_tail(r.err));
+		}
+	}
+	say("status", "Checking the environment");
+	r = pyenv_run([vpy, "-I", "-c", "import sys; sys.stdout.write('%d.%d.%d' % sys.version_info[:3])"], None, root, None, 60000);
+	if(r.code !== 0)
+		return fail("check", "The Python of the environment does not run: " + std.string(r.error) + std.string(r.err).strip(), pyenv_tail(r.err));
+	res.version = std.string(r.out).strip();
+	fileio.write_json(venv + "/" + PYENV_MARKER, [env_key = env_key, python = python, version = res.version,
+		dependencies = dependencies, uv = uv.version, built = std.timestamp()]);
+	if(fileio.exists(lock))
+		fileio.remove(lock);
+	res.ok = true;
+	return res;
+}
+
+// Removes an environment (it is made again on the next use). Its Python must not run (Windows keeps the files open)
+pyenv_remove_env(root, env_key) {
+	var dir = pyenv_env_dir(root, env_key);
+	if(fileio.exists(dir))
+		fileio.remove(dir);
+	return !fileio.exists(dir);
+}
+
+// ---- in the app: one build per key, in a process of its own ----
+
+// The builds of this run of VibeVJ, by the folder of the venv (shared by all generators: two of the same key wait for
+// one build)
+pyenv_registry() {
+	var g = std.global("py_env_builds");
+	var reg = g.get();
+	if(!std.is_json(reg)) {
+		g.set([builds = std.json(), started = 0]);
+		reg = g.get();
+	}
+	return reg;
+}
+
+// What a script runs with. Returns an entry; its state:
+//   "override"  configs/python.json names a python: entry.python
+//   "ready"     the environment is built: entry.python (its python), entry.version
+//   "building"  a build runs: entry.status_text, entry.progress; pyenv_poll(entry) until it changes
+//   "error"     the build failed: entry.error, entry.detail; pyenv_forget(entry) before a new try (Retry)
+//   "fallback"  no uv or no uv Python could be had for an asset that declares nothing: use the Python of the system
+// Always also: env_key, venv, python_request, dependencies, problems, declared, cache
+pyenv_for_script(script_path, over = None) {
+	var cfg = pyenv_config(over);
+	if(cfg.has("python") && cfg["python"]) {
+		return [state = "override", python = cfg["python"], env_key = "", venv = "", python_request = "",
+			dependencies = [], problems = [], declared = false, cache = ""];
+	}
+	var spec = pyenv_spec(script_path);
+	var root = pyenv_cache_root(cfg);
+	var py = spec.python;
+	if(py == "")
+		py = cfg.has("default_python") && cfg["default_python"] ? std.string(cfg["default_python"]) : PYENV_DEFAULT_PYTHON;
+	var env_key = pyenv_key(py, spec.dependencies);
+	var venv = pyenv_env_dir(root, env_key);
+	var reg = pyenv_registry();
+	var builds = reg["builds"];
+	if(builds.has(venv)) {
+		var known = builds[venv];
+		if(known["state"] != "ready")
+			return known;
+	}
+	var e = [state = "building", python = "", version = "", env_key = env_key, venv = venv, python_request = py,
+		dependencies = spec.dependencies, problems = spec.problems, declared = spec.declared, cache = root,
+		status_text = "Starting the installer", progress = "", error = "", detail = "", kind = "", rx = "", lines = [],
+		started = std.millis(), proc = None, result = None, uv = "", build_no = 0];
+	var m = pyenv_ready(root, env_key);
+	if(m) {
+		e.state = "ready";
+		e.python = pyenv_venv_python(venv);
+		e.version = m["version"] ?? "";
+		builds[venv] = e;
+		return e;
+	}
+	// The build process: shz runs py_env_build.shio with a request file
+	fileio.mkdir(root + "/venvs");
+	var req_path = root + "/venvs/" + env_key + ".request.json";
+	var opts = std.json();
+	for(k : ["uv", "no_path", "no_download", "uv_url", "uv_sha256", "timeout_ms", "lock_stale_ms"]) {
+		if(cfg.has(k))
+			opts[k] = cfg[k];
+	}
+	fileio.write_json(req_path, [root = root, python = py, dependencies = spec.dependencies, opts = opts]);
+	var p = subprocess.process();
+	p.pipes(true, true, true);
+	p.terminate_on_destroy(true);
+	var cmd = [std.local_executable(), fileio.absolute_path(PYENV_DIR + "/py_env_build.shio"), req_path];
+	var ok = false;
+	try {
+		ok = p.start(cmd, std.wd(), false);
+	}
+	catch(err) {}
+	reg["started"] = std.int(reg["started"] ?? 0) + 1;
+	e.build_no = reg["started"];
+	if(!ok) {
+		e.state = "error";
+		e.kind = "start";
+		e.error = "The installer could not be started: " + std.string(p.error());
+		e.detail = std.string(cmd[0]) + " " + std.string(cmd[1]);
+	}
+	else {
+		p.close_stdin();
+		e.proc = p;
+	}
+	builds[venv] = e;
+	return e;
+}
+
+// Reads what the build process of an entry wrote. Call it every frame while entry.state is "building"; returns entry
+pyenv_poll(e) {
+	if(!e || e["state"] != "building" || !e["proc"])
+		return e;
+	var p = e["proc"];
+	var done = p.exited();
+	var text = std.string(p.read("stdout"));
+	var errs = std.string(p.read("stderr"));
+	if(errs != "")
+		text += errs;
+	if(text != "") {
+		var all_text = std.string(e["rx"]) + text.replace("\r", "");
+		var parts = all_text.split("\n");
+		e["rx"] = parts.pop_back();
+		for(line : parts) {
+			var l = std.string(line);
+			if(l.starts("@status ")) {
+				e["status_text"] = l.substr(8);
+				e["progress"] = "";
+			}
+			else if(l.starts("@progress "))
+				e["progress"] = l.substr(10);
+			else if(l.starts("@result ")) {
+				var r = std.json();
+				if(r.from_string(l.substr(8)))
+					e["result"] = r;
+			}
+			else if(l.strip() != "") {
+				e["lines"].push_back(l);
+				if(e["lines"].size() > 40)
+					e["lines"].erase(0);
+			}
+		}
+	}
+	if(!done)
+		return e;
+	var r = e["result"];
+	e["proc"] = None;
+	if(std.is_json(r) && r["ok"]) {
+		e["state"] = "ready";
+		e["python"] = r["python"];
+		e["version"] = r["version"] ?? "";
+		e["uv"] = r["uv"] ?? "";
+		return e;
+	}
+	if(std.is_json(r)) {
+		e["kind"] = r["kind"] ?? "";
+		e["error"] = r["error"] ?? "";
+		e["detail"] = r["detail"] ?? "";
+	}
+	else {
+		e["kind"] = "died";
+		e["error"] = "The installer ended without a result (exit code " + std.string(p.poll() ??? -1) + ")";
+		var d = "";
+		for(l : e["lines"])
+			d += l + "\n";
+		e["detail"] = d.strip();
+	}
+	// Without uv or its Python an asset that asks for nothing runs with the Python of the system
+	if(!e["declared"] && (e["kind"] == "uv" || e["kind"] == "python"))
+		e["state"] = "fallback";
+	else
+		e["state"] = "error";
+	return e;
+}
+
+// Forgets a build that failed (or a fallback), so the next pyenv_for_script() tries again
+pyenv_forget(e) {
+	if(!e || e["state"] == "building")
+		return;
+	var builds = pyenv_registry()["builds"];
+	if(e["venv"] != "" && builds.has(e["venv"]))
+		builds.remove(e["venv"]);
+}

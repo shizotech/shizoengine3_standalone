@@ -1,6 +1,7 @@
 
 #include "generatoritem"
 #include "engine/interfaces/aiinterface"
+#include "generator_moves"
 
 using eigen;
 
@@ -35,6 +36,7 @@ class clipview
 	link_shaders_lazy = false;
 	
 	on_change_callback = None; //callback(item, row, col) If item == None that means the cell was removed...
+	on_clip_start_callback = None; //callback(cell): a clip starts (or is queued after a running transition), #374
 	//Undo / redo (#350): engine.env.clip_views finds this view by its uid; clip_recording: a user action on clips runs
 	uid = "";
 	listed = false;
@@ -112,8 +114,8 @@ class clipview
 		
 		grid.dragdrop_enabled(true);
 		
-		//What the grid does not take (#346: a generator, an area, a drag without a path) gets the red outline of the
-		//screen and is not dropped
+		//What the grid does not take (#346: an area, a drag without a path) gets the red outline of the screen and is
+		//not dropped
 		grid.content().on_dragdrop_hover([this, grid](payload, pos) {
 			return grid.dragdrop_enabled() && this.takes_drop(payload);
 		});
@@ -146,6 +148,10 @@ class clipview
 				});
 				return true;
 			}
+
+			//Generators Alt + dragged out of a Patchview (#348): a clip of them, or more entries of the clip there
+			if(this.is_generators_payload(payload))
+				return this.drop_generators(row, col);
 			
 			//An asset: a new clip, or one more entry of the clip in that cell
 			path = fileio.relative_path_cwd(payload.path);	
@@ -172,8 +178,14 @@ class clipview
 		
 		set_size(3,4);
 		
+		//In: a picture for the clips whose input is off (#374, link_shaders). A link that goes leaves its last picture
+		//in the control (in_port_value), the clips are linked again without it
 		input_ctrl.callback([this](v){
 			this.link_shaders();
+		});
+		input_ctrl.on_unlink([this](ctrl1, ctrl2){
+			if(ctrl2 == this.input_ctrl)
+				this.link_shaders_lazy = true;
 		});
 	}
 
@@ -350,11 +362,13 @@ class clipview
 								cell_item.dispatch("set_input", [name=in.name, value=target_layer_out]);
 						}
 						else {
-							
+							//Off: the default input of the clip gets the picture on the In port of the Clipview
+							//(#374), its other inputs nothing. Nothing linked to In: None, as before
+							in_value = in.is_default ? this.in_port_value() : None;
 							if(cell.attr.has_default_input)
-								cell_item.dispatch("get_default_input").value(None);
+								cell_item.dispatch("get_default_input").value(in_value);
 							else
-								cell_item.dispatch("set_input", [name=in.name, value=None]);
+								cell_item.dispatch("set_input", [name=in.name, value=in_value]);
 						}
 					}
 		
@@ -389,6 +403,15 @@ class clipview
 		layer_out = layer_item.dispatch("get_default_output").value();
 			
 		composition_shader.dispatch("get_default_input").value(layer_out);
+	}
+
+	//The picture on the In port of the Clipview (#374), None when nothing is linked to it. Not the value alone: a link
+	//that goes leaves its last picture in the control
+	in_port_value() {
+		if(!input_ctrl || input_ctrl.link_count_incoming() == 0)
+			return None;
+		v = input_ctrl.value();
+		return v ? v : None;
 	}
 
 	//A control of the shader of a layer (layerblend.glsl, the first item of its stack), by the name of its uniform
@@ -627,6 +650,10 @@ class clipview
 				custom_transition = cell.attr.transition.value();
 				if(custom_transition >= 0.0)
 					transition_value = custom_transition;
+			
+			//Before the layer macros read the macros of the clip: the CueList sets them first (#374)
+			if(this.on_clip_start_callback)
+				this.on_clip_start_callback(cell);
 			
 			layer_macros = layer_controls[row];
 			if(layer_macros.map_to_clip_macros.value()) {
@@ -1044,8 +1071,9 @@ class clipview
 	}
 
 	//from_state: the clip comes from a saved state, whose load_state fills its stack right after; the clip stays even
-	//when its own asset no longer exists, so its saved entries are not lost (#202)
-	add_generator(path, row, col, guid = "", auto_select_preview = true, from_state = false) {
+	//when its own asset no longer exists, so its saved entries are not lost (#202). fill(clip): makes the first entry of
+	//the stack instead of a new generator of path (a generator moved or copied from a Patchview, #348), true when it did
+	add_generator(path, row, col, guid = "", auto_select_preview = true, from_state = false, fill = None) {
 		if(row >= 0 && col >= 0) {
 			new_rows = grid.rows();
 			new_cols = grid.cols();
@@ -1123,6 +1151,10 @@ class clipview
 			item.dispatch("on_user_step", [this, cell](name, action){
 				this.clip_step(name, [[view = this, row = cell.row(), col = cell.col()]], action);
 			});
+			//Generators of a Patchview dropped on the entries of the clip (#348): more entries of it
+			item.dispatch("on_generators_drop", [this, cell](stack){
+				this.drop_generators(cell.row(), cell.col());
+			});
 		}
 		cell.attr.trigger_btn = trigger_btn;
 		cell.attr.hidden_label = hidden_label;
@@ -1157,7 +1189,8 @@ class clipview
 			item.dispatch("start_inactive", true);
 		
 		try {
-			if(!item.dispatch("add_generator", path) && !from_state)
+			made = std.is_function(fill) ? fill(item) : item.dispatch("add_generator", path);
+			if(!made && !from_state)
 				std.free(item);
 				std.free(cell);
 				return None;
@@ -1353,9 +1386,16 @@ class clipview
 				}
 				
 				cell.attr.inputs = [];
+				has_default = false;
 				
 				for(i = 0; i < item_inputs.size(); i++) {
 					in_name = item_inputs.key(i);
+					//The default input of the clip: its only one, or the first "input" / "iChannel0" of a shader, the
+					//rule of shader_loader.shio. It gets the In port of the Clipview while its link is off (#374)
+					lc = in_name.lowercase();
+					is_default = cell.attr.has_default_input || (!has_default && (lc == "input" || lc == "ichannel0"));
+					if(is_default)
+						has_default = true;
 					
 					splitter = inputs_vec.widget().anchor_left(0).anchor_right(0).fixed_height(30);
 					
@@ -1368,7 +1408,7 @@ class clipview
 						in_ctrl.value(0);
 						cell.attr.item.dispatch("set_input", [name=in_name, value=None]);
 						
-					cell.attr.inputs.push_back([name=in_name, ctrl=in_ctrl, type=in_type]);
+					cell.attr.inputs.push_back([name=in_name, ctrl=in_ctrl, type=in_type, is_default=is_default]);
 					
 					in_ctrl.callback([this](v){
 						link_shaders_lazy = true;
@@ -1420,12 +1460,20 @@ class clipview
 		return std.is_json(payload) && payload.has("cell") && payload.has("item") ? true : false;
 	}
 
-	//What a cell takes (#346): a clip, or an asset (a payload with a path, from the asset browser)
+	//A drag of generators out of a Patchview (generatorview.start_drag, #348)
+	is_generators_payload(payload) {
+		return std.is_json(payload) && payload.has("generators") && payload.generators ? true : false;
+	}
+
+	//What a cell takes (#346): a clip, generators of a Patchview (#348), or an asset (a payload with a path, from the
+	//asset browser)
 	takes_drop(payload) {
 		if(!std.is_json(payload))
 			return false;
 		if(is_clip_payload(payload))
 			return true;
+		if(is_generators_payload(payload))
+			return !nanogui.show_mode();
 		return payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
 	}
 
@@ -1468,6 +1516,145 @@ class clipview
 			return;
 		item.load_state(state);
 		item.node.deserialize_json(node_state, true);
+	}
+
+	// =========================================================================
+	// Generators dragged out of a Patchview (#348)
+	// =========================================================================
+
+	//Generators Alt + dragged out of a Patchview are dropped on the cell row, col (or on the entries of its clip). They
+	//become one clip, the first one its first entry and the others stacked on it in the order they were selected, or
+	//the last entries of the clip in that cell. They move alive: controls, links and MIDI mappings stay. Ctrl at the
+	//drop leaves copies, with the links the copied generators have among themselves (copy_links.shio). One step of the
+	//history. A CueList drops them here too (a cue of them)
+	drop_generators(row, col) {
+		if(row < 0 || col < 0)
+			return false;
+		drag = take_dragged_generators();
+		if(!drag)
+			return false;
+		source = drag.view;
+		gens = drag.gens;
+		what = gens.size() == 1 ? "generator" : "generators";
+
+		if(grid.screen().modifier_ctrl()) {
+			clip_step("Copy " + what, [[view = this, row = row, col = col]], [this, source, gens, row, col](){
+				this.copy_generators_in(source, gens, row, col);
+			});
+			return true;
+		}
+
+		moves = [];
+		for(i = 0; i < gens.size(); i++)
+			moves.push_back(generator_home(source, gens[i]));
+		clip_guid = move_generators_in(moves, row, col, "");
+		if(clip_guid == "")
+			return false;
+		source.select_none();
+
+		//Undone and done again alive, by the uids of the views and the guids, as this view may be gone by then
+		env = std.global("engine").env;
+		step = [view = uid, row = row, col = col, clip = clip_guid, moves = moves];
+		if(std.is_function(env.edit_step))
+			env.edit_step("Move " + what, [step](){
+				view = clip_view_by_uid(step.view);
+				if(view)
+					view.move_generators_out(step);
+				else
+					std.warn("Undo: the Clipview of the moved generators no longer exists, they are skipped");
+			}, [step](){
+				view = clip_view_by_uid(step.view);
+				if(view)
+					view.move_generators_in(step.moves, step.row, step.col, step.clip);
+				else
+					std.warn("Redo: the Clipview of the moved generators no longer exists, they are skipped");
+			});
+		return true;
+	}
+
+	//The generators of moves (generator_home) leave their Patchviews for the clip clip_guid, or for the clip in the cell
+	//row, col, or for a new clip there (with the guid clip_guid, for a redo). Returns the guid of the clip, "" when
+	//none took them
+	move_generators_in(moves, row, col, clip_guid) {
+		clip = clip_guid != "" && items.has(clip_guid) ? items[clip_guid] : None;
+		cell = grid.get_item_at(row, col);
+		if(!clip && cell && cell.attr.item) {
+			if(clip_guid != "") {
+				std.warn("Redo: the cell of the moved generators holds another clip now, they stay in their view");
+				return "";
+			}
+			clip = cell.attr.item;
+		}
+		first = 0;
+		if(!clip) {
+			m = moves[0];
+			view = patch_view_by_uid(m.view);
+			if(!view || !view.items.has(m.guid)) {
+				std.warn("A moved generator or its Patchview no longer exists, nothing is moved");
+				return "";
+			}
+			if(clip_guid != "")
+				wait_freed(); //the clip of the undo has to be gone before it is made again with its guid
+			clip = add_generator(view.items[m.guid].get_relative_path(), row, col, clip_guid, true, false, [m](made){
+				return adopt_moved(made, m);
+			});
+			if(!clip)
+				return "";
+			first = 1;
+		}
+		for(i = first; i < moves.size(); i++) {
+			if(!adopt_moved(clip, moves[i]))
+				std.warn("A moved generator or its Patchview no longer exists, it is skipped");
+		}
+		clip.extra_widgets.cell.attr.select_preview(true);
+		link_shaders();
+		return clip.guid;
+	}
+
+	//The undo of move_generators_in: the generators go back into their Patchviews, where they were. A clip the move
+	//made goes with them, a clip that was there before keeps its other entries
+	move_generators_out(step) {
+		if(!items.has(step.clip)) {
+			std.warn("Undo: the clip of the moved generators no longer exists, they are skipped");
+			return;
+		}
+		clip = items[step.clip];
+		for(k = step.moves.size() - 1; k >= 0; k--)
+			return_moved(clip, step.moves[k]);
+		if(clip.dispatch("is_empty"))
+			clip.on_close();
+		else
+			clip.dispatch("link_items");
+		link_shaders();
+	}
+
+	//Ctrl at the drop: copies of gens (generators of the Patchview source) in the cell row, col, one clip of them or
+	//the last entries of the clip there, with the links among them
+	copy_generators_in(source, gens, row, col) {
+		cell = grid.get_item_at(row, col);
+		clip = cell && cell.attr.item ? cell.attr.item : None;
+		snaps = [];
+		copies = [];
+		for(i = 0; i < gens.size(); i++) {
+			gen = gens[i];
+			entry = generator_entry(gen);
+			copy = None;
+			if(!clip) {
+				clip = add_generator(gen.get_relative_path(), row, col, "", true, false, [entry](made){
+					return made.dispatch("add_entry", entry) ? true : false;
+				});
+				if(clip)
+					copy = last_entry(clip);
+			}
+			else
+				copy = clip.dispatch("add_entry", entry);
+			snaps.push_back(source.snapshot_generator(gen));
+			copies.push_back(copy);
+		}
+		link_copies(snaps, copies);
+		if(clip)
+			clip.extra_widgets.cell.attr.select_preview(true);
+		link_shaders();
 	}
 
 	//An asset dropped on the cell row, col: a new clip, or one more entry of the clip in it
@@ -1722,6 +1909,14 @@ class clipview
 		return item;
 	}
 
+	//A new clip in the cell row, col in place of the clip there and its stack (add_item with clear, #808)
+	replace_generator(path, row, col) {
+		cell = grid.get_item_at(row, col);
+		if(cell && cell.attr.item)
+			cell.attr.item.on_close();
+		return this.add_generator(path, row, col);
+	}
+
 	save_state() {
 		states = [grid_states=[], rows=grid.rows(), cols=grid.cols(), livemode=livemode.pushed()];
 			
@@ -1859,6 +2054,11 @@ class clipview
 
 	on_change(cb) {
 		on_change_callback = cb;
+	}
+
+	//cb(cell) is called when a clip of the grid starts, before the layer takes its macros (the CueList, #374)
+	on_clip_start(cb) {
+		on_clip_start_callback = cb;
 	}
 
 	load_in_progress = false;

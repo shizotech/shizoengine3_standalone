@@ -1,7 +1,9 @@
 
 #include "generatoritem"
 
-//TODO: this can be dragged into the clipview to stack effects onto sources, should include the sidebar (like in v2)
+//The stack of a clip (a cell of the Clipview, a clip of the timeline): its entries run one after the other, the output
+//of one into the default input of the next. Assets and generators dragged out of a Patchview (#348) are dropped on
+//the list of its entries
 
 class stackview
 {
@@ -17,6 +19,9 @@ class stackview
 	on_items_changed = None;
 	//callback(name, action): runs a user action on the entries as one step of the undo history (the Clipview, #350)
 	on_user_step = None;
+	//callback(stack): generators dragged out of a Patchview are dropped on the entries (#348). The owner of the clip
+	//(Clipview, timeline) takes them, as one step of its history. None: the stack does not take them
+	on_generators_drop = None;
 	
 	no_delete_first_item = false;
 	
@@ -32,7 +37,8 @@ class stackview
 		ctrl_area = area.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(250).vscroll().anchor(0).content().layout(nanogui.layout_vertical());
 		item_area = area.widget().anchor_left(250).anchor_top(0).anchor_bottom(0).anchor_right(0);
 		
-		//Only assets (a payload with a path, #346): anything else gets the red outline of the screen and is not dropped
+		//Assets (a payload with a path, #346) and generators of a Patchview (#348): anything else gets the red outline
+		//of the screen and is not dropped
 		ctrl_area.content().on_dragdrop_hover([this](payload, pos) {
 			return this.takes_drop(payload);
 		});
@@ -40,6 +46,10 @@ class stackview
 		ctrl_area.content().on_dragdrop([this, area](payload, pos) {
 			if(!this.takes_drop(payload))
 				return false;
+			if(payload.has("generators") && payload.generators) {
+				this.on_generators_drop(this);
+				return true;
+			}
 			path = fileio.relative_path_cwd(payload.path);	
 			
 			this.user_step("Add to clip", [this, path](){
@@ -55,9 +65,14 @@ class stackview
 		settings_area.visible(false);
 	}
 
-	//An asset dragged from the asset browser: a payload with a path
+	//An asset dragged from the asset browser (a payload with a path), generators of a Patchview when the owner of the
+	//clip takes them
 	takes_drop(payload) {
-		return std.is_json(payload) && payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
+		if(!std.is_json(payload))
+			return false;
+		if(payload.has("generators") && payload.generators)
+			return std.is_function(on_generators_drop) && !nanogui.show_mode() ? true : false;
+		return payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
 	}
 
 	dispatch(cmd, value) {		
@@ -76,6 +91,28 @@ class stackview
 			on_user_step = value;
 			return None;
 		}
+
+		if(cmd == "on_generators_drop") {
+			on_generators_drop = value;
+			return None;
+		}
+
+		//A generator that lives in another view becomes the last entry (#348)
+		if(cmd == "adopt_generator")
+			return adopt_generator(value);
+
+		//An entry leaves the stack alive (value: its guid), the undo of adopt_generator
+		if(cmd == "release_entry")
+			return release_entry(value);
+
+		if(cmd == "link_items") {
+			link_items();
+			return None;
+		}
+
+		//No entries left, also none whose asset is missing: the clip would go with the next link_items
+		if(cmd == "is_empty")
+			return items.size() == 0 && missing.size() == 0 ? true : false;
 		
 		if(cmd == "start_inactive") {
 			start_inactive = value;
@@ -150,6 +187,54 @@ class stackview
 		if(start_inactive)
 			item.set_active(false);
 		
+		return take_item(item, do_init);
+	}
+
+	//A generator dragged out of a Patchview (#348) becomes the last entry alive: its controls, links and MIDI mappings
+	//stay. It runs when the clip runs, as the other entries. Returns it
+	adopt_generator(gen) {
+		if(!gen || !gen.window)
+			return None;
+		gen.set_collapsed(false);
+		window = gen.window;
+		window.move_to(item_area);
+		window.clear_anchors();
+		window.position(vec2f(0, 0));
+		window.header_enabled(false);
+		window.snap_grid(0);
+		//The handlers of the Patchview (select, Alt + drag) belong to the view it left
+		window.on_mouse_button(None);
+		window.on_grab(None);
+		gen.on_user_close = None;
+		return take_item(gen, true);
+	}
+
+	//The entry guid leaves the stack alive (the undo of a move into the clip, #348): its row in the list goes, the
+	//generator does not. Its window is still in the stack: the caller moves it out, then dispatches "link_items" (a
+	//stack without entries closes its clip then, with what is still in it). Returns the generator, None when the
+	//stack has no such entry
+	release_entry(guid) {
+		if(!items.has(guid))
+			return None;
+		gen = items[guid];
+		items.erase(guid);
+		//The link the stack made from the entry before into its default input
+		default_in = gen.dispatch("get_default_input");
+		if(default_in) {
+			default_in.remove_all_links();
+			default_in.visible(true);
+		}
+		if(gen.extra_widgets && gen.extra_widgets.entry_cnt)
+			std.free(gen.extra_widgets.entry_cnt);
+		gen.extra_widgets = [];
+		gen.on_close = None;
+		gen.window.visible(true);
+		return gen;
+	}
+
+	//An entry made here or taken from another view: its row in the list of entries, its window in the stack
+	take_item(item, do_init) {
+		path = item.path;
 		item.window.anchor(0).visible(false);
 		item.window.movable(false);
 		item.window.resizable(false);
@@ -161,9 +246,11 @@ class stackview
 		entry_btn.on_change([this, item, entry_btn](v){
 			if(v) {
 				for(i = 0; i < items.size(); i++) {
-					if(!items[i])
+					if(!items[i]) {
 						items.erase(i);
 						i--;
+						continue;
+					}
 					items[i].extra_widgets.entry_btn.pushed(false);
 					cb = items[i].extra_widgets.entry_btn.on_change();
 					cb(false);

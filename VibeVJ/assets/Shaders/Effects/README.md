@@ -10,17 +10,18 @@ Effects shaders transform input textures/video into new visuals. They typically 
 
 | Category | Description |
 |----------|-------------|
-| **Backgrounds** | Background generation and processing shaders |
 | **Color** | Color manipulation and adjustment effects |
 | **Examples** | Reference and example effect shaders |
-| **Exciters** | Exciter-based effect shaders |
-| **Feedback** | Feedback loop and recursive effects |
+| **Exciters** | Strobe, chromatic and glitch effects |
+| **Feedback&Blur** | Feedback loops, blurs, the frame cache (TimeMachine), flow smear |
 | **Glow&Light** | Glow, bloom, and lighting effects |
 | **Kaleidoscope** | Kaleidoscope and symmetry effects |
-| **Morph** | Morphing and transformation effects |
-| **Patterns** | Pattern generation and modulation effects |
+| **Mapping** | Projection mapping helpers (edge blend, masks) |
+| **Morph&Mirror** | Displacement, mirroring, morphing, the Instancer |
 | **Retro** | Retro, vintage, and analog emulation effects |
-| **Utility** | Effect utility and helper shaders |
+| **Utility** | Effect utility and helper shaders (optical flow, transform, composite) |
+| **Video3D** | The input picture turned into 3D or into time: Rutt/Etra scanlines, point cloud, voxels, slit scan, datamosh (#586) |
+| **basic**, **morph** | Older distortion and cloning effects |
 
 ## Shader Format
 

@@ -56,7 +56,8 @@ function getActiveId() {
   return localStorage.getItem(ACTIVE_KEY);
 }
 function setActiveId(id) {
-  localStorage.setItem(ACTIVE_KEY, id);
+  if (id) localStorage.setItem(ACTIVE_KEY, id);
+  else localStorage.removeItem(ACTIVE_KEY);
 }
 function generateId() {
   return 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
@@ -200,69 +201,70 @@ function loadConversationHTML(conv) {
    
    // ── RECONSTRUCT AGENT FLOW STATE FROM DOM ──
    // Extract all worker sub-bubbles from loaded DOM
-   const allWorkerSubBubbles = messagesInner.querySelectorAll('[id^="worker-"]');
-   const loadedWorkerGroupBubbles = Array.from(messagesInner.querySelectorAll('.bubble.role-assistant'));
-   
-   // Extract worker IDs from DOM element IDs
-   const extractedWorkerIds = new Set();
-   const reconstructedWorkerSubBubbles = {};
-   const reconstructedWorkerBuffers = {};
-   
-   allWorkerSubBubbles.forEach(workerBubble => {
-     try {
-       // Extract worker ID from element ID (format: worker-XXX)
-       const elementId = workerBubble.id;
-       if (!elementId.startsWith('worker-')) return;
-       
-       const workerId = elementId.slice(7); // Remove 'worker-' prefix
-       extractedWorkerIds.add(workerId);
-       
-       // Extract buffer content from DOM text
-       const workerContent = workerBubble.querySelector('.worker-content');
-       const bufferContent = workerContent ? workerContent.innerHTML || '' : '';
-       
-       // Store reference to worker sub-bubble with text buffer reference
-       reconstructedWorkerSubBubbles[workerId] = {
-         content: workerContent,
-         buffer: bufferContent,
-         finished: workerBubble.classList.contains('completed'),
-         bubble: workerBubble,
-         statusBar: workerBubble.querySelector('.worker-status-bar')
-       };
-       
-       // Store buffer content
-       reconstructedWorkerBuffers[workerId] = bufferContent;
-       
-       console.log('Reconstructed worker sub-bubble:', {
-         workerId: workerId,
-         hasContent: !!workerContent,
-         bufferLength: bufferContent.length,
-         isFinished: workerBubble.classList.contains('completed')
-       });
-     } catch (err) {
-       console.error('Error reconstructing worker sub-bubble:', err);
-     }
-   });
-   
-   // Restore the agent bubbles state with loaded worker group bubbles
-   agentBubbles = {
-     currentPlannerBubble: null,
-     plannerBuffer: '',
-     currentWorkerGroupBubble: null,
-     workerGroupBubbles: loadedWorkerGroupBubbles, // Use loaded worker group bubbles
-     workerBuffers: reconstructedWorkerBuffers,
-     workerSubBubbles: reconstructedWorkerSubBubbles
-   };
-   
-   // Set flags based on actual loaded state
-   hasCreatedWorkerGroup = loadedWorkerGroupBubbles.length > 0;
-   inWorkerMode = extractedWorkerIds.size > 0 && loadedWorkerGroupBubbles.some(group => {
-     // Check if any worker group has active workers (not all completed)
-     const workers = group.querySelectorAll('.worker-sub-bubble');
-     return workers.length > 0 && !Array.from(workers).every(w => w.classList.contains('completed'));
-   });
-   knownWorkerIds.clear();
-   knownWorkerIds.addAll(extractedWorkerIds);
+    const allWorkerSubBubbles = messagesInner.querySelectorAll('.worker-sub-bubble');
+    const loadedWorkerGroupBubbles = Array.from(messagesInner.querySelectorAll('.bubble.role-assistant'))
+      .filter((bubble) => bubble.querySelector('.worker-group-container'));
+
+    // Extract worker IDs from DOM element IDs
+    const extractedWorkerIds = new Set();
+    const reconstructedWorkerSubBubbles = {};
+    const reconstructedWorkerBuffers = {};
+
+    allWorkerSubBubbles.forEach(workerBubble => {
+      try {
+        // Extract worker ID from element ID (format: worker-XXX)
+        const elementId = workerBubble.id;
+        if (!elementId.startsWith('worker-')) return;
+
+        const workerId = elementId.slice(7); // Remove 'worker-' prefix
+        extractedWorkerIds.add(workerId);
+
+        // Reconstruct the raw text buffer from the rendered DOM text
+        const workerContent = workerBubble.querySelector('.worker-content');
+        const bufferContent = workerContent ? (workerContent.dataset.buffer ?? (workerContent.textContent || '')) : '';
+
+        // Store reference to worker sub-bubble with text buffer reference
+        reconstructedWorkerSubBubbles[workerId] = {
+          content: workerContent,
+          buffer: bufferContent,
+          finished: workerBubble.classList.contains('completed'),
+          bubble: workerBubble,
+          statusBar: workerBubble.querySelector('.worker-status-bar')
+        };
+
+        // Store buffer content
+        reconstructedWorkerBuffers[workerId] = bufferContent;
+
+        console.log('Reconstructed worker sub-bubble:', {
+          workerId: workerId,
+          hasContent: !!workerContent,
+          bufferLength: bufferContent.length,
+          isFinished: workerBubble.classList.contains('completed')
+        });
+      } catch (err) {
+        console.error('Error reconstructing worker sub-bubble:', err);
+      }
+    });
+
+    // Restore the agent bubbles state with loaded worker group bubbles
+    agentBubbles = {
+      currentPlannerBubble: null,
+      plannerBuffer: '',
+      currentWorkerGroupBubble: null,
+      workerGroupBubbles: loadedWorkerGroupBubbles, // Use loaded worker group bubbles
+      workerBuffers: reconstructedWorkerBuffers,
+      workerSubBubbles: reconstructedWorkerSubBubbles
+    };
+
+    // Set flags based on actual loaded state
+    hasCreatedWorkerGroup = loadedWorkerGroupBubbles.length > 0;
+    inWorkerMode = extractedWorkerIds.size > 0 && loadedWorkerGroupBubbles.some(group => {
+      // Check if any worker group has active workers (not all completed)
+      const workers = group.querySelectorAll('.worker-sub-bubble');
+      return workers.length > 0 && !Array.from(workers).every(w => w.classList.contains('completed'));
+    });
+    knownWorkerIds.clear();
+    for (const id of extractedWorkerIds) knownWorkerIds.add(id);
    
    console.log('Agent flow state restored from conversation:', {
      workerGroupBubblesCount: loadedWorkerGroupBubbles.length,
@@ -308,6 +310,8 @@ const btnMobile = document.getElementById('btnMobile');
 const editorResizer = document.getElementById('editorResizer');
 
 let sending = false;
+let stopRequested = false;
+let pollAbort = null;
 
 // ── Throttle / Debounce Logic Variables ──
 let lastUpdate = 0; 
@@ -640,7 +644,7 @@ function scheduleEditorUpdate(html) {
     // Set timer to update after the delay
     updateDebounceTimer = setTimeout(() => {
       updateEditorPanel(html);
-      lastUpdate = now;
+      lastUpdate = Date.now();
     }, UPDATE_DELAY_MS);
   }
 }
@@ -695,16 +699,20 @@ async function streamAgentResponse({ prompt, sessionId, mode, activeId, onDelta,
     activeId: activeId,
     timestamp: new Date().toISOString()
   });
-  
+
+  stopRequested = false;
+  pollAbort = new AbortController();
+
   // 1) Start session with prompt only
   try {
     const res = await fetch(`/api/adminagent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: NodeApi.headers(),
       body: JSON.stringify({
         prompt: prompt,
         session_id: sessionId || ''
-      })
+      }),
+      signal: pollAbort.signal
     });
 
     if (!res.ok) {
@@ -736,6 +744,10 @@ async function streamAgentResponse({ prompt, sessionId, mode, activeId, onDelta,
       onDelta({ session_id: newSessionId });
     }
   } catch (e) {
+    if (e.name === 'AbortError') {
+      onDone();
+      return sessionId;
+    }
     onError?.(`Network error: ${e.message}`);
     onDone();
     return sessionId;
@@ -744,12 +756,13 @@ async function streamAgentResponse({ prompt, sessionId, mode, activeId, onDelta,
   // 2) Poll for agent deltas
   let done = false;
   let consecutiveWaitCount = 0;  // Track consecutive waiting responses for backoff
-  while (!done) {
+  while (!done && !stopRequested) {
     try {
       const res = await fetch(`/api/adminagent/poll`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId })
+        headers: NodeApi.headers(),
+        body: JSON.stringify({ session_id: sessionId }),
+        signal: pollAbort.signal
       });
 
       if (!res.ok) {
@@ -793,6 +806,10 @@ async function streamAgentResponse({ prompt, sessionId, mode, activeId, onDelta,
           break;
       }
     } catch (e) {
+      if (e.name === 'AbortError') {
+        done = true;
+        break;
+      }
       console.warn('Poll network error, retrying...', e);
       // Reset consecutive wait count on network error
       consecutiveWaitCount = 0;
@@ -958,7 +975,8 @@ function createWorkerGroupBubble(workerIds) {
     workerStatusBar.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Running...';
 
     const workerContent = document.createElement('div');
-    workerContent.className = 'worker-content';
+        workerContent.className = 'worker-content';
+        workerContent.dataset.buffer = '';
 
     workerBubble.appendChild(workerHeader);
     workerBubble.appendChild(workerStatusBar);
@@ -1109,6 +1127,7 @@ function appendAgentDelta(delta) {
 
         const workerContent = document.createElement('div');
         workerContent.className = 'worker-content';
+        workerContent.dataset.buffer = '';
 
         workerBubble.appendChild(workerHeader);
         workerBubble.appendChild(workerStatusBar);
@@ -1164,7 +1183,8 @@ function appendAgentDelta(delta) {
           workerStatusBar.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Running...';
 
           const workerContent = document.createElement('div');
-          workerContent.className = 'worker-content';
+        workerContent.className = 'worker-content';
+        workerContent.dataset.buffer = '';
 
           workerBubble.appendChild(workerHeader);
           workerBubble.appendChild(workerStatusBar);
@@ -1204,7 +1224,8 @@ function appendAgentDelta(delta) {
     if (workerSubBubble && !workerSubBubble.finished) {
       // Append text to worker buffer (NOT directly to HTML)
       workerSubBubble.buffer += text;
-      
+      workerSubBubble.content.dataset.buffer = workerSubBubble.buffer;
+
       // Convert entire buffer to markdown and update HTML directly
       workerSubBubble.content.innerHTML = renderMarkdown(workerSubBubble.buffer);
       
@@ -1389,6 +1410,9 @@ async function sendPrompt() {
 
   setStatus('thinking');
 
+  // Finalize any worker group reconstructed from saved history before a new turn.
+  closeWorkerGroupBubble();
+
   // Reset agent flow state for new message but preserve conversation history
   agentBubbles = {
     currentPlannerBubble: null,
@@ -1437,6 +1461,12 @@ async function sendPrompt() {
       // Handle different delta types
       if (delta.agent === 'planner' || (delta.agent === 'worker' && delta.id)) {
         appendAgentDelta(delta);
+      }
+
+      // Coding mode: keep the HTML editor panel in sync with the generated code.
+      if (mode === 'coding' && delta.agent === 'planner') {
+        const block = extractHtmlBlock(agentBubbles.plannerBuffer);
+        if (block.html) scheduleEditorUpdate(block.html);
       }
       
       // Log worker group state after delta processing
@@ -1518,13 +1548,17 @@ async function stopRequest() {
     // Call the stop API endpoint
     const res = await fetch('/api/adminagent/stop', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: NodeApi.headers(),
       body: JSON.stringify({ session_id: sessionId })
     });
     
     if (res.ok) {
       console.log('Request stopped successfully');
-      
+
+      // Stop the polling loop immediately; it must not keep consuming deltas.
+      stopRequested = true;
+      if (pollAbort) pollAbort.abort();
+
       // Close any active worker group
       closeWorkerGroupBubble();
       
@@ -1533,8 +1567,7 @@ async function stopRequest() {
       
       renderSidebar();
       setStatus('idle');
-      sending = false;
-      btnSend.disabled = false;
+      btnStop.disabled = true;
       
       // Remove blinking red outline from prompt box
       composerInner.classList.remove('prompt-processing');

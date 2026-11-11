@@ -18,8 +18,10 @@ monitor_out = None; //the shader of the display output that copies the picture (
 last_frame_index = -1;
 
 uniforms = [];
+uniform_value_setters = []; //name -> sets the current value of its control on one more pass (#586)
 inputs = [];
 text_uniform_ctrls = []; //name -> the text field of a //@text annotation
+readouts = []; //the passes with a //@readout annotation: [shader=, ctrls=[the pure outputs, one per channel]] (#586)
 is_shadertoy = false;
 
 size_x = None;
@@ -29,76 +31,86 @@ size_mode = None; //Settings > Render > Size: 0 Custom, 1 Project
 default_input = None;
 default_output = None;
 
-//For loaders that build on this one (the FFGL loader, #428): inputs that get no control (set by the loader itself),
-//and the Control tab, where they add their own controls
+//For loaders that build on this one (the FFGL loader, #428, native assets, #201): inputs that get no control (set by
+//the loader itself), and the Control tab, where they add their own controls
 hidden_inputs = [];
 control_area = None;
+//The Time section of the Control tab: time_ctrl has the time of the generator (Free / Manual / Sync), a native asset
+//gets it every frame; the section is hidden when the shader has no iTime (time_vec.visible(true) shows it again)
+time_vec = None;
+time_ctrl = None;
+//Optional: the state of the loader's own content beyond the controls (a native asset: its plugin's state). Functions,
+//save_state() keeps what loader_save_state() gives as `extra`, load_state() gives it back to loader_load_state(extra)
+loader_save_state = None;
+loader_load_state = None;
+//Optional: the source of a pass as the loader wants it (src) -> src, before the shader is made from it (a native asset
+//declares the samplers of its picture inputs in it, so they get ports like the inputs of a shader)
+loader_source_filter = None;
 
 render_callback = None;
 
-#include "engine/generators/extensions/glsl/shadertoy"
+//Samplers that get the spectrum and waveform of the audio analysis by themselves (#586): a texture of 512 x 2, row 0
+//the spectrum (512 bands from 20 Hz to half the sample rate, log spaced, 0 .. 1), row 1 the waveform (512 samples,
+//-1 .. 1). Only while nothing else feeds them: a link into the port, a picture set by a Clipview (set_input) wins.
+//engine.audio_texture is written by AudioInputAnalysis with every message; one older than AUDIO_STALE_MS is a closed
+//or stopped analysis, and the input is emptied again. A shader that declares `uniform int AUDIO_ON;` (no annotation)
+//gets 1 while an audio input has a picture, else 0: textureSize of an empty sampler is not 0 on every driver (Mesa)
+AUDIO_INPUT_NAMES = ["AUDIO", "WAVE"];
+AUDIO_STALE_MS = 3000;
+audio_inputs = []; //name -> [explicit = what was set from outside or None, auto_id = id of the bound analysis texture]
 
-//The visible name of a shader control, made from its uniform name (#436): "bg_colour" -> "Background colour",
-//"timeMultiplier" -> "Time multiplier", "stage5_offset" -> "Stage 5 offset", "BAND_WIDTH" -> "Band width". Only the
-//caption: the uniform name stays the ID of the control (links, MIDI mappings and saved projects find it by that), and
-//a displayname= of the annotation or a name the user gives the control still wins
-SHADER_CAPTION_WORDS = [bg="background", fg="foreground", rot="rotation", freq="frequency", amp="amplitude",
-	pos="position", src="source", tgt="target", num="number", anim="animation", dir="direction", mult="multiplier",
-	lum="luminance", func="function", hi="high", rgb="RGB", rgba="RGBA", hsv="HSV", uv="UV", vhs="VHS", fft="FFT",
-	bpm="BPM", sdf="SDF", led="LED", x="X", y="Y", z="Z", w="W", fps="FPS", interp="interpolation",
-	kaleido="kaleidoscope", cols="columns", dist="distance", fov="FOV", aa="anti-aliasing"];
-SHADER_CAPTION_WORDS["3d"] = "3D";
-SHADER_CAPTION_WORDS["2d"] = "2D";
-
-shader_uniform_caption(name) {
-	s = name;
-	if(s.starts("u_"))
-		s = s.substr(2);
-	words = [];
-	word = "";
-	prev = "";
-	for(c : s) {
-		is_digit = "0123456789".contains(c);
-		is_upper = !is_digit && c != c.lowercase();
-		prev_digit = prev != "" && "0123456789".contains(prev);
-		prev_lower = prev != "" && !prev_digit && prev != "_" && prev == prev.lowercase();
-		if(c == "_" || c == " " || c == "-") {
-			if(word != "")
-				words.push_back(word);
-			word = "";
-		}
-		else {
-			if(word != "" && ((is_upper && (prev_lower || prev_digit)) || (is_digit && !prev_digit)))
-				words.push_back(word);
-				word = "";
-			word += c;
-		}
-		prev = c;
-	}
-	if(word != "")
-		words.push_back(word);
-	if(words.size() == 0)
-		return name;
-	//Shadertoy style: iMouse -> Mouse
-	if(words.size() > 1 && words[0] == "i")
-		words.erase(0);
-	//A name in capitals only (BAND_WIDTH_FAR) is read as plain words
-	shouting = s == s.uppercase();
-	out = "";
-	for(i, w : words) {
-		l = w.lowercase();
-		if(SHADER_CAPTION_WORDS.has(l))
-			l = SHADER_CAPTION_WORDS[l];
-		else if(!shouting && w.size() > 1 && w == w.uppercase() && w != l)
-			l = w; //an abbreviation written in capitals stays (RGB, UV)
-		else if(i > 0 && l.size() == 1)
-			l = l.uppercase(); //colorB -> Color B
-		if(i == 0 && l.size() > 0)
-			l = l.substr(0, 1).uppercase() + l.substr(1);
-		out += (i > 0 ? " " : "") + l;
-	}
-	return out;
+running_audio_texture() {
+	engine = std.global("engine");
+	if(!engine)
+		return None;
+	at = engine.audio_texture;
+	if(!at || std.millis() - at.ms > AUDIO_STALE_MS)
+		return None;
+	return at;
 }
+
+//AUDIO_ON of every pass: 1 while one of the audio inputs has a picture
+set_audio_on() {
+	on = 0;
+	for(name, entry : audio_inputs) {
+		if(entry.explicit || entry.auto_id != "")
+			on = 1;
+	}
+	for(i = 0; i < shaders.size(); i++) {
+		if(shaders[i].shader.has_uniform("AUDIO_ON"))
+			shaders[i].shader.uniform("AUDIO_ON", on);
+	}
+}
+
+//Once a frame: the audio inputs nothing else feeds follow the running analysis (or get nothing without one)
+update_audio_inputs() {
+	at = running_audio_texture();
+	id = at ? at.id : "";
+	for(name, entry : audio_inputs) {
+		if(entry.explicit || entry.auto_id == id)
+			continue;
+		audio_inputs[name].auto_id = id;
+		ins = inputs[name];
+		for(i = 0; i < ins.size(); i++)
+			ins[i].input(name, at ? at.image : None);
+		set_audio_on();
+	}
+}
+
+//An audio input set from outside: a picture wins, None gives the input back to the audio analysis
+set_audio_input(name, value) {
+	audio_inputs[name].explicit = value;
+	at = value ? None : running_audio_texture();
+	audio_inputs[name].auto_id = at ? at.id : "";
+	v = value ? value : (at ? at.image : None);
+	ins = inputs[name];
+	for(i = 0; i < ins.size(); i++)
+		ins[i].input(name, v);
+	set_audio_on();
+}
+
+#include "engine/generators/extensions/glsl/shadertoy"
+#include "engine/generators/extensions/glsl/annotation_controls"
 
 //iDate of Shadertoy: year, month - 1, day, seconds since midnight (local time, with milliseconds). Declared for every
 //Shadertoy shader, it was never set and stayed 0 (#436: the clock of DateTime showed 00:00)
@@ -110,6 +122,26 @@ shadertoy_idate() {
 		tz = -tz;
 	secs = math.mod(std.millis() / 1000.0 + tz, 86400.0);
 	return vec4f(std.int(d[0]), std.int(d[1]) - 1, std.int(d[2]), secs);
+}
+
+//The Screenshot button of the Outputs (#865): the folder in the folder of VibeVJ
+SCREENSHOT_DIR = "screenshots";
+
+//Saves the last frame of a shader as SCREENSHOT_DIR/<name>_<date>_<time>.png (opaque, at the render size). Waits for the
+//next frame, so it runs on a thread of its own, never on the one that draws. Returns the absolute path, None on failure
+shader_screenshot(shader, name) {
+	fileio.mkdir(SCREENSHOT_DIR);
+	base = SCREENSHOT_DIR + "/" + (name ? name : "shader") + "_" + std.date("%Y-%m-%d_%H-%M-%S");
+	path = base + ".png";
+	for(i = 2; fileio.exists(path); i++)
+		path = base + "_" + i + ".png";
+	if(!shader.save_png(path))
+		return None;
+	try {
+		return fileio.absolute_path(path);
+	}
+	catch(e) {}
+	return path;
 }
 
 //The characters a //@text annotation can send, from code 32 (space) on
@@ -144,6 +176,154 @@ shader_input_caption(name) {
 	return shader_uniform_caption(name);
 }
 
+//The words of a //@ annotation after the kind ("min=0 max=10 options=(a,b) displayname=\"X\" value=(1,0)") as
+//[[key, value], ...] for shader_annotation_control(): options a list, displayname without the quotes, the rest as written
+shader_annotation_attrs(attributes) {
+	attrs = [];
+	for(ai = 1; ai < attributes.size(); ai++) {
+		attr_text = attributes[ai];
+		if(attr_text.find("=") < 0)
+			continue;
+		key_value = attr_text.smart_split("=");
+		if(key_value.size() < 2)
+			continue;
+		attr_value = key_value[1];
+		if(key_value[0] == "options")
+			attr_value = attr_value.extract("(",")").smart_split(",");
+		else if(key_value[0] == "displayname")
+			attr_value = attr_value.extract("\"","\"");
+		attrs.push_back([key_value[0], attr_value]);
+	}
+	return attrs;
+}
+
+//The control of an annotation (//@slider, //@rgb, //@enum, ...) in parent, with its caption from the name and the
+//attributes applied in order. A native asset (#201, engine/generators/extensions/native) builds its controls here too:
+//the same kinds give the same UI. attrs: [[key, value], ...]; a value of a vector is "(1,0)" or a list.
+//Returns [ctrl, vec_ctrls (the component controls of a vector / colour, else None), color_selector], None for an
+//unknown kind
+SHADER_VEC_COMPONENTS = ["X", "Y", "Z", "W"];
+
+shader_annotation_control(parent, name, kind, attrs) {
+	ctrl = None;
+	vec_ctrls = None;
+	color_selector = None;
+	
+	if(kind == "slider") {
+		ctrl = parent.controlslider(name, "uniforms");
+	}
+	else if(kind == "int") {
+		ctrl = parent.controlint(name, "uniforms");
+	}
+	else if(kind == "float") {
+		ctrl = parent.controlfloat(name, "uniforms");
+	}
+	else if(kind == "button") {
+		//A toggle, as SHADER_GUIDE.MD says: without push(1) it was a button that only reports the press, a //@button
+		//(Flip Y of DateTime, ...) could be switched on and never off again (#436)
+		ctrl = parent.controlbutton(name, "uniforms").push(1);
+	}
+	else if(kind == "pushbutton") {
+		ctrl = parent.controlbutton(name, "uniforms").push(1);
+	}
+	else if(kind == "vec2" || kind == "vec3" || kind == "vec4") {
+		ctrl = parent.controlvector(name, "uniforms");
+		for(ci = 0; ci < std.int(kind.substr(3)); ci++)
+			vec_ctrls.push_back(ctrl.controlfloat(SHADER_VEC_COMPONENTS[ci], "uniforms"));
+	}
+	else if(kind == "ivec2" || kind == "ivec3" || kind == "ivec4") {
+		ctrl = parent.controlvector(name, "uniforms");
+		for(ci = 0; ci < std.int(kind.substr(4)); ci++)
+			vec_ctrls.push_back(ctrl.controlint(SHADER_VEC_COMPONENTS[ci], "uniforms"));
+	}
+	else if(kind == "slidervec2" || kind == "slidervec3" || kind == "slidervec4") {
+		ctrl = parent.controlvector(name, "uniforms");
+		for(ci = 0; ci < std.int(kind.substr(9)); ci++)
+			vec_ctrls.push_back(ctrl.controlslider(SHADER_VEC_COMPONENTS[ci], "uniforms"));
+	}
+	else if(kind == "rgb") {
+		ctrl = parent.controlvector(name, "uniforms");
+		rgb_vec = ctrl.controlvector("RGB");
+		color_selector = ctrl.color_selector();
+		
+		vec_ctrls.push_back(rgb_vec.controlslider("R", "uniforms"));
+		vec_ctrls.push_back(rgb_vec.controlslider("G", "uniforms"));
+		vec_ctrls.push_back(rgb_vec.controlslider("B", "uniforms"));
+		
+		r_comp = vec_ctrls[-3];
+		g_comp = vec_ctrls[-2];
+		b_comp = vec_ctrls[-1];
+		
+		color_selector.on_color_change([r_comp,g_comp,b_comp](col) {
+			r_comp.value(col.x);
+			g_comp.value(col.y);
+			b_comp.value(col.z);
+		});
+	}
+	else if(kind == "rgba") {
+		ctrl = parent.controlvector(name, "uniforms");
+		rgb_vec = ctrl.controlvector("RGBA");
+		color_selector = ctrl.color_selector();
+		
+		vec_ctrls.push_back(rgb_vec.controlslider("R", "uniforms"));
+		vec_ctrls.push_back(rgb_vec.controlslider("G", "uniforms"));
+		vec_ctrls.push_back(rgb_vec.controlslider("B", "uniforms"));
+		vec_ctrls.push_back(rgb_vec.controlslider("A", "uniforms"));
+		
+		r_comp = vec_ctrls[-4];
+		g_comp = vec_ctrls[-3];
+		b_comp = vec_ctrls[-2];
+		a_comp = vec_ctrls[-1];
+		
+		color_selector.on_color_change([r_comp,g_comp,b_comp,a_comp](col) {
+			r_comp.value(col.x);
+			g_comp.value(col.y);
+			b_comp.value(col.z);
+			a_comp.value(col.w);
+		});
+	}
+	else if(kind == "enum") {
+		ctrl = parent.controlcombo(name, "uniforms");
+	}
+	
+	if(!ctrl)
+		return None;
+	
+	ctrl.caption(shader_uniform_caption(name));
+	for(kv : attrs) {
+		attr_key = kv[0];
+		attr_value = kv[1];
+		try {
+			if(attr_key == "options") {
+				ctrl.items(attr_value);
+			}
+			else if(attr_key == "displayname") {
+				ctrl.display_name(attr_value);
+			}
+			else if(attr_key == "value" && kind == "enum" && (!std.is_string(attr_value) || "0123456789".contains(attr_value.substr(0, 1)))) {
+				//value=2 is the index of the option: a string would be looked up as the text of an option (#436)
+				ctrl.value(std.int(attr_value));
+			}
+			else if(attr_key == "value" && (kind == "button" || kind == "pushbutton")) {
+				//value=0 is off: the text "0" set as it is switched the button on (#586)
+				ctrl.value(std.float(attr_value) != 0.0 ? 1 : 0);
+			}
+			else if(vec_ctrls) {
+				vec_values = std.is_string(attr_value) ? attr_value.extract("(",")").split(",", -1, true) : attr_value;
+				for(j = 0; j < math.min(vec_values.size(), vec_ctrls.size()); j++) {
+					c = vec_ctrls[j];
+					c[attr_key](vec_values[j]);
+				}
+			}
+			else {
+				ctrl[attr_key](attr_value);
+			}
+		}
+		catch(e) {}
+	}
+	return [ctrl = ctrl, vec_ctrls = vec_ctrls, color_selector = color_selector];
+}
+
 find_shader(name) {
 	for(i = 0; i < shaders.size(); i++) {
 		if(shaders[i].name == name)
@@ -161,6 +341,19 @@ dispatcher(generator, cmd, value) {
 		}
 	}
 	
+	//A clip on the timeline (#680): CLIP_POS (0..1 through the clip) and CLIP_TIME (seconds since its start) for a
+	//shader that declares them (without an //@ annotation they get no control)
+	if(cmd == "clip_start" || cmd == "clip_position") {
+		for(i = 0; i < shaders.size(); i++) {
+			clip_shader = shaders[i].shader;
+			if(clip_shader.has_uniform("CLIP_POS"))
+				clip_shader.uniform("CLIP_POS", std.float(value.pos));
+			if(clip_shader.has_uniform("CLIP_TIME"))
+				clip_shader.uniform("CLIP_TIME", std.float(value.seconds));
+		}
+		return None;
+	}
+
 	if(cmd == "get_inputs")
 		return inputs;
 	
@@ -194,6 +387,10 @@ dispatcher(generator, cmd, value) {
 	if(cmd == "set_input") {
 		if(!inputs.has(value.name))
 			return false;
+		if(audio_inputs.has(value.name)) {
+			set_audio_input(value.name, value.value);
+			return true;
+		}
 		ins = inputs[value.name];
 		for(i = 0; i < ins.size(); i++)
 			ins[i].input(value.name, value.value);
@@ -294,6 +491,10 @@ entry(generator, area, shader_dir) {
 	//Uniforms
 	uniform_vec = ctrls_tab.controlvector("Controls", "uniforms").expanded(false);
 	uniform_vec.tooltip("The controls the [[shader]] itself has");
+
+	//Values the shader measures (//@readout of a pass, #586): pure outputs to link from
+	readout_vec = ctrls_tab.controlvector("Values", "readouts").expanded(true);
+	readout_vec.tooltip("Values the [[shader]] measures in its picture, 0 to 1: [[pure output|pure outputs]], [[link]] them into what should follow\n[[wiki:Output-and-Devices#the-tabs-of-a-shader]]");
 	
 	//Input controls
 	input_vec = ctrls_tab.controlvector("Inputs", "ctrls").expanded(false);	
@@ -377,6 +578,24 @@ entry(generator, area, shader_dir) {
 	
 	ndi_name.callback([monitor_select](v) {
 		shaders[0].shader.ndi_source_name(v);
+	});
+
+	//A PNG of the picture at its render size (not of the preview widget) into SCREENSHOT_DIR (#865). A press button
+	//control, so it can be linked to a MIDI key as well
+	screenshot_btn = output_vec.controlbutton("Screenshot", "screenshot").caption("Save screenshot");
+	screenshot_btn.tooltip("Save the picture as a PNG in its render size into the folder " + SCREENSHOT_DIR + " of VibeVJ");
+	screenshot_name = fileio.pure_name(generator.path); //SimpleColor, not the __init__ of its folder
+	screenshot_btn.callback([screenshot_btn, screenshot_name](v) {
+		if(!v || !shaders.size())
+			return;
+		shader = shaders[0].shader;
+		name = screenshot_name;
+		//save_png waits for the next frame: not on the thread that draws it
+		worker = std.thread([shader, name, screenshot_btn]() {
+			path = shader_screenshot(shader, name);
+			screenshot_btn.tooltip(path ? "Saved " + path : "The screenshot failed, see the log of VibeVJ");
+		});
+		worker.run();
 	});
 	
 	monitor_select.callback([monitor_select, spout_enable, monitor_type, monitor_name, monitor_fit](index) {
@@ -488,8 +707,17 @@ entry(generator, area, shader_dir) {
 	
 	size_cb = [size_x, size_y, render_downscale](v) {
 		for(i = 0; i < shaders.size(); i++) {
-			if(!shaders[i].has_fixed_size)
-				shaders[i].shader.render_size(vec2i(size_x.value() * render_downscale.value(), size_y.value() * render_downscale.value()));
+			if(shaders[i].has_fixed_size)
+				continue;
+			w = size_x.value() * render_downscale.value();
+			h = size_y.value() * render_downscale.value();
+			//A pass with //@settings renderscale=0.25 renders at that share of the shader's size, so it follows the
+			//project size and Render scale (#586: blur pyramids, a flow estimate at a quarter of the size)
+			if(shaders[i].has("render_scale")) {
+				w = math.max(math.round(w * shaders[i].render_scale.x), 1);
+				h = math.max(math.round(h * shaders[i].render_scale.y), 1);
+			}
+			shaders[i].shader.render_size(vec2i(w, h));
 		}
 	};
 	
@@ -694,170 +922,37 @@ entry(generator, area, shader_dir) {
 		
 		if(uniforms.has(name)) {
 			uniforms[name].push_back(shader);
+			//A pass that declares a uniform an earlier pass made the control for starts with the value of that
+			//control: before, it kept 0 until the control was moved (#586, a blur level was black on a fresh add)
+			if(uniform_value_setters.has(name))
+				uniform_value_setters[name](shader);
 			return;
 		}
 		
-		ctrl = None;
-		
 		attributes = str.smart_split(" ");
-		
-		vec_ctrls = None;
-		color_selector = None;
-		
-		if(attributes[0] == "slider") {
-			ctrl = uniform_vec.controlslider(name, "uniforms");
-		}
-		else if(attributes[0] == "int") {
-			ctrl = uniform_vec.controlint(name, "uniforms");
-		}
-		else if(attributes[0] == "float") {
-			ctrl = uniform_vec.controlfloat(name, "uniforms");
-		}
-		else if(attributes[0] == "button") {
-			//A toggle, as SHADER_GUIDE.MD says: without push(1) it was a button that only reports the press, a //@button
-			//(Flip Y of DateTime, ...) could be switched on and never off again (#436)
-			ctrl = uniform_vec.controlbutton(name, "uniforms").push(1);
-		}
-		else if(attributes[0] == "pushbutton") {
-			ctrl = uniform_vec.controlbutton(name, "uniforms").push(1);
-		}
-		else if(attributes[0] == "vec2") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlfloat("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("Y", "uniforms"));
-		}
-		else if(attributes[0] == "vec3") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlfloat("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("Z", "uniforms"));
-		}
-		else if(attributes[0] == "vec4") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlfloat("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("Z", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlfloat("W", "uniforms"));
-		}
-		else if(attributes[0] == "ivec2") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlint("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("Y", "uniforms"));
-		}
-		else if(attributes[0] == "ivec3") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlint("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("Z", "uniforms"));
-		}
-		else if(attributes[0] == "ivec4") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlint("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("Z", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlint("W", "uniforms"));
-		}
-		else if(attributes[0] == "slidervec2") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlslider("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("Y", "uniforms"));
-		}
-		else if(attributes[0] == "slidervec3") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlslider("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("Z", "uniforms"));
-		}
-		else if(attributes[0] == "slidervec4") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			vec_ctrls.push_back(ctrl.controlslider("X", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("Y", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("Z", "uniforms"));
-			vec_ctrls.push_back(ctrl.controlslider("W", "uniforms"));
-		}
-		else if(attributes[0] == "rgb") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			rgb_vec = ctrl.controlvector("RGB");
-			color_selector = ctrl.color_selector();
-			
-			vec_ctrls.push_back(rgb_vec.controlslider("R", "uniforms"));
-			vec_ctrls.push_back(rgb_vec.controlslider("G", "uniforms"));
-			vec_ctrls.push_back(rgb_vec.controlslider("B", "uniforms"));
-			
-			r_comp = vec_ctrls[-3];
-			g_comp = vec_ctrls[-2];
-			b_comp = vec_ctrls[-1];
-			
-			color_selector.on_color_change([r_comp,g_comp,b_comp](col) {
-				r_comp.value(col.x);
-				g_comp.value(col.y);
-				b_comp.value(col.z);
-			});
-		}
-		else if(attributes[0] == "rgba") {
-			ctrl = uniform_vec.controlvector(name, "uniforms");
-			rgb_vec = ctrl.controlvector("RGBA");
-			color_selector = ctrl.color_selector();
-			
-			vec_ctrls.push_back(rgb_vec.controlslider("R", "uniforms"));
-			vec_ctrls.push_back(rgb_vec.controlslider("G", "uniforms"));
-			vec_ctrls.push_back(rgb_vec.controlslider("B", "uniforms"));
-			vec_ctrls.push_back(rgb_vec.controlslider("A", "uniforms"));
-			
-			r_comp = vec_ctrls[-4];
-			g_comp = vec_ctrls[-3];
-			b_comp = vec_ctrls[-2];
-			a_comp = vec_ctrls[-1];
-			
-			color_selector.on_color_change([r_comp,g_comp,b_comp,a_comp](col) {
-				r_comp.value(col.x);
-				g_comp.value(col.y);
-				b_comp.value(col.z);
-				a_comp.value(col.w);
-			});
-		}
-		else if(attributes[0] == "enum") {
-			ctrl = uniform_vec.controlcombo(name, "uniforms");
-		}
+		built = shader_annotation_control(uniform_vec, name, attributes[0], shader_annotation_attrs(attributes));
+		ctrl = built ? built.ctrl : None;
+		vec_ctrls = built ? built.vec_ctrls : None;
+		color_selector = built ? built.color_selector : None;
 		
 		if(ctrl) {
-			ctrl.caption(shader_uniform_caption(name));
-			for(i = 1; i < attributes.size(); i++) {
-				attr = &attributes[i];
-				if(attr.find("=") >= 0) {
-					key_value = attr.smart_split("=");
-					try {
-						if(key_value[0] == "options") {
-							ctrl.items(key_value[1].extract("(",")").smart_split(","));
-						}
-						else if(key_value[0] == "displayname") {
-							ctrl.display_name(key_value[1].extract("\"","\""));
-						}
-						else if(key_value[0] == "value" && attributes[0] == "enum" && "0123456789".contains(key_value[1].substr(0, 1))) {
-							//value=2 is the index of the option: a string would be looked up as the text of an option (#436)
-							ctrl.value(std.int(key_value[1]));
-						}
-						else if(vec_ctrls) {
-							vec_values = key_value[1].extract("(",")").split(",", -1, true);
-							for(j = 0; j < math.min(vec_values.size(), vec_values.size()); j++) {
-								c = vec_ctrls[j];
-								c[key_value[0]](vec_values[j]);
-							}
-						}
-						else {
-							ctrl[key_value[0]](key_value[1]);
-						}
-					}
-					catch(e) {}
-				}
-			}
-			
 			//This is extremely inefficient, somehow update the uniforms differently.
 			//Currently this callback is called EVERY time one of the components changes...		
 			//TODO: set the uniforms in before_render callback instead, so it can be set multiple times in one frame but still only updates once!
 			
 			uniforms[name] = [shader];
 			uniform_entry = &uniforms[name];
+			
+			uniform_value_setters[name] = [name, ctrl, vec_ctrls](s) {
+				if(!vec_ctrls)
+					s.uniform(name, ctrl.value());
+				else if(vec_ctrls.size() == 2)
+					s.uniform(name, vec2f(vec_ctrls[0].value(), vec_ctrls[1].value()));
+				else if(vec_ctrls.size() == 3)
+					s.uniform(name, vec3f(vec_ctrls[0].value(), vec_ctrls[1].value(), vec_ctrls[2].value()));
+				else if(vec_ctrls.size() == 4)
+					s.uniform(name, vec4f(vec_ctrls[0].value(), vec_ctrls[1].value(), vec_ctrls[2].value(), vec_ctrls[3].value()));
+			};
 			
 			if(vec_ctrls) {
 				if(vec_ctrls.size() == 2)
@@ -946,6 +1041,20 @@ entry(generator, area, shader_dir) {
 					set_comp_fmt(key_value[1]);
 				else if(key_value[0] == "format")
 					set_pixel_fmt(key_value[1]);
+				else if(key_value[0] == "renderscale") {
+					//renderscale=0.5 or renderscale=(0.5,0.25): the pass renders at that share of the shader's size
+					scale_str = key_value[1];
+					if(scale_str.starts("("))
+						scale_str = scale_str.extract("(",")");
+					scale_values = scale_str.split(",", -1, true);
+					try {
+						sx = std.float(scale_values[0]);
+						sy = scale_values.size() > 1 ? std.float(scale_values[1]) : sx;
+						if(sx > 0 && sy > 0)
+							shaders[shader_index].render_scale = vec2f(sx, sy);
+					}
+					catch(e) {}
+				}
 				else if(key_value[0] == "rendersize") {
 					vec_values = key_value[1].extract("(",")").split(",", -1, true);
 					try {
@@ -958,6 +1067,34 @@ entry(generator, area, shader_dir) {
 		}
 	};
 	
+	//@readout names=(life,turning): the first pixel of this pass goes out as pure outputs, one per channel (r, g, b,
+	//a), 0..1, read back from the GPU (#586: how much of a growing shape is grown). The pass is made uint8 RGBA; it
+	//renders when another pass reads it (a 1 x 1 pass the main pass reads, //@settings rendersize=(1,1))
+	parse_readout = [readout_vec](shader_index, str) {
+		attributes = str.smart_split(" ");
+		for(i = 0; i < attributes.size(); i++) {
+			kv = attributes[i].smart_split("=");
+			if(kv.size() < 2 || kv[0] != "names")
+				continue;
+			names = kv[1].extract("(", ")").smart_split(",");
+			ctrls = [];
+			for(k = 0; k < math.min(names.size(), 4); k++) {
+				nm = names[k].strip();
+				c = readout_vec.controlslider(nm, "readouts").caption(shader_uniform_caption(nm)).as_output(true);
+				c.tooltip("A value the shader measures, 0 to 1. A [[pure output]]: [[link]] it into what should follow it");
+				ctrls.push_back(c);
+			}
+			//(not named entry: a lambda that assigns a name the module has, like entry(), overwrites it)
+			readout_shader = shaders[shader_index].shader;
+			readout_shader.output_component_format("uint8");
+			readout_shader.output_pixel_format("rgba");
+			shaders[shader_index].has_fixed_comp_fmt = true;
+			shaders[shader_index].has_fixed_pixel_fmt = true;
+			readout_shader.pixel_readback(true);
+			readouts.push_back([shader = readout_shader, ctrls = ctrls]);
+		}
+	};
+
 	total_inputs = 0;
 	parse_inputs = [in_panel, &total_inputs, mask_vec, input_vec](shader_index) {
 		shader = shaders[shader_index].shader;
@@ -992,6 +1129,9 @@ entry(generator, area, shader_dir) {
 			if(hidden_inputs.has(input_name))
 				continue;
 			
+			if(AUDIO_INPUT_NAMES.has_value(input_name))
+				audio_inputs[input_name] = [explicit = None, auto_id = "-"];
+			
 			in_ctrl = None;
 			
 			if(input_name == "RenderMaskInput") {
@@ -1006,12 +1146,19 @@ entry(generator, area, shader_dir) {
 			in_ctrl.tooltip("An input of the shader: [[link]] a picture into it\n[[wiki:Output-and-Devices#the-tabs-of-a-shader]]");
 			in_ctrl.on_unlink([in_ctrl, input_name, input_entry](ctrl1,ctrl2){
 				if(ctrl2 == in_ctrl) {
-					for(sid = 0; sid < input_entry.size(); sid++)
-						input_entry[sid].input(input_name, None);
+					if(audio_inputs.has(input_name))
+						set_audio_input(input_name, None);
+					else
+						for(sid = 0; sid < input_entry.size(); sid++)
+							input_entry[sid].input(input_name, None);
 					
 				}
 			});
 			in_ctrl.callback([input_name, input_entry](v) {
+				if(audio_inputs.has(input_name)) {
+					set_audio_input(input_name, v);
+					return;
+				}
 				for(sid = 0; sid < input_entry.size(); sid++)
 					input_entry[sid].input(input_name, v);
 			});
@@ -1081,6 +1228,38 @@ entry(generator, area, shader_dir) {
 		return false;
 	};
 	
+	//#586: //@settings draw=points (or draw=quads) count=<numbers and int uniforms joined by *> blend=add|alpha|max|none:
+	//the pass draws points instead of a picture (SHADER_GUIDE.MD, *Point passes*). count=columns*rows multiplies the
+	//values of two controls. None for a picture pass. Looked for line by line (#102: no regex_search on a long source).
+	point_settings = [](src) {
+		if(src.find("draw=points") < 0 && src.find("draw=quads") < 0)
+			return None;
+		result = None;
+		src_lines = src.split("\n");
+		for(i = 0; i < src_lines.size(); i++) {
+			line = src_lines[i].strip().compress_whitespace();
+			if(!line.starts("//@settings") || (line.find("draw=points") < 0 && line.find("draw=quads") < 0))
+				continue;
+			result = [count = [], blend = "add", quads = line.find("draw=quads") >= 0];
+			attributes = line.removeprefix("//@settings").strip().smart_split(" ");
+			for(j = 0; j < attributes.size(); j++) {
+				kv = attributes[j].smart_split("=");
+				if(kv.size() < 2)
+					continue;
+				if(kv[0] == "count") {
+					factors = kv[1].split("*");
+					for(k = 0; k < factors.size(); k++) {
+						f = factors[k].strip();
+						result.count.push_back(f.find_first_not_of("0123456789") < 0 ? std.int(f) : f);
+					}
+				}
+				else if(kv[0] == "blend")
+					result.blend = kv[1];
+			}
+		}
+		return result;
+	};
+
 	for(sid = 0; sid < shader_paths.size(); sid++) {
 		shader_src_file = fileio.read_string(shader_paths[sid]);
 		shader_src = shader_src_file;	
@@ -1089,8 +1268,21 @@ entry(generator, area, shader_dir) {
 			include_file = shader_paths[sid];
 			shader_src = resolve_includes(fileio.file_dir(include_file), fileio.file_name(include_file)).strip();
 		}
+		if(std.is_function(loader_source_filter))
+			shader_src = loader_source_filter(shader_src);
 		
-		if(declares_main_image(shader_src)) {
+		points = point_settings(shader_src);
+		vertex_src = "";
+		if(points) {
+			//A point pass: the same source as the vertex shader (mainPoint once a point) and the fragment shader
+			//(pointPixel, or a round dot), shadertoy.shio
+			is_shadertoy = true;
+			quads_define = points.quads ? "#define SHZ_QUADS 1\n" : "";
+			vertex_src = quads_define + points_vertex_header + shadertoy_header + "\n#line 1\n" + shader_src + "\n" + points_vertex_main;
+			point_main = shader_src.find("pointPixel") >= 0 ? points_fragment_main_custom : points_fragment_main;
+			shader_src = quads_define + points_fragment_header + shadertoy_header + "\n#line 1\n" + shader_src + "\n" + point_main;
+		}
+		else if(declares_main_image(shader_src)) {
 			is_shadertoy = true;
 			//#line: compile errors then count lines from the start of the shader file, not of the injected header
 			shader_src = shadertoy_header + "\n#line 1\n" + shader_src + "\n" + shadertoy_main;
@@ -1103,8 +1295,21 @@ entry(generator, area, shader_dir) {
 			shader = shader_widget.shader();
 		
 		shader.anchor(0);
+		if(points) {
+			shader.vertex_source(vertex_src);
+			shader.point_quads(points.quads);
+			try {
+				shader.point_blend(points.blend);
+			}
+			catch(e) {
+				std.warn(fileio.file_name(shader_paths[sid]) + ": //@settings blend=" + points.blend + " is not add, alpha, max or none");
+			}
+			shader.points(0);
+		}
 		shader.fragment_source(shader_src);	
 		shaders.push_back([shader=shader, name=fileio.pure_name(shader_paths[sid])]);
+		if(points)
+			shaders[shaders.size() - 1].point_count = points.count;
 
 		if(shader.has_uniform("iTime"))
 			has_time_controls = true;
@@ -1119,6 +1324,10 @@ entry(generator, area, shader_dir) {
 				if(line.starts("//@settings"))
 					current_def = "";
 					parse_settings(sid, line.removeprefix("//@settings").strip());
+					continue;
+				if(line.starts("//@readout"))
+					current_def = "";
+					parse_readout(sid, line.removeprefix("//@readout").strip());
 					continue;
 				if(line.starts("//@"))
 					current_def = line.substr(3);
@@ -1168,6 +1377,20 @@ entry(generator, area, shader_dir) {
 			if(!shader_entry || !shader_entry.shader)
 				return;
 
+			//#586: a point pass draws as many points as its count= says (numbers and values of int uniforms, multiplied)
+			if(shader_entry.has("point_count")) {
+				n = shader_entry.point_count.size() > 0 ? 1 : 0;
+				for(k = 0; k < shader_entry.point_count.size(); k++) {
+					f = shader_entry.point_count[k];
+					if(std.is_string(f)) {
+						f = shader_entry.shader.uniform(f);
+						f = std.is_none(f) ? 0 : std.int(f);
+					}
+					n *= math.max(f, 0);
+				}
+				shader_entry.shader.points(math.min(n, 67108864));
+			}
+
 			if(shader_entry.need_projection_update) {
 				shader_entry.need_projection_update = false;
 				shader_entry.shader.projection_grid(vec2i(projection_grid_x.value(), projection_grid_y.value()));
@@ -1183,6 +1406,19 @@ entry(generator, area, shader_dir) {
 			
 				if(std.is_function(render_callback))
 					render_callback();
+
+				//The values of the //@readout passes: the last pixels the GPU gave back (uint8 RGBA)
+				for(r = 0; r < readouts.size(); r++) {
+					buf = readouts[r].shader.pixel_buffer();
+					if(!buf)
+						continue;
+					rc = readouts[r].ctrls;
+					for(k = 0; k < math.min(rc.size(), buf.size()); k++)
+						rc[k].value(buf[k] / 255.0);
+				}
+				
+				if(audio_inputs)
+					update_audio_inputs();
 			
 				time_type = time_type_ctrl.value();
 			
@@ -1209,7 +1445,7 @@ entry(generator, area, shader_dir) {
 			if(is_shadertoy) {
 				if(has_iresolution)
 					render_size = shader_entry.shader.render_size();
-					shader_entry.shader.uniform("iResolution", vec3f(render_size.x, render_size.y, render_size.x / render_size.y));
+					shader_entry.shader.uniform("iResolution", vec3f(render_size.x, render_size.y, std.float(render_size.x) / math.max(render_size.y, 1))); //a float: x / y of two ints was 1 for 16:9 (#586)
 				if(has_itime)
 					shader_entry.shader.uniform("iTime", current_time);
 				if(has_itimedelta)
@@ -1237,6 +1473,8 @@ entry(generator, area, shader_dir) {
 	
 	if(!uniforms)
 		std.free(uniform_vec); //Remove collapsable when no uniforms are present...
+	if(!readouts)
+		std.free(readout_vec);
 	
 	rnd_name = fileio.pure_name(generator.path) + "_" + std.random_hash(6);
 	spout_name.value(rnd_name);
@@ -1253,6 +1491,8 @@ save_state() {
 	//TODO, rather than saving by index, save the shader name too so changes dont break things...
 	for(i = 0; i < shaders.size(); i++)
 		result.proj.push_back(shaders[i].shader.projection_save());
+	if(std.is_function(loader_save_state))
+		result.extra = loader_save_state();
 	
 	return result;
 }
@@ -1268,6 +1508,9 @@ load_state(state) {
 				shaders[i].shader.rendering_enabled(state.enabled);
 			}
 	}
+	
+	if(state.has("extra") && std.is_function(loader_load_state))
+		loader_load_state(state.extra);
 	
 	default_output.value(shaders[0].shader);
 }

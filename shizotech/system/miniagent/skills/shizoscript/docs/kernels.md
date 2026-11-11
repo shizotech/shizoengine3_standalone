@@ -402,11 +402,44 @@ memory. The JIT removes that, with exactly the semantics of the VM:
   (wrapping integer arithmetic, canonical 64 bit registers, the same float to int checks, division by zero and
   bounds checks with the same trap codes and values), so errors read the same as on the VM. The C compiler then
   keeps the registers in CPU registers, removes what is not needed and vectorizes where it can.
-- **Compiling**: with `SHZ_KERNEL_CC`, else the first of `cc`, `gcc`, `clang` (`cl`, `clang`, `gcc` on
-  Windows) that answers `--version` (`/?`). Flags: `-O2 -shared -fPIC -fno-strict-aliasing -ffp-contract=off
-  -fno-math-errno` (`/O2 /fp:precise /LD` for `cl`). `-ffp-contract=off` keeps the compiler from fusing
-  `a * b + c` into an FMA, which would round differently from the VM. Math builtins (`sqrt`, `sin`, ...) call
-  the C library in both, so they give the same results on the same machine.
+- **Compiling**: with `SHZ_KERNEL_CC`, else the first of `cc`, `gcc`, `clang` that answers
+  `--version` (on Windows the first of `cl`, `clang-cl`, `clang`, `gcc`, and `/?` for the two
+  MSVC-style drivers). The flag set follows from the command name: `/O2 /fp:precise /LD` (with
+  `/nologo /w`, the library through `/Fe` and the object through `/Fo`) for `cl` and `clang-cl`,
+  and `-O2 -shared -fPIC -fno-strict-aliasing -ffp-contract=off -fno-math-errno` for the gcc-style
+  drivers. On Windows a gcc-style driver gets no `-fPIC` and an explicit target, and so does
+  `clang-cl`: `-fPIC` is a hard error for an MSVC target (`clang: error: unsupported option
+  '-fPIC' for target 'x86_64-pc-windows-msvc'`), and the `clang` / `clang-cl` of
+  `VC\Tools\LLVM\bin` is a 32 bit host that defaults to `i686-pc-windows-msvc` - the library it
+  builds is a 14C (x86) image and `LoadLibraryW` of a 64 bit interpreter answers `cannot load`.
+  `-ffp-contract=off` keeps the compiler from fusing `a * b + c` into an FMA, which would round
+  differently from the VM (`/fp:precise` is the same rule for the MSVC-style drivers). Math
+  builtins (`sqrt`, `sin`, ...) call the C library in both, so they give the same results on the
+  same machine.
+- **The compiler matrix on Windows, measured** (issue #222, 2026-10-28: Windows 10, host of
+  `main 8e9f7b74` built with the v143 toolset, clang and clang-cl 16.0.5 of Visual Studio 2022
+  Preview; the library size is one JIT compile of the generated C of a 4-pointer kernel):
+
+  | compiler command | flags as the JIT uses them | JIT | AOT library | one library |
+  |---|---|---|---|---|
+  | `cl` (a shell that ran `vcvars64.bat`) | `/nologo /O2 /fp:precise /LD /w` | `_testing/kernels.shio` **239** checks | loads, `jit_status() == "aot"`, `LOADED=2` in a second process with an empty JIT cache | 107520 B, x64, imports KERNEL32 |
+  | `clang-cl` | `/nologo /O2 /fp:precise /LD /w --target=x86_64-pc-windows-msvc` | **239** checks | same | 103936 B, x64, imports KERNEL32 |
+  | `clang` | `-O2 -shared -fno-strict-aliasing -ffp-contract=off -fno-math-errno -w --target=x86_64-pc-windows-msvc` | **239** checks | same | 103936 B, x64 |
+  | `gcc` (MinGW) | `-O2 -shared -fno-strict-aliasing -ffp-contract=off -fno-math-errno -w -m64` | not measured: no MinGW on this box | - | - |
+
+  Without the explicit target, `clang-cl` of `VC\Tools\LLVM\bin` produces a 32 bit library that
+  cannot be loaded, and plain `clang` of that directory targets i686 too; the clang of
+  `VC\Tools\Llvm\x64\bin` (the directory `vcvars64.bat` puts on the PATH) defaults to x64. The
+  explicit target makes both installs behave the same. A `clang-cl` build without `/MD` links the
+  **debug** CRT (measured control: imports `VCRUNTIME140D.dll` and `ucrtbased.dll`); the flags of
+  the table do not (`_testing/kernel_clang_222.shio` scans the bytes of every built library for
+  those names). Test: `_testing/kernel_clang_222.shio` - for every clang it finds on the PATH, in a
+  child process on a scratch cache: the VM and the JIT give the same values for a 4-pointer kernel,
+  a `u32` division by a constant (which runs through `k_mulhi`) and a kernel with a local array, the
+  bits of a `f64` `a * b + 1.0` reduction are the VM's bits, the cache holds one `k_<16 hex>.dll`
+  per kernel with no compile leftovers, and the AOT library built by that compiler is used by a
+  second process that never JITs. A compiler that is not installed is SKIPped with a reason naming
+  it, so the test does not need clang on the box.
 - **Cache**: the library is stored as `k_<hash>.so` / `.dll` in `SHZ_KERNEL_CACHE`, else
   `$XDG_CACHE_HOME/shizoscript/kernels`, `~/.cache/shizoscript/kernels` or
   `%LOCALAPPDATA%\shizoscript\kernels`. The hash covers the C source, the compiler command, the
@@ -449,8 +482,8 @@ memory. The JIT removes that, with exactly the semantics of the VM:
 - **Threads, chunks, reductions and aborts** stay in the launch runtime: the native function runs one chunk
   (the gids `begin .. end - 1`) with the register image of the launch and returns the trap of the first failing
   gid; reductions are combined in chunk order as on the VM. Loops poll the abort flag every 1024 iterations.
-- The JIT is not available on microcontrollers and Emscripten (no compiler, no dynamic loading); they run the VM,
-  or code compiled ahead of time (below).
+- The JIT is not available on Emscripten (no compiler, no dynamic loading); it runs the VM, or code compiled
+  ahead of time (below). Microcontroller builds have no kernels at all (section 7).
 
 `_testing/kernels.shio` runs every comparison with the JIT off, with `auto` and with `sync`, and checks that
 the kernels are actually compiled when a compiler exists.
@@ -464,10 +497,14 @@ runs on the JIT / VM as usual. The file is independent of file names and paths. 
 
 - **Shared library** (a desktop target without a compiler): build it on a machine with one,
   `cc -O2 -shared -fPIC -fno-strict-aliasing -ffp-contract=off -fno-math-errno -DSHZK_AOT_SHARED -o kernels.so kernels.c`
-  (`cl /O2 /fp:precise /LD /DSHZK_AOT_SHARED kernels.c` on Windows), ship it with the script and call
+  (`cl /O2 /fp:precise /LD /DSHZK_AOT_SHARED kernels.c` on Windows; with clang on Windows the
+  flags of the JIT table above - `clang-cl /O2 /fp:precise /LD --target=x86_64-pc-windows-msvc
+  /DSHZK_AOT_SHARED kernels.c`, or `clang -shared --target=x86_64-pc-windows-msvc -ffp-contract=off
+  -DSHZK_AOT_SHARED -o kernels.dll kernels.c`, measured for both in
+  `_testing/kernel_clang_222.shio`), ship it with the script and call
   `std.kernel_aot_load("kernels.so")` before the first launch. `k.jit_status()` is `"aot"` for kernels that use it.
-- **Built into the interpreter** (microcontrollers, Emscripten, or a fixed set of kernels in a product): add the
-  file to the build as a C++ source (`kernels.cpp`, e.g. next to the ESP32 sketch), compiled without fused
+- **Built into the interpreter** (Emscripten, or a fixed set of kernels in a product): add the
+  file to the build as a C++ source (`kernels.cpp`), compiled without fused
   multiply-add (`-ffp-contract=off`, `/fp:precise`). Its kernels register themselves at startup
   (`shzk_aot_register`), no dynamic loading is needed.
 
@@ -509,6 +546,21 @@ Because the prelude is inside `shzk_aot_hash()` and inside the JIT cache file na
 every cached JIT library and every shipped AOT library — they stop matching and are rebuilt. An ABI change
 therefore needs no `SHZK_JIT_VERSION` bump, and a library built against the old layout is never picked up.
 
+**Which intrinsics branch the prelude takes (issue #222).** The MSVC intrinsics of the prelude
+(`intrin.h`, `_InterlockedExchangeAdd`, `__umulh`) are selected by `#if defined(_MSC_VER) && !defined(__clang__)`.
+clang and clang-cl define `_MSC_VER` on the MSVC target, but clang's `intrin.h` declares no `__umulh`:
+`clang-cl` fails on every kernel with `error: call to undeclared function '__umulh'` (the helper is in
+the prelude text, so it is in every generated file), and plain `clang` accepts the call as an implicit
+declaration that returns `int` - which **truncates the 64 bit result of `k_mulhi` to 32 bits**, and
+`k_mulhi` is what the strength reduction of a `u32` division by a constant uses: the JIT would have
+computed wrong quotients with no error at all. So every clang takes the portable branch below the
+`#else` (the `__atomic` builtins, `__builtin_expect`, the 32x32 `k_mulhi`), which clang has, and which
+`gcc` already used. `cl` is unaffected. The line is part of the prelude, so the prelude text changed:
+every cached JIT library and every shipped AOT library of the old text stops matching and is rebuilt
+(the layout of `kptr` is untouched, so this is not an ABI change). Pinned by
+`_testing/kernel_clang_222.shio` (the text of the `#if`, the portable `k_mulhi` in the generated C, and
+the VM-vs-JIT equality of a `u32` division by a constant per compiler).
+
 The generated code has the exact semantics of the VM (bounds checks, traps, the order of
 reductions), like the JIT. `std.kernel_jit("off")` turns ahead of time code off as well.
 
@@ -516,8 +568,13 @@ reductions), like the JIT. `std.kernel_jit("off")` turns ahead of time code off 
 
 ## 7. Portability
 
-- Microcontrollers (`SHZ_FEAT_MICROCONTROLLER`, no thread pool) and Emscripten run kernels on the launching
-  thread (`launch_async` runs at once). Same results, same API.
+- Microcontroller builds (`SHZ_FEAT_MICROCONTROLLER`) leave kernels out (#781, 2026-11-04): `SHZ_FEAT_KERNELS`
+  of `internal/shz_types.h` is not defined there, so the kernel compiler, VM, JIT and `std.kernel_*` are not
+  compiled (about 400 KB of the ESP32-P4 firmware, which did not fit into its 5 MB app slots). A kernel
+  declaration or a `launch` statement is the compile error "Kernels are not available on this build
+  (microcontroller).", `std.kernel_compile(...)` and the other `std.kernel_*` functions do not exist.
+  `std.buffer.read` / `write` stay. Defining `SHZ_FEAT_KERNELS` there brings them back (the code is portable).
+- Emscripten runs kernels on the launching thread (`launch_async` runs at once). Same results, same API.
 - No compiler specific code is required: computed goto falls back to a switch, `__restrict` and the
   `optimize("O3")` attribute of the batch loop are only used where the compiler has them, 64x64 bit high
   multiplication has a portable fallback.
@@ -579,8 +636,13 @@ Reading the numbers:
 
 ## 9. Not done yet / next steps
 
-- The JIT and ahead of time libraries on Windows (`cl` / `clang`) and macOS are implemented but not tested yet
-  (Linux x64 with gcc is); the build into the interpreter is tested on Linux x64 (g++), not on an ESP32 yet.
+- The JIT and the ahead of time libraries on Windows are measured for `cl`, `clang-cl` and `clang`
+  (section 6, the table, 2026-10-28) and on macOS with `cc` (Apple clang, #222); `gcc` on Windows
+  (MinGW) is not measured on any box yet, and neither is the clang of a standalone LLVM install
+  without a Visual Studio C++ installation - `clang` and `clang-cl` need the MSVC headers
+  (`intrin.h` of the prelude branch for MSVC, `math.h`) and a linker (`lld-link` next to the
+  compiler, or `link.exe`); the build of the AOT file into the interpreter is tested on Linux x64
+  (g++), not on an ESP32 yet.
 - The optimizer merges loads and drops repeated bounds checks inside a basic block only; loads are not moved
   out of loops (a store through any pointer may change them, the same buffer can be passed twice). Pure
   instructions are hoisted out of loops, the unchecked address op `ADDRU` of a local array included

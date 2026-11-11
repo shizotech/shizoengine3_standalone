@@ -1,15 +1,16 @@
 # Settings
 
 The settings have a window of their own, *Settings*. Its pages *Project* and *Links* belong to the project, the pages
-*Appearance* and *Display* are personal and valid for every project, and the page *Output* is for the output of the
-whole window. This page also explains how to scale views with Page Up and Page Down.
+*Appearance*, *Display* and *Sound* are personal and valid for every project, and the page *Output* is for the output
+of the whole window. This page also explains how to scale views with Page Up and Page Down.
 
 ![The Settings window with the page Appearance open](media/settings.png)
 
 ## Open the settings
 
 1. Click the gear button (⚙) in the top bar, between the sidebar button and the help button (?).
-2. Click a page in the list at the left side of the window: *Project*, *Links*, *Appearance*, *Output* or *Display*.
+2. Click a page in the list at the left side of the window: *Project*, *Links*, *Appearance*, *Output*, *Display* or
+   *Sound*.
 
 The window floats above the program.
 
@@ -193,6 +194,24 @@ What follows from it:
 
 VibeVJ does not switch the mode of a display: the system keeps running it at its size, and *Picture* (*Stretch*, *Fit*,
 *Fill*) of the output decides how a picture of another shape is shown on it.
+
+## Sound
+
+The page *Sound* says where the sound of [video clips](Video.md#sound) plays. The choices are personal, kept in
+`VibeVJ/engine/style.json` by the name of the device, so they come back after a restart and when the device is plugged
+in again.
+
+| Setting | What it does |
+|---|---|
+| *Main output* | Where the clips with *Audio* on play. *System default* (the standard): the default output of the computer, and it follows when you change that in the system. Or a device of the list. |
+| *Pre-listen output* | Headphones for the clips with [*Pre-listen*](Video.md#pre-listen) on: they play there instead of the main output. *Off* (the standard): none. |
+| *Look for devices* | Asks the system for its sound devices again. While the window is open the lists also follow by themselves. |
+
+- A chosen device that is not connected stays chosen, marked "(not connected)". Meanwhile the default output plays
+  (for the pre-listen output: nothing), and when the device is back VibeVJ takes it again within 2 seconds.
+- The line under the lists says which devices play right now. The devices open with the first clip that has *Audio*,
+  *Pre-listen* or *Audio analysis* on, and close with the last one.
+- The sound card the [audio analysis](Audio.md) listens to is chosen in the system, not here.
 
 ## View scaling with Page Up and Page Down
 

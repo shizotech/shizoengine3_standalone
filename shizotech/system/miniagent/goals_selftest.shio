@@ -51,6 +51,9 @@ class FakeHost {
 	workers = 2;
 	idle = 100000;
 	refuse = false;
+	inspect_error = false;
+	inspect_none = false;
+	inspect_lost_json = false;
 
 	add_task(name, goal) {
 		if(refuse)
@@ -69,6 +72,12 @@ class FakeHost {
 	}
 
 	inspect_task(taskid) {
+		if(inspect_error)
+			std.runtime_error("inspect failed");
+		if(inspect_none)
+			return None;
+		if(inspect_lost_json)
+			return [ok = false, taskid = taskid, state = "lost", error = "remote request expired", active = false, last_update_ms = 0];
 		t = find(taskid);
 		if(!t)
 			return "Not found.";
@@ -140,6 +149,15 @@ has_event(sch, kind, goal) {
 			return true;
 	}
 	return false;
+}
+
+count_events(sch, kind, goal) {
+	n = 0;
+	for(e : sch.ledger.data.events) {
+		if(e.kind == kind && e.goal == goal)
+			n++;
+	}
+	return n;
 }
 
 notes_with(host, needle) {
@@ -298,10 +316,38 @@ oncev = goal_validate(gfm_read_text("---\ntitle: T\nschedule:\n  type: once\n  d
 check("every is refused for type once", !oncev.ok && gfm_join(oncev.errors, "; ").contains("recurring or windowed"), gfm_join(oncev.errors, "; "));
 
 bare = goal_validate(gfm_read_text("---\ntitle: T\nschedule:\n  type: recurring\n  every: 2\n  start: \"06:00\"\n---\nWork.\n").data, "Work.", prefs, "x", "active");
-check("a bare number is refused (in a duration it would mean minutes)", !bare.ok && gfm_join(bare.errors, "; ").contains("day unit"), gfm_join(bare.errors, "; "));
+check("a bare number is refused (in a duration it would mean minutes)", !bare.ok && gfm_join(bare.errors, "; ").contains("add a unit"), gfm_join(bare.errors, "; "));
+
+short_interval = goal_validate(gfm_read_text("---\ntitle: Frequent check\nschedule:\n  type: recurring\n  every: 5m\n  timezone: Europe/Berlin\n---\nCheck it.\n").data, "Check it.", prefs, "frequent-check", "active");
+short_anchor = at(ber, "2026-10-20", "06:02");
+short_windows = goal_next_windows(short_interval.def, short_anchor + 90, 3, short_anchor);
+check("every 5m is a valid continuous schedule without a time window", short_interval.ok && std.is_none(short_interval.def.schedule.start) && short_interval.def.schedule.interval_seconds == 300, gfm_join(short_interval.errors, "; "));
+check("sub-day windows stay five minutes apart and last one interval", short_windows.size() == 3 && short_windows[0].start == short_anchor && short_windows[1].start - short_windows[0].start == 300 && short_windows[0].end - short_windows[0].start == 300, std.string(short_windows));
+check("sub-day interval has a readable schedule summary", goal_schedule_text(short_interval.def).contains("every 5m"), goal_schedule_text(short_interval.def));
+short_between = goal_windows_between(short_interval.def, short_anchor + 120, short_anchor + 420, short_anchor);
+check("sub-day windows overlapping a tick range are returned", short_between.size() == 2 && short_between[0].start == short_anchor && short_between[1].start == short_anchor + 300, std.string(short_between));
+
+short_root = ROOT + "/short_interval";
+short_space = GoalSpace(short_root);
+short_space.init(TEMPLATE);
+short_goal_dir = short_root + "/goals/active/frequent-check";
+goal_mkdir(short_goal_dir);
+fileio.write_text(short_goal_dir + "/goal.md", "---\nid: frequent-check\ntitle: Frequent check\nschedule:\n  type: recurring\n  every: 5m\n  timezone: Europe/Berlin\n---\nCheck it.\n");
+short_clock = FakeClock();
+short_clock.t = short_anchor;
+short_host = FakeHost();
+short_scheduler = GoalScheduler(short_space, short_host, [notify = false]);
+short_scheduler.clock = [short_clock]() { return short_clock.t; };
+short_scheduler.tick();
+check("scheduler dispatches a minute-interval goal", count_activations(short_scheduler, "frequent-check") == 1 && short_host.tasks.size() == 1, std.string(short_host.tasks.size()));
+short_host.finish("t1", "finished", "done");
+short_clock.t += 300;
+short_scheduler.tick();
+check("scheduler dispatches again at the five-minute cadence", count_activations(short_scheduler, "frequent-check") == 2 && short_host.tasks.size() == 2, std.string(short_host.tasks.size()));
+fileio.remove(short_root);
 
 part = goal_validate(gfm_read_text("---\ntitle: T\nschedule:\n  type: recurring\n  every: 36h\n  start: \"06:00\"\n---\nWork.\n").data, "Work.", prefs, "x", "active");
-check("a part-day interval is refused", !part.ok && gfm_join(part.errors, "; ").contains("whole days"), gfm_join(part.errors, "; "));
+check("a mixed interval of 1d or longer is refused", !part.ok && gfm_join(part.errors, "; ").contains("whole days"), gfm_join(part.errors, "; "));
 
 big = goal_validate(gfm_read_text("---\ntitle: T\nschedule:\n  type: recurring\n  every: 400d\n  start: \"06:00\"\n---\nWork.\n").data, "Work.", prefs, "x", "active");
 check("an interval over a year is refused", !big.ok && gfm_join(big.errors, "; ").contains("365d"), gfm_join(big.errors, "; "));
@@ -348,6 +394,42 @@ sch.clock = [clk]() { return clk.t; };
 sch.tick();
 check("before the window: nothing activated", count_activations(sch, "gh-issues") == 0 && host.tasks.size() == 0, "");
 
+check("the scheduler is bound to one workspace", sch.root == ROOT && sch.workspace_id == ROOT, std.string([root = sch.root, workspace_id = sch.workspace_id]));
+
+pr = sch.poll_task("missing");
+check("poll_task: legacy 'Not found.' is lost", pr.ok == 1 && pr.taskid == "missing" && pr.state == "lost", std.string(pr));
+check("poll_task: result has the protocol fields", pr.has("ok") && pr.has("taskid") && pr.has("state") && pr.has("report") && pr.has("error") && pr.has("active") && pr.has("last_update_ms"), std.string(pr));
+
+host.inspect_error = true;
+pr = sch.poll_task("transient");
+check("poll_task: an inspect exception is unknown, not lost", pr.ok == 0 && pr.state == "unknown" && pr.error != "", std.string(pr));
+host.inspect_error = false;
+
+host.inspect_none = true;
+pr = sch.poll_task("transient");
+check("poll_task: None is unknown, not lost", pr.ok == 0 && pr.state == "unknown", std.string(pr));
+host.inspect_none = false;
+
+host.inspect_lost_json = true;
+pr = sch.poll_task("canonical");
+check("poll_task: canonical ok=false/state=lost is lost", pr.ok == 1 && pr.state == "lost", std.string(pr));
+host.inspect_lost_json = false;
+
+ua = [akey = "unknown-run", goal = "unknown-goal", state = "open", runs = []];
+ur = [n = 1, kind = "work", state = "running", taskid = "transient", settled = false, terminal_reported = false];
+ua.runs.push_back(ur);
+sch.ledger.data.activations["unknown-run"] = ua;
+host.inspect_error = true;
+sch.settle_runs();
+check("a transient unknown inspect result keeps the run open", ur.state == "running" && !gj(ur, "settled", false), std.string([state = ur.state, settled = gj(ur, "settled", false)]));
+host.inspect_error = false;
+sch.ledger.data.activations.remove("unknown-run");
+
+tevt = [taskid = "dup-task", state = "finished", report = "done", last_update_ms = std.millis()];
+sch.on_host_task_finished(tevt);
+sch.on_host_task_finished(tevt);
+check("on_host_task_finished stores one terminal event per taskid", sch.terminal_events.size() == 1, std.string(sch.terminal_events.size()));
+
 clk.t = at(ber, "2026-10-19", "05:00") + 20;
 sch.tick();
 check("window start: one activation", count_activations(sch, "gh-issues") == 1, "");
@@ -358,6 +440,9 @@ check("the start is announced", notes_with(host, "Goal gh-issues starts") == 1, 
 sch.tick();
 sch.tick();
 check("more ticks: still one activation, one task", count_activations(sch, "gh-issues") == 1 && host.tasks.size() == 1, "");
+
+sch.update();
+check("update() is a synchronous tick alias", count_activations(sch, "gh-issues") == 1 && host.tasks.size() == 1, "");
 
 // restart: a new process, the host lost its in-memory tasks
 clk.t = at(ber, "2026-10-19", "05:10");
@@ -381,9 +466,27 @@ act = sch2.ledger.data.activations[akey];
 check("finished run closes the window (no repeat)", act.state == "done", act.state);
 check("no new run after success", host2.tasks.size() == 1, "");
 check("history.md got an entry", goal_read(ROOT + "/goals/active/gh-issues/history.md").contains("Fixed issue #12"), "");
-// the task's own finished event carries the report to the chat: the goal notify must not repeat it ([done] + [notify])
-check("the finished notify does not repeat the report", notes_with(host2, "finished (report in the task message)") == 1 && notes_with(host2, "Fixed issue #12") == 0, std.string(host2.notes));
-check("the run records the definition revision", act.runs[act.runs.size() - 1].revision == act.revision && act.revision != "", "");
+// One completed task = one message: the task_finished event carries the report,
+	// so the goal scheduler must not add a second [notify] for a plain finished run.
+	check("the finished notify does not repeat the report", notes_with(host2, "finished (report in the task message)") == 0 && notes_with(host2, "Fixed issue #12") == 0, std.string(host2.notes));
+	check("the run records the definition revision", act.runs[act.runs.size() - 1].revision == act.revision && act.revision != "", "");
+
+	frr = act.runs[act.runs.size() - 1];
+	check("a finished run is settled exactly once", gj(frr, "settled", false) && count_events(sch2, "run_finished", "gh-issues") == 1, std.string([settled = gj(frr, "settled", false), events = count_events(sch2, "run_finished", "gh-issues")]));
+	sch2.finish_run(act, frr, "finished", "again");
+	sch2.settle_runs();
+	check("repeated settlement adds no terminal event", count_events(sch2, "run_finished", "gh-issues") == 1, std.string(count_events(sch2, "run_finished", "gh-issues")));
+
+	sch2.notify_once("dedupe-probe", "one scheduler message");
+	sch2.notify_once("dedupe-probe", "one scheduler message");
+	check("notify_once dedupes scheduler notifications by key", notes_with(host2, "one scheduler message") == 1, std.string(host2.notes));
+
+	qa = [akey = "question-run", goal = "question-goal", state = "open", runs = []];
+	qr = [n = 1, kind = "work", state = "running", taskid = "question-task", settled = false, terminal_reported = false];
+	qa.runs.push_back(qr);
+	sch2.finish_run(qa, qr, "question", "need a decision");
+	sch2.finish_run(qa, qr, "question", "need a decision");
+	check("a question run settles and notifies once", qa.state == "blocked" && count_events(sch2, "run_question", "question-goal") == 1 && notes_with(host2, "needs you") == 1, std.string([state = qa.state, events = count_events(sch2, "run_question", "question-goal"), notes = notes_with(host2, "needs you")]));
 
 // ═════════════════════════════════════════════════════════════════════════════
 section("scheduler: failures and retries");
@@ -411,6 +514,9 @@ sch2.tick();
 clk.t += 10 * 60;
 sch2.tick();
 check("max_attempts ends the window as failed", host2.tasks.size() == 4 && notes_with(host2, "no attempts left") == 1, std.string(host2.tasks.size()));
+
+sch2.tick();
+check("max_attempts notification is reported once, even on a repeated tick", notes_with(host2, "no attempts left") == 1, std.string(host2.notes));
 
 // ═════════════════════════════════════════════════════════════════════════════
 section("scheduler: window end and stop policy");
@@ -819,6 +925,12 @@ check("a goal that may release stays proposed even with activate=yes", hi.ok && 
 act = goal_tool_create(sch4, [title = "Fix GitHub issues", instructions = "Fix eligible issues.", schedule_type = "windowed", days = "weekdays", window = "tonight", start = "05:00", end = "10:00", activate = "yes"]);
 check("an explicit 05:00-10:00 wins over 'tonight' and is active", act.ok && act.status == "active" && act.schedule.contains("05:00-10:00"), std.string(act));
 
+recurring_tool = goal_tool_create_recurring(sch4, [title = "Recurring task tool test", instructions = "Check the scheduled report.", every = "3d", start = "07:00", duration = "20m"]);
+check("recurring task tool creates an interval goal proposed by default", recurring_tool.ok && recurring_tool.status == "proposed" && recurring_tool.schedule.contains("every 3d"), std.string(recurring_tool));
+recurring_days_tool = goal_tool_create_recurring(sch4, [title = "Bicycle maintenance patrol", instructions = "Inspect the chain and inflate the tires before each commute.", days = "weekdays", window = "tonight"]);
+check("recurring task tool accepts weekday cadence", recurring_days_tool.ok && recurring_days_tool.status == "proposed" && recurring_days_tool.schedule.contains("mon,tue,wed,thu,fri"), std.string(recurring_days_tool));
+check("recurring task tool persists its interval", goal_read(ROOT + "/goals/proposed/recurring-task-tool-test/goal.md").contains("every: 3d"), "");
+
 ev = goal_tool_create(sch4, [title = "Check the server logs", instructions = "Read the last 200 lines of the server log.", schedule_type = "recurring", every = "2d", start = "06:00", duration = "30m", activate = "yes"]);
 check("create_goal accepts every='2d'", ev.ok && ev.schedule.contains("every 2d"), gj_str(ev, "error", std.string(ev)));
 check("create_goal writes 'every: 2d' into goal.md", ev.ok && goal_read(ROOT + "/goals/active/check-the-server-logs/goal.md").contains("every: 2d"), goal_read(ROOT + "/goals/active/check-the-server-logs/goal.md"));
@@ -886,6 +998,8 @@ clk.t = at(ber, "2026-10-29", "19:00") + 5;
 sch4.tick();
 check("a refused dispatch creates no task, only a dispatch_failed event", host4.tasks.size() == before && has_event(sch4, "dispatch_failed", "refused"), std.string(host4.tasks.size() - before));
 check("a refused dispatch notifies the owner with the reason", notes_with(host4, "could not start - the host refused the task") == 1, std.string(host4.notes));
+sch4.tick();
+check("a refused dispatch notification is reported once, even on a repeated tick", notes_with(host4, "could not start - the host refused the task") == 1, std.string(host4.notes));
 host4.refuse = false;
 clk.t += 6 * 60;
 sch4.tick();
@@ -947,6 +1061,7 @@ check("day 3: the cadence continues", count_activations(sch4, "log-sweep") == 2 
 check("the prompt carries the interval instructions", host4.tasks.size() && host4.tasks[host4.tasks.size() - 1].task.contains("Read the last 200 lines of the server log."), "");
 
 sum = sch4.goal_summary("log-sweep", sch4.defs["log-sweep"]);
+check("the summary exposes the active run and task", sum.active_run_state == "running" && sum.active_taskid == host4.tasks[host4.tasks.size() - 1].taskid, std.string(sum));
 check("the summary renders the interval", sum.schedule.contains("every 2d"), sum.schedule);
 check("the preview is on the interval phase (the open window of 11-03)", sum.next_window.starts("2026-11-03 06:00"), sum.next_window);
 

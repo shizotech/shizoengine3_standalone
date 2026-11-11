@@ -1,0 +1,263 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  web_ui.shio — the web interface of a Node: shz miniagent --web
+//
+//      shz miniagent --web [--port 13337] [--api-token secret]
+//      shz miniagent.node --web ...                   (the same)
+//
+//  One HTTP server on the Node:
+//    /                       the dashboard (web/index.html): chat with the
+//                            receptionist and the workspace tasks
+//    /api/...                the Node JSON API (node_api.shio, node_api.md)
+//    /api/adminagent...      the chat protocol of the dashboard, run on the
+//                            Node's receptionist connector
+//    /api/workspaces...      WorkspaceRegistry routes (workspaces.shio)
+//
+//  Every page works offline: no CDN, everything is in web/.
+//  With --api-token the pages ask for the token once (kept in the browser).
+//
+//      #include "web_ui"
+//      opts = web_ui_parse(web_ui_args());       // [web, port, api_token]
+//      ui = web_ui_start(node, cfg, opts, registry);  // [server, board, runtime] | None
+// ═════════════════════════════════════════════════════════════════════════════
+ 
+#include "node_api"
+#include "workspaces"
+
+WEB_UI_DEFAULT_PORT = 13337;
+WEB_UI_ROOT = __DIR__ + "/web";
+
+// The dashboard is web/index.html. The old chat and tasks pages are no longer
+// part of the web UI; deny them at the static root. The architecture editor is
+// still embedded by the dashboard's Architecture tab, so it must be served.
+web_ui_protect(req) {
+	p = std.string(req.path ?? "");
+	if(p == "/chat" || p.starts("/chat/") || p == "/tasks" || p.starts("/tasks/"))
+		return false;
+	return true;
+}
+
+// the command line as a list (index 0, the script, left out)
+web_ui_args() {
+	args = [];
+	for(i = 1; i < std.argc(); i++) {
+		a = std.argv(i);
+		args.push_back(a ? std.string(a) : "");
+	}
+	return args;
+}
+
+web_ui_value(args, flag) {
+	for(i = 0; i < args.size(); i++) {
+		a = std.string(args[i]);
+		if(a == flag && i + 1 < args.size())
+			return std.string(args[i + 1]);
+		if(a.starts(flag + "="))
+			return a.substr(flag.length() + 1);
+	}
+	return "";
+}
+
+web_ui_has(args, flag) {
+	for(a : args) {
+		if(std.string(a) == flag)
+			return true;
+	}
+	return false;
+}
+
+// -> [web, port, api_token]
+//    web: --web (also --web=<port>); port: --port, else 13337
+web_ui_parse(args) {
+	web = web_ui_has(args, "--web");
+	port = WEB_UI_DEFAULT_PORT;
+
+	inline = web_ui_value(args, "--web");
+	if(inline && !inline.starts("--") && std.int(inline) > 0) {
+		web = true;
+		port = std.int(inline);
+	}
+
+	p = web_ui_value(args, "--port");
+	if(p && std.int(p) > 0)
+		port = std.int(p);
+
+	return [
+		web = web,
+		port = port,
+		api_token = web_ui_value(args, "--api-token"),
+	];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  /api/adminagent: the chat protocol of the dashboard on the Node's receptionist
+// ─────────────────────────────────────────────────────────────────────────────
+
+// a receptionist action -> the delta of the chat page (None: not shown)
+web_ui_chat_delta(action) {
+	if(!std.is_json(action))
+		return None;
+
+	if(action.has("text") && action.text)
+		return [agent = "planner", text = std.string(action.text)];
+
+	// a tool call arrives twice: as "tool" (the model's call) and as "tool_start"
+	// (the harness runs it); the chat shows it once
+	tool = None;
+	if(action.has("tool_start") && std.is_json(action.tool_start))
+		tool = action.tool_start;
+
+	if(!tool || !tool.has("name"))
+		return None;
+
+	name = std.string(tool.name);
+	args = tool.has("args") && std.is_json(tool.args) ? tool.args : std.json();
+
+	if(name == "finish" && args.has("summary"))
+		return [agent = "planner", text = "\n\n" + std.string(args.summary)];
+
+	text = "\n> [TOOL] " + name;
+	if(args.has("name") && args.name)
+		text += " `" + std.string(args.name) + "`";
+	else if(args.has("path") && args.path)
+		text += " `" + std.string(args.path) + "`";
+	return [agent = "planner", text = text + "\n\n"];
+}
+
+web_ui_chat_routes(server, node, api_token) {
+	sessions = [];		// client ip -> [token, queue, status]
+
+	server.route("POST", "^/api/adminagent$", [node, sessions, api_token](req, writer) {
+		if(!node_api_authorized(req, api_token))
+			return node_api_err("Unauthorized", 401);
+
+		body = node_api_body(req);
+		prompt = node_api_get(body, "prompt");
+		if(!prompt.strip())
+			return node_api_err("Missing 'prompt'");
+
+		client = std.string(req.client_ip);
+		token = node_api_get(body, "session_id");
+		if(!token)
+			token = std.random_hash(16);
+
+		sessions[client] = [token = token, queue = [], status = "generating", started = std.millis()];
+
+		run = [node, sessions, client, token, prompt]() {
+			on_action = [sessions, client, token](action) {
+				if(!sessions.has(client) || sessions[client].token != token)
+					return;
+				d = web_ui_chat_delta(action);
+				if(d)
+					sessions[client].queue.push_back(d);
+			};
+			result = None;
+			try {
+				result = node.request(prompt, None, on_action);
+			}
+			catch(e) {
+				result = [ok = false, error = std.string(e)];
+			}
+			if(!sessions.has(client) || sessions[client].token != token)
+				return;
+			// the report of the turn closes the answer (the finish summary is
+			// streamed already, so only a turn without one adds its report)
+			if(std.is_json(result) && !result.ok) {
+				txt = std.string(result.error ?? "the turn failed");
+				if(std.is_json(result.reports) && result.reports.size())
+					txt = std.string(result.reports[0].report);
+				sessions[client].queue.push_back([agent = "planner", text = "\n\n" + txt]);
+			}
+			sessions[client].status = "done";
+		};
+		std.thread(run).run();
+
+		return [status_code = 200, headers = node_api_headers(), body = std.string([ok = 1, session_id = token])];
+	});
+
+	server.route("POST", "^/api/adminagent/poll$", [sessions, api_token](req, writer) {
+		if(!node_api_authorized(req, api_token))
+			return node_api_err("Unauthorized", 401);
+
+		body = node_api_body(req);
+		client = std.string(req.client_ip);
+		reply = [ok = true, status = "done"];
+
+		if(sessions.has(client)) {
+			s = sessions[client];
+			if(s.token != node_api_get(body, "session_id")) {
+				reply = [ok = false, status = "error", error = "unknown session"];
+			}
+			else if(s.queue.size()) {
+				d = s.queue[0];
+				s.queue.erase(0);
+				// consecutive text of the same agent in one delta
+				for(s.queue.size() && s.queue[0].agent == d.agent) {
+					d.text += s.queue[0].text;
+					s.queue.erase(0);
+				}
+				reply = [ok = true, status = "generating", delta = d];
+			}
+			else if(s.status == "done") {
+				sessions.erase(client);
+				reply = [ok = true, status = "done"];
+			}
+			else
+				reply = [ok = true, status = "waiting"];
+		}
+
+		return [status_code = 200, headers = node_api_headers(), body = std.string(reply)];
+	});
+
+	server.route("POST", "^/api/adminagent/stop$", [node, sessions, api_token](req, writer) {
+		if(!node_api_authorized(req, api_token))
+			return node_api_err("Unauthorized", 401);
+
+		client = std.string(req.client_ip);
+		if(sessions.has(client)) {
+			sessions.erase(client);
+			try {
+				node.receptionist.stop();
+			}
+			catch(e) {}
+		}
+		return [status_code = 200, headers = node_api_headers(), body = std.string([ok = true])];
+	});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Workspace boards are served by workspaces_api_register; no node-level
+//  /api/architecture routes here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// -> [server, board, runtime], None when the port cannot be bound
+//    registry: the WorkspaceRegistry to serve; defaults to node.registry.
+//    board: the Node workspace's board (compatibility for node.shio); no legacy
+//           node-level ArchitectureBoard is created here.
+web_ui_start(node, cfg, opts, registry = None) {
+	port = std.int(opts.port ?? WEB_UI_DEFAULT_PORT);
+	token = std.string(opts.api_token ?? "");
+
+	if(std.is_none(registry)) {
+		try {
+			registry = node.registry;
+		} catch(e) {
+			registry = None;
+		}
+	}
+
+	server = node_api_start(node, cfg, port, token, WEB_UI_ROOT, web_ui_protect);
+	if(!server)
+		return None;
+
+	web_ui_chat_routes(server, node, token);
+
+	runtime = workspaces_api_register(server, cfg, token, registry);
+
+	board = None;
+	try {
+		if(node && !std.is_none(node.node_workspace) && !std.is_none(node.node_workspace.board))
+			board = node.node_workspace.board;
+	} catch(e) {}
+
+	return [server = server, board = board, runtime = runtime];
+}

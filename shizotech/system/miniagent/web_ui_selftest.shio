@@ -1,0 +1,246 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  web_ui_selftest.shio — the web interface of a node keeps answering
+//
+//  Usage:  shz web_ui_selftest.shio      (from system/miniagent, no LLM)
+//
+//  web_ui_start() on a stub host whose receptionist turn takes 2 s, then what a
+//  browser does: the pages and their files, the polling of every page, a chat
+//  turn with its /poll loop, many requests in a row and at the same time, a
+//  keep-alive connection that is reused (curl with several URLs). After every step the server must still answer
+//  quickly (shizotech/shizoscript3 PR #9: "after the first request the webserver
+//  hangs"). Exits with code 0 when every check passes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "web_ui"
+
+import curl;
+
+TEST_PORT = 13347;
+ROOT = __DIR__ + "/.selftest_web_ui";
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+// the Megamind surface web_ui / node_api / the board use; a turn takes 2 s
+class StubHost {
+	running = true;
+	_receptionist_active = false;
+	request_queue = [];
+	worker_threads = [];
+	receptionist = None;
+	tasks = [];
+	tasks_scheduled = [];
+	tasks_finished = [];
+	tasks_failed = [];
+	listeners = [];
+	turns = 0;
+
+	on_notify(cb) {}
+	on_task_finished(cb) {}
+	add_task_finished_listener(cb) { listeners.push_back(cb); }
+
+	request(prompt, on_finish_cb = None, on_action_cb = None) {
+		turns++;
+		_receptionist_active = true;
+		if(on_action_cb) {
+			on_action_cb([text = "thinking about " + prompt]);
+			on_action_cb([tool = [name = "start_task", args = [name = "Job"]]]);
+			on_action_cb([tool_start = [id = "1", name = "start_task", args = [name = "Job"]]]);
+		}
+		std.sleep(2000);
+		if(on_action_cb)
+			on_action_cb([text = " done"]);
+		_receptionist_active = false;
+		return [ok = true, reports = [[report = "done"]]];
+	}
+
+	get_overview() {
+		return [tasks = tasks, tasks_scheduled = tasks_scheduled, tasks_finished = tasks_finished, tasks_failed = tasks_failed];
+	}
+
+	add_task(name, goal, role = "adaptive") {
+		id = std.random_hash(16);
+		tasks_scheduled.push_back([name = name, task = goal, taskid = id, state = "planned", role = role]);
+		return id;
+	}
+
+	stop_task(taskid) { return false; }
+	update_task(taskid, message) { return false; }
+	inspect_task(taskid) {
+		return [
+			ok = false,
+			taskid = taskid,
+			name = "",
+			state = "lost",
+			active = json.bool(false),
+			report = "",
+			error = "not found",
+			token_usage = 0,
+			last_update_ms = 0,
+		];
+	}
+}
+
+base = "http://127.0.0.1:" + std.string(TEST_PORT);
+
+http(method, path, body = "", timeout_ms = 5000) {
+	managed c = curl.curl();
+	t0 = std.millis();
+	res = c.request(method, base + path, std.string(body), ["Content-Type" = "application/json"], timeout_ms);
+	res.ms = std.millis() - t0;
+	return res;
+}
+
+// the server answers a fresh request within a second
+alive(tag) {
+	r = http("GET", "/api/health", "", 3000);
+	check("still answers: " + tag, r.http_code == 200 && r.ms < 1000, std.string(r.http_code) + " in " + std.string(r.ms) + " ms");
+}
+
+if(fileio.exists(ROOT)) {
+	for(f : fileio.files(ROOT, true))
+		try { fileio.remove(ROOT + "/" + f); } catch(e) {}
+}
+
+host = StubHost();
+cfg = [url = "http://127.0.0.1:9", name = "stub-model", token = "", max_tokens = 8000, max_running_agents = 0];
+ui = web_ui_start(host, cfg, [port = TEST_PORT, api_token = ""]);
+
+if(!ui) {
+	std.print("FAIL: the web interface did not start");
+	std.exitprocess(1);
+}
+check(!std.is_none(ui.runtime) && !std.is_none(ui.runtime.store) && !std.is_none(ui.runtime.manager), "web_ui_start returns the workspace runtime");
+std.sleep(300);
+
+std.print("\n── the pages and their files ──");
+for(p : ["/", "/dashboard.js", "/components/nodeapi.js", "/components/icons.css", "/components/industrial.css",
+	"/architecture/index.html", "/architecture/graph.js", "/architecture/style.css"]) {
+	r = http("GET", p);
+	check("GET " + p, r.http_code == 200 && std.string(r.body).length() > 50, std.string(r.http_code));
+}
+r = http("GET", "/chat/index.html");
+check("old chat page is denied", (r.http_code == 403 || r.http_code == 404) && r.ms < 1000, std.string(r.http_code));
+r = http("GET", "/tasks/index.html");
+check("old tasks page is denied", (r.http_code == 403 || r.http_code == 404) && r.ms < 1000, std.string(r.http_code));
+r = http("GET", "/favicon.ico");
+check("a missing file is answered (403 / 404), not a hang", (r.http_code == 404 || r.http_code == 403) && r.ms < 1000, std.string(r.http_code));
+alive("after the pages");
+
+std.print("\n── the polling of every page, 30 times in a row ──");
+bad = 0;
+slow = 0;
+for(i = 0; i < 30; i++) {
+	for(p : ["/api/status", "/api/notifications", "/api/tasks", "/api/events", "/api/health"]) {
+		r = http("GET", p);
+		if(r.http_code != 200)
+			bad++;
+		if(r.ms > 1000)
+			slow++;
+	}
+}
+check("150 polls answered", bad == 0 && slow == 0, std.string(bad) + " failed, " + std.string(slow) + " slow");
+alive("after the polling");
+
+std.print("\n── a chat turn (2 s) while the pages poll ──");
+r = http("POST", "/api/adminagent", [prompt = "hello"]);
+sid = std.json(std.string(r.body), true).session_id;
+check("the chat turn starts", r.http_code == 200 && sid, std.string(r.body));
+text = "";
+state = "";
+during = [n = 0, slow = 0];
+t0 = std.millis();
+for(std.millis() - t0 < 6000) {
+	p = http("POST", "/api/adminagent/poll", [session_id = sid]);
+	j = std.json(std.string(p.body), true);
+	state = std.string(j.status);
+	if(j.has("delta"))
+		text += std.string(j.delta.text);
+	q = http("GET", "/api/status");
+	during.n++;
+	if(q.http_code != 200 || q.ms > 1000)
+		during.slow++;
+	if(state == "done")
+		break;
+	std.sleep(50);
+}
+check("the turn ends with done", state == "done", state);
+check("the answer arrived", text.contains("thinking about hello") && text.contains("done"), text);
+check("a tool call is shown once", text.split("[TOOL] start_task").size() == 2, text);
+check("the other pages were answered during the turn", during.n > 5 && during.slow == 0, std.string(during));
+alive("after the chat turn");
+
+std.print("\n── a second and third chat turn ──");
+for(k = 0; k < 2; k++) {
+	r = http("POST", "/api/adminagent", [prompt = "again " + std.string(k)]);
+	sid = std.json(std.string(r.body), true).session_id;
+	state = "";
+	t0 = std.millis();
+	for(std.millis() - t0 < 6000 && state != "done") {
+		state = std.string(std.json(std.string(http("POST", "/api/adminagent/poll", [session_id = sid]).body), true).status);
+		std.sleep(100);
+	}
+	check("turn " + std.string(k + 2) + " ends", state == "done", state);
+}
+check("three receptionist turns ran", host.turns == 3, std.string(host.turns));
+alive("after three turns");
+
+std.print("\n── 20 requests at the same time ──");
+res = [ok = 0, n = 0];
+for(i = 0; i < 20; i++) {
+	std.thread([res, i]() {
+		r = http("GET", i % 2 ? "/api/status" : "/api/tasks");
+		if(r.http_code == 200)
+			res.ok++;
+		res.n++;
+	}).run();
+}
+t0 = std.millis();
+for(res.n < 20 && std.millis() - t0 < 10000)
+	std.sleep(20);
+check("20 parallel requests answered", res.ok == 20, std.string(res));
+alive("after the parallel requests");
+
+std.print("\n── keep-alive ──");
+// curl reuses one connection for several URLs (what a browser does)
+// (static files answer "Connection: close", the API keeps the connection)
+urls = ["/api/health", "/api/status", "/api/status", "/api/tasks", "/api/health"];
+cmd = "curl -s -H \"Connection: keep-alive\" -w \"%{http_code} %{num_connects};\"";
+for(u : urls)
+	cmd += " -o " + (std.os_platform() == "windows" ? "NUL" : "/dev/null") + " " + base + u;
+out = "";
+try {
+	out = std.string(std.system(cmd, true));
+}
+catch(e) {
+	out = "";
+}
+if(out.contains("200")) {
+	// num_connects is 0 for a request that reused the connection
+	check("five requests on one keep-alive connection", out.split("200").size() == 6 && out.split(" 0;").size() == 5, out);
+}
+else {
+	std.print("  (no curl command line: keep-alive check skipped) ", out);
+}
+alive("with keep-alive connections open");
+
+ui.server.stop();
+if(fileio.exists(ROOT)) {
+	for(f : fileio.files(ROOT, true))
+		try { fileio.remove(ROOT + "/" + f); } catch(e) {}
+	try { fileio.remove(ROOT); } catch(e) {}
+}
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+std.exitprocess(failed ? 1 : 0);

@@ -59,6 +59,41 @@ MyAsset.asset/
         └── helper.shio
 ```
 
+The entry file picks the loader (`engine/generators/extensions/`): `src/__init__.shio` a script asset (this guide),
+`src/__init__.glsl` a shader (`Shaders/SHADER_GUIDE.MD`), `src/__init__.native` a native asset (below).
+
+### Native assets: an algorithm in C (#201)
+
+A native asset is a generator whose code is a C ABI plugin (plain C, or C++ / Rust / Zig through the C interface)
+instead of a script: an algorithm on the CPU that the engine shows like a shader. Example and walkthrough:
+`assets/Generators/Native/Life.asset` and the section *A native VibeVJ asset* of
+`core/shizoscript3_core_cabi/README.md` (in the source repository); one that processes a picture (an input and a text
+control, C ABI 1.3): `assets/Generators/Native/Dither.asset`.
+
+```
+MyAlgo.asset/
+├── asset.json
+├── src/
+│   └── __init__.native     # {"asset": "my_algo.algo", "package": "plugin"}: the type the plugin registers, its folder
+└── plugin/                 # the C ABI plugin as a package: package.shz, the sources, CMakeLists.txt
+    └── native/<platform>/shzmodule_my_algo.<so|dylib|dll>   # built for each system (linux_x64, macos_arm64, windows_x64)
+```
+
+- The plugin includes only `shz_abi.h` and registers its asset with `reg->add_asset()` (C ABI 1.2): controls of the
+  kinds a shader annotation has (slider, int, float, button, pushbutton, enum, vec2..4, ivec2..4, slidervec2..4, rgb,
+  rgba; 1.3: text), value outputs, a picture (RGBA8 or RGBA32F, made on the CPU), 1.3: picture inputs (the engine reads
+  the linked picture back from the GPU at the size the input asks for) and the callbacks create / update / render /
+  control_changed / save / load / destroy.
+- Rebuilt while VibeVJ runs, the plugin is loaded again (the section *Plugin* of its window: *Reload plugin*, *Watch the
+  library*; `std.native_reload` in a script): *Reloading a plugin while it runs* of the README of the C ABI.
+- The engine builds the window of a shader around it (`engine/generators/extensions/native/`): the controls in the
+  section *Controls* of the *Control* tab (the same builder as for shader uniforms), the value outputs in *Values*, the
+  picture as the input of a passthrough shader, so *Out*, render size, Spout, NDI and the displays work.
+- Without a library for the system in `plugin/native/`, the package named like the namespace of the type is imported
+  (`shizotech/packages/my_algo`): that is how the builds of this repository ship the plugins of its own assets.
+- Check it without the app: `_testing/native_asset.shio` shows how (the loader's `native_asset_open()` gives the object
+  and what it declares; `set`, `update`, `render`, `serialize` on it).
+
 ### asset.json: the id of an asset
 
 A project saves each generator with the `path` of its asset and, next to it, its `asset_id`. When the folder was moved
@@ -114,6 +149,32 @@ dispatcher(generator, cmd, value) {
 
 `dispatcher(generator, cmd, value)` — OPTIONAL. Called by the engine to react to commands. Used by the Network generators (artnet_receiver, artnet_sender, spout_receiver) and the AudioInputAnalysis generator.
 
+**Clips on the timeline (#680).** Any generator can be dropped onto a lane of the timeline. It is then active only while
+the playhead is inside the clip (`"active"` true / false as from its power button) and gets three commands:
+
+| `cmd` | When |
+|---|---|
+| `"clip_start"` | the playhead enters the clip (playing, a jump, the loop), after `"active"` true |
+| `"clip_position"` | every frame while the playhead is inside, also while the timeline stands |
+| `"clip_stop"` | the playhead leaves the clip, or the clip is deleted; before `"active"` false |
+| `"clip_length"` | a video file became a clip (#680 step 3): answer the seconds it should last, or None (the video module answers In to Out at its Speed) |
+
+`value` is `[pos, beat, seconds, length, length_seconds, lane, start]`: `pos` from 0 to 1 through the clip, `beat` the
+beats since its start, `seconds` the same in seconds at the tempo now, `length` its length in beats, `start` where it
+starts on the timeline. A generator that ignores them still works as a clip. A class asset gets them as the methods
+`clip_start(v)`, `clip_position(v)`, `clip_stop(v)` (mixin `TimelineClip`, `engine/contracts/README.md`). Example: a
+generator that runs one sweep over the length of the clip:
+
+```
+dispatcher(generator, cmd, value) {
+    if(cmd == "clip_position")
+        out_ctrl.value(value.pos);
+}
+```
+
+Shaders get the uniforms `CLIP_POS` and `CLIP_TIME` instead (`Shaders/SHADER_GUIDE.MD`); a video starts at its In point
+when its clip starts.
+
 #### save_state / load_state — OPTIONAL
 
 ```
@@ -129,6 +190,14 @@ load_state(state) {
 ```
 
 `save_state()` returns a JSON object capturing the generator's serializable state (artnet_receiver ~line 144; also spout_receiver, textbox, ColorSelector). `load_state(state)` restores it (artnet_receiver ~line 158). Both are OPTIONAL.
+
+#### Undo steps of your own editor
+
+Values of controls and links are steps of the undo history by themselves. An asset with an editor of its own (shapes,
+points, a list) makes its edits steps with `generator.engine.env.edit_step(name, undo_fn, redo_fn, key)`: `undo_fn` and
+`redo_fn` put the state before / after back; a step with the same non-empty `key` less than a second after the last
+one extends it (a drag). Nothing is recorded while a step is undone or a project loads. The functions can run after
+the generator was deleted: catch the errors there. Example: `record()` in `assets/Mapping/MaskDraw.asset` (#586).
 
 #### update_pre / update_post — OPTIONAL
 

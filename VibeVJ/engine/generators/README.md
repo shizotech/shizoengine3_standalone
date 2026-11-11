@@ -26,7 +26,7 @@ engine/generators/
   - Handles **state save/load** (`save_state` / `load_state`) for window
     position, size, big/collapse state and per-generator data.
   - Auto-detects the asset's file extension (no extension → checks for
-    `path/src/__init__.shio` = `asset`, or `path/src/__init__.glsl` = `glsl`)
+    `path/src/__init__.shio` = `asset`, `path/src/__init__.glsl` = `glsl`, or `path/src/__init__.native` = `native`)
     and loads the matching loader from `extensions/<ext>/__init__.shio`,
     calling its `load_extension(generator)` entry point.
 

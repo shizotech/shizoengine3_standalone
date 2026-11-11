@@ -55,7 +55,7 @@ The header runs along the top of the window. From left to right; on the right: *
 | Maximize | *Maximize* | The window fills the whole view and the other windows are hidden. Press it again to go back. While maximized, the chevron and *Close* are hidden, and the zoom of the Patchview is set back and held. |
 | × | *Close* | Closes the generator. |
 
-> Screenshot to add: the header from left to right, with each button labelled.
+![The window header from left to right: collapse, power, links, the name, the ⋯ menu, maximize, close](media/generator-header.png)
 
 ### The ⋯ menu
 
@@ -99,25 +99,35 @@ In a Patchview (and in the *Patch* area of the timeline) you can select generato
 
 **Move**
 
-1. Hold Alt and drag one of the selected generators. A small label at the mouse says what you drag: the name of the
-   generator, or "2 generators". Alt + drag on a generator that is not selected takes that one alone.
+1. Hold Alt and drag one of the selected generators. A small stack of cards at the mouse shows what you drag: "3
+   generators" and their names below (the one you hold first, up to five, then "+ 2 more"), or the name of one
+   generator. While you hold Ctrl it has a "+ Copy" badge: let go now and you drop copies. Alt + drag on a generator
+   that is not selected takes that one alone.
 2. Drop it:
    - in the same Patchview: the generators move to that place;
    - on another Patchview: the generators move there and keep their arrangement;
    - on an area: the generator becomes the view of that area. On an edge it splits the area, in the middle it is added
-     as a tab. More than one generator: the first goes where you drop it, the others become tabs.
+     as a tab. More than one generator: the first goes where you drop it, the others become tabs;
+   - on a cell of a [Clipview](Clipview.md#make-a-clip): the generators become one clip, the first one its first
+     entry and the others stacked on it in the order you selected them. On a cell with a clip, or on the list of the
+     selected clip in the *Layer* window, they are stacked onto that clip;
+   - on a [CueList](CueList.md#add-cues): a cue of them, as an asset dropped there;
+   - on the lanes of the [timeline](Timeline.md#clips-and-lanes) or of a loop: a clip of each, one lane below the
+     other. On the list of a clip in the *Clip* panel they are stacked onto that clip.
 3. Hold Ctrl when you let go to drop copies. The originals stay where they are.
 
-- A generator that moves keeps its controls, links and MIDI mappings. Nothing is reloaded.
-- A copy has the settings of its original. Links between the generators you copy together are copied too: two linked
-  generators give two copies linked the same way. Links to generators you did not copy are not.
+- A generator that moves keeps its controls, links and MIDI mappings. Nothing is reloaded. In a clip it runs while the
+  clip runs, like the other entries of its stack.
+- A copy has the settings of its original, its MIDI mappings too (the copy follows the same knob). Links between the
+  generators you copy together are copied too: two linked generators give two copies linked the same way. Links to
+  generators you did not copy are not.
 - Ctrl + C copies the selected generators, Ctrl + V pastes them: into the Patchview the mouse was over last, the first
   one where the mouse was. The copy stays inside VibeVJ, it is not on the clipboard of your system. A paste is one
   step of [Undo and redo](The-Screen.md#undo-and-redo), and the pasted generators are the selection then.
 - Alt is the key of [*Settings* › *Appearance* › *Move areas with*](Settings.md#move-areas-with).
-- Ctrl + Z takes a move or a copy into an area or another Patchview back: see
-  [Undo and redo](The-Screen.md#undo-and-redo). A move inside the same Patchview is not a step.
-- Not yet: dropping generators into a Clipview cell or a CueList.
+- Ctrl + Z takes a move or a copy back, each drop is one step: see [Undo and redo](The-Screen.md#undo-and-redo). A
+  generator moved into a clip goes back into its Patchview where it was, with its links; the clip the move made goes
+  with it. A move inside the same Patchview is not a step.
 - Not in show mode.
 
 ## Presets

@@ -159,6 +159,22 @@ class generators
 			});
 		});
 
+		//An asset dropped on the bar (#755): it opens in a new view tab, as "+" and a drop into its area would do.
+		//Over the bar the bar takes the drop: the areas below it are its children and take their own drops
+		subviews.on_dragdrop_hover([](payload, pos){
+			return std.is_json(payload) && payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
+		});
+		subviews.on_dragdrop([this](payload, pos){
+			if(nanogui.show_mode() || !std.is_json(payload) || !payload.has("path") || !std.is_string(payload.path) || payload.path == "")
+				return false;
+			path = fileio.relative_path_cwd(payload.path);
+			this.layout_step("Add view", [this, path](){
+				ws = this.add_workspace(this.free_tab_name(), "", true, false);
+				ws.view.add_generator(ws.view.area, path);
+			});
+			return true;
+		});
+
 		subviews.on_double_click([this](index){
 			this.layout_step("Rename tab", [this, index](){
 				this.rename_tab(index);
@@ -202,6 +218,13 @@ class generators
 					return;
 				}
 			}
+		};
+
+		//A generator came into the area of a view tab (singleview.name_tab, #755): the tab is named after it. Not while
+		//a project loads: the tabs keep the names it saved
+		engine.env.name_view_tab = [this, engine](uid, name, only_new){
+			if(!engine.load_in_progress)
+				this.name_view_tab(uid, name, only_new);
 		};
 
 		//The mouse entered an area (singleview): the shortcuts work on that one now
@@ -268,6 +291,8 @@ class generators
 			//Save and the transport: also when a button or a slider that was clicked last only swallowed the key
 			if(action == 1 && (!handled || key_absorbed(engine.screen)) && this.app_key(key, mods, letter))
 				return true;
+			if(action == 0)
+				this.app_key_up(key);
 			return handled;
 		});
 
@@ -306,6 +331,16 @@ class generators
 			this.undo_history.push(name,
 				[this, moves, copies, deletes](){ this.undo_generators(moves, copies, deletes); },
 				[this, moves, copies, deletes](){ this.redo_generators(moves, copies, deletes); });
+		};
+		//An edit an asset makes in its own editor (#586: the shapes of MaskDraw), generators of a Patchview moved alive
+		//into a clip of a Clipview (#348): undo_fn and redo_fn put it back and do it again. key: a step with the same
+		//key less than a second after the last one extends it (a drag)
+		engine.env.edit_step = [this, engine](name, undo_fn, redo_fn, key = ""){
+			if(!this.undo_history || this.undo_history.busy || this.recording || engine.load_in_progress)
+				return;
+			if(key != "" && this.undo_history.extend(key, redo_fn))
+				return;
+			this.undo_history.push(name, undo_fn, redo_fn, key);
 		};
 		//Clips added, moved, copied, stacked or removed in a Clipview (#350): the cells before and after
 		engine.env.clip_step = [this, engine](name, changes){
@@ -642,6 +677,7 @@ class generators
 				undo = undo_history ? undo_history.undo_name() : "",
 				redo = undo_history ? undo_history.redo_name() : "",
 				windows = window_overview(),
+				show_mode = nanogui.show_mode() ? 1 : 0, //the layout tools refuse to work while it is on (#285)
 			];
 		}
 		catch(e) {
@@ -762,8 +798,36 @@ class generators
 		if(!parking)
 			parking = window.widget().fixed_size(vec2f(8, 8)).visible(false);
 
-		//1. Every view that is alive leaves its area and waits
+		//The layout is taken apart and built again in steps, and the screen draws between them: the view tabs are
+		//covered and no area shows its picker until it stands (#873)
+		covered = [];
+		for(i = 0; i < workspaces.size(); i++) {
+			workspaces[i].view.building(true);
+			covered.push_back(workspaces[i].view);
+		}
+		failed = None;
+		try {
+			restore_steps(desc);
+		}
+		catch(e) {
+			failed = e;
+		}
+		for(i = 0; i < covered.size(); i++) {
+			if(covered[i])
+				covered[i].building(false);
+		}
+
+		active_area = "";
+		marked_area = "";
+		for(i = 0; i < workspaces.size(); i++)
+			workspaces[i].view.refresh_tree();
+		if(!std.is_none(failed))
+			std.runtime_error(failed);
+	}
+
+	restore_steps(desc) {
 		pool = [];
+		//1. Every view that is alive leaves its area and waits
 		for(i = 0; i < workspaces.size(); i++) {
 			leaves = [];
 			workspaces[i].view.collect_leaves(leaves);
@@ -830,11 +894,6 @@ class generators
 			if(desc.front != "" && workspaces[i].node.guid() == desc.front)
 				subviews.set_active_tab(workspaces[i].tab);
 		}
-
-		active_area = "";
-		marked_area = "";
-		for(i = 0; i < workspaces.size(); i++)
-			workspaces[i].view.refresh_tree();
 	}
 
 	//A generator that "Move generators" (#348) took out of a Patchview goes back into it. false: it has no such home,
@@ -1085,7 +1144,21 @@ class generators
 			tl.tap();
 			return true;
 		}
+		//Ctrl+L (Cmd+L on a Mac): show mode on at once; leaving it needs the key held (#285, timeline show_key_down).
+		//Not a key of the Mac menu bar: its item would take the press and send press and release at once, so the key
+		//could never be held there
+		if(letter == "l" && mods == 2) {
+			tl.show_key_down(key);
+			return true;
+		}
 		return false;
+	}
+
+	//Every key release, after the focused widget had it: ends the hold of Ctrl+L in show mode (#285)
+	app_key_up(key) {
+		tl = eng.timeline;
+		if(tl && tl.play_btn)
+			tl.show_key_up(key);
 	}
 
 	//true: the key was a shortcut and is used up. mods: 0 none, 1 Shift, 2 Ctrl, 3 Ctrl+Shift. letter: the letter on
@@ -1097,6 +1170,10 @@ class generators
 		//Alt+Left: back to where the last jump of the cable view started
 		if(key == 263 && mods == 4)
 			return cable_back();
+		//Esc ends the learn gesture of the virtual controller (#343) before it closes a window: the element or control
+		//that waits is let go, or learn mode ends
+		if(key == 256 && eng.env.cancel_midi_learn_gesture && eng.env.cancel_midi_learn_gesture(false))
+			return true;
 		//Esc closes a tool window (Settings, Help): the one that has the focus, else the one in front (#376: right
 		//after F1 or the ? button the window does not have the focus yet)
 		if(key == 256 && eng.env.toolwindows) {
@@ -1418,6 +1495,33 @@ class generators
 		return "View";
 	}
 
+	//The view tab of that area is named name. only_new: only while it has the name of a new tab (free_tab_name, the
+	//first tab), not one the user gave it
+	name_view_tab(uid, name, only_new) {
+		for(i = 0; i < workspaces.size(); i++) {
+			ws = workspaces[i];
+			if(ws.view.uid != uid)
+				continue;
+			if(name != "" && (!only_new || is_new_tab_name(subviews.tab_name(ws.tab))))
+				subviews.tab_name(ws.tab, name);
+			return;
+		}
+	}
+
+	//"Views" (the first tab), "View", "View 2", ...: what a tab is called before anything names it
+	is_new_tab_name(name) {
+		if(name == "Views" || name == "View")
+			return true;
+		if(!name.starts("View "))
+			return false;
+		number = name.substr(5);
+		try {
+			return number != "" && std.string(std.int(number)) == number;
+		}
+		catch(e) {}
+		return false;
+	}
+
 	find_workspace(tab) {
 		if(!tab)
 			return None;
@@ -1640,6 +1744,8 @@ class generators
 				return true;
 			if(action == 1 && (!handled || key_absorbed(scr)) && this.app_key(key, mods, letter))
 				return true;
+			if(action == 0)
+				this.app_key_up(key);
 			return handled;
 		});
 
@@ -2082,8 +2188,10 @@ class generators
 			return;
 		}
 
-		//Projects from before the view tabs only have "generatorview"
+		//Projects from before the view tabs only have "generatorview". The main tab still has the name it had in the
+		//project before (#376)
 		if(!states.workspaces) {
+			subviews.tab_name(main.tab, "Views");
 			main.view.load_state(states.generatorview);
 			return;
 		}

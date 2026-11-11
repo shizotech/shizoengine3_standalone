@@ -43,6 +43,32 @@ into calls. Until then, the default `dispatch()` sends `"active"` to `active()`,
 | `VideoIO` | `get_default_input()`, `get_default_output()`, `get_inputs()`, `set_input(v)`, `set_uniform(v)`, `set_render_callback(v)` |
 | `Transitionable` | `transition(v)`, `clip_preview(v)`, `has_cell_preview()` / `draw_cell(size)` (a module without a picture draws its clip cell, #677) |
 | `ItemStack` | `get_items()`, `get_item(i)`, `add_item(path)`, `on_items_changed(cb)` |
+| `TimelineClip` | `clip_start(v)`, `clip_position(v)`, `clip_stop(v)`: the generator is a clip on the timeline (#680) |
+
+### Clips on the timeline (#680)
+
+A generator dropped onto a lane of the timeline is a clip there (`src/menu/timeline/timeline_clips.shio`). It is in a
+stack like a clip of the Clipview (`engine/assets/shaderstack.asset`), which passes every command to its entries.
+
+| Command | When | Before / after |
+|---|---|---|
+| `clip_start` | the cursor enters the clip (playing, a jump, the loop, a clip moved under the cursor) | after `"active"` true |
+| `clip_position` | every frame while the cursor is inside the clip, also while the timeline stands | |
+| `clip_stop` | the cursor leaves the clip, or the clip is deleted | before `"active"` false |
+
+The value is `[pos, beat, seconds, length, length_seconds, lane, start]`: `pos` 0..1 through the clip, `beat` the
+beats since its start, `seconds` the same in seconds at the tempo now, `length` the length in beats. A module that
+does nothing with them needs nothing: the clip is switched on and off with `"active"` anyway. An old dispatcher
+(`dispatcher(generator, cmd, value)`) gets them like any command. What the engine does with them itself: a shader gets
+the uniforms `CLIP_POS` and `CLIP_TIME` when it declares them (`extensions/glsl/shader_loader.shio`), a video starts at
+its In point, as far into it as the cursor is in the clip (`extensions/video/video_module.shio`).
+
+The timeline also asks the entries of a new clip `clip_length` (value None, #680 step 3): an entry that answers a
+number of seconds sets the length of the clip (in beats at the tempo now). The video module answers the seconds from
+its In to its Out point at its Speed, None while the video is not open (the timeline asks again for 10 s). Only for a
+video file dropped (or added over MCP without `length`) onto the main timeline.
+
+Two clips that overlap on a lane both get their commands (both are active); the lane crossfades them over the overlap.
 
 A class asset:
 

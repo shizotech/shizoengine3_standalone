@@ -21,6 +21,7 @@ that show or shape a value.
 | **Control-Button-Matrix.asset** | A matrix of buttons with the same three modes |
 | **EnvelopeOutput.asset** | An editable envelope, run FREE or SYNC, sampled into an output |
 | **StepChaser.asset** | A step sequencer synced to the bar: a value or HOLD for every count |
+| **LoopTrigger.asset** | A clip of the timeline that starts a loop timeline of the view Loops while the playhead is inside it (#680) |
 | **control4.asset** | Four plain sliders, to link to |
 | **quantize.asset** | Rounds an input to a number of steps |
 | **textbox.asset** | A text field; its text is saved with the project |

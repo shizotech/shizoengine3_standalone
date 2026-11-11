@@ -1,0 +1,859 @@
+//A Python script as a generator (#853 step 2). The script runs in a Python server of its own (engine/python,
+//docs/python-server.md): a crash, an exception or a hang of Python ends at most that process, VibeVJ keeps running.
+//
+//Its #@ annotations (py_annotations.shio, the //@ grammar of the shaders) become controls of the generator: parameters
+//in Controls (the paths of shader uniforms: uniforms.uniforms@Controls.<name>), value outputs in Outputs, picture
+//inputs as ports at the bottom (input_ctrls@<name>, as the samplers of a shader), the picture output as Out
+//(output_ctrls@OUT). Every frame the inputs are read back from the GPU (a small copy shader per input with
+//pixel_readback) and sent with the parameter values to process() of the script, one call at a time: while Python works
+//on a frame the next frames are dropped, the render loop never waits. The reply sets the outputs and the picture.
+//
+//The Python side: py_asset_runner.py (loads the script, sets its variables, calls process()). Changes of the file
+//restart the Python process; new or changed annotations need *Reload module* (the controls are made again).
+//
+//Which Python (#853 step 3, engine/python/py_env.shio): "python" of configs/python.json for every asset, else a venv
+//that uv makes for the Python version and dependencies of the asset (asset.json "python", requirements.txt) on first
+//use. The build runs in a process of its own; the generator shows its progress and starts Python when it is done.
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/python/python_server"
+#include "engine/python/py_env"
+#include "engine/interfaces/videorouter"
+#include "engine/patch/palette"
+#include "engine/generators/extensions/glsl/annotation_controls"
+#include "engine/generators/extensions/py/py_annotations"
+
+
+def py_follow_colour(sel, comps);
+def py_status_json();
+def py_first_line(text);
+def py_show_status();
+def py_start_with(cmd);
+def py_retry();
+def py_reinstall();
+
+PY_RUNNER = __DIR__ + "/py_asset_runner.py";
+PY_SIDE_W = 250;
+PY_INPUT_SIZE = [320, 180];	//the size an input is read at without size=
+PY_TIMEOUT = 5000;		//ms a frame may take without timeout= (the first one may load a model)
+
+managed server = None;
+managed video_router = None;
+
+gen = None;
+script_path = "";		//the .py file
+asset_name = "";		//the name of the asset (LFO of LFO.py), in the Log
+asset_dir = "";		//the asset folder (X.py/) or the folder of the file
+parsed = None;			//py_parse_annotations()
+decl_sig = "";
+params = [];			//[decl, ctrl, vec_ctrls, py]: py is the Python type the value goes as (float, int, bool, str, tuple)
+triggers = std.json();		//name -> pressed since the last frame
+inputs = [];			//[decl, port, reader, linked, width, height, channels]
+outputs = [];			//[decl, ctrl, vec_ctrls]
+texture_decl = None;
+out_image = None;		//the image widget whose texture shows the picture output
+out_texture = None;
+out_tex_size = [0, 0, 0];	//width, height, channels of out_texture
+out_bytes = 0;			//out_size of a frame call: the reply's picture comes through shared memory
+default_input = None;
+default_output = None;
+
+status_lbl = None;
+note_lbl = None;
+build_lbl = None;		//the last line of uv while the environment is built
+restart_btn = None;
+shown_status = "";
+
+py_env = None;			//pyenv_for_script(): the environment of the script (state, python, status_text, progress, ...)
+env_waiting = false;		//py_start() waits for the build of the environment
+env_note = "";			//why the script runs with the Python of the system
+spec_time = 0;			//the newest time of asset.json / requirements.txt (a change makes the environment again)
+
+rate = 0;			//frames per second at most (#@settings rate=), 0 = every frame
+call_timeout = PY_TIMEOUT;
+in_flight = false;
+frame_no = 0;
+started_ms = 0;
+last_send = 0;
+last_frame_ms = 0.0;		//the time process() took (Python's own measure)
+dropped = 0;			//frames left out while a call was in flight
+error_text = "";		//what is wrong now ("" = nothing)
+error_detail = "";		//the traceback / stderr of it
+logged_error = "";
+setup_done = false;
+python_version = "";
+file_time = 0;
+next_file_check = 0;
+reload_note = "";
+
+//The Python of the system (pysrv_find_python()), looked for once per run of VibeVJ: it starts a process per candidate
+py_system_python() {
+	cache = std.global("py_asset_python");
+	found = cache.get();
+	if(!std.is_string(found) && !std.is_json(found)) {
+		found = pysrv_find_python();
+		cache.set(found);
+	}
+	return found;
+}
+
+//The Python command of the script (a string or a command list): "python" of configs/python.json (wins for every
+//asset), else the python of the environment of the asset, made by uv (py_env.shio); the Python of the system when no
+//uv or no uv Python can be had for an asset that declares nothing. "" while the environment is built or when that
+//failed: py_env says which (state building / error)
+py_asset_python(path) {
+	py_env = pyenv_for_script(path);
+	st = py_env["state"];
+	if(st == "override" || st == "ready")
+		return py_env["python"];
+	if(st == "fallback") {
+		note = "uv or its Python could not be had (" + py_first_line(py_env["error"]) + "): the Python of the system runs the script";
+		if(note != env_note) {
+			env_note = note;
+			std.warn("Python generator " + asset_name + ": " + note);
+		}
+		return py_system_python();
+	}
+	return "";
+}
+
+//The newest change time of the files that declare the environment of the asset
+py_spec_time() {
+	t = 0;
+	root = pyenv_asset_root(script_path);
+	if(root == "")
+		return 0;
+	for(f : [root + "/asset.json", root + "/requirements.txt", root + "/src/requirements.txt"]) {
+		try {
+			if(fileio.exists(f))
+				t = math.max(t, fileio.file_info(f).last_write_time);
+		}
+		catch(e) {}
+	}
+	return t;
+}
+
+//The text of the status line and its colour
+py_show_status() {
+	if(!status_lbl)
+		return;
+	text = "";
+	colour = PAL_TEXT_2;
+	tip = "";
+	if(error_text != "") {
+		text = error_text;
+		colour = PAL_DANGER;
+		tip = error_detail != "" ? error_detail : error_text;
+	}
+	else if(env_waiting && py_env) {
+		text = std.string(py_env["status_text"]) + "…";
+		colour = PAL_CUE;
+		deps = "";
+		for(d : py_env["dependencies"])
+			deps += "\n  " + d;
+		tip = "VibeVJ makes the Python environment of this asset (first use): Python " + std.string(py_env["python_request"]) +
+			(deps != "" ? ", the dependencies" + deps : ", no dependencies") + "\nin " + std.string(py_env["venv"]);
+	}
+	else if(!server || server.state() == "stopped")
+		text = "Stopped";
+	else if(server.state() == "starting")
+		text = "Starting Python…";
+	else {
+		tenths = std.int(math.round(last_frame_ms * 10.0));
+		text = "Python " + python_version + " · " + std.string(std.int(tenths / 10)) + "." + std.string(tenths % 10) + " ms";
+		tip = "process() took " + std.string(last_frame_ms) + " ms for the last frame; " + std.string(dropped) +
+			" frames were left out while Python was busy";
+		if(py_env && py_env["venv"] != "" && py_env["state"] == "ready")
+			tip += "\nEnvironment: " + py_env["venv"];
+	}
+	if(env_note != "" && !env_waiting)
+		tip += (tip != "" ? "\n" : "") + env_note;
+	progress = env_waiting && py_env ? std.string(py_env["progress"]) : "";
+	retry = error_text != "" && py_env && py_env["state"] == "error";
+	key = text + "|" + tip + "|" + reload_note + "|" + progress + "|" + std.string(retry);
+	if(key == shown_status)
+		return;
+	shown_status = key;
+	status_lbl.caption(text).text_color(colour).tooltip(tip + "\n[[wiki:Python-Generators#" + (env_waiting || retry ? "dependencies" : "errors") + "]]");
+	if(note_lbl)
+		note_lbl.caption(reload_note).visible(reload_note != "");
+	if(build_lbl)
+		build_lbl.caption(progress).visible(progress != "");
+	if(restart_btn)
+		restart_btn.caption(retry ? "Retry" : "Restart");
+}
+
+//An error of the script or the process: on the status line, in the Log once per new text
+py_set_error(text, detail = "") {
+	error_text = text;
+	error_detail = detail;
+	if(text != "" && text != logged_error) {
+		logged_error = text;
+		std.error("Python generator " + asset_name + ": " + text + (detail != "" ? "\n" + detail : ""));
+	}
+	if(text == "")
+		logged_error = "";
+	py_show_status();
+}
+
+//The first line of a longer text
+py_first_line(text) {
+	t = std.string(text ?? "").strip();
+	nl = t.find("\n");
+	return nl >= 0 ? t.substr(0, nl) : t;
+}
+
+//Starts the Python process of the script (again) and tells it its outputs. When the environment of the asset is not
+//built yet, starts its build (or joins the one that runs) and returns: update() starts Python when it is done
+py_start() {
+	if(server) {
+		server.kill();
+		server = None;
+	}
+	in_flight = false;
+	setup_done = false;
+	frame_no = 0;
+	started_ms = std.millis();
+	env_waiting = false;
+	py_set_error("");
+	spec_time = py_spec_time();
+	cmd = py_asset_python(script_path);
+	for(p : py_env["problems"] ?? [])
+		std.warn(asset_name + ": " + p);
+	if(py_env["state"] == "building") {
+		env_waiting = true;
+		py_show_status();
+		return true;
+	}
+	return py_start_with(cmd);
+}
+
+//The environment is there (or its build failed): starts Python with it, or shows why not
+py_start_with(cmd) {
+	env_waiting = false;
+	if(py_env && py_env["state"] == "error") {
+		py_set_error(py_first_line(py_env["error"]), std.string(py_env["detail"]) != "" ? py_env["error"] + "\n\n" + py_env["detail"] : py_env["error"]);
+		return false;
+	}
+	if(!cmd || cmd == "") {
+		py_set_error("No Python 3.9 or newer found", "Install Python 3 or name it in configs/python.json: {\"python\": \"/path/to/python3\"}");
+		return false;
+	}
+	started_ms = std.millis();
+	server = PythonServer(PY_RUNNER, [python = cmd, cwd = asset_dir, env = ["SHZ_PY_ASSET=" + fileio.absolute_path(script_path)],
+		timeout = call_timeout, start_timeout = 60000, pump_ms = 0]);
+	server.on_stderr([](line) {
+		std.print("[" + asset_name + "] " + line);
+	});
+	if(!server.start(false)) {
+		py_set_error(py_first_line(server.last_error()), server.last_error());
+		return false;
+	}
+	out_names = [];
+	for(o : outputs)
+		out_names.push_back(o.decl.name);
+	py_types = std.json();
+	for(p : params)
+		py_types[p.decl.name] = p.py;
+	server.call_async("shz_setup", [outputs = out_names, texture = texture_decl ? texture_decl.name : "", params = py_types], [](r) {
+		if(r.ok) {
+			setup_done = true;
+			python_version = server && server.info() ? server.info()["python"] : "";
+			if(!r.result["process"])
+				py_set_error("The script has no process()", "Define def process(): ... in the script; it runs every frame");
+		}
+		else if(r.kind == "exception")
+			py_set_error(py_first_line(r.error), r.traceback);
+	});
+	py_show_status();
+	return true;
+}
+
+//The value of a parameter for Python, by its type
+py_param_value(p) {
+	d = p.decl;
+	if(p.vec_ctrls) {
+		vals = [];
+		for(c : p.vec_ctrls)
+			vals.push_back(d.type.starts("ivec") ? std.int(c.value()) : std.float(c.value()));
+		return vals;
+	}
+	if(d.type == "trigger") {
+		pressed = triggers[d.name] ? true : false;
+		triggers[d.name] = false;
+		return pressed;
+	}
+	v = p.ctrl.value();
+	if(p.py == "bool")
+		return v ? true : false;
+	if(d.type == "enum" && p.py == "str") {
+		items = p.ctrl.items();
+		return v >= 0 && v < items.size() ? std.string(items[v]).strip() : "";
+	}
+	if(p.py == "int")
+		return std.int(v);
+	if(p.py == "str")
+		return std.string(v);
+	return std.float(v);
+}
+
+//Sets a value output from what Python returned
+py_set_output(o, v) {
+	if(v === None)
+		return;
+	if(o.vec_ctrls) {
+		if(!std.is_json(v))
+			return;
+		for(j = 0; j < math.min(v.size(), o.vec_ctrls.size()); j++)
+			o.vec_ctrls[j].value(std.float(v[j] ?? 0.0));
+		return;
+	}
+	type = o.decl.type;
+	if(type == "list")
+		o.ctrl.value(v);
+	else if(type == "text")
+		o.ctrl.value(std.string(v));
+	else if(type == "bool" || type == "button")
+		o.ctrl.value(v ? 1 : 0);
+	else if(type == "int")
+		o.ctrl.value(std.int(v));
+	else
+		o.ctrl.value(std.float(v));
+}
+
+//The picture Python returned into the texture of Out (made again in a new size or format)
+py_set_picture(desc, data) {
+	if(!out_texture || !desc || data == None)
+		return;
+	w = std.int(desc["width"]);
+	h = std.int(desc["height"]);
+	ch = std.int(desc["channels"] ?? 4);
+	if(w <= 0 || h <= 0 || data.size() != w * h * ch)
+		return;
+	if(out_tex_size[0] != w || out_tex_size[1] != h || out_tex_size[2] != ch) {
+		out_texture.pixel_format(ch == 1 ? "r" : (ch == 3 ? "rgb" : "rgba")).size(vec2i(w, h));
+		out_tex_size = [w, h, ch];
+	}
+	out_bytes = math.max(out_bytes, w * h * ch);
+	out_texture.upload_data(data);
+}
+
+//One frame to Python: the parameters, the inputs (the first one with the call, the others before it), the time
+py_send_frame(tl_pos) {
+	now = std.millis();
+	vals = std.json();
+	for(p : params)
+		vals[p.decl.name] = py_param_value(p);
+	ins = std.json();
+	first = None;
+	for(inp : inputs) {
+		desc = None;
+		buf = inp.linked ? inp.reader.pixel_buffer() : None;
+		if(buf != None && buf.size() == inp.width * inp.height * inp.channels) {
+			desc = [width = inp.width, height = inp.height, channels = inp.channels];
+			if(first == None) {
+				desc.frame = true;
+				first = buf;
+			}
+			else
+				server.call_async("shz_input", [inp.decl.name, inp.width, inp.height, inp.channels], None, buf);
+		}
+		ins[inp.decl.name] = desc;
+	}
+	timeline = std.global("timeline");
+	bpm = timeline ? timeline.bpm_ctrl.value() : 120.0;
+	dt = last_send > 0 ? (now - last_send) / 1000.0 : 0.0;
+	last_send = now;
+	args = [params = vals, inputs = ins, time = (now - started_ms) / 1000.0, beat = std.float(tl_pos), bpm = bpm, dt = dt,
+		frame = frame_no];
+	frame_no++;
+	in_flight = true;
+	options = [timeout = call_timeout];
+	if(texture_decl)
+		options.out_size = out_bytes;
+	server.call_async("shz_frame", args, [](r) {
+		in_flight = false;
+		if(r.ok) {
+			last_frame_ms = std.float(r.ms ?? 0.0);
+			res = r.result;
+			if(res && res.has("outputs")) {
+				for(o : outputs) {
+					if(res["outputs"].has(o.decl.name))
+						py_set_output(o, res["outputs"][o.decl.name]);
+				}
+			}
+			if(res && res.has("texture"))
+				py_set_picture(res["texture"], r.binary);
+			if(error_text != "")
+				py_set_error("");
+			else
+				py_show_status();
+		}
+		else if(r.kind == "exception")
+			py_set_error("process(): " + py_first_line(r.error), r.traceback);
+		else if(r.kind == "timeout")
+			py_set_error("process() took longer than " + std.string(call_timeout) + " ms", "Python is busy or hangs. Restart ends it; #@settings timeout=<ms> allows more time");
+		//died / not_running / stopped: update() shows the end of the process
+	}, first, options);
+}
+
+//The script changed on disk: Python starts again with the new code. New controls need Reload module
+py_check_file() {
+	next_file_check = std.millis() + 1000;
+	t = 0;
+	try {
+		t = fileio.file_info(script_path).last_write_time;
+	}
+	catch(e) {
+		return;
+	}
+	st = py_spec_time();
+	if(t == file_time && st == spec_time)
+		return;
+	file_time = t;
+	src = fileio.read_string(script_path);
+	now_parsed = py_parse_annotations(src);
+	if(py_decl_signature(now_parsed.decls) != decl_sig)
+		reload_note = "The script declares other controls now: … › Reload module makes them";
+	else
+		reload_note = "";
+	py_start();
+}
+
+update(generator, tl_pos, pos_delta) {
+	try {
+		if(std.millis() >= next_file_check)
+			py_check_file();
+		if(env_waiting) {
+			pyenv_poll(py_env);
+			if(py_env["state"] == "building") {
+				py_show_status();
+				return;
+			}
+			cmd = py_env["state"] == "ready" ? py_env["python"] : (py_env["state"] == "fallback" ? py_asset_python(script_path) : "");
+			py_start_with(cmd);
+		}
+		if(!server)
+			return;
+		server.poll();
+		st = server.state();
+		if(st == "dead") {
+			if(error_text == "" || !error_text.starts("Python ended"))
+				py_set_error("Python ended: " + py_first_line(server.last_error()).replace("the Python server ended with ", ""), server.last_error());
+			return;
+		}
+		if(st != "running" && st != "starting")
+			return;
+		if(in_flight) {
+			if(st == "running")
+				dropped++;
+			return;
+		}
+		if(rate > 0 && std.millis() - last_send < 1000.0 / rate)
+			return;
+		py_send_frame(tl_pos);
+	}
+	catch(e) {
+		py_set_error("The generator failed: " + e);
+	}
+}
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "get_default_input")
+		return default_input;
+	if(cmd == "get_default_output")
+		return default_output;
+	//vibevj_capture with picture 1: the picture output, else what the first input shows
+	if(cmd == "get_capture_widget") {
+		if(out_image)
+			return out_image;
+		return inputs.size() > 0 ? inputs[0].reader : None;
+	}
+	if(cmd == "get_inputs") {
+		ports = std.json();
+		for(inp : inputs)
+			ports[inp.decl.name] = inp.port;
+		return ports;
+	}
+	return None;
+}
+
+on_free() {
+	if(server) {
+		server.stop(300);
+		server = None;
+	}
+	video_router = None;
+}
+
+//The parameter controls in Controls, like the uniforms of a shader
+py_make_params(parent) {
+	for(d : parsed.decls) {
+		if(d.kind != "param")
+			continue;
+		ctrl = None;
+		vec_ctrls = None;
+		made = None;
+		if(d.type == "text")
+			ctrl = parent.controltext(d.name, "uniforms");
+		else if(d.type == "trigger")
+			ctrl = parent.controlbutton(d.name, "uniforms"); //no push: a press, not a switch
+		else {
+			made = annotation_control(parent, d.type, d.name, "uniforms");
+			ctrl = made.ctrl;
+			vec_ctrls = made.vec_ctrls;
+		}
+		if(!ctrl)
+			continue;
+		ctrl.caption(shader_uniform_caption(d.name));
+		annotation_apply_attrs(ctrl, d.type, d.attrs, vec_ctrls);
+		//The value of the assignment, unless the annotation has value=
+		if(d.has_default && py_attr(d, "value") == None && d.type != "trigger") {
+			dv = d.default;
+			try {
+				if(vec_ctrls && std.is_json(dv)) {
+					for(j = 0; j < math.min(dv.size(), vec_ctrls.size()); j++)
+						vec_ctrls[j].value(dv[j]);
+				}
+				else if(d.type == "enum" && std.is_string(dv)) {
+					items = ctrl.items();
+					for(j = 0; j < items.size(); j++) {
+						if(std.string(items[j]).strip() == dv)
+							ctrl.value(j);
+					}
+				}
+				else if(d.type == "button" || d.type == "pushbutton")
+					ctrl.value(dv ? 1 : 0);
+				else if(dv !== None)
+					ctrl.value(dv);
+			}
+			catch(e) {}
+		}
+		//The colour selector shows the colour of the sliders, as in a shader
+		if(made && made.color_selector && vec_ctrls)
+			py_follow_colour(made.color_selector, vec_ctrls);
+		py = "float";
+		if(vec_ctrls)
+			py = "tuple";
+		else if(d.type == "button" || d.type == "pushbutton" || d.type == "trigger")
+			py = "bool";
+		else if(d.type == "int")
+			py = "int";
+		else if(d.type == "enum")
+			py = d.default_kind == "string" ? "str" : "int";
+		else if(d.type == "text")
+			py = "str";
+		if(d.type == "trigger") {
+			triggers[d.name] = false;
+			name = d.name;
+			ctrl.callback([name](v) {
+				if(v)
+					triggers[name] = true;
+			});
+		}
+		params.push_back([decl = d, ctrl = ctrl, vec_ctrls = vec_ctrls, py = py]);
+	}
+}
+
+//The colour selector of an rgb / rgba control follows its sliders
+py_follow_colour(sel, comps) {
+	follow = [sel, comps](v) {
+		if(comps.size() == 3)
+			sel.rgb(vec3f(comps[0].value(), comps[1].value(), comps[2].value()));
+		else
+			sel.rgba(vec4f(comps[0].value(), comps[1].value(), comps[2].value(), comps[3].value()));
+	};
+	for(c : comps)
+		c.callback(follow);
+	follow(0);
+}
+
+//The value outputs in Outputs: links lead out of them like out of any output
+py_make_outputs(parent) {
+	for(d : parsed.decls) {
+		if(d.kind != "output" || d.type == "texture")
+			continue;
+		ctrl = None;
+		vec_ctrls = None;
+		type = d.type;
+		if(type == "float" || type == "slider")
+			ctrl = parent.controlslider(d.name, "outputs");
+		else if(type == "int")
+			ctrl = parent.controlint(d.name, "outputs");
+		else if(type == "bool" || type == "button")
+			ctrl = parent.controlbutton(d.name, "outputs").push(1);
+		else if(type == "text")
+			ctrl = parent.controltext(d.name, "outputs");
+		else if(type == "list")
+			ctrl = parent.control(d.name, "outputs");
+		else {
+			made = annotation_control(parent, type == "rgb" || type == "rgba" ? type : "slider" + type, d.name, "outputs");
+			ctrl = made.ctrl;
+			vec_ctrls = made.vec_ctrls;
+		}
+		if(!ctrl)
+			continue;
+		ctrl.caption(shader_uniform_caption(d.name));
+		annotation_apply_attrs(ctrl, type, d.attrs, vec_ctrls);
+		if(vec_ctrls) {
+			for(c : vec_ctrls)
+				c.as_output(true);
+		}
+		else
+			ctrl.as_output(true);
+		if(d.has_default && d.default !== None)
+			py_set_output([decl = d, ctrl = ctrl, vec_ctrls = vec_ctrls], d.default);
+		ctrl.tooltip("A value of the script (" + d.name + "): [[link]] it into what should follow it\n[[wiki:Python-Generators#outputs]]");
+		outputs.push_back([decl = d, ctrl = ctrl, vec_ctrls = vec_ctrls]);
+	}
+}
+
+//An input port and the copy shader that reads its picture back for Python
+py_make_input(d, in_panel, preview, index, show) {
+	size = py_attr_numbers(py_attr(d, "size"));
+	w = size.size() > 0 ? math.max(std.int(size[0]), 1) : PY_INPUT_SIZE[0];
+	h = size.size() > 1 ? math.max(std.int(size[1]), 1) : PY_INPUT_SIZE[1];
+	fmt = py_attr(d, "format", "rgba");
+	channels = PY_INPUT_FORMATS[fmt];
+	colour = fmt == "gray" ? "vec4(vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114))), 1.0)" : "c";
+	reader = preview.shader().anchor(0).visible(show);
+	reader.fragment_source("uniform sampler2D shz_in;\nvoid main() { vec4 c = texture(shz_in, v_uv); fragColor = " + colour + "; }\n");
+	reader.output_pixel_format(fmt == "gray" ? "r" : fmt);
+	reader.render_size(vec2i(w, h));
+	reader.pixel_readback(true);
+
+	caption = d.name == "input" ? "In" : shader_uniform_caption(d.name);
+	port = in_panel.control(d.name, "input_ctrls").caption(caption);
+	port.anchor_left(index * 100).anchor_top(0).anchor_bottom(0).fixed_width(100);
+	own_tip = py_unquote(py_attr(d, "tooltip", ""));
+	port.tooltip((own_tip != "" ? own_tip + "\n" : "") + "A picture into the script (" + d.name + ", " + std.string(w) + " × " + std.string(h) + " " + fmt + "): [[link]] a picture into it\n[[wiki:Python-Generators#inputs]]");
+	slot_entry = [decl = d, port = port, reader = reader, linked = false, width = w, height = h, channels = channels];
+	inputs.push_back(slot_entry);
+	slot = inputs.size() - 1;
+	port.callback([slot](v) {
+		inputs[slot].reader.input("shz_in", v);
+		inputs[slot].linked = v != None;
+	});
+	port.on_unlink([port, slot](ctrl1, ctrl2) {
+		if(ctrl2 == port) {
+			inputs[slot].reader.input("shz_in", None);
+			inputs[slot].linked = false;
+		}
+	});
+	lc = d.name.lowercase();
+	if(!default_input && (lc == "input" || lc == "ichannel0" || slot == 0))
+		default_input = port;
+}
+
+entry(generator, area, path) {
+	gen = generator;
+	script_path = path;
+	asset_name = fileio.pure_name(generator.path);
+	asset_dir = fileio.file_dir(path);
+	src = fileio.read_string(path);
+	try {
+		file_time = fileio.file_info(path).last_write_time;
+	}
+	catch(e) {}
+	next_file_check = std.millis() + 1000;
+	parsed = py_parse_annotations(src);
+	decl_sig = py_decl_signature(parsed.decls);
+	for(p : parsed.problems)
+		std.warn(asset_name + " (" + path + ":" + std.string(p.line) + "): " + p.text);
+	if(parsed.settings.has("rate"))
+		rate = math.max(std.float(parsed.settings["rate"]), 0.0);
+	if(parsed.settings.has("timeout"))
+		call_timeout = math.max(std.int(parsed.settings["timeout"]), 100);
+	for(d : parsed.decls) {
+		if(d.kind == "output" && d.type == "texture" && !texture_decl)
+			texture_decl = d;
+	}
+	input_decls = [];
+	for(d : parsed.decls) {
+		if(d.kind == "input")
+			input_decls.push_back(d);
+	}
+	has_picture = texture_decl || input_decls.size() > 0;
+
+	//Tall enough for the controls and outputs it declares (a row of a control is about 32 px)
+	n_params = 0;
+	n_outputs = 0;
+	for(d : parsed.decls) {
+		if(d.kind == "param")
+			n_params++;
+		else if(d.kind == "output" && d.type != "texture")
+			n_outputs++;
+	}
+	rows_h = 110 + (n_params > 0 ? 36 + 32 * n_params : 0) + (n_outputs > 0 ? 36 + 32 * n_outputs : 0);
+	area.layout(None);
+	generator.window.fixed_size(vec2f(has_picture ? 560 : 300, math.clamp(rows_h, has_picture ? 320 : 160, 640)));
+	side = area.vscroll().anchor_left(0).anchor_top(0).anchor_bottom(25);
+	if(has_picture)
+		side.fixed_width(PY_SIDE_W);
+	else
+		side.anchor_right(0);
+	side = side.content().layout(nanogui.layout_vertical());
+
+	//The status line: what Python does, or the error in red (its traceback in the tooltip), and Restart
+	status_row = side.widget().fixed_height(25);
+	status_lbl = status_row.label("Starting Python…").anchor_left(4).anchor_top(0).anchor_bottom(0).anchor_right(80);
+	restart_btn = status_row.button("Restart").anchor_right(0).anchor_top(2).anchor_bottom(2).fixed_width(76);
+	restart_btn.tooltip("Start the Python process of the script again (it keeps the settings of the controls)\n[[wiki:Python-Generators#errors]]");
+	restart_btn.on_click([]() {
+		reload_note = "";
+		py_retry();
+	});
+	note_lbl = side.label("").wrap(true).text_color(PAL_CUE).visible(false);
+	build_lbl = side.label("").wrap(true).text_color(PAL_TEXT_2).visible(false);
+	build_lbl.tooltip("What uv does now (the Python environment of the asset is made on first use)\n[[wiki:Python-Generators#dependencies]]");
+
+	params_vec = side.controlvector("Controls", "uniforms").expanded(true);
+	params_vec.tooltip("The controls the script declares with #@ comments\n[[wiki:Python-Generators#controls]]");
+	py_make_params(params_vec);
+	if(params.size() == 0)
+		std.free(params_vec);
+
+	outputs_vec = side.controlvector("Outputs", "outputs").expanded(true);
+	outputs_vec.tooltip("The values the script sends out (#@output)\n[[wiki:Python-Generators#outputs]]");
+	py_make_outputs(outputs_vec);
+	if(outputs.size() == 0)
+		std.free(outputs_vec);
+
+	io_panel = area.widget().anchor_bottom(0).anchor_left(0).anchor_right(0).fixed_height(25);
+	in_panel = io_panel.widget().anchor(0).anchor_right(70);
+	preview = None;
+	if(has_picture)
+		preview = area.widget().anchor_left(PY_SIDE_W).anchor_top(0).anchor_bottom(25).anchor_right(0);
+
+	//The picture output: a texture of an image widget, shown in the preview, the value of Out
+	if(texture_decl) {
+		out_image = preview.image().anchor(0);
+		out_texture = out_image.texture();
+		out_texture.pixel_format("rgba").component_format("uint8").size(vec2i(PY_INPUT_SIZE[0], PY_INPUT_SIZE[1]));
+		size = py_attr_numbers(py_attr(texture_decl, "size"));
+		if(size.size() > 1)
+			out_texture.size(vec2i(math.max(std.int(size[0]), 1), math.max(std.int(size[1]), 1)));
+		out_tex_size = [out_texture.size().x, out_texture.size().y, 4];
+		out_bytes = out_tex_size[0] * out_tex_size[1] * 4;
+		black = std.buffer();
+		black.resize(out_bytes);
+		out_texture.upload_data(black);
+
+		out = io_panel.control("OUT", "output_ctrls").caption("Out").as_output(true);
+		out.tooltip("The picture of the script (" + texture_decl.name + "): [[link]] it into an input, MapLab or a display\n[[wiki:Python-Generators#outputs]]");
+		out.anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(70);
+		out.value(out_image);
+		out.callback([out](v) {
+			out.value(out_image);
+		});
+		default_output = out;
+
+		videorouter_vec = side.controlvector("VideoRouter", "video_router").caption("Video router").expanded(false);
+		videorouter_enable = videorouter_vec.controlbutton("Enable Router").caption("Enable router").push(1);
+		videorouter_name = videorouter_vec.controltext("VideoRouterName").caption("Video router name").hide_config_menu();
+		videorouter_vec.tooltip("Offer the picture to shaders by name: they pick it under Inputs\n[[wiki:Output-and-Devices#outputs-tab-control]]");
+		videorouter_enable.callback([videorouter_name](v) {
+			if(v) {
+				if(!video_router)
+					video_router = VideoRouter(videorouter_name.value(), default_output);
+			}
+			else
+				video_router = None;
+		});
+		videorouter_name.callback([](v) {
+			if(video_router)
+				video_router.name = v;
+		});
+		videorouter_name.value(fileio.pure_name(generator.path) + "_" + std.random_hash(6));
+	}
+
+	//The inputs: the first one shows in the preview when the script has no picture output
+	for(i, d : input_decls)
+		py_make_input(d, in_panel, preview, i, !texture_decl && i == 0);
+
+	generator.register("get_python_status", [], [](args) {
+		return py_status_json();
+	}, "Python generator: the state of its Python process (running, starting, dead, stopped), the error with its traceback, the Python version, the time of the last frame, frames left out, the declarations of the script.");
+	generator.register("restart_python", [], [](args) {
+		reload_note = "";
+		py_retry();
+		return py_status_json();
+	}, "Python generator: starts the Python process of the script again (as its Restart button; Retry after a failed install of its environment).");
+	generator.register("reinstall_python_env", [], [](args) {
+		py_reinstall();
+		return py_status_json();
+	}, "Python generator: deletes the Python environment (venv) of the asset and makes it again (uv installs the dependencies anew), then starts Python.");
+
+	py_start();
+}
+
+//Restart / Retry: a failed build of the environment is tried again
+py_retry() {
+	if(py_env && (py_env["state"] == "error" || py_env["state"] == "fallback"))
+		pyenv_forget(py_env);
+	env_note = "";
+	py_start();
+}
+
+//Deletes the environment of the asset and makes it again (Python stops first: Windows keeps its files open)
+py_reinstall() {
+	if(py_env && py_env["state"] == "building")
+		return;
+	if(server) {
+		server.stop(300);
+		server = None;
+	}
+	if(py_env && py_env["env_key"] != "") {
+		pyenv_forget(py_env);
+		pyenv_remove_env(py_env["cache"], py_env["env_key"]);
+		std.print("Python generator " + asset_name + ": the environment " + py_env["venv"] + " is made again");
+	}
+	py_start();
+}
+
+//The environment part of get_python_status
+py_env_json() {
+	if(!py_env)
+		return [state = "none"];
+	return [
+		state = py_env["state"],
+		building = env_waiting,
+		venv = py_env["venv"],
+		python_request = py_env["python_request"],
+		dependencies = py_env["dependencies"],
+		env_key = py_env["env_key"],
+		cache = py_env["cache"],
+		status = env_waiting ? py_env["status_text"] ?? "" : "",
+		progress = env_waiting ? py_env["progress"] ?? "" : "",
+		error = py_env["error"] ?? "",
+		build_no = py_env["build_no"] ?? 0,
+		problems = py_env["problems"] ?? [],
+		note = env_note,
+		command = py_env["state"] == "fallback" ? py_system_python() : py_env["python"],
+	];
+}
+
+py_status_json() {
+	decls = [];
+	for(d : parsed.decls)
+		decls.push_back([kind = d.kind, type = d.type, name = d.name, default = d.default]);
+	return [
+		state = env_waiting ? "installing" : (server ? server.state() : "stopped"),
+		error = error_text,
+		detail = error_detail,
+		python = python_version,
+		pid = server && server.info() ? server.info()["pid"] : 0,
+		frame_ms = last_frame_ms,
+		frames = frame_no,
+		dropped = dropped,
+		script = script_path,
+		note = reload_note,
+		declarations = decls,
+		problems = parsed.problems,
+		env = py_env_json(),
+	];
+}

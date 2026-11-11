@@ -26,6 +26,7 @@ start.
 | *Sound card* | The standard recording input of your computer (line-in, microphone, audio interface). Choose that input in the sound settings of your system; VibeVJ has no device list of its own. | "Sound card" |
 | *DJ Watch (USB)* | The microphone or line-in of DJ Watch (the ESP32 box in the DJ network, formerly prolink-bridge) on USB. It shares the USB connection with the [Prolink generators](Output-and-Devices.md#prolink-cdjs). | "DJ Watch USB: … kHz" while audio comes in |
 | *DJ Watch (network)* | The same audio from a relay ESP32 in your network, over ShizoNet. | "DJ Watch relay: … kHz" or "DJ Watch listener via relay: … kHz" |
+| *Video clips* | The sound of the [video clips](Video.md#sound-for-the-audio-analysis) with *Options* › *Audio analysis* on, mixed. They need not play through the speakers. | "Video clips: 1 clip in the analysis" |
 
 - For DJ Watch the firmware must send audio (firmware command "audio mic" or "audio line"). If it does not, the line
   says "No audio from DJ Watch (firmware: audio mic|line)".
@@ -33,6 +34,8 @@ start.
 - *DJ Watch port (empty = auto)*, in the section *Settings* of the window, picks a USB port by hand. Leave it empty to
   find the board by itself.
 - For *DJ Watch (network)*, *ShizoNet* must be on in the sidebar: see [Output and devices](Output-and-Devices.md#shizonet).
+- With *Video clips* and no clip that sends its sound the line says "No video clip sends its sound: switch on Options >
+  Audio analysis of a video clip".
 
 ## The values
 
@@ -67,6 +70,16 @@ Turn on *Sync timeline* (off at the start) and the timeline follows the music: i
 analysis and its position is nudged onto the beat, every frame. While it is on, a BPM you type in the timeline is
 overwritten. Turn it off to set the tempo by hand. See [Timeline](Timeline.md#sync-the-timeline-from-audio).
 
+## LTC: timecode as sound
+
+The analysis also reads SMPTE timecode that comes as sound (LTC, linear timecode), on each channel of its input: a
+show often has the timecode on one side and the music on the other. The line *LTC* in the section *Analysis* shows the
+timecode it reads, its frame rate (24, 25, 29.97 drop frame, 30), whether it runs (or runs backwards) and the channel.
+
+The [timeline](Timeline.md#timecode) follows it: *TC* in its bar, *Source* *LTC (audio input)*, *Chase* on. The
+timecode works with every *Source* of the analysis, also with *DJ Watch* and *Video clips* (the sound track of a video
+that carries LTC). Feed it at a normal level: very quiet LTC (below about -45 dB) is taken as silence.
+
 ## Settings
 
 The section *Settings* of the window. (The settings of the program are in a window of their own:
@@ -90,6 +103,11 @@ separate drop row: the drop is the moment *Break* goes back to 0.
 The row *FFT texture* is a texture output with an *Out* port. It holds the spectrum (512 bands, low to high) in its
 first row and the waveform in its second row. Link it into the input of an audio shader, for example one from
 `Shaders` › `Sources` › `Audio`, to draw with the sound. The preview at the bottom of the window shows the same data.
+
+A shader with an input *Audio* or *Wave* gets this texture by itself while the analysis runs, as long as nothing else
+is linked into that input: in a Patchview, in a [clip](Clipview.md#make-a-clip) and on the timeline. The shaders of
+[*Shaders* › *Sound*](Assets.md#shaders--sound) (Spectrum, Oscilloscope, Spectrogram, AudioDisplace) work so. Closed
+or stopped for three seconds, the analysis no longer feeds them.
 
 The section *FFT* shapes the spectrum:
 

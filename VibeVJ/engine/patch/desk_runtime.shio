@@ -343,6 +343,9 @@ class desk_runtime {
 		frame = nanogui.current_context().frame_index();
 		now = std.millis();
 		beat = engine.timeline.cursor_pos.value();
+		//what the timelines of cues run with (#755): the lamps and the BPM
+		DESK_TL.p = engine.patch;
+		DESK_TL.bpm = engine.timeline.bpm_ctrl ? std.float(engine.timeline.bpm_ctrl.value()) : 120.0;
 		poll_phrase();
 		new_phrase = events.has("phrase") && events.phrase;
 		for(i = 0; i < data.stacks.size(); i++) {
@@ -363,7 +366,7 @@ class desk_runtime {
 				desk_go(pb, stack, now, beat, current_all());
 				changed();
 			}
-			send("stack:" + stack.id, pb.ltp, desk_playback_values(pb, now), master_of(stack.id), frame);
+			send("stack:" + stack.id, pb.ltp, desk_playback_values(pb, now, stack), master_of(stack.id), frame);
 		}
 		//A Go that waits for the next beat or bar (the stack's quantize)
 		for(i = 0; i < playbacks.size(); i++) {
@@ -581,6 +584,74 @@ class desk_runtime {
 			current_stack = "";
 		record_step("Delete stack", undo_from);
 		changed();
+	}
+
+	// =========================================================================
+	// Effect timelines of cues (#755, engine/patch/desk.shio)
+	// =========================================================================
+
+	//The timeline of a cue of a stack. make: a new one when the cue has none, and the cue (with no values) when the stack
+	//has none of that number. None without a stack, or when there is none and make is false
+	timeline_of(stack_id, number, make = false) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s)
+			return None;
+		at = desk_cue_index(s, std.float(number));
+		cue = None;
+		if(at >= 0)
+			cue = s.cues[at];
+		else if(make)
+			cue = desk_cue_store(s, std.float(number), std.json(), "merge", 0.0);
+		if(!cue)
+			return None;
+		if(!cue.has("timeline") || !cue.timeline) {
+			if(!make)
+				return None;
+			cue.timeline = desk_timeline_new();
+		}
+		return cue.timeline;
+	}
+
+	//A change of a timeline, as one step of the undo history when name is given: action(timeline) changes it. An editor
+	//that drags passes no name while the mouse moves and calls record_step(name, undo_from) when it lets go
+	edit_timeline(stack_id, number, action, name = "") {
+		managed _grd = std.critical_section("desk");
+		undo_from = name ? snapshot() : None;
+		tl = timeline_of(stack_id, number, true);
+		if(!tl)
+			return None;
+		action(tl);
+		if(name)
+			record_step(name, undo_from);
+		changed();
+		return tl;
+	}
+
+	//Where the timeline of the cue a stack plays is now, in beats from its start (the playhead), -1 when it plays none
+	timeline_beat(stack_id) {
+		managed _grd = std.critical_section("desk");
+		s = desk_stack(data, stack_id);
+		if(!s || !playbacks.has(stack_id) || !playbacks[stack_id].on)
+			return -1.0;
+		pb = playbacks[stack_id];
+		tl = desk_playing_timeline(pb, s);
+		if(!tl)
+			return -1.0;
+		length = math.max(0.0001, std.float(tl.length));
+		return desk_timeline_time(desk_timeline_beats(pb, std.millis(), DESK_TL.bpm), length, tl.has("loop") ? tl.loop : true);
+	}
+
+	//"group:<id>", "lamp:<id>" or "all" of a target an agent names: a group or lamp by name or number, or one of those
+	timeline_target(ref) {
+		r = std.string(ref ?? "");
+		if(r == "all" || r.starts("group:") || r.starts("lamp:"))
+			return r;
+		g = desk_find_group(engine.patch, r);
+		if(g)
+			return "group:" + g.id;
+		f = desk_find_lamp(engine.patch, r);
+		return f ? "lamp:" + f.id : "";
 	}
 
 	//The programmer into a cue of a stack (number None: the next one). Returns the cue or None
@@ -963,7 +1034,8 @@ class desk_runtime {
 			for(k = 0; k < s.cues.size(); k++) {
 				c = s.cues[k];
 				cues.push_back([number = c.number, name = c.name, fade = c.fade, delay = c.delay ?? 0.0, trig = c.trig ?? "go",
-					trig_time = c.trig_time ?? 0.0, values = desk_cue_count(c)]);
+					trig_time = c.trig_time ?? 0.0, values = desk_cue_count(c),
+					timeline_lanes = c.has("timeline") && c.timeline ? c.timeline.lanes.size() : 0]);
 			}
 			st = stack_status(s.id);
 			stacks.push_back([number = i + 1, id = s.id, name = s.name, cues = cues, on = st.on, at = st.cue,
@@ -1033,6 +1105,62 @@ class desk_runtime {
 			this.release_group(g.id);
 			return [ok = true];
 		}, "Lighting desk: the inputs of a group stop sending, its lamps go back to what they had.");
+
+		ai.register("get_cue_timeline", [
+			stack = "&string(): A cue stack by name or number",
+			cue = "&float(): The number of the cue",
+		], [this](args) {
+			s = desk_find_stack(this.data, std.string(args.stack ?? ""));
+			if(!s)
+				return [ok = false, error = "No stack " + std.string(args.stack ?? "")];
+			tl = this.timeline_of(s.id, std.float(args.cue ?? 0), false);
+			return [ok = true, timeline = tl ? tl.copy() : None, playhead = this.timeline_beat(s.id)];
+		}, "Lighting desk: the effect timeline of a cue (None: the cue has none) and where it plays now (playhead in beats, -1: not playing). See set_cue_timeline for its form.");
+
+		ai.register("set_cue_timeline", [
+			stack = "&string(): A cue stack by name or number",
+			cue = "&float(): The number of the cue (made when the stack has none of that number)",
+			timeline = "&json(): [length = beats, loop = true, lanes = [[target, attr, keys = [[t, v, curve]], wave = [shape, period, amp, center], spread]]]. target: a group or lamp by name, or all. attr: dimmer, color, pan, tilt, another function, or label:<channel>. v: 0..1, for color [r, g, b]. curve: step, linear, smooth (to the next key). wave.shape: none, sine, saw, square, triangle, random (instead of the keys). spread 0..1: the lamps one after the other (a chase). Empty lanes: the cue has no timeline",
+		], [this](args) {
+			s = desk_find_stack(this.data, std.string(args.stack ?? ""));
+			if(!s)
+				return [ok = false, error = "No stack " + std.string(args.stack ?? "")];
+			src = args.timeline;
+			if(!std.is_json(src))
+				return [ok = false, error = "timeline: a json [length, loop, lanes]"];
+			lanes = [];
+			list = src.has("lanes") && std.is_json(src.lanes) ? src.lanes : [];
+			for(i = 0; i < list.size(); i++) {
+				l = list[i];
+				target = this.timeline_target(l.target ?? "all");
+				if(!target)
+					return [ok = false, error = "lane " + i + ": no group or lamp " + std.string(l.target ?? "")];
+				lane = desk_lane_new(target, std.string(l.attr ?? "dimmer"), std.string(l.name ?? ""));
+				keys = l.has("keys") && std.is_json(l.keys) ? l.keys : [];
+				for(k = 0; k < keys.size(); k++)
+					desk_lane_set_key(lane, keys[k].t ?? 0.0, keys[k].v ?? 0.0, std.string(keys[k].curve ?? "linear"));
+				if(l.has("wave") && std.is_json(l.wave)) {
+					lane.wave.shape = std.string(l.wave.shape ?? "none");
+					if(l.wave.has("period"))
+						lane.wave.period = std.float(l.wave.period);
+					if(l.wave.has("amp"))
+						lane.wave.amp = std.float(l.wave.amp);
+					if(l.wave.has("center"))
+						lane.wave.center = std.float(l.wave.center);
+				}
+				lane.spread = math.clamp(std.float(l.spread ?? 0.0), 0.0, 1.0);
+				lanes.push_back(lane);
+			}
+			length = src.has("length") ? math.max(0.25, std.float(src.length)) : 8.0;
+			loop = src.has("loop") ? (src.loop ? true : false) : true;
+			number = std.float(args.cue ?? 0);
+			this.edit_timeline(s.id, number, [lanes, length, loop](tl) {
+				tl.length = length;
+				tl.loop = loop;
+				tl.lanes = lanes;
+			}, "Timeline of cue " + desk_num_text(number));
+			return [ok = true, lanes = lanes.size()];
+		}, "Lighting desk: gives a cue an effect timeline (#755): keyframes and waveforms per group and attribute that play while the stack plays the cue, over the cue's own values. Go on the stack plays it.");
 
 		ai.register("desk_command", [
 			command = "&string(): A command line of the desk, e.g. 'group \"Front pars\" at 50', 'all at color red', 'store cue 3 fade 2', 'go stack Main', 'clear'. 'help' lists the commands",

@@ -52,7 +52,7 @@ src/
 - **toolwindow.shio** - A floating window with pages listed at its side (class `toolwindow`). The settings window is one; it is built in `assetbrowser/assetbrowser.shio` and opened from the top bar
 - **assetbrowser/** - The sidebar: Projects tab (`projects_menu.shio`: project actions, overview of the open project, all projects and templates), asset browsing and selection UI (fixtures / artnet / shizonet / chat / mcp)
 - **generators/** - Generator management UI (tabbed `singleview`)
-- **timeline/** - Timeline editor UI (bottom panel, BPM/phase nudge logic)
+- **timeline/** - Timeline editor UI (bottom panel, BPM/phase nudge logic; `timeline_clips.shio`: clips on lanes, the lane blending, the envelopes of the lanes, the loop, the AI queries of the live_path `timeline`, one class for the main timeline and each loop timeline, #680; `loops.shio`: the Loops view, each loop with a timeline of its own; `shows.shio`: the songs of a show, each a timeline of its own, picked by hand, MIDI or timecode; `cues.shio`: what the cues on the ruler run and their editor; `timecode.shio`: MTC / MIDI clock / LTC chase and output)
 - **mainview/** - Main view component (empty placeholder directory)
 - **midi/** - MIDI input handling (empty placeholder directory)
 - **outputs/** - Output configuration UI (empty placeholder directory)

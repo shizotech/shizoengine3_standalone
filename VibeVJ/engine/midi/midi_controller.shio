@@ -7,6 +7,11 @@
 //An element with feedback = false ignores what comes back; color / colors (a grid) give it its own colour instead of
 //the accent, min / max the range of the value it sends (midi_layout.shio).
 //Edit mode: drag an element to move it, its lower right corner to size it (snapped to MIDI_CTRL_SNAP). Not in show mode.
+//The learn gesture: an element, then a click on a control in VibeVJ (its learn overlay), and the control is mapped to
+//the element (map_element). Or the control first, then the element. A right click picks an element; in learn mode
+//(set_learn_mode, the Learn button of the window) a left click does too. Not in show mode.
+//Colours from the theme of the widget (Shizo UI: a new accent restyles it at once), sizes from MIDI_LAYOUT_SIZE
+//(design/tokens.json); the color / colors of an element win over the accent.
 //Mappings move with the element: when an element gets another number (properties, an agent, learn_from_hardware), the
 //controls mapped to its old number on the virtual device get the new one. midi_move_mappings() moves all mappings of
 //one device to another, e.g. to the real controller whose numbers the elements learned.
@@ -16,13 +21,21 @@
 //  c.set_value("knob1", 0.5);           //as if turned: sends CC 21 = 64
 //  c.on_change = [](id, cell, value) {}; //every value the controller sends
 
-MIDI_CTRL_SNAP = 8;
-MIDI_CTRL_ACCENT = vec4f(0.616, 0.522, 1.0, 1.0);
-MIDI_CTRL_FACE = vec4f(0.16, 0.16, 0.18, 1.0);
-MIDI_CTRL_EDGE = vec4f(1.0, 1.0, 1.0, 0.10);
-MIDI_CTRL_TEXT = vec4f(1.0, 1.0, 1.0, 0.75);
-MIDI_CTRL_DIM = vec4f(1.0, 1.0, 1.0, 0.35);
-MIDI_CTRL_SELECT = vec4f(1.0, 0.82, 0.35, 0.9);
+//Edit mode snaps to size.pad of Shizo UI (two steps of its 4 px grid)
+MIDI_CTRL_SNAP = MIDI_LAYOUT_SIZE.pad;
+//The colours the controller draws with: each comment names the nanogui theme key it is read from every frame
+//(theme_colors) and the token of design/tokens.json behind it; the values are the tokens, for a theme without the key
+MIDI_CTRL_THEME = [
+	accent = vec4f(157 / 255.0, 133 / 255.0, 1.0, 1.0),    //accent_color: what an element sends, the selection in edit mode
+	accent_ink = vec4f(11 / 255.0, 11 / 255.0, 12 / 255.0, 1.0), //accent_ink_color: text on a lit button
+	cue = vec4f(240 / 255.0, 180 / 255.0, 76 / 255.0, 1.0), //cue_color: learning (the learn gesture)
+	face = vec4f(37 / 255.0, 37 / 255.0, 40 / 255.0, 1.0), //button_gradient_top_unfocused (control): buttons, pads, the knob
+	field = vec4f(14 / 255.0, 14 / 255.0, 15 / 255.0, 1.0), //input_fill (field): the field of an xy
+	edge = vec4f(1.0, 1.0, 1.0, 0.12),                      //border_light (line_strong): knob ring, tracks, outlines
+	text = vec4f(237 / 255.0, 237 / 255.0, 237 / 255.0, 1.0), //text_color: pointer, thumb
+	text_2 = vec4f(155 / 255.0, 155 / 255.0, 160 / 255.0, 1.0), //text_secondary_color: captions
+	text_3 = vec4f(94 / 255.0, 94 / 255.0, 99 / 255.0, 1.0), //disabled_text_color: edit outlines, the middle of a bend
+	radius = MIDI_LAYOUT_SIZE.radius];                        //button_corner_radius (radius.control)
 //NanoVG text alignment
 MIDI_CTRL_ALIGN_CENTER_MIDDLE = 2 | 16;
 
@@ -35,6 +48,21 @@ midi_same_message(a, b) {
 	if(tb == 0x80)
 		tb = 0x90;
 	return ta == tb && a.channel == b.channel && a.number == b.number;
+}
+
+//A mapping ([status, channel, number]) in words: "CC 21 on channel 1", "note 36 on channel 2", "pitch bend on channel 1"
+midi_mapping_text(m) {
+	type = m.status & 0xF0;
+	what = "CC " + std.string(m.number);
+	if(type == 0x90 || type == 0x80)
+		what = "note " + std.string(m.number);
+	else if(type == 0xE0)
+		what = "pitch bend";
+	else if(type == 0xD0)
+		what = "pressure";
+	else if(type == 0xC0)
+		what = "program change";
+	return what + " on channel " + std.string(m.channel + 1);
 }
 
 //Every control mapped to device from gets the same message on device to (the real controller after show prep with
@@ -66,6 +94,16 @@ class midi_controller
 	on_edit = None;    //callback(): the layout was changed by hand (edit mode)
 
 	learning = None;   //learn_from_hardware: [id =, step =, cc =, on_done =]
+
+	//The learn gesture: an element and a control picked by clicks are mapped (map_element)
+	learn_mode = false;  //a left click on an element picks it instead of playing it (the Learn button)
+	armed = None;        //[id =, cell =]: the element that waits for a click on a control
+	picked = None;       //the control that waits for an element (clicked first, in learn mode)
+	learn_owned = false; //the gesture turned MIDI learn on (so every control shows its learn overlay): off again after it
+	on_learn = None;     //callback(event, info): "armed" [id, cell], "picked" [control], "mapped" [id, cell, control,
+	                     //mapping], "failed" [id, control, error], "cancelled" []: for the hint line of the window
+
+	colors = None;       //the theme colours of the frame that is drawn (theme_colors)
 
 	//drag state
 	drag = None;       //[id =, cell =, kind = "turn" / "slide" / "xy" / "move" / "size", from =, start_value =, start =]
@@ -450,6 +488,135 @@ class midi_controller
 	}
 
 	// =========================================================================
+	// The learn gesture: an element, then a control (or the control first)
+	// =========================================================================
+
+	learn_event(kind, info) {
+		if(std.is_function(on_learn))
+			on_learn(kind, info);
+	}
+
+	//MIDI learn on while the gesture waits, so every control shows its learn overlay and a click on one picks it
+	//(nanogui.on_midi_learn_pick). MIDI learn that was on before stays on afterwards
+	learn_overlays(on) {
+		if(on) {
+			if(!nanogui.midi_learn()) {
+				nanogui.midi_learn(true);
+				learn_owned = true;
+			}
+			nanogui.on_midi_learn_pick([this](control) {
+				this.control_picked(control);
+			});
+			return;
+		}
+		nanogui.on_midi_learn_pick(None);
+		if(learn_owned) {
+			nanogui.midi_learn(false);
+			learn_owned = false;
+		}
+	}
+
+	//Learn mode (the Learn button): a click on an element picks it instead of playing it, and the overlays stay on
+	//until it ends. Not in show mode. Returns whether it is on
+	set_learn_mode(on) {
+		on = on && !nanogui.show_mode();
+		learn_mode = on ? true : false;
+		if(learn_mode)
+			learn_overlays(true);
+		else {
+			cancel_learn();
+			learn_overlays(false);
+		}
+		return learn_mode;
+	}
+
+	//Picks an element (a pad of a grid: cell). A control that was clicked first is mapped to it at once; else the
+	//element waits for a click on a control. The same element again: it no longer waits. False in show mode, for a
+	//label and an element that is not there
+	arm(id, cell = 0) {
+		e = element(id);
+		if(nanogui.show_mode() || !e || e.type == "label")
+			return false;
+		if(e.type != "grid")
+			cell = 0;
+		if(picked) {
+			control = picked;
+			picked = None;
+			return finish_learn(id, cell, control);
+		}
+		if(armed && armed.id == id && armed.cell == cell) {
+			cancel_learn();
+			return true;
+		}
+		armed = [id = id, cell = cell];
+		learn_overlays(true);
+		learn_event("armed", [id = id, cell = cell]);
+		return true;
+	}
+
+	is_armed(id = "") {
+		return armed && (!id || armed.id == id);
+	}
+
+	//nanogui.on_midi_learn_pick: the learn overlay of a control was clicked
+	control_picked(control) {
+		if(nanogui.show_mode() || !control)
+			return;
+		if(armed) {
+			a = armed;
+			armed = None;
+			finish_learn(a.id, a.cell, control);
+			return;
+		}
+		if(learn_mode) {
+			picked = control;
+			learn_event("picked", [control = control]);
+		}
+	}
+
+	finish_learn(id, cell, control) {
+		res = map_element(id, control, cell);
+		if(!learn_mode)
+			learn_overlays(false);
+		if(std.is_string(res)) {
+			learn_event("failed", [id = id, control = control, error = res]);
+			return false;
+		}
+		learn_event("mapped", [id = id, cell = cell, control = control, mapping = res]);
+		return true;
+	}
+
+	//Esc: the element or the control that waits is let go (learn mode stays). Returns whether one waited
+	cancel_learn() {
+		had = armed || picked;
+		if(picked) {
+			try {
+				picked.midi_learn(false);
+			}
+			catch(err) {}
+		}
+		armed = None;
+		picked = None;
+		if(!learn_mode)
+			learn_overlays(false);
+		if(had)
+			learn_event("cancelled", []);
+		return had ? true : false;
+	}
+
+	//A right click on an element, or a left click in learn mode, picks it for the gesture instead of playing it
+	learn_click(pos, btn, down) {
+		if(can_edit() || nanogui.show_mode() || drag || !(btn == 1 || (btn == 0 && learn_mode)))
+			return false;
+		h = hit(pos);
+		if(!h || h.cell < 0)
+			return btn == 0;
+		if(down)
+			arm(h.element.id, h.cell);
+		return true;
+	}
+
+	// =========================================================================
 	// Mouse
 	// =========================================================================
 
@@ -478,6 +645,8 @@ class midi_controller
 	}
 
 	mouse_button(pos, btn, down, mods) {
+		if(learn_click(pos, btn, down))
+			return true;
 		if(btn != 0)
 			return false;
 		if(!down) {
@@ -508,7 +677,7 @@ class midi_controller
 			if(!h)
 				return true;
 			e = h.element;
-			corner = pos.x > e.x + e.w - 12 && pos.y > e.y + e.h - 12;
+			corner = pos.x > e.x + e.w - MIDI_LAYOUT_SIZE.handle && pos.y > e.y + e.h - MIDI_LAYOUT_SIZE.handle;
 			drag = [id = e.id, cell = 0, kind = corner ? "size" : "move", from = pos, start = [x = e.x, y = e.y, w = e.w, h = e.h]];
 			return true;
 		}
@@ -608,6 +777,28 @@ class midi_controller
 	// Drawing (NanoVG, in the coordinates of the widget)
 	// =========================================================================
 
+	//The colours of the theme (MIDI_CTRL_THEME), read every frame: a new accent or theme restyles the controller at once
+	theme_colors() {
+		t = None;
+		try {
+			t = widget.theme();
+		}
+		catch(err) {}
+		if(!t)
+			return MIDI_CTRL_THEME;
+		return [
+			accent = t.accent_color,
+			accent_ink = t.accent_ink_color,
+			cue = t.cue_color,
+			face = t.button_gradient_top_unfocused,
+			field = t.input_fill,
+			edge = t.border_light,
+			text = t.text_color,
+			text_2 = t.text_secondary_color,
+			text_3 = t.disabled_text_color,
+			radius = t.button_corner_radius];
+	}
+
 	box(x, y, w, h, r, color) {
 		nanogui.nvgBeginPath();
 		nanogui.nvgRoundedRect(vec2f(x, y), vec2f(w, h), r);
@@ -623,15 +814,27 @@ class midi_controller
 		nanogui.nvgStroke();
 	}
 
-	//The colour of an element (a pad of a grid) with alpha a: its color / colors, else the accent
+	with_alpha(c, a) {
+		return vec4f(c.x, c.y, c.z, a);
+	}
+
+	//The colour of an element (a pad of a grid) with alpha a: its color / colors, else the accent of the theme
 	accent(e, cell = 0, a = 1.0) {
 		hex = midi_layout_element_color(e, cell);
-		if(!hex)
-			return vec4f(MIDI_CTRL_ACCENT.x, MIDI_CTRL_ACCENT.y, MIDI_CTRL_ACCENT.z, a);
+		if(!hex) {
+			c = colors ? colors.accent : MIDI_CTRL_THEME.accent;
+			return vec4f(c.x, c.y, c.z, a);
+		}
 		if(!rgb_cache.has(hex))
 			rgb_cache[hex] = midi_layout_rgb(hex);
 		rgb = rgb_cache[hex];
 		return vec4f(rgb[0], rgb[1], rgb[2], a);
+	}
+
+	//Text on a lit fill: the dark ink on a light colour (the accent), the text colour on a dark one
+	ink(fill) {
+		light = 0.2126 * fill.x + 0.7152 * fill.y + 0.0722 * fill.z > 0.5;
+		return light ? colors.accent_ink : colors.text;
 	}
 
 	text(x, y, s, size, color) {
@@ -643,6 +846,8 @@ class midi_controller
 	}
 
 	draw() {
+		colors = theme_colors();
+		r = colors.radius;
 		for(e : layout.elements) {
 			if(e.type == "knob")
 				draw_knob(e);
@@ -659,13 +864,43 @@ class midi_controller
 			else if(e.type == "xy")
 				draw_xy(e);
 			else if(e.type == "label")
-				text(e.x + e.w / 2, e.y + e.h / 2, e.label, 14, e.has("color") ? accent(e) : MIDI_CTRL_TEXT);
+				text(e.x + e.w / 2, e.y + e.h / 2, e.label, MIDI_LAYOUT_SIZE.label, e.has("color") ? accent(e) : colors.text_2);
 			if(editing) {
-				outline(e.x, e.y, e.w, e.h, 4, e.id == selected ? MIDI_CTRL_SELECT : MIDI_CTRL_DIM, e.id == selected ? 2 : 1);
+				sel = e.id == selected;
+				outline(e.x, e.y, e.w, e.h, r, sel ? colors.accent : colors.text_3, sel ? 2 : 1);
 				//the corner that sizes it
-				box(e.x + e.w - 8, e.y + e.h - 8, 8, 8, 1, e.id == selected ? MIDI_CTRL_SELECT : MIDI_CTRL_DIM);
+				hs = MIDI_LAYOUT_SIZE.handle_small;
+				box(e.x + e.w - hs, e.y + e.h - hs, hs, hs, 1, sel ? colors.accent : colors.text_3);
 			}
+			else if(learn_mode && e.type != "label" && !is_armed(e.id))
+				//learn mode: every element can be picked (cue, the colour of learning)
+				outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 1, r, with_alpha(colors.cue, 0.45), 1);
 		}
+		draw_armed();
+	}
+
+	//The element that waits for a control: a cue outline and tint (a pad of a grid: that pad)
+	draw_armed() {
+		if(!armed)
+			return;
+		e = element(armed.id);
+		if(!e)
+			return;
+		x = e.x;
+		y = e.y;
+		w = e.w;
+		h = e.h;
+		if(e.type == "grid") {
+			g = grid_rect(e);
+			cw = g.w / e.cols;
+			chh = g.h / e.rows;
+			x = g.x + (armed.cell % e.cols) * cw;
+			y = g.y + std.int(armed.cell / e.cols) * chh;
+			w = cw;
+			h = chh;
+		}
+		box(x, y, w, h, colors.radius, with_alpha(colors.cue, 0.18));
+		outline(x + 1, y + 1, w - 2, h - 2, colors.radius, colors.cue, 2);
 	}
 
 	number_text(e) {
@@ -684,6 +919,12 @@ class midi_controller
 		return "N " + std.string(e.note);
 	}
 
+	caption(e) {
+		return e.label ? e.label : number_text(e);
+	}
+
+	//A knob as the knobs of the program (design/README.md, fader and knob): a 270 degree ring in line_strong, the value
+	//along it, the pointer in the text colour, the caption below
 	draw_knob(e) {
 		size = math.min(e.w, e.h - 14);
 		cx = e.x + e.w / 2;
@@ -694,92 +935,106 @@ class midi_controller
 		a1 = a0 + 1.5 * math.PI;
 		nanogui.nvgBeginPath();
 		nanogui.nvgArc(vec2f(cx, cy), r, a0, a1, 2);
-		nanogui.nvgStrokeColor(MIDI_CTRL_EDGE);
-		nanogui.nvgStrokeWidth(4);
+		nanogui.nvgStrokeColor(colors.edge);
+		nanogui.nvgStrokeWidth(MIDI_LAYOUT_SIZE.grid);
 		nanogui.nvgStroke();
 		if(v > 0.001) {
 			nanogui.nvgBeginPath();
 			nanogui.nvgArc(vec2f(cx, cy), r, a0, a0 + v * 1.5 * math.PI, 2);
 			nanogui.nvgStrokeColor(accent(e));
-			nanogui.nvgStrokeWidth(4);
+			nanogui.nvgStrokeWidth(MIDI_LAYOUT_SIZE.grid);
 			nanogui.nvgStroke();
 		}
-		box(cx - r + 6, cy - r + 6, (r - 6) * 2, (r - 6) * 2, r - 6, MIDI_CTRL_FACE);
+		box(cx - r + 6, cy - r + 6, (r - 6) * 2, (r - 6) * 2, r - 6, colors.face);
 		//the pointer
 		a = a0 + v * 1.5 * math.PI;
 		nanogui.nvgBeginPath();
 		nanogui.nvgMoveTo(vec2f(cx, cy));
 		nanogui.nvgLineTo(vec2f(cx + math.cos(a) * (r - 7), cy + math.sin(a) * (r - 7)));
-		nanogui.nvgStrokeColor(MIDI_CTRL_TEXT);
+		nanogui.nvgStrokeColor(colors.text);
 		nanogui.nvgStrokeWidth(2);
 		nanogui.nvgStroke();
-		text(cx, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+		text(cx, e.y + e.h - 7, caption(e), MIDI_LAYOUT_SIZE.caption, colors.text_2);
 	}
 
 	draw_slider(e) {
 		t = slider_track(e);
 		v = value(e.id);
-		box(t.x, t.y, t.w, t.h, 3, MIDI_CTRL_EDGE);
-		box(t.x, t.y + t.h * (1.0 - v), t.w, t.h * v, 3, accent(e));
-		box(e.x + 4, t.y + t.h * (1.0 - v) - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
-		text(e.x + e.w / 2, e.y + e.h - 8, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+		r = colors.radius;
+		box(t.x, t.y, t.w, t.h, r, colors.edge);
+		box(t.x, t.y + t.h * (1.0 - v), t.w, t.h * v, r, accent(e));
+		box(e.x + 4, t.y + t.h * (1.0 - v) - 5, e.w - 8, 10, r, colors.text);
+		text(e.x + e.w / 2, e.y + e.h - 8, caption(e), MIDI_LAYOUT_SIZE.caption, colors.text_2);
 	}
 
 	draw_button(e) {
 		v = value(e.id);
-		box(e.x, e.y, e.w, e.h, 6, v > 0.001 ? accent(e) : MIDI_CTRL_FACE);
-		outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 1, 6, MIDI_CTRL_EDGE, 1);
-		text(e.x + e.w / 2, e.y + e.h / 2, e.label ? e.label : number_text(e), 12, MIDI_CTRL_TEXT);
+		lit = v > 0.001;
+		fill = lit ? accent(e) : colors.face;
+		box(e.x, e.y, e.w, e.h, colors.radius, fill);
+		outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 1, colors.radius, colors.edge, 1);
+		text(e.x + e.w / 2, e.y + e.h / 2, caption(e), MIDI_LAYOUT_SIZE.caption, lit ? ink(fill) : colors.text_2);
 	}
 
 	draw_grid(e) {
 		g = grid_rect(e);
 		if(e.label)
-			text(e.x + e.w / 2, e.y + 9, e.label, 12, MIDI_CTRL_TEXT);
+			text(e.x + e.w / 2, e.y + 9, e.label, MIDI_LAYOUT_SIZE.caption, colors.text_2);
 		cw = g.w / e.cols;
 		chh = g.h / e.rows;
+		gap = MIDI_LAYOUT_SIZE.gap;
 		for(row = 0; row < e.rows; row++) {
 			for(col = 0; col < e.cols; col++) {
 				cell = row * e.cols + col;
 				v = value(e.id, cell);
 				//a pad with a colour of its own shows it dimly while off, like the pads of a launchpad
 				lit = midi_layout_element_color(e, cell);
-				color = v > 0.001 ? accent(e, cell, 0.35 + 0.65 * v) : (lit ? accent(e, cell, 0.18) : MIDI_CTRL_FACE);
-				box(g.x + col * cw + 2, g.y + row * chh + 2, cw - 4, chh - 4, 4, color);
+				color = v > 0.001 ? accent(e, cell, 0.35 + 0.65 * v) : (lit ? accent(e, cell, 0.18) : colors.face);
+				box(g.x + col * cw + gap / 2, g.y + row * chh + gap / 2, cw - gap, chh - gap, colors.radius, color);
 			}
 		}
+		//the edges of all pads in one stroke, like the edge of a button
+		nanogui.nvgBeginPath();
+		for(row = 0; row < e.rows; row++)
+			for(col = 0; col < e.cols; col++)
+				nanogui.nvgRoundedRect(vec2f(g.x + col * cw + gap / 2 + 0.5, g.y + row * chh + gap / 2 + 0.5), vec2f(cw - gap - 1, chh - gap - 1), colors.radius);
+		nanogui.nvgStrokeColor(colors.edge);
+		nanogui.nvgStrokeWidth(1);
+		nanogui.nvgStroke();
 	}
 
 	draw_xy(e) {
-		box(e.x, e.y, e.w, e.h - 16, 4, MIDI_CTRL_FACE);
+		box(e.x, e.y, e.w, e.h - 16, colors.radius, colors.field);
+		outline(e.x + 0.5, e.y + 0.5, e.w - 1, e.h - 17, colors.radius, colors.edge, 1);
 		x = e.x + value(e.id, 0) * e.w;
 		y = e.y + (1.0 - value(e.id, 1)) * (e.h - 16);
 		nanogui.nvgBeginPath();
 		nanogui.nvgCircle(vec2f(x, y), 6);
 		nanogui.nvgFillColor(accent(e));
 		nanogui.nvgFill();
-		text(e.x + e.w / 2, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+		text(e.x + e.w / 2, e.y + e.h - 7, caption(e), MIDI_LAYOUT_SIZE.caption, colors.text_2);
 	}
 
 	draw_bend(e) {
 		t = slider_track(e);
 		v = value(e.id);
-		box(t.x, t.y, t.w, t.h, 3, MIDI_CTRL_EDGE);
+		r = colors.radius;
+		box(t.x, t.y, t.w, t.h, r, colors.edge);
 		if(t.horizontal) {
 			mid = t.x + t.w / 2;
 			at = t.x + t.w * v;
-			box(math.min(mid, at), t.y, math.abs(at - mid), t.h, 3, accent(e));
-			box(mid - 1, t.y - 6, 2, t.h + 12, 1, MIDI_CTRL_DIM);
-			box(at - 5, t.y - 8, 10, t.h + 16, 3, MIDI_CTRL_TEXT);
+			box(math.min(mid, at), t.y, math.abs(at - mid), t.h, r, accent(e));
+			box(mid - 1, t.y - 6, 2, t.h + 12, 1, colors.text_3);
+			box(at - 5, t.y - 8, 10, t.h + 16, r, colors.text);
 		}
 		else {
 			mid = t.y + t.h / 2;
 			at = t.y + t.h * (1.0 - v);
-			box(t.x, math.min(mid, at), t.w, math.abs(at - mid), 3, accent(e));
-			box(t.x - 6, mid - 1, t.w + 12, 2, 1, MIDI_CTRL_DIM);
-			box(e.x + 4, at - 5, e.w - 8, 10, 3, MIDI_CTRL_TEXT);
+			box(t.x, math.min(mid, at), t.w, math.abs(at - mid), r, accent(e));
+			box(t.x - 6, mid - 1, t.w + 12, 2, 1, colors.text_3);
+			box(e.x + 4, at - 5, e.w - 8, 10, r, colors.text);
 		}
-		text(e.x + e.w / 2, e.y + e.h - 7, e.label ? e.label : number_text(e), 11, MIDI_CTRL_TEXT);
+		text(e.x + e.w / 2, e.y + e.h - 7, caption(e), MIDI_LAYOUT_SIZE.caption, colors.text_2);
 	}
 
 }

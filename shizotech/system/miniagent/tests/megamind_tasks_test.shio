@@ -1,0 +1,297 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  megamind_tasks_test.shio — the task system of a node keeps running
+//  (shizotech/shizoscript3_source#762: "after some time the workers are not
+//  triggered and the task gets stuck")
+//
+//  Usage:  shz tests/megamind_tasks_test.shio     (from system/miniagent, no LLM)
+//
+//  A real Megamind with stand-in agents (create_worker / create_receptionist).
+//  Found with it (each check failed before the fix):
+//    * update_task on a task in the implement phase ran the rest of the task in
+//      the CALLER (the old worker.send_prompt: the receptionist's tool call): the update
+//      call blocked until the task was done, the worker thread meanwhile wrote
+//      the task as stopped and could start the next task on the same agent.
+//    * a follow-up for a running receptionist turn (shizonet_ai ai_request_update)
+//      ran the turn on the refresh thread while the receptionist thread took the
+//      next request on the same agent.
+//    * a throwing on_task_finished callback ended the worker thread: every later
+//      task stayed "planned".
+//    * stop_task could not reach a task that waited for a max_running_agents
+//      slot: it waited forever.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../megamind"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+wait_for(fn, ms = 3000) {
+	t0 = std.millis();
+	for(std.millis() - t0 < ms) {
+		if(fn())
+			return true;
+		std.sleep(10);
+	}
+	return fn();
+}
+
+meter = [now = 0, peak = 0, prompts = []];
+
+// a worker agent: research returns at once, "LONG" work runs until stopped
+// (max 3 s), "CRASH" work throws, an update continues for 300 ms
+class StubWorker {
+	model_config = [max_running_agents = 0];
+	stopped = false;
+	running = false;
+	env = [];
+	task_result = None;
+	on_action = None;
+	_slot_held = false;
+	_slot_lent = false;
+
+	should_stop() { return stopped; }
+	clear_chat() {}
+	set_reasoning_effort(e) {}
+	stop() { stopped = true; }
+	task_update(p) {
+		if(!running)
+			return None;
+		stop();
+		return None;
+	}
+
+	task(prompt, continue_task = false) {
+		stopped = false;
+		running = true;
+		task_result = None;
+		meter.now++;
+		if(meter.now > meter.peak)
+			meter.peak = meter.now;
+		meter.prompts.push_back(prompt);
+
+		try {
+			if(prompt.starts("# Instruction")) {
+				task_result = [signal = "finished", result = "research done", from_tool = json.bool(true)];
+			}
+			else if(prompt.contains("CRASH")) {
+				std.runtime_error("worker exploded");
+			}
+			else if(prompt.starts("# Update from the user") || continue_task) {
+				std.sleep(300);
+				task_result = [signal = "finished", result = "continued with: " + prompt, from_tool = json.bool(true)];
+			}
+			else if(prompt.contains("LONG")) {
+				t0 = std.millis();
+				for(!stopped && std.millis() - t0 < 3000)
+					std.sleep(10);
+				if(!stopped) {
+					task_result = [signal = "finished", result = "long work done", from_tool = json.bool(true)];
+				}
+			}
+			else {
+				task_result = [signal = "finished", result = "done: " + prompt.substr(0, 30), from_tool = json.bool(true)];
+			}
+		}
+		catch(e) {
+			meter.now--;
+			running = false;
+			std.runtime_error(e);
+		}
+
+		meter.now--;
+		running = false;
+		return task_result;
+	}
+}
+
+rmeter = [now = 0, peak = 0, prompts = []];
+
+// the receptionist: a turn runs until stopped (max 2 s), a continuation reports
+class StubReceptionist {
+	model_config = [max_running_agents = 0];
+	stopped = false;
+	running = false;
+	env = [];
+	task_result = None;
+	on_action = None;
+
+	should_stop() { return stopped; }
+	clear_chat() {}
+	set_reasoning_effort(e) {}
+	stop() { stopped = true; }
+	task_update(p) {
+		if(!running)
+			return None;
+		stop();
+		return None;
+	}
+
+	task(prompt, continue_task = false) {
+		stopped = false;
+		running = true;
+		task_result = None;
+		rmeter.now++;
+		if(rmeter.now > rmeter.peak)
+			rmeter.peak = rmeter.now;
+		rmeter.prompts.push_back(prompt);
+
+		if(continue_task) {
+			std.sleep(200);
+			task_result = [signal = "finished", result = "followup: " + prompt, from_tool = json.bool(true)];
+		}
+		else {
+			t0 = std.millis();
+			for(!stopped && std.millis() - t0 < 2000)
+				std.sleep(10);
+			if(!stopped)
+				task_result = [signal = "finished", result = "turn done", from_tool = json.bool(true)];
+		}
+
+		rmeter.now--;
+		running = false;
+		return task_result;
+	}
+}
+
+workers = [];
+roles_made = [];
+
+class TestMind : Megamind {
+	create_receptionist(cfg) {
+		return StubReceptionist();
+	}
+	create_worker(cfg, role = "adaptive") {
+		roles_made.push_back(role);
+		w = StubWorker();
+		workers.push_back(w);
+		return w;
+	}
+}
+
+cfg = ModelConfig();
+mind = TestMind(cfg, cfg, 1);
+wait_for([]() { return workers.size() == 1; });
+check("one stand-in worker", workers.size() == 1);
+
+state_of(id) {
+	t = mind.inspect_task(id);
+	return std.is_json(t) ? std.string(t.state) : "gone";
+}
+
+std.print("\n── update_task during the implementation ──");
+id = mind.add_task("Long", "LONG work");
+wait_for([id]() { return state_of(id) == "implement"; });
+check("the task is in the implement phase", state_of(id) == "implement", state_of(id));
+t0 = std.millis();
+ok = mind.update_task(id, "use tabs");
+dt = std.millis() - t0;
+check("update_task accepts the update", ok);
+check("update_task returns at once (the worker continues, not the caller)", dt < 150, std.string(dt) + " ms");
+wait_for([id]() { t = mind.inspect_task(id); return std.is_json(t) && (t.state == "finished" || t.state == "failed" || t.state == "stopped"); });
+t = mind.inspect_task(id);
+check("the task finishes with the update", std.is_json(t) && t.state == "finished" && std.string(t.report).contains("use tabs"), std.string(t.state) + " / " + std.string(t.report));
+check("one generation at a time on the worker", meter.peak == 1, std.string(meter.peak));
+check("the task left the running list", mind.tasks.size() == 0, std.string(mind.tasks.size()));
+ok = mind.update_task(id, "too late");
+check("an update for a finished task is refused", !ok);
+
+std.print("\n── a throwing finished listener ──");
+mind.on_task_finished([](task) { std.runtime_error("listener exploded"); });
+a = mind.add_task("A", "quick work a");
+wait_for([a]() { return state_of(a) == "finished"; });
+check("the task finishes", state_of(a) == "finished", state_of(a));
+b = mind.add_task("B", "quick work b");
+wait_for([b]() { return state_of(b) == "finished"; });
+check("the next task still runs (the worker thread lives)", state_of(b) == "finished", state_of(b));
+mind.on_task_finished(None);
+ 
+std.print("\n── additive notify / file listeners ──");
+notify_counts = [legacy = 0, added = 0];
+mind.on_notify([](msg) { notify_counts.legacy++; });
+mind.add_notify_listener([](msg) { notify_counts.added++; });
+mind.notify_user("owner ping");
+check("on_notify keeps its single slot", notify_counts.legacy == 1, std.string(notify_counts));
+check("add_notify_listener receives the event too", notify_counts.added == 1, std.string(notify_counts));
+
+file_counts = [legacy = 0, added = 0];
+mind.on_file([](f) { file_counts.legacy++; });
+mind.add_file_listener([](f) { file_counts.added++; });
+probe = "megamind_share_probe_" + std.random_hash(6) + ".txt";
+fileio.write_text(probe, "payload");
+sent = mind.share_file(probe, "probe");
+fileio.remove(probe);
+check("share_file reaches both file listeners", sent.ok && file_counts.legacy == 1 && file_counts.added == 1, std.string(file_counts));
+
+// A throwing notify listener must not stop the other listeners or the caller.
+safe_counts = [hit = 0];
+mind.add_notify_listener([](msg) { std.runtime_error("notify listener exploded"); });
+mind.add_notify_listener([safe_counts](msg) { safe_counts.hit++; });
+mind.notify_user("still fine");
+check("a throwing notify listener is caught and the next one runs", safe_counts.hit == 1, std.string(safe_counts));
+ 
+std.print("\n── a crashing worker ──");
+c = mind.add_task("C", "CRASH now");
+wait_for([c]() { return state_of(c) == "failed"; });
+tc = mind.inspect_task(c);
+check("a crash is a failed task with the reason", std.is_json(tc) && tc.state == "failed" && std.string(tc.report).contains("exploded"), std.string(tc));
+d = mind.add_task("D", "quick work d");
+wait_for([d]() { return state_of(d) == "finished"; });
+check("the next task runs after a crash", state_of(d) == "finished", state_of(d));
+check("no slot held after a crash", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+std.print("\n── stop a task that waits for a slot ──");
+workers[0].model_config.max_running_agents = 1;
+pool = agent_slot_pool();
+pool.count = 1;	// another agent holds the only slot
+w = mind.add_task("Waiting", "quick work w");
+wait_for([w]() { return state_of(w) == "research"; });
+std.sleep(100);
+check("the task waits for a slot", state_of(w) == "research" && workers[0].running == false, state_of(w));
+mind.stop_task(w);
+wait_for([w]() { return state_of(w) == "stopped"; }, 2000);
+check("stop_task ends the wait", state_of(w) == "stopped", state_of(w));
+pool.count = 0;
+workers[0].model_config.max_running_agents = 0;
+e = mind.add_task("E", "quick work e");
+wait_for([e]() { return state_of(e) == "finished"; });
+check("the next task runs", state_of(e) == "finished", state_of(e));
+
+std.print("\n── the role of a task ──");
+f = mind.add_task("F", "quick work f");
+check("the default role is adaptive", mind.inspect_task(f).role == "adaptive", std.string(mind.inspect_task(f)));
+wait_for([f]() { return state_of(f) == "finished"; });
+check("a default-role task runs on the worker thread's agent", state_of(f) == "finished" && workers.size() == 1 && roles_made.size() == 1, std.string(roles_made));
+g = mind.add_task("G", "quick work g", "some_role");
+wait_for([g]() { return state_of(g) == "finished"; });
+check("another role gets an agent of its own", state_of(g) == "finished" && roles_made.size() == 2 && roles_made[1] == "some_role", std.string(roles_made));
+
+std.print("\n── a follow-up for the running receptionist turn ──");
+check("no turn: update_receptionist answers false", !mind.update_receptionist("nobody listens"));
+res = [r = None];
+th = std.thread([res]() { res.r = mind.request("hello"); });
+th.run();
+wait_for([]() { return mind._receptionist_active; });
+t0 = std.millis();
+ok = mind.update_receptionist("also do X");
+dt = std.millis() - t0;
+check("update_receptionist accepts it at once", ok && dt < 100, std.string(dt) + " ms");
+wait_for([res]() { return !std.is_none(res.r); });
+reps = std.string(res.r);
+check("the turn is continued with the follow-up, on the receptionist thread", reps.contains("followup") && reps.contains("also do X"), reps);
+check("one receptionist generation at a time", rmeter.peak == 1, std.string(rmeter.peak));
+check("the receptionist is free again", !mind._receptionist_active);
+
+mind.running = false;
+std.print("\n", passed, " passed, ", failed, " failed\n");
+std.exitprocess(failed ? 1 : 0);

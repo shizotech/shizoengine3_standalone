@@ -19,6 +19,10 @@
 //- The plan on the left (#677): 2D (the plan from above, the phaser whose settings are open) or 3D (the stage of the
 //  fixture setup with beams: the lamps the phasers of this generator drive, or every lamp with "Only its lamps" off).
 //  The cell of a clip with a Phaser draws the same, so a clip shows what it drives.
+//- Cue (#755): a phaser can play a cue of a cue stack of the lighting desk (engine/patch/desk.shio) instead of its own
+//  wave: what the cue sends (the cues of its stack before it tracked in) and its effect timeline, on the clock of this
+//  phaser (the BPM, a Speed master), whether the stack plays or not. Level scales its dimmers, Blend and Priority mix
+//  it with the rest as for any phaser.
 
 import nanogui;
 
@@ -27,6 +31,7 @@ using nanogui;
 
 #include "engine/patch/patch"
 #include "engine/patch/fx"
+#include "engine/patch/desk"
 #include "engine/patch/stage3d"
 #include "engine/patch/palette"
 #include "engine/patch/stage3d_draw"
@@ -100,6 +105,10 @@ PHASER_SPEED_MASTERS = ["None", "Speed 1", "Speed 2", "Speed 3", "Speed 4"];
 
 def set_show_patch(v);
 def phaser_clock(item);
+def phaser_cue_name(ref);
+def resolve_cue(item);
+def update_cue(item);
+def set_control_value(item, ctrl, value);
 
 // =========================================================================
 // The wave
@@ -189,6 +198,8 @@ fill_attribute_combo(combo, target, current) {
 
 //What the Level slider shows: "Group 1 › DIMMER", "Heads › Position"
 row_caption(item) {
+	if(item.cue)
+		return phaser_cue_name(item.cue);
 	if(!item.target || !item.attribute)
 		return "Level";
 	return patch_target_name(engine.patch, item.target) + " › " + fx_attribute_label(item.attribute);
@@ -228,19 +239,153 @@ color_value(c) {
 	return [r = c.r.value(), g = c.g.value(), b = c.b.value()];
 }
 
+// =========================================================================
+// A cue of the desk (#755): a phaser that plays a cue of a cue stack instead of its own wave
+// =========================================================================
+
+//The cues of the lighting desk a phaser can play: [[ref = "<stack id>|<number>", name], ...]
+phaser_cues() {
+	list = [];
+	if(!engine || !engine.desk)
+		return list;
+	managed _grd = std.critical_section("desk");
+	d = engine.desk.data;
+	for(i = 0; i < d.stacks.size(); i++) {
+		s = d.stacks[i];
+		for(k = 0; k < s.cues.size(); k++) {
+			c = s.cues[k];
+			title = "Cue " + desk_num_text(c.number);
+			name = s.name + " · " + title + (c.name && c.name != title ? " " + c.name : "");
+			if(c.has("timeline") && c.timeline && c.timeline.lanes.size())
+				name += " · timeline";
+			list.push_back([ref = s.id + "|" + desk_num_text(c.number), name = name]);
+		}
+	}
+	return list;
+}
+
+//The stack and the index of the cue of a ref ("<stack id>|<number>"), None when the desk has it no more
+phaser_cue_find(ref) {
+	if(!ref || !engine || !engine.desk)
+		return None;
+	parts = std.string(ref).split("|");
+	if(parts.size() != 2)
+		return None;
+	s = desk_stack(engine.desk.data, parts[0]);
+	if(!s)
+		return None;
+	at = desk_cue_index(s, std.float(parts[1]));
+	return at >= 0 ? [stack = s, index = at] : None;
+}
+
+//The ref of a cue named by its stack (name or number) and number, or why there is none ("No ...")
+phaser_cue_ref(stack, number) {
+	managed _grd = std.critical_section("desk");
+	s = desk_find_stack(engine.desk.data, stack);
+	if(!s)
+		return "No stack " + stack;
+	if(desk_cue_index(s, number) < 0)
+		return "No cue " + desk_num_text(number) + " in " + s.name;
+	return s.id + "|" + desk_num_text(number);
+}
+
+//"Main · Cue 2 Drop" of a ref
+phaser_cue_name(ref) {
+	list = phaser_cues();
+	for(i = 0; i < list.size(); i++) {
+		if(list[i].ref == ref)
+			return list[i].name;
+	}
+	return ref ? "Cue (gone)" : "";
+}
+
+//What a cue sends at beat t of its timeline ([<id> = [<label> = v]]): the cues of its stack up to it (tracking), its
+//timeline over them. None when it is gone
+phaser_cue_values(ref, t) {
+	managed _grd = std.critical_section("desk");
+	found = phaser_cue_find(ref);
+	if(!found)
+		return None;
+	vals = desk_tracked_state(found.stack, found.index);
+	cue = found.stack.cues[found.index];
+	if(cue.has("timeline") && cue.timeline && cue.timeline.lanes.size())
+		vals = desk_over(vals, desk_timeline_values(cue.timeline, engine.patch, t, vals));
+	return vals;
+}
+
+//The ids of the lamps a cue moves: those of its values and of the lanes of its timeline
+phaser_cue_ids(ref) {
+	ids = std.json();
+	managed _grd = std.critical_section("desk");
+	found = phaser_cue_find(ref);
+	if(!found)
+		return ids;
+	vals = desk_tracked_state(found.stack, found.index);
+	for(i = 0; i < vals.size(); i++)
+		ids[vals.key(i)] = true;
+	cue = found.stack.cues[found.index];
+	if(cue.has("timeline") && cue.timeline) {
+		for(i = 0; i < cue.timeline.lanes.size(); i++) {
+			lane_ids = desk_target_ids(engine.patch, cue.timeline.lanes[i].target);
+			for(k = 0; k < lane_ids.size(); k++)
+				ids[lane_ids[k]] = true;
+		}
+	}
+	return ids;
+}
+
+//The colour a lamp shows of a cue's values (for the bars and the plan): its colour times its dimmer and the level
+phaser_lamp_color(f, vals, level) {
+	r = 1.0;
+	g = 1.0;
+	b = 1.0;
+	labels = desk_labels_of_function(f.type, "color");
+	if(labels.size() >= 3) {
+		r = vals.has(labels[0]) ? vals[labels[0]] : 0.0;
+		g = vals.has(labels[1]) ? vals[labels[1]] : 0.0;
+		b = vals.has(labels[2]) ? vals[labels[2]] : 0.0;
+	}
+	dims = desk_labels_of_function(f.type, "dimmer");
+	d = dims.size() && vals.has(dims[0]) ? vals[dims[0]] : 1.0;
+	return [r = r * d * level, g = g * d * level, b = b * d * level];
+}
+
+fill_cue_combo(combo, current) {
+	list = phaser_cues();
+	items = ["None: its own wave"];
+	sel = 0;
+	for(i = 0; i < list.size(); i++) {
+		items.push_back(list[i].name);
+		if(list[i].ref == current)
+			sel = i + 1;
+	}
+	if(current && sel == 0) {
+		items.push_back("Cue (gone)");
+		sel = items.size() - 1;
+	}
+	combo.items(items).selected(sel);
+	return list;
+}
+
 //Shows what fits the attribute: Wave for a channel, Shape and the centre for a position, the colours for a colour
 apply_kind(item) {
-	kind = fx_attribute_kind(item.attribute);
+	kind = item.cue ? "cue" : fx_attribute_kind(item.attribute);
 	item.kind = kind;
 	ui = item.ui;
-	ui.wave_holder.visible(kind != "position" && !(kind == "color" && item.color_mode.value() == 1));
+	cue = kind == "cue";
+	//a cue: what it sends comes from the desk, the settings of a wave are hidden
+	for(i = 0; i < ui.wave_only.size(); i++)
+		ui.wave_only[i].visible(!cue);
+	ui.cue_lbl.visible(cue);
+	ui.cue_lbl.caption(cue ? "Plays " + phaser_cue_name(item.cue) : "");
+	ui.wave_holder.visible(!cue && kind != "position" && !(kind == "color" && item.color_mode.value() == 1));
 	ui.shape_holder.visible(kind == "position");
 	ui.mode_holder.visible(kind == "color");
 	ui.single_box.visible(kind == "single");
 	ui.position_box.visible(kind == "position");
 	ui.color_box.visible(kind == "color");
-	ui.mirror_box.visible(kind != "color");
-	ui.input_box.visible(kind != "position" && item.wave.value() == PHASER_WAVE_INPUT);
+	ui.mirror_box.visible(kind != "color" && !cue);
+	ui.input_box.visible(!cue && kind != "position" && item.wave.value() == PHASER_WAVE_INPUT);
 	//the quick row: [mode][wave][cycle] for a colour, [wave or shape][cycle] else
 	if(kind == "color" && ui.wave_holder.visible()) {
 		ui.mode_holder.clear_anchor_right().anchor_left(0).fixed_width(PHASER_QUICK_HALF);
@@ -254,7 +399,7 @@ apply_kind(item) {
 	target_list.refresh_layout();
 }
 
-add_target(guid = "", open_settings = false, target = "", attribute = "", wave = -1) {
+add_target(guid = "", open_settings = false, target = "", attribute = "", wave = -1, cue = "") {
 	if(!guid)
 		guid = std.random_hash();
 
@@ -273,6 +418,7 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 	shape_holder = quick.widget().anchor_left(0).anchor_right(PHASER_SPEED_W + 4).fixed_height(PHASER_ROW);
 	mode_holder = quick.widget().anchor_left(0).anchor_right(PHASER_SPEED_W + 4).fixed_height(PHASER_ROW);
 	speed_holder = quick.widget().anchor_right(0).fixed_width(PHASER_SPEED_W).fixed_height(PHASER_ROW);
+	cue_lbl = quick.label("").anchor_left(4).anchor_right(0).fixed_height(PHASER_ROW).text_color(PAL_TEXT_2);
 
 	//The values it sends, one bar per lamp
 	bars = cnt.widget().fixed_height(18);
@@ -281,7 +427,8 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 	setts.visible(open_settings);
 
 	control_targets[guid] = [cnt = cnt, guid = guid, slider = slider, target = target, attribute = attribute, kind = "single",
-		lamps = [], controls = [], shares = [], buffers = [], values = [], colors = [], points = [], revision = -1, clock = -1.0];
+		lamps = [], controls = [], shares = [], buffers = [], values = [], colors = [], points = [], revision = -1, clock = -1.0,
+		cue = cue];
 	item = control_targets[guid];
 
 	settings_btn.on_change([setts, guid](v) {
@@ -308,14 +455,14 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 		nvgFillColor(PAL_FIELD);
 		nvgFill();
 		if(!n) {
-			pal_text(vec2f(4, s.y / 2.0), item.target ? "No lamps with this attribute" : "Open the settings (cog) to pick lamps", 10, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+			pal_text(vec2f(4, s.y / 2.0), item.cue ? "The cue moves no lamps" : item.target ? "No lamps with this attribute" : "Open the settings (cog) to pick lamps", 10, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
 			return;
 		}
 		w = s.x / n;
 		for(i = 0; i < n; i++) {
 			v = math.clamp(item.values[i], 0.0, 1.0);
 			color = PAL_ON;
-			if(item.kind == "color") {
+			if(item.kind == "color" || item.kind == "cue") {
 				c = item.colors[i];
 				color = vec4f(c.r, c.g, c.b, 1.0);
 				v = 1.0;
@@ -327,10 +474,31 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 		}
 	});
 
+	//A cue of the desk instead of the wave (#755)
+	cue_combo = labeled_row(setts, "Cue").combobox().anchor(0);
+	cue_combo.tooltip("Plays a cue of a [[cue stack]] of the lighting desk instead of a wave of its own: what the cue sends (with the cues of its stack before it, tracking) and its effect timeline, on the clock of this phaser (the BPM, a Speed master), whether the stack plays or not. Level scales its dimmers\n[[wiki:Lighting-Desk#the-phaser-plays-a-cue]]");
+	fill_cue_combo(cue_combo, cue);
+	cue_combo.on_open([cue_combo, guid]() {
+		fill_cue_combo(cue_combo, control_targets[guid].cue);
+	});
+	cue_combo.on_change([guid, slider](index, text) {
+		item = control_targets[guid];
+		list = phaser_cues();
+		if(index == 0)
+			item.cue = "";
+		else if(index <= list.size())
+			item.cue = list[index - 1].ref;
+		item.revision = -1;
+		slider.display_name(row_caption(item));
+		apply_kind(item);
+	});
+
 	//Lamps, attribute and how it blends
-	target_combo = labeled_row(setts, "Lamps").combobox().anchor(0);
+	target_row = labeled_row(setts, "Lamps");
+	target_combo = target_row.combobox().anchor(0);
 	target_combo.tooltip("Which lamps: a group of the fixture setup (in its order) or all lamps of a type");
-	attribute_combo = labeled_row(setts, "Attribute").combobox().anchor(0);
+	attribute_row = labeled_row(setts, "Attribute");
+	attribute_combo = attribute_row.combobox().anchor(0);
 	attribute_combo.tooltip("What the phaser moves: Position (pan and tilt of moving heads), a Colour, or one channel. What a channel does comes from the fixture file (Function in the fixture editor)");
 	fill_target_combo(target_combo, target);
 	fill_attribute_combo(attribute_combo, target, attribute);
@@ -414,7 +582,8 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 	//For every attribute
 	item.phase = setts.controlfloat("Phase", guid).unit("°").decimals(0).min(0.0).max(3600.0).value(360.0);
 	item.phase.tooltip("How far the effect is spread over the lamps in degrees: 0 all together, 360 one cycle from the first lamp to the last, 720 two waves");
-	item.phase_mode = labeled_row(setts, "Spread").controlcombo("phase_mode", guid).caption("Spread").items(PHASER_SPREADS).anchor(0);
+	spread_row = labeled_row(setts, "Spread");
+	item.phase_mode = spread_row.controlcombo("phase_mode", guid).caption("Spread").items(PHASER_SPREADS).anchor(0);
 	item.phase_mode.tooltip("Which lamp comes first. The directions use where the lamps hang on the stage plan of the fixture setup.");
 	item.wings = setts.controlint("Wings", guid).min(0).max(16).value(0);
 	item.wings.tooltip("Mirrors the phase: with 2 wings the lamps of the second half run the other way, as a mirror of the first");
@@ -432,7 +601,9 @@ add_target(guid = "", open_settings = false, target = "", attribute = "", wave =
 	item.auto_mirrory.tooltip("Lamps behind the middle of the stage get the mirrored value");
 
 	item.ui = [wave_holder = wave_holder, shape_holder = shape_holder, mode_holder = mode_holder, single_box = single_box,
-		position_box = position_box, color_box = color_box, mirror_box = mirror_box, input_box = input_box];
+		position_box = position_box, color_box = color_box, mirror_box = mirror_box, input_box = input_box, cue_lbl = cue_lbl,
+		wave_only = [speed_holder, target_row.parent(), attribute_row.parent(), item.phase, spread_row.parent(), item.wings,
+			item.start_device, item.end_device]];
 
 	if(wave >= 0)
 		item.wave.value(wave);
@@ -543,6 +714,10 @@ add_quick_effect(name, target) {
 
 //The lamps, their controls and shares of a phaser, again when the patch, the target or the spread changed
 resolve(item) {
+	if(item.cue) {
+		resolve_cue(item);
+		return;
+	}
 	if(item.revision == engine.patch_revision)
 		return;
 	item.revision = engine.patch_revision;
@@ -582,6 +757,62 @@ resolve(item) {
 	item.shares = phaser_shares(item.lamps, item.phase_mode.value(), item.wings.value());
 }
 
+//The lamps of a phaser that plays a cue: those the cue moves, in the order of the fixture setup, again when the patch
+//or the desk changed
+resolve_cue(item) {
+	key = std.string(engine.patch_revision) + "|" + std.string(engine.desk ? engine.desk.revision : -1);
+	if(std.string(item.revision) == key)
+		return;
+	item.revision = key;
+	item.lamps = [];
+	item.controls = [];
+	item.buffers = [];
+	item.values = [];
+	item.colors = [];
+	item.points = [];
+	item.shares = [];
+	ids = phaser_cue_ids(item.cue);
+	fixtures = engine.patch.fixtures;
+	for(i = 0; i < fixtures.size(); i++) {
+		if(!ids.has(fixtures[i].id))
+			continue;
+		item.lamps.push_back(fixtures[i]);
+		item.values.push_back(0.0);
+		item.colors.push_back([r = 0.0, g = 0.0, b = 0.0]);
+		item.points.push_back([pan = 0.5, tilt = 0.5]);
+	}
+}
+
+//A phaser that plays a cue: its values at the beat of the phaser's clock into the controls of its lamps. The Level
+//scales the dimmers (the colour of a lamp without dimmer), as the master of a stack
+update_cue(item) {
+	resolve(item);
+	if(!item.lamps.size() || !engine.desk)
+		return;
+	vals = phaser_cue_values(item.cue, phaser_clock(item));
+	if(!vals)
+		return;
+	level = item.slider.value();
+	for(i = 0; i < item.lamps.size(); i++) {
+		f = item.lamps[i];
+		if(!vals.has(f.id))
+			continue;
+		lv = vals[f.id];
+		for(k = 0; k < lv.size(); k++) {
+			c = engine.desk.control(f.id, lv.key(k));
+			if(!c)
+				continue;
+			v = lv[k];
+			if(c.function == "dimmer" || (c.function == "color" && !c.has_dimmer))
+				v = v * level;
+			set_control_value(item, c.ctrl, v);
+		}
+		col = phaser_lamp_color(f, lv, level);
+		item.colors[i] = col;
+		item.values[i] = math.max(col.r, math.max(col.g, col.b));
+	}
+}
+
 //A value of a phaser for a control: blended with the other phasers on it this frame (fx_contribute); during a clip
 //transition the phaser's own value is blended with what the control had
 set_control_value(item, ctrl, value) {
@@ -607,6 +838,10 @@ input_value(item, i, level, delay) {
 }
 
 update_control_target(item) {
+	if(item.cue) {
+		update_cue(item);
+		return;
+	}
 	resolve(item);
 	n = item.controls.size();
 	if(n == 0)
@@ -821,6 +1056,8 @@ draw_plan2d(s, item, compact) {
 		mode = FX_SHAPES[item.shape.value()];
 	else if(item.kind == "color")
 		mode = FX_COLOR_MODES[item.color_mode.value()];
+	else if(item.kind == "cue")
+		mode = "cue";
 	pal_text(vec2f(8, s.y - 12), row_caption(item) + " · " + mode + " · " + item.lamps.size() + " lamps · " + FX_BLENDS[item.blend.value()], 12, PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE);
 }
 
@@ -989,6 +1226,8 @@ describe_item(item) {
 		spread = PHASER_SPREADS[item.phase_mode.value()],
 		wings = item.wings.value(),
 		level = item.slider.value(),
+		cue = item.cue,
+		cue_name = item.cue ? phaser_cue_name(item.cue) : "",
 		lamps = item.lamps.size(),
 		values = item.values,
 		sent = [],
@@ -1094,6 +1333,30 @@ register_queries(generator) {
 		apply_kind(item);
 		return [ok = true, value = item.guid];
 	}, "Adds a phaser: an effect over the lamps of a target on one attribute (a channel, the position of moving heads or a colour)");
+
+	generator.register("add_cue_phaser", [
+		stack = "&string(): A cue stack of the lighting desk by name or number",
+		cue = "&float(): The number of the cue",
+		level = "float(): Level 0..1 (default 1): scales the dimmers of the cue",
+		blend = "string(): " + FX_BLENDS.combine_string(", ") + " (default Priority): with other phasers on the same channels",
+		speed_master = "string(): " + PHASER_SPEED_MASTERS.combine_string(", ") + ": the timeline of the cue runs that many times as fast",
+	], [](args) {
+		if(!engine.desk)
+			return [ok = false, error = "No lighting desk"];
+		ref = phaser_cue_ref(std.string(args.stack ?? ""), std.float(args.cue ?? 0));
+		if(ref.starts("No "))
+			return [ok = false, error = ref];
+		item = add_target("", false, "", "", -1, ref);
+		if(args.has("level"))
+			item.slider.value(math.clamp(std.float(args.level), 0.0, 1.0));
+		if(args.has("blend") && pick_index(FX_BLENDS, args.blend) >= 0)
+			item.blend.value(pick_index(FX_BLENDS, args.blend));
+		if(args.has("speed_master") && pick_index(PHASER_SPEED_MASTERS, args.speed_master) >= 0)
+			item.speed_master.value(pick_index(PHASER_SPEED_MASTERS, args.speed_master));
+		item.slider.display_name(row_caption(item));
+		apply_kind(item);
+		return [ok = true, value = item.guid];
+	}, "Adds a phaser that plays a cue of the lighting desk (#755): its values and its effect timeline, on the clock of this Phaser, whether its stack plays or not");
 
 	generator.register("add_quick_effect", [
 		effect = "&string(): " + PHASER_QUICK.map([](q) { return q.name; }).combine_string(", "),
@@ -1254,7 +1517,7 @@ save_state() {
 		view3d = view3d, only_driven = only_driven, camera = [yaw = cam_yaw, pitch = cam_pitch, zoom = cam_zoom]];
 	for(i = 0; i < control_targets.size(); i++) {
 		item = control_targets[i];
-		state.items[item.guid] = [target = item.target, attribute = item.attribute, order = i];
+		state.items[item.guid] = [target = item.target, attribute = item.attribute, order = i, cue = item.cue];
 	}
 	return state;
 }
@@ -1275,7 +1538,7 @@ load_state(state) {
 		data = items[guid];
 		//A phaser of a project before #439 (migrated: wave "Input") keeps its effect: the input with a delay
 		wave = (data.wave ?? "") == "Input" ? PHASER_WAVE_INPUT : -1;
-		add_target(guid, false, data.target ?? "", data.attribute ?? "", wave);
+		add_target(guid, false, data.target ?? "", data.attribute ?? "", wave, data.cue ?? "");
 	}
 	view.load_state(state.view);
 	//Projects before #655 had the patch view always: they keep it

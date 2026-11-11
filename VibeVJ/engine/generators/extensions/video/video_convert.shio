@@ -2,7 +2,8 @@
 // (src/menu/assetbrowser/assetbrowser.shio) and the video generator (video_module.shio).
 //
 // A copy lands next to its file as <name>_<suffix>[_<size>p].mov: the first format with the
-// original size is <name>_hap.mov, as before #460.
+// original size is <name>_hap.mov, as before #460. "Replace the original" puts the conversion in
+// the place of the file instead and keeps the original in _originals/ (see video_replace_finish).
 
 VIDEO_CONVERT_FORMATS = [
 	[id = "hap", name = "HAP", short = "HAP", suffix = "hap",
@@ -19,6 +20,11 @@ VIDEO_CONVERT_FORMATS = [
 
 // The most pixels of the shorter side (0 = the size of the file); never enlarged
 VIDEO_CONVERT_SIZES = [0, 2160, 1080, 720, 480];
+
+// "Replace the original" (#460, video_replace_finish below): the originals go into this folder next to their file,
+// with a list of what replaced them
+VIDEO_ORIGINALS_DIR = "_originals";
+VIDEO_REPLACED_FILE = "replaced.json"; // [<old name> = [now = <name of the replacement>, original = <name in _originals>, format =]]
 
 video_convert_size_name(size_index) {
 	size = VIDEO_CONVERT_SIZES[size_index];
@@ -63,12 +69,19 @@ video_convert_size_index(size) {
 	return 0;
 }
 
-// The copy a conversion writes: <dir>/<name>_<suffix>[_<size>p].mov
+// The copy a conversion writes: <dir>/<name>_<suffix>[_<size>p].mov, next to its file.
+// fileio.file_dir() answers the container's slash form ("C:/videos" for the OS form
+// "C:\videos\clip.mp4" that std.system_path() hands back), so the target of one file is
+// the same string on every platform. A path without a directory gets no separator: its
+// copy is "clip_hap.mov" next to it, not "/clip_hap.mov" in the root of the drive.
 video_convert_target(path, format_index, size_index) {
 	name = fileio.pure_name(path) + "_" + VIDEO_CONVERT_FORMATS[format_index].suffix;
 	if(VIDEO_CONVERT_SIZES[size_index])
 		name = name + "_" + video_convert_size_name(size_index);
-	return fileio.file_dir(path) + "/" + name + ".mov";
+	dir = fileio.file_dir(path);
+	if(dir == "")
+		return name + ".mov";
+	return dir + "/" + name + ".mov";
 }
 
 // The files VibeVJ plays as videos (mapped to this loader in generatoritem.shio)
@@ -130,10 +143,21 @@ video_convert_folder_videos(dir) {
 // Why the file needs no conversion to this format and size, or "" when it does (#460). The file is
 // read (nanogui.video_probe) when no copy exists; a file that cannot be read is left to the converter,
 // which says what is wrong with it.
-video_convert_skip_reason(path, format_index, size_index) {
-	target = video_convert_target(path, format_index, size_index);
-	if(fileio.exists(target))
-		return "copy exists: " + fileio.file_name(target);
+// replace: for "Replace the original" (below): no copy name, but the name the result gets must be free, and an
+// original kept in _originals is not replaced again.
+video_convert_skip_reason(path, format_index, size_index, replace = false) {
+	if(replace) {
+		if(fileio.pure_name(fileio.file_dir(path)) == VIDEO_ORIGINALS_DIR)
+			return "an original kept by Replace";
+		result = nanogui.video_replace_path(path);
+		if(result != path && fileio.exists(result))
+			return fileio.file_name(result) + " exists";
+	}
+	else {
+		target = video_convert_target(path, format_index, size_index);
+		if(fileio.exists(target))
+			return "copy exists: " + fileio.file_name(target);
+	}
 	info = nanogui.video_probe(path);
 	if(!info.ok)
 		return "";
@@ -146,4 +170,113 @@ video_convert_skip_reason(path, format_index, size_index) {
 			return "the file is " + format.name + " already";
 	}
 	return "";
+}
+
+// "Replace the original" (#460): the conversion is written next to the file as <name>.<ext>.replacing
+// (.part while it is written; no video name, so neither the Assets list nor a folder conversion takes it
+// for a video), read again when it is done (nanogui.video_convert(..., check = true)) and then put in the
+// place of the file by nanogui.video_replace: clip.mp4 becomes clip.mov (a .mov keeps its name), the
+// original goes to _originals/ in the same folder. video_replace_finish() does that together with the
+// generators of the open project that play the file.
+video_convert_replace_temp(path) {
+	return path + ".replacing";
+}
+
+// The file a job writes: the copy, or the temporary file of a replacement
+video_convert_job_target(path, format_index, size_index, replace) {
+	return replace ? video_convert_replace_temp(path) : video_convert_target(path, format_index, size_index);
+}
+
+// A path in one form for comparing: "/" and relative to the working directory, as the engine saves it
+video_path_key(path) {
+	p = std.string(path).replace("\\", "/");
+	if(p.starts("/") || p.contains(":/"))
+		p = fileio.relative_path_cwd(p).replace("\\", "/");
+	if(p.starts("./"))
+		p = p.substr(2, p.size() - 2);
+	return p;
+}
+
+// The generators of the open project that play this file (engine.ai_interfaces knows every one of them)
+video_generators_of(engine, path) {
+	found = [];
+	if(!engine)
+		return found;
+	want = video_path_key(path);
+	registry = engine.ai_interfaces;
+	for(i = 0; i < registry.size(); i++) {
+		iface = registry[i];
+		if(!iface || !iface.target)
+			continue;
+		try {
+			gen = iface.target;
+			if(gen.path && video_convert_is_video(gen.path) && video_path_key(gen.path) == want)
+				found.push_back(gen);
+		}
+		catch(e) {}
+	}
+	return found;
+}
+
+// After a checked conversion of source into converted: the generators that play source let go of it (Windows cannot
+// rename an open file), nanogui.video_replace swaps the files, and they open the new one where they were (or the
+// original again when the swap failed; it undoes itself then). A conversion that could not be put in place is
+// deleted, the original is untouched then. What was replaced goes into _originals/replaced.json, which leads a project
+// saved before to the new file (asset_resolver.shio). Returns the json of nanogui.video_replace plus generators = n.
+video_replace_finish(engine, source, converted, label) {
+	gens = video_generators_of(engine, source);
+	for(gen : gens) {
+		try {
+			gen.dispatch("video_release", None);
+		}
+		catch(e) {
+			std.warn("Replace: " + e);
+		}
+	}
+	done = nanogui.video_replace(source, converted);
+	for(gen : gens) {
+		try {
+			if(done.ok) {
+				dir = fileio.file_dir(gen.path);
+				gen.path = (dir ? dir + "/" : "") + fileio.file_name(done.path);
+				if(gen.ai_interface)
+					gen.ai_interface.source_file = gen.get_relative_path();
+			}
+			gen.dispatch("video_reopen", gen.path);
+		}
+		catch(e) {
+			std.warn("Replace: " + e);
+		}
+	}
+	if(done.ok) {
+		try {
+			list_path = fileio.file_dir(done.original) + "/" + VIDEO_REPLACED_FILE;
+			replaced = fileio.exists(list_path) ? fileio.read_json(list_path) : std.json();
+			if(!replaced)
+				replaced = std.json();
+			replaced[fileio.file_name(source)] = [now = fileio.file_name(done.path), original = fileio.file_name(done.original), format = label];
+			fileio.write_json(list_path, replaced);
+		}
+		catch(e) {
+			std.warn("Replace: could not write " + VIDEO_REPLACED_FILE + ": " + e);
+		}
+		std.print("Replaced " + source + " by " + label + " " + done.path + ", the original is " + done.original);
+	}
+	else {
+		std.warn("Replacing " + source + " failed: " + done.error);
+		if(fileio.exists(converted))
+			fileio.remove(converted);
+	}
+	done.generators = gens.size();
+	return done;
+}
+
+// "clip.mp4 replaced by clip.mov (HAP), the original is _originals/clip.mp4", or why not
+video_replace_note(source, done) {
+	if(!done.ok)
+		return "Replacing " + fileio.file_name(source) + " failed: " + done.error;
+	note = fileio.file_name(source) + " replaced by " + fileio.file_name(done.path) + ", the original is " + VIDEO_ORIGINALS_DIR + "/" + fileio.file_name(done.original);
+	if(done.generators > 0)
+		note = note + " (" + std.string(done.generators) + (done.generators == 1 ? " clip" : " clips") + " updated)";
+	return note;
 }

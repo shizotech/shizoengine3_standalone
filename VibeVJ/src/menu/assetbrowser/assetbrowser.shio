@@ -8,8 +8,11 @@ using eigen;
 #include "chat_menu"
 #include "projects_menu"
 #include "shader_preview"
+#include "video_preview"
 #include "midi_controller_menu"
+#include "webremote_menu"
 #include "display_settings"
+#include "sound_settings"
 #include "engine/generators/extensions/video/video_convert"
 
 save_in_progress = false;
@@ -24,6 +27,7 @@ class assetbrowser
 	managed artnet = None;
 	managed network_cards = None; //Devices > Network > Network cards (#501)
 	managed midi_controller = None; //the virtual MIDI controller (#343)
+	managed web_remote = None; //Devices > Network > Web remote (#359)
 	managed shizonet = None;
 	managed chat = None;
 	managed mcp = None;
@@ -37,6 +41,7 @@ class assetbrowser
 	projects_tab = None;
 	managed settings = None; //the settings window (#356)
 	managed display_page = None; //Settings > Display (#593, display_settings.shio)
+	managed sound_page = None;   //Settings > Sound (#460, sound_settings.shio)
 	midi_mapping_buttons = []; //[button=, name=, device=] the "MIDI mapping" button of every MIDI device with an input
 	midi_learn_btn = None; //Devices > MIDI > MIDI learn
 
@@ -45,8 +50,9 @@ class assetbrowser
 	//far they are. Formats and sizes: engine/generators/extensions/video/video_convert.shio
 	filebrowser = None;     //the list of the Assets tab
 	managed preview = None; //the preview of a shader the mouse rests on (#536, shader_preview.shio)
+	managed clip_preview = None; //the same for a video, and the length of the videos in their rows (#460, video_preview.shio)
 	menu_tabs = [];         //[path=, name=]: the tab name of every .menu opened so far (#575, open_menu_asset)
-	convert_jobs = [];      //[job=, name=, label=, folder=, stopped=]; folder: a job of the folder queue
+	convert_jobs = [];      //[job=, name=, label=, folder=, source=, replace=, stopped=]; folder: a job of the folder queue
 	convert_btn = None;
 	convert_status = None;
 	convert_note = "";      //what the last job said when it ended, shown for a few seconds
@@ -54,7 +60,9 @@ class assetbrowser
 	convert_refresh = 0;
 	convert_format = 0;     //index into VIDEO_CONVERT_FORMATS: personal, style.json convert_format (#460)
 	convert_size = 0;       //index into VIDEO_CONVERT_SIZES: style.json convert_size
-	//Convert videos in a folder: one job after the other, [path=, format_index=, size_index=] waiting; what came of them so far
+	convert_replace = 0;    //1: "Replace the original" (#460, video_replace_finish in video_convert.shio): style.json convert_replace
+	app_engine = None;      //the engine: video_replace_finish updates the generators of the open project
+	//Convert videos in a folder: one job after the other, [path=, format_index=, size_index=, replace=] waiting; what came of them so far
 	convert_queue = [];
 	convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
 	convert_pumping = false; //pump_convert_queue runs: a second caller returns (see there)
@@ -76,7 +84,7 @@ class assetbrowser
 				return true;
 		}
 		for(item : convert_queue) {
-			if(video_convert_target(item.path, item.format_index, item.size_index) == target)
+			if(video_convert_job_target(item.path, item.format_index, item.size_index, item.replace) == target)
 				return true;
 		}
 		return false;
@@ -92,12 +100,14 @@ class assetbrowser
 		return false;
 	}
 
-	start_convert(path, format_index, size_index, folder) {
-		job = nanogui.video_convert(path, video_convert_target(path, format_index, size_index),
-			VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index]);
+	//replace: the result is checked and then takes the place of the file (update_converts)
+	start_convert(path, format_index, size_index, folder, replace) {
+		job = nanogui.video_convert(path, video_convert_job_target(path, format_index, size_index, replace),
+			VIDEO_CONVERT_FORMATS[format_index].id, VIDEO_CONVERT_SIZES[size_index], replace);
 		if(!job)
 			return false;
-		convert_jobs.push_back([job = job, name = fileio.file_name(path), label = video_convert_label(format_index, size_index), folder = folder]);
+		convert_jobs.push_back([job = job, name = fileio.file_name(path), label = video_convert_label(format_index, size_index), folder = folder,
+			source = path, replace = replace]);
 		convert_refresh = 0;
 		return true;
 	}
@@ -108,9 +118,9 @@ class assetbrowser
 		if(!convert_queue_active())
 			convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
 		for(path : video_convert_folder_videos(dir)) {
-			if(convert_busy(video_convert_target(path, convert_format, convert_size)))
+			if(convert_busy(video_convert_job_target(path, convert_format, convert_size, convert_replace)))
 				continue;
-			convert_queue.push_back([path = path, format_index = convert_format, size_index = convert_size]);
+			convert_queue.push_back([path = path, format_index = convert_format, size_index = convert_size, replace = convert_replace]);
 			convert_queue_stats.total = convert_queue_stats.total + 1;
 		}
 		if(convert_queue.size() == 0 && convert_queue_stats.total == 0) {
@@ -161,11 +171,11 @@ class assetbrowser
 			item = convert_queue[0];
 			convert_queue.erase(0);
 			reads++;
-			if(video_convert_skip_reason(item.path, item.format_index, item.size_index)) {
+			if(video_convert_skip_reason(item.path, item.format_index, item.size_index, item.replace)) {
 				convert_queue_stats.skipped = convert_queue_stats.skipped + 1;
 				continue;
 			}
-			if(start_convert(item.path, item.format_index, item.size_index, true))
+			if(start_convert(item.path, item.format_index, item.size_index, true, item.replace))
 				return;
 			convert_queue_stats.failed = convert_queue_stats.failed + 1;
 		}
@@ -196,7 +206,23 @@ class assetbrowser
 			}
 			if(entry.has("stopped"))
 				continue;
-			if(entry.job.ok()) {
+			if(entry.job.ok() && entry.replace) {
+				//The preview may play the file: it lets go of it, like the generators do in video_replace_finish, and
+				//forgets the row under the mouse (its file is gone; the next move of the mouse shows the new one)
+				if(clip_preview)
+					clip_preview.hover("", 0);
+				done = video_replace_finish(app_engine, entry.source, entry.job.target(), entry.label);
+				convert_note = video_replace_note(entry.source, done);
+				if(entry.folder) {
+					if(done.ok)
+						convert_queue_stats.done = convert_queue_stats.done + 1;
+					else
+						convert_queue_stats.failed = convert_queue_stats.failed + 1;
+				}
+				if(filebrowser && !entry.folder)
+					filebrowser.refresh();
+			}
+			else if(entry.job.ok()) {
 				convert_note = fileio.file_name(entry.job.target()) + " is ready";
 				if(entry.folder)
 					convert_queue_stats.done = convert_queue_stats.done + 1;
@@ -232,6 +258,7 @@ class assetbrowser
 			style = fileio.read_json(STYLE_FILE);
 			style.convert_format = VIDEO_CONVERT_FORMATS[convert_format].id;
 			style.convert_size = VIDEO_CONVERT_SIZES[convert_size];
+			style.convert_replace = convert_replace;
 			fileio.write_json(STYLE_FILE, style);
 		}
 		catch(e) {}
@@ -245,32 +272,38 @@ class assetbrowser
 		enabled = true;
 		caption = "";
 		tip = "";
+		replace_tip = "The converted file is checked (every frame readable, as long as the original, first and last frame decode) and then takes the place of the file: "
+			+ "clip.mp4 becomes clip.mov, every clip of the project that plays it follows, and the original is kept in the folder " + VIDEO_ORIGINALS_DIR + " next to it.\n[[wiki:Video#replace-the-original]]";
 		if(convert_menu_folder) {
 			n = convert_menu_videos.size();
-			caption = "Convert " + std.string(n) + (n == 1 ? " video" : " videos") + " here to " + label;
+			caption = (convert_replace ? "Replace " : "Convert ") + std.string(n) + (n == 1 ? " video" : " videos") + " here " + (convert_replace ? "with " : "to ") + label;
 			if(n == 0) {
 				caption = "No videos in this folder";
 				enabled = false;
 			}
 			tip = "Converts the videos in this folder (not in its subfolders) to " + label + ", one after the other; the line at the bottom shows how far it is. "
-				+ "Left out: files that are " + VIDEO_CONVERT_FORMATS[convert_format].name + " already, files whose copy exists, and the copies Convert made.\n[[wiki:Video#converting]]";
+				+ "Left out: files that are " + VIDEO_CONVERT_FORMATS[convert_format].name + " already, "
+				+ (convert_replace ? "files whose new name is taken.\n" + replace_tip : "files whose copy exists, and the copies Convert made.\n[[wiki:Video#converting]]");
 		}
 		else {
 			path = convert_menu_path;
-			target = video_convert_target(path, convert_format, convert_size);
-			caption = "Convert to " + label;
+			target = video_convert_job_target(path, convert_format, convert_size, convert_replace);
+			caption = (convert_replace ? "Replace with " : "Convert to ") + label;
 			if(convert_busy(target)) {
 				caption = "Converting to " + label + "...";
 				enabled = false;
 			}
 			else {
-				reason = video_convert_skip_reason(path, convert_format, convert_size);
+				reason = video_convert_skip_reason(path, convert_format, convert_size, convert_replace);
 				if(reason) {
 					caption = reason.substr(0, 1).uppercase() + reason.substr(1, reason.size() - 1);
 					enabled = false;
 				}
 			}
-			tip = "A copy in " + label + " next to the file, " + fileio.file_name(target) + ": every frame stands on its own, so it can be positioned without waiting and played backwards.\n[[wiki:Video#converting]]";
+			if(convert_replace)
+				tip = label + " in the place of " + fileio.file_name(path) + ", as " + fileio.file_name(nanogui.video_replace_path(path)) + ". " + replace_tip;
+			else
+				tip = "A copy in " + label + " next to the file, " + fileio.file_name(target) + ": every frame stands on its own, so it can be positioned without waiting and played backwards.\n[[wiki:Video#converting]]";
 		}
 		convert_entry.caption(caption).tooltip(tip).enabled(enabled);
 	}
@@ -305,6 +338,15 @@ class assetbrowser
 			this.save_convert_settings();
 			this.update_convert_entry();
 		});
+		menu.label("Result").anchor_left(4);
+		result_select = menu.combobox().fixed_height(26).items(["Copy next to it", "Replace the original"]).segmented(true).anchor_left(0).anchor_right(0)
+			.tooltip("Copy next to it: name_hap.mov beside the file, the file stays. Replace the original: the converted file is checked and takes the place of the file (clip.mp4 becomes clip.mov), the clips of the project follow, the original goes into the folder " + VIDEO_ORIGINALS_DIR + " next to it\n[[wiki:Video#replace-the-original]]");
+		result_select.selected(convert_replace);
+		result_select.on_change([this](v, txt){
+			this.convert_replace = v;
+			this.save_convert_settings();
+			this.update_convert_entry();
+		});
 
 		convert_entry = menu.button("").alignment("left").anchor_left(0).anchor_right(0).fixed_height(28).icon(nanogui.icon("exchange_alt"));
 		convert_entry.on_click([this](){
@@ -312,7 +354,7 @@ class assetbrowser
 			if(this.convert_menu_folder)
 				this.start_folder_convert(this.convert_menu_path);
 			else
-				this.start_convert(this.convert_menu_path, this.convert_format, this.convert_size, false);
+				this.start_convert(this.convert_menu_path, this.convert_format, this.convert_size, false, this.convert_replace);
 		});
 		update_convert_entry();
 
@@ -383,6 +425,7 @@ class assetbrowser
 		page_appearance = settings.add_page("Appearance", "eye");
 		page_output = settings.add_page("Output", "desktop");
 		page_display = settings.add_page("Display", "expand_arrows_alt");
+		page_sound = settings.add_page("Sound", "volume_up");
 
 		//The name of the project is shown in the top bar (generators.shio sets project_env.label)
 		set_project_label = [project_env](text){
@@ -644,6 +687,9 @@ class assetbrowser
 		//Display (#593): the connected displays, their role and resolution (display_settings.shio)
 		display_page = display_settings(engine, settings, page_display);
 
+		//Sound (#460): the output devices of the sound of video clips (sound_settings.shio)
+		sound_page = sound_settings(engine, settings, page_sound);
+
 		//Blackout (#538): how it comes back. Personal, kept in the style file
 		settings.section(page_output, "Blackout");
 		settings.note(page_output, nanogui.key_text("Personal. Ctrl+B or the Blackout button of the timeline: black at once, back with this fade."));
@@ -891,7 +937,8 @@ class assetbrowser
 		//#362). The split zones of an area only show where nothing in it takes the drop
 		
 		engine.filebrowser = filebrowser;
-		
+		app_engine = engine;
+
 		//Double click: a .menu runs in a new tab, a text file (code, shader, JSON, Markdown, preset) opens in a code tab.
 		//Pictures, videos, sound and the like are not text: they are dragged onto a view instead
 		filebrowser.on_double_click([main_menu](path){
@@ -908,7 +955,8 @@ class assetbrowser
 		});
 
 		//Right click on a video: Convert makes a copy next to it (name_hap.mov, #278), in the format and size chosen in the
-		//menu (#460); on a folder it converts every video in it, one after the other. In a HAP file every frame stands on
+		//menu (#460), or replaces the file with it (Result: Replace the original); on a folder it converts every video in
+		//it, one after the other. In a HAP file every frame stands on
 		//its own, so the clip can be positioned without waiting and played backwards. The menu hangs on a button of no
 		//size that is put under the cursor (like the menu of an area, singleview.shio)
 		convert_btn = asset_tab.button_popup("").side("auto").transparent(true)
@@ -923,6 +971,8 @@ class assetbrowser
 				convert_format = video_convert_format_index(style.convert_format);
 			if(style && style.has("convert_size"))
 				convert_size = video_convert_size_index(style.convert_size);
+			if(style && style.has("convert_replace"))
+				convert_replace = style.convert_replace ? 1 : 0;
 		}
 		catch(e) {}
 
@@ -943,18 +993,34 @@ class assetbrowser
 		//own hover (mouse_motion_default)
 		preview = shader_preview(engine, window);
 		engine.env.shader_preview = preview;   //ticks in on_frame_finished of the engine
+		clip_preview = video_preview(engine, window);
+		clip_preview.browser = filebrowser;
+		engine.env.video_preview = clip_preview;
 		filebrowser.on_mouse_motion([this](p, rel, button, mods){
 			fb = this.filebrowser;
 			fb.mouse_motion_default(p, rel, button, mods);
 			if(button != 0) {
 				this.preview.hover("", 0); //a drag: no preview
+				this.clip_preview.hover("", 0);
 				return;
 			}
 			this.preview.hover(fb.path_at(p), fb.absolute_position().y + p.y);
+			this.clip_preview.hover(fb.path_at(p), fb.absolute_position().y + p.y);
+		});
+		//A press in the list closes the previews: it may start a drag, and the moves of a drag go to the drag, not to
+		//the list, so the preview opened by the rest before the press stayed open after the drop (#377)
+		filebrowser.on_mouse_button([this](pos, btn, down, mods){
+			if(down) {
+				this.preview.hover("", 0);
+				this.clip_preview.hover("", 0);
+			}
+			return this.filebrowser.mouse_button_default(pos, btn, down, mods);
 		});
 		filebrowser.on_mouse_enter([this](pos, enter){
-			if(!enter)
+			if(!enter) {
 				this.preview.hover("", 0);
+				this.clip_preview.hover("", 0);
+			}
 		});
 
 		asset_tab.on_draw([this](){
@@ -1049,6 +1115,10 @@ class assetbrowser
 			engine.net.enabled(v);
 		});
 		
+		//The web remote for phones and tablets (#359)
+		web_remote_vec = network_vec.collapsable("Web remote").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
+		web_remote = webremote_menu(engine, web_remote_vec);
+
 		//WLED and MQTT get their sections back once they have settings (empty sections are hidden, Shizo UI)
 			
 		fixtures_vec = ctrls_panel.collapsable("Fixtures").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());

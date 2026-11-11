@@ -28,6 +28,8 @@ engine/
 │       ├── glsl/
 │       │   ├── __init__.shio     # Loader for .glsl generators (src/__init__.glsl entry point)
 │       │   └── shader_loader.shio
+│       ├── py/                    # Loader for Python scripts (.py, #853): py_generator.shio, py_annotations.shio (#@),
+│       │                          # py_asset_runner.py (the Python side); controls through glsl/annotation_controls.shio
 │       ├── png/
 │       │   ├── __init__.shio     # Loader for .png image generators
 │       │   └── image_module.shio
@@ -50,6 +52,15 @@ engine/
 │   ├── desk.shio                  # The lighting desk as logic (#719): programmer, palettes, cue stacks, command line
 │   ├── desk_runtime.shio          # engine.desk: sends the desk every frame, desk.json, AI queries (live_path desk)
 │   └── palette.shio
+├── python/                        # The Python server (#853, docs/python-server.md): a Python script in a process of its own
+│   ├── python_server.shio         # The host: PythonServer (start, call, call_async, events, stop, restart)
+│   ├── shz_python_server.py       # The Python side: frames over stdin / stdout, shared memory for binary data
+│   ├── py_env.shio                # The venvs of the .py assets (#853 step 3): their packages from asset.json, made by uv
+│   └── py_env_build.shio          # The build process of a venv (shz runs it, it runs uv; progress on stdout)
+├── webremote/                     # The web remote for phones and tablets (#359), Devices › Network › Web remote
+│   ├── webremote.shio             # Its server (webserver module): pairing, the API, Server-Sent Events, trust model
+│   ├── qrcode.shio                # A QR code encoder in script (the address with the PIN)
+│   └── www/                       # The web app: index.html, app.js, app.css, icon.svg (the only files it serves)
 └── processes/                     # Subprocess code (DO NOT CHANGE)
     ├── audio_process.shio         # Audio processing subprocess
     └── monitor_process.shio       # Monitor processing subprocess
@@ -140,7 +151,8 @@ can be called at once; with the watcher alone that call got "Unknown tool" in 2 
 The layout actions of the mouse are tools too (#344, `interfaces/mcp_layout.shio`): `vibevj_split_area`,
 `vibevj_close_area`, `vibevj_move_view` (move, copy, swap, new_tab), `vibevj_set_area_view` (the picker of an empty
 area; as a tab; Replace view), `vibevj_view_tab` (add, select, close, rename), `vibevj_set_split_sizes` (the line
-between two areas) and `vibevj_undo`. They run on the render thread like the project tools and call the code of the
+between two areas), `vibevj_maximize_area` (no undo step), `vibevj_duplicate_view`, `vibevj_delete_view` (the
+menu entry without its question: the agent asks the user) and `vibevj_undo`. They run on the render thread like the project tools and call the code of the
 head, the menu, the drop and the top bar of the views (`singleview.shio`, `generators.shio`), so each is the same one
 undo step as with the mouse, and return `vibevj_describe_layout` with a `result`. An area is addressed by its path in
 its view tab (`generators.area_list`: "" the tab, "1/0" the index in the split or the Tabview at each level; `areas`

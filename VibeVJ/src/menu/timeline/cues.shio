@@ -1,0 +1,451 @@
+//Cues of a show (#680, step 5): markers on the ruler of a timeline (the main timeline or a song of the show, shows.shio)
+//that do something when the playhead passes them while it plays: launch a clip or a column of a Clipview, run a
+//command line of the lighting desk (a cue of a cue stack: "goto 3 stack Main"), send a MIDI message, start or stop a
+//loop timeline, go to another song, or run any AI query of a generator. The cues are data of their timeline
+//(timeline_clips: add_cue, fire_cues, saved with its clips); this file has what runs them and the editor in the Clip
+//panel (a click on the flag of a cue shows it).
+
+TL_CUE_TYPES = ["clip", "column", "desk", "midi", "loop", "song", "query"];
+TL_CUE_TYPE_NAMES = ["Clipview: launch a clip", "Clipview: launch a column", "Lighting desk: a command", "MIDI: send a message", "Loop timeline: start / stop", "Song: go to a song", "AI query of a generator"];
+TL_CUE_COLORS = [
+	clip = vec4f(0.95, 0.62, 0.18, 1.0),
+	column = vec4f(0.95, 0.62, 0.18, 1.0),
+	desk = vec4f(0.98, 0.85, 0.30, 1.0),
+	midi = vec4f(0.45, 0.80, 0.95, 1.0),
+	loop = vec4f(0.45, 0.88, 0.55, 1.0),
+	song = vec4f(0.85, 0.60, 0.95, 1.0),
+	query = vec4f(0.80, 0.80, 0.82, 1.0),
+];
+
+//A number as short text: up to 3 decimals, no trailing zeros ("7", "7.25", "127.5")
+tl_num_text(v) {
+	m = std.int(math.round(math.abs(std.float(v)) * 1000.0));
+	whole = std.int(math.floor(m / 1000.0));
+	frac = m - whole * 1000;
+	text = (v < 0.0 && m > 0 ? "-" : "") + std.string(whole);
+	if(frac == 0)
+		return text;
+	digits = std.string(frac + 1000).substr(1);
+	for(digits.ends("0"))
+		digits = digits.substr(0, digits.size() - 1);
+	return text + "." + digits;
+}
+
+//The position of a value in a list, -1 when it is not in it
+tl_cue_index(list, v) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == v)
+			return i;
+	}
+	return -1;
+}
+
+//The colour of the flag of a cue by what it does
+tl_cue_color(action) {
+	t = action && action.has("type") ? std.string(action.type) : "";
+	return TL_CUE_COLORS.has(t) ? TL_CUE_COLORS[t] : vec4f(0.80, 0.80, 0.82, 1.0);
+}
+
+//What a cue does, as a short text (its tooltip, the list of cues of MCP)
+tl_cue_text(action) {
+	if(!action || !action.has("type"))
+		return "nothing";
+	t = action.type;
+	view = action.has("view") && action.view != "" ? " of " + action.view : "";
+	if(t == "clip")
+		return "launch clip row " + std.int(action.row ?? 0) + " column " + std.int(action.col ?? 0) + view;
+	if(t == "column")
+		return "launch column " + std.int(action.col ?? 0) + view;
+	if(t == "desk")
+		return "desk: " + std.string(action.command ?? "");
+	if(t == "midi")
+		return "MIDI " + std.string(action.message ?? "") + " to " + std.string(action.device ?? "");
+	if(t == "loop")
+		return ((action.run ??? 1) ? "start" : "stop") + " loop " + std.string(action.loop ?? "");
+	if(t == "song")
+		return "go to song " + std.string(action.song ?? "");
+	if(t == "query")
+		return std.string(action.query ?? "") + " on " + std.string(action.live_path ?? "");
+	return t;
+}
+
+//A byte of a MIDI message as text: hex ("90", "3C", "0x7F")
+tl_hex_byte(text) {
+	t = std.string(text).trim().lowercase();
+	if(t.starts("0x"))
+		t = t.substr(2);
+	if(t == "" || t.size() > 2)
+		return -1;
+	v = 0;
+	for(c : t) {
+		d = "0123456789abcdef".find(c);
+		if(d < 0)
+			return -1;
+		v = v * 16 + d;
+	}
+	return v;
+}
+
+//"90 3C 7F" (hex bytes as MIDI monitors show them): [status, data1, data2], None when it is no message
+tl_midi_bytes(text) {
+	parts = std.string(text).trim().replace(",", " ").split(" ");
+	out = [];
+	for(i = 0; i < parts.size(); i++) {
+		if(parts[i].trim() == "")
+			continue;
+		v = tl_hex_byte(parts[i]);
+		if(v < 0)
+			return None;
+		out.push_back(v);
+	}
+	if(out.size() < 1 || out.size() > 3 || out[0] < 0x80)
+		return None;
+	for(out.size() < 3)
+		out.push_back(0);
+	return out;
+}
+
+//The AI interface of a generator by its live_path, or the first one that has the query (live_path ""). None: none
+tl_find_interface(live_path, query) {
+	eng = std.global("engine");
+	ifaces = eng.ai_interfaces;
+	if(!ifaces)
+		return None;
+	for(i = 0; i < ifaces.size(); i++) {
+		iface = ifaces[i];
+		try {
+			if(query != "" && !iface.has_query(query))
+				continue;
+			if(live_path == "" || iface.target.get_live_path() == live_path)
+				return iface;
+		}
+		catch(e) {}
+	}
+	return None;
+}
+
+//The live_paths of the generators that have the query (the Clipviews for launch_clip)
+tl_interfaces_with(query) {
+	out = [];
+	eng = std.global("engine");
+	ifaces = eng.ai_interfaces;
+	for(i = 0; ifaces && i < ifaces.size(); i++) {
+		try {
+			if(ifaces[i].has_query(query))
+				out.push_back(ifaces[i].target.get_live_path());
+		}
+		catch(e) {}
+	}
+	return out;
+}
+
+//Runs what a cue does. timeline: the timeline (timeline.shio). Returns [ok = true] or [ok = false, error = "..."]
+tl_cue_run(action, timeline) {
+	if(!action || !action.has("type"))
+		return [ok = false, error = "The cue does nothing (no type)."];
+	t = std.string(action.type);
+	try {
+		if(t == "clip" || t == "column") {
+			query = t == "clip" ? "launch_clip" : "launch_column";
+			view = std.string(action.view ?? "");
+			iface = tl_find_interface(view, query);
+			if(!iface)
+				return [ok = false, error = view == "" ? "No Clipview in the project." : "No Clipview " + view + "."];
+			args = t == "clip" ? [row = std.int(action.row ?? 0), col = std.int(action.col ?? 0)] : [col = std.int(action.col ?? 0)];
+			r = iface.query(query, args, "timeline cue");
+			return r && r.has("ok") && !r.ok ? [ok = false, error = std.string(r.error ?? "failed")] : [ok = true];
+		}
+		if(t == "desk") {
+			desk = std.global("engine").desk;
+			if(!desk)
+				return [ok = false, error = "No lighting desk."];
+			r = desk.command(std.string(action.command ?? ""));
+			return r.ok ? [ok = true] : [ok = false, error = std.string(r.text)];
+		}
+		if(t == "midi") {
+			bytes = tl_midi_bytes(action.message ?? "");
+			if(!bytes)
+				return [ok = false, error = "The message must be hex bytes, e.g. 90 3C 7F."];
+			name = std.string(action.device ?? "");
+			dev = name == "" ? None : nanogui.midi_device(name);
+			if(!dev)
+				return [ok = false, error = "No MIDI device " + name + "."];
+			dev.send_message(bytes[0], bytes[1], bytes[2]);
+			return [ok = true];
+		}
+		if(t == "loop") {
+			lv = timeline.loops;
+			e = lv ? lv.find(action.loop ?? "") : None;
+			if(!e)
+				return [ok = false, error = "No loop timeline " + std.string(action.loop ?? "") + "."];
+			if(action.run ??? 1)
+				e.clock.start(lv.main_pos());
+			else
+				e.clock.stop();
+			return [ok = true];
+		}
+		if(t == "song") {
+			sh = timeline.shows;
+			s = sh ? sh.find(action.song ?? "") : None;
+			if(!s)
+				return [ok = false, error = "No song " + std.string(action.song ?? "") + "."];
+			sh.select(sh.index_of(s), "cue");
+			return [ok = true];
+		}
+		if(t == "query") {
+			iface = tl_find_interface(std.string(action.live_path ?? ""), std.string(action.query ?? ""));
+			if(!iface)
+				return [ok = false, error = "No generator " + std.string(action.live_path ?? "") + " with the query " + std.string(action.query ?? "") + "."];
+			args = action.has("args") && std.is_json(action.args) ? action.args : std.json();
+			r = iface.query(std.string(action.query), args, "timeline cue");
+			return r && r.has("ok") && !r.ok ? [ok = false, error = std.string(r.error ?? "failed")] : [ok = true];
+		}
+	}
+	catch(e) {
+		return [ok = false, error = std.string(e)];
+	}
+	return [ok = false, error = "Unknown type " + t + " (" + TL_CUE_TYPES.combine_string(", ").removesuffix(", ") + ")."];
+}
+
+//The editor of a cue in the Clip panel: what it is called, where it is, what it does. One per panel (timeline_panel),
+//filled for the cue a click on its flag selected; each change is a step of the undo history (timeline_clips.user_set_cue)
+class timeline_cue_editor
+{
+	managed box = None;
+	owner = None;      //the timeline_clips of the cue
+	cue_id = "";
+	busy = false;      //filling the fields (their on_change is not the user)
+	views = [];        //the live_paths in the Clipview list ("" first: the first Clipview)
+	devices = [];
+	managed name_box = None;
+	managed beat_box = None;
+	managed type_box = None;
+	managed view_box = None;
+	managed row_box = None;
+	managed col_box = None;
+	managed text_box = None;
+	managed dev_box = None;
+	managed run_box = None;
+	managed path_box = None;
+	managed args_box = None;
+	managed status = None;
+	rows = None;       //the rows shown by type
+
+	__init__(window) {
+		//A window like the generators in the panel (a plain widget among them broke showing them: "out of range")
+		box = window.window(" ").anchor(0).movable(false).resizable(false).visible(false);
+		box.header_enabled(false);
+		col = box.widget().anchor_left(8).anchor_top(6).anchor_right(8).anchor_bottom(6).layout(nanogui.layout_vertical());
+		rows = std.json();
+		field = [col](caption, tip) {
+			r = col.widget().anchor_left(0).anchor_right(0).fixed_height(28);
+			r.label(caption).font_size(13).anchor_left(0).anchor_top(4).fixed_width(110).fixed_height(20).tooltip(tip);
+			return r;
+		};
+		r = field("Name", "The name of the cue: its flag in the ruler shows it");
+		name_box = r.textbox("").editable(true).alignment("left").anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		r = field("Beat", "Where the cue is on the timeline, in beats (drag its flag along the ruler)");
+		beat_box = r.textbox("").editable(true).alignment("left").anchor_left(112).fixed_width(90).anchor_top(2).fixed_height(24);
+		r = field("Does", "What happens when the playhead passes the cue while the timeline plays");
+		type_box = r.combobox().items(TL_CUE_TYPE_NAMES).anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+
+		r = field("Clipview", "The Clipview whose clip or column is launched (its live_path). The first one: the first Clipview of the project");
+		view_box = r.combobox().anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		rows["view"] = r;
+		r = field("Row, column", "The cell of the clip: row and column from 0, as launch_clip counts them (a column: only the column)");
+		row_box = r.textbox("0").editable(true).alignment("left").anchor_left(112).fixed_width(60).anchor_top(2).fixed_height(24);
+		col_box = r.textbox("0").editable(true).alignment("left").anchor_left(178).fixed_width(60).anchor_top(2).fixed_height(24);
+		rows["cell"] = r;
+		r = field("Text", "Desk: a command line of the lighting desk (goto 3 stack Main, go stack Main, off stack Main). Song: its name or number. Loop: the name of the loop timeline. MIDI: hex bytes (90 3C 7F: a note on). Query: its name");
+		text_box = r.textbox("").editable(true).alignment("left").anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		rows["text"] = r;
+		r = field("MIDI output", "Where the MIDI message goes");
+		dev_box = r.combobox().anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		rows["device"] = r;
+		r = field("Loop", "Start or stop the loop timeline");
+		run_box = r.combobox().items(["Start", "Stop"]).anchor_left(112).fixed_width(120).anchor_top(2).fixed_height(24);
+		rows["run"] = r;
+		r = field("live_path", "The generator whose AI query runs (vibevj_list_generators shows them; timeline, desk, ...)");
+		path_box = r.textbox("").editable(true).alignment("left").anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		rows["path"] = r;
+		r = field("Arguments", 'The arguments of the query as JSON, e.g. {"row": 0, "col": 2}');
+		args_box = r.textbox("").editable(true).alignment("left").anchor_left(112).anchor_right(0).anchor_top(2).fixed_height(24);
+		rows["args"] = r;
+
+		btns = col.widget().anchor_left(0).anchor_right(0).fixed_height(30).layout(nanogui.layout_horizontal());
+		fire_btn = btns.button("Fire now").icon(nanogui.icon("play")).fixed_width(110).tooltip("Runs what the cue does now, to try it");
+		del_btn = btns.button("Delete cue").icon(nanogui.icon("trash_alt")).danger("hover").fixed_width(120).tooltip("Deletes the cue (Delete with its flag selected; Ctrl+Z brings it back)");
+		status = col.label("").font_size(13).fixed_height(36);
+		col.label("A cue runs when the playhead passes it while the timeline plays (not when it jumps there). Double click in the ruler adds one, drag its flag to move it.").font_size(12).fixed_height(48);
+
+		name_box.on_change([this](text){ this.changed([name = text.trim()]); });
+		beat_box.on_change([this](text){ this.changed([beat = math.max(0.0, std.float(text))]); });
+		type_box.on_change([this](index, text){
+			if(index >= 0 && index < TL_CUE_TYPES.size())
+				this.changed_action([type = TL_CUE_TYPES[index]]);
+		});
+		view_box.on_open([this](){ this.fill_views(); });
+		view_box.on_change([this](index, text){
+			if(index >= 0 && index < this.views.size())
+				this.changed_action([view = this.views[index]]);
+		});
+		row_box.on_change([this](text){ this.changed_action([row = std.int(std.float(text))]); });
+		col_box.on_change([this](text){ this.changed_action([col = std.int(std.float(text))]); });
+		text_box.on_change([this](text){ this.changed_text(text.trim()); });
+		dev_box.on_open([this](){ this.fill_devices(); });
+		dev_box.on_change([this](index, text){
+			if(index >= 0 && index < this.devices.size())
+				this.changed_action([device = this.devices[index]]);
+		});
+		run_box.on_change([this](index, text){ this.changed_action([run = index == 0 ? 1 : 0]); });
+		path_box.on_change([this](text){ this.changed_action([live_path = text.trim()]); });
+		args_box.on_change([this](text){
+			j = std.json();
+			if(text.trim() != "" && !j.from_string(text)) {
+				this.show_status("The arguments are no JSON.");
+				return;
+			}
+			this.changed_action([args = j]);
+		});
+		fire_btn.on_click([this](){
+			if(this.owner && this.owner.cues.has(this.cue_id))
+				this.show_status(this.owner.run_cue(this.owner.cues[this.cue_id]));
+		});
+		del_btn.on_click([this](){
+			if(this.owner && !nanogui.show_mode())
+				this.owner.user_remove_cue(this.cue_id);
+		});
+	}
+
+	//The cue of a timeline in the fields
+	show(clips, id) {
+		owner = clips;
+		cue_id = id;
+		refresh();
+	}
+
+	refresh() {
+		if(!owner || !owner.cues.has(cue_id))
+			return;
+		cue = owner.cues[cue_id];
+		a = cue.action;
+		t = std.string(a.type ?? "clip");
+		busy = true;
+		try {
+			name_box.value(cue.name);
+			beat_box.value(tl_num_text(cue.beat));
+			type_box.selected(math.max(0, tl_cue_index(TL_CUE_TYPES, t)));
+			fill_views();
+			row_box.value(std.string(std.int(a.row ?? 0)));
+			col_box.value(std.string(std.int(a.col ?? 0)));
+			text = "";
+			if(t == "desk")
+				text = a.command ?? "";
+			else if(t == "midi")
+				text = a.message ?? "";
+			else if(t == "loop")
+				text = a.loop ?? "";
+			else if(t == "song")
+				text = std.string(a.song ?? "");
+			else if(t == "query")
+				text = a.query ?? "";
+			text_box.value(std.string(text));
+			fill_devices();
+			run_box.selected((a.run ??? 1) ? 0 : 1);
+			path_box.value(std.string(a.live_path ?? ""));
+			args_box.value(a.has("args") && std.is_json(a.args) ? a.args.string() : "");
+		}
+		catch(e) {}
+		busy = false;
+		rows["view"].visible(t == "clip" || t == "column");
+		rows["cell"].visible(t == "clip" || t == "column");
+		col_box.visible(true);
+		row_box.visible(t == "clip");
+		rows["text"].visible(t != "clip" && t != "column");
+		rows["device"].visible(t == "midi");
+		rows["run"].visible(t == "loop");
+		rows["path"].visible(t == "query");
+		rows["args"].visible(t == "query");
+		show_status(cue.last);
+		box.refresh_layout();
+	}
+
+	show_status(r) {
+		text = "";
+		if(std.is_string(r))
+			text = r;
+		else if(r)
+			text = r.ok ? "Ran: " + tl_cue_text(owner.cues[cue_id].action) : "Failed: " + std.string(r.error ?? "");
+		if(status.caption() != text)
+			status.caption(text);
+	}
+
+	fill_views() {
+		views = [""];
+		names = ["The first Clipview"];
+		found = tl_interfaces_with("launch_clip");
+		for(i = 0; i < found.size(); i++) {
+			views.push_back(found[i]);
+			names.push_back(found[i]);
+		}
+		cur = owner && owner.cues.has(cue_id) ? std.string(owner.cues[cue_id].action.view ?? "") : "";
+		if(cur != "" && tl_cue_index(views, cur) < 0) {
+			views.push_back(cur);
+			names.push_back(cur + " (not there)");
+		}
+		was = busy;
+		busy = true;
+		view_box.items(names);
+		view_box.selected(math.max(0, tl_cue_index(views, cur)));
+		busy = was;
+	}
+
+	fill_devices() {
+		devices = [];
+		names = [];
+		n = nanogui.midi_device_count();
+		for(i = 0; i < n; i++) {
+			name = nanogui.midi_device_name(i);
+			if(tl_cue_index(devices, name) < 0) {
+				devices.push_back(name);
+				names.push_back(name);
+			}
+		}
+		cur = owner && owner.cues.has(cue_id) ? std.string(owner.cues[cue_id].action.device ?? "") : "";
+		if(cur != "" && tl_cue_index(devices, cur) < 0) {
+			devices.push_back(cur);
+			names.push_back(cur + " (not connected)");
+		}
+		was = busy;
+		busy = true;
+		dev_box.items(names);
+		dev_box.selected(tl_cue_index(devices, cur) >= 0 ? tl_cue_index(devices, cur) : None);
+		busy = was;
+	}
+
+	changed(fields) {
+		if(busy || !owner || nanogui.show_mode())
+			return;
+		owner.user_set_cue(cue_id, fields);
+	}
+
+	changed_action(fields) {
+		if(busy || !owner || !owner.cues.has(cue_id) || nanogui.show_mode())
+			return;
+		a = owner.cues[cue_id].action.copy();
+		for(k, v : fields)
+			a[k] = v;
+		owner.user_set_cue(cue_id, [action = a]);
+	}
+
+	//The text field: what it means depends on the type
+	changed_text(text) {
+		if(busy || !owner || !owner.cues.has(cue_id))
+			return;
+		t = std.string(owner.cues[cue_id].action.type ?? "");
+		field_name = t == "desk" ? "command" : (t == "midi" ? "message" : (t == "loop" ? "loop" : (t == "song" ? "song" : "query")));
+		f = std.json();
+		f[field_name] = text;
+		changed_action(f);
+	}
+}

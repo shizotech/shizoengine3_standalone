@@ -1,0 +1,624 @@
+//Pre-programmed shows (#680, step 5): the songs of the view Timeline. A show is a list of songs, each a timeline of its
+//own (lanes, clips, envelopes, the loop, cues: the class timeline_clips), and one plays at a time:
+//- The list is the song button in the corner above the lane heads (right of Out): its popup has a row per song (Go,
+//  its number, name, the timecode it starts at, its BPM, delete), Previous / Next, SONG (the song by number: map a MIDI
+//  program change or a controller to it) and By timecode. Go, Previous and Next are MIDI-mappable buttons (a note).
+//- Picked by hand (the list, MIDI, MCP select_timeline_song, a cue of type song), the song plays from its start; its
+//  BPM (when it has one) becomes the tempo.
+//- By timecode: while the timeline chases MTC or LTC (timecode.shio), the song whose start timecode is the last one at
+//  or before the incoming timecode plays, and its start is the offset of the chase (the timecode at its beat 0). A
+//  show of songs at 01:00:00:00, 02:00:00:00, ... (one an hour, as TC-driven shows do) follows the master: a locate
+//  into the second hour switches to the second song and the playhead goes to where it is in it. Songs without a
+//  timecode are only picked by hand.
+//- The songs share the Out of the timeline (timeline_out of the first song: links and outputs stay) and the Clip
+//  panel. The song that plays is timeline.clips: the engine moves and ticks it, the queries of the live_path timeline
+//  go to it (or to the song of their argument song). The others rest: their clips stopped, their lane shaders inactive.
+//- Saved with the project: the first song in timeline_clips.json as before, the show in timeline_shows.json (the
+//  songs, their timecodes and BPMs, the timelines of the songs after the first). The controls of the lane heads of a
+//  song are in controls.json by its guid (<guid>_lane_<id>), the Go button of each by "song_<guid>". Adding,
+//  deleting, renaming a song and changing its timecode or BPM are steps of the undo history.
+
+TL_SONG_W = 92;     //the song button in the corner, right of Out
+
+//A BPM as the list shows it: "128", "127.5", "" for none
+tl_bpm_text(bpm) {
+	if(bpm <= 0.0)
+		return "";
+	return tl_num_text(bpm);
+}
+
+class timeline_shows
+{
+	timeline = None;
+	view = None;            //the view Timeline: the boxes of the songs
+	panel = None;           //the Clip panel the songs share (timeline_panel)
+	managed songs = [];     //[guid, name, tc, bpm, clips, box, tlw, row, num, name_box, tc_box, bpm_box]
+	active = 0;
+	by_timecode = true;     //while the chase follows MTC / LTC, the timecode picks the song
+	busy = false;
+	managed btn = None;     //the song button in the corner
+	managed list = None;    //the rows of the songs
+	managed song_ctrl = None;
+	managed tc_btn = None;
+	first_box = None;
+
+	//tl: the timeline (timeline.shio); view: the view Timeline; corner: the corner above the lane heads; first: the
+	//timeline_clips of the first song (in first_box); shared_panel: the Clip panel
+	__init__(tl, view_widget, corner, first, box, shared_panel) {
+		timeline = tl;
+		view = view_widget;
+		panel = shared_panel;
+		first_box = box;
+		first.out_ctrl.anchor_right(TL_SONG_W + 4);
+
+		btn = corner.button_popup("Song 1").icon(nanogui.icon("list_ol")).side("right").anchor_right(2).anchor_top(1).fixed_width(TL_SONG_W).fixed_height(math.max(18.0, first.tl.scrub_height() - 2.0))
+			.tooltip("The show: its songs, each a timeline of its own. Pick one here, by MIDI or by the timecode it starts at.\n[[wiki:Timeline#shows]]");
+		btn.on_screen(true).autoclose(true);
+		pop = btn.popup().content().layout(nanogui.layout_vertical());
+		pop.fixed_width(440);
+		node = pop.matrixnode("", "timeline_show").layout(nanogui.layout_vertical());
+
+		bar = node.widget().fixed_height(28).layout(nanogui.layout_horizontal());
+		add_btn = bar.button("+ Song").icon(nanogui.icon("plus")).fixed_width(96).tooltip("A new song at the end of the show: an empty timeline of its own");
+		prev_btn = bar.controlbutton("SONG_PREV").caption("").fixed_width(40);
+		prev_btn.get_button().caption("").icon(nanogui.icon("step_backward")).tooltip("The song before (MIDI-mappable)");
+		next_btn = bar.controlbutton("SONG_NEXT").caption("").fixed_width(40);
+		next_btn.get_button().caption("").icon(nanogui.icon("step_forward")).tooltip("The next song (MIDI-mappable)");
+		song_ctrl = bar.controlint("SONG").caption("Song").min(0).max(127).value(0).fixed_width(110)
+			.tooltip("The song that plays, by number from 0 (the first song). Map a MIDI program change to it: program 0 is the first song, 1 the second, ...");
+		tc_btn = bar.pushbutton("By TC").fixed_width(70)
+			.tooltip("By timecode: while the timeline chases MTC or LTC (TC), the timecode picks the song (the last one that starts at or before it) and its start is the offset of the chase");
+		tc_btn.pushed(true);
+		prev_btn.undoable(false);
+		next_btn.undoable(false);
+		song_ctrl.undoable(false);
+
+		head = node.widget().fixed_width(434).fixed_height(18);
+		head.layout(nanogui.layout_horizontal());
+		head.label("Go").font_size(12).fixed_width(60).fixed_height(16);
+		head.label("Song").font_size(12).fixed_width(132).fixed_height(16);
+		head.label("Starts at (TC)").font_size(12).fixed_width(98).fixed_height(16);
+		head.label("BPM").font_size(12).fixed_width(56).fixed_height(16);
+		list = node.widget().fixed_width(434).fixed_height(30).layout(nanogui.layout_vertical());
+		node.label("Go, Previous, Next and Song can be MIDI-mapped. A song picked by hand plays from its start.").font_size(12).fixed_height(18);
+
+		add_btn.on_click([this](){
+			if(!nanogui.show_mode())
+				this.user_add_song("");
+		});
+		prev_btn.callback([this](v){
+			if(v)
+				this.select(this.active - 1, "midi");
+		});
+		next_btn.callback([this](v){
+			if(v)
+				this.select(this.active + 1, "midi");
+		});
+		song_ctrl.callback([this](v){
+			if(!this.busy)
+				this.select(std.int(v), "midi");
+		});
+		tc_btn.on_change([this](v){
+			this.by_timecode = v ? true : false;
+		});
+
+		songs.push_back(song_entry("timeline", "Song 1", "", 0.0, first, box, first.tl));
+		make_row(songs[0]);
+		refresh();
+		register_queries(first.ai);
+	}
+
+	song_entry(guid, name, tc, bpm, clips, box, tlw) {
+		return [guid = guid, name = name, tc = tc, bpm = bpm, clips = clips, box = box, tlw = tlw, row = None, num = None,
+			name_box = None, tc_box = None, bpm_box = None];
+	}
+
+	// =========================================================================
+	// Songs
+	// =========================================================================
+
+	//The row of a song in the list: Go (MIDI-mappable, saved by "song_<guid>"), its number, name, timecode, BPM, delete
+	make_row(s) {
+		//A fixed width: in the vertical layout of the list a row with anchors only was 0 wide and took no clicks
+		row = list.widget().fixed_width(434).fixed_height(28);
+		rn = row.matrixnode("", "song_" + s.guid).anchor(0).layout(nanogui.layout_horizontal());
+		go = rn.controlbutton("GO").caption("").fixed_width(40).fixed_height(24);
+		go.get_button().caption("").icon(nanogui.icon("play")).tooltip("Play this song from its start (MIDI-mappable: a note)");
+		go.undoable(false);
+		num = rn.label("").font_size(13).fixed_width(18).fixed_height(24);
+		name_box = rn.textbox(s.name).editable(true).alignment("left").fixed_width(130).fixed_height(24)
+			.tooltip("The name of the song");
+		tc_box = rn.textbox(s.tc).editable(true).alignment("left").fixed_width(96).fixed_height(24)
+			.tooltip("The timecode the song starts at (hh:mm:ss:ff): with By TC the chase plays it while the timecode is between it and the start of the next one. Empty: picked by hand only");
+		bpm_box = rn.textbox(tl_bpm_text(s.bpm)).editable(true).alignment("left").fixed_width(56).fixed_height(24)
+			.tooltip("The tempo of the song: the BPM when it starts. Empty: the tempo stays");
+		del_btn = rn.button("").icon(nanogui.icon("trash_alt")).danger("hover").fixed_width(26).fixed_height(24)
+			.tooltip("Delete the song with its timeline (Ctrl+Z brings it back)").visible(s.guid != "timeline");
+		s.row = row;
+		s.num = num;
+		s.name_box = name_box;
+		s.tc_box = tc_box;
+		s.bpm_box = bpm_box;
+		guid = s.guid;
+		go.callback([this, guid](v){
+			if(v)
+				this.select(this.index_of(this.find(guid)), "go");
+		});
+		name_box.on_change([this, guid](text){
+			this.user_set_song(this.find(guid), [name = text.trim()]);
+		});
+		tc_box.on_change([this, guid](text){
+			this.user_set_song(this.find(guid), [tc = text.trim()]);
+		});
+		bpm_box.on_change([this, guid](text){
+			this.user_set_song(this.find(guid), [bpm = text.trim() == "" ? 0.0 : std.float(text)]);
+		});
+		del_btn.on_click([this, guid](){
+			if(!nanogui.show_mode())
+				this.user_delete_song(this.index_of(this.find(guid)));
+		});
+		relayout();
+	}
+
+	//The rows of the popup laid out again (a song added or deleted while it is open)
+	relayout() {
+		try {
+			list.fixed_height(math.max(1, list.child_count()) * 30);
+			list.refresh_layout();
+			btn.popup().refresh_layout();
+		}
+		catch(e) {}
+	}
+
+	//A song after the first: its box in the view (hidden), its timeline, its row. d: its data (save_song), None new
+	add_song(d) {
+		guid = d && d.has("guid") && d.guid != "" ? d.guid : "song_" + std.random_hash(10);
+		name = d && d.has("name") ? std.string(d["name"]) : "Song " + std.string(songs.size() + 1);
+		box = view.widget().anchor(0).visible(false);
+		tlw = box.timeline(name).anchor(0);
+		first = songs[0].clips;
+		c = timeline_clips(timeline, box, tlw, [prefix = guid, title = name, panel = panel, out = first.out_ctrl, ai = false]);
+		c.set_song_active(false);
+		tlw.scrub_callback([this](pos){
+			this.timeline.cursor_pos.value(pos);
+		});
+		if(panel.window.visible())
+			c.lanes_right(panel.window.width());
+		s = song_entry(guid, name, d && d.has("tc") ? std.string(d.tc) : "", d && d.has("bpm") ? std.float(d.bpm) : 0.0, c, box, tlw);
+		songs.push_back(s);
+		make_row(s);
+		if(d && d.has("timeline") && d.timeline)
+			c.load_state(d.timeline);
+		refresh();
+		return s;
+	}
+
+	//The song at i goes (not the first one: it is the main timeline of the project). Returns false when it cannot
+	remove_song(i) {
+		if(i < 1 || i >= songs.size())
+			return false;
+		if(i == active)
+			select(i > 0 ? i - 1 : 1, "delete");
+		s = songs[i];
+		s.clips.dispose();
+		songs.erase(i);
+		if(active > i)
+			active--;
+		std.free(s.row);
+		std.free(s.box);
+		relayout();
+		refresh();
+		return true;
+	}
+
+	//What a song is saved as (the first one without its timeline: that is timeline_clips.json)
+	save_song(i) {
+		s = songs[i];
+		d = [guid = s.guid, name = s.name, tc = s.tc, bpm = s.bpm];
+		if(i > 0)
+			d.timeline = s.clips.save_state();
+		return d;
+	}
+
+	//A song by its guid, its name or its number (from 1); None when there is none
+	find(key) {
+		if(std.is_none(key))
+			return None;
+		for(i = 0; i < songs.size(); i++) {
+			if(songs[i].guid == key || songs[i].name == key)
+				return songs[i];
+		}
+		k = -1;
+		if(std.is_string(key))
+			k = std.string(std.int(key)) == key ? std.int(key) : -1;
+		else
+			k = std.int(key);
+		return k >= 1 && k <= songs.size() ? songs[k - 1] : None;
+	}
+
+	find_clips(c) {
+		for(i = 0; i < songs.size(); i++) {
+			if(songs[i].clips == c)
+				return songs[i];
+		}
+		return None;
+	}
+
+	index_of(s) {
+		if(!s)
+			return -1;
+		for(i = 0; i < songs.size(); i++) {
+			if(songs[i].guid == s.guid)
+				return i;
+		}
+		return -1;
+	}
+
+	active_clips() {
+		return songs[math.clamp(active, 0, songs.size() - 1)].clips;
+	}
+
+	//Song i plays. why: "go" / "midi" / "cue" / "mcp" (from its start, its BPM), "timecode" (the chase puts the cursor),
+	//"load", "delete"
+	select(i, why = "go") {
+		if(i < 0 || i >= songs.size())
+			return false;
+		changed = i != active;
+		old = songs[math.clamp(active, 0, songs.size() - 1)];
+		s = songs[i];
+		if(changed || why == "load") {
+			for(k = 0; k < songs.size(); k++) {
+				if(k != i && songs[k].clips.song_active)
+					songs[k].clips.set_song_active(false);
+				if(k != i)
+					songs[k].box.visible(false);
+			}
+			active = i;
+			s.box.visible(true);
+			if(!s.clips.song_active)
+				s.clips.set_song_active(true);
+			timeline.clips = s.clips;
+			tlw = s.clips.tl;
+			tlw.follow(timeline.follow_btn ? timeline.follow_btn.value() != 0 : false);
+			tlw.loop_enabled(timeline.loop_btn ? timeline.loop_btn.value() != 0 : false);
+		}
+		if(why != "load" && why != "delete") {
+			if(s.bpm > 0.0 && timeline.bpm_ctrl.value() != s.bpm)
+				timeline.bpm_ctrl.value(s.bpm);
+			if(why != "timecode")
+				timeline.cursor_pos.value(0.0);
+		}
+		s.clips.tl.cursor(timeline.cursor_pos.value());
+		refresh();
+		return changed;
+	}
+
+	//The timecode of the chase (MTC / LTC, seconds at a rate): the song it is in plays. true: another song plays now
+	follow_timecode(seconds, rate) {
+		if(!by_timecode)
+			return false;
+		best = -1;
+		best_at = -1.0;
+		for(i = 0; i < songs.size(); i++) {
+			if(songs[i].tc == "")
+				continue;
+			at = tc_parse(songs[i].tc, rate);
+			if(std.is_none(at) || at > seconds + 0.0001)
+				continue;
+			if(at > best_at) {
+				best_at = at;
+				best = i;
+			}
+		}
+		if(best < 0 || best == active)
+			return false;
+		select(best, "timecode");
+		return true;
+	}
+
+	//The offset of the chase: the timecode of the song that plays (By TC), None when it has none
+	offset_seconds(rate) {
+		if(!by_timecode)
+			return None;
+		s = songs[math.clamp(active, 0, songs.size() - 1)];
+		if(s.tc == "")
+			return None;
+		return tc_parse(s.tc, rate);
+	}
+
+	//The song button, the numbers and marks of the rows, SONG
+	refresh() {
+		s = songs[math.clamp(active, 0, songs.size() - 1)];
+		label = songs.size() > 1 ? std.string(active + 1) + " " + s.name : s.name;
+		if(btn.caption() != label)
+			btn.caption(label);
+		for(i = 0; i < songs.size(); i++) {
+			r = songs[i];
+			if(r.num) {
+				r.num.caption(std.string(i + 1));
+				r.num.text_color(i == active ? vec4f(0.45, 0.88, 0.55, 1.0) : vec4f(1.0, 1.0, 1.0, 0.55));
+			}
+			if(r.name_box && !r.name_box.focused() && r.name_box.value() != r.name)
+				r.name_box.value(r.name);
+			if(r.tc_box && !r.tc_box.focused() && r.tc_box.value() != r.tc)
+				r.tc_box.value(r.tc);
+			bpm_text = tl_bpm_text(r.bpm);
+			if(r.bpm_box && !r.bpm_box.focused() && r.bpm_box.value() != bpm_text)
+				r.bpm_box.value(bpm_text);
+			r.clips.title = r.name;
+		}
+		busy = true;
+		if(song_ctrl.value() != active)
+			song_ctrl.value(active);
+		busy = false;
+		if(tc_btn.pushed() != by_timecode)
+			tc_btn.pushed(by_timecode);
+		timeline.refresh_caption();
+	}
+
+	//The caption of the ruler: Timeline, or the song that plays once there are several
+	caption() {
+		if(songs.size() < 2)
+			return "Timeline";
+		s = songs[math.clamp(active, 0, songs.size() - 1)];
+		return std.string(active + 1) + "  " + s.name;
+	}
+
+	//The Clip panel opened, changed width or closed: the lanes of every song end left of it
+	lanes_right(w) {
+		for(i = 0; i < songs.size(); i++)
+			songs[i].clips.lanes_right(w);
+	}
+
+	// Each a step of the undo history (the list, MCP), never in show mode
+
+	step(name, undo_fn, redo_fn) {
+		eng = std.global("engine");
+		gm = timeline && timeline.menu ? timeline.menu.generators_menu : None;
+		h = gm ? gm.undo_history : None;
+		if(!h || h.busy || gm.recording || eng.load_in_progress)
+			return;
+		h.push(name, undo_fn, redo_fn);
+	}
+
+	user_add_song(name) {
+		if(nanogui.show_mode())
+			return None;
+		s = add_song(name != "" ? [name = name] : None);
+		snap = song_snapshot(index_of(s));
+		guid = s.guid;
+		step("Add song", [this, guid](){ this.remove_song(this.index_of(this.find(guid))); }, [this, snap](){ this.restore_song(snap); });
+		return s;
+	}
+
+	user_delete_song(i) {
+		if(nanogui.show_mode() || i < 1 || i >= songs.size())
+			return false;
+		snap = song_snapshot(i);
+		guid = songs[i].guid;
+		if(!remove_song(i))
+			return false;
+		step("Delete song", [this, snap](){ this.restore_song(snap); }, [this, guid](){ this.remove_song(this.index_of(this.find(guid))); });
+		return true;
+	}
+
+	//name, tc, bpm of a song
+	set_song(s, data) {
+		if(!s)
+			return false;
+		if(data.has("name") && data["name"] != "") {
+			s.name = std.string(data["name"]);
+			s.tlw.caption(s.name);
+		}
+		if(data.has("tc")) {
+			t = std.string(data.tc).trim();
+			if(t != "" && std.is_none(tc_parse(t, "25")))
+				return false;
+			s.tc = t;
+		}
+		if(data.has("bpm"))
+			s.bpm = math.max(0.0, std.float(data.bpm));
+		refresh();
+		return true;
+	}
+
+	user_set_song(s, data) {
+		if(!s || nanogui.show_mode()) {
+			refresh();
+			return false;
+		}
+		was = [name = s.name, tc = s.tc, bpm = s.bpm];
+		if(!set_song(s, data)) {
+			refresh();
+			return false;
+		}
+		now = [name = s.name, tc = s.tc, bpm = s.bpm];
+		if(was.name == now.name && was.tc == now.tc && was.bpm == now.bpm)
+			return true;
+		guid = s.guid;
+		step(was.name != now.name ? "Rename song" : "Song settings", [this, guid, was](){ this.set_song(this.find(guid), was); }, [this, guid, now](){ this.set_song(this.find(guid), now); });
+		return true;
+	}
+
+	//What restore_song makes a song again of: its place, its data with its timeline, the controls of its lane heads
+	//and of its row with their links and MIDI mappings
+	song_snapshot(i) {
+		s = songs[i];
+		d = save_song(i);
+		if(i == 0)
+			d.timeline = s.clips.save_state();
+		heads = std.json();
+		for(k = 0; k < s.clips.lanes.size(); k++)
+			heads[std.string(s.clips.lanes[k].id)] = s.clips.lanes[k].node.serialize_json(true);
+		node = None;
+		try {
+			node = s.row.children(0).serialize_json(true);
+		}
+		catch(e) {}
+		return [index = i, data = d, heads = heads, node = node];
+	}
+
+	restore_song(snap) {
+		//Its generators and nodes of before have the same names and guids: they have to be gone first
+		for(!view.screen().garbage_cleared()) {
+			std.sleep(0);
+		}
+		s = add_song(snap.data);
+		at = math.clamp(snap.index, 1, songs.size() - 1);
+		if(at < songs.size() - 1) {
+			songs.erase(songs.size() - 1);
+			songs.insert(at, s);
+			for(i = at + 1; i < songs.size(); i++)
+				songs[i].row.bring_to_front();
+			relayout();
+		}
+		try {
+			for(k = 0; k < s.clips.lanes.size(); k++) {
+				id = std.string(s.clips.lanes[k].id);
+				if(snap.heads.has(id))
+					s.clips.lanes[k].node.deserialize_json(snap.heads[id], true);
+			}
+			if(snap.node)
+				s.row.children(0).deserialize_json(snap.node, true);
+		}
+		catch(e) {}
+		refresh();
+		return s;
+	}
+
+	// =========================================================================
+	// Saved with the project (timeline_shows.json)
+	// =========================================================================
+
+	save_state() {
+		out = [];
+		for(i = 0; i < songs.size(); i++)
+			out.push_back(save_song(i));
+		return [active = active, by_timecode = by_timecode ? 1 : 0, songs = out];
+	}
+
+	//states: what save_state returned, None for a new project or a project before the shows (one song)
+	load_state(states) {
+		had = songs.size() > 1;
+		for(songs.size() > 1) {
+			s = songs[songs.size() - 1];
+			s.clips.dispose();
+			songs.erase(songs.size() - 1);
+			std.free(s.row);
+			std.free(s.box);
+		}
+		active = 0;
+		list0 = states && states.has("songs") && std.is_list(states.songs) ? states.songs : [];
+		s0 = songs[0];
+		s0.name = list0.size() > 0 && list0[0].has("name") ? std.string(list0[0]["name"]) : "Song 1";
+		s0.tc = list0.size() > 0 && list0[0].has("tc") ? std.string(list0[0].tc) : "";
+		s0.bpm = list0.size() > 0 && list0[0].has("bpm") ? std.float(list0[0].bpm) : 0.0;
+		if(had && list0.size() > 1) {
+			for(!view.screen().garbage_cleared()) {
+				std.sleep(0);
+			}
+		}
+		for(i = 1; i < list0.size(); i++)
+			add_song(list0[i]);
+		by_timecode = states && states.has("by_timecode") ? std.int(states.by_timecode) != 0 : true;
+		select(math.clamp(states && states.has("active") ? std.int(states.active) : 0, 0, songs.size() - 1), "load");
+		refresh();
+	}
+
+	// =========================================================================
+	// AI agents: the live_path timeline
+	// =========================================================================
+
+	song_json(s) {
+		if(!s)
+			return None;
+		i = index_of(s);
+		return [number = i + 1, guid = s.guid, name = s.name, timecode = s.tc, bpm = s.bpm, active = i == active ? true : false,
+			lanes = s.clips.lanes.size(), clips = s.clips.clips.size(), cues = s.clips.cues.size()];
+	}
+
+	register_queries(ai) {
+		song_spec = "string(): A song of the show: its name, number (from 1) or guid (get_timeline_songs). Empty: the song that plays.";
+		ai.register("get_timeline_songs", [], [this](args){
+			out = [];
+			for(i = 0; i < this.songs.size(); i++)
+				out.push_back(this.song_json(this.songs[i]));
+			return [ok = true, active = this.active + 1, by_timecode = this.by_timecode ? true : false, songs = out];
+		}, "The songs of the show of the main timeline: number (from 1), guid, name, timecode (where it starts, empty: picked by hand only), bpm (0: the tempo stays), active (it plays), lanes, clips, cues. Every timeline query takes song to work on one (default: the one that plays).", "read");
+
+		ai.register("add_timeline_song", [
+			name = "string(): Its name. Default: Song and its number.",
+			timecode = "string(): The timecode it starts at (hh:mm:ss:ff), for By timecode.",
+			bpm = "float(): Its tempo (the BPM when it starts). 0: the tempo stays.",
+		], [this](args){
+			s = this.user_add_song(args.has("name") ? std.string(args["name"]) : "");
+			if(!s)
+				return [ok = false, error = "Not in show mode."];
+			d = std.json();
+			if(args.has("timecode"))
+				d.tc = std.string(args.timecode);
+			if(args.has("bpm"))
+				d.bpm = std.float(args.bpm);
+			if(d.size() > 0 && !this.set_song(s, d))
+				return [ok = false, error = "timecode must be hh:mm:ss:ff."];
+			return [ok = true, song = this.song_json(s)];
+		}, "Adds a song to the show: an empty timeline of its own at the end of the list. It does not play yet (select_timeline_song). A step of the undo history.");
+
+		ai.register("set_timeline_song", [
+			song = "&" + song_spec.substr(0),
+			name = "string(): A new name.",
+			timecode = "string(): The timecode it starts at (hh:mm:ss:ff); empty: none.",
+			bpm = "float(): Its tempo; 0: the tempo stays.",
+			by_timecode = "int(0,1): For the show: the chase of MTC / LTC picks the song by its timecode (1) or not (0).",
+		], [this](args){
+			s = this.find(args.song);
+			if(!s)
+				return [ok = false, error = "No song " + std.string(args.song) + " (get_timeline_songs lists them)."];
+			d = std.json();
+			if(args.has("name"))
+				d["name"] = std.string(args["name"]);
+			if(args.has("timecode"))
+				d.tc = std.string(args.timecode);
+			if(args.has("bpm"))
+				d.bpm = std.float(args.bpm);
+			if(d.size() > 0 && !this.user_set_song(s, d))
+				return [ok = false, error = "timecode must be hh:mm:ss:ff (or show mode)."];
+			if(args.has("by_timecode")) {
+				this.by_timecode = std.int(args.by_timecode) != 0;
+				this.refresh();
+			}
+			return [ok = true, song = this.song_json(s), by_timecode = this.by_timecode ? true : false];
+		}, "Renames a song of the show, sets the timecode it starts at and its BPM (steps of the undo history), or switches By timecode.");
+
+		ai.register("select_timeline_song", [
+			song = "&" + song_spec.substr(0),
+			position = "float(): Where the playhead goes in it, in beats. Default 0 (its start).",
+		], [this](args){
+			s = this.find(args.song);
+			if(!s)
+				return [ok = false, error = "No song " + std.string(args.song) + " (get_timeline_songs lists them)."];
+			this.select(this.index_of(s), "mcp");
+			if(args.has("position"))
+				this.timeline.cursor_pos.value(std.float(args.position));
+			return [ok = true, song = this.song_json(s), position = this.timeline.cursor_pos.value()];
+		}, "The song plays (as Go in its row): its timeline is shown, the playhead goes to its start (or position), its BPM becomes the tempo. Play keeps playing.");
+
+		ai.register("remove_timeline_song", [song = "&" + song_spec.substr(0)], [this](args){
+			s = this.find(args.song);
+			if(!s)
+				return [ok = false, error = "No song " + std.string(args.song) + " (get_timeline_songs lists them)."];
+			if(!this.user_delete_song(this.index_of(s)))
+				return [ok = false, error = "The first song stays: it is the main timeline (or show mode)."];
+			return [ok = true];
+		}, "Deletes a song of the show with its timeline (not the first one: the main timeline). A step of the undo history: undo brings it back with its clips, links and MIDI mappings.");
+
+		//Every timeline query that takes loop takes song too
+		spec = aiinterface_normalize_arg(song_spec);
+		for(i = 0; i < ai.queries.size(); i++) {
+			q = ai.queries[i];
+			if(q.args.has("loop") && !q.args.has("song"))
+				q.args["song"] = spec;
+		}
+		ai.notify_query_changed("registered", "song");
+	}
+}

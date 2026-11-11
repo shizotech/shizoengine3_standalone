@@ -1,0 +1,2837 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  workspaces.shio — workspace tree, sessions and per-workspace mind state
+//  issue #907: every workspace owns its own .megamind, sessions, architecture
+//  and goals below std.user_path()/miniagent/workspaces.
+//
+//      #include "workspaces"
+//      registry = workspaces_api_register(server, cfg, api_token[, registry]);
+//      store = registry.store;
+//      manager = registry.manager;
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "node_api"
+#include "architecture"
+#include "goal_engine"
+#include "goal_tools"
+#include "model_config_cli"
+
+import webserver;
+import subprocess;
+
+WS_SETTINGS_FILE = "settings.json";
+WS_REGISTRY_FILE = "workspaces.json";
+WS_DEFAULT_MAX_SESSIONS = 2;
+WS_MAX_SESSIONS_LIMIT = 64;
+// issue #907 always-retry: no attempt cap; backoff is capped at 30 s.
+WS_RETRY_BACKOFF_MAX_MS = 30000;
+WS_EVENT_KEPT = 300;
+WS_NOTIFY_KEPT = 100;
+WS_STREAM_POLL_MS = 100;
+WS_STREAM_PING_MS = 15000;
+
+// ── small helpers ──────────────────────────────────────────────────────────
+ws_str(v, def = "") {
+    if(std.is_none(v))
+        return def;
+    return std.string(v);
+}
+
+// Canonical config spec for a workspace subprocess: an absolute path plus the
+// optional #profile suffix. Empty stays empty, which means "use the default".
+ws_config_spec_absolute(spec) {
+    s = ws_str(spec);
+    if(!s)
+        return "";
+
+    parts = model_config_split_profile(s);
+    raw = ws_str(parts.path);
+
+    if(!raw)
+        return "";
+
+    path = fileio.absolute_path(raw);
+
+    if(parts.profile)
+        return path + "#" + std.string(parts.profile);
+
+    return path;
+}
+
+ws_spec_profile(spec) {
+    parts = model_config_split_profile(ws_str(spec));
+    return std.string(parts.profile);
+}
+
+ws_valid_reasoning_effort(value) {
+    effort = ws_str(value).lowercase();
+    return effort == "low" || effort == "medium" || effort == "high";
+}
+
+ws_slug(text) {
+    s = ws_str(text).lowercase().strip();
+    out = "";
+
+    for(c : s) {
+        if((c >= "a" && c <= "z") || (c >= "0" && c <= "9"))
+            out += c;
+        else
+            out += "_";
+    }
+
+    if(out.length() > 48)
+        out = out.substr(0, 48);
+
+    if(!out)
+        out = "workspace";
+
+    return out;
+}
+
+// a title inferred from the first prompt / goal, so "+" sessions get a real name
+ws_title_from(text, n = 48) {
+    s = ws_str(text).strip().replace("\r", " ").replace("\n", " ");
+
+    for(s.length() > n)
+        s = s.substr(0, n);
+
+    for(s.ends(" "))
+        s = s.substr(0, s.length() - 1);
+
+    if(!s)
+        s = "New session";
+
+    return s;
+}
+
+ws_chat_from_events(events) {
+    chat = [];
+    assistant_text = "";
+    assistant_report = "";
+
+    for(event : events) {
+        if(!std.is_json(event))
+            continue;
+
+        if(event.type == "user") {
+            if(assistant_report || assistant_text) {
+                content = assistant_report ? assistant_report : assistant_text;
+                chat.push_back([role = "assistant", content = content]);
+            }
+
+            assistant_text = "";
+            assistant_report = "";
+            user_text = ws_str(event.text);
+
+            if(user_text)
+                chat.push_back([role = "user", content = user_text]);
+        }
+        else if(event.type == "delta") {
+            action = event.action;
+
+            if(std.is_json(action) && action.has("text"))
+                assistant_text += ws_str(action.text);
+        }
+        else if(event.type == "done") {
+            assistant_report = ws_str(event.report);
+            content = assistant_report ? assistant_report : assistant_text;
+
+            if(content)
+                chat.push_back([role = "assistant", content = content]);
+
+            assistant_text = "";
+            assistant_report = "";
+        }
+    }
+
+    if(assistant_report || assistant_text) {
+        content = assistant_report ? assistant_report : assistant_text;
+        chat.push_back([role = "assistant", content = content]);
+    }
+
+    return chat;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WorkspaceStore — physical directory tree + registry + settings
+// ═══════════════════════════════════════════════════════════════════════════
+
+class WorkspaceStore {
+    root = "";
+    registry_path = "";
+    settings_path = "";
+    items = [];
+
+    __init__(_root = "") {
+        base = ws_str(_root);
+
+        if(base) {
+            for(base.length() > 1 && (base.ends("/") || base.ends("\\")))
+                base = base.substr(0, base.length() - 1);
+
+            root = fileio.absolute_path(base);
+        } else {
+            root = fileio.absolute_path(miniagent_workspaces_root());
+        }
+        registry_path = root + "/" + WS_REGISTRY_FILE;
+        settings_path = root + "/" + WS_SETTINGS_FILE;
+        items = [];
+
+        load();
+    }
+
+    root_workspace() {
+        return [
+            id = "root",
+            name = "Workspaces",
+            path = root,
+            parent = "",
+            created = std.millis(),
+            description = "",
+        ];
+    }
+
+    ensure_megamind(path) {
+        meg = path + "/.megamind";
+        fileio.mkdir(meg);
+        fileio.mkdir(meg + "/sessions");
+        fileio.mkdir(meg + "/architecture");
+
+        // A workspace that already had the old .agentspace/architecture.json
+        // keeps that graph when the per-workspace .megamind is created.
+        arch = meg + "/architecture/architecture.json";
+        legacy = path + "/.agentspace/architecture.json";
+
+        if(!fileio.exists(arch) && fileio.exists(legacy)) {
+            try {
+                fileio.write_text(arch, fileio.read_string(legacy));
+            } catch(e) {
+                std.error("[workspaces] architecture import failed: ", e);
+            }
+        }
+
+        return meg;
+    }
+
+    migrate_legacy_goal_space(path, template) {
+        legacy = path + "/.megamind/tasks";
+        target = path + "/.agentspace";
+        if(!fileio.is_directory(legacy))
+            return true;
+
+        for(f : fileio.files(legacy, true)) {
+            src = legacy + "/" + f;
+            dst = target + "/" + f;
+            text = goal_read(src);
+
+            if(fileio.exists(dst)) {
+                template_file = template + "/" + f;
+                if(f.starts("preferences/") && fileio.exists(template_file) && goal_read(dst) == goal_read(template_file)) {
+                    if(!fileio.write_text(dst, text)) {
+                        std.error("[workspaces] could not import legacy goal preferences from ", src);
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            goal_mkdir(fileio.file_dir(dst));
+            if(!fileio.write_text(dst, text)) {
+                std.error("[workspaces] could not import legacy goal data from ", src);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ensure_agentspace(path) {
+        template = __DIR__ + "/agentspace_template";
+        if(!fileio.is_directory(template)) {
+            std.error("[workspaces] goal-engine template is missing: ", template);
+            return false;
+        }
+
+        if(!migrate_legacy_goal_space(path, template))
+            return false;
+
+        space = GoalSpace(path + "/.agentspace");
+        space.init(template);
+        if(!space.exists() || !fileio.exists(path + "/.agentspace/preferences/scheduling.md")) {
+            std.error("[workspaces] could not initialize goal engine at ", path + "/.agentspace");
+            return false;
+        }
+        return true;
+    }
+
+    save() {
+        fileio.mkdir(root);
+        return fileio.write_json(registry_path, [workspaces = items], true, true);
+    }
+
+    load() {
+        fileio.mkdir(root);
+
+        if(!fileio.exists(settings_path))
+            fileio.write_json(settings_path, [max_sessions = WS_DEFAULT_MAX_SESSIONS], true, true);
+
+        data = fileio.read_json(registry_path, true);
+
+        if(!std.is_json(data))
+            data = [workspaces = []];
+
+        if(!data.has("workspaces") || !std.is_json(data.workspaces))
+            data.workspaces = [];
+
+        items = data.workspaces.copy();
+
+        has_root = false;
+
+        for(w : items) {
+            if(w.id == "root")
+                has_root = true;
+        }
+
+        if(!has_root) {
+            items.push_back(root_workspace());
+            save();
+        }
+
+        for(w : items) {
+            if(!w.path)
+                continue;
+            ensure_megamind(w.path);
+            if(w.id != "root" && !ensure_agentspace(w.path))
+                return false;
+        }
+
+        return true;
+    }
+
+    settings() {
+        if(!fileio.exists(settings_path))
+            fileio.write_json(settings_path, [max_sessions = WS_DEFAULT_MAX_SESSIONS], true, true);
+
+        data = fileio.read_json(settings_path, true);
+
+        if(!std.is_json(data))
+            data = [max_sessions = WS_DEFAULT_MAX_SESSIONS];
+
+        max_sessions = WS_DEFAULT_MAX_SESSIONS;
+
+        if(data.has("max_sessions"))
+            max_sessions = std.int(data.max_sessions);
+
+        if(max_sessions <= 0)
+            max_sessions = WS_DEFAULT_MAX_SESSIONS;
+
+        if(max_sessions > WS_MAX_SESSIONS_LIMIT)
+            max_sessions = WS_MAX_SESSIONS_LIMIT;
+
+        return [max_sessions = max_sessions];
+    }
+
+    set_settings(max_sessions) {
+        cs = std.critical_section_named("workspace_store");
+
+        n = std.int(max_sessions);
+
+        if(n <= 0) {
+            cs.release();
+            return [ok = false, error = "max_sessions must be at least 1"];
+        }
+
+        if(n > WS_MAX_SESSIONS_LIMIT)
+            n = WS_MAX_SESSIONS_LIMIT;
+
+        fileio.write_json(settings_path, [max_sessions = n], true, true);
+
+        cs.release();
+
+        return [ok = true, settings = [max_sessions = n]];
+    }
+
+    list() {
+        return items.copy();
+    }
+
+    get(id) {
+        id = ws_str(id);
+        for(w : items) {
+            if(w.id == id)
+                return w.copy();
+        }
+        return None;
+    }
+
+    find_by_path(path) {
+        p = fileio.absolute_path(ws_str(path));
+
+        for(w : items) {
+            if(w.path == p)
+                return w.copy();
+        }
+
+        return None;
+    }
+
+    create(name, path = "", parent = "", description = "") {
+        cs = std.critical_section_named("workspace_store");
+
+        name = ws_str(name).strip();
+        path = ws_str(path).strip();
+        parent = ws_str(parent).strip();
+
+        if(!parent)
+            parent = "root";
+
+        if(!name)
+            name = "Workspace-" + std.random_hash(6);
+
+        base = root;
+
+        if(parent) {
+            p = get(parent);
+
+            if(!p) {
+                cs.release();
+                return [ok = false, error = "unknown parent workspace"];
+            }
+
+            base = p.path;
+        }
+
+        phys = "";
+
+        if(path)
+            phys = fileio.absolute_path(path);
+        else
+            phys = fileio.absolute_path(base + "/" + ws_slug(name));
+
+        if(fileio.exists(phys) && !fileio.is_directory(phys)) {
+            cs.release();
+            return [ok = false, error = "path is not a directory"];
+        }
+
+        existing = find_by_path(phys);
+
+        if(existing) {
+            cs.release();
+            return [ok = true, workspace = existing, reused = true];
+        }
+
+        fileio.mkdir(phys);
+        ensure_megamind(phys);
+        if(!ensure_agentspace(phys)) {
+            cs.release();
+            return [ok = false, error = "could not initialize the workspace goal engine"];
+        }
+
+        id = std.random_hash(16);
+
+        if(phys == root)
+            id = "root";
+
+        w = [
+            id = id,
+            name = name,
+            path = phys,
+            parent = parent,
+            created = std.millis(),
+            description = ws_str(description),
+        ];
+
+        items.push_back(w);
+        save();
+
+        cs.release();
+
+        return [ok = true, workspace = w.copy(), reused = false];
+    }
+
+    delete(id) {
+        cs = std.critical_section_named("workspace_store");
+
+        id = ws_str(id);
+
+        if(id == "root") {
+            cs.release();
+            return [ok = false, error = "the root workspace cannot be deleted"];
+        }
+
+        w = get(id);
+
+        if(!w) {
+            cs.release();
+            return [ok = false, error = "unknown workspace"];
+        }
+
+        for(c : items) {
+            if(c.parent == id) {
+                cs.release();
+                return [ok = false, error = "workspace has children"];
+            }
+        }
+
+        for(i = 0; i < items.size(); i++) {
+            if(items[i].id == id) {
+                items.erase(i);
+                break;
+            }
+        }
+
+        save();
+
+        cs.release();
+
+        return [ok = true, workspace = w];
+    }
+
+    tree_node(w) {
+        node = w.copy();
+        node.children = [];
+
+        for(c : items) {
+            if(c.parent == w.id)
+                node.children.push_back(tree_node(c));
+        }
+
+        return node;
+    }
+
+    tree() {
+        root_node = None;
+
+        for(w : items) {
+            if(!w.parent) {
+                root_node = w;
+                break;
+            }
+        }
+
+        if(!root_node)
+            return [workspaces = []];
+
+        return tree_node(root_node);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SessionManager — subprocess sessions with JSON-line stdio
+// ═══════════════════════════════════════════════════════════════════════════
+
+class SessionManager {
+    store = None;
+    cfg_spec = "";
+    token = "";
+    sessions = [];
+    live_texts = [];
+    live_text_seqs = [];
+    procs = [];
+    pump_active = [];
+    deleting_sessions = [];
+    listeners = [];
+    notifications = [];
+    notify_listeners = [];
+    file_listeners = [];
+    workspace_paths = [];
+    stop_requested = [];
+    terminal_reported = [];
+
+    __init__(_store, _cfg_spec, _token = "") {
+        store = _store;
+        cfg_spec = ws_config_spec_absolute(_cfg_spec);
+        token = ws_str(_token);
+        sessions = [];
+        live_texts = [];
+        live_text_seqs = [];
+        procs = [];
+        pump_active = [];
+        deleting_sessions = [];
+        listeners = [];
+        notifications = [];
+        notify_listeners = [];
+        file_listeners = [];
+        workspace_paths = [];
+        stop_requested = [];
+        terminal_reported = [];
+        load_sessions();
+    }
+
+    // A Workspace registers its physical directory before any session is created.
+    // The node's own Workspace lives outside the userspace registry, so the shared
+    // manager must know its path too.
+    register_workspace(id, path) {
+        id = ws_str(id);
+        path = ws_str(path);
+
+        if(!id || !path)
+            return false;
+
+        workspace_paths[id] = path;
+        return true;
+    }
+
+    workspace_path(id) {
+        id = ws_str(id);
+
+        if(workspace_paths.has(id))
+            return ws_str(workspace_paths[id]);
+
+        w = store.get(id);
+
+        if(!w)
+            return "";
+
+        return ws_str(w.path);
+    }
+
+    // Restarting the node must not hide the sessions that were saved in each
+    // workspace's .megamind/sessions. They are shown with their chat history;
+    // non-terminal sessions are marked stopped because their process is gone.
+    load_sessions() {
+        for(w : store.list())
+            load_workspace_sessions(w.path, w.id);
+
+        // The node's own Workspace is outside the userspace registry.
+        node_path = miniagent_node_root();
+        if(fileio.is_directory(node_path + "/.megamind/sessions"))
+            load_workspace_sessions(node_path, "node");
+    }
+
+    load_workspace_sessions(path, workspace_id) {
+        path = ws_str(path);
+        workspace_id = ws_str(workspace_id);
+        register_workspace(workspace_id, path);
+
+        dir = path + "/.megamind/sessions";
+
+        if(!fileio.is_directory(dir))
+            return 0;
+
+        loaded = 0;
+
+        for(d : fileio.dirs(dir, false)) {
+            sid = fileio.file_name(d);
+            path = dir + "/" + sid + "/session.json";
+            data = fileio.read_json(path, true);
+
+            if(!std.is_json(data))
+                continue;
+
+            s = data.copy();
+            s.id = sid;
+            s.workspace_id = ws_str(s.workspace_id, workspace_id);
+            s.title = ws_str(s.title, "Session");
+            s.mode = ws_str(s.mode, "normal");
+            s.role = ws_str(s.role, "adaptive");
+            s.reasoning_effort = ws_str(s.reasoning_effort, "medium");
+            if(!ws_valid_reasoning_effort(s.reasoning_effort))
+                s.reasoning_effort = "medium";
+            s.status = ws_str(s.status, "stopped");
+            s.prompt = ws_str(s.prompt);
+            s.report = ws_str(s.report);
+            s.error = ws_str(s.error);
+            s.token_usage = std.int(s.token_usage);
+            s.created = std.int(s.created);
+            s.updated = std.int(s.updated);
+            s.seq = std.int(s.seq);
+            s.attempts = std.int(s.attempts);
+
+            if(!s.events || !std.is_json(s.events))
+                s.events = [];
+
+            live_texts[s.id] = "";
+            live_text_seqs[s.id] = 0;
+            stop_requested[s.id] = false;
+            terminal_reported[s.id] = false;
+            s.chat_history_size_at_prompt = std.int(s.chat_history_size_at_prompt);
+            restarted = false;
+
+            if(s.status == "starting" || s.status == "running" || s.status == "waiting") {
+                recovered = recovered_turn(dir + "/" + sid, s);
+
+                if(std.is_json(recovered)) {
+                    s.status = recovered.status == "finished" ? "done" : recovered.status;
+                    s.report = recovered.report;
+                    s.error = recovered.status == "failed" ? s.report : "";
+                    s.token_usage = recovered.token_usage;
+                    s.updated = recovered.completed;
+                    if(!s.updated) s.updated = std.millis();
+                    push_event(s, "done", [
+                        ok = json.bool(recovered.status == "finished"),
+                        status = recovered.status,
+                        report = s.report,
+                        token_usage = s.token_usage,
+                    ]);
+                    restarted = true;
+                } else {
+                    s.status = "failed";
+                    s.error = "the session process exited without a terminal result";
+                    s.report = s.error;
+                    s.updated = std.millis();
+                    push_event(s, "done", [
+                        ok = json.bool(false),
+                        status = "failed",
+                        report = s.report,
+                        token_usage = s.token_usage,
+                    ]);
+                    restarted = true;
+                }
+            }
+
+            sessions[s.id] = s;
+            loaded++;
+
+            if(restarted)
+                save_session(sid);
+        }
+
+        return loaded;
+    }
+
+    max_sessions() {
+        return store.settings().max_sessions;
+    }
+
+    active_count() {
+        n = 0;
+
+        for(k, s : sessions) {
+            if(s.status == "starting" || s.status == "running" || s.status == "waiting")
+                n++;
+        }
+
+        return n;
+    }
+
+    session_dir(sid) {
+        s = sessions[sid];
+
+        if(!s)
+            return "";
+
+        path = workspace_path(s.workspace_id);
+
+        if(!path)
+            return "";
+
+        return path + "/.megamind/sessions/" + sid;
+    }
+
+    session_path(sid) {
+        dir = session_dir(sid);
+
+        if(!dir)
+            return "";
+
+        return dir + "/session.json";
+    }
+
+    // A terminal result written by the worker before it exited. It must match the
+    // current prompt and add history, so an old result is not mistaken for this turn.
+    recovered_turn(dir, s) {
+        path = dir + "/chat.json.result.json";
+
+        if(!fileio.exists(path))
+            return None;
+
+        result = None;
+
+        try {
+            result = fileio.read_json(path, true);
+        } catch(e) {
+            return None;
+        }
+
+        if(!std.is_json(result))
+            return None;
+
+        status = ws_str(result.status);
+
+        if(status != "finished" && status != "failed" && status != "question")
+            return None;
+
+        if(ws_str(result.prompt) != ws_str(s.prompt))
+            return None;
+
+        if(std.int(result.history_size) <= std.int(s.chat_history_size_at_prompt))
+            return None;
+
+        return [
+            status = status,
+            report = ws_str(result.report),
+            token_usage = std.int(result.token_usage),
+            completed = std.int(result.completed),
+        ];
+    }
+
+    save_session(sid) {
+        path = session_path(sid);
+
+        if(!path)
+            return false;
+
+        cs = std.critical_section_named("workspace_session_save:" + path);
+        s = sessions[sid];
+
+        if(!s) {
+            cs.release();
+            return false;
+        }
+
+        saved = [
+            id = s.id,
+            workspace_id = s.workspace_id,
+            title = s.title,
+            mode = s.mode,
+            reasoning_effort = s.reasoning_effort,
+            status = s.status,
+            prompt = s.prompt,
+            events = s.events.copy(),
+            chat_history_size_at_prompt = std.int(s.chat_history_size_at_prompt),
+            token_usage = s.token_usage,
+            created = s.created,
+            updated = s.updated,
+            role = s.role,
+            report = s.report,
+            error = s.error,
+            seq = s.seq,
+        ];
+
+        result = fileio.write_json(path, saved, true, true);
+        cs.release();
+        return result;
+    }
+
+    push_event(s, type, payload) {
+        s.seq++;
+        e = payload.copy();
+        e.seq = s.seq;
+        e.type = type;
+        s.events.push_back(e);
+
+        for(s.events.size() > WS_EVENT_KEPT)
+            s.events.erase(0);
+
+        return e;
+    }
+
+    host_state(status) {
+        if(status == "done")
+            return "finished";
+        if(status == "failed")
+            return "failed";
+        if(status == "question")
+            return "question";
+        if(status == "starting")
+            return "planned";
+        if(status == "running" || status == "waiting")
+            return "running";
+        if(status == "stopped")
+            return "stopped";
+        return "planned";
+    }
+
+    session_view(sid) {
+        s = sessions[sid];
+
+        if(!s)
+            return None;
+
+        out = s.copy();
+        p = procs[sid];
+        out.process_running = json.bool(p && p.running());
+        out.active = json.bool(s.status == "starting" || s.status == "running" || s.status == "waiting");
+
+        return out;
+    }
+
+    get_session(sid) {
+        return session_view(sid);
+    }
+
+    delete_session(sid) {
+        sid = ws_str(sid);
+        s = sessions[sid];
+
+        if(!s)
+            return [ok = false, error = "unknown session"];
+
+        guard = std.critical_section_named("workspace_sessions");
+        if(deleting_sessions[sid]) {
+            guard.release();
+            return [ok = false, error = "session deletion is already in progress"];
+        }
+        deleting_sessions[sid] = true;
+        guard.release();
+
+        if(s.status == "starting" || s.status == "running" || s.status == "waiting")
+            stop_session(sid);
+
+        dir = session_dir(sid);
+        save_lock = std.critical_section_named("workspace_session_save:" + dir + "/session.json");
+        removed = fileio.remove(dir);
+        if(!removed) {
+            save_lock.release();
+            guard = std.critical_section_named("workspace_sessions");
+            deleting_sessions.erase(sid);
+            guard.release();
+            return [ok = false, error = "could not remove session files: " + dir];
+        }
+
+        guard = std.critical_section_named("workspace_sessions");
+        sessions.erase(sid);
+        live_texts.erase(sid);
+        live_text_seqs.erase(sid);
+        procs.erase(sid);
+        pump_active.erase(sid);
+        stop_requested.erase(sid);
+        terminal_reported.erase(sid);
+        deleting_sessions.erase(sid);
+        guard.release();
+        save_lock.release();
+
+        return [ok = true, removed = sid];
+    }
+
+    session_live_state(sid) {
+        return [text = ws_str(live_texts[sid]), seq = std.int(live_text_seqs[sid])];
+    }
+
+    session_chat_history(sid) {
+        dir = session_dir(sid);
+
+        if(!dir)
+            return None;
+
+        path = dir + "/chat.json";
+
+        if(!fileio.exists(path))
+            return [];
+
+        history = None;
+
+        for(i = 0; i < 5; i++) {
+            try {
+                history = fileio.read_json(path, true);
+            } catch(e) {
+                history = None;
+            }
+
+            if(std.is_list(history))
+                return history;
+
+            std.sleep(50);
+        }
+
+        return None;
+    }
+
+    list_sessions(workspace_id) {
+        out = [];
+
+        for(k, s : sessions) {
+            if(s.workspace_id == workspace_id)
+                out.push_back(session_view(k));
+        }
+
+        return out;
+    }
+
+    session_events(sid) {
+        s = sessions[sid];
+
+        if(!s)
+            return [];
+
+        return s.events.copy();
+    }
+
+    inspect_task(taskid) {
+        s = sessions[taskid];
+
+        if(!s) {
+            return [
+                ok = false,
+                taskid = ws_str(taskid),
+                name = "",
+                state = "lost",
+                active = json.bool(false),
+                report = "",
+                error = "not found",
+                token_usage = 0,
+                last_update_ms = 0,
+            ];
+        }
+
+        return [
+            ok = true,
+            taskid = s.id,
+            workspace_id = s.workspace_id,
+            name = s.title,
+            role = s.role,
+            mode = s.mode,
+            state = host_state(s.status),
+            active = json.bool(s.status == "starting" || s.status == "running" || s.status == "waiting"),
+            report = s.report,
+            error = s.error,
+            token_usage = s.token_usage,
+            last_update_ms = s.updated,
+        ];
+    }
+
+    host_tasks(workspace_id) {
+        out = [];
+
+        for(k, s : sessions) {
+            if(s.workspace_id == workspace_id)
+                out.push_back(inspect_task(k));
+        }
+
+        return out;
+    }
+
+    spawn(sid) {
+        s = sessions[sid];
+
+        if(!s)
+            return false;
+
+        stop_requested[sid] = false;
+        terminal_reported[sid] = false;
+
+        path = workspace_path(s.workspace_id);
+
+        if(!path)
+            return false;
+
+        dir = session_dir(sid);
+        fileio.mkdir(dir);
+
+        history_path = dir + "/chat.json";
+
+        if(!fileio.exists(history_path) && std.is_json(s.events) && s.events.size()) {
+            legacy_chat = ws_chat_from_events(s.events);
+
+            if(legacy_chat.size() && !fileio.write_json(history_path, legacy_chat, true, true)) {
+                s.error = "Cannot migrate session chat history: " + history_path;
+                save_session(sid);
+                return false;
+            }
+        }
+
+        p = subprocess.process();
+        p.pipes(true, true, true);
+
+        args = [
+            ws_str(std.local_executable()),
+            __DIR__ + "/workspace_agent.shio",
+            "--workspace", path,
+            "--config-spec", cfg_spec,
+            "--session-id", sid,
+            "--history-file", history_path,
+            "--reasoning-effort", ws_str(s.reasoning_effort, "medium"),
+            "--role", s.role,
+            "--mode", s.mode,
+        ];
+
+        started = false;
+
+        try {
+            started = p.start(args, path, false);
+        } catch(e) {
+            s.error = ws_str(e);
+            s.status = "starting";
+            save_session(sid);
+            return false;
+        }
+
+        if(!started) {
+            s.error = ws_str(p.error());
+            s.status = "starting";
+            save_session(sid);
+            return false;
+        }
+
+        procs[sid] = p;
+        return true;
+    }
+
+    send_json(sid, obj) {
+        p = procs[sid];
+
+        if(!p || !p.running())
+            return false;
+
+        return p.write_line(obj.compact_string());
+    }
+
+    create_session(workspace_id, title = "", mode = "normal", prompt = "", role = "adaptive", reasoning_effort = "medium") {
+        path = workspace_path(workspace_id);
+
+        if(!path)
+            return [ok = false, error = "unknown workspace"];
+
+        mode = ws_str(mode);
+        if(mode != "goal")
+            mode = "normal";
+
+        role = ws_str(role);
+        if(!role)
+            role = "adaptive";
+
+        reasoning_effort = ws_str(reasoning_effort, "medium").lowercase();
+        if(!ws_valid_reasoning_effort(reasoning_effort))
+            return [ok = false, error = "reasoning_effort must be low, medium, or high"];
+
+        title = ws_str(title).strip();
+        prompt = ws_str(prompt).strip();
+
+        if(!title) {
+            if(prompt) {
+                title = ws_title_from(prompt, 48);
+            } else {
+                n = 0;
+                for(k, s : sessions) {
+                    if(s.workspace_id == workspace_id)
+                        n++;
+                }
+                title = "Session " + std.string(n + 1);
+            }
+        }
+
+        cs = std.critical_section_named("workspace_sessions");
+
+        if(active_count() >= max_sessions()) {
+            cs.release();
+            return [ok = false, error = "max_sessions reached"];
+        }
+
+        sid = std.random_hash(16);
+
+        s = [
+            id = sid,
+            workspace_id = workspace_id,
+            title = title,
+            mode = mode,
+            reasoning_effort = reasoning_effort,
+            status = "starting",
+            prompt = prompt,
+            events = [],
+            chat_history_size_at_prompt = 0,
+            token_usage = 0,
+            created = std.millis(),
+            updated = std.millis(),
+            role = role,
+            report = "",
+            error = "",
+            seq = 0,
+            attempts = 0,
+        ];
+
+        sessions[sid] = s;
+        live_texts[sid] = "";
+        live_text_seqs[sid] = 0;
+        stop_requested[sid] = false;
+        terminal_reported[sid] = false;
+        cs.release();
+
+        dir = session_dir(sid);
+        fileio.mkdir(dir);
+        save_session(sid);
+
+        if(!spawn(sid)) {
+            sessions.erase(sid);
+            return [ok = false, error = s.error];
+        }
+
+        if(prompt) {
+            send_json(sid, [type = "prompt", text = prompt, reasoning_effort = s.reasoning_effort]);
+            s.status = "running";
+            push_event(s, "user", [text = prompt]);
+            push_event(s, "status", [status = "running"]);
+        }
+
+        s.updated = std.millis();
+        save_session(sid);
+
+        pump_active[sid] = true;
+
+        std.thread([this, sid]() {
+            this.pump(sid);
+        }).run();
+
+        return [ok = true, session = session_view(sid)];
+    }
+
+    send_prompt(sid, prompt, reasoning_effort = None) {
+        s = sessions[sid];
+
+        if(!s)
+            return [ok = false, error = "unknown session"];
+
+        if(deleting_sessions[sid])
+            return [ok = false, error = "session deletion is in progress"];
+
+        prompt = ws_str(prompt).strip();
+
+        if(!prompt)
+            return [ok = false, error = "empty prompt"];
+
+        if(!std.is_none(reasoning_effort)) {
+            reasoning_effort = ws_str(reasoning_effort).lowercase();
+            if(!ws_valid_reasoning_effort(reasoning_effort))
+                return [ok = false, error = "reasoning_effort must be low, medium, or high"];
+            s.reasoning_effort = reasoning_effort;
+        }
+
+        // "+" creates an empty session with a placeholder title.
+        // prompt names it from the request text.
+        if(!s.title || s.title.starts("Session ")) {
+            s.title = ws_title_from(prompt, 48);
+        }
+
+        history = session_chat_history(sid);
+
+        if(!std.is_list(history))
+            return [ok = false, error = "Cannot read session chat history"];
+
+        p = procs[sid];
+
+        if(!p || !p.running()) {
+            s.status = "starting";
+            s.attempts = 0;
+            s.report = "";
+            s.error = "";
+
+            if(!spawn(sid)) {
+            sessions.erase(sid);
+            return [ok = false, error = s.error];
+        }
+
+            if(!pump_active[sid]) {
+                pump_active[sid] = true;
+                std.thread([this, sid]() {
+                    this.pump(sid);
+                }).run();
+            }
+        }
+
+        // A prompt while the subprocess is generating updates its running task
+        // (miniagent.task_update); an interrupt would stop that task instead.
+        send_json(sid, [type = "prompt", text = prompt, reasoning_effort = s.reasoning_effort]);
+
+        s.prompt = prompt;
+        live_texts[sid] = "";
+        live_text_seqs[sid] = s.seq;
+        s.chat_history_size_at_prompt = history.size();
+        s.status = "running";
+        s.updated = std.millis();
+        push_event(s, "user", [text = prompt]);
+        push_event(s, "status", [status = "running"]);
+        save_session(sid);
+
+        return [ok = true, session = session_view(sid)];
+    }
+
+    set_mode(sid, mode) {
+        s = sessions[sid];
+
+        if(!s)
+            return [ok = false, error = "unknown session"];
+
+        if(deleting_sessions[sid])
+            return [ok = false, error = "session deletion is in progress"];
+
+        mode = ws_str(mode);
+
+        if(mode != "goal")
+            mode = "normal";
+
+        s.mode = mode;
+        s.updated = std.millis();
+        send_json(sid, [type = "mode", mode = mode]);
+        push_event(s, "status", [status = s.status, mode = mode]);
+        save_session(sid);
+
+        return [ok = true, session = session_view(sid)];
+    }
+
+    set_reasoning_effort(sid, effort) {
+        s = sessions[sid];
+
+        if(!s)
+            return [ok = false, error = "unknown session"];
+
+        if(deleting_sessions[sid])
+            return [ok = false, error = "session deletion is in progress"];
+
+        effort = ws_str(effort).lowercase();
+
+        if(!ws_valid_reasoning_effort(effort))
+            return [ok = false, error = "reasoning_effort must be low, medium, or high"];
+
+        s.reasoning_effort = effort;
+        s.updated = std.millis();
+        push_event(s, "status", [status = s.status, reasoning_effort = effort]);
+        save_session(sid);
+
+        return [ok = true, session = session_view(sid)];
+    }
+
+    stop_session(sid) {
+        s = sessions[sid];
+
+        if(!s)
+            return false;
+
+        if(s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped") {
+            stop_requested[sid] = true;
+            return true;
+        }
+
+        // Mark the intent before touching the process: a pump that sees the exit
+        // in between must report the stop, not a failure.
+        stop_requested[sid] = true;
+        s.status = "stopped";
+        s.report = "The session was stopped.";
+        s.error = "";
+        s.updated = std.millis();
+        push_event(s, "status", [status = "stopped"]);
+        save_session(sid);
+        emit_finished_task(s);
+
+        p = procs[sid];
+
+        if(p && p.running()) {
+            send_json(sid, [type = "stop"]);
+            p.stop();
+            std.sleep(200);
+
+            if(p.running())
+                p.terminate();
+            std.sleep(200);
+
+            if(p.running())
+                p.kill();
+        }
+
+        return true;
+    }
+
+    pump(sid) {
+        for(1) {
+            s = sessions[sid];
+
+            if(!s)
+                break;
+
+            if(s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped")
+                break;
+
+            p = procs[sid];
+
+            if(!p)
+                break;
+
+            // Drain stdout before checking running(): the child can exit after
+            // writing its final delta and done line, while both remain buffered.
+            line = p.read_line("stdout", 100);
+
+            if(line.empty()) {
+                err = p.read_line("stderr", 0);
+
+                if(err && s.status == "starting") {
+                    s.error = err;
+                    push_event(s, "error", [message = err]);
+                    save_session(sid);
+                }
+
+                if(!p.running()) {
+                    s.attempts++;
+
+                    if(stop_requested[sid]) {
+                        finish_terminal(s, "stopped", s.report ?? "The session was stopped.", "");
+                        break;
+                    }
+
+                    recovered = recovered_turn(session_dir(sid), s);
+
+                    if(std.is_json(recovered)) {
+                        s.token_usage = recovered.token_usage;
+                        finish_terminal(
+                            s,
+                            recovered.status,
+                            recovered.report,
+                            recovered.status == "failed" ? recovered.report : ""
+                        );
+                        break;
+                    }
+
+                    s.report = err ? "the session process exited without a terminal result: " + err
+                        : "the session process exited without a terminal result";
+                    s.error = s.report;
+                    push_event(s, "error", [message = s.error]);
+                    finish_terminal(s, "failed", s.report, s.error);
+                    break;
+                }
+
+                std.sleep(20);
+                continue;
+            }
+
+            // A stop intent wins over a late delta/error line.
+            if(stop_requested[sid] && s.status == "stopped")
+                break;
+
+            data = None;
+
+            try {
+                data = std.json(line, true);
+            } catch(e) {
+                data = None;
+            }
+
+            if(!std.is_json(data))
+                continue;
+
+            type = ws_str(data.type);
+
+            if(type == "ready") {
+                s.status = s.prompt ? "running" : "waiting";
+                s.updated = std.millis();
+                push_event(s, "status", [status = s.status]);
+                save_session(sid);
+            }
+            else if(type == "delta") {
+                action = data.action;
+
+                if(!std.is_json(action))
+                    action = std.json();
+
+                s.status = "running";
+                s.updated = std.millis();
+                e = push_event(s, "delta", [action = action]);
+                if(!std.is_none(action.text)) {
+                    live_texts[sid] = ws_str(live_texts[sid]) + ws_str(action.text);
+                    live_text_seqs[sid] = e.seq;
+                }
+                save_session(sid);
+            }
+            else if(type == "stats") {
+                s.token_usage = std.int(data.token_usage);
+                live_texts[sid] = "";
+                s.updated = std.millis();
+                e = push_event(s, "stats", [token_usage = s.token_usage]);
+                live_text_seqs[sid] = e.seq;
+                save_session(sid);
+            }
+            else if(type == "file") {
+                f = [
+                    name = ws_str(data.name),
+                    bytes = std.int(data.bytes),
+                    caption = ws_str(data.caption),
+                    data = ws_str(data.data),
+                ];
+
+                s.updated = std.millis();
+                push_event(s, "file", f.copy());
+                save_session(sid);
+                file_event(f);
+            }
+            else if(type == "notify") {
+                msg = ws_str(data.message);
+
+                s.updated = std.millis();
+                push_event(s, "notify", [message = msg]);
+                save_session(sid);
+                notify_user(msg);
+            }
+            else if(type == "error") {
+                s.error = ws_str(data.message);
+                if(!s.error)
+                    s.error = "Agent reported an unspecified error";
+                s.updated = std.millis();
+                push_event(s, "error", [message = s.error]);
+
+                if(stop_requested[sid])
+                    finish_terminal(s, "stopped", s.error, "");
+                else
+                    finish_terminal(s, "failed", s.error, s.error);
+
+                break;
+            }
+            else if(type == "done") {
+                status = ws_str(data.status, "failed");
+
+                if(status != "finished" && status != "failed" && status != "question" && status != "stopped")
+                    status = "failed";
+
+                if(stop_requested[sid])
+                    status = "stopped";
+
+                s.report = ws_str(data.report);
+                s.token_usage = std.int(data.token_usage);
+                s.error = status == "failed" ? s.report : "";
+
+                finish_terminal(s, status, s.report, s.error);
+                break;
+            }
+        }
+
+        pump_active[sid] = false;
+    }
+
+    notify(msg) {
+        return notify_user(msg);
+    }
+
+    notify_user(msg) {
+        msg = ws_str(msg);
+        notifications.push_back([message = msg, time = std.millis()]);
+
+        for(notifications.size() > WS_NOTIFY_KEPT)
+            notifications.erase(0);
+
+        sent = 0;
+
+        for(cb : notify_listeners) {
+            try {
+                cb(msg);
+                sent++;
+            } catch(e) {
+                std.error("[workspaces] notify listener failed: ", e);
+            }
+        }
+
+        return [ok = true, listeners = sent, message = msg];
+    }
+
+    add_notify_listener(cb) {
+        if(std.is_function(cb))
+            notify_listeners.push_back(cb);
+    }
+
+    add_file_listener(cb) {
+        if(std.is_function(cb))
+            file_listeners.push_back(cb);
+    }
+
+    file_event(f) {
+        if(!std.is_json(f))
+            return 0;
+
+        sent = 0;
+
+        for(cb : file_listeners) {
+            try {
+                cb(f);
+                sent++;
+            } catch(e) {
+                std.error("[workspaces] file listener failed: ", e);
+            }
+        }
+
+        return sent;
+    }
+
+    share_file(path, caption = "") {
+        path = ws_str(path);
+
+        if(!path || !fileio.exists(path))
+            return [ok = false, error = "file not found: " + path];
+
+        data = fileio.read_file(path);
+        f = [
+            name = fileio.file_name(path),
+            bytes = data.size(),
+            caption = ws_str(caption),
+            data = std.base64_encode(data),
+        ];
+
+        sent = file_event(f);
+
+        if(!sent)
+            return [ok = false, error = "no chat is connected to this workspace manager"];
+
+        return [ok = true, name = f.name, bytes = f.bytes];
+    }
+
+    overview(workspace_id) {
+        workspace_id = ws_str(workspace_id);
+        active_tasks = [];
+        tasks_scheduled = [];
+        tasks_finished = [];
+        tasks_failed = [];
+
+        for(k, s : sessions) {
+            if(s.workspace_id != workspace_id)
+                continue;
+
+            info = inspect_task(k);
+            info.workspace_id = workspace_id;
+
+            state = ws_str(info.state);
+
+            if(state == "running")
+                active_tasks.push_back(info);
+            else if(state == "planned")
+                tasks_scheduled.push_back(info);
+            else if(state == "finished")
+                tasks_finished.push_back(info);
+            else
+                tasks_failed.push_back(info);
+        }
+
+        return [
+            tasks = active_tasks,
+            tasks_scheduled = tasks_scheduled,
+            tasks_finished = tasks_finished,
+            tasks_failed = tasks_failed,
+        ];
+    }
+
+    tasks(workspace_id) {
+        ov = overview(workspace_id);
+        out = [];
+
+        for(t : ov.tasks)
+            out.push_back(t);
+        for(t : ov.tasks_scheduled)
+            out.push_back(t);
+        for(t : ov.tasks_finished)
+            out.push_back(t);
+        for(t : ov.tasks_failed)
+            out.push_back(t);
+
+        return out;
+    }
+
+    stop_workspace(workspace_id) {
+        workspace_id = ws_str(workspace_id);
+        stopped = 0;
+
+        for(k, s : sessions) {
+            if(s.workspace_id != workspace_id)
+                continue;
+
+            if(s.status == "starting" || s.status == "running" || s.status == "waiting") {
+                try {
+                    if(stop_session(k))
+                        stopped++;
+                } catch(e) {
+                    std.error("[workspaces] session stop failed: ", e);
+                }
+            }
+        }
+
+        return stopped;
+    }
+
+    add_task_finished_listener(cb) {
+        if(std.is_function(cb))
+            listeners.push_back(cb);
+    }
+
+    // One terminal event per task turn. The durable result is written first,
+    // the SSE `done` event follows, and listeners are notified at most once.
+    finish_terminal(s, status, report, error = "") {
+        if(terminal_reported[s.id])
+            return false;
+
+        s.status = status == "finished" ? "done" : status;
+        s.report = ws_str(report);
+        s.error = ws_str(error);
+        s.updated = std.millis();
+
+        e = push_event(s, "done", [
+            ok = json.bool(status == "finished"),
+            status = status,
+            report = s.report,
+            token_usage = s.token_usage,
+        ]);
+        live_text_seqs[s.id] = e.seq;
+        save_session(s.id);
+        emit_finished_task(s);
+
+        return true;
+    }
+
+    emit_finished_task(s) {
+        if(terminal_reported[s.id])
+            return;
+
+        terminal_reported[s.id] = true;
+
+        task = [
+            taskid = s.id,
+            name = s.title,
+            state = host_state(s.status),
+            report = s.report,
+            error = s.error,
+            token_usage = s.token_usage,
+            last_update_ms = s.updated,
+        ];
+
+        for(cb : listeners) {
+            try {
+                cb(task);
+            } catch(e) {
+                std.error("[workspaces] finished listener failed: ", e);
+            }
+        }
+    }
+
+    capacity() {
+        return [
+            workers = max_sessions(),
+            busy = active_count(),
+            interactive_idle_secs = 0,
+        ];
+    }
+
+    stats() {
+        active = 0;
+        running = 0;
+        tokens = [];
+        session_status = std.json();
+
+        for(k, s : sessions) {
+            session_status[k] = s.status;
+            if(s.status == "starting" || s.status == "running" || s.status == "waiting")
+                active++;
+
+            p = procs[k];
+
+            if(p && p.running())
+                running++;
+
+            tokens[k] = s.token_usage;
+        }
+
+        return [
+            active_sessions = active,
+            total_sessions = sessions.size(),
+            running_processes = running,
+            token_usage = tokens,
+            session_status = session_status,
+            max_sessions = max_sessions(),
+        ];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Workspace — one task executor, its scheduler and architecture board
+// ═══════════════════════════════════════════════════════════════════════════
+
+class Workspace {
+    id = "";
+    name = "";
+    path = "";
+    parent = "";
+    record = [];
+    manager = None;
+    scheduler = None;
+    board = None;
+    cfg_spec = "";
+    token = "";
+
+    __init__(_record, _manager, _cfg_spec, _token = "") {
+        record = std.is_json(_record) ? _record.copy() : [];
+        manager = _manager;
+        cfg_spec = ws_str(_cfg_spec);
+        token = ws_str(_token);
+
+        id = ws_str(record.id);
+        name = ws_str(record.name, "Workspace");
+        path = ws_str(record.path);
+        parent = ws_str(record.parent);
+        scheduler = None;
+        board = None;
+
+        // The synthetic root is a container; it has no project scheduler and no
+        // .agentspace. The node's own scheduler is attached later by Node.
+        if(id && id != "root" && path) {
+            space = GoalSpace(path + "/.agentspace");
+
+            if(!space.exists())
+                space.init(__DIR__ + "/agentspace_template");
+
+            try {
+                scheduler = GoalScheduler(space, this, [workspace_id = id]);
+                scheduler.start();
+            } catch(e) {
+                std.error("[workspaces] goal scheduler failed: ", e);
+                scheduler = None;
+            }
+
+            try {
+                board = ArchitectureBoard(this, path + "/.megamind/architecture", "adaptive");
+            } catch(e) {
+                std.error("[workspaces] architecture board failed: ", e);
+                board = None;
+            }
+        }
+    }
+
+    add_task(name, goal, role = "adaptive") {
+        role = ws_str(role, "adaptive");
+        if(!role)
+            role = "adaptive";
+
+        res = manager.create_session(id, ws_str(name), "normal", ws_str(goal), role, "medium");
+
+        if(res.ok && std.is_json(res.session))
+            return ws_str(res.session.id);
+
+        return "";
+    }
+
+    update_task(taskid, message) {
+        res = manager.send_prompt(ws_str(taskid), ws_str(message));
+        return res.ok ? true : false;
+    }
+
+    stop_task(taskid) {
+        return manager.stop_session(ws_str(taskid));
+    }
+
+    inspect_task(taskid) {
+        info = manager.inspect_task(ws_str(taskid));
+
+        if(std.is_json(info))
+            info.workspace_id = id;
+
+        return info;
+    }
+
+    get_overview() {
+        return manager.overview(id);
+    }
+
+    tasks() {
+        return manager.tasks(id);
+    }
+
+    goals() {
+        if(!scheduler)
+            return [];
+
+        try {
+            return scheduler.overview();
+        } catch(e) {
+            std.error("[workspaces] goals overview failed: ", e);
+            return [];
+        }
+    }
+
+    add_task_finished_listener(cb) {
+        manager.add_task_finished_listener(cb);
+    }
+
+    add_notify_listener(cb) {
+        manager.add_notify_listener(cb);
+    }
+
+    add_file_listener(cb) {
+        manager.add_file_listener(cb);
+    }
+
+    notify_user(msg) {
+        return manager.notify_user(msg);
+    }
+
+    share_file(path, caption = "") {
+        return manager.share_file(path, caption);
+    }
+
+    background_capacity() {
+        return manager.capacity();
+    }
+
+    stop() {
+        stopped = 0;
+
+        if(scheduler) {
+            try {
+                scheduler.stop();
+            } catch(e) {}
+            scheduler = None;
+            stopped++;
+        }
+
+        stopped += manager.stop_workspace(id);
+
+        return stopped;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WorkspaceRegistry — all workspaces, one SessionManager, one store
+// ═══════════════════════════════════════════════════════════════════════════
+
+class WorkspaceRegistry {
+    store = None;
+    manager = None;
+    workspaces = [];
+    cfg_spec = "";
+    token = "";
+
+    __init__(_cfg_spec, _token = "") {
+        cfg_spec = ws_config_spec_absolute(_cfg_spec);
+        token = ws_str(_token);
+
+        store = WorkspaceStore();
+        manager = SessionManager(store, cfg_spec, token);
+        workspaces = [];
+
+        for(rec : store.list())
+            ensure(rec);
+
+        start_all_schedulers();
+    }
+
+    ensure(record) {
+        rec = std.is_json(record) ? record.copy() : [];
+        id = ws_str(rec.id);
+
+        if(!id)
+            return None;
+
+        if(workspaces.has(id))
+            return workspaces[id];
+
+        w = Workspace(rec, manager, cfg_spec, token);
+        workspaces[id] = w;
+
+        return w;
+    }
+
+    get(id) {
+        id = ws_str(id);
+
+        if(workspaces.has(id))
+            return workspaces[id];
+
+        return None;
+    }
+
+    list() {
+        out = [];
+
+        for(k, w : workspaces)
+            out.push_back(w);
+
+        return out;
+    }
+
+    tree() {
+        return store.tree();
+    }
+
+    create(name, path = "", parent = "", description = "") {
+        res = store.create(name, path, parent, description);
+
+        if(!res.ok)
+            return None;
+
+        return ensure(res.workspace);
+    }
+
+    delete(id) {
+        id = ws_str(id);
+
+        if(id == "root")
+            return [ok = false, error = "the root workspace cannot be deleted", code = 409];
+
+        w = get(id);
+
+        if(!w)
+            return [ok = false, error = "unknown workspace", code = 404];
+
+        for(c : store.list()) {
+            if(c.parent == id)
+                return [ok = false, error = "workspace has children", code = 409];
+        }
+
+        sessions = manager.list_sessions(id);
+        removed_sessions = [];
+
+        for(s : sessions) {
+            res = manager.delete_session(s.id);
+
+            if(!res.ok) {
+                return [
+                    ok = false,
+                    error = "could not delete session " + ws_str(s.id) + ": " + ws_str(res.error, "failed"),
+                    code = 409,
+                    sessions_removed = removed_sessions,
+                ];
+            }
+
+            removed_sessions.push_back(ws_str(s.id));
+        }
+
+        w.stop();
+        workspaces.erase(id);
+
+        res = store.delete(id);
+
+        if(!res.ok)
+            return [
+                ok = false,
+                error = ws_str(res.error, "failed"),
+                code = 409,
+                sessions_removed = removed_sessions,
+            ];
+
+        return [
+            ok = true,
+            removed = id,
+            sessions_removed = removed_sessions,
+            files_kept = true,
+        ];
+    }
+
+    scheduler(id) {
+        w = get(id);
+
+        if(!w)
+            return None;
+
+        return w.scheduler;
+    }
+
+    board(id) {
+        w = get(id);
+
+        if(!w)
+            return None;
+
+        return w.board;
+    }
+
+    start_all_schedulers() {
+        started = 0;
+
+        for(k, w : workspaces) {
+            if(!w.scheduler)
+                continue;
+
+            try {
+                w.scheduler.start();
+                started++;
+            } catch(e) {
+                std.error("[workspaces] scheduler start failed: ", e);
+            }
+        }
+
+        return started;
+    }
+
+    stop() {
+        stopped = 0;
+
+        for(k, w : workspaces)
+            stopped += w.stop();
+
+        workspaces = [];
+
+        return stopped;
+    }
+}
+
+// compatibility helpers for the old adapter routes
+workspaces_get_host(ctx, workspace_id) {
+    return ctx.get(workspace_id);
+}
+
+workspaces_get_board(ctx, workspace_id) {
+    return ctx.board(workspace_id);
+}
+
+workspaces_get_scheduler(ctx, workspace_id) {
+    return ctx.scheduler(workspace_id);
+}
+
+workspaces_start_all_schedulers(ctx) {
+    return ctx.start_all_schedulers();
+}
+
+workspaces_board_reply(res) {
+    if(std.is_json(res) && res.has("ok") && !res.ok)
+        return node_api_err(ws_str(res.error, "failed"), 409);
+
+    return node_api_ok(res);
+}
+
+// Remove a workspace and every session that belongs to it. Project files stay
+// on disk. Children are refused before sessions are deleted, so a refused delete
+// leaves the workspace and its sessions intact.
+workspaces_delete_workspace(ctx, workspace_id) {
+    return ctx.delete(ws_str(workspace_id));
+}
+
+// Activate / pause / cancel a goal of this workspace (the task menu).
+workspaces_goal_status(ctx, workspace_id, goal_id, status) {
+    scheduler = workspaces_get_scheduler(ctx, workspace_id);
+
+    if(!scheduler) {
+        return [ok = false, error = "goal scheduler unavailable"];
+    }
+
+    res = scheduler.space.move(goal_id, status);
+
+    if(res.ok) {
+        try {
+            scheduler.rescan();
+            scheduler.write_overview();
+        } catch(e) {
+            std.error("[workspaces] goal rescan failed: ", e);
+        }
+    }
+
+    return res;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HTTP API
+// ═══════════════════════════════════════════════════════════════════════════
+
+workspaces_api_register(server, cfg, api_token, registry = None) {
+    if(!registry) {
+        spec = "";
+
+        if(std.is_string(cfg)) {
+            spec = std.string(cfg);
+        } else if(std.is_json(cfg)) {
+            if(cfg.has("spec"))
+                spec = ws_str(cfg.spec);
+            else if(cfg.has("name"))
+                spec = ws_str(cfg.name);
+        }
+
+        registry = WorkspaceRegistry(spec, api_token);
+    }
+
+    registry.token = ws_str(api_token);
+    store = registry.store;
+    manager = registry.manager;
+    token = registry.token;
+    ctx = registry;
+
+    // ── global routes ──────────────────────────────────────────────────────
+    server.route("GET", "^/api/workspaces$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok([
+            tree = ctx.store.tree(),
+            workspaces = ctx.store.list(),
+            settings = ctx.store.settings(),
+            stats = ctx.manager.stats(),
+        ]);
+    });
+
+    server.route("POST", "^/api/workspaces$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        name = node_api_get(body, "name");
+
+        if(name.strip().empty())
+            return node_api_err("Missing 'name'");
+
+        path = node_api_get(body, "path");
+        parent = node_api_get(body, "parent");
+        description = node_api_get(body, "description");
+
+        res = ctx.store.create(name, path, parent, description);
+
+        if(!res.ok)
+            return node_api_err(res.error, 400);
+
+        ctx.ensure(res.workspace);
+        workspaces_get_scheduler(ctx, res.workspace.id);
+
+        return node_api_ok(res.workspace);
+    });
+
+    server.route("GET", "^/api/settings$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok(ctx.store.settings());
+    });
+
+    server.route("PUT", "^/api/settings$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        max_sessions = node_api_int(body, "max_sessions", 0);
+
+        if(max_sessions <= 0)
+            return node_api_err("Missing 'max_sessions'");
+
+        res = ctx.store.set_settings(max_sessions);
+
+        if(!res.ok)
+            return node_api_err(res.error, 400);
+
+        return node_api_ok(res.settings);
+    });
+
+    server.route("GET", "^/api/stats$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok(ctx.manager.stats());
+    });
+
+    // ── workspace routes ───────────────────────────────────────────────────
+    server.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        w = ctx.store.get(workspace_id);
+
+        if(!w)
+            return node_api_err("unknown workspace", 404);
+
+        board = workspaces_get_board(ctx, workspace_id);
+        scheduler = workspaces_get_scheduler(ctx, workspace_id);
+
+        architecture = None;
+        goals = [];
+
+        if(board) {
+            try {
+                architecture = board.state();
+            } catch(e) {
+                std.error("[workspaces] architecture state failed: ", e);
+            }
+        }
+
+        if(scheduler) {
+            try {
+                goals = scheduler.overview();
+            } catch(e) {
+                std.error("[workspaces] goals overview failed: ", e);
+            }
+        }
+
+        return node_api_ok([
+            workspace = w,
+            sessions = ctx.manager.list_sessions(workspace_id),
+            architecture = architecture,
+            goals = goals,
+            tasks = ctx.manager.host_tasks(workspace_id),
+        ]);
+    });
+
+    server.route("DELETE", "^/api/workspaces/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        res = workspaces_delete_workspace(ctx, workspace_id);
+
+        if(!res.ok)
+            return node_api_err(res.error, res.code);
+
+        return node_api_ok([
+            removed = res.removed,
+            sessions_removed = res.sessions_removed,
+            files_kept = res.files_kept,
+        ]);
+    });
+
+    server.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)/sessions$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        return node_api_ok(ctx.manager.list_sessions(workspace_id));
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/sessions$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        title = node_api_get(body, "title");
+        mode = node_api_get(body, "mode", "normal");
+        prompt = node_api_get(body, "prompt");
+        role = node_api_get(body, "role", "adaptive");
+        reasoning_effort = node_api_get(body, "reasoning_effort", "medium");
+
+        if(!workspaces_get_scheduler(ctx, workspace_id))
+            return node_api_err("workspace goal scheduler unavailable", 409);
+
+        res = ctx.manager.create_session(workspace_id, title, mode, prompt, role, reasoning_effort);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok(res.session);
+    });
+
+    // ── architecture routes ────────────────────────────────────────────────
+    server.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        return node_api_ok(board.state());
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/analyze$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        return workspaces_board_reply(board.analyze());
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/edits$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        return workspaces_board_reply(board.add_edit(body));
+    });
+
+    server.route("DELETE", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/edits/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        n = board.remove_edit(std.string(req.matches[1]));
+
+        if(!n)
+            return node_api_err("unknown edit", 404);
+
+        return node_api_ok([removed = n]);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/discard$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        return node_api_ok([removed = board.discard_edits()]);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/layout$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body) || !body.has("positions"))
+            return node_api_err("Missing 'positions'");
+
+        return node_api_ok([moved = board.set_layout(body.positions)]);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/plan$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        return workspaces_board_reply(board.review_plan(node_api_get(body, "feedback")));
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/architecture/apply$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        board = workspaces_get_board(ctx, workspace_id);
+
+        if(!board)
+            return node_api_err("unknown workspace or architecture board", 404);
+
+        return workspaces_board_reply(board.apply());
+    });
+
+    // ── per-workspace task routes ──────────────────────────────────────────
+    server.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)/tasks$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        scheduler = workspaces_get_scheduler(ctx, workspace_id);
+        goals = [];
+
+        if(scheduler) {
+            try {
+                goals = scheduler.overview();
+            } catch(e) {
+                std.error("[workspaces] goals overview failed: ", e);
+            }
+        }
+
+        templates = [];
+
+        if(scheduler) {
+            try {
+                for(f : fileio.files(scheduler.space.root + "/templates", false)) {
+                    templates.push_back([
+                        name = fileio.file_name(f),
+                        path = scheduler.space.root + "/templates/" + f,
+                    ]);
+                }
+            } catch(e) {
+                std.error("[workspaces] template list failed: ", e);
+            }
+        }
+
+        return node_api_ok([
+            goals = goals,
+            sessions = ctx.manager.host_tasks(workspace_id),
+            templates = templates,
+        ]);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/tasks$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        goal = node_api_get(body, "goal");
+
+        if(goal.strip().empty())
+            return node_api_err("Missing 'goal'");
+
+        name = node_api_get(body, "name");
+        role = node_api_get(body, "role", "adaptive");
+        mode = node_api_get(body, "mode", "normal");
+
+        if(name.strip().empty())
+            name = "Task-" + std.random_hash(6);
+
+        if(!workspaces_get_scheduler(ctx, workspace_id))
+            return node_api_err("workspace goal scheduler unavailable", 409);
+
+        res = ctx.manager.create_session(workspace_id, name, mode, goal, role);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok([
+            taskid = res.session.id,
+            name = name,
+            state = "planned",
+        ]);
+    });
+
+    // ── goal routes: the task menu can create / activate scheduled tasks ───
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/goals$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        scheduler = workspaces_get_scheduler(ctx, workspace_id);
+
+        if(!scheduler)
+            return node_api_err("goal scheduler unavailable", 409);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        res = goal_tool_create(scheduler, body);
+
+        if(!res.ok)
+            return node_api_err(res.error, 400);
+
+        try {
+            scheduler.rescan();
+            scheduler.write_overview();
+        } catch(e) {
+            std.error("[workspaces] goal rescan failed: ", e);
+        }
+
+        return node_api_ok(res);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/goals/([0-9a-zA-Z_-]+)/run$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        goal_id = std.string(req.matches[1]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        scheduler = workspaces_get_scheduler(ctx, workspace_id);
+        if(!scheduler)
+            return node_api_err("goal scheduler unavailable", 409);
+
+        scheduler.rescan();
+        res = scheduler.request_run(goal_id);
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok([goal_id = goal_id, queued = true]);
+    });
+
+    server.route("POST", "^/api/workspaces/([0-9a-zA-Z_-]+)/goals/([0-9a-zA-Z_-]+)/status$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        goal_id = std.string(req.matches[1]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        status = node_api_get(body, "status", "active");
+
+        res = workspaces_goal_status(ctx, workspace_id, goal_id, status);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok(res);
+    });
+
+    server.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)/tasks/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        taskid = std.string(req.matches[1]);
+        s = ctx.manager.get_session(taskid);
+
+        if(!s || s.workspace_id != workspace_id)
+            return node_api_err("unknown task", 404);
+
+        info = ctx.manager.inspect_task(taskid);
+
+        if(std.is_string(info))
+            return node_api_err(info, 404);
+
+        return node_api_ok(info);
+    });
+
+    server.route("PUT", "^/api/workspaces/([0-9a-zA-Z_-]+)/tasks/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        taskid = std.string(req.matches[1]);
+        s = ctx.manager.get_session(taskid);
+
+        if(!s || s.workspace_id != workspace_id)
+            return node_api_err("unknown task", 404);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        message = node_api_get(body, "message");
+
+        if(message.strip().empty())
+            return node_api_err("Missing 'message'");
+
+        res = ctx.manager.send_prompt(taskid, message);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok([taskid = taskid, state = "updated"]);
+    });
+
+    server.route("DELETE", "^/api/workspaces/([0-9a-zA-Z_-]+)/tasks/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        taskid = std.string(req.matches[1]);
+        s = ctx.manager.get_session(taskid);
+
+        if(!s || s.workspace_id != workspace_id)
+            return node_api_err("unknown task", 404);
+
+        ctx.manager.stop_session(taskid);
+
+        return node_api_ok([taskid = taskid, state = "stopped"]);
+    });
+
+    // ── session routes ─────────────────────────────────────────────────────
+    server.route("DELETE", "^/api/sessions/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        res = ctx.manager.delete_session(sid);
+        if(!res.ok)
+            return node_api_err(res.error, res.error == "unknown session" ? 404 : 409);
+        return node_api_ok([removed = sid]);
+    });
+
+    server.route("GET", "^/api/sessions/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        s = ctx.manager.get_session(sid);
+
+        if(!s)
+            return node_api_err("unknown session", 404);
+
+        history = ctx.manager.session_chat_history(sid);
+
+        if(!std.is_list(history)) {
+            std.error("[workspaces] session chat history unavailable: ", sid);
+            history = [];
+        }
+
+        live = ctx.manager.session_live_state(sid);
+        s.chat_history = history;
+        s.live_text = live.text;
+        s.live_text_seq = live.seq;
+        return node_api_ok(s);
+    });
+
+    server.route("POST", "^/api/sessions/([0-9a-zA-Z_-]+)/prompt$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        prompt = node_api_get(body, "prompt");
+        reasoning_effort = node_api_get(body, "reasoning_effort", None);
+
+        if(prompt.strip().empty())
+            return node_api_err("Missing 'prompt'");
+
+        res = ctx.manager.send_prompt(sid, prompt, reasoning_effort);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok([session_id = sid, status = res.session.status]);
+    });
+
+    server.route("POST", "^/api/sessions/([0-9a-zA-Z_-]+)/mode$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        mode = node_api_get(body, "mode", "normal");
+
+        res = ctx.manager.set_mode(sid, mode);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok([session_id = sid, mode = res.session.mode]);
+    });
+
+    server.route("POST", "^/api/sessions/([0-9a-zA-Z_-]+)/effort$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        reasoning_effort = node_api_get(body, "reasoning_effort");
+
+        res = ctx.manager.set_reasoning_effort(sid, reasoning_effort);
+
+        if(!res.ok)
+            return node_api_err(res.error, 409);
+
+        return node_api_ok(res.session);
+    });
+
+    server.route("POST", "^/api/sessions/([0-9a-zA-Z_-]+)/stop$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+
+        if(!ctx.manager.stop_session(sid))
+            return node_api_err("unknown session", 404);
+
+        return node_api_ok([session_id = sid, status = "stopped"]);
+    });
+
+    server.route("GET", "^/api/sessions/([0-9a-zA-Z_-]+)/stream$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token)) {
+            writer.write_header(401, "application/json; charset=utf-8", node_api_headers());
+            writer.write(std.string([ok = json.bool(false), error = "Unauthorized"]));
+            writer.end();
+            return;
+        }
+
+        sid = std.string(req.matches[0]);
+        s = ctx.manager.get_session(sid);
+
+        if(!s) {
+            writer.write_header(404, "application/json; charset=utf-8", node_api_headers());
+            writer.write(std.string([ok = json.bool(false), error = "Unknown session"]));
+            writer.end();
+            return;
+        }
+
+        if(!writer.write_header(200, "text/event-stream", node_api_headers([
+            "Content-Type" = "text/event-stream; charset=utf-8",
+            "Cache-Control" = "no-cache",
+            "Connection" = "keep-alive",
+            "X-Accel-Buffering" = "no",
+        ])))
+            return;
+
+        writer.write_sse(std.string([session_id = sid, status = "connected"]), "status");
+
+        last_seq = node_api_int(req.query_params, "since", 0);
+        last_ping = std.millis();
+
+        for(1) {
+            if(!writer.is_client_alive())
+                break;
+
+            s = ctx.manager.get_session(sid);
+
+            if(!s)
+                break;
+
+            events = ctx.manager.session_events(sid);
+            sent = false;
+
+            for(e : events) {
+                if(e.seq > last_seq) {
+                    last_seq = e.seq;
+                    payload = e.copy();
+                    payload.erase("type");
+                    writer.write_sse(std.string(payload), std.string(e.type));
+                    sent = true;
+                }
+            }
+
+            if(s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped")
+                break;
+
+            if(!sent && std.millis() - last_ping > WS_STREAM_PING_MS) {
+                writer.write(": ping\n\n");
+                last_ping = std.millis();
+            }
+
+            std.sleep(WS_STREAM_POLL_MS);
+        }
+
+        writer.end();
+    });
+
+    return registry;
+}

@@ -15,7 +15,21 @@ engine/generators/extensions/
 │   └── passthrough.glsl         # the shader generator around the plugin reads it from here
 ├── glsl/
 │   ├── __init__.shio            # Loader for .glsl directories (src/__init__.glsl entry point)
-│   └── shader_loader.shio
+│   ├── shader_loader.shio
+│   └── annotation_controls.shio # the controls of a //@ (and #@) annotation type: shared with the py loader
+├── py/
+│   ├── __init__.shio            # Loader for Python scripts (.py file, or Name.py/src/__init__.py), #853
+│   ├── py_generator.shio        # controls from the #@ annotations, the Python server (in the uv venv of the asset,
+│   │                            # engine/python/py_env.shio), the frame loop, errors
+│   ├── py_annotations.shio      # the parser of the #@ annotations (no GUI)
+│   └── py_asset_runner.py       # the Python side: loads the script, sets its variables, calls process()
+│   └── shader_loader.shio       # also shader_annotation_control(): the control of a //@ annotation
+├── native/
+│   ├── __init__.shio            # Loader for native assets (src/__init__.native: a C ABI plugin, #201)
+│   ├── native_loader.shio       # shader_loader + the plugin's controls, values, inputs, picture, reload
+│   ├── native_asset.shio        # the part without a window: the spec, the import, the annotations, the passthrough
+│   │                            # source with the inputs, std.native_reload (tested headless)
+│   └── passthrough.glsl         # the shader around the plugin's picture
 ├── png/
 │   ├── __init__.shio            # Loader for .png image generators
 │   └── image_module.shio
@@ -66,7 +80,8 @@ See `engine/contracts/README.md`.
    `.mkv`, `.webm`, `.avi`, `.mxf`, `.mpg`, `.mpeg`, `.ts`, `.wmv`) all map to
    the `video` loader (see `docs/video.md` in the repository root).
 2. Otherwise (a bare directory), it checks for `path/src/__init__.shio`
-   (→ `asset`) or `path/src/__init__.glsl` (→ `glsl`).
+   (→ `asset`), `path/src/__init__.glsl` (→ `glsl`) or `path/src/__init__.native`
+   (→ `native`, a native asset: `core/shizoscript3_core_cabi/README.md`, *A native VibeVJ asset*).
 3. It then loads `engine/generators/extensions/<ext>/__init__.shio` into a
    `std.module()` and calls `load_extension(this)`.
 

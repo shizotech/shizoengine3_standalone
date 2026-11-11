@@ -8,6 +8,8 @@
 //                [--verbose-events]
 //
 //  What it does:
+//    * node info and task state come from the Router only (no direct Node API
+//      calls); the Router talks to Nodes over ShizoNet.
 //    * plain text from a TRUSTED chat is ONE router-agent turn: the agent
 //      (roles/router) reads get_nodes(), picks the node and delegates. The
 //      answer of the turn is sent back to that chat.
@@ -100,6 +102,7 @@ class TelegramRouter : Router
     tg_last_chat = 0;       // the last accepted message, for duplicate deliveries
     tg_last_text = "";
     tg_last_ms = 0;
+    tg_terminal_seen = [];   // taskids already rendered as a terminal message
     tg_events = "reports";  // "reports" = only what deserves attention (default)
                             // "all"    = every node event (the verbose stream)
     tg_lock = "telegram:chats";
@@ -570,19 +573,35 @@ class TelegramRouter : Router
 
     // one worker thread: sends queued event notifications, then runs one
     // router-agent turn. Telegram HTTP never happens on the shizonet thread.
+    //
+    // Nothing may end this thread: it is the only one that answers the chats
+    // and sends the notifications. An error in one turn used to end it for good -
+    // every later message was queued and never answered, no task report arrived.
     tg_worker()
     {
         for(tg_running) {
-            sent = tg_flush_out();
-
-            idx = tg_next_ready();
-
-            if(idx >= 0) {
-                tg_run_item(idx);
-                continue;
+            sent = 0;
+            try {
+                sent = tg_flush_out();
+            }
+            catch(e) {
+                std.error("[telegram] sending the notifications failed: ", e);
             }
 
-            if(!sent) {
+            ran = false;
+            try {
+                idx = tg_next_ready();
+
+                if(idx >= 0) {
+                    ran = true;
+                    tg_run_item(idx);
+                }
+            }
+            catch(e) {
+                std.error("[telegram] a queued message failed: ", e);
+            }
+
+            if(!sent && !ran) {
                 std.sleep(50);
             }
         }
@@ -645,12 +664,21 @@ class TelegramRouter : Router
         }
         cs.release();
 
-        if(first.kind == "cmd") {
-            tg_send(first.chatdata, tg_slow_command(first.text));
-            return;
-        }
+        try {
+            if(first.kind == "cmd") {
+                tg_send(first.chatdata, tg_slow_command(first.text));
+                return;
+            }
 
-        tg_run_turn(items);
+            tg_run_turn(items);
+        }
+        catch(e) {
+            // the messages are out of the queue: the chat learns that they failed
+            tg_active = None;
+            turn_attachments = [];
+            std.error("[telegram] the turn failed: ", e);
+            tg_send(first.chatdata, "This message failed on the router: " + std.string(e));
+        }
     }
 
     tg_run_turn(items)
@@ -1073,6 +1101,23 @@ class TelegramRouter : Router
 
     tg_push_event(e)
     {
+        kind = std.string(e.kind ?? "");
+        taskid = std.string(e.taskid ?? "");
+        st = std.string(e.state ?? "");
+
+        // One task, one terminal message. The Router de-duplicates its own
+        // task_finished/task_state pair, but this guard makes the chat safe even
+        // if both kinds arrive: the first terminal message wins.
+        if(taskid.length() > 0 && (kind == "task_finished" || kind == "task_state") &&
+            (st == "finished" || st == "failed" || st == "lost" || st == "stopped" || st == "question")) {
+            for(i = 0; i < tg_terminal_seen.size(); i++) {
+                if(tg_terminal_seen[i] == taskid) {
+                    return;
+                }
+            }
+            tg_terminal_seen.push_back(taskid);
+        }
+
         msg = tg_render_event(e);
 
         if(!msg) {

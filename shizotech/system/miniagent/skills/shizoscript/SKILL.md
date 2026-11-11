@@ -1,4 +1,4 @@
-<!-- generated from shizoscript_language_doc.md by post_compile.shio on 2026-10-28 - do not edit: edit the source and re-run post_compile.shio -->
+<!-- generated from shizoscript_language_doc.md by post_compile.shio on 2026-11-11 - do not edit: edit the source and re-run post_compile.shio -->
 
 # ShizoScript Code Generation
 
@@ -351,20 +351,22 @@ w = 5;
 inc(w);          // w is now 6
 
 both(a, &b) { a++; b++; }   // a by value, b by reference
-set(&v) { *v = 10; }        // assignment through a reference needs *
+set(&v) { v = 10; }         // writes the caller's variable
 ```
 
-Writing through a reference (reference variable, `&` parameter or `[&x]` lambda capture):
+Writing through a reference (`&` parameter, `[&x]` lambda capture, or a reference variable `r = &x`):
 
-| Statement | Changes the original? |
-|---|---|
-| `*v = 10;` / `*v += 5;` | YES |
-| `v++;` / `v--;` | YES |
-| `v = 10;` | NO (rebinds the local reference) |
-| `v += 5;` | NO |
-| `v.key = 1;` / `v.push_back(1);` (JSON, list, object) | YES (no `*` needed) |
+| Statement | `&` parameter / `[&x]` capture | reference variable `r = &x` |
+|---|---|---|
+| `v = 10;` / `v += 5;` (every compound assignment) | YES, writes the original | NO, rebinds `r` |
+| `*v = 10;` / `*v += 5;` | YES | YES |
+| `v++;` / `v--;` | YES | YES |
+| `v.key = 1;` / `v.push_back(1);` (JSON, list, object) | YES | YES |
+| `var v = 10;` in a nested block | NO, a new local that shadows `v` | - |
 
-ALWAYS use `*v = ...` / `*v += ...` to assign through a reference.
+Since 2026-10-28 (#170) an assignment to a name bound by `&` in a parameter list or a capture list writes through, like
+`v++` (before, `v = x` and `v += x` silently rebound the local reference). A reference variable made with `r = &x` stays
+a variable that holds a reference: `r = 5` rebinds it, `*r = 5` writes `x`.
 
 ---
 
@@ -379,7 +381,8 @@ Standard arithmetic, logical, comparison.
 === !==              // equality without converting between types, see 6.2
 && || !              // logical
 a ? b : c            // ternary, right-associative: "a ? b : c ? d : e" means "a ? b : (c ? d : e)"
-a ?? b               // b if a is falsy (see Runtime Pitfalls)
+a ?? b               // b if a is falsy: 0, 0.0, "", false, [] and None (see Runtime Pitfalls)
+a ??? b              // b only if a is None (also a missing key: obj.k ??? d), 0 / "" / false stay
 ++ --
 = += -= *= /= %= &= |= ^=
 ```
@@ -394,7 +397,7 @@ The order of C (and JS / Python for these operators):
 | Level | Operators | Notes |
 |---|---|---|
 | 1 (lowest) | `? :` | ternary, right-associative |
-| 2 | `??` | |
+| 2 | `??` `???` | left to right: `a ??? b ?? c` is `(a ??? b) ?? c` |
 | 3 | `\|\|` | |
 | 4 | `&&` | |
 | 5 | `\|` | bitwise or |
@@ -698,7 +701,7 @@ Checklist:
 - Shizoscript JSONS do not differentiate between objects and lists syntactically. 
 - However, when converted to a string (or constructed from a string) it produces and accepts the official JSON syntax to keep compatibility.
 - **Keys named like a JSON method**: the names the JSON type itself registers are `push`, `push_back`, `pop`, `pop_back`, `insert`, `size`, `clear`, `clear_free`, `key`, `has`, `has_value`, `has_value_str`, `geti`, `hasi`, `erase`, `remove`, `erase_value`, `remove_value`, `remove_all_keys`, `copy`, `sort`, `sort_reverse`, `rsort`, `sort_by`, `string`, `compact_string`, `combine_string`, `from_string`, `filter_key`, `filter_value`, `filter`, `merge`, `append`, `map`, `reduce`, `any`, `all`, `foreach`, `to_list`, `resize`, `unique`, `push_cyclic`, `debug_refs` (43 in total, from `shz_std_json::script_register()`). Writing such a name is a data write, so `[size = 1]`, `obj.size = 5` and `obj["size"] = 5` all create the key (#569).
-- READING `obj.size` resolves to the METHOD, also when the JSON carries a key of exactly that name; the value behind that key is only readable as `obj["size"]` (that precedence is fixed; do not rely on the dot form for such keys). Since #569 a dot read of a name that is a method **and** a key of that JSON prints a one-line runtime warning, once per method name and process: `Runtime Warning: the json key "key" is hidden by the built-in json method of that name: obj.key is the method, use obj["key"] to read the value`. A call (`obj.size()`, `obj.key(0)`) asks for the method and does not warn. The warning changes nothing - it only makes the trap visible. Names that are **not** JSON members (`keys`, `length`, `name`, `type`, `find`, `data`, ...) are ordinary keys and read their value. `key` is additionally reserved inside a `foreach`/`map` callback, where it names the loop key.
+- READING `obj.size` gives the VALUE when the JSON holds a key `size` (the key wins a dot read, decided 2026-10-28, #569 / #660), the same as `obj["size"]` and `obj.size ?? x`; a JSON without that key gives the method. A CALL (`obj.size()`, `obj.key(0)`, `obj.map(f)`) is always the method, also when the JSON holds a key of that name (a function stored under such a key is called as `f = obj.map; f(x)` or `obj["map"](x)`). Before 2026-10-28 the method won the dot read and only `obj["size"]` reached the value. Names that are **not** JSON members (`keys`, `length`, `name`, `type`, `find`, `data`, ...) are ordinary keys and read their value. `key` is additionally reserved inside a `foreach`/`map` callback, where it names the loop key.
 
 ---
 
@@ -715,6 +718,54 @@ using std, math;    // several at once
 import nanogui;     // load a native module
 import curl, zip;   // several at once
 ```
+
+`import x;` loads the package `x` (`shizotech/packages/x/` next to the interpreter or on a search path): every library
+of `x/native/<platform>/` whose name contains `shzmodule`. A failed import is a syntax error of the script;
+`std.import("x")` tries at run time and returns 0 when it failed. Besides the modules built from the ShizoScript
+sources, a package can hold a plugin of the stable C ABI (#201): plain C against
+`core/shizoscript3_core_cabi/include/shz_abi.h`, no core source needed. Its functions and types work like built-in
+ones (`plugin.fn(x)`, `obj = plugin.type(args)`, `obj.method()`, `obj.property`, `std.type(obj)` is
+`"plugin.type"`), its errors are runtime errors that `try` / `catch` catches, its objects are finalized when the last
+reference goes or by `std.free(obj)`. A plugin built for another C ABI version is refused at import with a message.
+Guide for plugin authors: `core/shizoscript3_core_cabi/README.md`.
+
+Native libraries run with the full rights of the process, so the host decides which may load: a script in restricted
+mode (`shzscript_config_restricted`, `shz --restricted std,fileio,...`) cannot import a package that has native
+libraries, and an allow-list of the configuration (`native_allow_list`, `shz --native-allow zip` or
+`--native-allow zip=<sha256>`) admits only the packages / files it names, optionally only with that SHA-256. A refused
+import fails like any other (`Import of module 'zip' refused: ...`, `std.import` returns 0). Packages with scripts only
+are not affected.
+
+Restricted mode also limits what the code of the script reaches, checked at compile time (#40). A refused name or
+file is a compile error, the script does not run:
+
+- **Namespaces**: only what the allow list names (`allow_list` of `shzscript_config_restricted`, `shz --restricted
+  std,math`). An entry is a dotted path and allows that name and everything below it: `std` allows `std.print` and
+  `std.string`, `std.print` allows only `std.print`, `cabi_example.math` allows `cabi_example.math.square` but not
+  `cabi_example.add`. The full path of every use is checked: a call `std.x()`, a function value `f = std.x;`, a child
+  namespace, and a name of a `using` namespace (`using std; print("x");` is `std.print`). `using ns;` needs an
+  entry for `ns` itself. Message: `*** 'std.string' is not allowed in restricted mode: it is not on the allow list of
+  the script.`
+- **Host builtins**: an entry `std` does not allow the builtins of std that start processes, touch the file system,
+  the network or the environment, load code or act on the host process. Only an entry with the name of one allows
+  it (`shz --restricted std,std.system`). The list (`shz_restricted_deny` in `core/shizoscript3_core/shz_script.cpp`):
+  `std.system`, `std.import`, `std.module`, `std.resolve_source_file`, `std.resolve_source_text`, `std.cd`, `std.wd`,
+  `std.set_env`, `std.home`, `std.system_path`, `std.save_config`, `std.load_config`, `std.config_path`,
+  `std.user_path`, `std.local_app_path`, `std.local_app_data`, `std.local_app_cache`, `std.path`,
+  `std.local_executable`, `std.web_get`, `std.exitprocess`, `std.hideconsole`, `std.messagebox`,
+  `std.kernel_compile`, `std.kernel_jit`, `std.kernel_aot_load`, `std.kernel_jit_compiler`, `std.kernel_cache_dir`
+  and the namespace `fileio`. The names are the same in every mode. Message: `*** 'std.system' is not allowed in
+  restricted mode: it reaches out of the script (processes, files, network, environment or loading code), only an
+  allow list entry 'std.system' allows it.`
+- **`#include`**: only files under the directory of the main script and under the `include_dirs` of the
+  configuration (`shz --restricted-include <dir>`, it can be repeated). The file is looked for beside the including
+  file, then in the include dirs; the search paths and the working directory are not used. An absolute path is
+  refused, and so is a file that lies outside these directories once `..` and symbolic links are resolved (`../x`,
+  a link that points out): `*** Cannot include 'outside.shio': it is /home/me/outside.shio, outside the directory of
+  the script (restricted mode).` A source without a path (`load_code`, the prompt) can include only from the
+  include dirs.
+- Objects a host gives the script, and native code (plugins, modules), still run with the rights of the process:
+  restricted mode limits the script code, it is no sandbox for the host.
 
 ---
 
@@ -855,9 +906,9 @@ that calls into the script are serialised by it.
 
 - **Everything between two points where the lock is given up is atomic**: no other task of the script and no
   other thread runs script code in between. Variables, json, lists, strings, class members, `static` and the
-  variables of the global scope need no lock of their own, and statements that follow each other without a
-  blocking call are one step: in `c = t.count; t.count = c + 1;` nothing of this script runs between the two
-  statements.
+  variables of the global scope need no lock of their own, and on the main thread statements that follow each
+  other without a blocking call are one step: in `c = t.count; t.count = c + 1;` nothing of this script runs
+  between the two statements. On any other thread they are not (the auto-yield below).
 - The lock is given up here, and only here:
   - the task waits: `std.sleep()`, `join()`, `ev.wait()`, `sem.acquire()`, `cv.wait()`, `r.get()`, a
     `std.critical_section` another task holds (a waiting task holds no script lock, as above);
@@ -867,11 +918,27 @@ that calls into the script are serialised by it.
     `k.launch(n, ...)`, `job.wait()`, and the blocking calls of the modules (`curl`, `mqtt`, `leveldb`,
     `python`, `tgbot`, ...). Path helpers (`fileio.file_dir`, `file_name`) and plain builtins keep the lock;
     kernel lanes run no script code at all (see Kernels).
-  - the host leaves the script (the end of the `update()` that ran the task).
-- **Nothing else yields.** There is no time slice and no instruction limit: a task that computes without a
-  blocking call keeps the lock, so no other task of the script and no other thread that needs this script runs
-  until it ends. The yield is `std.sleep(0);` - the task suspends, the other tasks continue, and the lock is free
-  when the host leaves the script. In a long loop call it per item, or every few items.
+  - the host leaves the script (the end of the `update()` that ran the task);
+  - on a thread that is not the main thread of the script, while another thread waits for the lock: at the jump
+    back of a loop or between two calls (the auto-yield, next point).
+- **Auto-yield: a thread that is not the main thread hands the lock over when another thread waits** (#94). The
+  main thread of a script is the thread that calls `update()` (the frame loop of the host; before the first
+  `update()`, the thread that made the script). Script code that another thread runs (a host or module thread
+  that calls into the script) checks every 64 loop iterations or calls whether a thread waits for the lock - the
+  render thread for its frame, a task that comes back from a blocking call - and if so gives the lock to it and
+  takes it back after it. After it got the lock in turn it keeps it 1 ms at least, so two such threads do not pass
+  it back and forth all the time. While no thread waits nothing happens (one memory read per loop iteration).
+  So on such a thread statements without a blocking call between them are **not** one step: code of another
+  thread may run in between. Hold a `std.critical_section` around a check and the act that follows (16.2).
+  There is no auto-yield on the main thread (it gives the lock up at the end of every `update()`), inside the
+  callback of a builtin (`list.sort(cmp)`, `foreach`, `map`, ...: the builtin keeps its own state across the
+  callback) and in a call that the host makes while it holds `SCRIPTAUTOLOCK()` itself (a host that needs the
+  call to be one step). `std.thread` tasks run on the script thread: they are not affected, they still switch
+  only where they wait.
+- **On the main thread nothing else yields.** There is no time slice and no instruction limit: a task that
+  computes without a blocking call keeps the lock, so no other task of the script and no other thread that needs
+  this script runs until it ends. The yield is `std.sleep(0);` - the task suspends, the other tasks continue, and
+  the lock is free when the host leaves the script. In a long loop call it per item, or every few items.
 - **The lock is no queue.** The thread that takes it first has it, and a task that comes back from a blocking
   call has to take it again: it can wait an unbounded amount of host work. A task sharing its script with a busy
   thread pays for every blocking call with the time the other thread holds the lock, so few big calls (read a
@@ -889,8 +956,9 @@ that calls into the script are serialised by it.
 
 ### 16.2 Check-then-act across a blocking call
 
-A check and the act that follows are one step only when no blocking call lies between them. At a blocking call
-the lock is free, and a task that runs in between changes the world the check was about:
+A check and the act that follows are one step only when no blocking call lies between them, and on a thread that
+is not the main thread of the script not even then (the auto-yield of 16.1). At a blocking call the lock is free,
+and a task that runs in between changes the world the check was about:
 
 ```
 if (!fileio.exists(path))           // exists() gives the lock up while it asks the disk
@@ -912,15 +980,23 @@ if (!fileio.exists(path))
 - `std.critical_section()` without a name is the section of the code that creates it: every task that runs
   through that function shares it, the same call in another function is another section.
 - `std.critical_section("name")` (a `std.critical_section_named`) is one section for every place that uses that
-  name, in every script of the application. That is the lock for state that is not part of one script:
-  `std.global("name")` is one variable for every script of the application, so scripts that run at the same time
-  share it and need the section around a read, modify, write:
+  name, in every script of the application.
+- `std.global("name")` belongs to the script: the script, its `std.module()`s and its `std.thread()`s share one
+  variable of that name, by reference (a member written through `get()` is seen by the next read). Another
+  `shzscript` of the process (an embedding host can run several, one per thread) has its own. Tasks that read,
+  modify and write it across a blocking call need a section around it:
 
 ```
 n = std.global("counter");
-c = std.critical_section("counter");    // every script that touches the counter uses this name
-n.set(n.get() + 1);
+c = std.critical_section("counter");    // every task that touches the counter uses this name
+v = n.get();
+fileio.write_text(path, v);             // other tasks of the script run during this call
+n.set(v + 1);
 ```
+
+- `std.global_delete("name")` removes the global of the script: 1 if it existed, else 0. A variable that still
+  holds it keeps the old value, the next `std.global("name")` starts empty. The globals of a script are released when
+  the script ends, before its memory is freed (#54).
 
 - Every script runs on a thread of its own. When a script releases a named section that a task of another script
   waits for, that task continues in the next update of its own script, on its own thread (#54: before, it was
@@ -994,7 +1070,7 @@ Like in C, an `else` belongs to the nearest `if`: in `if(a) if(b) x(); else y();
 - NO {} for data
 - NO `struct` (only `class`)
 - NO variables used after the block that created them
-- NO `ref = value` / `ref += value` to write through a reference (parameter or capture), use `*ref = value` / `*ref += value`
+- NO `r = value` to write through a reference VARIABLE (`r = &x`), use `*r = value` (a `&` parameter or `[&x]` capture writes through with plain `v = value`)
 - NO new
 - NO null
 - NO function keyword
@@ -1018,7 +1094,7 @@ Before generating code:
 ## 21. Runtime Pitfalls
 
 - Single-line indentation-scoped `if`/`for` blocks are valid and can be easy to misread; use braces for clarity when needed. An unbraced body on the same line as the `if`/`else`/`for` is exactly one statement: in `if(c) a(); b();` only `a()` is conditional (see Indentation vs Brackets).
-- `??` is binary and truthiness-based (`a ?? b`), not a dedicated `None`-only coalescing operator.
+- `??` is binary and truthiness-based (`a ?? b`): `0 ?? 7`, `"" ?? 7` and `false ?? 7` are all `7`, like `None ?? 7`. For a default that replaces only `None` use `???` (issue #570): `0 ??? 7` is `0`, `None ??? 7` is `7`, `st.returncode ??? -1` keeps the exit code 0 of a successful command. Like `??`, `???` reads the last member or key without creating it (`obj.k ??? d`, `obj["k"] ??? d`, `list[i] ??? d`; a missing one counts as `None`; in `a.x.k ??? d` the read of `a.x` is an ordinary read) and runs the right side only when it is needed.
 - Integer division truncates (`7 / 2 == 3`).
 - Division by zero returns `0` (`x / 0 == 0`, also `x % 0`) and prints a one-line warning, once for each place in the code (`file.shio:12:8: Runtime Warning: Division by zero, the result is 0 (shown once for this place)`). It is NOT an error: the script continues, the exit code stays 0 and `try`/`catch` does NOT catch it. Check the divisor yourself if 0 is possible. In `#strict` code a literal `0` divisor is a compile error.
 - Variables of a namespace (`math.PI`, ...) are shared by every script and module: `math.PI = 3`, `math.PI += 1` and `math.PI++` are compile errors. Copy the value into a variable of your own (`p = math.PI;`). Members of an object held by a namespace variable can still be changed.
@@ -1110,7 +1186,7 @@ int length(Node? n) {
     if (n == None) { return 0; }      // after this line n is a Node
     return 1 + length(n.next);
 }
-int v = maybe ?? 0;                   // '??' gives a default
+int v = maybe ??? 0;                  // '???' gives a default for None ('??' also replaces 0)
 ```
 
 - `x != None`, `x == None` (with `else`), `!x`, `x` (truth) and `this.member` are recognized; assigning a value that may be `None` undoes the check.
@@ -1268,12 +1344,12 @@ fn = [local_var]() {
 local_var = "test";
 
 fn = [&local_var]() {
-    *local_var = "changed";
+    local_var = "changed";
 };
 ```
 
 - Captures a REFERENCE to `local_var`
-- Write through the reference with `*`: `*local_var = "changed";` changes the original variable. A plain `local_var = "changed";` (or `local_var += ...`) does NOT change the original (see the table in References).
+- `local_var = "changed";`, `local_var += ...` and `*local_var = "changed";` all change the original variable (#170, see the table in References). `list.foreach([&sum](e) { sum += e; })` sums into `sum`.
 - JSON / lists / objects do not need `*` for member changes (`list.push_back(2)`, `c[0] = "f"`).
 - Since references are also ref-counted in shizoscript, the original scoped value is kept alive as long as the lambda lives, even if it goes out of scope.
 
@@ -1382,7 +1458,9 @@ shz file_name
 shz --check file_name    // syntax check only (includes the strict mode checks), a directory checks every script in it
 shz --check --format=gcc file_name   // the same, one line per diagnostic: file:line:col: error: message
 shz --strict file_name   // strict mode for every file, as if each started with #strict
+shz --restricted std file_name   // restricted mode: only these namespaces, #include only below the script (section 11)
 shz --test [dir...]      // run the self-checking scripts of a directory, each in its own process, with a summary
+shz fmt <file or dir>... // format .shio files, whitespace only (--check: write nothing, list what would change)
 shz --watch file_name    // run it, start it again when it or a file it #includes changes
 shz -i                   // the prompt: one input at a time (also "shz" alone on a terminal without a script)
 ```
@@ -1435,6 +1513,21 @@ shz -i                   // the prompt: one input at a time (also "shz" alone on
   The output is one line per test (`ok <name>`, `FAIL <name>: <reason>`, `skip <name> (<reason>)`),
   then the output of every failed test, then `N passed / M failed / K skipped`; the process exits
   with `1` when a test failed. `_testing/shz_test_cli.shio` checks the runner itself.
+
+- `fmt` (#544; also `--fmt`) formats the `.shio` files given, a directory with every `.shio` below it
+  (directories whose name starts with `.` and `node_modules` are not walked). It changes whitespace only:
+  trailing spaces and tabs are removed, at most one blank line in a row, no blank line at the end, one
+  line break at the end of the file (`\r\n` stays `\r\n`), and leading spaces become tabs where they cover a
+  multiple of 4 columns. The lexer counts a tab as 4 columns and an unbraced block ends at the first
+  line not indented deeper than its `if` / `for` / `else`, so the column of a line is its meaning: a line
+  at another column (an aligned continuation line) keeps its whitespace, and a file with a line at 1 to 3
+  columns (two spaces per level) keeps its indentation. Strings, raw strings, `'''` / `"""` blocks and comments
+  keep their content, also trailing spaces and blank lines inside them. A file the lexer rejects (an
+  unterminated string or comment) is left as it is. `shz fmt --check` writes nothing and prints one line
+  `file:line:col: warning: what` per line that would change (the format of `--format=gcc`). Exit code: `0`
+  done, `1` with `--check` when a file would change, `2` when a file was left (not read, written or lexed).
+  Formatting twice changes nothing. Removed blank lines move the line numbers (`__LINE__`, error messages).
+  `_testing/shz_fmt_cli.shio` checks it.
 
 - The process exits with code `1` after an uncaught runtime error in the main script (errors caught by `try`/`catch` do not count).
 

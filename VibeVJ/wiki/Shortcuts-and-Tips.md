@@ -2,7 +2,7 @@
 
 All keys and mouse or touch gestures of VibeVJ on one page. A key works on the part of the screen you clicked last.
 
-> Screenshot to add: a generator window before and after pressing E (header shown, then hidden), side by side.
+![A generator window before and after E: the header shown, then hidden](media/header-e.png)
 
 ## Keys
 
@@ -19,6 +19,7 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
 | Shift + Space | Anywhere | Stop the timeline and go back to the start. |
 | T | Anywhere | Tap the tempo, like the *Tap* button: press it on each beat. |
 | Ctrl + B | Anywhere | [Blackout](Output-and-Devices.md#blackout): all outputs to black at once; again: back with a fade. |
+| Ctrl + L | Anywhere | [Show mode](Timeline.md#show-mode) on at once. To leave it, hold Ctrl + L for 400 ms, then let go: a short press does nothing. |
 | Ctrl + Z | The views | [Undo](The-Screen.md#undo-and-redo): takes back the last change of the layout, a link or a value. |
 | Ctrl + Y or Ctrl + Shift + Z | The views | Redo. |
 | Ctrl + E | An area of a view tab | *Split right*: an empty area appears beside it. |
@@ -42,13 +43,13 @@ All keys and mouse or touch gestures of VibeVJ on one page. A key works on the p
   After F6 they act on the marked area, until the mouse enters an area again. The buttons in the header of an area name
   their key in the tooltip. More in [The screen](The-Screen.md#views-and-tabs).
 - Undo, redo and the keys for areas are off in [show mode](Timeline.md#show-mode).
-- Ctrl + K, Ctrl + S, Ctrl + B, Space, Shift + Space and T work everywhere, also in show mode, but not while you type: a text field, a
+- Ctrl + K, Ctrl + S, Ctrl + B, Ctrl + L, Space, Shift + Space and T work everywhere, also in show mode, but not while you type: a text field, a
   value you type, the code editor (there Ctrl + S saves the code) and the mapping editors keep their keys. After a click
   on a button or a slider they work at once.
 
 ### On a Mac
 
-Cmd (⌘) does what this page calls Ctrl: Cmd + K, Cmd + S, Cmd + B, Cmd + Z, Cmd + E, Cmd + W, Cmd + 0, Cmd while dropping a clip, Cmd + C in a text
+Cmd (⌘) does what this page calls Ctrl: Cmd + K, Cmd + S, Cmd + B, Cmd + L, Cmd + Z, Cmd + E, Cmd + W, Cmd + 0, Cmd while dropping a clip, Cmd + C in a text
 field, and so on. macOS keeps a few keys for itself, so these differ:
 
 | Windows and Linux | Mac | Why |
@@ -164,7 +165,7 @@ More in [Clipview](Clipview.md) and [CueList](CueList.md).
 | Right click in an area | Opens [the menu of the area](The-Screen.md#the-menu-of-an-area). Not on a button, a text field or a control: they keep their own right click. |
 | Click the header of a generator in a Patchview | Selects it. Ctrl or Shift + click adds one or takes it away. |
 | Drag on the empty canvas of a Patchview | A frame that selects every generator it touches. With Shift or Ctrl it adds to the selection. |
-| Alt + drag a generator in a Patchview | Takes it, with the others that are selected, to another Patchview or into an area. Ctrl while dropping leaves copies. See [Select and move generators](Generators.md#select-and-move-generators). |
+| Alt + drag a generator in a Patchview | Takes it, with the others that are selected, to another Patchview, into an area, a Clipview cell, a CueList or the timeline. Ctrl while dropping leaves copies. See [Select and move generators](Generators.md#select-and-move-generators). |
 | Ctrl + C, Ctrl + V in a Patchview | Copies the selected generators and pastes them where the mouse is, with the links they have among themselves. See [Select and move generators](Generators.md#select-and-move-generators). |
 | Right click on a view tab of the top bar | *Rename…*, *Save layout as preset…*, *Delete tab…*. |
 | Double click a file in *Assets* | Opens it in a new tab. |
@@ -176,9 +177,19 @@ More in [Clipview](Clipview.md) and [CueList](CueList.md).
 | Mouse wheel over the timeline | Zooms around the mouse. |
 | Drag on the ruler | Left or right moves the view, up or down zooms. |
 | Right click on the ruler | Moves the playhead to the nearest whole beat. |
+| Shift + drag on the ruler | Draws the loop range. |
+| Drag a clip / its ends | Moves it, or makes it longer or shorter (Shift: no snapping). |
+| Delete on a selected clip | Deletes it (several selected: all of them). |
+| Shift + click / Ctrl + click on a clip | Adds it to the selection / adds or removes it. |
+| Drag on an empty part of the lanes | Selects the clips the band touches. |
+| Ctrl + C, Ctrl + V, Ctrl + D, Ctrl + A | Copy the selected clips, paste them at the playhead, duplicate them, select all ([clips](Timeline.md#clips-and-lanes)). |
+| Drag the grip of a lane head | Moves the lane ([lanes](Timeline.md#lanes)). |
+| Click on an envelope line / drag a point | Adds a point / moves it ([envelopes](Timeline.md#envelopes)). |
+| Alt + drag on an envelope | Bends the segment. |
+| Right click or double click on an envelope point | Deletes it. |
 | Click *Tap* on each beat | Sets the tempo. |
-| Click the lock | Turns show mode on. |
-| Hold the lock for 400 ms, then let go | Leaves show mode. |
+| Click the lock | Turns show mode on (or Ctrl + L). |
+| Hold the lock for 400 ms, then let go | Leaves show mode (or hold Ctrl + L as long). |
 
 More in [Timeline](Timeline.md).
 
@@ -212,7 +223,7 @@ When a file opens as text (for example a shader):
 
 ## Tips
 
-- **Before the show,** turn on [show mode](Timeline.md#show-mode). Nothing can be linked, moved or closed by accident,
+- **Before the show,** turn on [show mode](Timeline.md#show-mode) (Ctrl + L). Nothing can be linked, moved or closed by accident,
   but every value, clip and MIDI control keeps working.
 - **Lost a cable?** Turn on *Cable view* with the link button in the timeline bar to see every link on screen. With
   *Off-screen link hints* a badge counts the links that end somewhere you cannot see. See

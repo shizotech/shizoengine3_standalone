@@ -1,0 +1,1780 @@
+// ============================================================================
+// webremote.shio — the web remote of VibeVJ (#359)
+//
+// A web app for a phone or tablet in the same network: the transport (play, stop, tap, BPM), the blackout, the clips
+// of every Clipview (launch a clip, a column, stop a layer, the layer masters), named pages of controls (faders,
+// buttons, choices, XY pads) that the phone can edit itself, and a small live picture of an output or a view. Served
+// by the webserver module, no internet, nothing from a CDN.
+//
+//   GET  /, /app.js, /app.css, /icon.svg   the web app (engine/webremote/www, only these files)
+//   POST /api/pair    {pin, name}           the PIN shown in VibeVJ -> {token}; the phone keeps the token
+//   GET  /api/state                         {layout, values} (header X-Remote-Token)
+//   GET  /api/events?t=<token>              Server-Sent Events: "layout" when the pages or the clips change,
+//                                           "values" when a value changes (checked every 40 ms)
+//   POST /api/set     {v: {id: value}}      values of controls of the pages and layer masters (m:<view>:<row>)
+//   POST /api/action  {a: play|stop|tap|bpm|blackout|clip|column|stop_layer, ...}
+//   GET  /api/controls                      the controls of the project a page can take (edit mode of the phone)
+//   POST /api/edit    {op, ...}             edit the pages: add, remove, move, set (label, kind, size, y), page_add,
+//                                           page_rename, page_remove, page_move. Not in show mode
+//   GET  /api/preview?src=<id>&after=<n>    the live preview: the next picture of a source (another than frame n) as
+//                                           JSON {frame, w, h, img (JPEG, base64)}; 204 when none came within 1.5 s
+//
+// Trust model (wiki: Web-Remote):
+//   - Off by default. On: it listens on the address picked in Devices > Network > Web remote (every network, one
+//     network card, or this computer only).
+//   - Every /api call but /api/pair needs a token. A token comes only from /api/pair with the PIN shown in VibeVJ
+//     (6 digits; 5 tries a minute per address; after 20 wrong tries in all the PIN changes). "New PIN" also forgets
+//     every paired phone. Tokens are kept in configs/web_remote.json on this computer.
+//   - The remote reaches only the transport, the blackout, the clips and the controls on its pages: no files, no
+//     projects, no settings. While "Phones can edit the pages" is on (the default) a paired phone can put any control
+//     of the project that the remote can show on a page; off, the pages stay as they were made in VibeVJ. It serves
+//     only the files of its web app.
+//   - The live preview is off until it is switched on in VibeVJ, and it needs the token too. Pictures are made only
+//     while a phone asks for them (they stop WEB_REMOTE_PREVIEW_IDLE_MS after the last request).
+//   - Writes are limited per phone (WEB_REMOTE_MAX_WRITES a second, WEB_REMOTE_MAX_VALUES values each), previews to
+//     WEB_REMOTE_MAX_PREVIEWS requests a second.
+//   - Plain HTTP: anyone who can read the network traffic of the venue Wi-Fi can read a token. Use a network of your
+//     own for shows where that matters.
+// Values are set like MIDI sets them (control.value from a script): no steps of the undo history, links follow. Show
+// mode does not stop the remote (it plays, it does not edit); editing the pages (in VibeVJ or on the phone) waits.
+//
+// The live preview: a hidden shader per picture shrinks it on the GPU (WEB_REMOTE_PREVIEW_COPY at the preview size)
+// and reads it back asynchronously (pixel_readback: a PBO, the render loop does not wait for it). tick() (engine
+// on_frame_finished, render thread) makes and frees the hidden shaders and renders them fps times a second; the pixel
+// callback keeps the frame (a copy of w x h x 3 bytes). The request of a phone encodes the newest frame with
+// nanogui.encode_jpeg, which runs on a worker thread, and answers it as base64 in JSON (a binary body of the webserver
+// module ends at its first zero byte, #359). The encoder is called through engine/webremote/jpeg.shio, loaded at run
+// time: with a nanogui module that has no encode_jpeg (an older build) that file does not compile, the preview answers
+// 501 and the rest of the remote works (a missing namespace function named in this file would stop all of it).
+// ============================================================================
+
+#include "qrcode"
+
+WEB_REMOTE_DEFAULT_PORT = 13350;
+WEB_REMOTE_CONFIG_PATH = "configs/web_remote.json";
+WEB_REMOTE_WWW = "engine/webremote/www/";
+WEB_REMOTE_MAX_WRITES = 60;      //write requests per second and phone
+WEB_REMOTE_MAX_VALUES = 64;      //values in one /api/set
+WEB_REMOTE_MAX_DEVICES = 16;     //paired phones kept (the oldest goes)
+WEB_REMOTE_PAIR_TRIES = 5;       //PIN tries per minute and address
+WEB_REMOTE_PAIR_FAILS = 20;      //wrong PINs in all before the PIN changes
+WEB_REMOTE_BAD_TOKENS = 30;      //requests with a wrong token per minute and address before they get 429
+WEB_REMOTE_KINDS = ["fader", "hfader", "button", "choice", "xy", "number"];
+WEB_REMOTE_MAX_PAGES = 16;       //pages of a project
+WEB_REMOTE_MAX_PAGE_CONTROLS = 64; //controls on one page
+WEB_REMOTE_MAX_CATALOG = 4000;   //controls /api/controls lists at most
+WEB_REMOTE_NAME_MAX = 40;        //characters of a page name or a label
+WEB_REMOTE_DEFAULT_PAGE = "Controls";
+
+//The live preview
+WEB_REMOTE_PREVIEW_WIDTHS = [160, 240, 320, 480, 640];
+WEB_REMOTE_PREVIEW_IDLE_MS = 4000;    //a picture stops this long after the last request for it
+WEB_REMOTE_PREVIEW_MAX_SOURCES = 2;   //pictures made at once (each phone picks its own)
+WEB_REMOTE_PREVIEW_WAIT_MS = 1500;    //a request waits this long for a new frame
+WEB_REMOTE_MAX_PREVIEWS = 40;         //preview requests per second and phone
+//The copy that shrinks the picture: 4 x 4 samples of the full size picture (level 0, as the output textures of the
+//shaders have no smaller levels) for each pixel of the preview, so a fine pattern does not flicker
+WEB_REMOTE_PREVIEW_COPY = R"(uniform sampler2D src;
+void main() {
+	vec2 step = vec2(dFdx(v_uv.x), dFdy(v_uv.y)) / 4.0;
+	vec3 sum = vec3(0.0);
+	for(int i = 0; i < 4; i++)
+		for(int j = 0; j < 4; j++)
+			sum += textureLod(src, v_uv + step * (vec2(float(i), float(j)) - 1.5), 0.0).rgb;
+	fragColor = vec4(sum / 16.0, 1.0);
+}
+)";
+
+//The JPEG encoder of the preview, loaded at run time (see above)
+WEB_REMOTE_JPEG_FILE = "engine/webremote/jpeg.shio";
+WEB_REMOTE_NO_JPEG = "This build of VibeVJ has no JPEG encoder (nanogui.encode_jpeg): the live preview needs the update of the program.";
+
+//The JPEG encoder of a file (WEB_REMOTE_JPEG_FILE): [module, encode] or None when it cannot be loaded
+web_remote_load_jpeg(path) {
+	try {
+		mod = std.module();
+		if(mod.load_file(path) && mod.has("encode"))
+			return [module = mod, encode = mod.get("encode")];
+	}
+	catch(e) {}
+	return None;
+}
+
+//The files of the web app: url -> file in WEB_REMOTE_WWW and its type. Nothing else is served
+WEB_REMOTE_FILES = [
+	[url = "/", file = "index.html", type = "text/html; charset=utf-8"],
+	[url = "/index.html", file = "index.html", type = "text/html; charset=utf-8"],
+	[url = "/app.js", file = "app.js", type = "text/javascript; charset=utf-8"],
+	[url = "/app.css", file = "app.css", type = "text/css; charset=utf-8"],
+	[url = "/icon.svg", file = "icon.svg", type = "image/svg+xml"],
+];
+
+//A secret of n x 8 hex digits. std.random_hash seeds its generator from std::random_device on every call, so each
+//call adds its own 32 bits
+web_remote_secret(chunks) {
+	text = "";
+	for(i = 0; i < chunks; i++)
+		text += std.random_hash(8);
+	return text;
+}
+
+web_remote_new_pin() {
+	digits = "";
+	hex = std.random_hash(12);
+	for(c : hex) {
+		if(digits.size() >= 6)
+			break;
+		if(c >= "0" && c <= "9")
+			digits += c;
+	}
+	for(digits.size() < 6) {
+		h = std.random_hash(1);
+		if(h >= "0" && h <= "9")
+			digits += h;
+	}
+	return digits;
+}
+
+web_remote_flag(value) {
+	if(std.is_none(value))
+		return false;
+	text = std.string(value);
+	return text == "1" || text == "true";
+}
+
+web_remote_is_number(v) {
+	t = std.type(v);
+	return t == "int" || t == "float";
+}
+
+//Rounded, so a value that only wobbles in the last digits is no change for the phones
+web_remote_round(v) {
+	return math.floor(std.float(v) * 10000.0 + 0.5) / 10000.0;
+}
+
+//A short name of the device from its User-Agent
+web_remote_device_name(agent) {
+	a = std.string(agent);
+	for(name : ["iPad", "iPhone", "Android", "Macintosh", "Windows", "Linux"]) {
+		if(a.contains(name))
+			return name == "Macintosh" ? "Mac" : name;
+	}
+	return "Browser";
+}
+
+web_remote_json(body, status = 200) {
+	return [
+		status_code = status,
+		headers = ["Content-Type" = "application/json", "Cache-Control" = "no-store", "X-Content-Type-Options" = "nosniff"],
+		body = body.compact_string(),
+	];
+}
+
+web_remote_error(status, text) {
+	return web_remote_json([ok = 0, error = text], status);
+}
+
+//A name from the phone or VibeVJ: trimmed, at most WEB_REMOTE_NAME_MAX characters, "" when there is none
+web_remote_clean_name(value) {
+	if(std.is_none(value))
+		return "";
+	text = std.string(value).trim();
+	if(text.length() > WEB_REMOTE_NAME_MAX)
+		text = text.substr(0, WEB_REMOTE_NAME_MAX).trim();
+	return text;
+}
+
+//"assets/Shaders/Sources/Basic/Aurora.glsl" -> "Aurora"
+web_remote_file_name(path) {
+	name = std.string(path).split("/")[-1];
+	for(ext : [".glsl", ".asset", ".menu", ".shio", ".preset"]) {
+		if(name.ends(ext))
+			return name.substr(0, name.length() - ext.length());
+	}
+	return name;
+}
+
+//The width a kind takes on a page by default: 1 one cell, 2 two cells, 3 the whole row
+web_remote_default_size(kind) {
+	if(kind == "choice")
+		return 3;
+	if(kind == "xy" || kind == "number" || kind == "hfader")
+		return 2;
+	return 1;
+}
+
+//The component controls of a vector control (in its content widget)
+web_remote_vector_parts(ctrl) {
+	parts = [];
+	for(i = 0; i < ctrl.child_count(); i++) {
+		w = ctrl.children(i);
+		for(j = 0; j < w.child_count(); j++) {
+			c = w.children(j);
+			t = std.string(c);
+			if(t == "nanogui.midicontrolslider" || t == "nanogui.midicontrolfloat" || t == "nanogui.midicontrolint")
+				parts.push_back(c);
+		}
+	}
+	return parts;
+}
+
+// The kind of a control on a page, from its type: [kind, kinds (what it can be shown as), min, max, whole (an int
+// control), opts, ranges, toggle]. A fader can also be a horizontal fader, a number, or the X of an XY pad whose Y is
+// a second fader (entry.y)
+web_remote_describe(ctrl) {
+	type = std.string(ctrl);
+	if(type == "nanogui.midicontrolbutton")
+		return [kind = "button", kinds = ["button"], toggle = ctrl.push() ? 1 : 0];
+	if(type == "nanogui.midicontrolcombo") {
+		opts = [];
+		for(item : ctrl.items())
+			opts.push_back(std.string(item).trim());
+		return [kind = "choice", kinds = ["choice"], opts = opts];
+	}
+	if(type == "nanogui.midicontrolslider" || type == "nanogui.midicontrolfloat" || type == "nanogui.midicontrolint") {
+		lo = std.float(ctrl.min());
+		hi = std.float(ctrl.max());
+		is_int = type == "nanogui.midicontrolint" ? 1 : 0;
+		//A number field without a sensible range (the whole float range) gets - / + instead of a fader
+		if(!(hi > lo) || hi - lo > 100000.0)
+			return [kind = "number", kinds = ["number"], min = lo, max = hi, whole = is_int];
+		return [kind = "fader", kinds = ["fader", "hfader", "number", "xy"], min = lo, max = hi, whole = is_int];
+	}
+	if(type == "nanogui.midicontrolvector") {
+		parts = web_remote_vector_parts(ctrl);
+		if(parts.size() >= 2) {
+			ranges = [];
+			for(p : parts)
+				ranges.push_back([std.float(p.min()), std.float(p.max())]);
+			return [kind = "xy", kinds = ["xy"], ranges = ranges];
+		}
+	}
+	return None;
+}
+
+//The picture of a generator: the value of its output (a shader, a video), or None
+web_remote_picture(target) {
+	out = None;
+	try {
+		out = target.dispatch("get_default_output");
+	}
+	catch(e) {
+		out = None;
+	}
+	if(!out) {
+		try {
+			out = target.node.get_control_by_path("default_io@OUT");
+		}
+		catch(e) {
+			out = None;
+		}
+	}
+	if(!out)
+		return None;
+	pic = None;
+	try {
+		pic = out.value();
+	}
+	catch(e) {
+		return None;
+	}
+	if(!pic || !std.string(pic).starts("nanogui."))
+		return None;
+	return pic;
+}
+
+class web_remote
+{
+	engine = None;
+	http = None;
+	running = false;
+	error = "";
+
+	//configs/web_remote.json: port, bind ("" every network, "127.0.0.1", or the address of a card), autostart, pin,
+	//devices ([token, name, paired]), phone_edit, preview (0 / 1), preview_fps, preview_width, preview_quality.
+	//Personal, like configs/mcp_server.json: not in the project
+	config = [];
+	//The pages of the remote, saved with the project (web_remote.json): [id, name, controls = [[id, path, label, kind,
+	//size (0: the default of its kind), y (the Y fader of an XY pad made of two faders, else "")]]]
+	pages = [];
+	controls_revision = 0;
+
+	//SSE streams: id -> [stop, name, since]
+	streams = [];
+	//Rate limits: token -> [start, count]; address -> [start, count]
+	write_windows = [];
+	pair_windows = [];
+	bad_token_windows = [];
+	preview_windows = [];
+	pair_fails = 0;
+	requests = 0;
+
+	//Cached for all streams
+	layout_text = "";
+	layout_at = 0;
+	values_text = "";
+	values_at = 0;
+	catalog_text = "";
+	catalog_at = 0;
+	sources_cache = [];
+	sources_at = 0;
+
+	//The live preview: source id -> time of the last request (the requests write it, tick() reads it), source id ->
+	//capture ([shader, pic, w, h, seq, buf, taken, encoding, encoded, jpeg, frame, checked]), and what it cost
+	preview_wanted = [];
+	captures = [];
+	preview_stats = [];
+	capture_host = None; //the hidden widget that holds the hidden shaders
+	preview_frames = 0; //the number of the last picture sent
+	jpeg = None; //[module, encode] of WEB_REMOTE_JPEG_FILE, None when this build has no encoder
+
+	files = []; //url -> [body, type], read when the server starts
+
+	on_change = None; //callback(): running, devices or the PIN changed (the menu shows it)
+
+	__init__(eng) {
+		engine = eng;
+		pages = [];
+		streams = std.json();
+		write_windows = std.json();
+		pair_windows = std.json();
+		bad_token_windows = std.json();
+		preview_windows = std.json();
+		preview_wanted = std.json();
+		captures = std.json();
+		files = std.json();
+		reset_stats();
+		load_config();
+		jpeg = web_remote_load_jpeg(WEB_REMOTE_JPEG_FILE);
+		if(!jpeg)
+			std.warn("Web remote: " + WEB_REMOTE_NO_JPEG + " The rest of the web remote works.");
+		load_state(None);
+	}
+
+	__deinit__() {
+		stop();
+		stop_previews();
+	}
+
+	// =========================================================================
+	// Settings of this computer
+	// =========================================================================
+
+	load_config() {
+		config = [port = WEB_REMOTE_DEFAULT_PORT, bind = "", autostart = 0, pin = "", devices = [], phone_edit = 1,
+			preview = 0, preview_fps = 5, preview_width = 320, preview_quality = 60];
+		if(fileio.exists(WEB_REMOTE_CONFIG_PATH)) {
+			try {
+				config.merge(fileio.read_json(WEB_REMOTE_CONFIG_PATH));
+			}
+			catch(e) {
+				std.warn("Web remote: cannot read " + WEB_REMOTE_CONFIG_PATH + ": " + e);
+			}
+		}
+		config.port = std.int(config.port);
+		config.bind = std.is_none(config.bind) ? "" : std.string(config.bind);
+		config.autostart = web_remote_flag(config.autostart) ? 1 : 0;
+		config.phone_edit = web_remote_flag(config.phone_edit) ? 1 : 0;
+		config.preview = web_remote_flag(config.preview) ? 1 : 0;
+		set_preview(None, config.preview_fps, config.preview_width, config.preview_quality, false);
+		pin_text = std.is_none(config.pin) ? "" : std.string(config.pin);
+		if(pin_text.size() != 6) {
+			config.pin = web_remote_new_pin();
+			save_config();
+		}
+		else
+			config.pin = pin_text;
+		if(!std.is_json(config.devices))
+			config.devices = [];
+	}
+
+	save_config() {
+		try {
+			fileio.write_json(WEB_REMOTE_CONFIG_PATH, config.copy());
+		}
+		catch(e) {
+			std.warn("Web remote: cannot write " + WEB_REMOTE_CONFIG_PATH + ": " + e);
+		}
+	}
+
+	changed() {
+		if(std.is_function(on_change))
+			on_change();
+	}
+
+	//A new PIN, and every paired phone has to pair again
+	new_pin() {
+		config.pin = web_remote_new_pin();
+		config.devices = [];
+		pair_fails = 0;
+		for(i = 0; i < streams.size(); i++)
+			streams[i].stop = true;
+		save_config();
+		changed();
+	}
+
+	device_count() {
+		return config.devices.size();
+	}
+
+	stream_count() {
+		return streams.size();
+	}
+
+	//The live preview: on (None keeps it), frames a second, width in pixels, JPEG quality. Clamped to what makes sense
+	set_preview(on, fps = None, width = None, quality = None, save = true) {
+		if(!std.is_none(on))
+			config.preview = web_remote_flag(on) ? 1 : 0;
+		if(!std.is_none(fps))
+			config.preview_fps = math.clamp(std.int(fps), 1, 15);
+		if(!std.is_none(width)) {
+			w = std.int(width);
+			best = WEB_REMOTE_PREVIEW_WIDTHS[0];
+			for(c : WEB_REMOTE_PREVIEW_WIDTHS) {
+				if(math.abs(c - w) < math.abs(best - w))
+					best = c;
+			}
+			config.preview_width = best;
+		}
+		if(!std.is_none(quality))
+			config.preview_quality = math.clamp(std.int(quality), 20, 95);
+		if(save) {
+			save_config();
+			changed();
+		}
+	}
+
+	// =========================================================================
+	// Server
+	// =========================================================================
+
+	//The addresses the phones can use: [[name, ip]], the picked one first
+	addresses() {
+		list = [];
+		bind_ip = config.bind;
+		if(bind_ip == "127.0.0.1")
+			return [["This computer", "127.0.0.1"]];
+		try {
+			for(c : shizonet.interfaces()) {
+				if(c.loopback || !c.up || c.ip == "" || c.ip.contains(":"))
+					continue;
+				if(bind_ip != "" && c.ip != bind_ip)
+					continue;
+				entry = [c.name, c.ip];
+				if(c.physical)
+					list.insert(0, entry);
+				else
+					list.push_back(entry);
+			}
+		}
+		catch(e) {}
+		if(list.size() == 0)
+			list.push_back(["This computer", bind_ip != "" ? bind_ip : "127.0.0.1"]);
+		return list;
+	}
+
+	url() {
+		a = addresses();
+		return "http://" + a[0][1] + ":" + std.string(config.port) + "/";
+	}
+
+	//The address with the PIN: opened from the QR code, the page pairs by itself
+	pair_url() {
+		return url() + "#pin=" + config.pin;
+	}
+
+	start(port = -1, bind_ip = None) {
+		if(running)
+			stop();
+		if(port > 0)
+			config.port = std.int(port);
+		if(!std.is_none(bind_ip))
+			config.bind = std.string(bind_ip);
+		error = "";
+
+		files = std.json();
+		for(f : WEB_REMOTE_FILES) {
+			body = "";
+			try {
+				body = fileio.read_text(WEB_REMOTE_WWW + f.file);
+			}
+			catch(e) {}
+			if(!body) {
+				error = "The web app is missing (" + WEB_REMOTE_WWW + f.file + ").";
+				changed();
+				return false;
+			}
+			files[f.url] = [body = body, type = f.type];
+		}
+
+		http = webserver.http_server();
+		//"" (every address) without the second argument: a webserver module built before #359 (the tracked Windows
+		//dll until the build machine rebuilds it) has init(port) only and stops at init(port, bind)
+		if(!(config.bind == "" ? http.init(config.port) : http.init(config.port, config.bind))) {
+			error = "'" + config.bind + "' is no IP address.";
+			http = None;
+			changed();
+			return false;
+		}
+		for(f : WEB_REMOTE_FILES) {
+			file_url = f.url;
+			http.route("GET", file_url, [this, file_url](req, writer) {
+				return this.serve_file(file_url);
+			});
+		}
+		http.route("POST", "/api/pair", this.handle_pair);
+		http.route("GET", "/api/state", this.handle_state);
+		http.route("GET", "/api/events", this.handle_events);
+		http.route("POST", "/api/set", this.handle_set);
+		http.route("POST", "/api/action", this.handle_action);
+		http.route("GET", "/api/controls", this.handle_controls);
+		http.route("POST", "/api/edit", this.handle_edit);
+		http.route("GET", "/api/preview", this.handle_preview);
+		if(!http.start()) {
+			error = "Cannot open port " + config.port + (config.bind != "" ? " on " + config.bind : "") + " (in use by another program?).";
+			http = None;
+			changed();
+			return false;
+		}
+		running = true;
+		std.print("Web remote: " + url() + " (PIN " + config.pin + ")");
+		save_config();
+		changed();
+		return true;
+	}
+
+	stop() {
+		if(!running && !http)
+			return;
+		running = false;
+		for(i = 0; i < streams.size(); i++)
+			streams[i].stop = true;
+		if(http)
+			http.stop();
+		http = None;
+		changed();
+	}
+
+	// =========================================================================
+	// Requests
+	// =========================================================================
+
+	serve_file(file_url) {
+		requests++;
+		f = files[file_url];
+		return [
+			status_code = 200,
+			headers = [
+				"Content-Type" = f.type,
+				"Cache-Control" = "no-cache",
+				"X-Content-Type-Options" = "nosniff",
+				"Referrer-Policy" = "no-referrer",
+				"Content-Security-Policy" = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'",
+			],
+			body = f.body,
+		];
+	}
+
+	//[start, count] of a window of window_ms in table[key]; true while count stays at most limit
+	within(table, key, limit, window_ms) {
+		now = std.millis();
+		if(!table.has(key) || now - table[key].start > window_ms)
+			table[key] = [start = now, count = 0];
+		table[key].count += 1;
+		return table[key].count <= limit;
+	}
+
+	//The paired device of the request, or None
+	device_of(req) {
+		token = "";
+		if(req.headers.geti("x-remote-token"))
+			token = std.string(req.headers.geti("x-remote-token"));
+		if(token == "" && req.query_params.geti("t"))
+			token = std.string(req.query_params.geti("t"));
+		if(token.size() < 32)
+			return None;
+		for(d : config.devices) {
+			if(d.token == token)
+				return d;
+		}
+		return None;
+	}
+
+	//None when the request may go on, else the answer
+	refuse(req) {
+		if(!running)
+			return web_remote_error(503, "The web remote is off.");
+		if(device_of(req))
+			return None;
+		if(!within(bad_token_windows, req.client_ip, WEB_REMOTE_BAD_TOKENS, 60000))
+			return web_remote_error(429, "Too many requests without pairing.");
+		return web_remote_error(401, "Not paired: enter the PIN shown in VibeVJ.");
+	}
+
+	body_of(req) {
+		try {
+			b = std.json(req.body);
+			if(std.is_json(b))
+				return b;
+		}
+		catch(e) {}
+		return None;
+	}
+
+	handle_pair(req, writer) {
+		requests++;
+		if(!running)
+			return web_remote_error(503, "The web remote is off.");
+		if(!within(pair_windows, req.client_ip, WEB_REMOTE_PAIR_TRIES, 60000))
+			return web_remote_error(429, "Too many tries. Wait a minute.");
+		b = body_of(req);
+		pin = b && b.has("pin") ? std.string(b["pin"]).trim() : "";
+		if(pin == "" || pin != config.pin) {
+			pair_fails++;
+			if(pair_fails >= WEB_REMOTE_PAIR_FAILS) {
+				std.warn("Web remote: " + pair_fails + " wrong PINs, the PIN was changed");
+				new_pin();
+			}
+			return web_remote_error(403, "Wrong PIN.");
+		}
+		pair_fails = 0;
+		token = web_remote_secret(4);
+		name = web_remote_device_name(req.user_agent);
+		config.devices.push_back([token = token, name = name, paired = std.timestamp()]);
+		for(config.devices.size() > WEB_REMOTE_MAX_DEVICES)
+			config.devices.erase(0);
+		save_config();
+		changed();
+		return web_remote_json([ok = 1, token = token, name = name]);
+	}
+
+	handle_state(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		return [
+			status_code = 200,
+			headers = ["Content-Type" = "application/json", "Cache-Control" = "no-store"],
+			body = "{\"layout\":" + layout_json(true) + ",\"values\":" + values_json(true) + "}",
+		];
+	}
+
+	//Server-Sent Events: what changed, until the phone goes, the PIN changes or the server stops
+	handle_events(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		dev = device_of(req);
+		if(!writer.write_header(200, "text/event-stream", ["Cache-Control" = "no-store", "X-Accel-Buffering" = "no"]))
+			return;
+		stream_id = std.random_hash(12);
+		streams[stream_id] = [stop = false, name = dev.name, since = std.millis()];
+		changed();
+		sent_layout = "";
+		sent_values = "";
+		last_write = std.millis();
+		ok = writer.write("retry: 2000\n\n");
+		for(ok && running && streams.has(stream_id) && !streams[stream_id].stop && writer.is_client_alive()) {
+			lay = layout_json();
+			if(lay != sent_layout) {
+				ok = writer.write("event: layout\ndata: " + lay + "\n\n");
+				sent_layout = lay;
+				last_write = std.millis();
+			}
+			val = values_json();
+			if(ok && val != sent_values) {
+				ok = writer.write("event: values\ndata: " + val + "\n\n");
+				sent_values = val;
+				last_write = std.millis();
+			}
+			//a comment now and then: a phone that went away is noticed, proxies keep the stream open
+			if(ok && std.millis() - last_write > 10000) {
+				ok = writer.write(": ping\n\n");
+				last_write = std.millis();
+			}
+			std.sleep(40);
+		}
+		streams.erase(stream_id);
+		changed();
+	}
+
+	handle_set(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		dev = device_of(req);
+		if(!within(write_windows, dev.token, WEB_REMOTE_MAX_WRITES, 1000))
+			return web_remote_error(429, "Too many changes a second.");
+		b = body_of(req);
+		if(!b || !b.has("v") || !std.is_json(b["v"]))
+			return web_remote_error(400, "Expected {\"v\": {id: value}}.");
+		vals = b["v"];
+		n = 0;
+		done = 0;
+		for(k, v : vals) {
+			n++;
+			if(n > WEB_REMOTE_MAX_VALUES)
+				break;
+			if(set_value(std.string(k), v))
+				done++;
+		}
+		return web_remote_json([ok = 1, set = done]);
+	}
+
+	handle_action(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		dev = device_of(req);
+		if(!within(write_windows, dev.token, WEB_REMOTE_MAX_WRITES, 1000))
+			return web_remote_error(429, "Too many changes a second.");
+		b = body_of(req);
+		if(!b || !b.has("a"))
+			return web_remote_error(400, "Expected {\"a\": action}.");
+		res = run_action(std.string(b["a"]), b);
+		if(std.is_string(res))
+			return web_remote_error(400, res);
+		return web_remote_json([ok = 1]);
+	}
+
+	//The controls a page can take, for the search of the edit mode
+	handle_controls(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		if(!config.phone_edit)
+			return web_remote_error(403, "Editing the pages on a phone is off in VibeVJ.");
+		return [
+			status_code = 200,
+			headers = ["Content-Type" = "application/json", "Cache-Control" = "no-store"],
+			body = catalog_json(),
+		];
+	}
+
+	//An edit of the pages from the phone: the same as in VibeVJ, saved with the project
+	handle_edit(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		dev = device_of(req);
+		if(!within(write_windows, dev.token, WEB_REMOTE_MAX_WRITES, 1000))
+			return web_remote_error(429, "Too many changes a second.");
+		if(!config.phone_edit)
+			return web_remote_error(403, "Editing the pages on a phone is off in VibeVJ.");
+		if(nanogui.show_mode())
+			return web_remote_error(409, "Show mode: the pages cannot be changed now.");
+		b = body_of(req);
+		if(!b || !b.has("op"))
+			return web_remote_error(400, "Expected {\"op\": ...}.");
+		res = edit(std.string(b["op"]), b);
+		if(std.is_string(res))
+			return web_remote_error(400, res);
+		changed();
+		return web_remote_json([ok = 1, result = res]);
+	}
+
+	//The next picture of a source after the frame the phone has (long poll: waits up to WEB_REMOTE_PREVIEW_WAIT_MS)
+	handle_preview(req, writer) {
+		requests++;
+		no = refuse(req);
+		if(no)
+			return no;
+		dev = device_of(req);
+		if(!config.preview)
+			return web_remote_error(403, "The live preview is off in VibeVJ.");
+		if(!jpeg)
+			return web_remote_error(501, WEB_REMOTE_NO_JPEG);
+		if(!within(preview_windows, dev.token, WEB_REMOTE_MAX_PREVIEWS, 1000))
+			return web_remote_error(429, "Too many previews a second.");
+		key = req.query_params.geti("src") ? std.string(req.query_params.geti("src")) : "";
+		if(key == "") {
+			list = preview_sources();
+			key = list.size() > 0 ? list[0].id : "";
+		}
+		if(!preview_source(key))
+			return web_remote_error(404, "There is no such picture.");
+		after = req.query_params.geti("after") ? std.int(req.query_params.geti("after")) : -1;
+		end = std.millis() + WEB_REMOTE_PREVIEW_WAIT_MS;
+		preview_wanted[key] = std.millis();
+		for(running && config.preview) {
+			c = captures.has(key) ? captures[key] : None;
+			if(c) {
+				if(c.seq > c.encoded && !c.encoding)
+					encode_frame(c);
+				if(c.frame != after && c.jpeg != "") {
+					return [
+						status_code = 200,
+						headers = ["Content-Type" = "application/json", "Cache-Control" = "no-store", "X-Content-Type-Options" = "nosniff"],
+						body = "{\"frame\":" + c.frame + ",\"w\":" + c.w + ",\"h\":" + c.h + ",\"img\":\"" + c.jpeg + "\"}",
+					];
+				}
+			}
+			if(std.millis() > end)
+				break;
+			preview_wanted[key] = std.millis();
+			std.sleep(15);
+		}
+		return [status_code = 204, headers = ["Cache-Control" = "no-store"], body = ""];
+	}
+
+	// =========================================================================
+	// What the remote does
+	// =========================================================================
+
+	clip_view(view_uid) {
+		if(!engine.env.has("clip_views"))
+			return None;
+		views = engine.env.clip_views;
+		for(v : views) {
+			if(v && v.uid == view_uid)
+				return v;
+		}
+		return None;
+	}
+
+	arg_int(b, key, fallback = 0) {
+		if(!b.has(key) || std.is_none(b[key]))
+			return fallback;
+		return std.int(b[key]);
+	}
+
+	arg_float(b, key, fallback = 0.0) {
+		if(!b.has(key) || std.is_none(b[key]))
+			return fallback;
+		return std.float(b[key]);
+	}
+
+	arg_text(b, key) {
+		if(!b.has(key) || std.is_none(b[key]))
+			return "";
+		return std.string(b[key]);
+	}
+
+	//An action of the transport, the blackout or the clips; a text when it cannot be done
+	run_action(action, b) {
+		tl = engine.timeline;
+		has_timeline = tl && !std.is_json(tl);
+		if(action == "play") {
+			if(!has_timeline)
+				return "No timeline.";
+			tl.play_btn.value(arg_int(b, "v", 1) ? 1 : 0);
+			return true;
+		}
+		if(action == "stop") {
+			if(!has_timeline)
+				return "No timeline.";
+			tl.stop();
+			return true;
+		}
+		if(action == "tap") {
+			if(!has_timeline)
+				return "No timeline.";
+			tl.tap();
+			return true;
+		}
+		if(action == "bpm") {
+			if(!has_timeline)
+				return "No timeline.";
+			bpm = arg_float(b, "v", 0.0);
+			if(bpm < 20.0 || bpm > 400.0)
+				return "BPM from 20 to 400.";
+			tl.set_bpm(bpm);
+			return true;
+		}
+		if(action == "blackout") {
+			if(!engine.blackout)
+				return "No blackout.";
+			engine.blackout.set(arg_int(b, "v", 1) != 0);
+			return true;
+		}
+		if(action == "clip" || action == "column" || action == "stop_layer") {
+			view = clip_view(b.has("view") ? std.string(b["view"]) : "");
+			if(!view)
+				return "That Clipview is gone.";
+			grid = view.grid;
+			row = arg_int(b, "row", -1);
+			col = arg_int(b, "col", -1);
+			if(action == "clip") {
+				if(row < 0 || col < 0 || row >= grid.rows() || col >= grid.cols())
+					return "No such cell.";
+				cell = grid.get_item_at(row, col);
+				if(!cell || !cell.attr.trigger_btn)
+					return "The cell is empty.";
+				//press and release, as the trigger of the cell gets them (a flash clip goes back on release)
+				trigger = cell.attr.trigger_btn.callback();
+				trigger(arg_int(b, "down", 1) != 0);
+				return true;
+			}
+			if(action == "column") {
+				if(col < 0 || col >= grid.cols())
+					return "No such column.";
+				head = grid.get_header_top_item(col);
+				btn = head ? head.children(0) : None;
+				if(!btn)
+					return "No such column.";
+				launch = btn.callback();
+				launch(true);
+				return true;
+			}
+			if(row < 0 || row >= grid.rows())
+				return "No such layer.";
+			stop_cb = view.layer_controls[row].stop_btn.callback();
+			stop_cb(true);
+			return true;
+		}
+		return "Unknown action '" + action + "'.";
+	}
+
+	//The entry of a control of a page, or None
+	entry_of(id) {
+		for(p : pages) {
+			for(c : p.controls) {
+				if(c.id == id)
+					return c;
+			}
+		}
+		return None;
+	}
+
+	//The page an entry is on, or None
+	page_with(id) {
+		for(p : pages) {
+			for(c : p.controls) {
+				if(c.id == id)
+					return p;
+			}
+		}
+		return None;
+	}
+
+	//A page by its id or name; "" the first one
+	page_of(key) {
+		if(pages.size() == 0)
+			return None;
+		if(std.is_none(key) || std.string(key) == "")
+			return pages[0];
+		k = std.string(key);
+		for(p : pages) {
+			if(p.id == k)
+				return p;
+		}
+		for(p : pages) {
+			if(p.name == k)
+				return p;
+		}
+		return None;
+	}
+
+	//Every entry of every page, with the id and the name of its page (for the MCP queries)
+	all_controls() {
+		list = [];
+		for(p : pages) {
+			for(c : p.controls)
+				list.push_back([id = c.id, path = c.path, label = c.label, kind = c.kind, size = c["size"], y = c.y, page = p.id, page_name = p.name]);
+		}
+		return list;
+	}
+
+	//What an entry shows now: [ctrl, d (web_remote_describe), kind (what it is shown as), yctrl, yd] or None when its
+	//control is not in the project. An XY pad of a fader needs its Y fader, else it is a fader again
+	resolve(entry) {
+		ctrl = engine.ctx.get_control_by_path(entry.path);
+		if(!ctrl)
+			return None;
+		d = web_remote_describe(ctrl);
+		if(!d)
+			return None;
+		kind = d.kinds.has_value(entry.kind) ? entry.kind : d.kind;
+		yctrl = None;
+		yd = None;
+		if(kind == "xy" && d.kind != "xy") {
+			yctrl = entry.y != "" ? engine.ctx.get_control_by_path(entry.y) : None;
+			yd = yctrl ? web_remote_describe(yctrl) : None;
+			if(!yd || yd.kind != "fader") {
+				kind = d.kind;
+				yctrl = None;
+				yd = None;
+			}
+		}
+		return [ctrl = ctrl, d = d, kind = kind, yctrl = yctrl, yd = yd];
+	}
+
+	set_scalar(ctrl, d, v) {
+		x = math.clamp(std.float(v), d.min, d.max);
+		ctrl.value(d.whole ? std.int(math.round(x)) : x);
+	}
+
+	//One value from the phone: a control of a page (its id) or a layer master (m:<view>:<row>)
+	set_value(id, v) {
+		if(id.starts("m:")) {
+			parts = id.split(":");
+			if(parts.size() != 3 || !web_remote_is_number(v))
+				return false;
+			view = clip_view(parts[1]);
+			row = std.int(parts[2]);
+			if(!view || row < 0 || row >= view.grid.rows())
+				return false;
+			head = view.grid.get_header_left_item(row);
+			if(!head || !head.attr.master_ctrl)
+				return false;
+			head.attr.master_ctrl.value(math.clamp(std.float(v), 0.0, 1.0));
+			return true;
+		}
+		entry = entry_of(id);
+		if(!entry)
+			return false;
+		r = resolve(entry);
+		if(!r)
+			return false;
+		ctrl = r.ctrl;
+		d = r.d;
+		kind = r.kind;
+		if(kind == "fader" || kind == "hfader" || kind == "number") {
+			if(!web_remote_is_number(v))
+				return false;
+			set_scalar(ctrl, d, v);
+			return true;
+		}
+		if(kind == "button") {
+			ctrl.value(web_remote_is_number(v) && std.float(v) != 0.0 ? 1 : 0);
+			return true;
+		}
+		if(kind == "choice") {
+			if(!web_remote_is_number(v))
+				return false;
+			n = d.opts.size();
+			i = std.int(v);
+			if(i < 0 || i >= n)
+				return false;
+			ctrl.value(i);
+			return true;
+		}
+		if(kind == "xy") {
+			if(!std.is_json(v) || v.size() < 2 || !web_remote_is_number(v[0]) || !web_remote_is_number(v[1]))
+				return false;
+			//two faders: X and Y
+			if(r.yctrl) {
+				set_scalar(ctrl, d, v[0]);
+				set_scalar(r.yctrl, r.yd, v[1]);
+				return true;
+			}
+			out = [];
+			for(k = 0; k < d.ranges.size(); k++) {
+				rg = d.ranges[k];
+				out.push_back(k < v.size() && web_remote_is_number(v[k]) ? math.clamp(std.float(v[k]), rg[0], rg[1]) : rg[0]);
+			}
+			//only the components the phone sent, the others keep their value
+			now_v = ctrl.value();
+			for(k = 2; k < out.size() && k < now_v.size(); k++)
+				out[k] = now_v[k];
+			ctrl.value(out);
+			return true;
+		}
+		return false;
+	}
+
+	// =========================================================================
+	// The pages
+	// =========================================================================
+
+	//Adds a control by its full path to a page (its id or name, "" the first page); returns the entry, or a text why not
+	add_control(path, label = "", kind = "", page_key = "") {
+		page = page_of(page_key);
+		if(!page)
+			return "There is no page '" + page_key + "'.";
+		ctrl = engine.ctx.get_control_by_path(path);
+		if(!ctrl)
+			return "There is no control with the path '" + path + "'.";
+		d = web_remote_describe(ctrl);
+		if(!d)
+			return "The remote cannot show a control of the type " + std.string(ctrl) + ".";
+		for(c : page.controls) {
+			if(c.path == path)
+				return c;
+		}
+		if(page.controls.size() >= WEB_REMOTE_MAX_PAGE_CONTROLS)
+			return "A page takes " + WEB_REMOTE_MAX_PAGE_CONTROLS + " controls at most.";
+		name = web_remote_clean_name(label);
+		if(name == "")
+			name = web_remote_clean_name(ctrl.display_name());
+		if(name == "")
+			name = web_remote_clean_name(path.split("/")[-1]);
+		entry = [id = std.random_hash(6), path = path, label = name, kind = d.kind, size = 0, y = ""];
+		if(kind != "" && d.kinds.has_value(kind) && kind != "xy")
+			entry.kind = kind;
+		page.controls.push_back(entry);
+		controls_revision++;
+		return entry;
+	}
+
+	remove_control(id) {
+		for(p : pages) {
+			for(i = 0; i < p.controls.size(); i++) {
+				if(p.controls[i].id == id) {
+					p.controls.erase(i);
+					controls_revision++;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	move_control(id, step) {
+		p = page_with(id);
+		if(!p)
+			return false;
+		for(i = 0; i < p.controls.size(); i++) {
+			if(p.controls[i].id != id)
+				continue;
+			j = i + step;
+			if(j < 0 || j >= p.controls.size())
+				return false;
+			a = p.controls[i];
+			p.controls[i] = p.controls[j];
+			p.controls[j] = a;
+			controls_revision++;
+			return true;
+		}
+		return false;
+	}
+
+	rename_control(id, label) {
+		entry = entry_of(id);
+		name = web_remote_clean_name(label);
+		if(!entry || name == "")
+			return false;
+		entry.label = name;
+		controls_revision++;
+		return true;
+	}
+
+	//Changes of an entry: label, kind (what its control is shown as), size (0 the default, 1 - 3), y (the Y fader of
+	//an XY pad made of a fader). True, or a text why not
+	set_control(id, changes) {
+		entry = entry_of(id);
+		if(!entry)
+			return "There is no control with the id '" + id + "' on the pages.";
+		ctrl = engine.ctx.get_control_by_path(entry.path);
+		d = ctrl ? web_remote_describe(ctrl) : None;
+		if(changes.has("label") && !std.is_none(changes.label)) {
+			name = web_remote_clean_name(changes.label);
+			if(name == "")
+				return "The name is empty.";
+			entry.label = name;
+		}
+		if(changes.has("size") && !std.is_none(changes["size"])) {
+			sz = std.int(changes["size"]);
+			if(sz < 0 || sz > 3)
+				return "The size is 0 (the default), 1, 2 or 3.";
+			entry["size"] = sz;
+		}
+		y = entry.y;
+		if(changes.has("y") && !std.is_none(changes.y))
+			y = std.string(changes.y);
+		if(changes.has("kind") && !std.is_none(changes.kind)) {
+			kind = std.string(changes.kind);
+			if(!WEB_REMOTE_KINDS.has_value(kind))
+				return "The kind is one of " + WEB_REMOTE_KINDS.combine_string(", ").removesuffix(", ") + ".";
+			if(!d)
+				return "The control is not in this project.";
+			if(!d.kinds.has_value(kind))
+				return "This control cannot be shown as " + kind + " (only " + d.kinds.combine_string(", ").removesuffix(", ") + ").";
+			if(kind == "xy" && d.kind != "xy") {
+				yctrl = y != "" ? engine.ctx.get_control_by_path(y) : None;
+				yd = yctrl ? web_remote_describe(yctrl) : None;
+				if(!yd || yd.kind != "fader")
+					return "An XY pad of a fader needs a second fader for Y (y: its full path).";
+				if(y == entry.path)
+					return "X and Y must be two different faders.";
+			}
+			entry.kind = kind;
+		}
+		entry.y = y;
+		controls_revision++;
+		return true;
+	}
+
+	add_page(name) {
+		if(pages.size() >= WEB_REMOTE_MAX_PAGES)
+			return "The remote takes " + WEB_REMOTE_MAX_PAGES + " pages at most.";
+		n = web_remote_clean_name(name);
+		if(n == "")
+			n = "Page " + (pages.size() + 1);
+		p = [id = std.random_hash(6), name = n, controls = []];
+		pages.push_back(p);
+		controls_revision++;
+		return p;
+	}
+
+	rename_page(key, name) {
+		p = page_of(key);
+		n = web_remote_clean_name(name);
+		if(!p)
+			return "There is no page '" + key + "'.";
+		if(n == "")
+			return "The name is empty.";
+		p.name = n;
+		controls_revision++;
+		return true;
+	}
+
+	remove_page(key) {
+		p = page_of(key);
+		if(!p)
+			return "There is no page '" + key + "'.";
+		if(pages.size() <= 1)
+			return "The remote has one page at least.";
+		for(i = 0; i < pages.size(); i++) {
+			if(pages[i].id == p.id) {
+				pages.erase(i);
+				break;
+			}
+		}
+		controls_revision++;
+		return true;
+	}
+
+	move_page(key, step) {
+		p = page_of(key);
+		if(!p)
+			return "There is no page '" + key + "'.";
+		for(i = 0; i < pages.size(); i++) {
+			if(pages[i].id != p.id)
+				continue;
+			j = i + step;
+			if(j < 0 || j >= pages.size())
+				return "The page is at the end already.";
+			a = pages[i];
+			pages[i] = pages[j];
+			pages[j] = a;
+			controls_revision++;
+			return true;
+		}
+		return "There is no page '" + key + "'.";
+	}
+
+	//An edit from the phone (or a test): what it returns, or a text why not
+	edit(op, b) {
+		if(op == "add") {
+			res = add_control(arg_text(b, "path"), arg_text(b, "label"), arg_text(b, "kind"), arg_text(b, "page"));
+			return std.is_string(res) ? res : [id = res.id];
+		}
+		if(op == "remove")
+			return remove_control(arg_text(b, "id")) ? true : "There is no such control on the pages.";
+		if(op == "move")
+			return move_control(arg_text(b, "id"), arg_int(b, "step", 1) < 0 ? -1 : 1) ? true : "It cannot move further.";
+		if(op == "set")
+			return set_control(arg_text(b, "id"), b);
+		if(op == "page_add") {
+			res = add_page(arg_text(b, "name"));
+			return std.is_string(res) ? res : [page = res.id];
+		}
+		if(op == "page_rename")
+			return rename_page(arg_text(b, "page"), arg_text(b, "name"));
+		if(op == "page_remove")
+			return remove_page(arg_text(b, "page"));
+		if(op == "page_move")
+			return move_page(arg_text(b, "page"), arg_int(b, "step", 1) < 0 ? -1 : 1);
+		return "Unknown edit '" + op + "'.";
+	}
+
+	clean_entry(c) {
+		if(!std.is_json(c) || !c.has("id") || !c.has("path"))
+			return None;
+		size_v = c.has("size") && !std.is_none(c["size"]) ? math.clamp(std.int(c["size"]), 0, 3) : 0;
+		return [id = std.string(c.id), path = std.string(c.path), label = std.string(c.label ?? ""),
+			kind = c.has("kind") ? std.string(c.kind) : "fader", size = size_v, y = c.has("y") && c.y ? std.string(c.y) : ""];
+	}
+
+	//Project save / load (engine.save_hooks / load_hooks). Format 1 (#786) had one list of controls: it becomes the
+	//first page
+	save_state() {
+		return [format = 2, pages = pages.copy()];
+	}
+
+	load_state(state) {
+		pages = [];
+		if(state && std.is_json(state)) {
+			if(state.has("pages") && std.is_json(state.pages)) {
+				for(p : state.pages) {
+					if(!std.is_json(p) || pages.size() >= WEB_REMOTE_MAX_PAGES)
+						continue;
+					page = [id = p.has("id") && p.id ? std.string(p.id) : std.random_hash(6), name = web_remote_clean_name(p.name ?? ""), controls = []];
+					if(page.name == "")
+						page.name = "Page " + (pages.size() + 1);
+					if(p.has("controls") && std.is_json(p.controls)) {
+						for(c : p.controls) {
+							e = clean_entry(c);
+							if(e)
+								page.controls.push_back(e);
+						}
+					}
+					pages.push_back(page);
+				}
+			}
+			else if(state.has("controls") && std.is_json(state.controls)) {
+				page = [id = std.random_hash(6), name = WEB_REMOTE_DEFAULT_PAGE, controls = []];
+				for(c : state.controls) {
+					e = clean_entry(c);
+					if(e)
+						page.controls.push_back(e);
+				}
+				pages.push_back(page);
+			}
+		}
+		if(pages.size() == 0)
+			pages.push_back([id = std.random_hash(6), name = WEB_REMOTE_DEFAULT_PAGE, controls = []]);
+		controls_revision++;
+	}
+
+	// =========================================================================
+	// What the phones see
+	// =========================================================================
+
+	//The structure: the pages with their controls and ranges, the Clipviews with their clips, what the preview can
+	//show. Built at most every 500 ms (it walks the grids), unless now is set
+	layout_json(now = false) {
+		t = std.millis();
+		if(!now && layout_text != "" && t - layout_at < 500)
+			return layout_text;
+		page_list = [];
+		for(p : pages) {
+			items = [];
+			for(c : p.controls) {
+				r = resolve(c);
+				item = [id = c.id, label = c.label, kind = c.kind, ok = r ? 1 : 0];
+				if(r) {
+					for(k, v : r.d) {
+						if(k != "kind")
+							item[k] = v;
+					}
+					item.kind = r.kind;
+					//an XY pad of two faders: the ranges of both
+					if(r.yctrl) {
+						item.ranges = [[r.d.min, r.d.max], [r.yd.min, r.yd.max]];
+						item.ylabel = std.string(r.yctrl.display_name());
+					}
+				}
+				item["size"] = c["size"] > 0 ? c["size"] : web_remote_default_size(item.kind);
+				items.push_back(item);
+			}
+			page_list.push_back([id = p.id, name = p.name, items = items]);
+		}
+		views = [];
+		cvs = engine.env.has("clip_views") ? engine.env.clip_views : [];
+		if(cvs) {
+			for(n, v : cvs) {
+				if(!v || !v.grid)
+					continue;
+				grid = v.grid;
+				rows = [];
+				for(r = 0; r < grid.rows(); r++) {
+					cells = [];
+					for(col = 0; col < grid.cols(); col++) {
+						cell = grid.get_item_at(r, col);
+						name = "";
+						if(cell && cell.attr.trigger_btn && cell.attr.preview_btn)
+							name = std.string(cell.attr.preview_btn.caption());
+						cells.push_back(name);
+					}
+					layer_name = "Layer " + (r + 1);
+					if(r < v.layer_controls.size() && v.layer_controls[r].name)
+						layer_name = std.string(v.layer_controls[r].name.value());
+					rows.push_back([name = layer_name, cells = cells]);
+				}
+				views.push_back([id = v.uid, name = cvs.size() > 1 ? "Clipview " + (n + 1) : "Clipview", cols = grid.cols(), rows = rows]);
+			}
+		}
+		//without an encoder the phones show no eye
+		preview = [on = config.preview && jpeg ? 1 : 0, fps = config.preview_fps, sources = []];
+		if(preview.on) {
+			for(s : preview_sources())
+				preview.sources.push_back([id = s.id, name = s.name]);
+		}
+		layout_text = [pages = page_list, clipviews = views, rev = controls_revision, edit = config.phone_edit, preview = preview].compact_string();
+		layout_at = t;
+		return layout_text;
+	}
+
+	//The values: transport, blackout, show mode, the controls of the pages, the live clip and master of each layer.
+	//Built at most every 30 ms for all phones
+	values_json(now = false) {
+		t = std.millis();
+		if(!now && values_text != "" && t - values_at < 30)
+			return values_text;
+		out = [show = nanogui.show_mode() ? 1 : 0];
+		tl = engine.timeline;
+		if(tl && !std.is_json(tl)) {
+			out.play = tl.play_btn.value() ? 1 : 0;
+			out.bpm = web_remote_round(tl.bpm_ctrl.value());
+			out.beat = std.int(math.floor(std.float(tl.cursor_pos.value())));
+		}
+		out.blackout = engine.blackout && engine.blackout.on ? 1 : 0;
+		vals = std.json();
+		for(p : pages) {
+			for(c : p.controls) {
+				ctrl = engine.ctx.get_control_by_path(c.path);
+				if(!ctrl)
+					continue;
+				v = ctrl.value();
+				if(web_remote_is_number(v)) {
+					//an XY pad of two faders
+					if(c.kind == "xy" && c.y != "") {
+						yctrl = engine.ctx.get_control_by_path(c.y);
+						yv = yctrl ? yctrl.value() : None;
+						if(web_remote_is_number(yv)) {
+							vals[c.id] = [web_remote_round(v), web_remote_round(yv)];
+							continue;
+						}
+					}
+					vals[c.id] = web_remote_round(v);
+				}
+				else if(std.is_json(v)) {
+					list = [];
+					for(x : v)
+						list.push_back(web_remote_is_number(x) ? web_remote_round(x) : 0);
+					vals[c.id] = list;
+				}
+			}
+		}
+		out.v = vals;
+		clips = std.json();
+		cvs = engine.env.has("clip_views") ? engine.env.clip_views : [];
+		if(cvs) {
+			for(v : cvs) {
+				if(!v || !v.grid)
+					continue;
+				live = [];
+				masters = [];
+				for(r = 0; r < v.grid.rows(); r++) {
+					cell = r < v.active_cells.size() ? v.active_cells[r] : None;
+					live.push_back(cell ? cell.col() : -1);
+					head = v.grid.get_header_left_item(r);
+					masters.push_back(head && head.attr.master_ctrl ? web_remote_round(head.attr.master_ctrl.value()) : 1.0);
+				}
+				clips[v.uid] = [live = live, master = masters];
+			}
+		}
+		out.clips = clips;
+		values_text = out.compact_string();
+		values_at = t;
+		return values_text;
+	}
+
+	//The generators of the project with their names, which the catalog and the preview walk: [[target, live_path,
+	//source_file, name]]. Leaves out the parts of the engine (engine/..., the layer blends of a Clipview, src/..., the
+	//lanes of the timeline). A clip of a Clipview is two: its cell (the macros, autoplay, trigger) and in it the shader
+	generators() {
+		out = [];
+		registry = engine.ai_interfaces;
+		for(i = 0; registry && i < registry.size(); i++) {
+			iface = registry[i];
+			if(!iface || !iface.target)
+				continue;
+			lp = "";
+			try {
+				lp = std.string(iface.target.get_live_path());
+			}
+			catch(e) {
+				continue;
+			}
+			src = std.string(iface.source_file ?? "");
+			if(src == "" || src.starts("engine/") || src.starts("src/"))
+				continue;
+			out.push_back([target = iface.target, live_path = lp, source_file = src, name = web_remote_file_name(src)]);
+		}
+		return out;
+	}
+
+	//Every control of the project a page can take: [[p (full path), l (label), g (generator), lp (local path), k
+	//(kind)]], at most WEB_REMOTE_MAX_CATALOG. Built at most every 3 s
+	catalog_json() {
+		t = std.millis();
+		if(catalog_text != "" && t - catalog_at < 3000)
+			return catalog_text;
+		list = [];
+		for(g : generators()) {
+			node = None;
+			try {
+				node = g.target.node;
+			}
+			catch(e) {
+				node = None;
+			}
+			if(!node)
+				continue;
+			paths = [];
+			try {
+				paths = node.get_control_paths(false);
+			}
+			catch(e) {
+				continue;
+			}
+			for(p : paths) {
+				if(p.contains("#"))
+					continue;
+				ctrl = node.get_control_by_path(p);
+				d = ctrl ? web_remote_describe(ctrl) : None;
+				if(!d)
+					continue;
+				label = web_remote_clean_name(ctrl.display_name());
+				list.push_back([p = std.string(ctrl.path()), l = label != "" ? label : p.split("@")[-1], g = g.name, lp = p, k = d.kind]);
+				if(list.size() >= WEB_REMOTE_MAX_CATALOG)
+					break;
+			}
+			if(list.size() >= WEB_REMOTE_MAX_CATALOG)
+				break;
+		}
+		catalog_text = [controls = list, more = list.size() >= WEB_REMOTE_MAX_CATALOG ? 1 : 0].compact_string();
+		catalog_at = t;
+		return catalog_text;
+	}
+
+	// =========================================================================
+	// The live preview
+	// =========================================================================
+
+	reset_stats() {
+		preview_stats = [frames = 0, encode_us = 0, bytes = 0, renders = 0, ticks = 0, tick_us = 0, since = std.millis()];
+	}
+
+	//What the preview can show: the output shaders (Shaders > Utilities > output) and the views of the project (a
+	//Clipview, a shader in a view of its own), each with its picture: [[id (the live_path with . for /), live_path,
+	//name, pic]]. Built at most every second
+	preview_sources() {
+		t = std.millis();
+		if(sources_at > 0 && t - sources_at < 1000)
+			return sources_cache;
+		list = [];
+		names = std.json();
+		for(g : generators()) {
+			is_output = g.source_file.ends("Utilities/output.glsl");
+			is_view = g.live_path.starts("generator_view/") && g.live_path.split("/").size() == 2;
+			if(!is_output && !is_view)
+				continue;
+			pic = web_remote_picture(g.target);
+			if(!pic)
+				continue;
+			name = is_output ? "Output" : g.name;
+			names[name] = (names.has(name) ? names[name] : 0) + 1;
+			if(names[name] > 1)
+				name = name + " " + names[name];
+			//the id goes into the address of /api/preview: no "/" (the query of the webserver module is not decoded)
+			entry = [id = g.live_path.replace("/", "."), live_path = g.live_path, name = name, pic = pic];
+			if(is_output)
+				list.insert(0, entry);
+			else
+				list.push_back(entry);
+		}
+		sources_cache = list;
+		sources_at = t;
+		return list;
+	}
+
+	preview_source(key) {
+		for(s : preview_sources()) {
+			if(s.id == key)
+				return s;
+		}
+		return None;
+	}
+
+	//The size of a picture (the render size of a shader, the size of another widget)
+	picture_size(pic) {
+		try {
+			rs = pic.render_size();
+			if(rs && rs.x > 0 && rs.y > 0)
+				return [rs.x, rs.y];
+		}
+		catch(e) {}
+		try {
+			sz = pic.size();
+			if(sz && sz.x > 0 && sz.y > 0)
+				return [sz.x, sz.y];
+		}
+		catch(e) {}
+		return [16, 9];
+	}
+
+	//Render thread (engine on_frame_finished): makes the hidden shader of each picture a phone asks for, frees the
+	//ones nobody asked for since WEB_REMOTE_PREVIEW_IDLE_MS, follows a source whose picture changed
+	tick() {
+		if(captures.size() == 0 && preview_wanted.size() == 0)
+			return;
+		now = std.millis();
+		allowed = running && config.preview && jpeg;
+		old = [];
+		for(k, c : captures) {
+			asked = preview_wanted.has(k) ? preview_wanted[k] : 0;
+			if(!allowed || now - asked > WEB_REMOTE_PREVIEW_IDLE_MS) {
+				old.push_back(k);
+				continue;
+			}
+			//every half second: is the picture the same (a project was loaded, the output was replaced), the size too
+			if(now - c.checked > 500) {
+				captures[k].checked = now;
+				src = preview_source(k);
+				sz = src ? picture_size(src.pic) : None;
+				if(!src || src.pic != c.pic || c.aspect != std.int(math.round(sz[0] * 1000.0 / sz[1])) || c.w != config.preview_width)
+					old.push_back(k);
+			}
+		}
+		for(k : old)
+			drop_capture(k);
+		forget = [];
+		for(k, at : preview_wanted) {
+			if(now - at > WEB_REMOTE_PREVIEW_IDLE_MS) {
+				forget.push_back(k);
+				continue;
+			}
+			if(allowed && !captures.has(k) && captures.size() < WEB_REMOTE_PREVIEW_MAX_SOURCES)
+				start_capture(k);
+		}
+		for(k : forget)
+			preview_wanted.erase(k);
+		//A frame when one is due, after the frame of VibeVJ: the hidden shader renders fps times a second, not in every
+		//frame of the render loop. What it costs here (the render thread) is measured: the GPU pass of w x h pixels, the
+		//readback of the frame before (a PBO, done by now) and its copy
+		for(k, c : captures) {
+			if(!c.ready)
+				continue;
+			t0 = nanogui.micros();
+			if(c.shader.rendering_enabled())
+				c.shader.rendering_enabled(false);
+			//the frame asked for last time: its readback is done by now (pixel_callback -> preview_take)
+			c.shader.pixel_buffer();
+			if(!c.encoding && now - c.rendered >= 1000 / config.preview_fps) {
+				captures[k].rendered = now;
+				c.shader.render(false);
+				preview_stats.renders++;
+			}
+			preview_stats.tick_us += nanogui.micros() - t0;
+			preview_stats.ticks++;
+		}
+	}
+
+	start_capture(key) {
+		src = preview_source(key);
+		if(!src || !engine.screen)
+			return false;
+		if(captures.size() == 0)
+			reset_stats();
+		sz = picture_size(src.pic);
+		w = config.preview_width;
+		h = math.clamp(std.int(math.round(w * sz[1] / sz[0] / 2.0)) * 2, 16, w * 2);
+		if(!capture_host)
+			capture_host = engine.screen.widget().visible(false).fixed_size(vec2f(8, 8));
+		cap_shader = capture_host.shader();
+		//Its widget as big as its picture: a shader maps its picture into the rectangle of its widget (its projection
+		//grid), a layout must not give the hidden widget another size
+		cap_shader.fixed_size(vec2f(w, h));
+		cap_shader.size(vec2f(w, h));
+		cap_shader.fragment_source(WEB_REMOTE_PREVIEW_COPY);
+		cap_shader.render_size(vec2i(w, h));
+		cap_shader.output_component_format("uint8");
+		cap_shader.output_pixel_format("rgb");
+		cap_shader.input("src", src.pic);
+		captures[key] = [shader = cap_shader, pic = src.pic, w = w, h = h, aspect = std.int(math.round(sz[0] * 1000.0 / sz[1])),
+			seq = 0, buf = None, taken = 0, encoding = 0, encoded = 0, jpeg = "", frame = 0, checked = std.millis(), ready = 0, rendered = 0];
+		cap_shader.pixel_callback([this, key](buf) {
+			this.preview_take(key, buf);
+		});
+		//rendered once by the render loop (that compiles it), then only by tick()
+		cap_shader.after_render([this, key]() {
+			if(this.captures.has(key))
+				this.captures[key].ready = 1;
+		});
+		return true;
+	}
+
+	drop_capture(key) {
+		if(!captures.has(key))
+			return;
+		c = captures[key];
+		captures.erase(key);
+		if(c.shader) {
+			c.shader.pixel_callback(None);
+			c.shader.pixel_readback(false);
+			std.free(c.shader);
+		}
+	}
+
+	stop_previews() {
+		keys = [];
+		for(k, c : captures)
+			keys.push_back(k);
+		for(k : keys)
+			drop_capture(k);
+		preview_wanted = std.json();
+	}
+
+	//The pixel callback of a hidden shader (render thread, from its pixel_buffer() in tick()): keeps the frame (a copy
+	//of w x h x 3 bytes), not while the last one is encoded
+	preview_take(key, buf) {
+		if(!captures.has(key))
+			return;
+		c = captures[key];
+		if(c.encoding)
+			return;
+		if(buf.size() != c.w * c.h * 3)
+			return;
+		c.buf = buf;
+		c.taken = std.millis();
+		c.seq++;
+	}
+
+	//The newest frame as a JPEG (a worker thread encodes it; this request waits, the render loop goes on)
+	encode_frame(c) {
+		c.encoding = 1;
+		s = c.seq;
+		t0 = nanogui.micros();
+		encode = jpeg ? jpeg.encode : None;
+		picture = encode ? encode(c.buf, c.w, c.h, config.preview_quality) : None;
+		us = nanogui.micros() - t0;
+		if(picture) {
+			c.jpeg = std.base64_encode(picture);
+			preview_frames++;
+			//one count for all pictures: a picture made again (its source changed) goes on after the last number
+			c.frame = preview_frames;
+			preview_stats.frames++;
+			preview_stats.encode_us += us;
+			preview_stats.bytes += picture.size();
+		}
+		c.encoded = s;
+		c.encoding = 0;
+	}
+
+	//For the window and get_web_remote: what the preview did since the first picture started (frames: pictures sent,
+	//encode_ms: from the start of the encoding until the request has the JPEG, the worker thread and the wait for the
+	//script; render_thread_us: what tick() takes in the render loop per frame of VibeVJ, per_picture_us: per picture)
+	preview_info() {
+		st = preview_stats;
+		n = st.frames;
+		secs = math.max(0.001, (std.millis() - st.since) / 1000.0);
+		active = [];
+		for(k, c : captures)
+			active.push_back([id = k, w = c.w, h = c.h, frames = c.frame]);
+		return [
+			on = config.preview,
+			available = jpeg ? 1 : 0,
+			error = jpeg ? "" : WEB_REMOTE_NO_JPEG,
+			fps = config.preview_fps,
+			width = config.preview_width,
+			quality = config.preview_quality,
+			active = active,
+			frames = n,
+			frames_per_second = std.int(n * 10.0 / secs) / 10.0,
+			encode_ms = n > 0 ? std.int(st.encode_us / n / 100.0) / 10.0 : 0,
+			kb_per_frame = n > 0 ? std.int(st.bytes / n / 102.4) / 10.0 : 0,
+			render_thread_us = st.ticks > 0 ? std.int(st.tick_us / st.ticks) : 0,
+			per_picture_us = st.renders > 0 ? std.int(st.tick_us / st.renders) : 0,
+		];
+	}
+}

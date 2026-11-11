@@ -13,8 +13,10 @@ HELP_TIP_LENGTH = 260;           //letters of a part of the wiki that the toolti
 
 //The pages in reading order; files in wiki/ that are not listed come after them, by name
 HELP_ORDER = [
-	"Getting-Started", "The-Screen", "Generators", "Assets", "Linking", "Clipview", "CueList", "Timeline", "MIDI",
-	"Audio", "Video", "Output-and-Devices", "Settings", "Shortcuts-and-Tips", "Troubleshooting",
+	"Getting-Started", "Tutorials", "Tutorial-Visuals-on-the-Beat", "Tutorial-Effect-Chain", "Tutorial-Live-Set",
+	"Tutorial-MIDI-Controller", "Tutorial-Projector", "Tutorial-Lights", "Tutorial-Timeline-Show", "Tutorial-Show-Night",
+	"The-Screen", "Generators", "Assets", "Linking", "Clipview", "CueList", "Timeline", "MIDI", "Web-Remote", "Audio",
+	"Video", "Output-and-Devices", "Lighting-Desk", "Settings", "Shortcuts-and-Tips", "Troubleshooting",
 ];
 
 HELP_NESTED_INDENT = 26; //an item of a list below another item
@@ -97,6 +99,162 @@ help_slug(text) {
 	return text.lowercase().removecharsexcept("abcdefghijklmnopqrstuvwxyz0123456789 -_").replace(" ", "-");
 }
 
+//The forms of a glossary term the text of a page may use: the term and its plural ("area", "areas")
+help_term_forms(key) {
+	if(key.ends("s") || key.ends("x") || key.ends("sh") || key.ends("ch"))
+		return [key, key + "es"];
+	if(key.ends("y") && !"aeiou".contains(key.substr(std.len(key) - 2, 1)))
+		return [key, key.substr(0, std.len(key) - 1) + "ies"];
+	return [key, key + "s"];
+}
+
+//true when low[at, end) is a word of its own: no letter, digit, "-" or "_" right before or after it
+help_whole_word(low, at, end) {
+	letters = "abcdefghijklmnopqrstuvwxyz0123456789-_";
+	if(at > 0 && letters.contains(low.substr(at - 1, 1)))
+		return false;
+	return end >= std.len(low) || !letters.contains(low.substr(end, 1));
+}
+
+help_overlaps(spans, at, end) {
+	for(span : spans) {
+		if(at < span.end && span.at < end)
+			return true;
+	}
+	return false;
+}
+
+//The parts of a line of markdown whose words stay as they are: `code`, [links](...), pictures, **bold** and *italic*
+//(the names of controls). A list of [at=, end=] (byte places). names gets the text of every link, in small letters
+help_kept(md, names) {
+	kept = [];
+	n = std.len(md);
+	i = 0;
+	for(i < n) {
+		next = n;
+		for(sign : ["`", "[", "*"]) {
+			at = md.find(sign, i);
+			if(at >= 0 && at < next)
+				next = at;
+		}
+		if(next >= n)
+			break;
+		c = md.substr(next, 1);
+		end = -1;
+		start = next;
+		if(c == "`") {
+			close = md.find("`", next + 1);
+			end = close < 0 ? n : close + 1;
+		}
+		else if(c == "[") {
+			//as help_marks reads a link: the "[" before the next "]("
+			mid = md.find("](", next);
+			close = mid < 0 ? -1 : md.find(")", mid);
+			if(close > 0 && md.substr(0, mid).rfind("[") == next) {
+				names.push_back(md.substr(next + 1, mid - next - 1).lowercase());
+				if(next > 0 && md.substr(next - 1, 1) == "!")
+					start = next - 1;
+				end = close + 1;
+			}
+		}
+		else if(md.substr(next, 2) == "**") {
+			close = md.find("**", next + 2);
+			if(close >= 0)
+				end = close + 2;
+			else
+				next++; //the next step starts after both stars
+		}
+		else if(next + 1 < n && md.substr(next + 1, 1) != " ") {
+			close = md.find("*", next + 1);
+			if(close >= 0)
+				end = close + 1;
+		}
+		if(end < 0) {
+			i = next + 1;
+			continue;
+		}
+		kept.push_back([at = start, end = end]);
+		i = end;
+	}
+	return kept;
+}
+
+//The terms of the glossary that the text of the pages links (help_term_links): [key=, forms=, page=] (page: the page
+//of its place in the wiki), the longest first, so "view tab" is found before "view". Not the ones with "auto": false
+//(a word with other meanings, like "live" or "port")
+help_term_list(glossary) {
+	terms = [];
+	for(i = 0; i < glossary.size(); i++) {
+		key = glossary.key(i);
+		term = glossary[i];
+		if(term.has("auto") && !term.auto)
+			continue;
+		place = term.page ?? "";
+		hash = place.find("#");
+		at = 0;
+		for(at < terms.size() && std.len(terms[at].key) >= std.len(key))
+			at++;
+		terms.insert(at, [key = key, forms = help_term_forms(key), page = hash >= 0 ? place.substr(0, hash) : place]);
+	}
+	return terms;
+}
+
+//The glossary terms in a block of markdown of a page (#378): the first use of each term in a part of the page (the
+//text under a heading) becomes a quiet link, [[~term:area|areas]]. Its tooltip is the term, a click or F1 goes to
+//the place of the term in the wiki. Not in headings, code, links, bold and italic (help_kept), and not the terms
+//whose place is on this page: it explains them itself. A term a link of the block already shows counts as linked.
+//Whole words only, in any case, and the plural (help_term_forms). terms: help_term_list, seen: key -> true for the
+//terms linked in this part so far (the function adds to it), page: the name of the page
+help_term_links(md, terms, seen, page) {
+	if(terms.size() == 0 || md == "")
+		return md;
+	names = [];
+	kept = help_kept(md, names);
+	for(name : names) {
+		for(t : terms) {
+			if(t.forms[0] == name || t.forms[1] == name)
+				seen[t.key] = true;
+		}
+	}
+	low = md.lowercase();
+	found = []; //[at=, end=, key=], in the order of the text
+	for(t : terms) {
+		if(seen.has(t.key) || t.page == page)
+			continue;
+		best = -1;
+		best_end = 0;
+		for(form : t.forms) {
+			at = low.find(form);
+			for(at >= 0 && (best < 0 || at < best)) {
+				end = at + std.len(form);
+				if(help_whole_word(low, at, end) && !help_overlaps(kept, at, end)) {
+					best = at;
+					best_end = end;
+					break;
+				}
+				at = low.find(form, at + 1);
+			}
+		}
+		if(best < 0)
+			continue;
+		seen[t.key] = true;
+		kept.push_back([at = best, end = best_end]);
+		pos = 0;
+		for(pos < found.size() && found[pos].at < best)
+			pos++;
+		found.insert(pos, [at = best, end = best_end, key = t.key]);
+	}
+	if(found.size() == 0)
+		return md;
+	out = "";
+	last = 0;
+	for(f : found) {
+		out += md.substr(last, f.at - last) + "[[~term:" + f.key + "|" + md.substr(f.at, f.end - f.at) + "]]";
+		last = f.end;
+	}
+	return out + md.substr(last);
+}
+
 //true for "1. text", "12. text"
 help_is_numbered(trimmed) {
 	dot = trimmed.find(". ");
@@ -118,6 +276,8 @@ help_is_table_rule(trimmed) {
 //  [kind="p", text=]                    a paragraph (its lines joined)
 //  [kind="li", text=, mark=, level=]    an item of a list
 //  [kind="table", rows=, header=]       rows of cells; header: the first row is the header
+//p, li and quote also have rich= (text with **bold** and *italic*) and md= (the markdown), a table rows_md= (the
+//markdown of its cells): the glossary terms are linked in it when the page is built (help_term_links)
 //  [kind="img", path=, alt=]            a picture or an animated GIF
 //  [kind="code", text=]                 a block of code
 //  [kind="quote", text=]                a note
@@ -136,7 +296,7 @@ help_blocks(markdown) {
 		//A block of code runs to the line that closes it
 		if(trimmed.starts("```")) {
 			if(para != "") {
-				blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para)]);
+				blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para), md = para]);
 				para = "";
 			}
 			code = "";
@@ -153,7 +313,7 @@ help_blocks(markdown) {
 		plain = trimmed != "" && !trimmed.starts("#") && !trimmed.starts("![") && !trimmed.starts(">")
 			&& !trimmed.starts("|") && !help_is_item(trimmed) && trimmed != "---";
 		if(!plain && para != "") {
-			blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para)]);
+			blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para), md = para]);
 			para = "";
 		}
 
@@ -198,12 +358,13 @@ help_blocks(markdown) {
 			//Notes for the authors of the wiki are not for the reader
 			if(quote.starts("Screenshot to"))
 				continue;
-			blocks.push_back([kind = "quote", text = help_inline(quote), rich = help_inline_rich(quote)]);
+			blocks.push_back([kind = "quote", text = help_inline(quote), rich = help_inline_rich(quote), md = quote]);
 			continue;
 		}
 
 		if(trimmed.starts("|")) {
 			rows = [];
+			rows_md = [];
 			header = false;
 			i--;
 			for(i + 1 < total && lines[i + 1].trim().starts("|")) {
@@ -216,12 +377,17 @@ help_blocks(markdown) {
 				//"\|" is a "|" inside a cell
 				parts = row_line.replace(R"(\|)", "&#124;").split("|");
 				cells = [];
+				cells_md = [];
 				//The line starts and ends with "|": the first and the last part are empty
-				for(c = 1; c < parts.size() - 1; c++)
-					cells.push_back(help_inline(parts[c].trim().replace("&#124;", "|")));
+				for(c = 1; c < parts.size() - 1; c++) {
+					cell = parts[c].trim().replace("&#124;", "|");
+					cells.push_back(help_inline(cell));
+					cells_md.push_back(cell);
+				}
 				rows.push_back(cells);
+				rows_md.push_back(cells_md);
 			}
-			blocks.push_back([kind = "table", rows = rows, header = header]);
+			blocks.push_back([kind = "table", rows = rows, rows_md = rows_md, header = header]);
 			continue;
 		}
 
@@ -243,11 +409,11 @@ help_blocks(markdown) {
 			i++;
 			text += " " + next_trimmed;
 		}
-		blocks.push_back([kind = "li", mark = mark, level = indent >= 2 ? 1 : 0, text = help_inline(text), rich = help_inline_rich(text)]);
+		blocks.push_back([kind = "li", mark = mark, level = indent >= 2 ? 1 : 0, text = help_inline(text), rich = help_inline_rich(text), md = text]);
 	}
 
 	if(para != "")
-		blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para)]);
+		blocks.push_back([kind = "p", text = help_inline(para), rich = help_inline_rich(para), md = para]);
 	return blocks;
 }
 
@@ -266,11 +432,16 @@ help_blocks(markdown) {
 //- The field above the list searches every page and the glossary; the page "Search" lists the parts that have all
 //  the words (#378).
 //- The arrows button in the header reads the page again; a page whose file changed is read again when it shows (#378).
+//- The terms of the glossary are quiet links in the text of the pages: the first use of each in a part of a page shows
+//  the term as its tooltip and leads to its place in the wiki (#378, help_term_links).
 class helpwindow
 {
 	managed tool = None;
 	entries = [];    //[name=, content=, loaded=, anchors=], in the order of the list. anchors: slug -> heading
-	glossary = None; //wiki/glossary.json: key -> [title=, text=, page=]
+	glossary = None; //wiki/glossary.json: key -> [title=, text=, page=, auto=]
+	term_list = [];  //the terms linked in the text of the pages: [key=, forms=, page=], the longest first
+	term_page = "";  //the page that is being built
+	term_seen = [];  //key -> true: the terms linked in the part of the page that is being built
 	trail = [];      //where the links that were followed left from: [index=, pos=], for "back"
 	summaries = None; //"Page" or "Page#heading" -> its heading and first lines, for the tooltips of links
 	back_btn = None;
@@ -287,7 +458,7 @@ class helpwindow
 	__init__(engine) {
 		this.engine = engine;
 		tool = toolwindow(engine, "Help", 1000, 720);
-		tool.side_nav(tool.window);
+		tool.side_nav(tool.window, 26);
 
 		back_btn = tool.window.button_panel().button("").icon(nanogui.icon("arrow_left"))
 			.tooltip("Back to where you followed the last link")
@@ -304,12 +475,11 @@ class helpwindow
 		});
 
 		//The search above the list of pages: Enter shows the results
-		search_box = tool.nav.textbox("").placeholder("Search the wiki").anchor_left(6).anchor_right(6).fixed_height(26)
+		search_box = tool.nav_head.textbox("").placeholder("Search the wiki").anchor_left(6).anchor_right(6).fixed_height(26)
 			.tooltip("Finds the parts of the wiki that have all the words. Enter shows them on the page Search.");
 		search_box.on_change([this](v){
 			this.search(v);
 		});
-		tool.nav.label("").fixed_height(6);
 
 		load_glossary();
 
@@ -378,6 +548,8 @@ class helpwindow
 				nanogui.tooltip_term(terms.key(i), text, term.title ?? terms.key(i));
 			}
 			glossary = terms;
+
+			term_list = help_term_list(terms);
 		}
 		catch(e) {
 			std.error("Cannot read " + HELP_GLOSSARY);
@@ -420,6 +592,8 @@ class helpwindow
 			return;
 		}
 		entries[index].changed = page_changed(index);
+		term_page = entries[index].name;
+		term_seen = [];
 		try {
 			blocks = help_blocks(fileio.read_string(page_file(index)));
 			for(i = 0; i < blocks.size(); i++)
@@ -478,6 +652,13 @@ class helpwindow
 	//Goes where a link leads. target: "Page", "Page#heading", "#heading" (on the page "from"), or a term of the
 	//glossary. keep: the place that is left can be reached again with "back"
 	follow(target, from = "", keep = true) {
+		//A term in the text of a page (help_term_links): the place in the wiki that says more about it
+		if(target.starts("term:")) {
+			key = target.substr(5);
+			target = key;
+			if(glossary && glossary.has(key) && glossary[key].page)
+				target = glossary[key].page;
+		}
 		page = target;
 		anchor = "";
 		hash = target.find("#");
@@ -595,6 +776,8 @@ class helpwindow
 	//What a link shows while the mouse is on it: the term of the glossary that has its name, or the heading and the
 	//first lines of the part of the wiki it leads to. shown: the text of the link, from: the page it is on
 	link_tip(target, shown, from) {
+		if(target.starts("term:"))
+			target = target.substr(5);
 		name = shown.lowercase();
 		if(glossary && glossary.has(name)) {
 			term = glossary[name];
@@ -790,7 +973,7 @@ class helpwindow
 		content = entries[index].content;
 		content.label("Glossary").font_size(26).bold(true).wrap(true).text_color(HELP_TITLE);
 		space(content, 8);
-		add_text(index, content, "The words VibeVJ uses for its parts. In a tooltip such a word is shown as a link: rest the mouse on the tooltip until it locks, then on the word, and this explanation opens. F1 on a tooltip opens the wiki at the place the tooltip is about.", 15, HELP_TEXT);
+		add_text(index, content, "The words VibeVJ uses for its parts. In a tooltip such a word is shown as a link: keep the mouse on what the tooltip belongs to until the tooltip locks, then move onto the word, and this explanation opens. F1 on a tooltip opens the wiki at the place the tooltip is about. In the pages of this window such a word has a dotted line below it.", 15, HELP_TEXT);
 		space(content, 8);
 
 		for(i = 0; i < glossary.size(); i++) {
@@ -842,6 +1025,8 @@ class helpwindow
 				inner = rest.substr(a + 2, b - a - 2);
 				bar = inner.find("|");
 				target = bar >= 0 ? inner.substr(0, bar) : inner;
+				if(target.starts("~"))
+					target = target.substr(1); //a quiet link (the label drops the "~" too)
 				shown = (bar >= 0 ? inner.substr(bar + 1) : inner).replace("**", "").replace("*", ""); //rich text marks
 				tip = link_tip(target, shown, page);
 				if(tip != "")
@@ -852,9 +1037,17 @@ class helpwindow
 		return label;
 	}
 
+	//A block of markdown with the glossary terms of the part of the page that is being built as quiet links
+	link_terms(md) {
+		return help_term_links(md, term_list, term_seen, term_page);
+	}
+
 	add_block(index, block) {
 		content = entries[index].content;
 		kind = block.kind;
+		//A new part of the page: its terms are linked again
+		if(kind == "h")
+			term_seen = [];
 
 		if(kind == "h") {
 			head = None;
@@ -881,7 +1074,7 @@ class helpwindow
 		}
 
 		if(kind == "p") {
-			add_text(index, content, block.rich ?? block.text, 15, HELP_TEXT, true);
+			add_text(index, content, block.md ? help_inline_rich(link_terms(block.md)) : (block.rich ?? block.text), 15, HELP_TEXT, true);
 			space(content, 8);
 			return;
 		}
@@ -906,14 +1099,16 @@ class helpwindow
 			parent = content;
 			if(block.level > 0)
 				parent = content.widget().layout(nanogui.layout_vertical().padding(vec4f(HELP_NESTED_INDENT, 0, 0, 0)));
-			add_text(index, parent, block.mark + "  " + (block.rich ?? text), 15, HELP_TEXT, true);
+			rich = block.md ? help_inline_rich(link_terms(block.md)) : (block.rich ?? text);
+			add_text(index, parent, block.mark + "  " + rich, 15, HELP_TEXT, true);
 			space(content, 3);
 			return;
 		}
 
 		if(kind == "quote") {
 			box = content.widget_solid().background_color(HELP_BLOCK);
-			add_text(index, box, block.rich ?? block.text, 14, HELP_TEXT_DIM, true).fixed_width(HELP_PAGE_WIDTH - 24);
+			rich = block.md ? help_inline_rich(link_terms(block.md)) : (block.rich ?? block.text);
+			add_text(index, box, rich, 14, HELP_TEXT_DIM, true).fixed_width(HELP_PAGE_WIDTH - 24);
 			space(content, 8);
 			return;
 		}
@@ -1046,7 +1241,10 @@ class helpwindow
 				.layout(nanogui.layout_horizontal().spacing(pad * 2).padding(vec4f(pad, pad, pad, pad)));
 			for(c = 0; c < cells.size() && c < columns; c++) {
 				col_w = HELP_PAGE_WIDTH * shares[c];
-				cell = add_text(index, row, cells[c], font, (is_header || c == 0) ? HELP_TITLE : HELP_TEXT)
+				text = cells[c];
+				if(!is_header && block.rows_md)
+					text = help_inline(link_terms(block.rows_md[r][c]));
+				cell = add_text(index, row, text, font, (is_header || c == 0) ? HELP_TITLE : HELP_TEXT)
 					.fixed_width(std.int(col_w - pad * 2));
 				if(is_header)
 					cell.bold(true);

@@ -49,6 +49,8 @@ the task. The binaries in `x64\Release` still come from the build machine; the c
 | `auto-in-progress`, `auto-pr`, `auto-failed`, `needs-info` | issue worker | taken now; PR opened; gave up (see comment); a question to answer |
 | `auto-skip` | Marc | the issue worker never takes this issue |
 | `owner:claude` | issue worker, Marc | reserved for Claude: the Shizotech AI does not take it |
+| `area:esp32` | sessions, Marc | the ESP32-P4 LED firmware, the LED controller board or the public repository `esp32_p4_nano_led` (overview #149, `_microcontroller/README.md`) |
+| `needs-hardware` | sessions, Marc | only an ESP32-P4-NANO / the LED controller board can test it (no test machine has one); comes with `auto-skip` when there is nothing left to do without the board |
 
 ## Steering it
 
@@ -68,3 +70,8 @@ the task. The binaries in `x64\Release` still come from the build machine; the c
   in parallel race, and GitHub can report a PR as conflicting (`mergeable_state: dirty`, merge refused with 405) that
   `git merge-tree` shows clean: merging `origin/main` into the PR branch and pushing fixes it. Do not switch branches
   in a worktree while a check (`check_libcxx_linux.sh`, `run_tests.sh`) runs there: its tests vanish mid-run.
+  Check the **base** of every PR first: a stacked PR (base: the branch of another PR) merges into that branch, not into
+  main, and once that other PR is merged nothing brings it on (2026-11-01: #843, #844, #846, #881 and #882 landed in
+  PR branches; #884 and #885 brought them to main). Merge a stack bottom up, or change the base to main first.
+  Two PRs that are each green can still break main together (#830 restricted mode and #846 native assets: the test of
+  #846 ran `std.import` in restricted mode, which #830 started to refuse): test main once more after the last merge.

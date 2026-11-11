@@ -1,0 +1,337 @@
+// The #@ annotations of a Python asset (#853 step 2): the same grammar as the //@ annotations of a GLSL shader
+// (engine/generators/extensions/glsl/shader_loader.shio, assets/Shaders/SHADER_GUIDE.MD), with "#" for "//" and a
+// module level assignment for the uniform:
+//
+//   #@slider min=0 max=2 displayname="Speed"      <- the annotation: a type, then key=value attributes
+//   # more attributes on the next comment lines     (appended, as //-lines after a //@ annotation)
+//   speed = 0.5                                   <- the name and the default value (value= of the annotation wins)
+//
+//   #@input size=(320,180) format=rgba            a picture port; the variable holds a shz.Image while process() runs
+//   #@output float min=0 max=1                    a value output: the variable after process(), or a key of its dict
+//   #@output texture                              the picture output (one per script)
+//   #@settings rate=30 timeout=1000               settings of the asset, no assignment below
+//
+// py_parse_annotations(source) returns [decls, settings, problems]. Pure parsing, no GUI: _testing/py_annotations_853.shio
+
+// The types of a parameter, as the GLSL loader knows them, plus the aliases and the trigger of Python assets
+PY_PARAM_TYPES = [slider=1, float=1, int=1, button=1, pushbutton=1, trigger=1, vec2=1, vec3=1, vec4=1, ivec2=1, ivec3=1,
+	ivec4=1, slidervec2=1, slidervec3=1, slidervec4=1, rgb=1, rgba=1, enum=1, text=1];
+// Aliases: bool is a toggle button, color an rgb (rgba with a default of four numbers), choice an enum
+PY_TYPE_ALIASES = [bool="button", color="rgb", colour="rgb", choice="enum", toggle="button"];
+// The types of a value output
+PY_OUTPUT_TYPES = [float=1, slider=1, int=1, bool=1, button=1, vec2=1, vec3=1, vec4=1, rgb=1, rgba=1, text=1, list=1, texture=1];
+PY_PARAM_TYPE_NAMES = "slider, float, int, button, pushbutton, trigger, vec2-4, ivec2-4, slidervec2-4, rgb, rgba, enum, text, bool, color, choice";
+PY_OUTPUT_TYPE_NAMES = "float, slider, int, bool, button, vec2, vec3, vec4, rgb, rgba, text, list, texture";
+// Pixel formats of an input
+PY_INPUT_FORMATS = [rgba=4, rgb=3, gray=1];
+
+// A name Python and the controls accept: letters, digits, _ (not first a digit)
+py_is_identifier(name) {
+	if(name == "")
+		return false;
+	idx = 0;
+	for(c : name) {
+		is_letter = c != c.uppercase() || c != c.lowercase() || c == "_";
+		is_digit = "0123456789".contains(c);
+		if(!is_letter && !(is_digit && idx > 0))
+			return false;
+		idx++;
+	}
+	return true;
+}
+
+// "1.5", "-2", "3e-4", "0.5f" (as in a //@ annotation): a number
+py_is_number(text) {
+	t = text.strip();
+	if(t.ends("f") && t.size() > 1)
+		t = t.substr(0, t.size() - 1);
+	if(t.starts("+") || t.starts("-"))
+		t = t.substr(1);
+	if(t == "" || t == ".")
+		return false;
+	seen_digit = false;
+	seen_dot = false;
+	seen_exp = false;
+	prev = "";
+	for(c : t) {
+		if("0123456789".contains(c))
+			seen_digit = true;
+		else if(c == "." && !seen_dot && !seen_exp)
+			seen_dot = true;
+		else if((c == "e" || c == "E") && seen_digit && !seen_exp)
+			seen_exp = true;
+		else if((c == "+" || c == "-") && (prev == "e" || prev == "E"))
+			{}
+		else if(c == "_")
+			{}
+		else
+			return false;
+		prev = c;
+	}
+	return seen_digit && prev != "e" && prev != "E" && prev != "+" && prev != "-";
+}
+
+py_number(text) {
+	t = text.strip().replace("_", "");
+	if(t.ends("f"))
+		t = t.substr(0, t.size() - 1);
+	if(t.contains(".") || t.contains("e") || t.contains("E"))
+		return std.float(t);
+	return std.int(t);
+}
+
+// The code of a line without its comment (a # outside of a string)
+py_strip_comment(line) {
+	quote = "";
+	for(i = 0; i < line.size(); i++) {
+		c = line.substr(i, 1);
+		if(quote != "") {
+			if(c == quote)
+				quote = "";
+		}
+		else if(c == "'" || c == "\"")
+			quote = c;
+		else if(c == "#")
+			return line.substr(0, i).strip();
+	}
+	return line.strip();
+}
+
+// A Python literal as a value: numbers, True / False (1 / 0), None, a string, a tuple or list of these. [ok, value]:
+// ok is false for anything else (an expression, a call), which leaves the default to the annotation
+py_literal(text) {
+	t = text.strip();
+	if(t == "")
+		return [ok = false, value = None];
+	if(t == "True")
+		return [ok = true, value = true, kind = "bool"];
+	if(t == "False")
+		return [ok = true, value = false, kind = "bool"];
+	if(t == "None")
+		return [ok = true, value = None, kind = "none"];
+	if(py_is_number(t))
+		return [ok = true, value = py_number(t), kind = "number"];
+	first = t.substr(0, 1);
+	if((first == "\"" || first == "'") && t.size() >= 2 && t.ends(first))
+		return [ok = true, value = t.substr(1, t.size() - 2), kind = "string"];
+	if((first == "(" && t.ends(")")) || (first == "[" && t.ends("]"))) {
+		inner = t.substr(1, t.size() - 2).strip();
+		items = [];
+		if(inner != "") {
+			for(part : inner.smart_split(",")) {
+				p = part.strip();
+				if(p == "")
+					continue; //(1,) and a comma at the end
+				lit = py_literal(p);
+				if(!lit.ok)
+					return [ok = false, value = None];
+				items.push_back(lit.value);
+			}
+		}
+		return [ok = true, value = items, kind = "list"];
+	}
+	return [ok = false, value = None];
+}
+
+// A module level assignment "name = value" or "name: type = value": [name, value text], or None
+py_assignment(line) {
+	if(line == "" || line.starts(" ") || line.starts("\t"))
+		return None;
+	eq = -1;
+	for(i = 0; i < line.size(); i++) {
+		c = line.substr(i, 1);
+		if(c == "=") {
+			eq = i;
+			break;
+		}
+		if(c == "(" || c == "[" || c == "'" || c == "\"" || c == "#")
+			return None;
+	}
+	if(eq <= 0)
+		return None;
+	//==, +=, <= ... are no assignment
+	if(line.substr(eq + 1, 1) == "=" || "+-*/%<>!&|^@".contains(line.substr(eq - 1, 1)))
+		return None;
+	target = line.substr(0, eq).strip();
+	colon = target.find(":");
+	if(colon >= 0)
+		target = target.substr(0, colon).strip();
+	if(!py_is_identifier(target))
+		return None;
+	return [name = target, value = py_strip_comment(line.substr(eq + 1))];
+}
+
+// The attributes of an annotation: [[key, value], ...] in their order (a value keeps its brackets and quotes, as in
+// the GLSL loader), and the words without "=" (the type, the type of an output)
+py_split_annotation(text) {
+	words = [];
+	attrs = [];
+	for(part : text.strip().smart_split(" ")) {
+		p = part.strip();
+		if(p == "" || p == "#")
+			continue;
+		if(p.find("=") > 0) {
+			kv = p.smart_split("=", 2);
+			attrs.push_back([kv[0].strip(), kv.size() > 1 ? kv[1].strip() : ""]);
+		}
+		else
+			words.push_back(p);
+	}
+	return [words = words, attrs = attrs];
+}
+
+// The value of an attribute, fallback when the annotation does not have it
+py_attr(decl, key, fallback = None) {
+	for(kv : decl.attrs) {
+		if(kv[0] == key)
+			return kv[1];
+	}
+	return fallback;
+}
+
+// "(320,180)" -> [320, 180]; "0.5" -> [0.5]
+py_attr_numbers(text) {
+	t = std.string(text ?? "").strip();
+	if(t.starts("(") || t.starts("["))
+		t = t.substr(1, t.size() - 2);
+	out = [];
+	for(part : t.split(",", -1, true)) {
+		if(py_is_number(part))
+			out.push_back(py_number(part));
+	}
+	return out;
+}
+
+// A quoted attribute value without its quotes: displayname="Speed", tooltip='...'
+py_unquote(text) {
+	t = std.string(text ?? "").strip();
+	if(t.size() >= 2 && (t.starts("\"") || t.starts("'")) && t.ends(t.substr(0, 1)))
+		return t.substr(1, t.size() - 2);
+	return t;
+}
+
+// The whole source. decls: [kind (param / input / output), type, name, line (from 1), default, has_default,
+// default_kind, attrs, text]; settings: [key = value text]; problems: [line, text]
+py_parse_annotations(source) {
+	decls = [];
+	settings = std.json();
+	problems = [];
+	names = std.json();
+	lines = std.string(source ?? "").replace("\r\n", "\n").split("\n");
+	pending = None; //[text, line] of the annotation that waits for its assignment
+	in_string = "";	//a module level """ ... """ string: its lines are no code
+	for(i, raw : lines) {
+		line_no = i + 1;
+		if(in_string != "") {
+			if(raw.contains(in_string))
+				in_string = "";
+			continue;
+		}
+		stripped = raw.strip();
+		if(stripped == "")
+			continue;
+		//Annotations stand at the start of a line, as the module level assignment below them
+		if(raw.starts("#@")) {
+			if(pending)
+				problems.push_back([line = pending.line, text = "#@" + pending.text + ": no assignment below it"]);
+			pending = None;
+			body = stripped.substr(2).strip();
+			if(body.starts("settings")) {
+				for(kv : py_split_annotation(body.substr(8)).attrs)
+					settings[kv[0]] = kv[1];
+				continue;
+			}
+			pending = [text = body, line = line_no];
+			continue;
+		}
+		if(stripped.starts("#")) {
+			//More attributes of the annotation above, as //-lines after a //@ annotation
+			if(pending && raw.starts("#"))
+				pending.text += " " + stripped.substr(1).strip();
+			continue;
+		}
+		for(q : ["\"\"\"", "'''"]) {
+			if(stripped.starts(q) && !(stripped.size() >= 6 && stripped.substr(3).contains(q))) {
+				in_string = q;
+				break;
+			}
+		}
+		if(in_string != "" || !pending)
+			continue;
+		ann = pending;
+		pending = None;
+		asg = py_assignment(raw.rtrim());
+		if(!asg) {
+			problems.push_back([line = ann.line, text = "#@" + ann.text + ": the line below it is no module level assignment (name = value)"]);
+			continue;
+		}
+		parts = py_split_annotation(ann.text);
+		if(parts.words.size() == 0) {
+			problems.push_back([line = ann.line, text = "#@ without a type above " + asg.name]);
+			continue;
+		}
+		kind = "param";
+		type = parts.words[0];
+		if(type == "input") {
+			kind = "input";
+			type = "texture";
+		}
+		else if(type == "output") {
+			kind = "output";
+			type = parts.words.size() > 1 ? parts.words[1] : "float";
+			if(PY_TYPE_ALIASES.has(type) && type != "bool")
+				type = PY_TYPE_ALIASES[type];
+			if(!PY_OUTPUT_TYPES.has(type)) {
+				problems.push_back([line = ann.line, text = "#@output " + type + ": unknown output type (" + PY_OUTPUT_TYPE_NAMES + ")"]);
+				continue;
+			}
+		}
+		else {
+			if(PY_TYPE_ALIASES.has(type))
+				type = PY_TYPE_ALIASES[type];
+			if(!PY_PARAM_TYPES.has(type)) {
+				problems.push_back([line = ann.line, text = "#@" + type + ": unknown type (" + PY_PARAM_TYPE_NAMES + ", input, output, settings)"]);
+				continue;
+			}
+		}
+		lit = py_literal(asg.value);
+		//color with four numbers is an rgba
+		if(type == "rgb" && lit.ok && std.is_json(lit.value) && lit.value.size() == 4)
+			type = "rgba";
+		if(names.has(asg.name)) {
+			problems.push_back([line = ann.line, text = asg.name + " is declared twice (line " + std.string(names[asg.name]) + ")"]);
+			continue;
+		}
+		names[asg.name] = line_no;
+		decl = [kind = kind, type = type, name = asg.name, line = line_no, default = lit.value, has_default = lit.ok,
+			default_kind = lit.ok ? lit.kind : "", attrs = parts.attrs, text = ann.text];
+		if(kind == "input") {
+			fmt = py_attr(decl, "format", "rgba");
+			if(!PY_INPUT_FORMATS.has(fmt)) {
+				problems.push_back([line = ann.line, text = "#@input format=" + fmt + ": rgba, rgb or gray"]);
+				continue;
+			}
+		}
+		decls.push_back(decl);
+	}
+	if(pending)
+		problems.push_back([line = pending.line, text = "#@" + pending.text + ": no assignment below it"]);
+	first_texture = "";
+	for(d : decls) {
+		if(d.kind != "output" || d.type != "texture")
+			continue;
+		if(first_texture == "")
+			first_texture = d.name;
+		else
+			problems.push_back([line = d.line, text = "only one #@output texture per script (" + first_texture + " is the first)"]);
+	}
+	return [decls = decls, settings = settings, problems = problems];
+}
+
+// What a change of the script changes for the controls: the kind, type and name of every declaration, in order
+py_decl_signature(decls) {
+	sig = "";
+	for(d : decls)
+		sig += d.kind + ":" + d.type + ":" + d.name + ";";
+	return sig;
+}

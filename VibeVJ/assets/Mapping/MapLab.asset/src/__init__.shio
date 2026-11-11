@@ -5,6 +5,9 @@
 #include "engine/patch/patch"
 
 def slice_lamp_value(f, label);
+def route_led(out);
+def hide_effects();
+def show_led(out, v);
 
 import nanogui;
 
@@ -29,6 +32,9 @@ active_input_mask = None;
 active_input_mask_btn = None;
 active_fx_btn = None; //the Effects button of the output whose effects show in the upper half (#428)
 active_fx_panel = None; //its panel: resized like an input mask by dragging the projection window (#520)
+active_led_output = None; //the output whose LED mapping covers the projection area (#755)
+projection_menu = None;   //the bar at the top of the projection window: drawn over everything, so hidden under the LED mapping
+LEDMAPPER_PATH = "assets/Mapping/LEDMapper.asset";
 
 add_input_btn = None;
 managed add_slice_row = None;      //the top row of the input side (#573)
@@ -1279,8 +1285,10 @@ route_output(out) {
 			}
 		}
 	}
-	else if(final == out.final_shader)
+	else if(final == out.final_shader) {
+		route_led(out);
 		return; //no effects, nothing changed
+	}
 
 	if(final != out.final_shader) {
 		old = out.final_shader;
@@ -1307,6 +1315,93 @@ route_output(out) {
 		out.preview.shader(final);
 		out.preview_input = final;
 	}
+	route_led(out);
+}
+
+//The LED mapping of an output (#755) gets what goes out: the end of its effects. It is no effect itself, the picture
+//it maps goes out unchanged. It loads after it was made: made active and routed once it has loaded
+route_led(out) {
+	led = out.led;
+	if(!led || !led.is_loaded())
+		return;
+	if(!out.led_live) {
+		led.dispatch("active", true);
+		out.led_live = true;
+	}
+	in = led.dispatch("get_default_input");
+	if(in && in.value() != out.final_shader)
+		in.value(out.final_shader);
+}
+
+//Makes the LEDMapper of an output (one per output), in its panel over the projection area
+make_led(out, guid = "") {
+	if(out.led)
+		return out.led;
+	item = generator(out.led_panel, LEDMAPPER_PATH, vec2f(0, 0), guid, [no_header = true]);
+	if(!item || !item.is_loaded()) {
+		if(item)
+			std.free(item);
+		std.warn("MapLab: the LEDMapper could not be made (" + LEDMAPPER_PATH + ")");
+		return None;
+	}
+	item.window.anchor(0);
+	item.window.movable(false);
+	item.window.resizable(false);
+	out.led = item;
+	out.led_live = false;
+	out.led_remove_btn.visible(true);
+	route_led(out);
+	return item;
+}
+
+free_led(out) {
+	if(active_led_output == out)
+		show_led(out, false);
+	if(out.led) {
+		try {
+			std.free(out.led);
+		}
+		catch(e) {}
+	}
+	out.led = None;
+	out.led_live = false;
+	out.led_remove_btn.visible(false);
+}
+
+//The LED mapping of one output over the whole projection area (#755): no split, no list. Only one thing covers the
+//projection area or its upper half at a time: the effects and an input mask close
+show_led(out, v) {
+	if(v) {
+		if(!make_led(out)) {
+			out.led_btn.pushed(false);
+			return;
+		}
+		if(active_input_mask_btn) {
+			cb = active_input_mask_btn.on_change();
+			cb(false);
+		}
+		hide_effects();
+		if(active_led_output && active_led_output != out)
+			show_led(active_led_output, false);
+		active_led_output = out;
+		out.led_panel.visible(true);
+		projection_menu.visible(false);
+	}
+	else {
+		out.led_panel.visible(false);
+		if(active_led_output == out) {
+			active_led_output = None;
+			projection_menu.visible(true);
+		}
+	}
+	out.led_btn.pushed(v);
+	main_area.refresh_layout();
+}
+
+//Closes the LED mapping that shows, before the effects or an input mask open
+hide_led() {
+	if(active_led_output)
+		show_led(active_led_output, false);
 }
 
 //The preview of an output (#272) is as wide as the output column and has the aspect of the output, within limits
@@ -1322,6 +1417,7 @@ output_preview_resize(out) {
 //The effects of one output in the upper half of MapLab, as an input mask shows there (only one of them at a time)
 show_effects(out, v) {
 	if(v) {
+		hide_led();
 		if(active_input_mask_btn) {
 			cb = active_input_mask_btn.on_change();
 			cb(false);
@@ -1548,6 +1644,7 @@ add_slice(current_input, slice_name = "", slice_guid = "", is_eco = false) {
 				old_cb = active_input_mask_btn.on_change();
 				old_cb(false);
 			hide_effects(); //the upper half shows one thing at a time
+			hide_led();
 			active_input_mask = current_slice.input_mask;
 			active_input_mask_btn = input_mask_btn;
 			if(!current_slice.input_mask)
@@ -2009,6 +2106,7 @@ add_input(input_name = "", input_guid = "") {
 				old_cb = active_input_mask_btn.on_change();
 				old_cb(false);
 			hide_effects(); //the upper half shows one thing at a time
+			hide_led();
 			active_input_mask = input_mask;
 			active_input_mask_btn = input_mask_btn;
 			input_mask.visible(true);
@@ -2118,9 +2216,13 @@ add_output(output_name, output_guid = "") {
 	fx_btn = slice_area.pushbutton("Effects").fixed_height(25)
 		.tooltip("Shaders that work on the whole output, after the mapping. Drop shaders from the Assets tab onto the list that opens.");
 	fx_panel = main_area.widget().anchor_top(0).anchor_bottom(0.5, "percent").anchor_left(side_width).anchor_right(side_width).visible(false);
-	//LED mapping of the output (#428): a LEDMapper in its effects gets this output as its picture and passes it on
-	led_btn = slice_area.button("LED mapping").fixed_height(25)
-		.tooltip("Adds a LEDMapper to the effects of this output: it maps the LEDs from this output and passes the picture on.");
+	//LED mapping of the output (#755): a LEDMapper of its own that maps the LEDs from what goes out (after the effects).
+	//It covers the whole projection area while it shows, and keeps sending while it does not
+	led_btn = slice_area.pushbutton("LED mapping").fixed_height(25)
+		.tooltip("Maps LEDs from what this output sends (after its effects): a LEDMapper of this output over the whole projection area. It keeps sending while it is closed.\n[[wiki:Output-and-Devices#the-outputs-of-maplab]]");
+	led_remove_btn = slice_area.button("Remove LED mapping").fixed_height(25).danger("hover").visible(false)
+		.tooltip("Removes the LEDMapper of this output with its segments");
+	led_panel = main_area.widget().anchor_top(0).anchor_bottom(30).anchor_left(side_width).anchor_right(side_width).visible(false);
 	fx_hint = fx_panel.label("Drop shaders from the Assets tab onto the list on the left. The first one gets the mapped output, the last one is what goes out.")
 		.anchor_left(260).anchor_right(10).anchor_top(10).fixed_height(40).text_color(vec4f(0.608, 0.608, 0.627, 1.0));
 	fx_stack = stackview(fx_panel);
@@ -2164,6 +2266,11 @@ add_output(output_name, output_guid = "") {
 		preview = preview,
 		preview_input = shader_slice,
 		fx_live = [], //guids of the effects that were made active
+		led_btn = led_btn,
+		led_remove_btn = led_remove_btn,
+		led_panel = led_panel,
+		led = None,        //its LEDMapper (#755), made by the first click on LED mapping
+		led_live = false,
 	]);
 	
 	current_output = outputs[-1];
@@ -2190,9 +2297,11 @@ add_output(output_name, output_guid = "") {
 		show_effects(current_output, v);
 	});
 
-	led_btn.on_click([current_output](){
-		current_output.fx_stack.add_generator("assets/Mapping/LEDMapper.asset");
-		show_effects(current_output, true);
+	led_btn.on_change([current_output](v){
+		show_led(current_output, v);
+	});
+	led_remove_btn.on_click([current_output](){
+		free_led(current_output);
 	});
 	
 	name.on_change([current_output](v){
@@ -2302,6 +2411,8 @@ add_output(output_name, output_guid = "") {
 		if(active_fx_btn == current_output.fx_btn)
 			show_effects(current_output, false);
 		free_effects(current_output);
+		free_led(current_output);
+		std.free(current_output.led_panel);
 		std.free(current_output.fx_panel);
 		std.free(current_output.area);
 		std.free(current_output.shader);
@@ -2518,7 +2629,10 @@ add_output(output_name, output_guid = "") {
 		// Output grid
 		// ------------------------------------------------------------
 
-		grid_size = grid_size_ctrl.value();
+		//(an output loaded with a project draws once before the bar of the projection window is there)
+		grid_size = grid_size_ctrl ? grid_size_ctrl.value() : 64;
+		if(grid_size < 4)
+			grid_size = 64;
 
 		nvgStrokeWidth(1);
 		nvgStrokeColor(vec4f(1.0, 1.0, 1.0, 0.08));
@@ -2615,7 +2729,9 @@ add_output(output_name, output_guid = "") {
 
 	//Render first max_num_inputs inputs directly
 	shader_slice.before_render([current_output, shader_slice](){
-		for(i = 0; i < math.min(max_num_inputs, current_output.inputs.size()); i++) {
+		//(no inputs yet before the first link_shaders of a loaded output)
+		count = current_output.inputs ? current_output.inputs.size() : 0;
+		for(i = 0; i < math.min(max_num_inputs, count); i++) {
 			cin = current_output.inputs[i];
 			slice_shader = cin.shader;
 			if(cin.is_eco) //Shaderview instead of shader
@@ -2740,6 +2856,8 @@ dispatcher(generator, cmd, value) {
 		for(i = 0; i < outputs.size(); i++) {
 			outputs[i].shader.rendering_enabled(value);
 			outputs[i].fx_stack.dispatch("active", value);
+			if(outputs[i].led && outputs[i].led.is_loaded())
+				outputs[i].led.dispatch("active", value);
 		}
 		for(i = 0; i < inputs.size(); i++) {
 			inputs[i].input_mask.rendering_enabled(value);
@@ -2789,10 +2907,51 @@ add_slice_to_current(is_eco) {
 	add_slice(input, "", "", is_eco);
 }
 
+//The queries of MapLab for the AI and MCP (vibevj_query): its outputs, and the LED mapping of one (#755)
+register_maplab_queries(generator) {
+	generator.register("get_outputs", [], [](args) {
+		list = [];
+		for(i = 0; i < outputs.size(); i++) {
+			out = outputs[i];
+			led = out.led;
+			in = led && led.is_loaded() ? led.dispatch("get_default_input") : None;
+			list.push_back([
+				index = i,
+				name = out.output_name,
+				guid = out.output_guid,
+				effects = out.fx_stack.items.size(),
+				led = led ? led.guid : "",
+				led_open = active_led_output == out,
+				//the LEDMapper maps what goes out: the end of the effects (the output shader without effects)
+				led_input_is_output = in ? in.value() == out.final_shader : false,
+				output_is_effect = out.final_shader != out.shader,
+			]);
+		}
+		return [ok = true, value = list];
+	}, "The outputs of MapLab: name, guid, number of effects, the guid of its LEDMapper (empty: none), whether that shows and maps what goes out");
+
+	generator.register("led_mapping", [index = "&int(): Output index (get_outputs)", action = "&string(): open, close or remove"], [](args) {
+		i = std.int(args.index);
+		if(i < 0 || i >= outputs.size())
+			return [ok = false, error = "no output " + i];
+		out = outputs[i];
+		if(args.action == "open")
+			show_led(out, true);
+		else if(args.action == "close")
+			show_led(out, false);
+		else if(args.action == "remove")
+			free_led(out);
+		else
+			return [ok = false, error = "action: open, close or remove"];
+		return [ok = true, led = out.led ? out.led.guid : ""];
+	}, "Opens the LED mapping of an output over the projection area (made the first time: a LEDMapper of its own that maps what the output sends, after its effects), closes it (it keeps sending) or removes it");
+}
+
 entry(generator, area) {
 	
 	maplab_engine = generator.engine;
 	generator.window.fixed_size(vec2f(1200,800));
+	register_maplab_queries(generator);
 	
 	area.layout(None);
 	
@@ -2821,6 +2980,7 @@ entry(generator, area) {
 	});
 
 	top_menu = projection_window.button_panel().layout(nanogui.layout_horizontal());
+	projection_menu = top_menu;
 
 	enable_grid_btn = top_menu.controlbutton("ENABLE GRID", "area_settings").tooltip("Slices snap to the grid when they are moved or resized").caption("Enable grid").push(1).value(1);
 	grid_size_ctrl = top_menu.controlint("Grid Size", "area_settings").tooltip("The size of the snap grid, in pixels").value(64);
@@ -2891,6 +3051,8 @@ update_post(generator) {
 	for(i = 0; i < outputs.size(); i++) {
 		if(outputs[i].fx_stack.items.size() > 0)
 			route_output(outputs[i]);
+		else if(outputs[i].led && !outputs[i].led_live)
+			route_led(outputs[i]);
 	}
 
 	if(link_shaders_lazy) {
@@ -2955,6 +3117,8 @@ save_state() {
 			shader_state = shader.projection_save(),
 			effects = output.fx_stack.save_state(),
 		]);
+		if(output.led)
+			saved_outputs[-1].led = output.led.save_state();
 	}
 	
 	return [
@@ -3023,6 +3187,18 @@ load_state(state) {
 			if(state_output.effects ?? false) {
 				if(state_output.effects.size() > 0)
 					output.fx_stack.load_state(state_output.effects);
+			}
+			//Its LED mapping (#755)
+			if(state_output.has("led") && state_output.led) {
+				led = make_led(output, state_output.led.guid ?? "");
+				if(led) {
+					try {
+						led.load_state(state_output.led);
+					}
+					catch(e) {
+						std.warn("MapLab: the LED mapping of " + output.output_name + " did not load: " + e);
+					}
+				}
 			}
 		}
 	}

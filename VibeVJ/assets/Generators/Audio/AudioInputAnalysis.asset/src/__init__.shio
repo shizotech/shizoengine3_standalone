@@ -3,6 +3,8 @@
 // formerly called prolink-bridge) sends (onboard microphone or line-in, firmware command "audio mic|line"):
 //   Source "DJ Watch (USB)":     DJ Watch on USB (shares the port with the Prolink generators)
 //   Source "DJ Watch (network)": a relay ESP32 in the network over ShizoNet (the prolink module receives it)
+//   Source "Video clips":        the sound of the video clips with Options > Audio analysis on, mixed (#460,
+//                                nanogui.video_audio_take: 48 kHz int16 mono, what the clips play at their volume)
 // The analysis runs in a subprocess (engine/processes/audio_process.shio); for the ESP32 it gets
 // the samples over ipc instead of opening the sound card.
 import subprocess;
@@ -21,6 +23,7 @@ ipc_name = "shizoserver_" + std.random_hash();
 SOURCE_LOCAL = 0;
 SOURCE_ESP_USB = 1;
 SOURCE_ESP_NETWORK = 2;
+SOURCE_VIDEO = 3;
 
 managed esp = None;      // prolink connection for Source "DJ Watch (USB)"
 audio_source = -1;       // source the subprocess was started for
@@ -39,6 +42,21 @@ MAX_PCM_PER_FRAME = 12;  // older chunks after a stall are dropped (stale for be
 
 dispatcher(generator, cmd, value) {
 	
+}
+
+//Every shader with a sampler AUDIO or WAVE that nothing else feeds gets the FFT texture of this analysis (#586,
+//shader_loader.shio): engine.audio_texture names it, ms is the last message, so a closed analysis stops feeding them
+audio_texture_id = std.random_hash(8);
+publish_audio_texture(image) {
+	engine = std.global("engine");
+	if(!engine)
+		return;
+	at = engine.audio_texture;
+	if(at && at.id == audio_texture_id) {
+		engine.audio_texture.ms = std.millis();
+		return;
+	}
+	engine.audio_texture = [image = image, id = audio_texture_id, ms = std.millis()];
 }
 
 restart_timeout = 0;
@@ -117,6 +135,8 @@ apply_source() {
 		esp = prolink.device();
 		esp.open(esp_port.value());
 	}
+	if(audio_source == SOURCE_VIDEO)
+		nanogui.video_audio_take(); // what was kept before is stale
 	audio_process = None; // terminates the old one
 	restart_timeout = 0;
 	restart_audio_process();
@@ -125,6 +145,18 @@ apply_source() {
 update_esp() {
 	if(audio_source == SOURCE_LOCAL) {
 		set_esp_status("Sound card");
+		return;
+	}
+
+	if(audio_source == SOURCE_VIDEO) {
+		take = nanogui.video_audio_take();
+		if(take.samples > 0)
+			send_pcm(take.rate, take.data);
+		if(take.clips > 0)
+			set_esp_status("Video clips: " + std.string(take.clips) + (take.clips == 1 ? " clip" : " clips") + " in the analysis" +
+				(take.device ? "" : " (no output device, only the analysis hears them)"));
+		else
+			set_esp_status("No video clip sends its sound: switch on Options > Audio analysis of a video clip");
 		return;
 	}
 	
@@ -291,11 +323,11 @@ entry(generator, area) {
 
 	sync = area.controlbutton("TIMELINE BPM SYNC").tooltip("The [[timeline]] follows the music: its [[bpm|BPM]] and position follow the analysis. A BPM typed into the timeline is overwritten while it is on\n[[wiki:Audio#sync-timeline]]").caption("Sync timeline").push(1);
 	
-	source_ctrl = area.controlcombo("SOURCE").tooltip("Where the sound comes from: the sound card, or DJ Watch over USB or the network\n[[wiki:Audio#source]]").caption("Source");
-	source_ctrl.items(["Sound card", "DJ Watch (USB)", "DJ Watch (network)"]); //index-based (SOURCE_LOCAL = 0, …)
+	source_ctrl = area.controlcombo("SOURCE").tooltip("Where the sound comes from: the sound card, DJ Watch over USB or the network, or the video clips that send their sound (Options > Audio analysis of a video clip)\n[[wiki:Audio#source]]").caption("Source");
+	source_ctrl.items(["Sound card", "DJ Watch (USB)", "DJ Watch (network)", "Video clips"]); //index-based (SOURCE_LOCAL = 0, …)
 	esp_status = area.label("Sound card").fixed_height(20);
 	
-	out = area.control("FFT TEXTURE OUT", "output_ctrls").tooltip("The spectrum (512 bands) and the waveform as a texture: [[link]] it into an audio [[shader]]\n[[wiki:Audio#fft-texture]]").caption("FFT texture").as_output(true);
+	out = area.control("FFT TEXTURE OUT", "output_ctrls").tooltip("The spectrum (512 bands) and the waveform as a texture: [[link]] it into an audio [[shader]]. Shaders with an input Audio or Wave get it by themselves while this analysis runs\n[[wiki:Audio#fft-texture]]").caption("FFT texture").as_output(true);
 
 	bpm = area.controlfloat("BPM").tooltip("The tempo the analysis hears. It glides to a new tempo instead of jumping\n[[wiki:Audio#the-values]]").max(999).as_output(true);
 	beat = area.controlslider("BEAT").tooltip("Where you are inside the current [[beat]], 0 to 1, again from 0 on every beat\n[[wiki:Audio#the-values]]").caption("Beat").as_output(true);
@@ -357,8 +389,21 @@ entry(generator, area) {
 		return current_phase;
 	};
 	
-	ipc_handle.on_message([beat, bpm, score, break_ctrl, break_ctrl2, get_phase, fft_texture,
-	low_energy, mid_energy, high_energy](msg) {
+	//LTC (#680 step 4): the analysis reads SMPTE timecode in the sound (each channel); the timeline chases it (TC,
+	//Source LTC). Shown here too
+	ltc_label = vars_cnt.label("LTC: none in the sound").font_size(13).fixed_height(20)
+		.tooltip("SMPTE timecode (LTC) the analysis reads in the sound, on either channel. The [[timeline]] can follow it: TC in its bar, Source LTC.\n[[wiki:Timeline#timecode]]");
+
+	ipc_handle.on_message([beat, bpm, score, break_ctrl, break_ctrl2, get_phase, fft_texture, fft_image,
+	low_energy, mid_energy, high_energy, ltc_label](msg) {
+		if(msg.type == "ltc") {
+			tl = std.global("timeline");
+			if(tl && tl.timecode)
+				tl.timecode.ltc_message(msg);
+			ltc_label.caption("LTC: " + msg.text + "  " + msg.rate + " fps" + (msg.running ? (msg.reverse ? ", backwards" : "") : ", stopped") +
+				", channel " + std.string(msg.channel + 1));
+			return;
+		}
 		if(msg.type == "info") {
 			beat.value(get_phase(msg.phase));
 			score.value(msg.cum_score);
@@ -382,6 +427,7 @@ entry(generator, area) {
 			texture_buffer = msg.normalized_bands + msg.waveform;
 			
 			fft_texture.upload_data(texture_buffer);
+			publish_audio_texture(fft_image);
 		}
 		else if(msg.type == "beat")
 		{

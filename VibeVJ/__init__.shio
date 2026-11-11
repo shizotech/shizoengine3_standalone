@@ -31,6 +31,7 @@ class shizoengine
 	generators = [];
 	generators_pre_callbacks = [];
 	generators_post_callbacks = [];
+	generators_reload_requests = []; //generator.request_reload(): loaded again at the start of the next frame (#201)
 	
 	net = None;
 	artnet_callbacks = [];
@@ -74,6 +75,11 @@ class shizoengine
 	main_generator_view = None; //Direct link to the main view
 
 	managed blackout = None; //the switch that takes all outputs to black (#538, engine/blackout.shio)
+
+	//The spectrum and waveform texture of the running audio analysis (AudioInputAnalysis): [image, id, ms], ms = the
+	//last message of the analysis. Shaders get it in their samplers AUDIO / WAVE when nothing else feeds them (#586,
+	//engine/generators/extensions/glsl/shader_loader.shio)
+	audio_texture = None;
 
 	//Autosave (AUTOSAVE_DIR): minutes between two autosaves, 0 is off (Settings > Project, kept in the style file)
 	autosave_minutes = AUTOSAVE_DEFAULT;
@@ -162,6 +168,8 @@ class shizoengine
 		//Autosave: minutes, set in Settings > Project
 		if(style.has("autosave_minutes"))
 			autosave_minutes = std.int(style.autosave_minutes);
+		//The outputs of the sound of video clips, set in Settings > Sound (#460)
+		sound_settings_apply(style);
 
 		blackout = blackout_switch(this);
 		menu = main_menu(this);
@@ -201,14 +209,29 @@ class shizoengine
 			//Do this here for better frame-timing consistency
 			this.net.artnet_sync_now();
 		
+			//MIDI Time Code (#680): before the cursor moves, it may start, stop, jump or pull the speed (nudge_factor)
+			if(this.timeline.timecode)
+				this.timeline.timecode.tick();
+
 			pos_delta = 0.0;
 			if(this.timeline.play_btn.value())
 				cur_pos = this.timeline.cursor_pos.value();
 				cur_pos += (this.timeline.bpm_ctrl.value() * this.timeline.nudge_factor) / (60.0 * ctx.real_fps());
 				pos_delta = cur_pos - this.timeline.cursor_pos.value();
 				this.timeline.nudge_factor = 1.0; //Reset
+				//The loop (#680): from its end back to its start. pos_delta stays the step of this frame
+				if(this.timeline.clips)
+					cur_pos = this.timeline.clips.wrap(this.timeline.cursor_pos.value(), cur_pos);
 				this.timeline.cursor_pos.value(cur_pos);
+
+			//MIDI clock / MTC sent as the master (#680 step 4): where the timeline is now, for the thread that sends
+			if(this.timeline.timecode)
+				this.timeline.timecode.after_move();
 			
+			//The clips of the timeline (#680): active while the cursor is inside them, their position every frame
+			if(this.timeline.clips)
+				this.timeline.clips.tick();
+
 			//The loops turn with the main timeline and tell nanogui where they are (#273): before the sync, so
 			//controls that follow a loop get its position of this frame
 			if(this.timeline.loops)
@@ -217,24 +240,46 @@ class shizoengine
 			//Sync all midicontrols to timeline which are sync enabled
 			nanogui.sync_update(this.timeline.cursor_pos.value(), pos_delta);
 			
+			//Modules that asked to be loaded again (generator.request_reload(), #201): before any of them runs
+			if(this.generators_reload_requests.size()) {
+				requests = this.generators_reload_requests;
+				this.generators_reload_requests = [];
+				for(i = 0; i < requests.size(); i++) {
+					if(!requests[i] || !std.is_function(requests[i]._reload_fn))
+						continue;
+					try {
+						requests[i]._reload_fn();
+					}
+					catch(e) {
+						std.error("Reloading a generator failed: " + e);
+					}
+				}
+			}
+
 			//The performance overlay (#537) measures each generator while it is on
 			perf = this.env.perf;
 			measure = perf && perf.on;
 			for(i = 0; i < this.generators_pre_callbacks.size(); i++) {
-				if(!this.generators_pre_callbacks[i] || !this.generators_pre_callbacks[i].module || !this.generators_pre_callbacks[i]._pre_callback)
+				g = this.generators_pre_callbacks[i];
+				if(!g || !g.module || !g._pre_callback)
 					this.generators_pre_callbacks.erase(i);
 					i--;
 					continue;
 					
 				try {
 					t0 = measure ? nanogui.micros() : 0;
-					this.generators_pre_callbacks[i]._pre_callback(this.generators_pre_callbacks[i], this.timeline.cursor_pos.value(), pos_delta);
-					if(measure)
-						perf.add(this.generators_pre_callbacks[i], nanogui.micros() - t0);
+					g._pre_callback(g, this.timeline.cursor_pos.value(), pos_delta);
+					if(measure && i < this.generators_pre_callbacks.size() && this.generators_pre_callbacks[i] == g)
+						perf.add(g, nanogui.micros() - t0);
 				}
 				catch(e) {
-					this.generators_pre_callbacks.erase(i);
-					i--;	
+					//The generator stops updating for the rest of the session: say which one and why. Not one that was
+					//freed during its update (a project load): it left this list in __deinit__ and the entries moved up
+					if(i < this.generators_pre_callbacks.size() && this.generators_pre_callbacks[i] == g) {
+						std.error("The update of the generator " + (g.path ?? "") + " failed, it is not updated any more: " + e);
+						this.generators_pre_callbacks.erase(i);
+						i--;
+					}
 				}
 			}
 			
@@ -286,29 +331,46 @@ class shizoengine
 			if(this.displays)
 				this.displays.tick();
 
+			//Settings > Sound follows the sound devices while the window is open (#460)
+			if(this.menu && this.menu.asset_menu && this.menu.asset_menu.sound_page)
+				this.menu.asset_menu.sound_page.tick();
+
 			//The shader preview of the Assets tab opens once the mouse rested on a shader (#536)
 			if(this.env.shader_preview)
 				this.env.shader_preview.tick();
+			//... and the video preview once it rested on a video (#460)
+			if(this.env.video_preview)
+				this.env.video_preview.tick();
+
+			//The live preview of the web remote (#359): its hidden shaders are made and freed here
+			if(this.env.web_remote)
+				this.env.web_remote.tick();
 
 			perf = this.env.perf;
 			measure = perf && perf.on;
 			if(measure)
 				perf.frame();
 			for(i = 0; i < this.generators_post_callbacks.size(); i++) {
-				if(!this.generators_post_callbacks[i] || !this.generators_post_callbacks[i].module || !this.generators_post_callbacks[i]._post_callback)
+				g = this.generators_post_callbacks[i];
+				if(!g || !g.module || !g._post_callback)
 					this.generators_post_callbacks.erase(i);
 					i--;
 					continue;
 					
 				try {
 					t0 = measure ? nanogui.micros() : 0;
-					this.generators_post_callbacks[i]._post_callback(this.generators_post_callbacks[i]);
-					if(measure)
-						perf.add(this.generators_post_callbacks[i], nanogui.micros() - t0);
+					g._post_callback(g);
+					if(measure && i < this.generators_post_callbacks.size() && this.generators_post_callbacks[i] == g)
+						perf.add(g, nanogui.micros() - t0);
 				}
 				catch(e) {
-					this.generators_post_callbacks.erase(i);
-					i--;	
+					//The generator stops updating for the rest of the session: say which one and why. Not one that was
+					//freed during its update (a project load): it left this list in __deinit__ and the entries moved up
+					if(i < this.generators_post_callbacks.size() && this.generators_post_callbacks[i] == g) {
+						std.error("The update of the generator " + (g.path ?? "") + " failed, it is not updated any more: " + e);
+						this.generators_post_callbacks.erase(i);
+						i--;
+					}
 				}
 			}
 
@@ -356,7 +418,15 @@ class shizoengine
 		if(old_format < PROJECT_FORMAT && fileio.exists(project_dir + "/generators.json"))
 			backup_project_files(project_dir, old_format);
 
-		write_project(project_dir);
+		//2026-11-04: a write that fails (a full disk, a name the file system refuses) keeps the autosave, the only good copy;
+		//an error (a throwing save hook is caught in write_project) must not leave save_in_progress set for good
+		written = false;
+		try {
+			written = write_project(project_dir);
+		}
+		catch(e) {
+			std.error("Cannot save the project " + project_env.name + ": " + e);
+		}
 
 		/*
 		fileio.write_json("projects/" + project_env.name + "/ui_settings.json", [
@@ -365,32 +435,43 @@ class shizoengine
 		*/
 
 		//The project on disk is up to date: the autosave is not needed any more
-		autosave_remove();
-		autosave_last = std.millis();
+		if(written) {
+			autosave_remove();
+			autosave_last = std.millis();
+		}
+		else
+			std.error("The project " + project_env.name + " was not saved completely, the autosave is kept");
 
 		screen.status_overlay("");
 		save_in_progress = false;
+		return written;
 	}
 
 	//Writes every file of the open project into dir: the patch, one file per save hook, the controls and the format.
-	//Save writes into projects/<name>, the autosave into AUTOSAVE_DIR
+	//Save writes into projects/<name>, the autosave into AUTOSAVE_DIR. Every file is written atomically (<file>.tmp, then
+	//renamed): a crash while saving keeps the file of the last save instead of a truncated one, which loaded as an
+	//empty project. Returns false when a file could not be written.
 	write_project(dir) {
-		if(patch)
-			fileio.write_json(dir + "/fixture_setup.json", patch);
+		all_written = true;
+		if(patch && !fileio.write_json(dir + "/fixture_setup.json", patch, false, true))
+			all_written = false;
 
 		for(i = 0; i < save_hooks.size(); i++) {
 			hook_name = save_hooks.key(i);
 			try {
 				hook_data = save_hooks[i]();
-				fileio.write_json(dir + "/" + hook_name + ".json", hook_data);
+				if(!fileio.write_json(dir + "/" + hook_name + ".json", hook_data, false, true))
+					all_written = false;
 			}
 			catch(e) {
 				std.error("Cannot run save hook: " + save_hooks.key(i) + ": " + e);
 			}
 		}
 
-		fileio.write_json(dir + "/controls.json", nanogui.serialize_controls());
+		if(!fileio.write_json(dir + "/controls.json", nanogui.serialize_controls(), false, true))
+			all_written = false;
 		write_project_format(dir);
+		return all_written;
 	}
 
 	// Autosave
@@ -422,10 +503,11 @@ class shizoengine
 		next = AUTOSAVE_DIR + "_next";
 		try {
 			started = std.millis();
-			fileio.remove(next);
-			write_project(next);
+			remove_if_exists(next);
+			if(!write_project(next))	//an incomplete autosave never takes the place of the last complete one
+				std.runtime_error("a file of the project could not be written");
 			fileio.write_json(next + "/autosave.json", [name = std.global("project").name ?? "", time = std.date("%Y-%m-%d %H:%M")]);
-			fileio.remove(AUTOSAVE_DIR);
+			remove_if_exists(AUTOSAVE_DIR);
 			ok = fileio.rename(next, AUTOSAVE_DIR) ? true : false;
 			env.last_autosave_ms = std.millis() - started;
 			std.print("Autosave took ", env.last_autosave_ms, " ms");
@@ -439,8 +521,8 @@ class shizoengine
 
 	autosave_remove() {
 		try {
-			fileio.remove(AUTOSAVE_DIR);
-			fileio.remove(AUTOSAVE_DIR + "_next");
+			remove_if_exists(AUTOSAVE_DIR);
+			remove_if_exists(AUTOSAVE_DIR + "_next");
 		}
 		catch(e) {}
 	}

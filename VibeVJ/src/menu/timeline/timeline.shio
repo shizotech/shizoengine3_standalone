@@ -1,8 +1,14 @@
 
 using eigen;
 
+SHOW_HOLD_MS = 400; //leaving show mode needs the lock or Ctrl+L held this long (#285)
+
 #include "engine/generators/generatorview"
-#include "loops"
+#include "cues" //the cues of a show (#680, step 5): before timeline_clips, which has them
+#include "timeline_clips"
+#include "loops" //after timeline_clips: a loop is a timeline with clips too (#680)
+#include "timecode" //MIDI Time Code chase (#680, step 3)
+#include "shows" //the songs of a show (#680, step 5)
 
 class timeline
 {
@@ -19,6 +25,13 @@ class timeline
 	managed screen = None;
 	managed timeline_generators = None;
 	managed loops = None; //the Loops view (#273)
+	clips = None;         //the clips and lanes of the view Timeline (#680): the song of the show that plays (shows.shio)
+	managed shows = None; //the songs of the show (#680, step 5); the first song is the timeline of before
+	managed follow_btn = None;
+	tc_caption = "";      //what the chase of a timecode shows in the ruler
+	managed loop_btn = None; //Loop (#680): the cursor jumps from the end of the loop range back to its start
+	managed timecode = None; //the MIDI Time Code chase (#680, step 3, timecode.shio): its button TC in the bar
+	managed ruler = None;    //the nanogui.timeline of the view Timeline
 	managed bar_parts = None; //the controls of the bar that give up width on a narrow screen (fit_bar)
 	bar_mode = -1;
 	bar_rest = 0; //the width of the bar without the parts that give up width (buttons, gaps, spacing), measured (fit_bar)
@@ -26,6 +39,9 @@ class timeline
 	nudge_factor = 1.0;
 	tap_times = []; //std.millis() of the recent taps on Tap
 	show_press = 0; //std.millis() of the press on the show mode button
+	show_key_press = 0; //std.millis() of the press of Ctrl+L in show mode, 0 = no hold of the key (show_key_up)
+	show_key_code = -1; //the key code of that press: its release ends the hold
+	eng = None;     //the engine (its env holds the hooks of other parts of the program)
 	expanded_top = 0.0; //top edge of the timeline before the last collapse, 0 = never collapsed
 
 	// Persistent state — keep these between calls
@@ -41,6 +57,7 @@ class timeline
 	__init__(engine, main_menu) {
 
 		engine.timeline = this;
+		eng = engine;
 		menu = main_menu;
 		screen = engine.screen;
 
@@ -82,7 +99,15 @@ class timeline
 		
 		timeline_node = window.matrixnode("timeline").anchor(0);
 		
-		timeline_widget = timeline_node.timeline("Timeline").anchor(0);
+		//The view Timeline: the heads of the lanes, the ruler with the lanes, the Clip panel (timeline_clips.shio, #680).
+		//Each song of the show (shows.shio) has a box of its own in it; the first song's is made here
+		tl_view = timeline_node.widget().anchor(0);
+		song_box = tl_view.widget().anchor(0);
+		timeline_widget = song_box.timeline("Timeline").anchor(0);
+		ruler = timeline_widget;
+		//The corner above the lane heads: Out and the song button, over the boxes of every song
+		tl_corner = timeline_node.widget().anchor_left(0).anchor_top(0).fixed_width(TL_HEAD_W).fixed_height(timeline_widget.scrub_height());
+		tl_panel = timeline_panel(tl_view);
 		
 		button_panel = window.button_panel().matrixnode("timeline_header").anchor(0).layout(nanogui.layout_horizontal());
 		
@@ -139,8 +164,10 @@ class timeline
 		//during the show does not unlock it. It sits at the start of the bar: the bar does not wrap, and on narrow
 		//screens (1280 px, or 1920 px at 150 % scaling) everything after the view switch is cut off.
 		//A toggle button so it is green ("on", like Play) while the show runs, which marks show mode; its own handler
-		//below decides when it toggles, the button's default click never runs
-		show_btn = button_panel.pushbutton("").icon(nanogui.icon("unlock")).fixed_width(44).tooltip("[[show mode|Show mode]]: lock [[notch|notches]] and editing");
+		//below decides when it toggles, the button's default click never runs.
+		//A plain button, not a control: it cannot be mapped to MIDI, so a controller message sent by mistake cannot
+		//unlock a show (#285). Ctrl+L does the same as the lock (show_key_down / show_key_up)
+		show_btn = button_panel.pushbutton("").icon(nanogui.icon("unlock")).fixed_width(44).tooltip("[[show mode|Show mode]]: lock [[notch|notches]] and editing (Ctrl+L)");
 		show_btn.on_mouse_button([this](pos, btn, down, mods) {
 			if(btn != 0)
 				return true;
@@ -150,7 +177,7 @@ class timeline
 			}
 			if(!nanogui.show_mode())
 				this.set_show_mode(true);
-			else if(std.millis() - this.show_press >= 400)
+			else if(std.millis() - this.show_press >= SHOW_HOLD_MS)
 				this.set_show_mode(false);
 			return true;
 		});
@@ -179,11 +206,16 @@ class timeline
 		play_btn = button_panel.controlbutton("PLAY").caption("Play").push(true).fixed_width(44);
 		stop_btn = button_panel.controlbutton("STOP").caption("Stop").fixed_width(44);
 		follow_btn = button_panel.controlbutton("FOLLOW").caption("Follow").push(true).fixed_width(44);
+		loop_btn = button_panel.controlbutton("LOOP").caption("Loop").push(true).fixed_width(44);
 		//Transport as icons with tooltips (Shizo UI); Play and Follow are green while on
 		play_btn.get_button().caption("").icon(nanogui.icon("play")).tooltip("Play or pause the [[timeline]] (Space). [[autoplay|Autoplay]] and everything that is synced run while it plays.");
 		stop_btn.get_button().caption("").icon(nanogui.icon("stop")).tooltip("Stop the [[timeline]] and go back to the start (Shift+Space)");
 		follow_btn.get_button().caption("").icon(nanogui.icon("crosshairs")).tooltip("Follow the playhead: the [[timeline]] pages along while it plays\n[[wiki:Timeline#the-transport-bar]]");
-		bpm_ctrl = button_panel.controlfloat("BPM").tooltip("[[bpm|BPM]]: the tempo. Click to type it.").readout(true).fixed_width(125).value(150);
+		loop_btn.get_button().caption("").icon(nanogui.icon("sync")).tooltip("Loop: while it plays, the [[timeline]] jumps from the end of the loop range back to its start. The range is the bar in the ruler: drag its ends, or Shift + drag in the ruler.\n[[wiki:Timeline#loop]]");
+		//TC (#680, step 3): the timeline follows MIDI Time Code; its popup has the MIDI input and the offset
+		timecode = timecode_chase(this, button_panel);
+		//#793: a MIDI value is scaled into the range of the control, so an unbounded one sends the tempo to the top of a double. 999 is what the BPM controls of the assets use (AudioInputAnalysis, ProlinkBridge, ProlinkDecks).
+		bpm_ctrl = button_panel.controlfloat("BPM").tooltip("[[bpm|BPM]]: the tempo. Click to type it.").min(20).max(999).readout(true).fixed_width(125).value(150);
 		
 		//Tap tempo: the average of the taps, a pause of two seconds starts over
 		tap_btn = button_panel.button("Tap").fixed_width(44).tooltip("Click on each [[beat]] to set the tempo, or press T\n[[wiki:Timeline#set-the-tempo]]");
@@ -192,9 +224,11 @@ class timeline
 		});
 		
 		//Start at 0, so an unset value never shows as 1.18e-38
-		beat_ctrl = button_panel.controlfloat("BEAT").tooltip("Where the playhead is inside the current [[beat]], from 0 to 1. [[link|Link]] it to anything that should pulse.").caption("Beat").readout(true).decimals(2).fixed_width(125).value(0);
+		//#793: the beat is 0 to 1 by definition - bound it, so a MIDI mapping or a link scales into it.
+		beat_ctrl = button_panel.controlfloat("BEAT").tooltip("Where the playhead is inside the current [[beat]], from 0 to 1. [[link|Link]] it to anything that should pulse.").caption("Beat").min(0).max(1).readout(true).decimals(2).fixed_width(125).value(0);
 		//Shown as bar.beat.tick (4 beats per bar); the value stays the position in beats, editing takes beats
-		pos_ctrl = button_panel.controlfloat("POSITION").tooltip("The position as bar.beat.tick. Click and type a position in [[beat|beats]] to jump there.\n[[wiki:Timeline#beat-and-bar]]").caption("Bar").bars(4).readout(true).fixed_width(200).value(0);
+		//#793: the position has no upper limit of its own (a timeline is as long as its items), but a MIDI mapping scales into the range of the control - 100000 beats is about a day at 120 BPM and keeps the mapping finite.
+		pos_ctrl = button_panel.controlfloat("POSITION").tooltip("The position as bar.beat.tick. Click and type a position in [[beat|beats]] to jump there.\n[[wiki:Timeline#beat-and-bar]]").caption("Bar").bars(4).min(0).max(100000).readout(true).fixed_width(200).value(0);
 		cursor_pos = pos_ctrl;
 		
 		stop_btn.callback([play_btn, pos_ctrl](v){
@@ -205,13 +239,18 @@ class timeline
 		});
 		
 		//Follow (#313): the timeline pages along with the cursor
-		follow_btn.callback([timeline_widget](v){
-			timeline_widget.follow(v != 0);
+		follow_btn.callback([this, timeline_widget](v){
+			(this.clips ? this.clips.tl : timeline_widget).follow(v != 0);
 		});
 
-		pos_ctrl.callback([timeline_widget, beat_ctrl](v) {
+		loop_btn.callback([this, timeline_widget](v){
+			(this.clips ? this.clips.tl : timeline_widget).loop_enabled(v != 0);
+		});
+
+		//The ruler of the song that plays (shows.shio)
+		pos_ctrl.callback([this, beat_ctrl, timeline_widget](v) {
 			beat_ctrl.value(math.fract(v));
-			timeline_widget.cursor(v);
+			(this.clips ? this.clips.tl : timeline_widget).cursor(v);
 		});
 		
 		timeline_widget.scrub_callback([pos_ctrl](pos) {
@@ -219,6 +258,14 @@ class timeline
 		});
 		
 		
+		clips = timeline_clips(this, song_box, timeline_widget, [panel = tl_panel, out_parent = tl_corner]);
+		first_song = clips;
+		//The songs of the show (#680, step 5): the song button next to Out; the Clip panel is shared by the songs
+		shows = timeline_shows(this, tl_view, tl_corner, first_song, song_box, tl_panel);
+		tl_panel.on_width = [this](w){
+			this.shows.lanes_right(w);
+		};
+
 		timeline_generators = generatorview(timeline_node);
 		timeline_generators.area.visible(false);
 		timeline_generators.grid_size = 16.0; //the grid of a Patchview (CANVAS_GRID), without its dots
@@ -228,8 +275,9 @@ class timeline
 
 		//Compared as an index: 0 timeline, 1 loops, 2 the generator view
 		select_mode = button_panel.controlcombo("view_mode_switch").tooltip("What the area of the [[timeline]] shows: the ruler, the [[loop|loops]], or an area for the windows of [[generator|generators]].\n[[wiki:Timeline#the-view-switch]]").caption("View").items(["Timeline", "Loops", "Patch"]).segmented(true, false).fixed_width(230);
-		select_mode.callback([timeline_widget, timeline_generators, loops](v) {
-			timeline_widget.visible(v == 0);
+		select_mode.callback([tl_view, tl_corner, timeline_generators, loops](v) {
+			tl_view.visible(v == 0);
+			tl_corner.visible(v == 0);
 			loops.area.visible(v == 1);
 			timeline_generators.area.visible(v == 2);
 		});
@@ -245,6 +293,7 @@ class timeline
 		play_btn.undoable(false);
 		stop_btn.undoable(false);
 		follow_btn.undoable(false);
+		loop_btn.undoable(false);
 		beat_ctrl.undoable(false);
 		pos_ctrl.undoable(false);
 		select_mode.undoable(false);
@@ -256,6 +305,31 @@ class timeline
 		
 		engine.load_hooks["timeline_generators"] = [timeline_generators](states){					
 			return timeline_generators.load_state(states);
+		};
+
+		//The first song: timeline_clips.json as before the shows; the show (its other songs) in timeline_shows.json
+		engine.save_hooks["timeline_clips"] = [first_song](){
+			return first_song.save_state();
+		};
+
+		engine.load_hooks["timeline_clips"] = [first_song](states){
+			return first_song.load_state(states);
+		};
+
+		engine.save_hooks["timeline_shows"] = [this](){
+			return this.shows.save_state();
+		};
+
+		engine.load_hooks["timeline_shows"] = [this](states){
+			return this.shows.load_state(states);
+		};
+
+		timecode.register_queries(first_song.ai);
+		engine.save_hooks["timecode"] = [this](){
+			return this.timecode.save_state();
+		};
+		engine.load_hooks["timecode"] = [this](states){
+			return this.timecode.load_state(states);
 		};
 
 		engine.save_hooks["loops"] = [loops](){
@@ -370,6 +444,21 @@ class timeline
 		bpm_ctrl.value(bpm);
 	}
 
+	//The caption in the ruler of the view Timeline: "Timeline" (with several songs the one that plays), while it chases
+	//timecode with the timecode
+	window_caption_tc(text) {
+		tc_caption = text;
+		refresh_caption();
+	}
+
+	refresh_caption() {
+		base = shows ? shows.caption() : "Timeline";
+		caption = tc_caption == "" ? base : base + "  ·  " + tc_caption;
+		r = clips ? clips.tl : ruler;
+		if(r && r.caption() != caption)
+			r.caption(caption);
+	}
+
 	// Transport. The buttons and the keys of the program (generators.shio: Space, Shift+Space, T) run these
 
 	//Play or pause, like the Play button
@@ -401,11 +490,37 @@ class timeline
 	
 	set_show_mode(enabled) {
 		nanogui.show_mode(enabled);
+		//No MIDI learn gesture of the virtual controller in show mode (#343)
+		if(enabled && eng && eng.env.cancel_midi_learn_gesture)
+			eng.env.cancel_midi_learn_gesture(true);
 		show_btn.icon(nanogui.icon(enabled ? "lock" : "unlock"));
 		show_btn.pushed(enabled);
-		show_btn.tooltip(enabled ? "Hold to leave [[show mode]]" : "[[show mode|Show mode]]: lock [[notch|notches]] and editing");
+		show_btn.tooltip(enabled ? "Hold to leave [[show mode]] (or hold Ctrl+L)" : "[[show mode|Show mode]]: lock [[notch|notches]] and editing (Ctrl+L)");
 		cable_btn.enabled(!enabled);
 		cable_btn.tooltip(enabled ? "[[cable view|Cable view]]: not in [[show mode]]" : "[[cable view|Cable view]]: show every [[link]]");
+	}
+
+	//Ctrl+L, Cmd+L on a Mac (#285): show mode on at once. In show mode the press starts a hold, and only a release
+	//SHOW_HOLD_MS later leaves it (show_key_up), the same rule as the lock: one stray key press cannot unlock a show.
+	//Key repeats do not come here (generators app_key takes presses only)
+	show_key_down(key) {
+		if(!nanogui.show_mode()) {
+			set_show_mode(true);
+			show_key_press = 0; //the release of this press does not leave it again
+			return;
+		}
+		show_key_press = std.millis();
+		show_key_code = key;
+	}
+
+	//Every key release. Only the key of the hold counts; the modifiers may already be up, as a hand lets go
+	show_key_up(key) {
+		if(show_key_press == 0 || key != show_key_code)
+			return;
+		held = std.millis() - show_key_press;
+		show_key_press = 0;
+		if(nanogui.show_mode() && held >= SHOW_HOLD_MS)
+			set_show_mode(false);
 	}
 
 	phase_distance(desired, actual)

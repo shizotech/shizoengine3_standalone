@@ -1,0 +1,275 @@
+//Native VibeVJ assets (#201 step 3): the part of the native loader that needs no window (native_loader.shio builds the
+//generator around it, _testing/native_asset.shio checks it without one).
+//
+//A native asset is a folder Name.asset with src/__init__.native, a JSON:
+//	[asset = "native_life.life", package = "plugin"]
+//- asset: the type its C ABI plugin registers with reg->add_asset() (core/shizoscript3_core_cabi/include/shz_abi.h),
+//  "<namespace>.<name>"
+//- package: the folder of the plugin package in the asset folder (package.shz, native/<platform>/shzmodule_*.<so|dylib|dll>)
+//The plugin is imported from that folder when it has a library for this system; else the package named like the
+//namespace is imported (shizotech/packages/native_life: the builds of this repository put the plugins of the assets of
+//the repository there). Restricted mode and the allow-list of native plugins apply to both (shz_global.cpp).
+
+//The library extension of this system
+native_library_ext() {
+	os = std.os_platform().lowercase();
+	if(os.starts("windows"))
+		return ".dll";
+	if(os.starts("mac"))
+		return ".dylib";
+	return ".so";
+}
+
+//True when the folder of a plugin package has a library for this system (native/<platform>/shzmodule_*)
+native_package_has_library(dir) {
+	if(!fileio.is_directory(dir + "/native"))
+		return false;
+	ext = native_library_ext();
+	files = fileio.files(dir + "/native", true);
+	for(f : files) {
+		if(f.contains("shzmodule") && f.ends(ext))
+			return true;
+	}
+	return false;
+}
+
+//A name of the form ns.name / ns.child.name: nothing else goes into the code that makes the object
+native_valid_type(name) {
+	if(!std.is_string(name) || name.empty())
+		return false;
+	letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+	parts = name.split(".");
+	if(parts.size() < 2)
+		return false;
+	for(p : parts) {
+		if(p.empty())
+			return false;
+		first = true;
+		for(c : p) {
+			if(!letters.contains(c) && !(!first && "0123456789".contains(c)))
+				return false;
+			first = false;
+		}
+	}
+	return true;
+}
+
+//The spec of an asset folder: [asset, namespace, package (the folder of the plugin package)], None with an error
+native_asset_spec(asset_dir) {
+	spec_path = asset_dir + "/src/__init__.native";
+	if(!fileio.exists(spec_path)) {
+		std.error("Native asset " + asset_dir + ": no src/__init__.native");
+		return None;
+	}
+	spec = None;
+	try {
+		spec = fileio.read_json(spec_path);
+	}
+	catch(e) {
+		std.error("Native asset " + asset_dir + ": src/__init__.native is no JSON: " + e);
+		return None;
+	}
+	if(!spec || !spec.has("asset") || !native_valid_type(spec["asset"])) {
+		std.error("Native asset " + asset_dir + ": src/__init__.native needs \"asset\": \"<namespace>.<name>\" (the type its plugin registers)");
+		return None;
+	}
+	type_name = spec["asset"];
+	package = spec.has("package") ? std.string(spec["package"]) : "plugin";
+	return [asset = type_name, namespace = type_name.substr(0, type_name.find(".")), package = asset_dir + "/" + package];
+}
+
+//The plugins imported in this process, by asset type: a second generator of the same asset imports nothing
+native_imported() {
+	g = std.global("native_assets");
+	state = g.get();
+	if(std.is_none(state) || !std.is_json(state)) {
+		g.set([]);
+		state = g.get();
+	}
+	return state;
+}
+
+// ---- reloading the plugin (std.native_reload)
+
+//What the window is built from: the controls, values and inputs as declared (not their values). After a reload the
+//window is built again when this changed
+native_signature(info) {
+	sig = [controls = [], values = [], inputs = []];
+	for(c : info.controls)
+		sig.controls.push_back([c.name, c.kind, c.has_range ? c["min"] : 0, c.has_range ? c["max"] : 0, c.options,
+			c.display_name, c.doc, c.kind == "text" ? c.max_length : 0]);
+	for(v : info.values)
+		sig.values.push_back([v.name, v.display_name, v["min"], v["max"]]);
+	for(i : info.inputs)
+		sig.inputs.push_back([i.name, i.pixels, i.follow_size]);
+	return sig.compact_string();
+}
+
+//Loads the rebuilt library of the plugin of a spec again: [ok = 1, report] or [ok = 0, error]. The objects of its
+//assets keep running (the host carries them over); the windows whose declarations changed are built again by their
+//loader (native_loader.shio sees the new reload count)
+native_reload_plugin(spec) {
+	try {
+		report = std.native_reload(spec.namespace);
+		std.print("Native asset " + spec.asset + ": its plugin was loaded again (" + report.previous_version + " -> " +
+			report.version + ", " + std.string(report.objects) + " objects carried over)");
+		return [ok = 1, report = report];
+	}
+	catch(e) {
+		std.error("Native asset " + spec.asset + ": " + e);
+		return [ok = 0, error = std.string(e)];
+	}
+}
+
+//Imports the plugin of a spec (once per process). True when its namespace is there. Imported already and its library
+//was rebuilt since (an author's "Reload module"): it is loaded again first (std.native_reload)
+native_asset_import(spec) {
+	done = native_imported();
+	if(done.has(spec.asset)) {
+		info = std.native_plugins(spec.namespace);
+		if(info && info.changed)
+			native_reload_plugin(spec);
+		return true;
+	}
+	ok = 0;
+	if(native_package_has_library(spec.package))
+		ok = std.import(spec.package);
+	if(!ok)
+		ok = std.import(spec.namespace);
+	if(!ok) {
+		std.error("Native asset " + spec.asset + ": its plugin could not be imported (from " + spec.package +
+			" or the package " + spec.namespace + "), the log above says why");
+		return false;
+	}
+	done[spec.asset] = 1;
+	return true;
+}
+
+//A new object of the asset type (the constructor of the plugin's type), None with an error
+native_asset_new(spec) {
+	if(!native_asset_import(spec))
+		return None;
+	maker = std.module();
+	maker.load_code("native_asset_make() { return " + spec.asset + "(); }");
+	obj = None;
+	try {
+		obj = maker.call("native_asset_make");
+	}
+	catch(e) {
+		std.error("Native asset " + spec.asset + ": " + e);
+		return None;
+	}
+	if(maker.call_error() || !obj) {
+		std.error("Native asset " + spec.asset + ": the plugin has no such asset (src/__init__.native names " + spec.asset + ")");
+		return None;
+	}
+	return obj;
+}
+
+//The asset object of an asset folder: [spec, obj, info (describe())], None with an error
+native_asset_open(asset_dir) {
+	spec = native_asset_spec(asset_dir);
+	if(!spec)
+		return None;
+	obj = native_asset_new(spec);
+	if(!obj)
+		return None;
+	return [spec = spec, obj = obj, info = obj.describe()];
+}
+
+//A control of describe() as the words of a shader annotation (//@slider min=0 max=30 value=8): its kind and the
+//attributes in the order shader_annotation_control() (shader_loader.shio) applies them. Ranges only when the plugin
+//gave one: a slider without one keeps the range of the control (0..1)
+native_control_annotation(c) {
+	attrs = [];
+	n = c.components;
+	if(c.has_range) {
+		attrs.push_back(["min", n == 1 ? c["min"][0] : c["min"]]);
+		attrs.push_back(["max", n == 1 ? c["max"][0] : c["max"]]);
+	}
+	if(c.kind == "enum")
+		attrs.push_back(["options", c.options]);
+	if(c.display_name)
+		attrs.push_back(["displayname", c.display_name]);
+	attrs.push_back(["value", n == 1 ? c["value"][0] : c["value"]]);
+	return [kind = c.kind, attrs = attrs];
+}
+
+//The state of a plugin (save() of shz_asset_def) for a project or a preset: they are JSON text, a buffer in them would
+//be saved empty. Bytes become [native_bytes = "<base64>"], everything else stays
+native_state_to_json(v) {
+	vt = std.type(v);
+	if(vt == "binary" || vt == "std.buffer")
+		return [native_bytes = std.base64_encode(v)];
+	if(!std.is_json(v))
+		return v;
+	if(std.is_list(v)) {
+		as_list = [];
+		for(item : v)
+			as_list.push_back(native_state_to_json(item));
+		return as_list;
+	}
+	as_map = std.json();
+	for(k, item : v)
+		as_map[k] = native_state_to_json(item);
+	return as_map;
+}
+
+//Back from native_state_to_json(): [native_bytes = "<base64>"] is the buffer again
+native_state_from_json(v) {
+	if(!std.is_json(v))
+		return v;
+	if(std.is_list(v)) {
+		as_list = [];
+		for(item : v)
+			as_list.push_back(native_state_from_json(item));
+		return as_list;
+	}
+	if(v.size() == 1 && v.has("native_bytes"))
+		return std.base64_decode(v["native_bytes"]);
+	as_map = std.json();
+	for(k, item : v)
+		as_map[k] = native_state_from_json(item);
+	return as_map;
+}
+
+//The value of a control of the UI for set(): a number, a list for a vector / colour (the components' values)
+native_control_value(ctrl, vec_ctrls) {
+	if(!vec_ctrls)
+		return std.float(ctrl.value());
+	out = [];
+	for(c : vec_ctrls)
+		out.push_back(std.float(c.value()));
+	return out;
+}
+
+// ---- picture inputs (C ABI 1.3)
+
+//The passthrough shader of an asset with picture inputs: a sampler per input, so the shader generator makes a port (IN)
+//and an entry of Inputs for each, like for the inputs of a shader. They are not drawn: native_inputs_zero is a uniform
+//nobody sets (0), it keeps the samplers in the program (a sampler that is not used has no port). The loader reads what
+//is linked into them back from the GPU (native_loader.shio) and gives it to the plugin
+native_passthrough_source(src, inputs) {
+	if(!inputs || inputs.size() == 0)
+		return src;
+	decl = "uniform float native_inputs_zero;\n";
+	use = "";
+	for(i : inputs) {
+		decl += "uniform sampler2D " + i.name + ";\n";
+		use += " + texture(" + i.name + ", vec2(0.5))";
+	}
+	main_at = src.find("void mainImage");
+	if(main_at < 0)
+		return src;
+	body_end = src.rfind("}");
+	return src.substr(0, main_at) + decl + "\n" + src.substr(main_at, body_end - main_at) +
+		"\tfragColor += native_inputs_zero * (vec4(0.0)" + use + ");\n}\n";
+}
+
+//The fragment shader that draws a linked picture at the size an input asks for (read back by pixel_readback)
+NATIVE_INPUT_COPY_SRC = "uniform sampler2D src;\nvoid main() { fragColor = texture(src, v_uv); }\n";
+
+//The bytes of an input picture of this size
+native_input_bytes(pixels, w, h) {
+	return w * h * (pixels == "rgba32f" ? 16 : 4);
+}

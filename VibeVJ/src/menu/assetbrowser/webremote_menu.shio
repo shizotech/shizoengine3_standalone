@@ -1,0 +1,663 @@
+#include "engine/webremote/webremote"
+
+//Issue #359: the web remote in Devices > Network > Web remote, and its window (Pairing, Pages, Preview).
+//- Section: on / off, port, the network it listens on, start with VibeVJ, the address and the PIN.
+//- Window, page Pairing: the QR code of the address with the PIN (a phone camera opens it and pairs), the paired
+//  phones, New PIN (forgets every phone).
+//- Window, page Pages: the pages of the remote (new, rename, remove, order) and the controls of the one picked. "Add
+//  the controls you move": every control the user moves after that is added to it (nanogui reports it, as for the
+//  undo history: engine.env.on_user_value in src/menu/value_steps.shio). Rename, order, remove. Saved with the project
+//  (web_remote.json). Not in show mode. "Phones can edit the pages": the edit mode of the phone.
+//- Window, page Preview: the live preview (off by default), its frames a second, size and quality, what it costs.
+//- AI agents: live_path "web_remote" (get_web_remote, add_web_remote_control, set_web_remote_control,
+//  remove_web_remote_control, add_web_remote_page, rename_web_remote_page, remove_web_remote_page,
+//  set_web_remote_preview).
+//The server itself: engine/webremote/webremote.shio; its tick() (the hidden shaders of the preview) runs in
+//on_frame_finished of __init__.shio through engine.env.web_remote.
+
+WEB_REMOTE_QR_SIZE = 240;
+WEB_REMOTE_ROW_H = 30;
+WEB_REMOTE_KIND_NAMES = [fader = "Fader", hfader = "Fader (across)", button = "Button", choice = "Choice", xy = "XY pad", number = "Number"];
+
+class web_remote_ai_target {
+	get_live_path() {
+		return "web_remote";
+	}
+	get_relative_path() {
+		return "assets/Devices/WebRemote.menu";
+	}
+}
+
+class webremote_menu
+{
+	engine = None;
+	managed remote = None;
+	managed tool = None;
+	managed ai = None;
+
+	//the section in Devices > Network
+	on_btn = None;
+	port_box = None;
+	net_select = None;
+	net_ips = [];      //the bind address of each entry of net_select
+	status_label = None;
+	url_box = None;
+	pin_label = None;
+
+	//the window
+	qr_view = None;
+	qr_text = "";      //what the QR code shows now
+	qr_quads = [];     //its dark modules as quads for nvgFillPolygons, in the widget
+	win_url = None;
+	win_pin = None;
+	devices_label = None;
+	pick_btn = None;
+	page_select = None;
+	page_name_box = None;
+	page_id = "";      //the page the list shows and "Add the controls you move" adds to
+	list_box = None;
+	list_note = None;
+	preview_btn = None;
+	preview_fps_box = None;
+	preview_width_select = None;
+	preview_quality_box = None;
+	preview_label = None;
+
+	picking = false;
+	dirty = true;      //the server changed something: the labels are refreshed on the next draw (render thread)
+	list_dirty = true;
+	last_refresh = 0;
+	shown_rev = -1;
+
+	__init__(eng, parent) {
+		engine = eng;
+		remote = web_remote(eng);
+		remote.on_change = [this]() {
+			this.dirty = true;
+		};
+		//the hidden shaders of the live preview are made and freed on the render thread (__init__.shio)
+		engine.env.web_remote = remote;
+		build_section(parent);
+		build_window();
+
+		engine.save_hooks["web_remote"] = [this]() {
+			return this.remote.save_state();
+		};
+		engine.load_hooks["web_remote"] = [this](state) {
+			this.remote.load_state(state);
+			this.page_id = "";
+			this.list_dirty = true;
+		};
+
+		//The control the user moves next (src/menu/value_steps.shio reports every change of the user)
+		engine.env.on_user_value = [this](path, info) {
+			this.user_moved(path);
+		};
+
+		ai = AIInterface(web_remote_ai_target(), tool.window, "assets/Devices/WebRemote.menu");
+		register_queries();
+
+		if(remote.config.autostart)
+			start();
+	}
+
+	__deinit__() {
+		if(engine && engine.env.web_remote == remote)
+			engine.env.web_remote = None;
+		if(remote) {
+			remote.stop();
+			remote.stop_previews();
+		}
+	}
+
+	// =========================================================================
+	// Devices > Network > Web remote
+	// =========================================================================
+
+	add_row(parent, name) {
+		div = parent.widget().fixed_height(WEB_REMOTE_ROW_H).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+		div.label(name).anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(75);
+		return div;
+	}
+
+	build_section(parent) {
+		on_btn = parent.pushbutton("Web remote").icon(nanogui.icon("power_off")).anchor_left(0).anchor_right(0)
+			.tooltip("A web page for a phone or tablet in the same network: play, tap, blackout, the clips, pages of controls and a live picture. "
+				+ "The phone pairs with the PIN below.\n[[wiki:Web-Remote]]");
+		on_btn.on_change([this](v) {
+			if(v)
+				this.start();
+			else
+				this.stop();
+		});
+
+		port_box = add_row(parent, "Port").intbox().value(std.int(remote.config.port)).anchor(0).anchor_left(75);
+		port_box.tooltip("The port of the web remote (default " + WEB_REMOTE_DEFAULT_PORT + "). Changed while it is off.");
+
+		net_select = add_row(parent, "Network").combobox().anchor(0).anchor_left(75)
+			.tooltip("Where phones can reach the web remote: every network of this computer, one network card, or only this computer (for trying it in a browser here).");
+		fill_networks();
+		net_select.on_change([this](v, txt) {
+			if(v >= 0 && v < this.net_ips.size()) {
+				this.remote.config.bind = this.net_ips[v];
+				this.remote.save_config();
+				this.dirty = true;
+			}
+		});
+
+		autostart_btn = parent.pushbutton("Start with VibeVJ").anchor_left(0).anchor_right(0);
+		autostart_btn.pushed(remote.config.autostart ? true : false);
+		autostart_btn.on_change([this](v) {
+			this.remote.config.autostart = v ? 1 : 0;
+			this.remote.save_config();
+		});
+
+		status_label = parent.label("Off").font_size(13).fixed_height(22);
+		url_box = add_row(parent, "Address").textbox().editable(false).anchor(0).anchor_left(75);
+		url_box.tooltip("Open it on the phone (same network), or scan the QR code in Pairing and controls");
+		pin_label = add_row(parent, "PIN").label("").anchor(0).anchor_left(75);
+
+		open_btn = parent.button("Pairing and controls…").icon(nanogui.icon("th")).anchor_left(0).anchor_right(0).fixed_height(28)
+			.tooltip("The QR code for the phone, the paired phones, the pages of controls and the live preview");
+		open_btn.on_click([this]() {
+			this.show();
+		});
+
+		//UI updates only here, on the render thread: the requests of the phones run as tasks of the server
+		status_label.on_draw([this]() {
+			now = std.millis();
+			if(!this.dirty && now - this.last_refresh < 1000)
+				return;
+			this.last_refresh = now;
+			this.dirty = false;
+			this.refresh();
+		});
+	}
+
+	//Every network (all cards), this computer only, and each card with an IPv4 address
+	fill_networks() {
+		names = ["Every network", "This computer only"];
+		net_ips = ["", "127.0.0.1"];
+		try {
+			for(c : shizonet.interfaces()) {
+				if(c.loopback || c.ip == "" || c.ip.contains(":") || net_ips.has_value(c.ip))
+					continue;
+				names.push_back(c.name + " · " + c.ip);
+				net_ips.push_back(c.ip);
+			}
+		}
+		catch(e) {}
+		//a card that is not there now (another place, another adapter): kept, so starting fails with a clear message
+		bind_now = remote.config.bind;
+		if(!net_ips.has_value(bind_now)) {
+			names.push_back(bind_now + " (not found)");
+			net_ips.push_back(bind_now);
+		}
+		net_select.items(names);
+		for(i = 0; i < net_ips.size(); i++)
+			if(net_ips[i] == bind_now)
+				net_select.selected(i);
+	}
+
+	start() {
+		ok = remote.start(std.int(port_box.value()), remote.config.bind);
+		on_btn.pushed(ok ? true : false);
+		port_box.enabled(!ok);
+		net_select.enabled(!ok);
+		if(!ok)
+			std.error("Web remote: " + remote.error);
+		dirty = true;
+		return ok;
+	}
+
+	stop() {
+		remote.stop();
+		on_btn.pushed(false);
+		port_box.enabled(true);
+		net_select.enabled(true);
+		dirty = true;
+	}
+
+	refresh() {
+		if(remote.running) {
+			n = remote.stream_count();
+			status_label.caption("On · " + (n == 1 ? "1 phone connected" : std.string(n) + " phones connected")
+				+ " · " + remote.device_count() + " paired");
+			url_box.value(remote.url());
+		}
+		else {
+			status_label.caption(remote.error != "" ? remote.error : "Off");
+			url_box.value("");
+		}
+		if(picking)
+			status_label.caption(status_label.caption() + " · adding the controls you move");
+		pin_label.caption(remote.config.pin);
+		if(win_pin) {
+			win_url.caption(remote.running ? remote.url() : "The web remote is off: switch it on in Devices › Network › Web remote.");
+			win_pin.caption("PIN  " + remote.config.pin);
+			devices = "";
+			for(d : remote.config.devices)
+				devices += d.name + " (" + d["paired"] + ")   ";
+			devices_label.caption(devices != "" ? "Paired: " + devices : "No phone paired yet.");
+			set_qr(remote.running ? remote.pair_url() : "");
+		}
+		if(list_dirty || shown_rev != remote.controls_revision)
+			build_list();
+		if(pick_btn && picking && nanogui.show_mode()) {
+			picking = false;
+			pick_btn.pushed(false);
+		}
+		if(preview_label)
+			refresh_preview();
+	}
+
+	// =========================================================================
+	// The window
+	// =========================================================================
+
+	build_window() {
+		tool = toolwindow(engine, "Web remote", 820, 600);
+		tool.side_nav(tool.window);
+		pairing = tool.add_page("Pairing", "th");
+		page = tool.add_page("Pages", "list_ol");
+		preview = tool.add_page("Preview", "desktop");
+
+		tool.section(pairing, "Open on the phone");
+		tool.note(pairing, "Scan the code with the camera of the phone (same network). It opens the remote and pairs it.");
+		qr_view = pairing.widget().fixed_size(vec2f(WEB_REMOTE_QR_SIZE, WEB_REMOTE_QR_SIZE));
+		qr_view.on_draw([this]() {
+			this.draw_qr();
+		});
+		win_url = pairing.label("").font_size(15).fixed_height(24);
+		win_pin = pairing.label("").font_size(20).fixed_height(30);
+		tool.note(pairing, "Or open the address on the phone and type the PIN.");
+		devices_label = pairing.label("").font_size(13).text_color(TOOLWINDOW_TEXT_2).fixed_height(22);
+		new_pin_btn = pairing.button("New PIN (forget every phone)").icon(nanogui.icon("sync")).fixed_height(28).fixed_width(280)
+			.tooltip("A new PIN, and every paired phone has to enter it again. For when a phone was lost or the PIN was seen by others.");
+		new_pin_btn.on_click([this]() {
+			this.remote.new_pin();
+		});
+		tool.section(pairing, "Trust");
+		tool.note(pairing, "Only paired phones can play. They reach the transport, the blackout, the clips and the controls on the");
+		tool.note(pairing, "pages, nothing else (no files, projects or settings). Plain HTTP: use a network of your own");
+		tool.note(pairing, "for shows where others on the Wi-Fi must not read the traffic.");
+
+		build_pages_page(page);
+		build_preview_page(preview);
+	}
+
+	build_pages_page(page) {
+		tool.section(page, "Pages");
+		row = page.widget().fixed_height(WEB_REMOTE_ROW_H + 4).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+		page_select = row.combobox().fixed_width(200).tooltip("The page shown below. The phone shows each page as a tab");
+		page_select.on_change([this](v, txt) {
+			//build_list() sets the selection too: only a change of the page rebuilds the list
+			if(v >= 0 && v < this.remote.pages.size() && this.remote.pages[v].id != this.page_id) {
+				this.page_id = this.remote.pages[v].id;
+				this.list_dirty = true;
+			}
+		});
+		page_name_box = row.textbox("").fixed_width(170).tooltip("The name of the page (its tab on the phone)");
+		page_name_box.editable(true);
+		page_name_box.on_change([this](text) {
+			if(nanogui.show_mode())
+				return;
+			this.remote.rename_page(this.page_id, std.string(text));
+			this.list_dirty = true;
+		});
+		add_btn = row.button("").icon(nanogui.icon("plus")).fixed_width(34).tooltip("A new page");
+		add_btn.on_click([this]() {
+			if(nanogui.show_mode())
+				return;
+			p = this.remote.add_page("");
+			if(!std.is_string(p))
+				this.page_id = p.id;
+			this.list_dirty = true;
+		});
+		left_btn = row.button("").icon(nanogui.icon("arrow_left")).fixed_width(34).tooltip("The page one tab earlier");
+		left_btn.on_click([this]() {
+			this.remote.move_page(this.page_id, -1);
+			this.list_dirty = true;
+		});
+		right_btn = row.button("").icon(nanogui.icon("arrow_right")).fixed_width(34).tooltip("The page one tab later");
+		right_btn.on_click([this]() {
+			this.remote.move_page(this.page_id, 1);
+			this.list_dirty = true;
+		});
+		del_btn = row.button("").icon(nanogui.icon("trash_alt")).fixed_width(34).tooltip("Remove the page (the controls themselves stay)");
+		del_btn.on_click([this]() {
+			if(nanogui.show_mode())
+				return;
+			this.remote.remove_page(this.page_id);
+			this.page_id = "";
+			this.list_dirty = true;
+		});
+
+		tool.section(page, "The controls of the page");
+		pick_btn = page.pushbutton("Add the controls you move").icon(nanogui.icon("crosshairs")).fixed_height(30).fixed_width(300)
+			.tooltip("While this is on, every control you move in VibeVJ (a slider, a button, a list, an XY) comes onto the page picked above. Not in show mode.");
+		pick_btn.on_change([this](v) {
+			if(v && nanogui.show_mode()) {
+				this.pick_btn.pushed(false);
+				return;
+			}
+			this.picking = v ? true : false;
+			this.dirty = true;
+		});
+		edit_btn = page.pushbutton("Phones can edit the pages").fixed_height(28).fixed_width(300)
+			.tooltip("On: a paired phone has an edit mode (add any control of the project, remove, order, resize, pick how it shows, pages). Off: the pages stay as they are made here.");
+		edit_btn.pushed(remote.config.phone_edit ? true : false);
+		edit_btn.on_change([this](v) {
+			this.remote.config.phone_edit = v ? 1 : 0;
+			this.remote.save_config();
+		});
+		list_note = tool.note(page, "");
+		list_box = page.widget().anchor_left(0).anchor_right(0).layout(nanogui.layout_vertical());
+	}
+
+	build_preview_page(page) {
+		tool.section(page, "Live preview");
+		tool.note(page, "A small picture of an output or a view on the phone (a few JPEG pictures a second). Off by default:");
+		tool.note(page, "it costs a little GPU and CPU while a phone shows it, nothing while no phone asks for it.");
+		preview_btn = page.pushbutton("Live preview").icon(nanogui.icon("eye")).fixed_height(30).fixed_width(300)
+			.tooltip("Lets the phones show a live picture of an output or a view. Each phone picks the picture.");
+		preview_btn.pushed(remote.config.preview ? true : false);
+		preview_btn.on_change([this](v) {
+			this.remote.set_preview(v ? 1 : 0);
+		});
+		fps_row = add_row(page, "Pictures/s");
+		preview_fps_box = fps_row.intbox().value(remote.config.preview_fps).fixed_width(120);
+		preview_fps_box.tooltip("Pictures a second, 1 to 15 (5: smooth enough to see what plays)");
+		preview_fps_box.value_callback([this](v) {
+			this.remote.set_preview(None, v);
+		});
+		width_row = add_row(page, "Width");
+		widths = [];
+		for(w : WEB_REMOTE_PREVIEW_WIDTHS)
+			widths.push_back(std.string(w) + " px");
+		preview_width_select = width_row.combobox().items(widths).fixed_width(120);
+		preview_width_select.tooltip("The width of the picture in pixels (the height follows its shape)");
+		for(i = 0; i < WEB_REMOTE_PREVIEW_WIDTHS.size(); i++)
+			if(WEB_REMOTE_PREVIEW_WIDTHS[i] == remote.config.preview_width)
+				preview_width_select.selected(i);
+		preview_width_select.on_change([this](v, txt) {
+			if(v >= 0 && v < WEB_REMOTE_PREVIEW_WIDTHS.size())
+				this.remote.set_preview(None, None, WEB_REMOTE_PREVIEW_WIDTHS[v]);
+		});
+		q_row = add_row(page, "Quality");
+		preview_quality_box = q_row.intbox().value(remote.config.preview_quality).fixed_width(120);
+		preview_quality_box.tooltip("JPEG quality, 20 to 95: lower is smaller and faster on a slow Wi-Fi");
+		preview_quality_box.value_callback([this](v) {
+			this.remote.set_preview(None, None, None, v);
+		});
+		preview_label = page.label("").font_size(13).text_color(TOOLWINDOW_TEXT_2).fixed_height(22);
+	}
+
+	refresh_preview() {
+		info = remote.preview_info();
+		//set over MCP (set_web_remote_preview): the button follows
+		if((preview_btn.pushed() ? 1 : 0) != info.on)
+			preview_btn.pushed(info.on ? true : false);
+		if(!info.available) {
+			preview_label.caption(info.error);
+			return;
+		}
+		if(!info.on) {
+			preview_label.caption("Off.");
+			return;
+		}
+		if(info.active.size() == 0) {
+			preview_label.caption("On · no phone shows a picture now.");
+			return;
+		}
+		sizes = "";
+		for(a : info.active)
+			sizes += std.string(a.w) + " × " + std.string(a.h) + "  ";
+		preview_label.caption("On · " + info.active.size() + " picture(s) " + sizes + "· " + info.frames_per_second + " pictures/s · "
+			+ info.kb_per_frame + " KB each · encoding " + info.encode_ms + " ms (worker thread) · render loop " + info.render_thread_us + " µs a frame");
+	}
+
+	show() {
+		dirty = true;
+		list_dirty = true;
+		tool.show();
+	}
+
+	//The QR code: white quiet zone of 4 modules, black modules as quads (nvgFillPolygons: one call)
+	set_qr(text) {
+		if(text == qr_text)
+			return;
+		qr_text = text;
+		qr_quads = [];
+		if(text == "")
+			return;
+		qr = qr_encode(text, "M");
+		if(!qr)
+			return;
+		n = qr.width;
+		cell = math.floor(WEB_REMOTE_QR_SIZE / (n + 8));
+		off = (WEB_REMOTE_QR_SIZE - cell * n) / 2.0;
+		for(y = 0; y < n; y++) {
+			x = 0;
+			for(x < n) {
+				if(!qr.modules[y * n + x]) {
+					x++;
+					continue;
+				}
+				run = x;
+				for(run < n && qr.modules[y * n + run])
+					run++;
+				x0 = off + x * cell;
+				x1 = off + run * cell;
+				y0 = off + y * cell;
+				y1 = y0 + cell;
+				for(p : [x0, y0, x1, y0, x1, y1, x0, y1])
+					qr_quads.push_back(p);
+				x = run;
+			}
+		}
+	}
+
+	draw_qr() {
+		nanogui.nvgBeginPath();
+		nanogui.nvgRoundedRect(vec2f(0, 0), vec2f(WEB_REMOTE_QR_SIZE, WEB_REMOTE_QR_SIZE), 8);
+		nanogui.nvgFillColor(qr_quads.size() > 0 ? vec4f(1.0, 1.0, 1.0, 1.0) : vec4f(1.0, 1.0, 1.0, 0.06));
+		nanogui.nvgFill();
+		if(qr_quads.size() == 0)
+			return;
+		nanogui.nvgFillColor(vec4f(0.0, 0.0, 0.0, 1.0));
+		nanogui.nvgShapeAntiAlias(false);
+		nanogui.nvgFillPolygons(qr_quads, 4);
+		nanogui.nvgShapeAntiAlias(true);
+	}
+
+	//The page the list shows (the picked one, else the first)
+	current_page() {
+		p = remote.page_of(page_id);
+		if(!p)
+			p = remote.page_of("");
+		if(p)
+			page_id = p.id;
+		return p;
+	}
+
+	//The page picker and the rows of the picked page: name (to rename), kind, up, down, remove
+	build_list() {
+		list_dirty = false;
+		shown_rev = remote.controls_revision;
+		if(!list_box)
+			return;
+		cur = current_page();
+		names = [];
+		sel = 0;
+		for(i = 0; i < remote.pages.size(); i++) {
+			names.push_back(remote.pages[i].name + " (" + remote.pages[i].controls.size() + ")");
+			if(cur && remote.pages[i].id == cur.id)
+				sel = i;
+		}
+		page_select.items(names);
+		page_select.selected(sel);
+		if(cur && !page_name_box.focused())
+			page_name_box.value(cur.name);
+		list_box.clear_children();
+		n = cur ? cur.controls.size() : 0;
+		list_note.caption(n == 0 ? "None yet: switch on the button above and move a control in VibeVJ, or add them on the phone (Edit)." :
+			std.string(n) + (n == 1 ? " control" : " controls") + ", saved with the project. The phone shows them in this order.");
+		for(i = 0; i < n; i++) {
+			c = cur.controls[i];
+			id = c.id;
+			row = list_box.widget().fixed_height(WEB_REMOTE_ROW_H + 4).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+			name_box = row.textbox(c.label).fixed_width(260).tooltip(c.path + (c.y != "" ? "\nY: " + c.y : ""));
+			name_box.editable(true);
+			name_box.on_change([this, id](text) {
+				this.remote.rename_control(id, std.string(text).trim());
+				this.shown_rev = this.remote.controls_revision;
+			});
+			kind_name = WEB_REMOTE_KIND_NAMES.has(c.kind) ? WEB_REMOTE_KIND_NAMES[c.kind] : c.kind;
+			row.label(kind_name).font_size(13).text_color(TOOLWINDOW_TEXT_2).fixed_width(100);
+			up = row.button("").icon(nanogui.icon("arrow_up")).fixed_width(34).tooltip("Earlier on the page");
+			up.on_click([this, id]() {
+				this.remote.move_control(id, -1);
+				this.list_dirty = true;
+			});
+			down = row.button("").icon(nanogui.icon("arrow_down")).fixed_width(34).tooltip("Later on the page");
+			down.on_click([this, id]() {
+				this.remote.move_control(id, 1);
+				this.list_dirty = true;
+			});
+			del = row.button("").icon(nanogui.icon("trash_alt")).fixed_width(34).tooltip("Off the page (the control stays)");
+			del.on_click([this, id]() {
+				this.remote.remove_control(id);
+				this.list_dirty = true;
+			});
+		}
+	}
+
+	user_moved(path) {
+		if(!picking || nanogui.show_mode())
+			return;
+		res = remote.add_control(path, "", "", page_id);
+		if(std.is_string(res))
+			list_note.caption(res);
+		list_dirty = true;
+	}
+
+	// =========================================================================
+	// AI agents (Chat, MCP): live_path "web_remote"
+	// =========================================================================
+
+	register_queries() {
+		ai.register("get_web_remote", [], [this](args) {
+			r = this.remote;
+			page_list = [];
+			for(p : r.pages) {
+				items = [];
+				for(c : p.controls)
+					items.push_back([id = c.id, path = c.path, label = c.label, kind = c.kind, size = c["size"], y = c.y]);
+				page_list.push_back([id = p.id, name = p.name, controls = items]);
+			}
+			sources = [];
+			for(s : r.preview_sources())
+				sources.push_back([id = s.id, name = s.name, live_path = s.live_path]);
+			preview = r.preview_info();
+			preview.sources = sources;
+			return [
+				running = r.running ? 1 : 0,
+				url = r.running ? r.url() : "",
+				port = r.config.port,
+				bind = r.config.bind,
+				phones_connected = r.stream_count(),
+				phones_paired = r.device_count(),
+				phone_edit = r.config.phone_edit,
+				pages = page_list,
+				controls = r.all_controls(),
+				preview = preview,
+				error = r.error,
+			];
+		}, "Web remote (phones and tablets): on or off, its address, how many phones are paired and connected, its pages with their controls (controls: all of them, with their page), whether phones may edit the pages, and the live preview (on, fps, width, quality, sources, the pictures made now and what they cost). The PIN is shown only in VibeVJ.");
+
+		ai.register("add_web_remote_control", [
+			control = "&string(): The full path of the control (full_path of get_local_control of a generator)",
+			label = "string(): The name on the phone (default: the name of the control)",
+			kind = "string(): fader, hfader, button, choice or number (default: from the type of the control; an XY pad of two faders: set_web_remote_control)",
+			page = "string(): The id or name of the page (default: the first page)",
+		], [this](args) {
+			label = args.has("label") && !std.is_none(args.label) ? std.string(args.label) : "";
+			kind = args.has("kind") && !std.is_none(args.kind) ? std.string(args.kind) : "";
+			page = args.has("page") && !std.is_none(args.page) ? std.string(args.page) : "";
+			res = this.remote.add_control(std.string(args.control), label, kind, page);
+			if(std.is_string(res))
+				return [ok = 0, error = res];
+			this.list_dirty = true;
+			return [ok = 1, control = res];
+		}, "Web remote: puts a control on a page of the phones (a slider becomes a fader, a button a button, a list its choices, a vector of two an XY pad). Saved with the project.");
+
+		ai.register("set_web_remote_control", [
+			id = "&string(): The id of the entry (get_web_remote)",
+			label = "string(): The name on the phone",
+			kind = "string(): How it shows: fader, hfader (a fader across), number, xy (a fader as X, with y), button, choice; only what the control allows",
+			size = "int(): Its width on the page: 1 one cell, 2 two cells, 3 the whole row, 0 the default of its kind",
+			y = "string(): The full path of the fader for Y, with kind xy on a fader",
+		], [this](args) {
+			res = this.remote.set_control(std.string(args.id), args);
+			if(std.is_string(res))
+				return [ok = 0, error = res];
+			this.list_dirty = true;
+			return [ok = 1, control = this.remote.entry_of(std.string(args.id))];
+		}, "Web remote: changes an entry of a page: its name, how it shows (an XY pad made of two faders: kind xy and y), its width.");
+
+		ai.register("remove_web_remote_control", [
+			id = "&string(): The id of the entry (get_web_remote)",
+		], [this](args) {
+			if(!this.remote.remove_control(std.string(args.id)))
+				return [ok = 0, error = "no entry with the id '" + args.id + "'"];
+			this.list_dirty = true;
+			return [ok = 1];
+		}, "Web remote: takes a control off its page (the control stays as it is).");
+
+		ai.register("add_web_remote_page", [
+			name = "string(): The name of the page (its tab on the phone)",
+		], [this](args) {
+			res = this.remote.add_page(args.has("name") && !std.is_none(args.name) ? std.string(args.name) : "");
+			if(std.is_string(res))
+				return [ok = 0, error = res];
+			this.list_dirty = true;
+			return [ok = 1, page = [id = res.id, name = res.name]];
+		}, "Web remote: a new, empty page (a tab on the phones). Saved with the project.");
+
+		ai.register("rename_web_remote_page", [
+			page = "&string(): The id or name of the page",
+			name = "&string(): The new name",
+		], [this](args) {
+			res = this.remote.rename_page(std.string(args.page), std.string(args.name));
+			if(std.is_string(res))
+				return [ok = 0, error = res];
+			this.list_dirty = true;
+			return [ok = 1];
+		}, "Web remote: renames a page.");
+
+		ai.register("remove_web_remote_page", [
+			page = "&string(): The id or name of the page",
+		], [this](args) {
+			res = this.remote.remove_page(std.string(args.page));
+			if(std.is_string(res))
+				return [ok = 0, error = res];
+			this.list_dirty = true;
+			return [ok = 1];
+		}, "Web remote: removes a page and its entries (the controls stay). The last page stays.");
+
+		ai.register("set_web_remote_preview", [
+			on = "int(): 1 lets the phones show a live picture, 0 not (the default)",
+			fps = "int(): Pictures a second, 1 to 15",
+			width = "int(): Width in pixels: 160, 240, 320, 480 or 640 (the nearest is taken)",
+			quality = "int(): JPEG quality, 20 to 95",
+		], [this](args) {
+			get = [](a, k) {
+				return a.has(k) && !std.is_none(a[k]) ? a[k] : None;
+			};
+			this.remote.set_preview(get(args, "on"), get(args, "fps"), get(args, "width"), get(args, "quality"));
+			this.dirty = true;
+			return [ok = 1, preview = this.remote.preview_info()];
+		}, "Web remote: the live preview of the phones (a small JPEG picture of an output or a view, made only while a phone shows it). A setting of this computer, not of the project.");
+	}
+}

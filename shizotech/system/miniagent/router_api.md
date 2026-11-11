@@ -1,19 +1,19 @@
 # Router ⇄ Node protocol (ShizoNet)
 
-This is the **binding contract** between an AI **node** (a `Megamind()` host, see
-`megamind.shio` / `node.shio`) and an AI **router** (a `Router()` class, see
+This is the **binding contract** between an AI **node** (a `Node` host, see
+`node.shio` / `workspaces.shio`) and an AI **router** (a `Router()` class, see
 `router_api.shio`). Both sides are plain ShizoNet servers on the same private network: they
 discover each other automatically via beacons, no IPs are configured anywhere.
 
 ```
-telegram bot / CLI / web  ──►  Router()  ── ShizoNet ──►  node A (Megamind + receptionist)
-                                │                       ►  node B (Megamind + receptionist)
+telegram bot / CLI / web  ──►  Router()  ── ShizoNet ──►  node A (Node + WorkspaceRegistry + Receptionist)
+                                │                       ►  node B (Node + WorkspaceRegistry + Receptionist)
                                 └── on_event(cb)  ◄── ai_event pushes from every node
 ```
 
 The router is a **receptionist of receptionists**: the routing intelligence is the
 **router agent** — a `miniagent` running the `router` role (`roles/router/`), the same
-kind of LLM turn layer the local `Megamind` gives its receptionist. That agent reads the
+kind of LLM turn layer the Node's `Receptionist` connector uses. That agent reads the
 fleet with `get_nodes()`, decides *which node* owns a task and delegates it with
 `start_task()`. `Router()` is the substrate around that agent: it executes the agent's
 decisions over ShizoNet, keeps a local mirror of the remote tasks and forwards node
@@ -81,11 +81,10 @@ The node registers the router implicitly: routers are the only devices that answ
     capabilities   = ["gpu", "coding", ...],   # free-form routing hints
     tags           = ["home-server"],
     model          = <model name>,
-    max_workers    = int,
-    busy           = bool,          # receptionist generating or workers running
-    tasks_running  = int,
-    tasks_planned  = int,
-    goals          = 1|0,           # the node runs a GoalScheduler (an .agentspace): it can do
+    busy           = bool,          # receptionist generating or workspace tasks running
+    tasks_running  = int,           # across all workspaces
+    tasks_planned  = int,           # across all workspaces
+    goals          = 1|0,           # the Node's own Workspace runs a GoalScheduler (an .agentspace): it can do
                                     # scheduled work at set times; 0 = its goal tools refuse
     uptime_ms      = int,
 ]
@@ -109,13 +108,13 @@ All payloads and replies are JSON objects. Every reply carries `ok = true|false`
 | `ai_request_poll` | `[request_id]` | `[ok, request_id, status, delta?, result?, error?]` |
 | `ai_request_stop` | `[request_id]` | `[ok]` |
 | `ai_request_update` | `[request_id, message]` | `[ok, request_id, state="updated"]` |
-| `ai_overview` | `[]` | `[ok, overview]` — exactly `Megamind.get_overview()` |
-| `ai_tasks` | `[]` | `[ok, tasks]` — flattened task list |
-| `ai_task` | `[taskid]` | `[ok, task]` |
-| `ai_task_add` | `[name, goal]` | `[ok, taskid, name, state="planned"]` |
+| `ai_overview` | `[]` | `[ok, overview]` — exactly `Node.get_overview()` across workspaces |
+| `ai_tasks` | `[]` | `[ok, tasks]` — flattened task list across all workspaces |
+| `ai_task` | `[taskid]` | `[ok, task]` — a task in any workspace |
+| `ai_task_add` | `[name, goal, workspace_id?]` | `[ok, taskid, name, state="planned", workspace_id?]` (workspace id defaults to the Node's own workspace) |
 | `ai_task_update` | `[taskid, message]` | `[ok]` |
 | `ai_task_stop` | `[taskid]` | `[ok]` |
-| `ai_goals` | `[action="list"]` | `[ok, goals]` — the node's scheduled goals (`GoalScheduler.overview()`) |
+| `ai_goals` | `[action="list"]` | `[ok, goals]` — the Node's own Workspace scheduled goals (`GoalScheduler.overview()`) |
 | `ai_goals` | `[action, goal]` | `[ok, goal, from, to]` / `[ok, queued]` — `run`, `pause`, `resume`, `activate`, `cancel`, `archive`, `complete` |
 
 `ai_goals` answers `ok = false` on a node without an `.agentspace` (goals off). A `run` is
@@ -124,12 +123,13 @@ queued for the node's scheduler thread; a status change moves the goal folder
 
 `ai_request_poll` status lifecycle is the node_api one, unchanged:
 `queued → generating → waiting → done | error`.
-`delta` is a raw agent action (`text` / `reasoning` / `tool_start` / `tool_end` / `milestone`).
-`result` is the miniagent result json: `[ok, reports=[[report=...]], execution_time_ms]`.
+`delta` is a raw agent action (`text` / `reasoning` / `tool_start` / `tool_end`; legacy `milestone` is still accepted by the mirror).
+`result` is the node's normalized receptionist turn result: `[ok, reports=[[report=...]], error, execution_time_ms]`, built from the receptionist's canonical `task_result`.
 
-`ai_task_add` / `ai_task_update` / `ai_task_stop` bypass the remote receptionist and drive
-the remote worker pool directly (the router's role tools use `ai_request` for real user
-work, these are for management and for the CLI).
+`ai_task_add` / `ai_task_update` / `ai_task_stop` bypass the remote receptionist and drive a
+remote `Workspace` directly (`ai_task_add` routes to a workspace, defaulting to the Node's own
+workspace; the router's role tools use `ai_request` for real user work, these are for management
+and for the CLI).
 
 ### `ai_request_update` — follow-ups on delegated work
 
@@ -138,9 +138,9 @@ receptionist, not a worker. The node applies `message` to the receptionist turn 
 `request_id`:
 
 * request **running** (`generating`): inject it into the live receptionist conversation —
-  the same mechanism `Megamind.update_task` uses for a running worker
-  (`host.receptionist.send_prompt(message)`), which stops the current generation, keeps the
-  chat and continues with the new user message.
+  the same mechanism `Node.update_receptionist` uses
+  (`host.receptionist.task_update(message)`), which stops the current generation, keeps the
+  chat and continues with the new user message (only when `host.receptionist.running`).
 * request **queued** (not started yet): append the message to the stored prompt so it is
   part of the task when it starts.
 * request **finished / reaped / unknown**: `[ok = false, error = "not found"]`.
@@ -151,8 +151,8 @@ command for `ai_request`-backed tasks and `ai_task_update` for `ai_task_add`-bac
 
 ## Events (node pushes, router receives)
 
-Command `ai_event`, sent with `broadcast("ai_event", payload)` by the node whenever
-`Megamind.on_task_finished`, `Megamind.on_notify` or `Megamind.on_file` fires, and on node state changes.
+Command `ai_event`, sent with `broadcast("ai_event", payload)` by the Node whenever a
+Workspace task-finished, notify or file listener fires, and on node state changes.
 The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other device does.
 
 ```
@@ -164,7 +164,7 @@ The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other dev
     taskid, name, state, report,
     # notify:
     message,
-    # file (send_file of an agent on the node, Megamind.share_file):
+    # file (send_file of a workspace agent, forwarded by Workspace):
     name, bytes, caption, data = <base64 of the file>,
     # node_state:
     online = bool,
@@ -183,7 +183,7 @@ The router answers `"ok"` (it registers `on_get("ai_event", ...)`); no other dev
 | `task_stalled` | `[kind, time, node, taskid, name, state, idle_ms, error]` | the router's stall watchdog |
 
 `task_state` gained `error`: the failure text of that transition — the node's `status="error"`
-answer, `"node offline"`, `"no reply from node"`, `"unknown remote id"`, ... — and `""` when
+answer, `"node offline for N min"`, `"remote request expired"`, `"no reply from node"`, ... — and `""` when
 there is none. A front end renders it, so the user sees **why** a task failed, not only that it
 did. `report` stays the node's report on a terminal state.
 
@@ -232,13 +232,10 @@ class Router
     running = true;
 
     request(prompt, on_finish_cb = None, on_action_cb = None)   # one router-agent turn, queued
-        # The result is normalized by `_turn_result`: the role's `finish(report)`
-        # tool puts the agent's answer into `agent.env.reports`, and miniagent only
-        # returns those when `env.use_finalize` is set — without the fold, a turn
-        # that ended with `finish()` comes back as
-        # `[ok=false, error="Agent returned nothing (maybe crashed)."]` although
-        # everything worked. The Router folds `agent.env.reports` in: the report is
-        # the answer and the turn is ok.
+        # The result is normalized by `_turn_result`: the role's `finish(report)` /
+        # `finalize(signal, result)` sets `agent.task_result`, and the Router folds
+        # that into the legacy owner-facing shape `[ok, reports=[[report=...]]]`.
+        # The report is the answer and the turn is ok when the signal is not failed.
     stop()
 
     nodes()                        # online node records
@@ -263,13 +260,14 @@ class Router
         # routed = false as an error.
         # `answer` is what the agent reported with `finish(report)` — the role
         # reports on every turn, so there is always text to show the user.
-    add_task(name, goal, node_name, mode = "receptionist")
+    add_task(name, goal, node_name, mode = "receptionist", workspace_id = "")
         # role tool entry point, -> taskid (None on failure)
         # node_name is REQUIRED: the agent picks it from get_nodes(). Empty, unknown
         #   or offline node -> None. This class never invents a node.
-        # mode "receptionist": the goal goes to the node's receptionist (ai_request) —
+        # mode "receptionist": the goal goes to the Node's receptionist connector (ai_request) —
         #   the normal path for user work, the remote receptionist decides how to execute.
-        # mode "worker": drives the remote worker pool directly (ai_task_add) — CLI/admin.
+        # mode "worker": drives a remote Workspace directly (ai_task_add); an empty
+        #   workspace id means the Node's own workspace — CLI/admin.
     add_task_error()               # -> string: the reason of the LAST add_task failure (""
                                    # after a success): "node offline: X", "unknown node: X",
                                    # "empty node name", "ai_request failed: ...", "the node did
@@ -283,7 +281,7 @@ class Router
         # [taskid, node, name, state, open, goal, report, last_error,
         #  user_updates, created, updated]
         # state: "all" (default) | "open"/"running" (queued+generating) |
-        #        "finished" | "failed" | "stopped" | "lost"; node_name restricts to one node.
+        #        "finished" | "failed" | "question" | "stopped" | "lost"; node_name restricts to one node.
     get_overview()                 # nodes + remote_tasks + events, device objects stripped
     notify_user(msg)
     on_notify(cb) / on_event(cb) / on_action(cb)
@@ -301,8 +299,10 @@ Remote task record (the router's mirror):
 `error`), `last_progress` the ms timestamp of the last visible progress (state change, report,
 delta, a poll with new data) — the stall watchdog measures against it.
 
-`state`: `queued | generating | finished | failed | stopped | lost`
-(`lost` = the node went offline and the request id is gone).
+`state`: `queued | generating | finished | failed | question | stopped | lost`
+(`question` is terminal: the node's `finalize(signal=question, result=...)` needs the owner. `lost` means the
+node/task is definitively gone — after a grace period while the node is offline, or a
+definitive `not found` with no report. A transient poll failure keeps the task open.)
 
 ### Mirror rules (why one user goal is exactly one task)
 
@@ -378,5 +378,5 @@ class plus the `router` role: embed them in a telegram bot, a web front end, any
 
 CLI commands of `router.shio`: `/nodes`, `/tasks`, `/overview [node]`,
 `/route <text>` (router-agent turn), `/node <node> <text>` (explicit delegation, no agent
-turn), `/addworker <node> <name> <goal>` (direct worker-pool task, bypasses the remote
-receptionist), `/notify <text>`, `/config`, `/help`, `/exit`.
+turn), `/addworker <node> <name> <goal>` (direct workspace task via `ai_task_add`, bypasses the remote
+receptionist; workspace defaults to the Node's own workspace), `/notify <text>`, `/config`, `/help`, `/exit`.

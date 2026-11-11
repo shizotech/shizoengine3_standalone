@@ -1,0 +1,211 @@
+using eigen;
+
+#include "engine/generators/extensions/video/video_convert"
+
+//Videos in the Assets tab (#460 point 7):
+//- the length of every video file at the right end of its row (filebrowser.note), read with nanogui.video_probe a few
+//  files per frame while they are in sight, and kept per file and time of change;
+//- rest the mouse on a video file and a small window beside the sidebar plays it (no sound), with its length, size,
+//  frame rate, codec and whether it plays backwards (an intra-only file such as HAP) and has sound.
+//Like the shader preview (shader_preview.shio): one window and one video widget for every preview, gone when the mouse
+//leaves the list.
+
+VIDEO_PREVIEW_WIDTH = 320;
+VIDEO_PREVIEW_HEIGHT = 180;
+VIDEO_PREVIEW_DELAY = 450;        //ms the mouse rests on a video before the preview opens
+VIDEO_PREVIEW_PROBES = 2;         //files read for their notes per round
+VIDEO_PREVIEW_NOTES_MS = 250;     //a round of the notes at most this often
+VIDEO_PREVIEW_COLOR_TEXT_2 = vec4f(0.608, 0.608, 0.627, 1.0);
+
+//"07" for 7: two digits
+video_preview_two(n) {
+	return (n < 10 ? "0" : "") + std.string(n);
+}
+
+//"0:07", "1:23", "1:02:03": the length of a clip in its row. Under a second: "0.4 s"
+video_preview_duration_text(seconds) {
+	if(seconds <= 0)
+		return "";
+	tenths = std.int(math.round(seconds * 10));
+	if(tenths < 10)
+		return "0." + std.string(tenths) + " s";
+	total = std.int(math.round(seconds));
+	h = std.int(total / 3600);
+	m = std.int((total % 3600) / 60);
+	s = total % 60;
+	if(h > 0)
+		return std.string(h) + ":" + video_preview_two(m) + ":" + video_preview_two(s);
+	return std.string(m) + ":" + video_preview_two(s);
+}
+
+//"30" for 30.0, "29.97" for 29.97002997
+video_preview_fps_text(fps) {
+	hundredths = std.int(math.round(fps * 100));
+	if(hundredths % 100 == 0)
+		return std.string(std.int(hundredths / 100));
+	return std.string(std.int(hundredths / 100)) + "." + video_preview_two(hundredths % 100);
+}
+
+//The name a VJ knows a codec by
+video_preview_codec_name(codec) {
+	names = [hap = "HAP", h264 = "H.264", hevc = "HEVC", prores = "ProRes", dnxhd = "DNxHD / DNxHR", mjpeg = "MJPEG",
+		mpeg2video = "MPEG-2", mpeg4 = "MPEG-4", vp8 = "VP8", vp9 = "VP9", av1 = "AV1", rawvideo = "uncompressed",
+		qtrle = "QuickTime Animation", png = "PNG"];
+	c = std.string(codec).lowercase();
+	return names.has(c) ? names[c] : c.uppercase();
+}
+
+//"1:23 · 1920 × 1080 · 30 fps · HAP · plays backwards · sound" out of nanogui.video_probe
+video_preview_info_text(info) {
+	if(!info || !info.ok)
+		return info && info.error ? "Cannot be read: " + info.error : "Cannot be read";
+	parts = [];
+	d = video_preview_duration_text(info.duration);
+	if(d != "")
+		parts.push_back(d);
+	if(info.width > 0 && info.height > 0)
+		parts.push_back(std.string(info.width) + " × " + std.string(info.height));
+	if(info.fps > 0)
+		parts.push_back(video_preview_fps_text(info.fps) + " fps");
+	if(info.codec)
+		parts.push_back(video_preview_codec_name(info.codec) + (info.alpha ? " with alpha" : ""));
+	if(info.intra_only)
+		parts.push_back("plays backwards");
+	if(info.audio)
+		parts.push_back("sound");
+	text = "";
+	for(part : parts)
+		text += (text == "" ? "" : " · ") + part;
+	return text;
+}
+
+class video_preview
+{
+	managed window = None;
+	managed video = None;
+	managed caption = None;
+	managed info_lbl = None;
+	engine = None;
+	sidebar = None;
+	hovered = "";
+	hover_since = 0;
+	hover_y = 0;
+	shown = "";
+	//path -> [stamp, text]: what the rows show, read once per file and time of change
+	notes = None;
+	browser = None;       //the filebrowser of the Assets tab, whose rows get the notes
+	notes_at = 0;
+
+	__init__(engine, sidebar) {
+		this.engine = engine;
+		this.sidebar = sidebar;
+		notes = std.json();
+		window = engine.screen.window("");
+		window.header_enabled(false).movable(false).resizable(false).overlay(true).visible(false)
+			.fixed_size(vec2f(VIDEO_PREVIEW_WIDTH + 16, VIDEO_PREVIEW_HEIGHT + 62));
+		caption = window.label("").font_size(13).anchor_left(10).anchor_right(10).anchor_top(VIDEO_PREVIEW_HEIGHT + 14).fixed_height(18);
+		info_lbl = window.label("").font_size(12).text_color(VIDEO_PREVIEW_COLOR_TEXT_2).anchor_left(10).anchor_right(10)
+			.anchor_top(VIDEO_PREVIEW_HEIGHT + 34).fixed_height(16);
+	}
+
+	//The mouse is over the list at a row with path ("" for none). screen_y: where the mouse is on the screen
+	hover(path, screen_y) {
+		file = std.string(path);
+		if(file != "" && (!video_convert_is_video(file) || fileio.is_directory(file)))
+			file = "";
+		hover_y = screen_y;
+		if(file == hovered)
+			return;
+		hovered = file;
+		hover_since = std.millis();
+		if(file == "")
+			hide();
+	}
+
+	//Called every frame (on_frame_finished of the engine, not a draw callback: a video_probe takes up to ~35 ms for a
+	//4K file): the notes of the rows in sight, and the preview once the mouse rested long enough
+	tick() {
+		if(!std.is_none(browser) && std.millis() - notes_at >= VIDEO_PREVIEW_NOTES_MS) {
+			notes_at = std.millis();
+			update_notes(browser);
+		}
+		if(hovered == "" || hovered == shown)
+			return;
+		if(std.millis() - hover_since < VIDEO_PREVIEW_DELAY)
+			return;
+		show(hovered);
+	}
+
+	show(path) {
+		shown = path;
+		if(!nanogui.video_available()) {
+			hide();
+			return;
+		}
+		//A new widget per clip: the old one closes its file with it
+		if(!std.is_none(video))
+			std.free(video);
+		video = window.video(path);
+		video.anchor_left(8).anchor_top(8).fixed_width(VIDEO_PREVIEW_WIDTH).fixed_height(VIDEO_PREVIEW_HEIGHT);
+		video.loop(true).play();
+		caption.caption(fileio.file_name(path));
+		info_lbl.caption(video_preview_info_text(probe(path)));
+		place();
+		window.visible(true);
+	}
+
+	hide() {
+		shown = "";
+		if(!std.is_none(video)) {
+			std.free(video);
+			video = None;
+		}
+		if(window.visible())
+			window.visible(false);
+	}
+
+	place() {
+		left = sidebar.position().x + sidebar.size().x + 8;
+		y = hover_y - (VIDEO_PREVIEW_HEIGHT + 62) / 2;
+		max_y = engine.screen.height() - VIDEO_PREVIEW_HEIGHT - 70;
+		if(y > max_y)
+			y = max_y;
+		if(y < 40)
+			y = 40;
+		window.position(vec2f(left, y));
+	}
+
+	//nanogui.video_probe of a file, None without FFmpeg
+	probe(path) {
+		if(!nanogui.video_available())
+			return None;
+		try {
+			return nanogui.video_probe(path);
+		}
+		catch(e) {}
+		return None;
+	}
+
+	//The length of the videos in sight as the note of their rows, VIDEO_PREVIEW_PROBES new files per call. A file
+	//that changed (a conversion writing it) is read again
+	update_notes(list) {
+		if(!nanogui.video_available())
+			return;
+		probed = 0;
+		for(row : list.item_rects()) {
+			if(row.dir || !video_convert_is_video(row.path))
+				continue;
+			fi = fileio.file_info(row.path);
+			stamp = fi ? fi.last_write_time : 0;
+			if(notes.has(row.path) && notes[row.path].stamp == stamp)
+				continue;
+			if(probed >= VIDEO_PREVIEW_PROBES)
+				return;
+			probed++;
+			info = probe(row.path);
+			text = info && info.ok ? video_preview_duration_text(info.duration) : "";
+			notes[row.path] = [stamp = stamp, text = text];
+			list.note(row.path, text);
+		}
+	}
+}

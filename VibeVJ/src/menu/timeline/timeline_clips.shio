@@ -1,0 +1,3448 @@
+#include "engine/generators/generatoritem"
+#include "engine/interfaces/aiinterface"
+#include "engine/generators/generator_moves"
+
+//Clips, lanes and envelopes of a timeline (#680). One implementation for the view Timeline of the timeline area and
+//for each loop timeline of the view Loops (loops.shio):
+//- Lanes: one row each, a head on the left (grip, name, envelope button, blend mode, menu, Mix) and the lane on the
+//  right. A lane lays its clip over the lanes below it with a LayerBlend shader, as a layer of the Clipview does
+//  (engine/assets/layerblend.glsl); the top lane gives the picture of the timeline, at the port Out in the corner
+//  above the heads. Step 3: lanes are added, deleted, moved (dragged by the grip) and renamed (the menu of the head);
+//  each has an id it keeps, so its controls, links and MIDI mappings stay with it.
+//- Clips: a shader, video, picture or generator (a Phaser too) dropped onto a lane, from the Assets tab, Alt + dragged
+//  out of a Patchview or dragged from a clip of a Clipview. Each clip is a stack like a clip of the Clipview
+//  (engine/assets/shaderstack.asset): more assets can be stacked onto it as effects in the Clip panel.
+//- A clip is active only while the cursor is inside it. Entering, every frame inside and leaving, its generators get
+//  the dispatcher commands clip_start, clip_position and clip_stop ([pos 0..1, beat, seconds, length, ...]; see
+//  engine/contracts/README.md). Where two clips overlap on a lane they crossfade: the later one fades in over the
+//  overlap (TRANSITION of the LayerBlend, step 3).
+//- Several clips are selected with Shift / Ctrl + click or a rubber band and moved together; Ctrl+C / Ctrl+V / Ctrl+D
+//  copy, paste (at the cursor) and duplicate them (step 3). A video dropped onto a lane gets the length of the video.
+//- Envelopes (step 2): Ableton style, one full-length envelope per lane and target, no envelope clips. Each envelope
+//  is an output control of the lane head (ENV_<n>) whose value is the envelope at the playhead; it reaches its target
+//  through a link (normalized), so any linkable control can be one. The first envelope of a lane goes to its Mix.
+//  The widget draws the shown envelope of a lane over the lane and edits it with the mouse (timeline.cpp).
+//- The loop: a range in the ruler (its ends dragged, Shift + drag draws a new one); on the main timeline the button
+//  Loop in the bar switches it on, a loop timeline always turns over its range (its clock, loop_clock.shio).
+//- Saved with the project (the main timeline: engine.save_hooks["timeline_clips"], a loop timeline: with its loop),
+//  the controls of the lane heads in controls.json (each head is a matrixnode "<prefix>_lane_<n>"). Adding,
+//  deleting, moving and resizing clips, editing envelopes and changing the loop are steps of the undo history.
+//- Step 5: a clip has a fade in and a fade out (the handles at its top corners) and a curve (linear, equal power, S)
+//  for its fades and a crossfade into it. A clip with fades and nothing to crossfade with fades over the lanes below as
+//  a clip fades in on an empty layer of the Clipview (LAYER_EMPTY, iChannel2, TRANSITION); a crossfade weighs the two
+//  clips by the curve (XFADE_CURVE of the LayerBlend). Envelope points are selected (click, Shift + click, the rubber
+//  band over a lane that shows its envelope), moved together, copied and pasted at the playhead and deleted. Adding
+//  or removing an entry of the stack of a clip in the Clip panel is a step of the undo history. Cues (cues.shio):
+//  flags in the ruler that run an action when the playhead passes them. A timeline can be a song of the show
+//  (shows.shio): the songs share the Out and the panel, only the song that plays ticks.
+//- For AI agents: the interface with the live_path "timeline" (get_timeline, add_timeline_clip, ...); a query with
+//  the argument loop goes to a loop timeline, with song to a song of the show (default: the song that plays).
+//The C++ widget (modules/shzmodule_nanogui/timeline.cpp) draws the lanes, the items, the envelopes and the loop and
+//does the mouse.
+
+TL_HEAD_W = 176;       //the column of the lane heads, left of the lanes
+TL_LANE_H = 46;        //a lane: name and blend mode, Mix below
+TL_ENV_LANE_H = 92;    //a lane with its envelope shown: room for the curve, the envelope row in the head
+TL_ENV_ROW_MIN = 66;   //the envelope row of a head shows from this lane height on
+TL_PANEL_W = 760;      //the Clip panel at the right, while a clip or a lane is selected (the stack list takes 250)
+TL_CLIP_BEATS = 16;    //an asset dropped onto a lane of the main timeline becomes a clip of 4 bars
+TL_MIN_LANES = 2;      //a new project starts with two lanes; there is always one empty lane at the bottom
+TL_KEY_DELETE = 261;   //GLFW key codes
+TL_KEY_BACKSPACE = 259;
+TL_BLEND_MIX = 3;      //the blend mode Mix of layerblend.glsl: Mix is then the opacity of the lane
+TL_VIDEO_EXT = [mp4=1, mov=1, m4v=1, mkv=1, webm=1, avi=1, mxf=1, mpg=1, mpeg=1, ts=1, wmv=1];
+TL_VIDEO_WAIT_MS = 10000; //how long a video clip waits for its video to open to take its length
+TL_CURVES = ["linear", "equal_power", "s_curve"]; //the curves of fades and crossfades (#680, step 5)
+TL_CURVE_NAMES = ["Linear", "Equal power", "S curve"];
+TL_CUE_JUMP = 2.0;        //a cursor that moves further than this in a frame jumped (a locate): the cues between do not run
+
+//The gain of a fade at t (0..1 through it) by a curve: linear, equal power (sin), S curve (smoothstep)
+tl_curve_gain(t, curve) {
+	t = math.clamp(t, 0.0, 1.0);
+	if(curve == 1)
+		return math.sin(t * 1.5707963);
+	if(curve == 2)
+		return t * t * (3.0 - 2.0 * t);
+	return t;
+}
+
+//A curve by its name (linear, equal_power, s_curve, also "Equal power") or index
+tl_curve_index(v) {
+	if(std.is_string(v)) {
+		w = v.lowercase().replace(" ", "_").replace("-", "_");
+		for(i = 0; i < TL_CURVES.size(); i++) {
+			if(TL_CURVES[i] == w)
+				return i;
+		}
+		if(w == "s" || w == "scurve")
+			return 2;
+		if(w == "power" || w == "equal")
+			return 1;
+		return std.int(std.float(v));
+	}
+	return math.clamp(std.int(v), 0, 2);
+}
+
+//What the AI interface belongs to (the MCP server and the Chat show this)
+class timeline_ai_target {
+	get_live_path() {
+		return "timeline";
+	}
+	get_relative_path() {
+		return "src/menu/timeline/timeline_clips.shio";
+	}
+}
+
+//The Clip panel: one window at the right that shows the stack of the selected clip or the LayerBlend of the selected
+//lane. The main timeline has one, the loop timelines share one (loops.shio). Every clip and lane shader of its
+//timelines lives in it, hidden while not selected (they render anyway)
+class timeline_panel
+{
+	managed window = None;
+	managed del_btn = None;
+	owner = None;     //the timeline_clips whose generator is shown
+	on_width = None;  //callback(width): the panel opened (its width), changed width or closed (0)
+	editor = None;    //the editor of a cue (cues.shio), made the first time a cue is shown
+
+	__init__(parent) {
+		window = parent.window("Clip").anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(TL_PANEL_W).min_size(vec2f(360, -1))
+			.movable(false).resizable_left(true).visible(false);
+		window.on_resize([this](new_size, old_size){
+			if(this.window.visible())
+				this.tell_width(new_size.x);
+		});
+		close_btn = window.button_panel().button("").icon(nanogui.icon("times")).tooltip("Close the panel (nothing selected)").anchor_right(0).anchor_top(0).anchor_bottom(0).fixed_width(25);
+		close_btn.on_click([this](){
+			if(this.owner)
+				this.owner.select_none();
+			else
+				this.hide();
+		});
+		del_btn = window.button_panel().button("").icon(nanogui.icon("trash_alt")).tooltip("Delete the selected [[clip]] (Delete)").danger("hover").anchor_right(30).anchor_top(0).anchor_bottom(0).fixed_width(25);
+		del_btn.on_click([this](){
+			if(this.owner)
+				this.owner.delete_selected();
+		});
+	}
+
+	//Shows the window of a generator of a timeline (what another timeline showed there is deselected)
+	show(by, gen, title, is_clip) {
+		if(owner && owner != by)
+			owner.deselect();
+		owner = by;
+		del_btn.visible(is_clip);
+		gen.window.visible(true);
+		window.title(title);
+		//At most 45 % of the area when it opens, so the lanes keep room on a small screen
+		if(!window.visible())
+			window.fixed_width(math.max(360, math.min(TL_PANEL_W, window.parent().width() * 0.45)));
+		window.visible(true);
+		tell_width(window.width() > 0 ? window.width() : TL_PANEL_W);
+		window.refresh_layout();
+	}
+
+	hide() {
+		owner = None;
+		hide_editor();
+		window.visible(false);
+		tell_width(0);
+	}
+
+	cue_editor() {
+		if(!editor)
+			editor = timeline_cue_editor(window);
+		return editor;
+	}
+
+	hide_editor() {
+		if(editor && editor.box.visible())
+			editor.box.visible(false);
+	}
+
+	tell_width(w) {
+		if(on_width)
+			on_width(w);
+	}
+}
+
+class timeline_clips
+{
+	tl = None;                 //the nanogui.timeline: ruler, lanes, items, envelopes, loop
+	timeline = None;           //the timeline of the program (timeline.shio): tempo, the undo history, the main cursor
+	clock = None;              //a loop timeline: its loop_clock (the cursor, the range); None for the main timeline
+	prefix = "timeline";       //the names of the lane heads (<prefix>_lane_<n>) and lane shaders (<prefix>_lane_shader_<n>)
+	title = "Timeline";
+	lazy_shaders = false;      //a loop timeline makes its lane shaders with its first clip (an empty loop renders nothing)
+	on_range = None;           //a loop timeline: callback(clock) after its range was changed (the Beats of its row)
+	dead = false;              //disposed (its loop was deleted): steps of the undo history for it do nothing
+	managed heads = None;      //the column of the lane heads
+	panel_box = None;          //the timeline_panel
+	panel = None;              //its window: the parent of every clip and lane shader (owned by the timeline_panel: it is shared, a
+	                           //managed one went with the first timeline that went, a deleted song or loop, #680 step 5)
+	managed own_out = None;   //Out: the picture of the timeline (a song of the show shares the one of the first song)
+	out_ctrl = None;
+	managed ai = None;
+	managed clips = [];        //id -> [id, item (the stack generator), tl_item, lane, beat, length, name, path, active]
+	managed lanes = [];        //[shader, head, node, name_btn, env_btn, blend, mix, env_row, env_sel, env_del, envs, ...]
+	selected_lane_id = -1;     //the id of the lane whose LayerBlend the panel shows
+	next_lane_id = 0;          //the id of the next new lane
+	lane_drag = None;          //a lane dragged by its grip: [id, y, dy, to]
+	relink = true;             //the lanes are linked again at the next tick
+	lanes_freed = false;       //lanes of the project before were freed (load_state)
+	loading = false;
+	pending_lengths = 0;       //video clips that wait for the length of their video
+	combo_busy = false;        //the envelope list of a head is being filled (its on_change is not the user)
+	name_tick = 0;
+	song_active = true;        //a song of the show that does not play (shows.shio): nothing of it runs
+	managed cues = [];         //id -> [id, beat, name, action, marker (its flag in the ruler), fired, last]: the cues (step 5)
+	cue_next = 1;
+	cue_pos = -1.0;            //where the cursor was at the last frame, for the cues it passes
+	selected_cue = "";         //the cue whose flag is selected (its editor in the panel)
+	fade_busy = false;         //the fade fields of a clip are being filled
+
+	//owner: the timeline (timeline.shio); parent: the widget the heads and the lanes go into; widget: the
+	//nanogui.timeline in it. opts: clock (a loop timeline), prefix, title, panel (a shared timeline_panel), ai (false),
+	//out (the Out control of another timeline: a song of the show), out_parent (where Out goes, default the heads)
+	__init__(owner, parent, widget, opts = None) {
+		timeline = owner;
+		tl = widget;
+		if(opts) {
+			clock = opts.has("clock") ? opts.clock : None;
+			prefix = opts.prefix ?? prefix;
+			title = opts.title ?? title;
+			panel_box = opts.has("panel") ? opts.panel : None;
+		}
+		lazy_shaders = clock ? true : false;
+		tl.anchor_left(TL_HEAD_W).item_lane_height(TL_LANE_H).snap(1.0);
+		tl.view_center(tl.visible_beats() * 0.5); //beat 0 at the left edge
+
+		heads = parent.widget().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(TL_HEAD_W);
+
+		//Out, in the corner above the heads (the height of the ruler). The songs of the show share one
+		if(opts && opts.has("out") && opts.out)
+			out_ctrl = opts.out;
+		else {
+			out_host = opts && opts.has("out_parent") && opts.out_parent ? opts.out_parent : heads;
+			own_out = out_host.control("OUT", prefix + "_out").caption("Out").as_output(true)
+				.anchor_left(2).anchor_right(2).anchor_top(0).fixed_height(tl.scrub_height())
+				.tooltip("The picture of the [[timeline]]: its lanes laid over each other. [[link|Link]] it to an output.\n[[wiki:Timeline#clips-and-lanes]]");
+			own_out.callback([this](v){
+				this.show_out();
+			});
+			out_ctrl = own_out;
+		}
+
+		if(!panel_box) {
+			panel_box = timeline_panel(parent);
+			panel_box.on_width = [this](w){
+				this.lanes_right(w);
+			};
+		}
+		panel = panel_box.window;
+
+		tl.select_callback([this](item){
+			this.on_select(item);
+		});
+		//One call for a whole drag: a selection of clips moves together, one step of the undo history
+		tl.edits_callback([this](list){
+			this.on_edits(list);
+		});
+		tl.loop_callback([this](start, end){
+			this.on_loop_drag(start, end);
+		});
+		tl.envelope_callback([this](id, old_points){
+			this.on_envelope_edit(id, old_points);
+		});
+		//Fades dragged at the top corners of a clip (#680, step 5)
+		tl.fade_callback([this](item, old_in, old_out){
+			this.on_fade_edit(item, old_in, old_out);
+		});
+		//Cues (#680, step 5): a flag clicked or dragged, a double click in the ruler adds one. Not on a loop timeline
+		if(!clock) {
+			tl.marker_callback([this](id, old_beat){
+				this.on_marker(id, old_beat);
+			});
+			tl.marker_add_callback([this](beat){
+				if(!nanogui.show_mode())
+					this.user_add_cue(beat, "", [type = "clip", view = "", row = 0, col = 0], true);
+			});
+		}
+
+		//Assets, generators of a Patchview, clips of a Clipview; anything else gets the red outline of the screen
+		tl.on_dragdrop_hover([this](payload, pos) {
+			return this.takes_drop(payload);
+		});
+		tl.on_dragdrop([this](payload, pos) {
+			if(!this.takes_drop(payload) || nanogui.show_mode())
+				return false;
+			return this.drop(payload, pos);
+		});
+
+		tl.on_keyboard([this](key, scancode, action, mods){
+			if(action == 1 && this.key(key, scancode, mods))
+				return true;
+			return this.tl.keyboard_default(key, scancode, action, mods);
+		});
+
+		//The heads follow the lanes (their heights can be dragged) every frame
+		heads.on_draw([this](){
+			this.place_heads();
+		});
+
+		if(clock) {
+			tl.loop_enabled(true);
+			sync_range();
+		}
+		set_lane_count(TL_MIN_LANES);
+
+		if(!opts || !opts.has("ai") || opts.ai) {
+			ai = AIInterface(timeline_ai_target(), None, "src/menu/timeline/timeline_clips.shio");
+			ai.add_capability("timeline");
+			register_queries();
+		}
+	}
+
+	//A loop timeline goes with its loop: its clips stop, its generators and its lanes go
+	dispose() {
+		if(dead)
+			return;
+		if(panel_box.owner == this)
+			panel_box.hide();
+		ids = [];
+		for(i = 0; i < clips.size(); i++)
+			ids.push_back(clips.key(i));
+		for(i = 0; i < ids.size(); i++)
+			remove_clip(ids[i]);
+		for(i = 0; i < lanes.size(); i++) {
+			if(lanes[i].shader)
+				std.free(lanes[i].shader);
+			lanes[i].shader = None;
+		}
+		//on_range of the loops view holds the entry of the loop, the entry holds this: without it a deleted loop was never freed
+		on_range = None;
+		dead = true;
+	}
+
+	// =========================================================================
+	// Where the timeline is
+	// =========================================================================
+
+	//The beat of the cursor: the main cursor, or where a loop is in its turn
+	cursor() {
+		return clock ? clock.position() : timeline.cursor_pos.value();
+	}
+
+	//A stopped loop plays nothing, nor a song of the show that does not play
+	running() {
+		if(!song_active)
+			return false;
+		return clock ? clock.running : true;
+	}
+
+	//A song of the show plays or not (shows.shio): its clips stop, its lane shaders rest while it does not
+	set_song_active(on) {
+		song_active = on ? true : false;
+		if(!song_active) {
+			for(i = 0; i < clips.size(); i++) {
+				if(clips[i].active)
+					stop_clip(clips[i]);
+			}
+			select_none();
+		}
+		for(i = 0; i < lanes.size(); i++) {
+			try {
+				if(lanes[i].shader)
+					lanes[i].shader.dispatch("active", song_active);
+			}
+			catch(e) {}
+		}
+		cue_pos = -1.0;
+		relink = true;
+	}
+
+	tempo_now() {
+		return math.max(1.0, timeline.bpm_ctrl.value());
+	}
+
+	//A clip dropped onto a loop timeline fills its turn
+	default_clip_beats() {
+		return clock ? math.max(1.0, clock.length) : TL_CLIP_BEATS;
+	}
+
+	// =========================================================================
+	// Lanes
+	// =========================================================================
+
+	//At least n lanes; this takes none away (delete_lane does, a project load starts again)
+	set_lane_count(n) {
+		for(lanes.size() < n)
+			add_lane();
+		tl.lanes(lanes.size());
+		relink = true;
+	}
+
+	//One lane more at the bottom while the last one holds a clip: there is always an empty lane to drop on
+	keep_free_lane() {
+		last = lanes.size() - 1;
+		for(i = 0; i < clips.size(); i++) {
+			if(clips[i].lane >= last) {
+				set_lane_count(clips[i].lane + 2);
+				return;
+			}
+		}
+	}
+
+	//The position of the lane with this id (0 = the top), -1 when there is none
+	lane_pos(id) {
+		for(i = 0; i < lanes.size(); i++) {
+			if(lanes[i].id == id)
+				return i;
+		}
+		return -1;
+	}
+
+	//What lane i is called: its name, or "Lane <n>" by its id, which it keeps when it moves
+	lane_label(i) {
+		if(i < 0 || i >= lanes.size())
+			return "";
+		return lanes[i].name != "" ? lanes[i].name : "Lane " + (lanes[i].id + 1);
+	}
+
+	lane_ids() {
+		out = [];
+		for(i = 0; i < lanes.size(); i++)
+			out.push_back(lanes[i].id);
+		return out;
+	}
+
+	//The heights of the lanes by their id: they move with their lanes
+	lane_heights() {
+		out = std.json();
+		for(i = 0; i < lanes.size(); i++)
+			out[std.string(lanes[i].id)] = tl.lane_height(i);
+		return out;
+	}
+
+	//A new lane: its head and its LayerBlend. Each lane has an id that it keeps: its head is the matrixnode
+	//"<prefix>_lane_<id>" (its controls, links and MIDI mappings are saved by that name, so they stay with the lane when
+	//it moves) and its LayerBlend has the guid "<prefix>_lane_shader_<id>". Lanes of projects before step 3 have their
+	//position as id. id -1: the next one; pos -1: at the bottom. A lane put between others needs remap_lanes
+	//(insert_lane does it)
+	add_lane(id = -1, pos = -1) {
+		if(id < 0)
+			id = next_lane_id;
+		next_lane_id = math.max(next_lane_id, id + 1);
+		head = heads.widget().anchor_left(0).anchor_right(0).fixed_height(TL_LANE_H);
+		node = head.matrixnode("", prefix + "_lane_" + id).anchor(0);
+		grip = node.button("").icon(nanogui.icon("grip_vertical")).anchor_left(0).anchor_top(2).fixed_height(20).fixed_width(12)
+			.tooltip("Drag up or down to move the lane: its clips, envelopes, links and MIDI mappings move with it.\n[[wiki:Timeline#lanes]]");
+		name_btn = node.pushbutton("").latched_style("selection").anchor_left(13).anchor_top(2).fixed_height(20).fixed_width(56);
+		env_btn = node.pushbutton("").icon(nanogui.icon("chart_line")).anchor_left(71).anchor_top(2).fixed_height(20).fixed_width(22)
+			.tooltip("Show or hide the envelopes of this lane. The first one drives its Mix; link an envelope to any control.\n[[wiki:Timeline#envelopes]]");
+		blend = node.controlcombo("BLEND").items(["No Blend", "Add", "Add Mask", "Mix", "Multiply", "MultiplyInput", "Chroma R", "Chroma G", "Chroma B"])
+			.anchor_left(95).anchor_right(26).anchor_top(2).fixed_height(20)
+			.tooltip("How this lane is laid over the lanes below it. Mix: Mix is the opacity of the lane.\n[[wiki:Timeline#clips-and-lanes]]");
+		//The menu of the lane: its name, a lane above or below, move, delete (#680, step 3)
+		more_btn = node.button_popup("").icon(nanogui.icon("ellipsis_v")).side("right").anchor_right(2).anchor_top(2).fixed_height(20).fixed_width(22)
+			.tooltip("The lane: rename it, add a lane, move it up or down, delete it.\n[[wiki:Timeline#lanes]]");
+		more_btn.on_screen(true).autoclose(true);
+		menu = more_btn.popup().content().layout(nanogui.layout_vertical());
+		menu.fixed_width(220);
+		name_box = menu.textbox("").editable(true).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28)
+			.tooltip("The name of the lane (Enter). Empty: Lane and its number.");
+		above_btn = menu.button("Add a lane above").icon(nanogui.icon("plus")).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+		below_btn = menu.button("Add a lane below").icon(nanogui.icon("plus")).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+		up_btn = menu.button("Move up").icon(nanogui.icon("arrow_up")).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+		down_btn = menu.button("Move down").icon(nanogui.icon("arrow_down")).alignment("left").anchor_left(0).anchor_right(0).fixed_height(28);
+		del_btn = menu.button("Delete the lane").icon(nanogui.icon("trash_alt")).danger("hover").alignment("left").anchor_left(0).anchor_right(0).fixed_height(28)
+			.tooltip("Deletes the lane with its clips and envelopes (Ctrl+Z brings it back)");
+		mix = node.controlslider("MIX").caption("Mix").anchor_left(2).anchor_right(2).anchor_top(24).fixed_height(20)
+			.tooltip("How strongly the clip of this lane covers the lanes below it");
+		//The envelope row: which envelope is shown (and a new one), its output, delete. Shown while the lane is tall
+		env_row = node.widget().anchor_left(0).anchor_right(0).anchor_top(46).fixed_height(22).visible(false);
+		env_sel = env_row.combobox().anchor_left(2).anchor_top(0).fixed_height(20).fixed_width(70)
+			.tooltip("The envelope shown on this lane, by the control it drives, or a new one");
+		env_del = env_row.button("").icon(nanogui.icon("trash_alt")).danger("hover").anchor_right(2).anchor_top(0).fixed_height(20).fixed_width(22)
+			.tooltip("Delete the shown envelope");
+		lane = [id = id, name = "", shader = None, head = head, node = node, grip = grip, name_btn = name_btn, env_btn = env_btn,
+			more_btn = more_btn, name_box = name_box, blend = blend, mix = mix, env_row = env_row, env_sel = env_sel, env_del = env_del,
+			envs = [], env_next = 1, env_shown = -1, env_show = false, env_raised = false, xfade = None, fade = None];
+		if(pos < 0 || pos >= lanes.size())
+			lanes.push_back(lane);
+		else
+			lanes.insert(pos, lane);
+
+		//The callbacks find the lane by its id: its position changes when lanes move
+		blend.callback([this, id](v){
+			this.set_lane_uniform(this.lane_pos(id), "BLEND", v);
+		});
+		mix.callback([this, id](v){
+			this.set_lane_uniform(this.lane_pos(id), "MIX", v);
+		});
+		name_btn.on_change([this, id](v){
+			if(v)
+				this.select_lane(this.lane_pos(id));
+			else if(this.selected_lane_id == id)
+				this.select_none();
+		});
+		env_btn.on_change([this, id](v){
+			this.show_envelopes(this.lane_pos(id), v ? true : false, true);
+		});
+		env_sel.on_open([this, id](){
+			this.fill_envelope_list(this.lane_pos(id));
+		});
+		env_sel.on_change([this, id](index, text){
+			if(!this.combo_busy)
+				this.pick_envelope(this.lane_pos(id), index);
+		});
+		env_del.on_click([this, id](){
+			i = this.lane_pos(id);
+			lane = this.lanes[i];
+			if(lane.env_shown >= 0 && lane.env_shown < lane.envs.size() && !nanogui.show_mode())
+				this.delete_envelope(i, lane.envs[lane.env_shown].n);
+		});
+		//Dragged by the grip, up or down: where it lands shows as a line across the lanes
+		grip.on_mouse_button([this, id](pos, btn, down, mods){
+			if(btn != 0)
+				return true;
+			if(down)
+				this.lane_drag_start(id);
+			else
+				this.lane_drag_end();
+			return true;
+		});
+		grip.on_mouse_drag([this](p, rel, btn, mods){
+			this.lane_drag_move(rel.y);
+			return true;
+		});
+		name_box.on_change([this, id, more_btn](text){
+			more_btn.close();
+			this.user_rename_lane(this.lane_pos(id), text);
+		});
+		above_btn.on_click([this, id, more_btn](){
+			more_btn.close();
+			this.user_add_lane(this.lane_pos(id));
+		});
+		below_btn.on_click([this, id, more_btn](){
+			more_btn.close();
+			this.user_add_lane(this.lane_pos(id) + 1);
+		});
+		up_btn.on_click([this, id, more_btn](){
+			more_btn.close();
+			i = this.lane_pos(id);
+			this.user_move_lane(i, i - 1);
+		});
+		down_btn.on_click([this, id, more_btn](){
+			more_btn.close();
+			i = this.lane_pos(id);
+			this.user_move_lane(i, i + 1);
+		});
+		del_btn.on_click([this, id, more_btn](){
+			more_btn.close();
+			this.delete_lane(this.lane_pos(id));
+		});
+		blend.value(TL_BLEND_MIX);
+		mix.value(1.0);
+		if(!lazy_shaders || clips.size() > 0)
+			make_lane_shader(lane_pos(id));
+		refresh_lane_labels();
+		return lane;
+	}
+
+	//The captions of the lanes, their names in their menus
+	refresh_lane_labels() {
+		for(i = 0; i < lanes.size(); i++) {
+			lane = lanes[i];
+			label = lane_label(i);
+			if(lane.name_btn.caption() != label) {
+				lane.name_btn.caption(label);
+				lane.name_btn.tooltip(label + ": click to see its LayerBlend in the panel (blend settings, output to a display). Its menu (the dots) renames, adds, moves and deletes lanes.\n[[wiki:Timeline#lanes]]");
+			}
+			if(!lane.name_box.focused() && lane.name_box.value() != label)
+				lane.name_box.value(label);
+		}
+	}
+
+	//After lanes were added, deleted or moved: the clips and envelopes go to the new positions of their lanes, the
+	//heights move with the lanes. old: the ids of the lanes before, heights: lane_heights() before
+	remap_lanes(old, heights) {
+		for(i = 0; i < clips.size(); i++) {
+			c = clips[i];
+			if(c.lane >= old.size())
+				continue;
+			p = lane_pos(old[c.lane]);
+			if(p >= 0 && p != c.lane) {
+				c.lane = p;
+				c.tl_item.lane(p);
+			}
+		}
+		for(i = 0; i < lanes.size(); i++) {
+			envs = lanes[i].envs;
+			for(k = 0; k < envs.size(); k++)
+				tl.envelope_lane(envs[k].eid, i);
+			k = std.string(lanes[i].id);
+			tl.lane_height(i, heights.has(k) ? heights[k] : TL_LANE_H);
+		}
+		tl.lanes(lanes.size());
+		relink = true;
+		refresh_lane_labels();
+		keep_free_lane();
+	}
+
+	//A lane at pos (no step of the undo history). id: the one it had (undo of a delete, redo), -1 a new one
+	insert_lane(pos, id = -1) {
+		if(id >= 0)
+			wait_freed(); //its head and its LayerBlend of before (the same names) have to be gone first
+		old = lane_ids();
+		heights = lane_heights();
+		lane = add_lane(id, math.clamp(pos, 0, lanes.size()));
+		remap_lanes(old, heights);
+		return lane;
+	}
+
+	//The lane at i goes with its clips and envelopes (no step of the undo history). Returns what restore_lane makes it
+	//again of: its id, place, name, the controls of its head with their links and MIDI mappings, its envelopes, its clips
+	remove_lane(i) {
+		if(i < 0 || i >= lanes.size())
+			return None;
+		lane = lanes[i];
+		snap = [id = lane.id, pos = i, name = lane.name, node = lane.node.serialize_json(true), envelopes = [], clips = [],
+			shown = lane.env_show, env_shown = lane.env_shown, height = tl.lane_height(i), raised = lane.env_raised];
+		for(k = 0; k < lane.envs.size(); k++)
+			snap.envelopes.push_back(envelope_snapshot(i, lane.envs[k]));
+		ids = [];
+		for(k = 0; k < clips.size(); k++) {
+			if(clips[k].lane == i)
+				ids.push_back(clips.key(k));
+		}
+		for(k = 0; k < ids.size(); k++) {
+			c = remove_clip(ids[k]);
+			if(c)
+				snap.clips.push_back(c);
+		}
+		for(lane.envs.size() > 0) {
+			env = lane.envs[0];
+			lane.envs.erase(0);
+			tl.envelope_remove(env.eid);
+			std.free(env.ctrl);
+		}
+		if(selected_lane_id == lane.id)
+			select_none();
+		old = lane_ids();
+		heights = lane_heights();
+		if(lane.shader)
+			std.free(lane.shader);
+		lane.shader = None;
+		lanes.erase(i);
+		std.free(lane.head);
+		remap_lanes(old, heights);
+		if(lanes.size() == 0)
+			set_lane_count(1);
+		keep_free_lane();
+		return snap;
+	}
+
+	//The lane of a snapshot of remove_lane again, in its place, with its clips, envelopes, links and MIDI mappings
+	restore_lane(snap) {
+		lane = insert_lane(snap.pos, snap.id);
+		i = lane_pos(snap.id);
+		lane.name = snap.name;
+		for(k = 0; k < snap.envelopes.size(); k++)
+			add_envelope(i, snap.envelopes[k].n, snap.envelopes[k].points);
+		//Blend, Mix, the envelope outputs: values, links (also those from other lanes to this one) and MIDI mappings
+		try {
+			lane.node.deserialize_json(snap.node, true);
+		}
+		catch(e) {}
+		for(k = 0; k < snap.clips.size(); k++)
+			restore(snap.clips[k]);
+		if(snap.envelopes.size() > 0) {
+			lane.env_shown = snap.env_shown;
+			show_envelopes(i, snap.shown ? true : false, false);
+		}
+		if(!snap.raised)
+			tl.lane_height(i, snap.height);
+		refresh_lane_labels();
+		relink = true;
+		return lane;
+	}
+
+	//The lane at from goes to to (both positions); its clips, envelopes and head go with it
+	move_lane(from, to) {
+		if(from == to || from < 0 || to < 0 || from >= lanes.size() || to >= lanes.size())
+			return false;
+		old = lane_ids();
+		heights = lane_heights();
+		lane = lanes[from];
+		lanes.erase(from);
+		lanes.insert(to, lane);
+		remap_lanes(old, heights);
+		return true;
+	}
+
+	rename_lane(i, name) {
+		if(i < 0 || i >= lanes.size())
+			return;
+		lanes[i].name = name;
+		refresh_lane_labels();
+	}
+
+	// With the mouse (the menu of a lane, its grip) or over MCP: each a step of the undo history, never in show mode
+
+	user_add_lane(pos, name = "") {
+		if(nanogui.show_mode())
+			return None;
+		pos = math.clamp(pos, 0, lanes.size());
+		lane = insert_lane(pos);
+		id = lane.id;
+		if(name != "")
+			rename_lane(pos, name);
+		step("Add lane", [this, id](){ this.remove_lane(this.lane_pos(id)); }, [this, pos, id, name](){
+			this.insert_lane(pos, id);
+			if(name != "")
+				this.rename_lane(pos, name);
+		});
+		return lane;
+	}
+
+	delete_lane(i) {
+		if(nanogui.show_mode() || i < 0 || i >= lanes.size())
+			return None;
+		snap = remove_lane(i);
+		if(!snap)
+			return None;
+		id = snap.id;
+		step("Delete lane", [this, snap](){ this.restore_lane(snap); }, [this, id](){ this.remove_lane(this.lane_pos(id)); });
+		return snap;
+	}
+
+	user_move_lane(from, to) {
+		if(nanogui.show_mode() || !move_lane(from, to))
+			return false;
+		step("Move lane", [this, from, to](){ this.move_lane(to, from); }, [this, from, to](){ this.move_lane(from, to); });
+		return true;
+	}
+
+	//The name typed in the menu of the lane; its default ("Lane <n>") or nothing is no name
+	user_rename_lane(i, text) {
+		if(i < 0 || i >= lanes.size() || nanogui.show_mode())
+			return false;
+		name = text.trim();
+		if(name == "Lane " + (lanes[i].id + 1))
+			name = "";
+		was = lanes[i].name;
+		if(name == was) {
+			refresh_lane_labels();
+			return false;
+		}
+		rename_lane(i, name);
+		id = lanes[i].id;
+		step("Rename lane", [this, id, was](){ this.rename_lane(this.lane_pos(id), was); }, [this, id, name](){ this.rename_lane(this.lane_pos(id), name); });
+		return true;
+	}
+
+	// A lane dragged by its grip: its head follows the mouse, a line shows where it lands
+
+	lane_drag_start(id) {
+		i = lane_pos(id);
+		if(i < 0 || nanogui.show_mode())
+			return;
+		lane_drag = [id = id, y = tl.lane_top(i) + tl.lane_height(i) * 0.5, dy = 0.0, to = i];
+	}
+
+	lane_drag_move(dy) {
+		if(!lane_drag)
+			return;
+		lane_drag.dy += dy;
+		from = lane_pos(lane_drag.id);
+		to = math.clamp(tl.lane_at(lane_drag.y + lane_drag.dy), 0, lanes.size() - 1);
+		lane_drag.to = to;
+		//The line goes above the lane it takes the place of when it moves up, below it when it moves down
+		tl.lane_marker(to == from ? -1 : (to < from ? to : to + 1));
+	}
+
+	lane_drag_end() {
+		d = lane_drag;
+		lane_drag = None;
+		tl.lane_marker(-1);
+		if(!d)
+			return;
+		from = lane_pos(d.id);
+		if(from >= 0 && d.to != from)
+			user_move_lane(from, d.to);
+	}
+
+	//The LayerBlend of lane i, with the blend mode of its head
+	make_lane_shader(i) {
+		if(lanes_freed) {
+			wait_freed(); //a lane of the project before, with this guid, has to be gone first
+			lanes_freed = false;
+		}
+		shader = generator(panel, "engine/assets/layerblend.glsl", vec2f(0, 0), prefix + "_lane_shader_" + lanes[i].id, [no_header=true]);
+		if(shader && shader.window)
+			shader.window.anchor(0).visible(false);
+		if(shader && !song_active)
+			shader.dispatch("active", false);
+		lanes[i].shader = shader;
+		set_lane_uniform(i, "BLEND", lanes[i].blend.value());
+		set_lane_uniform(i, "MASTER", 1.0);
+		relink = true;
+	}
+
+	//A loop timeline gets its lane shaders with its first clip
+	ensure_lane_shaders() {
+		for(i = 0; i < lanes.size(); i++) {
+			if(!lanes[i].shader)
+				make_lane_shader(i);
+		}
+	}
+
+	//A uniform of the LayerBlend of lane i. BLEND is a control of the shader (saved with it): it is set there
+	set_lane_uniform(i, name, v) {
+		if(i < 0 || i >= lanes.size() || !lanes[i].shader)
+			return;
+		shader = lanes[i].shader;
+		try {
+			if(name == "BLEND") {
+				ctrl = shader_control(shader, "BLEND");
+				if(ctrl && ctrl.value() != v)
+					ctrl.value(v);
+				return;
+			}
+			shader.dispatch("set_uniform", [name = name, value = v, index = 0]);
+		}
+		catch(e) {}
+	}
+
+	//A control of the uniforms of a shader generator by its name ("uniforms.uniforms@Controls.<name>")
+	shader_control(shader, name) {
+		paths = shader.node.get_control_paths(true);
+		for(i = 0; i < paths.size(); i++) {
+			if(paths[i].starts("uniforms") && paths[i].ends("." + name))
+				return shader.node.get_control_by_path(paths[i]);
+		}
+		return None;
+	}
+
+	place_heads() {
+		for(i = 0; i < lanes.size(); i++) {
+			lane = lanes[i];
+			head = lane.head;
+			y = tl.lane_top(i);
+			h = tl.lane_height(i);
+			//The lane dragged by its grip follows the mouse
+			if(lane_drag && lane_drag.id == lane.id)
+				y = y + lane_drag.dy;
+			if(head.y() != y)
+				head.y(y);
+			row = lane.env_show && h >= TL_ENV_ROW_MIN;
+			if(head.fixed_height() != h || lane.env_row.visible() != row) {
+				head.fixed_height(h);
+				lane.env_row.visible(row);
+				head.refresh_layout(); //the anchors of the node and its rows follow the new height
+			}
+		}
+	}
+
+	//The height the lanes need (a loop row grows with them)
+	needed_height() {
+		n = tl.lane_count();
+		return tl.lane_top(n - 1) + tl.lane_height(n - 1) + 2;
+	}
+
+	//The picture of each lane: its clip over the lane below it. Lane 1 (index 0) is the picture of the timeline.
+	//Two clips of a lane that overlap crossfade (#680, step 3): the one that started first goes to iChannel0, the later
+	//one to iChannel2, and TRANSITION of the LayerBlend runs from 0 to 1 over the overlap (fade_tick), as a transition
+	//of the Clipview does
+	link_lanes() {
+		relink = false;
+		per = lane_clips();
+		for(i = lanes.size() - 1; i >= 0; i--) {
+			lane = lanes[i];
+			shader = lane.shader;
+			if(!shader)
+				continue;
+			try {
+				k = std.string(i);
+				list = per.has(k) ? per[k] : [];
+				b = list.size() > 0 ? list[list.size() - 1] : None;
+				a = list.size() > 1 ? list[list.size() - 2] : None;
+				out_b = b && b.item ? b.item.dispatch("get_default_output") : None;
+				out_a = a && a.item ? a.item.dispatch("get_default_output") : None;
+				lane.xfade = out_a && out_b ? [a = a.id, b = b.id] : None;
+				//A clip with fades that crossfades with none (step 5): it fades over the lanes below, as a clip fades
+				//in on an empty layer of the Clipview (iChannel2 with LAYER_EMPTY, TRANSITION its gain)
+				lane.fade = !lane.xfade && out_b && (b.fade_in > 0.0 || b.fade_out > 0.0) ? b.id : None;
+				first = out_a ? out_a : out_b;
+				shader.dispatch("set_uniform", [name = "LAYER_EMPTY", value = first && !lane.fade ? 0 : 1, index = 0]);
+				shader.dispatch("get_default_input").value(first && !lane.fade ? first.value() : None);
+				shader.dispatch("set_input", [name = "iChannel2", value = lane.xfade || lane.fade ? out_b.value() : None, index = 0]);
+				shader.dispatch("set_uniform", [name = "TRANSITION", value = lane_transition(lane, cursor()), index = 0]);
+				shader.dispatch("set_uniform", [name = "XFADE_CURVE", value = lane.xfade ? b.curve : 0, index = 0]);
+				below = None;
+				if(i + 1 < lanes.size() && lanes[i + 1].shader)
+					below = lanes[i + 1].shader.dispatch("get_default_output").value();
+				shader.dispatch("set_input", [name = "iChannel1", value = below, index = 0]);
+				shader.dispatch("set_uniform", [name = "MIX", value = lane.mix.value(), index = 0]);
+				shader.dispatch("set_uniform", [name = "MASTER", value = 1.0, index = 0]);
+			}
+			catch(e) {}
+		}
+		show_out();
+	}
+
+	//How far the crossfade from clip a to clip b is at pos: 0 where b starts, 1 where the first of them ends
+	xfade_amount(a, b, pos) {
+		end = math.min(a.beat + a.length, b.beat + b.length);
+		span = end - b.beat;
+		if(span <= 0.0)
+			return 1.0;
+		return math.clamp((pos - b.beat) / span, 0.0, 1.0);
+	}
+
+	//The gain of the fades of clip c at pos (0..1, by its curve): 1 between its fades
+	fade_gain(c, pos) {
+		g = 1.0;
+		if(c.fade_in > 0.0)
+			g = math.min(g, (pos - c.beat) / c.fade_in);
+		if(c.fade_out > 0.0)
+			g = math.min(g, (c.beat + c.length - pos) / c.fade_out);
+		return tl_curve_gain(g, c.curve);
+	}
+
+	//TRANSITION of the LayerBlend of a lane at pos: the crossfade of two clips, the fade of one clip, else 0
+	lane_transition(lane, pos) {
+		x = lane.xfade;
+		if(x && clips.has(x.a) && clips.has(x.b))
+			return xfade_amount(clips[x.a], clips[x.b], pos);
+		if(lane.fade && clips.has(lane.fade))
+			return fade_gain(clips[lane.fade], pos);
+		return 0.0;
+	}
+
+	//Every frame: the crossfades and fades of the lanes
+	fade_tick(pos) {
+		for(i = 0; i < lanes.size(); i++) {
+			if((!lanes[i].xfade && !lanes[i].fade) || !lanes[i].shader)
+				continue;
+			try {
+				lanes[i].shader.dispatch("set_uniform", [name = "TRANSITION", value = lane_transition(lanes[i], pos), index = 0]);
+			}
+			catch(e) {}
+		}
+	}
+
+	show_out() {
+		try {
+			if(lanes.size() > 0 && lanes[0].shader) {
+				v = lanes[0].shader.dispatch("get_default_output").value();
+				if(out_ctrl.value() != v)
+					out_ctrl.value(v);
+			}
+		}
+		catch(e) {}
+	}
+
+	//Lane (as a string key) -> its active clips, by their start (the one that started last at the end)
+	lane_clips() {
+		out = std.json();
+		for(i = 0; i < clips.size(); i++) {
+			c = clips[i];
+			if(!c.active)
+				continue;
+			k = std.string(c.lane);
+			if(!out.has(k))
+				out[k] = [];
+			at = out[k].size();
+			for(j = 0; j < out[k].size(); j++) {
+				if(out[k][j].beat > c.beat) {
+					at = j;
+					break;
+				}
+			}
+			out[k].insert(at, c);
+		}
+		return out;
+	}
+
+	// =========================================================================
+	// Envelopes (#680, step 2): one per lane and target, Ableton style
+	// =========================================================================
+
+	//The envelope n of lane i, None when there is none
+	env_of(i, n) {
+		if(i < 0 || i >= lanes.size())
+			return None;
+		envs = lanes[i].envs;
+		for(k = 0; k < envs.size(); k++) {
+			if(envs[k].n == n)
+				return envs[k];
+		}
+		return None;
+	}
+
+	//The envelope with the id of the widget: [lane, env], None when there is none
+	env_by_id(eid) {
+		for(i = 0; i < lanes.size(); i++) {
+			envs = lanes[i].envs;
+			for(k = 0; k < envs.size(); k++) {
+				if(envs[k].eid == eid)
+					return [lane = i, env = envs[k]];
+			}
+		}
+		return None;
+	}
+
+	//A new envelope on lane i: its output control ENV_<n> in the head, its curve in the widget. n 0: the next number.
+	//Not shown and not linked yet
+	add_envelope(i, n = 0, points = None) {
+		set_lane_count(i + 1);
+		lane = lanes[i];
+		if(n <= 0)
+			n = lane.env_next;
+		lane.env_next = math.max(lane.env_next, n + 1);
+		if(std.is_none(points))
+			points = [[0.0, 0.5, 0.0]];
+		ctrl = lane.env_row.controlslider("ENV_" + n).caption("Env").min(0).max(1).value(0).as_output(true).undoable(false)
+			.anchor_left(74).anchor_right(26).anchor_top(0).fixed_height(20).visible(false)
+			.tooltip("The value of this envelope at the playhead. [[link|Link]] it from its right notch to the control it should drive (normalized: the envelope runs through the range of the control).\n[[wiki:Timeline#envelopes]]");
+		eid = tl.envelope_add(i, points);
+		env = [n = n, eid = eid, ctrl = ctrl];
+		lane.envs.push_back(env);
+		return env;
+	}
+
+	//The name of an envelope: the control it drives ("Lane 2 Mix" for a control of another lane of this timeline)
+	envelope_name(env) {
+		try {
+			info = env.ctrl.link_info();
+			for(k = 0; k < info.size(); k++) {
+				if(info[k].direction != "out")
+					continue;
+				own = env.ctrl.path();
+				own_lane = own.substr(0, own.size() - ("ENV_" + env.n).size());
+				parts = info[k].path.split("/");
+				if(parts.size() >= 2 && !info[k].path.starts(own_lane)) {
+					node = parts[parts.size() - 2];
+					tag = prefix + "_lane_";
+					if(node.starts(tag)) {
+						at = lane_pos(std.int(node.substr(tag.size())));
+						if(at >= 0)
+							return lane_label(at) + " " + info[k].name;
+					}
+				}
+				return info[k].name;
+			}
+		}
+		catch(e) {}
+		return "Env " + env.n;
+	}
+
+	//The full paths of the controls an envelope drives
+	envelope_targets(env) {
+		out = [];
+		try {
+			info = env.ctrl.link_info();
+			for(k = 0; k < info.size(); k++) {
+				if(info[k].direction == "out")
+					out.push_back(info[k].path);
+			}
+		}
+		catch(e) {}
+		return out;
+	}
+
+	//The envelope as data, made again by restore_envelope (with its links)
+	envelope_snapshot(i, env) {
+		return [lane = i, n = env.n, points = tl.envelope_points(env.eid), targets = envelope_targets(env)];
+	}
+
+	restore_envelope(snap) {
+		wait_freed(); //its control of before (the same name) has to be gone first
+		env = add_envelope(snap.lane, snap.n, snap.points);
+		ctx = nanogui.current_context();
+		for(k = 0; k < snap.targets.size(); k++) {
+			dest = ctx.get_control_by_path(snap.targets[k]);
+			if(dest)
+				env.ctrl.link_to(dest, "normalized");
+		}
+		lane = lanes[snap.lane];
+		show_envelopes(snap.lane, true, false);
+		pick_envelope(snap.lane, lane.envs.size() - 1);
+		return env;
+	}
+
+	//The envelope goes. Returns its snapshot (for undo), None when there is none
+	remove_envelope(i, n) {
+		env = env_of(i, n);
+		if(!env)
+			return None;
+		lane = lanes[i];
+		snap = envelope_snapshot(i, env);
+		for(k = 0; k < lane.envs.size(); k++) {
+			if(lane.envs[k].n == n) {
+				lane.envs.erase(k);
+				break;
+			}
+		}
+		tl.envelope_remove(env.eid);
+		std.free(env.ctrl);
+		if(lane.env_shown >= lane.envs.size())
+			lane.env_shown = lane.envs.size() - 1;
+		if(lane.envs.size() == 0)
+			show_envelopes(i, false, false);
+		else
+			pick_envelope(i, lane.env_shown);
+		return snap;
+	}
+
+	//The envelope that drives the Mix of the lane, from its Mix now on (the first envelope of a lane)
+	add_mix_envelope(i, points = None) {
+		lane = lanes[i];
+		env = add_envelope(i, 0, std.is_none(points) ? [[0.0, lane.mix.value(), 0.0]] : points);
+		env.ctrl.link_to(lane.mix, "normalized");
+		return env;
+	}
+
+	//The envelopes of lane i shown (and edited) on the lane or not. ask: from the button (the first envelope is made
+	//then, a step of the undo history)
+	show_envelopes(i, on, ask) {
+		if(i >= lanes.size())
+			return;
+		lane = lanes[i];
+		if(on && lane.envs.size() == 0) {
+			if(!ask || nanogui.show_mode()) //show mode: nothing is made (#285)
+				on = false;
+			else {
+				env = add_mix_envelope(i);
+				snap = envelope_snapshot(i, env);
+				n = env.n;
+				step("Add envelope", [this, i, n](){ this.remove_envelope(i, n); }, [this, snap](){ this.restore_envelope(snap); });
+			}
+		}
+		lane.env_show = on;
+		if(lane.env_btn.pushed() != on)
+			lane.env_btn.pushed(on);
+		//The lane makes room for the curve while it is shown, and gives it back
+		h = tl.lane_height(i);
+		if(on && h < TL_ENV_LANE_H) {
+			tl.lane_height(i, TL_ENV_LANE_H);
+			lane.env_raised = true;
+		}
+		else if(!on && lane.env_raised) {
+			if(h == TL_ENV_LANE_H)
+				tl.lane_height(i, TL_LANE_H);
+			lane.env_raised = false;
+		}
+		pick_envelope(i, lane.env_shown >= 0 ? lane.env_shown : 0);
+	}
+
+	//The envelope k of lane i is the one shown (and its output control the one in the head)
+	pick_envelope(i, k) {
+		lane = lanes[i];
+		envs = lane.envs;
+		if(k == envs.size() && lane.env_show && !nanogui.show_mode()) {
+			//The last item of the list: a new envelope, not linked (the user links it from its notch)
+			env = add_envelope(i);
+			snap = envelope_snapshot(i, env);
+			n = env.n;
+			step("Add envelope", [this, i, n](){ this.remove_envelope(i, n); }, [this, snap](){ this.restore_envelope(snap); });
+		}
+		k = math.clamp(k, -1, envs.size() - 1);
+		lane.env_shown = k;
+		for(j = 0; j < envs.size(); j++) {
+			on = lane.env_show && j == k;
+			tl.envelope_visible(envs[j].eid, on);
+			if(envs[j].ctrl.visible() != (j == k))
+				envs[j].ctrl.visible(j == k);
+		}
+		fill_envelope_list(i);
+	}
+
+	//The list of the head: the envelopes by the control they drive, then a new one
+	fill_envelope_list(i) {
+		lane = lanes[i];
+		names = [];
+		for(k = 0; k < lane.envs.size(); k++)
+			names.push_back(envelope_name(lane.envs[k]));
+		names.push_back("+ New");
+		combo_busy = true;
+		try {
+			lane.env_sel.items(names);
+			lane.env_sel.selected(lane.env_shown >= 0 ? lane.env_shown : None);
+		}
+		catch(e) {}
+		combo_busy = false;
+	}
+
+	delete_envelope(i, n) {
+		snap = remove_envelope(i, n);
+		if(snap)
+			step("Delete envelope", [this, snap](){ this.restore_envelope(snap); }, [this, i, n](){ this.remove_envelope(i, n); });
+		return snap;
+	}
+
+	set_envelope_points(i, n, points) {
+		env = env_of(i, n);
+		if(env)
+			tl.envelope_points(env.eid, points);
+	}
+
+	//Points of an envelope changed with the mouse: a step of the undo history
+	on_envelope_edit(eid, old_points) {
+		at = env_by_id(eid);
+		if(!at)
+			return;
+		i = at.lane;
+		n = at.env.n;
+		now = tl.envelope_points(eid);
+		step("Edit envelope", [this, i, n, old_points](){ this.set_envelope_points(i, n, old_points); }, [this, i, n, now](){ this.set_envelope_points(i, n, now); });
+	}
+
+	//Every frame: the value of each envelope at the cursor goes out of its control (and through its links)
+	drive_envelopes(pos) {
+		for(i = 0; i < lanes.size(); i++) {
+			envs = lanes[i].envs;
+			for(k = 0; k < envs.size(); k++) {
+				v = tl.envelope_value(envs[k].eid, pos);
+				if(!std.is_none(v) && envs[k].ctrl.value() != v)
+					envs[k].ctrl.value(v);
+			}
+		}
+		//The names in the lists follow the links the user makes (twice a second is enough)
+		name_tick++;
+		if(name_tick >= 30) {
+			name_tick = 0;
+			for(i = 0; i < lanes.size(); i++) {
+				if(lanes[i].env_show && lanes[i].env_row.visible())
+					refresh_envelope_name(i);
+			}
+		}
+	}
+
+	refresh_envelope_name(i) {
+		lane = lanes[i];
+		if(lane.env_shown < 0 || lane.env_shown >= lane.envs.size())
+			return;
+		name = envelope_name(lane.envs[lane.env_shown]);
+		if(lane.env_sel.selected_text() != name)
+			fill_envelope_list(i);
+	}
+
+	envelopes_state(i) {
+		out = [];
+		envs = lanes[i].envs;
+		for(k = 0; k < envs.size(); k++)
+			out.push_back([n = envs[k].n, points = tl.envelope_points(envs[k].eid)]);
+		return out;
+	}
+
+	clear_envelopes() {
+		for(i = 0; i < lanes.size(); i++) {
+			lane = lanes[i];
+			for(lane.envs.size() > 0) {
+				env = lane.envs[0];
+				lane.envs.erase(0);
+				tl.envelope_remove(env.eid);
+				std.free(env.ctrl);
+			}
+			lane.env_shown = -1;
+			lane.env_next = 1;
+			show_envelopes(i, false, false);
+		}
+	}
+
+	// Selected envelope points (#680, step 5): click, Shift + click, the rubber band; Delete, Ctrl+C, Ctrl+V
+
+	//The visible envelope with selected points: [lane, env, indices], None when no point is selected
+	selected_points() {
+		for(i = 0; i < lanes.size(); i++) {
+			envs = lanes[i].envs;
+			for(k = 0; k < envs.size(); k++) {
+				sel = tl.envelope_selection(envs[k].eid);
+				if(sel.size() > 0)
+					return [lane = i, env = envs[k], indices = sel];
+			}
+		}
+		return None;
+	}
+
+	//The points of an envelope (the step of the undo history: its points before and after)
+	points_step(step_name, i, n, was) {
+		env = env_of(i, n);
+		if(!env)
+			return;
+		now = tl.envelope_points(env.eid);
+		step(step_name, [this, i, n, was](){ this.set_envelope_points(i, n, was); }, [this, i, n, now](){ this.set_envelope_points(i, n, now); });
+	}
+
+	delete_points() {
+		s = selected_points();
+		if(!s || nanogui.show_mode())
+			return false;
+		was = tl.envelope_points(s.env.eid);
+		keep = [];
+		for(k = 0; k < was.size(); k++) {
+			if(tl_cue_index(s.indices, k) < 0)
+				keep.push_back(was[k]);
+		}
+		tl.envelope_points(s.env.eid, keep);
+		points_step(s.indices.size() == 1 ? "Delete envelope point" : "Delete envelope points", s.lane, s.env.n, was);
+		return true;
+	}
+
+	//Ctrl+C: the selected points to the clipboard of the program, their beats from the first of them
+	copy_points() {
+		s = selected_points();
+		if(!s)
+			return false;
+		pts = tl.envelope_points(s.env.eid);
+		first = pts[s.indices[0]][0];
+		data = [];
+		for(k = 0; k < s.indices.size(); k++) {
+			p = pts[s.indices[k]];
+			data.push_back([p[0] - first, p[1], p[2]]);
+		}
+		cp = std.global("copy_paste");
+		cp.timeline_points = [points = data, eid = s.env.eid];
+		cp.timeline_copied = "points";
+		return true;
+	}
+
+	//The envelope pasted points go to: the one with selected points, the one they were copied from, the first one shown
+	paste_target(eid) {
+		s = selected_points();
+		if(s)
+			return [lane = s.lane, env = s.env];
+		at = env_by_id(eid);
+		if(at)
+			return at;
+		for(i = 0; i < lanes.size(); i++) {
+			l = lanes[i];
+			if(l.env_show && l.env_shown >= 0 && l.env_shown < l.envs.size())
+				return [lane = i, env = l.envs[l.env_shown]];
+		}
+		return None;
+	}
+
+	//Ctrl+V: the copied points at the beat at (the playhead): the points that were in their span go, they are selected
+	paste_points(at, lane = -1, n = 0) {
+		cp = std.global("copy_paste").timeline_points;
+		if(nanogui.show_mode() || !cp || !cp.points || cp.points.size() == 0)
+			return false;
+		target = lane >= 0 ? (env_of(lane, n) ? [lane = lane, env = env_of(lane, n)] : None) : paste_target(cp.eid);
+		if(!target)
+			return false;
+		eid = target.env.eid;
+		was = tl.envelope_points(eid);
+		span = cp.points[cp.points.size() - 1][0];
+		out = [];
+		for(k = 0; k < was.size(); k++) {
+			b = was[k][0];
+			if(b < at || b > at + span)
+				out.push_back(was[k]);
+		}
+		for(k = 0; k < cp.points.size(); k++)
+			out.push_back([at + cp.points[k][0], cp.points[k][1], cp.points[k][2]]);
+		tl.envelope_points(eid, out);
+		//The pasted points selected (they are sorted by beat now)
+		now = tl.envelope_points(eid);
+		sel = [];
+		for(k = 0; k < now.size(); k++) {
+			if(now[k][0] >= at - 0.00001 && now[k][0] <= at + span + 0.00001)
+				sel.push_back(k);
+		}
+		tl.envelope_select_none();
+		tl.envelope_selection(eid, sel);
+		points_step("Paste envelope points", target.lane, target.env.n, was);
+		return true;
+	}
+
+	//The selected points moved by beats and value (MCP; the mouse moves them in the widget)
+	move_points(beats, value) {
+		s = selected_points();
+		if(!s || nanogui.show_mode())
+			return false;
+		was = tl.envelope_points(s.env.eid);
+		pts = tl.envelope_points(s.env.eid);
+		lo = 1.0;
+		hi = 0.0;
+		first = 1000000000.0;
+		for(k = 0; k < s.indices.size(); k++) {
+			p = pts[s.indices[k]];
+			lo = math.min(lo, p[1]);
+			hi = math.max(hi, p[1]);
+			first = math.min(first, p[0]);
+		}
+		db = math.max(beats, -first);
+		dv = math.clamp(value, -lo, 1.0 - hi);
+		moved = [];
+		for(k = 0; k < pts.size(); k++) {
+			p = pts[k];
+			on = tl_cue_index(s.indices, k) >= 0;
+			moved.push_back([b = p[0] + (on ? db : 0.0), v = p[1] + (on ? dv : 0.0), c = p[2], on = on ? 1 : 0]);
+		}
+		moved.sort_by("b");
+		out = [];
+		sel = [];
+		for(k = 0; k < moved.size(); k++) {
+			out.push_back([moved[k].b, moved[k].v, moved[k].c]);
+			if(moved[k].on)
+				sel.push_back(k);
+		}
+		tl.envelope_points(s.env.eid, out);
+		tl.envelope_selection(s.env.eid, sel);
+		points_step(sel.size() == 1 ? "Move envelope point" : "Move envelope points", s.lane, s.env.n, was);
+		return true;
+	}
+
+	// =========================================================================
+	// Clips
+	// =========================================================================
+
+	//A clip of the asset path (a shader, video, picture, generator), or of saved entries (entries: a list of
+	//[state, node, button_node] as the stack takes them with add_entry). guid: the one of a saved clip, "" for a new one.
+	//fill(item): fills the stack instead (a generator moved from a Patchview, #348), true when it did. Returns the clip
+	//or None
+	make_clip(path, lane, beat, length, guid = "", entries = None, fades = None, fill = None) {
+		item = generator(panel, "engine/assets/shaderstack.asset", vec2f(0, 0), guid, [no_header=true, custom_path=path]);
+		if(!item || !item.is_loaded()) {
+			if(item)
+				std.free(item);
+			return None;
+		}
+		item.window.anchor(0).visible(false);
+		item.dispatch("start_inactive", true); //a clip is active only while the cursor is inside it
+
+		ok = false;
+		try {
+			if(std.is_function(fill))
+				ok = fill(item) ? true : false;
+			else if(std.is_none(entries))
+				ok = item.dispatch("add_generator", path) ? true : false;
+			else {
+				for(i = 0; i < entries.size(); i++) {
+					if(item.dispatch("add_entry", entries[i]))
+						ok = true;
+				}
+			}
+		}
+		catch(e) {}
+		if(!ok) {
+			std.free(item);
+			return None;
+		}
+		item.dispatch("start_inactive", false);
+		item.dispatch("active", false);
+		default_in = item.dispatch("get_default_input");
+		if(default_in)
+			default_in.visible(false);
+		return adopt_clip(item, path, lane, beat, length, fades);
+	}
+
+	//The clip around the stack generator item: its item on the timeline, its place in the list. fades: [fade_in,
+	//fade_out, curve] (step 5), None: none
+	adopt_clip(item, path, lane, beat, length, fades = None) {
+		beat = std.float(beat);
+		length = std.float(length);
+		id = item.guid;
+		name = fileio.pure_name(path);
+		tl_item = tl.add_item(beat, length, name);
+		tl_item.lane(lane);
+		tl_item.color(clip_color(path));
+		tl_item.attr.clip_id = id;
+		tl_item.tooltip(name + ": active while the cursor is inside it. Drag to move, drag its ends to resize. Shift / Ctrl + click or a drag on the empty lanes selects several; Delete, Ctrl+C, Ctrl+V, Ctrl+D.");
+		clip = [id = id, item = item, tl_item = tl_item, lane = lane, beat = beat, length = length, name = name, path = path, active = false, length_wait = None,
+			fade_in = 0.0, fade_out = 0.0, curve = 0, fade_ui = None];
+		clips[id] = clip;
+		if(fades) {
+			clip.fade_in = math.clamp(std.float(fades.fade_in ?? 0.0), 0.0, length);
+			clip.fade_out = math.clamp(std.float(fades.fade_out ?? 0.0), 0.0, length);
+			clip.curve = tl_curve_index(fades.curve ?? 0);
+		}
+		tl_item.fade_in(clip.fade_in).fade_out(clip.fade_out).curve(clip.curve);
+
+		//The entries of the stack change (one removed in the panel): the clip goes with its last one
+		item.dispatch("on_items_changed", [this, id](stackview) {
+			if(stackview.items.size() == 0 && stackview.missing.size() == 0)
+				this.remove_clip(id);
+			this.relink = true;
+		});
+		//What the user does to the stack in the Clip panel (an entry added or removed): a step of the undo history
+		item.dispatch("on_user_step", [this, id](step_name, action) {
+			this.stack_step(step_name, id, action);
+		});
+		//Generators of a Patchview dropped on the entries in the Clip panel (#348): more entries of this clip
+		item.dispatch("on_generators_drop", [this, id](stack) {
+			this.drop_generators(None, id);
+		});
+		make_fade_ui(clip);
+		keep_free_lane();
+		ensure_lane_shaders();
+		relink = true;
+		return clip;
+	}
+
+	//The file of a clip: the one its item plays now ("Replace the original" of a video gives the item another file,
+	//clip.mov for clip.mp4, #460)
+	clip_file(c) {
+		try {
+			if(c.item && c.item.path)
+				c.path = c.item.path;
+		}
+		catch(e) {}
+		return c.path;
+	}
+
+	//The fill of a clip on the timeline by what it is: a shader, a video or picture, another generator
+	clip_color(path) {
+		ext = fileio.file_ext(path).lowercase();
+		if(ext == "glsl")
+			return vec4f(0.33, 0.27, 0.55, 0.95);
+		if(TL_VIDEO_EXT.has(ext) || [png=1, jpg=1, jpeg=1].has(ext))
+			return vec4f(0.20, 0.33, 0.50, 0.95);
+		return vec4f(0.18, 0.40, 0.38, 0.95);
+	}
+
+	// A video clip as long as its video (#680, step 3)
+
+	//A clip of a video gets the length of the video (In to Out, at its Speed) in beats at the tempo now. The video opens
+	//in a moment: tick() asks again (poll_lengths) for up to TL_VIDEO_WAIT_MS. snaps: snapshots of the undo step that
+	//made the clip, they get the length too (redo makes it as long)
+	fit_video_length(c, snaps = None) {
+		if(!c || !TL_VIDEO_EXT.has(fileio.file_ext(c.path).lowercase()))
+			return;
+		c.length_wait = [until = std.millis() + TL_VIDEO_WAIT_MS, snaps = snaps ?? []];
+		pending_lengths++;
+		poll_length(c);
+	}
+
+	//The seconds the video of a clip plays (an entry of its stack answers clip_length), None while none knows yet
+	video_seconds(c) {
+		try {
+			items = c.item.dispatch("get_items");
+			for(i = 0; items && i < items.size(); i++) {
+				v = items[i].dispatch("clip_length", None);
+				t = std.type(v);
+				if((t == "float" || t == "int") && v > 0)
+					return std.float(v);
+			}
+		}
+		catch(e) {}
+		return None;
+	}
+
+	poll_length(c) {
+		w = c.length_wait;
+		if(!w)
+			return;
+		secs = video_seconds(c);
+		if(std.is_none(secs) && std.millis() < w.until)
+			return;
+		c.length_wait = None;
+		pending_lengths = math.max(0, pending_lengths - 1);
+		if(std.is_none(secs))
+			return;
+		beats = math.round(secs * tempo_now() / 60.0 * 1000.0) / 1000.0;
+		set_clip(c.id, c.lane, c.beat, beats);
+		for(k = 0; k < w.snaps.size(); k++) {
+			if(w.snaps[k].id == c.id)
+				w.snaps[k].length = c.length;
+		}
+	}
+
+	poll_lengths() {
+		for(i = 0; i < clips.size(); i++) {
+			if(clips[i].length_wait)
+				poll_length(clips[i]);
+		}
+	}
+
+	//The clip goes (its generators too). Returns its snapshot (for undo), None when there is no such clip
+	remove_clip(id) {
+		if(!clips.has(id))
+			return None;
+		c = clips[id];
+		snap = snapshot(c);
+		if(c.length_wait) {
+			c.length_wait = None;
+			pending_lengths = math.max(0, pending_lengths - 1);
+		}
+		if(c.active)
+			stop_clip(c);
+		if(panel.visible() && c.item && c.item.window && c.item.window.visible())
+			select_none();
+		clips.erase(id);
+		try {
+			tl.remove_item(c.tl_item);
+		}
+		catch(e) {}
+		std.free(c.item);
+		relink = true;
+		return snap;
+	}
+
+	//The clip as data: made again by restore() with its guid, its stack, its settings and its links
+	snapshot(c) {
+		return [id = c.id, path = clip_file(c), lane = c.lane, beat = c.beat, length = c.length, state = c.item.save_state(), node = c.item.node.serialize_json(true),
+			fades = fades_of(c)];
+	}
+
+	fades_of(c) {
+		return [fade_in = c.fade_in, fade_out = c.fade_out, curve = c.curve];
+	}
+
+	// Fades and curves (#680, step 5)
+
+	//The fades of a clip (None: unchanged), no step of the undo history
+	set_clip_fades(id, fade_in, fade_out, curve) {
+		if(!clips.has(id))
+			return false;
+		c = clips[id];
+		if(!std.is_none(fade_in))
+			c.fade_in = math.clamp(std.float(fade_in), 0.0, c.length);
+		if(!std.is_none(fade_out))
+			c.fade_out = math.clamp(std.float(fade_out), 0.0, c.length);
+		if(c.fade_in + c.fade_out > c.length) {
+			if(!std.is_none(fade_out) && std.is_none(fade_in))
+				c.fade_in = c.length - c.fade_out;
+			else
+				c.fade_out = c.length - c.fade_in;
+		}
+		if(!std.is_none(curve))
+			c.curve = tl_curve_index(curve);
+		c.tl_item.fade_in(c.fade_in).fade_out(c.fade_out).curve(c.curve);
+		refresh_fade_ui(c);
+		relink = true;
+		return true;
+	}
+
+	//The same as a step of the undo history (the fields of the clip, MCP)
+	user_set_fades(id, fade_in, fade_out, curve) {
+		if(!clips.has(id) || nanogui.show_mode())
+			return false;
+		was = fades_of(clips[id]);
+		set_clip_fades(id, fade_in, fade_out, curve);
+		now = fades_of(clips[id]);
+		if(was.fade_in != now.fade_in || was.fade_out != now.fade_out || was.curve != now.curve)
+			step(was.curve != now.curve ? "Clip curve" : "Clip fades", [this, id, was](){ this.set_clip_fades(id, was.fade_in, was.fade_out, was.curve); },
+				[this, id, now](){ this.set_clip_fades(id, now.fade_in, now.fade_out, now.curve); });
+		return true;
+	}
+
+	//The fades of a clip were dragged at its top corners (the widget changed its item already)
+	on_fade_edit(item, old_in, old_out) {
+		id = item.attr.clip_id;
+		if(!clips.has(id))
+			return;
+		c = clips[id];
+		was = [fade_in = old_in, fade_out = old_out, curve = c.curve];
+		c.fade_in = item.fade_in();
+		c.fade_out = item.fade_out();
+		now = fades_of(c);
+		refresh_fade_ui(c);
+		relink = true;
+		step("Clip fades", [this, id, was](){ this.set_clip_fades(id, was.fade_in, was.fade_out, was.curve); },
+			[this, id, now](){ this.set_clip_fades(id, now.fade_in, now.fade_out, now.curve); });
+	}
+
+	//The fields of the fades in the settings of the stack of a clip (its Clip panel): the curve, fade in and out
+	make_fade_ui(c) {
+		try {
+			area = c.item.dispatch("get_settings_area", "Timeline clip");
+			if(!area)
+				return;
+			area.tooltip("The fades of the [[clip]] on the timeline: drag the handles at its top corners, or type the beats here.\n[[wiki:Timeline#fades]]");
+			box = area.content().layout(nanogui.layout_vertical());
+			id = c.id;
+			r1 = box.widget().anchor_left(0).anchor_right(0).fixed_height(26);
+			r1.label("Curve").font_size(13).anchor_left(0).anchor_top(4).fixed_width(70).fixed_height(18);
+			curve_box = r1.combobox().items(TL_CURVE_NAMES).anchor_left(72).anchor_right(0).anchor_top(1).fixed_height(24)
+				.tooltip("The shape of the fades of the clip and of a crossfade into it: Linear, Equal power (no dip in the middle of a crossfade), S curve (slow at both ends)");
+			r2 = box.widget().anchor_left(0).anchor_right(0).fixed_height(26);
+			r2.label("Fade in").font_size(13).anchor_left(0).anchor_top(4).fixed_width(70).fixed_height(18);
+			in_box = r2.textbox("0").editable(true).alignment("left").anchor_left(72).fixed_width(60).anchor_top(1).fixed_height(24)
+				.tooltip("Beats from the start of the clip over which it fades in (0: none)");
+			r2.label("out").font_size(13).anchor_left(140).anchor_top(4).fixed_width(30).fixed_height(18);
+			out_box = r2.textbox("0").editable(true).alignment("left").anchor_left(170).fixed_width(60).anchor_top(1).fixed_height(24)
+				.tooltip("Beats before the end of the clip over which it fades out (0: none)");
+			curve_box.on_change([this, id](index, text){
+				if(!this.fade_busy)
+					this.user_set_fades(id, None, None, index);
+			});
+			in_box.on_change([this, id](text){
+				if(!this.fade_busy)
+					this.user_set_fades(id, math.max(0.0, std.float(text)), None, None);
+			});
+			out_box.on_change([this, id](text){
+				if(!this.fade_busy)
+					this.user_set_fades(id, None, math.max(0.0, std.float(text)), None);
+			});
+			c.fade_ui = [curve = curve_box, fade_in = in_box, fade_out = out_box];
+			refresh_fade_ui(c);
+		}
+		catch(e) {}
+	}
+
+	refresh_fade_ui(c) {
+		u = c.fade_ui;
+		if(!u)
+			return;
+		fade_busy = true;
+		try {
+			u.curve.selected(c.curve);
+			if(!u.fade_in.focused())
+				u.fade_in.value(tl_num_text(c.fade_in));
+			if(!u.fade_out.focused())
+				u.fade_out.value(tl_num_text(c.fade_out));
+		}
+		catch(e) {}
+		fade_busy = false;
+	}
+
+	// The entries of the stack of a clip (#680, step 5)
+
+	//What the user does to the stack of a clip in the Clip panel (an entry added or removed): one step of the undo
+	//history with the clip before and after (made again with its guid, its entries and their settings). Removing its
+	//last entry removes the clip: undo brings it back
+	stack_step(step_name, id, action) {
+		if(!clips.has(id) || nanogui.show_mode()) {
+			action();
+			return;
+		}
+		before = snapshot(clips[id]);
+		action();
+		after = clips.has(id) ? snapshot(clips[id]) : None;
+		step(step_name, [this, id, before](){ this.replace_clip(id, before); }, [this, id, after](){ this.replace_clip(id, after); });
+	}
+
+	//The clip id as a snapshot says (None: gone); shown in the panel again when it was
+	replace_clip(id, snap) {
+		shown = false;
+		if(clips.has(id)) {
+			c = clips[id];
+			shown = panel.visible() && c.item && c.item.window && c.item.window.visible();
+		}
+		remove_clip(id);
+		if(!snap)
+			return None;
+		c = restore(snap);
+		if(c && shown) {
+			tl.select(c.tl_item);
+			on_select(c.tl_item);
+		}
+		return c;
+	}
+
+	//Makes the clip of a snapshot again, with its guid
+	restore(snap) {
+		wait_freed();
+		item = generator(panel, "engine/assets/shaderstack.asset", vec2f(0, 0), snap.id, [no_header=true, custom_path=snap.path]);
+		if(!item || !item.is_loaded()) {
+			if(item)
+				std.free(item);
+			std.warn("Timeline: the clip " + snap.path + " cannot be made again, it is skipped");
+			return None;
+		}
+		item.window.anchor(0).visible(false);
+		item.dispatch("start_inactive", true);
+		try {
+			item.load_state(snap.state);
+			item.node.deserialize_json(snap.node, true);
+		}
+		catch(e) {}
+		item.dispatch("start_inactive", false);
+		item.dispatch("active", false);
+		return adopt_clip(item, snap.path, snap.lane, snap.beat, snap.length, snap.has("fades") ? snap.fades : None);
+	}
+
+	//Freed generators go with the next frame: before one is made again with the same guid, the old one has to be gone
+	wait_freed() {
+		for(!tl.screen().garbage_cleared()) {
+			std.sleep(0);
+		}
+	}
+
+	//Moves / resizes a clip (the widget item and the data)
+	set_clip(id, lane, beat, length) {
+		if(!clips.has(id))
+			return false;
+		c = clips[id];
+		c.lane = math.max(0, std.int(lane));
+		c.beat = math.max(0.0, beat);
+		c.length = math.max(0.0625, length);
+		c.tl_item.lane(c.lane).beat(c.beat).length(c.length);
+		if(c.fade_in + c.fade_out > c.length)
+			set_clip_fades(id, math.min(c.fade_in, c.length), math.min(c.fade_out, math.max(0.0, c.length - math.min(c.fade_in, c.length))), None);
+		keep_free_lane();
+		relink = true;
+		return true;
+	}
+
+	// =========================================================================
+	// Playing: active while the cursor is inside
+	// =========================================================================
+
+	//Every frame (the engine, after the cursor moved; also while it stands)
+	tick() {
+		if(loading || dead)
+			return;
+		pos = cursor();
+		run = running();
+		if(clock) {
+			if(tl.cursor() != pos)
+				tl.cursor(pos);
+			sync_range();
+		}
+		tempo = tempo_now();
+		changed = false;
+		for(i = 0; i < clips.size(); i++) {
+			c = clips[i];
+			if(!c.item)
+				continue;
+			inside = run && pos >= c.beat && pos < c.beat + c.length;
+			if(inside && !c.active) {
+				start_clip(c, pos, tempo);
+				changed = true;
+			}
+			else if(!inside && c.active) {
+				stop_clip(c);
+				changed = true;
+			}
+			if(c.active) {
+				try {
+					c.item.dispatch("clip_position", clip_info(c, pos, tempo));
+				}
+				catch(e) {}
+			}
+		}
+		drive_envelopes(pos);
+		if(changed || relink)
+			link_lanes();
+		fade_tick(pos);
+		if(!clock)
+			fire_cues(pos);
+		if(pending_lengths > 0)
+			poll_lengths();
+	}
+
+	//What the dispatcher commands of a clip carry
+	clip_info(c, pos, bpm) {
+		into = math.clamp(pos - c.beat, 0.0, c.length);
+		return [
+			pos = into / c.length,                //0..1 through the clip
+			beat = into,                          //beats since the start of the clip
+			seconds = into * 60.0 / bpm,          //seconds since the start of the clip, at the tempo now
+			length = c.length,                    //beats
+			length_seconds = c.length * 60.0 / bpm,
+			lane = c.lane,
+			start = c.beat,                       //where the clip starts on the timeline, in beats
+		];
+	}
+
+	start_clip(c, pos, bpm) {
+		c.active = true;
+		try {
+			c.item.dispatch("active", true);
+			c.item.dispatch("clip_start", clip_info(c, pos, bpm));
+		}
+		catch(e) {}
+	}
+
+	stop_clip(c) {
+		c.active = false;
+		try {
+			c.item.dispatch("clip_stop", clip_info(c, cursor(), tempo_now()));
+			c.item.dispatch("active", false);
+		}
+		catch(e) {}
+	}
+
+	// The loop: the engine moves the main cursor through wrap() while the timeline plays
+
+	//The position the cursor goes to: back to the start of the loop when it runs over its end (only from inside the
+	//loop: a cursor put after the loop plays on). A loop timeline turns by its clock
+	wrap(old_pos, new_pos) {
+		if(clock || !timeline.loop_btn || !timeline.loop_btn.value())
+			return new_pos;
+		//Chasing timecode the timecode says where the cursor is
+		if(timeline.timecode && timeline.timecode.chasing())
+			return new_pos;
+		range = tl.loop();
+		len = range.y - range.x;
+		if(len <= 0.0 || old_pos >= range.y || new_pos < range.y)
+			return new_pos;
+		return range.x + math.mod(new_pos - range.y, len);
+	}
+
+	//A loop timeline: the range in the ruler is its turn
+	sync_range() {
+		r = tl.loop();
+		end = clock.offset + clock.length;
+		if(r.x != clock.offset || r.y != end)
+			tl.loop(clock.offset, end);
+	}
+
+	// =========================================================================
+	// Selection and the Clip panel
+	// =========================================================================
+
+	on_select(item) {
+		if(!item) {
+			select_none();
+			return;
+		}
+		id = item.attr.clip_id;
+		if(!clips.has(id))
+			return;
+		show_in_panel(clips[id].item, (clock ? title + ": " : "") + clips[id].name);
+	}
+
+	//The windows of this timeline in the panel are hidden
+	hide_windows() {
+		if(panel_box.owner == this || !panel_box.owner)
+			panel_box.hide_editor();
+		select_cue("");
+		for(i = 0; i < clips.size(); i++) {
+			if(clips[i].item && clips[i].item.window)
+				clips[i].item.window.visible(false);
+		}
+		for(i = 0; i < lanes.size(); i++) {
+			if(lanes[i].shader && lanes[i].shader.window)
+				lanes[i].shader.window.visible(false);
+		}
+	}
+
+	//Shows the window of a generator in the panel (the others there are hidden)
+	show_in_panel(gen, caption, is_clip = true) {
+		hide_windows();
+		panel_box.show(this, gen, caption, is_clip);
+	}
+
+	select_lane(i) {
+		if(i < 0 || i >= lanes.size())
+			return;
+		if(!lanes[i].shader)
+			make_lane_shader(i);
+		if(!lanes[i].shader)
+			return;
+		tl.select(None);
+		for(j = 0; j < lanes.size(); j++) {
+			if(j != i && lanes[j].name_btn.pushed())
+				lanes[j].name_btn.pushed(false);
+		}
+		selected_lane_id = lanes[i].id;
+		show_in_panel(lanes[i].shader, (clock ? title + ", " : "") + lane_label(i) + ": LayerBlend", false);
+	}
+
+	//Nothing of this timeline is selected; the panel stays (another timeline shows something in it)
+	deselect() {
+		tl.select(None);
+		hide_windows();
+		at = lane_pos(selected_lane_id);
+		if(at >= 0 && lanes[at].name_btn.pushed())
+			lanes[at].name_btn.pushed(false);
+		selected_lane_id = -1;
+	}
+
+	select_none() {
+		deselect();
+		if(panel_box.owner == this || !panel_box.owner)
+			panel_box.hide();
+	}
+
+	//The lanes end right this far from the right edge (the panel is there). The beats keep their width: the view shows
+	//fewer or more beats from the same first beat, so a clip does not jump under the mouse
+	lanes_right(right) {
+		if(right == right_now)
+			return;
+		w = tl.width();
+		vis = tl.visible_beats();
+		start = tl.view_center() - vis * 0.5;
+		new_w = w + right_now - right;
+		right_now = right;
+		tl.anchor_right(right);
+		if(w > 1 && new_w > 1) {
+			new_vis = vis * new_w / w;
+			tl.visible_beats(new_vis);
+			tl.view_center(start + tl.visible_beats() * 0.5);
+		}
+	}
+	right_now = 0;
+
+	selected_clip() {
+		item = tl.selected_item();
+		if(!item || !clips.has(item.attr.clip_id))
+			return None;
+		return clips[item.attr.clip_id];
+	}
+
+	//The selected clips (#680, step 3: Shift / Ctrl + click, a rubber band)
+	selected_clips() {
+		out = [];
+		items = tl.selected_items();
+		for(i = 0; i < items.size(); i++) {
+			id = items[i].attr.clip_id;
+			if(clips.has(id))
+				out.push_back(clips[id]);
+		}
+		return out;
+	}
+
+	//The selected clips go, one step of the undo history
+	delete_selected() {
+		if(nanogui.show_mode())
+			return false;
+		sel = selected_clips();
+		if(sel.size() == 0)
+			return false;
+		ids = [];
+		snaps = [];
+		for(i = 0; i < sel.size(); i++) {
+			ids.push_back(sel[i].id);
+			snap = remove_clip(sel[i].id);
+			if(snap)
+				snaps.push_back(snap);
+		}
+		step(ids.size() == 1 ? "Delete clip" : "Delete clips",
+			[this, snaps](){ for(i = 0; i < snaps.size(); i++) this.restore(snaps[i]); },
+			[this, ids](){ for(i = 0; i < ids.size(); i++) this.remove_clip(ids[i]); });
+		return true;
+	}
+
+	//The keys of the timeline while it has the focus: Delete / Backspace, Ctrl+C, Ctrl+V, Ctrl+D, Ctrl+A. true: used.
+	//Selected envelope points take them first, then a selected cue (Delete), then the clips (#680, step 5)
+	key(key, scancode, mods) {
+		if(mods == 0 && (key == TL_KEY_DELETE || key == TL_KEY_BACKSPACE)) {
+			if(selected_points())
+				return delete_points();
+			if(selected_cue != "" && cues.has(selected_cue))
+				return user_remove_cue(selected_cue);
+			return delete_selected();
+		}
+		if(mods != 2)
+			return false;
+		letter = tl.screen().key_name(key, scancode);
+		if(letter == "c" && selected_points())
+			return copy_points();
+		if(letter == "v" && std.global("copy_paste").timeline_copied == "points")
+			return paste_points(cursor());
+		if(letter == "c")
+			return copy_selected();
+		if(letter == "v")
+			return paste_clips();
+		if(letter == "d")
+			return duplicate_selected();
+		if(letter == "a" && !nanogui.show_mode()) {
+			for(i = 0; i < clips.size(); i++)
+				clips[i].tl_item.selected(true);
+			return true;
+		}
+		return false;
+	}
+
+	// Copy, paste, duplicate (#680, step 3)
+
+	//The entries of the stack of a clip as add_entry takes them: each with its settings. A clip made of them is a
+	//copy: its generators get guids of their own
+	stack_entries(src) {
+		entries = [];
+		stack_items = src.dispatch("get_items");
+		state = src.save_state();
+		entry_states = state.data ?? [];
+		for(i = 0; i < entry_states.size(); i++) {
+			s = entry_states[i];
+			e = [state = s, node = None, button_node = None];
+			if(stack_items && s.guid && stack_items.has(s.guid)) {
+				e.node = stack_items[s.guid].node.serialize_json(false);
+				e.button_node = stack_items[s.guid].button_panel.serialize_json();
+			}
+			entries.push_back(e);
+		}
+		return entries;
+	}
+
+	//Clips as data: their assets, lanes, lengths and stacks, their beats from the first of them
+	clips_data(sel) {
+		first = sel[0].beat;
+		for(i = 1; i < sel.size(); i++)
+			first = math.min(first, sel[i].beat);
+		data = [];
+		for(i = 0; i < sel.size(); i++) {
+			c = sel[i];
+			data.push_back([path = clip_file(c), lane = c.lane, beat = c.beat - first, length = c.length, entries = stack_entries(c.item), fades = fades_of(c)]);
+		}
+		return data;
+	}
+
+	//Ctrl+C: the selected clips go to the clipboard of the program (std.global("copy_paste").timeline_clips), also for
+	//another timeline (a loop)
+	copy_selected() {
+		sel = selected_clips();
+		if(sel.size() == 0)
+			return false;
+		std.global("copy_paste").timeline_clips = clips_data(sel);
+		std.global("copy_paste").timeline_copied = "clips";
+		return true;
+	}
+
+	//Ctrl+V: the copied clips at the cursor, on the lanes they were on
+	paste_clips() {
+		data = std.global("copy_paste").timeline_clips;
+		if(nanogui.show_mode() || !std.is_list(data) || data.size() == 0)
+			return false;
+		return place_copies(data, cursor(), "Paste clips");
+	}
+
+	//Ctrl+D: copies of the selected clips right after them
+	duplicate_selected() {
+		sel = selected_clips();
+		if(nanogui.show_mode() || sel.size() == 0)
+			return false;
+		end = 0.0;
+		for(i = 0; i < sel.size(); i++)
+			end = math.max(end, sel[i].beat + sel[i].length);
+		return place_copies(clips_data(sel), end, "Duplicate clips");
+	}
+
+	//Clips of copied data from the beat at on: one step of the undo history, they are selected afterwards
+	place_copies(data, at, name) {
+		made = [];
+		for(i = 0; i < data.size(); i++) {
+			d = data[i];
+			c = make_clip(d.path, std.int(d.lane), at + d.beat, d.length, "", d.entries, d.has("fades") ? d.fades : None);
+			if(c)
+				made.push_back(c.id);
+		}
+		if(made.size() == 0)
+			return false;
+		snaps = [];
+		for(i = 0; i < made.size(); i++)
+			snaps.push_back(snapshot(clips[made[i]]));
+		step(name, [this, made](){ for(i = 0; i < made.size(); i++) this.remove_clip(made[i]); },
+			[this, snaps](){ for(i = 0; i < snaps.size(); i++) this.restore(snaps[i]); });
+		tl.select(None);
+		for(i = 0; i < made.size(); i++)
+			clips[made[i]].tl_item.selected(true);
+		on_select(clips[made[made.size() - 1]].tl_item);
+		return true;
+	}
+
+	// =========================================================================
+	// Cues (#680, step 5): flags in the ruler that run an action when the playhead passes them (cues.shio)
+	// =========================================================================
+
+	//A cue (no step of the undo history). id: the one it had (undo, a load), "" a new one
+	add_cue(beat, name, action, id = "") {
+		if(id == "") {
+			id = "cue" + cue_next;
+			for(cues.has(id)) {
+				cue_next++;
+				id = "cue" + cue_next;
+			}
+		}
+		if(id.starts("cue")) {
+			k = std.int(std.float(id.substr(3)));
+			cue_next = math.max(cue_next, k + 1);
+		}
+		action = std.is_json(action) ? action.copy() : [type = "clip", view = "", row = 0, col = 0];
+		beat = math.max(0.0, std.float(beat));
+		m = tl.marker_add(beat, name);
+		cue = [id = id, beat = beat, name = name, action = action, marker = m, fired = 0, last = None];
+		cues[id] = cue;
+		tl.marker_color(m, tl_cue_color(action));
+		return cue;
+	}
+
+	remove_cue(id) {
+		if(!cues.has(id))
+			return None;
+		cue = cues[id];
+		snap = cue_data(cue);
+		tl.marker_remove(cue.marker);
+		cues.erase(id);
+		if(selected_cue == id) {
+			selected_cue = "";
+			if(panel_box.owner == this)
+				select_none();
+		}
+		return snap;
+	}
+
+	//A cue as data: what add_cue makes it again of
+	cue_data(cue) {
+		return [id = cue.id, beat = cue.beat, name = cue.name, action = cue.action.copy()];
+	}
+
+	//Changes of a cue: beat, name, action (no step of the undo history)
+	set_cue(id, data) {
+		if(!cues.has(id))
+			return false;
+		cue = cues[id];
+		if(data.has("beat"))
+			cue.beat = math.max(0.0, std.float(data.beat));
+		if(data.has("name"))
+			cue.name = std.string(data.name);
+		if(data.has("action") && std.is_json(data.action))
+			cue.action = data.action.copy();
+		tl.marker_beat(cue.marker, cue.beat);
+		tl.marker_caption(cue.marker, cue.name);
+		tl.marker_color(cue.marker, tl_cue_color(cue.action));
+		if(selected_cue == id && panel_box.editor && panel_box.editor.owner == this) {
+			panel_box.editor.refresh();
+			if(panel_box.owner == this)
+				panel_box.window.title("Cue: " + (cue.name != "" ? cue.name : cue.id) + " at beat " + tl_num_text(cue.beat));
+		}
+		return true;
+	}
+
+	// Each a step of the undo history (the mouse, the editor, MCP), never in show mode
+
+	user_add_cue(beat, name, action, select = false) {
+		if(nanogui.show_mode())
+			return None;
+		cue = add_cue(beat, name, action);
+		d = cue_data(cue);
+		id = d.id;
+		step("Add cue", [this, id](){ this.remove_cue(id); }, [this, d](){ this.add_cue(d.beat, d.name, d.action, d.id); });
+		if(select)
+			select_cue(id, true);
+		return cue;
+	}
+
+	user_remove_cue(id) {
+		if(nanogui.show_mode())
+			return false;
+		d = remove_cue(id);
+		if(!d)
+			return false;
+		step("Delete cue", [this, d](){ this.add_cue(d.beat, d.name, d.action, d.id); }, [this, id](){ this.remove_cue(id); });
+		return true;
+	}
+
+	user_set_cue(id, data) {
+		if(nanogui.show_mode() || !cues.has(id))
+			return false;
+		was = cue_data(cues[id]);
+		set_cue(id, data);
+		now = cue_data(cues[id]);
+		if(was.beat == now.beat && was.name == now.name && was.action.string() == now.action.string())
+			return true;
+		step(was.beat != now.beat && was.name == now.name ? "Move cue" : "Edit cue", [this, id, was](){ this.set_cue(id, was); }, [this, id, now](){ this.set_cue(id, now); });
+		return true;
+	}
+
+	//The cue of a flag of the ruler, None when none
+	cue_by_marker(m) {
+		for(i = 0; i < cues.size(); i++) {
+			if(cues[i].marker == m)
+				return cues[i];
+		}
+		return None;
+	}
+
+	//A flag was clicked or dragged (the widget moved it already): selected, its editor in the panel; a move is a step
+	on_marker(m, old_beat) {
+		cue = cue_by_marker(m);
+		if(!cue)
+			return;
+		beat = tl.marker_beat(m);
+		if(beat != old_beat) {
+			id = cue.id;
+			cue.beat = old_beat;
+			user_set_cue(id, [beat = beat]);
+		}
+		select_cue(cue.id, true);
+	}
+
+	//The cue id selected (its flag outlined); show: its editor in the panel. "" none
+	select_cue(id, show = false) {
+		selected_cue = cues.has(id) ? id : "";
+		for(i = 0; i < cues.size(); i++)
+			tl.marker_selected(cues[i].marker, cues[i].id == selected_cue);
+		if(selected_cue == "" || !show)
+			return;
+		tl.select(None);
+		ed = panel_box.cue_editor();
+		cue = cues[selected_cue];
+		for(i = 0; i < clips.size(); i++) {
+			if(clips[i].item && clips[i].item.window)
+				clips[i].item.window.visible(false);
+		}
+		for(i = 0; i < lanes.size(); i++) {
+			if(lanes[i].shader && lanes[i].shader.window)
+				lanes[i].shader.window.visible(false);
+		}
+		panel_box.show(this, [window = ed.box], "Cue: " + (cue.name != "" ? cue.name : cue.id) + " at beat " + tl_num_text(cue.beat), false);
+		ed.show(this, selected_cue);
+	}
+
+	//Runs a cue now: [ok, error]
+	run_cue(cue) {
+		r = tl_cue_run(cue.action, timeline);
+		cue.fired++;
+		cue.last = r;
+		if(!r.ok)
+			std.warn("Timeline cue " + (cue.name != "" ? cue.name : cue.id) + ": " + r.error);
+		if(selected_cue == cue.id && panel_box.editor && panel_box.editor.owner == this)
+			panel_box.editor.show_status(r);
+		return r;
+	}
+
+	//Every frame: the cues the playhead passed since the last frame while the timeline plays (from where it was, up to
+	//before where it is). A jump (a locate, the cursor set by hand) runs none; the loop jumping back to its start runs
+	//those at the start of the loop
+	fire_cues(pos) {
+		last = cue_pos;
+		cue_pos = pos;
+		if(cues.size() == 0 || last < 0.0 || !song_active || !timeline.play_btn.value())
+			return;
+		d = pos - last;
+		if(d > 0.0 && d <= TL_CUE_JUMP) {
+			run_cues_in(last, pos);
+			return;
+		}
+		//The loop: back from its end to its start
+		if(d < 0.0 && timeline.loop_btn && timeline.loop_btn.value()) {
+			r = tl.loop();
+			if(last >= r.y - TL_CUE_JUMP && last <= r.y + TL_CUE_JUMP && pos >= r.x && pos < r.x + TL_CUE_JUMP) {
+				run_cues_in(last, r.y);
+				run_cues_in(r.x, pos);
+			}
+		}
+	}
+
+	//The cues from beat a (with it) to beat b (without it), in the order of their beats
+	run_cues_in(a, b) {
+		due = [];
+		for(i = 0; i < cues.size(); i++) {
+			if(cues[i].beat >= a && cues[i].beat < b)
+				due.push_back([id = cues[i].id, beat = cues[i].beat]);
+		}
+		due.sort_by("beat");
+		for(i = 0; i < due.size(); i++) {
+			if(cues.has(due[i].id))
+				run_cue(cues[due[i].id]);
+		}
+	}
+
+	//The cues as saved, by their beats
+	cues_state() {
+		out = [];
+		for(i = 0; i < cues.size(); i++)
+			out.push_back(cue_data(cues[i]));
+		out.sort_by("beat");
+		return out;
+	}
+
+	clear_cues() {
+		for(cues.size() > 0)
+			remove_cue(cues.key(0));
+		tl.marker_clear();
+		cue_next = 1;
+		selected_cue = "";
+	}
+
+	cue_json(cue) {
+		return [id = cue.id, beat = cue.beat, name = cue.name, action = cue.action, does = tl_cue_text(cue.action), fired = cue.fired,
+			last = cue.last, selected = cue.id == selected_cue ? true : false];
+	}
+
+	// =========================================================================
+	// Mouse: drops, moves, the loop
+	// =========================================================================
+
+	takes_drop(payload) {
+		if(!std.is_json(payload) || (payload.has("layout") && payload.layout))
+			return false;
+		if(payload.has("generators") && payload.generators)
+			return true;
+		if(payload.has("cell") && payload.has("item"))
+			return true;
+		return payload.has("path") && std.is_string(payload.path) && payload.path != "" ? true : false;
+	}
+
+	//Where a drop at pos (of the widget) lands: the lane under it, the beat on the grid before it
+	drop_place(pos) {
+		lane = tl.lane_at(pos.y);
+		lane = math.clamp(lane, 0, tl.lane_count() - 1);
+		snap = tl.snap() > 0 ? tl.snap() : 1.0;
+		beat = math.max(0.0, math.floor(tl.beat_at(pos.x) / snap) * snap);
+		return [lane = lane, beat = beat];
+	}
+
+	drop(payload, pos) {
+		at = drop_place(pos);
+		made = [];
+		beats = default_clip_beats();
+
+		//Generators Alt + dragged out of a Patchview (#348): a clip of each, one lane after the other
+		if(payload.has("generators") && payload.generators)
+			return drop_generators(at, "");
+		//A clip of a Clipview (its name tag): a copy of its stack, each entry with its settings
+		else if(payload.has("cell") && payload.has("item")) {
+			src = payload.item;
+			c = make_clip(src.path, at.lane, at.beat, beats, "", stack_entries(src));
+			if(c)
+				made.push_back(c.id);
+		}
+		//An asset (a folder that is no asset is not, see generatoritem)
+		else {
+			path = fileio.relative_path_cwd(payload.path);
+			if(!fileio.file_ext(path) && !fileio.exists(path + "/src/__init__.shio") && !fileio.exists(path + "/src/__init__.glsl") &&
+				!fileio.exists(path + "/src/__init__.native"))
+				return false;
+			c = make_clip(path, at.lane, at.beat, beats);
+			if(c)
+				made.push_back(c.id);
+		}
+
+		if(made.size() == 0)
+			return false;
+		snaps = [];
+		for(i = 0; i < made.size(); i++)
+			snaps.push_back(snapshot(clips[made[i]]));
+		step(made.size() == 1 ? "Add clip" : "Add clips",
+			[this, made](){ for(i = 0; i < made.size(); i++) this.remove_clip(made[i]); },
+			[this, snaps](){ for(i = 0; i < snaps.size(); i++) this.restore(snaps[i]); });
+		//A video takes the length of the video (on a loop timeline the clip fills the turn)
+		if(!clock) {
+			for(i = 0; i < made.size(); i++)
+				fit_video_length(clips[made[i]], snaps);
+		}
+		//The new clip is selected (its stack in the panel)
+		last = clips[made[made.size() - 1]];
+		tl.select(last.tl_item);
+		on_select(last.tl_item);
+		return true;
+	}
+
+	// Generators dragged out of a Patchview (#348)
+
+	//Generators Alt + dragged out of a Patchview are dropped at (drop_place: a lane and a beat): a clip of each, one lane
+	//after the other, or more entries of the clip into (a drop on its entries in the Clip panel). They move alive:
+	//controls, links and MIDI mappings stay, and they run while the cursor is inside their clip. Ctrl at the drop leaves
+	//copies, with the links the copied generators have among themselves (copy_links.shio). One step of the history
+	drop_generators(at, into = "") {
+		if(into != "" && !clips.has(into))
+			return false;
+		drag = take_dragged_generators();
+		if(!drag)
+			return false;
+		source = drag.view;
+		gens = drag.gens;
+		what = gens.size() == 1 ? "generator" : "generators";
+		beats = default_clip_beats();
+
+		if(tl.screen().modifier_ctrl()) {
+			if(into != "") {
+				before = snapshot(clips[into]);
+				copy_generators_in(source, gens, at, beats, into);
+				after = snapshot(clips[into]);
+				step("Copy " + what, [this, into, before](){ this.replace_clip(into, before); },
+					[this, into, after](){ this.replace_clip(into, after); });
+				return true;
+			}
+			made = copy_generators_in(source, gens, at, beats, "");
+			if(made.size() == 0)
+				return false;
+			snaps = [];
+			for(i = 0; i < made.size(); i++)
+				snaps.push_back(snapshot(clips[made[i]]));
+			step("Copy " + what, [this, made](){ for(i = 0; i < made.size(); i++) this.remove_clip(made[i]); },
+				[this, snaps](){ for(i = 0; i < snaps.size(); i++) this.restore(snaps[i]); });
+			show_dropped(made);
+			return true;
+		}
+
+		moves = [];
+		for(i = 0; i < gens.size(); i++)
+			moves.push_back(generator_home(source, gens[i]));
+		made = move_generators_in(moves, at, beats, into, []);
+		if(into == "" && !made.any([](id){ return id != ""; }))
+			return false;
+		source.select_none();
+		//Undone and done again alive, by the uids of the Patchviews and the guids of the generators and the clips
+		rec = [moves = moves, at = at, beats = beats, into = into, made = made];
+		step("Move " + what, [this, rec](){ this.move_generators_out(rec); },
+			[this, rec](){ this.move_generators_in(rec.moves, rec.at, rec.beats, rec.into, rec.made); });
+		if(into == "")
+			show_dropped(made);
+		return true;
+	}
+
+	//The generators of moves (generator_home) leave their Patchviews: a new clip of each at at (with the guids ids, for
+	//a redo), or the last entries of the clip into. Returns the ids of the clips made, "" where none was made
+	move_generators_in(moves, at, beats, into, ids) {
+		made = [];
+		for(i = 0; i < moves.size(); i++) {
+			m = moves[i];
+			if(into != "") {
+				if(!clips.has(into) || !adopt_moved(clips[into].item, m))
+					std.warn("A moved generator, its Patchview or the clip no longer exists, it is skipped");
+				continue;
+			}
+			view = patch_view_by_uid(m.view);
+			if(!view || !view.items.has(m.guid)) {
+				std.warn("A moved generator or its Patchview no longer exists, it is skipped");
+				made.push_back("");
+				continue;
+			}
+			id = i < ids.size() ? ids[i] : "";
+			if(id != "")
+				wait_freed(); //the clip of the undo has to be gone before it is made again with its guid
+			c = make_clip(view.items[m.guid].get_relative_path(), at.lane + i, at.beat, beats, id, None, None, [m](stack_gen){
+				return adopt_moved(stack_gen, m);
+			});
+			made.push_back(c ? c.id : "");
+		}
+		if(into != "" && clips.has(into)) {
+			c = clips[into];
+			c.item.dispatch("active", c.active); //an entry added to a clip runs only while the clip does
+		}
+		relink = true;
+		return made;
+	}
+
+	//The undo of move_generators_in: the generators go back into their Patchviews, where they were. The clips the move
+	//made go with them, the clip into keeps its other entries
+	move_generators_out(rec) {
+		for(k = rec.moves.size() - 1; k >= 0; k--) {
+			id = rec.into != "" ? rec.into : (k < rec.made.size() ? rec.made[k] : "");
+			if(id == "" || !clips.has(id)) {
+				std.warn("Undo: the clip of a moved generator no longer exists, it is skipped");
+				continue;
+			}
+			c = clips[id];
+			return_moved(c.item, rec.moves[k]);
+			if(c.item.dispatch("is_empty"))
+				remove_clip(id);
+			else
+				c.item.dispatch("link_items");
+		}
+		relink = true;
+	}
+
+	//Ctrl at the drop: copies of gens (generators of the Patchview source), a new clip of each at at, or the last entries
+	//of the clip into, with the links among them. Returns the ids of the clips made
+	copy_generators_in(source, gens, at, beats, into) {
+		made = [];
+		snaps = [];
+		copies = [];
+		for(i = 0; i < gens.size(); i++) {
+			gen = gens[i];
+			copy = None;
+			if(into != "")
+				copy = clips[into].item.dispatch("add_entry", generator_entry(gen));
+			else {
+				c = make_clip(gen.get_relative_path(), at.lane + i, at.beat, beats, "", [generator_entry(gen)]);
+				if(c) {
+					made.push_back(c.id);
+					copy = last_entry(c.item);
+				}
+			}
+			snaps.push_back(source.snapshot_generator(gen));
+			copies.push_back(copy);
+		}
+		link_copies(snaps, copies);
+		if(into != "") {
+			c = clips[into];
+			c.item.dispatch("active", c.active);
+		}
+		relink = true;
+		return made;
+	}
+
+	//The last of the clips ids (that exists) is selected, its stack in the Clip panel
+	show_dropped(ids) {
+		for(i = ids.size() - 1; i >= 0; i--) {
+			if(ids[i] != "" && clips.has(ids[i])) {
+				last = clips[ids[i]];
+				tl.select(last.tl_item);
+				on_select(last.tl_item);
+				return;
+			}
+		}
+	}
+
+	//Clips were moved or resized with the mouse (the widget changed the items already): list of [item, old_beat,
+	//old_length, old_lane], one step of the undo history for all of them
+	on_edits(list) {
+		ids = [];
+		was = [];
+		now = [];
+		resized = false;
+		for(i = 0; i < list.size(); i++) {
+			item = list[i][0];
+			id = item.attr.clip_id;
+			if(!clips.has(id))
+				continue;
+			c = clips[id];
+			c.lane = std.int(item.lane());
+			c.beat = item.beat();
+			c.length = item.length();
+			if(list[i][2] != c.length)
+				resized = true;
+			ids.push_back(id);
+			was.push_back([lane = std.int(list[i][3]), beat = list[i][1], length = list[i][2]]);
+			now.push_back([lane = c.lane, beat = c.beat, length = c.length]);
+		}
+		if(ids.size() == 0)
+			return;
+		keep_free_lane();
+		relink = true;
+		name = resized ? "Resize clip" : (ids.size() == 1 ? "Move clip" : "Move clips");
+		step(name, [this, ids, was](){ for(i = 0; i < ids.size(); i++) this.set_clip(ids[i], was[i].lane, was[i].beat, was[i].length); },
+			[this, ids, now](){ for(i = 0; i < ids.size(); i++) this.set_clip(ids[i], now[i].lane, now[i].beat, now[i].length); });
+	}
+
+	//A clip was moved or resized with the mouse (the widget changed the item already)
+	on_edit(item, old_beat, old_length, old_lane) {
+		id = item.attr.clip_id;
+		if(!clips.has(id))
+			return;
+		c = clips[id];
+		c.lane = std.int(item.lane());
+		c.beat = item.beat();
+		c.length = item.length();
+		now = [lane = c.lane, beat = c.beat, length = c.length];
+		was = [lane = std.int(old_lane), beat = old_beat, length = old_length];
+		keep_free_lane();
+		relink = true;
+		name = old_length != c.length ? "Resize clip" : "Move clip";
+		step(name, [this, id, was](){ this.set_clip(id, was.lane, was.beat, was.length); }, [this, id, now](){ this.set_clip(id, now.lane, now.beat, now.length); });
+	}
+
+	on_loop_drag(start, end) {
+		was = loop_before;
+		if(clock)
+			was = [x = clock.offset, y = clock.offset + clock.length];
+		set_loop(start, end);
+		now = loop_before;
+		step("Loop range", [this, was](){ this.set_loop(was.x, was.y); }, [this, now](){ this.set_loop(now.x, now.y); });
+	}
+	loop_before = [x = 0.0, y = 16.0];
+
+	//The loop range; of a loop timeline its turn: where it starts and how many beats it takes
+	set_loop(start, end) {
+		tl.loop(start, end);
+		r = tl.loop();
+		if(clock) {
+			clock.offset = r.x;
+			clock.set_length(r.y - r.x);
+			sync_range();
+			r = tl.loop();
+			if(on_range)
+				on_range(clock);
+		}
+		loop_before = [x = r.x, y = r.y];
+	}
+
+	//One step of the undo history of the program (Ctrl+Z), after the action ran. Nothing happens for a timeline whose
+	//loop was deleted meanwhile
+	step(name, undo_fn, redo_fn) {
+		eng = std.global("engine");
+		gm = timeline.menu ? timeline.menu.generators_menu : None;
+		h = gm ? gm.undo_history : None;
+		if(!h || h.busy || gm.recording || eng.load_in_progress || loading)
+			return;
+		h.push(name, [this, undo_fn](){ if(!this.dead) undo_fn(); }, [this, redo_fn](){ if(!this.dead) redo_fn(); });
+	}
+
+	// =========================================================================
+	// Project
+	// =========================================================================
+
+	save_state() {
+		out = [];
+		for(i = 0; i < clips.size(); i++) {
+			c = clips[i];
+			try {
+				rec = [lane = c.lane, beat = c.beat, length = c.length, path = clip_file(c), data = c.item.save_state()];
+				//Fades (#680, step 5): only when there are any, so a project without them saves as before
+				if(c.fade_in > 0.0 || c.fade_out > 0.0 || c.curve != 0)
+					rec.fades = fades_of(c);
+				out.push_back(rec);
+			}
+			catch(e) {}
+		}
+		lane_state = [];
+		for(i = 0; i < lanes.size(); i++)
+			lane_state.push_back([envelopes = envelopes_state(i), shown = lanes[i].env_show ? 1 : 0, envelope = lanes[i].env_shown]);
+		//The lanes from the top: their ids (the names of their heads in controls.json) and names (#680, step 3)
+		lane_info = [];
+		for(i = 0; i < lanes.size(); i++)
+			lane_info.push_back([id = lanes[i].id, name = lanes[i].name]);
+		r = tl.loop();
+		st = [lanes = lanes.size(), lane_info = lane_info, next_lane = next_lane_id, loop = [start = r.x, end = r.y], clips = out, lane_state = lane_state];
+		if(cues.size() > 0)
+			st.cues = cues_state();
+		return st;
+	}
+
+	//states: what save_state returned, None for a project without clips on the timeline
+	load_state(states) {
+		loading = true;
+		select_none();
+		ids = [];
+		for(i = 0; i < clips.size(); i++)
+			ids.push_back(clips.key(i));
+		for(i = 0; i < ids.size(); i++)
+			remove_clip(ids[i]);
+		clear_envelopes();
+		clear_cues();
+		wait_freed();
+
+		//The lanes of the project from the top, by their ids; a project before step 3 has lanes 0 .. n - 1
+		ids = [];
+		names = [];
+		if(states && states.has("lane_info") && std.is_list(states.lane_info)) {
+			for(i = 0; i < states.lane_info.size(); i++) {
+				ids.push_back(std.int(states.lane_info[i].id));
+				names.push_back(states.lane_info[i].name ?? "");
+			}
+		}
+		else {
+			n = states && states.has("lanes") ? std.int(states.lanes) : 0;
+			for(i = 0; i < n; i++) {
+				ids.push_back(i);
+				names.push_back("");
+			}
+		}
+		next_id = states && states.has("next_lane") ? std.int(states.next_lane) : 0;
+		for(i = 0; i < ids.size(); i++)
+			next_id = math.max(next_id, ids[i] + 1);
+		for(ids.size() < TL_MIN_LANES) {
+			ids.push_back(next_id);
+			names.push_back("");
+			next_id++;
+		}
+		//The lanes of the project before that this one does not have go, the others keep their heads
+		for(i = lanes.size() - 1; i >= 0; i--) {
+			keep = false;
+			for(k = 0; k < ids.size(); k++) {
+				if(ids[k] == lanes[i].id)
+					keep = true;
+			}
+			if(keep)
+				continue;
+			lane = lanes[i];
+			lanes.erase(i);
+			if(lane.shader)
+				std.free(lane.shader);
+			std.free(lane.head);
+			lanes_freed = true;
+		}
+		for(i = 0; i < ids.size(); i++) {
+			at = lane_pos(ids[i]);
+			if(at < 0)
+				add_lane(ids[i], i);
+			else if(at != i) {
+				lane = lanes[at];
+				lanes.erase(at);
+				lanes.insert(i, lane);
+			}
+			lanes[i].name = names[i];
+			lanes[i].xfade = None;
+		}
+		next_lane_id = math.max(next_lane_id, next_id);
+		tl.lanes(lanes.size());
+		for(i = 0; i < lanes.size(); i++) {
+			lanes[i].blend.value(TL_BLEND_MIX);
+			lanes[i].mix.value(1.0);
+			lanes[i].env_raised = false;
+			tl.lane_height(i, TL_LANE_H);
+		}
+		refresh_lane_labels();
+
+		if(clock)
+			sync_range();
+		else if(states && states.has("loop"))
+			set_loop(states.loop.start, states.loop.end);
+		else
+			set_loop(0.0, 16.0);
+
+		if(states && states.has("clips")) {
+			for(i = 0; i < states.clips.size(); i++) {
+				s = states.clips[i];
+				try {
+					item = generator(panel, "engine/assets/shaderstack.asset", vec2f(0, 0), s.data.guid ?? "",
+						[no_header=true, custom_path=asset_resolve(s.data.path, s.data.asset_id ?? "")]);
+					if(!item || !item.is_loaded()) {
+						if(item)
+							std.free(item);
+						std.warn("Timeline: the clip " + s.path + " is not loaded");
+						continue;
+					}
+					item.window.anchor(0).visible(false);
+					item.dispatch("start_inactive", true);
+					item.dispatch("no_delete", true);
+					item.load_state(s.data);
+					item.dispatch("no_delete", false);
+					item.dispatch("start_inactive", false);
+					item.dispatch("active", false);
+					adopt_clip(item, item.path, std.int(s.lane), s.beat, s.length, s.has("fades") ? s.fades : None);
+				}
+				catch(e) {
+					std.warn("Timeline: a clip did not load: " + e);
+				}
+			}
+		}
+
+		//The envelopes, before the controls of the project are loaded: their links come with controls.json
+		if(states && states.has("lane_state")) {
+			for(i = 0; i < states.lane_state.size(); i++) {
+				ls = states.lane_state[i];
+				envs = ls.envelopes ?? [];
+				for(k = 0; k < envs.size(); k++)
+					add_envelope(i, std.int(envs[k].n), envs[k].points);
+				if(i < lanes.size() && envs.size() > 0) {
+					lanes[i].env_shown = std.int(ls.envelope ?? 0);
+					show_envelopes(i, ls.shown ? true : false, false);
+				}
+			}
+		}
+		if(states && states.has("cues") && std.is_list(states.cues)) {
+			for(i = 0; i < states.cues.size(); i++) {
+				d = states.cues[i];
+				add_cue(d.beat ?? 0.0, std.string(d.name ?? ""), d.action ?? None, std.string(d.id ?? ""));
+			}
+		}
+		cue_pos = -1.0;
+		relink = true;
+		loading = false;
+	}
+
+	// =========================================================================
+	// AI agents (MCP, Chat): live_path "timeline"
+	// =========================================================================
+
+	clip_json(c) {
+		//The generators of its stack with their live_path (#680 step 4): vibevj_query reaches them (LoopTrigger: set_loop)
+		entries = [];
+		try {
+			items = c.item.dispatch("get_items");
+			for(k = 0; items && k < items.size(); k++)
+				entries.push_back([name = fileio.pure_name(items[k].path), live_path = items[k].get_live_path()]);
+		}
+		catch(e) {}
+		return [id = c.id, name = c.name, path = clip_file(c), lane = c.lane, beat = c.beat, length = c.length, active = c.active ? true : false,
+			selected = c.tl_item.selected() ? true : false, entries = entries, fade_in = c.fade_in, fade_out = c.fade_out, curve = TL_CURVES[c.curve]];
+	}
+
+	//The clips of ids (a list of ids, or one) selected in the widget; false when one of them is no clip
+	select_ids(ids) {
+		if(!std.is_list(ids))
+			ids = [ids];
+		tl.select(None);
+		for(i = 0; i < ids.size(); i++) {
+			if(!clips.has(ids[i]))
+				return false;
+			clips[ids[i]].tl_item.selected(true);
+		}
+		return true;
+	}
+
+	envelope_json(i, env) {
+		lane = lanes[i];
+		return [
+			lane = i,
+			envelope = env.n,
+			selected = tl.envelope_selection(env.eid),
+			name = envelope_name(env),
+			targets = envelope_targets(env),
+			control = env.ctrl.path(),
+			points = tl.envelope_points(env.eid),
+			value = env.ctrl.value(),
+			shown = lane.env_show && lane.env_shown >= 0 && lane.envs[lane.env_shown].n == env.n ? true : false,
+		];
+	}
+
+	lane_json(i) {
+		envs = [];
+		for(k = 0; k < lanes[i].envs.size(); k++)
+			envs.push_back(envelope_json(i, lanes[i].envs[k]));
+		return [lane = i, id = lanes[i].id, name = lane_label(i), blend = lanes[i].blend.items()[std.int(lanes[i].blend.value())], mix = lanes[i].mix.value(),
+			crossfade = lanes[i].xfade ? true : false, fading = lanes[i].fade ? true : false, transition = lane_transition(lanes[i], cursor()), envelopes = envs];
+	}
+
+	//What get_timeline returns for this timeline
+	status_json() {
+		out = [];
+		for(i = 0; i < clips.size(); i++)
+			out.push_back(clip_json(clips[i]));
+		lane_list = [];
+		for(i = 0; i < lanes.size(); i++)
+			lane_list.push_back(lane_json(i));
+		r = tl.loop();
+		st = [
+			ok = true,
+			position = cursor(),
+			bpm = timeline.bpm_ctrl.value(),
+			playing = timeline.play_btn.value() ? true : false,
+			loop = [start = r.x, end = r.y, on = clock ? true : (timeline.loop_btn.value() ? true : false)],
+			lanes = lane_list,
+			clips = out,
+		];
+		if(clock)
+			st.loop_timeline = clock_json(clock);
+		else {
+			cl = [];
+			list = cues_state();
+			for(i = 0; i < list.size(); i++)
+				cl.push_back(cue_json(cues[list[i].id]));
+			st.cues = cl;
+			if(timeline.shows)
+				st.song = timeline.shows.song_json(timeline.shows.find_clips(this));
+		}
+		return st;
+	}
+
+	clock_json(c) {
+		return [guid = c.guid, name = c.name, beats = c.length, start = c.offset, rate = c.rate, running = c.running ? true : false, chase = c.chase ? true : false, phase = c.phase(), position = c.position()];
+	}
+
+	blend_index(v) {
+		if(std.is_string(v)) {
+			items = lanes[0].blend.items();
+			for(i = 0; i < items.size(); i++) {
+				if(items[i].lowercase() == v.lowercase())
+					return i;
+			}
+			std.runtime_error("No blend mode '" + v + "' (" + items.combine_string(", ").removesuffix(", ") + ").");
+		}
+		return std.int(v);
+	}
+
+	//The timeline a query is for: the argument loop names a loop timeline (its guid, its name or its index), song a
+	//song of the show (its name, number or guid), else the song that plays (the main timeline). None when there is no
+	//such loop or song
+	timeline_for(args) {
+		if(args.has("loop") && !std.is_none(args.loop) && args.loop != "") {
+			lv = timeline.loops;
+			e = lv ? lv.find(args.loop) : None;
+			return e ? e.clips : None;
+		}
+		sh = timeline.shows;
+		if(!sh)
+			return this;
+		if(args.has("song") && !std.is_none(args.song) && args.song != "") {
+			s = sh.find(args.song);
+			return s ? s.clips : None;
+		}
+		return sh.active_clips();
+	}
+
+	no_loop(args) {
+		if(args.has("loop") && !std.is_none(args.loop) && args.loop != "")
+			return [ok = false, error = "No loop timeline '" + args.loop + "' (get_timeline_loops lists them)."];
+		return [ok = false, error = "No song '" + std.string(args.song ?? "") + "' (get_timeline_songs lists them)."];
+	}
+
+	register_queries() {
+		loop_arg = "string(): A loop timeline of the view Loops (its guid, name or index, see get_timeline_loops). Empty: the main timeline.";
+
+		ids_arg = "array(): Ids of clips (get_timeline). Default: the selected clips.";
+
+		ai.register("get_timeline", [loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			st = t.status_json();
+			if(t == this && this.timeline.loops)
+				st.loops = this.timeline.loops.list_json();
+			return st;
+		}, "A timeline: position (beats), bpm, playing, the loop, the lanes (lane 0 is the top: the picture of the timeline; with their envelopes: envelope number, name = the control it drives, targets, points [[beat, value 0..1, curve -1..1]], value now, shown) and the clips (id, asset, lane, beat, length in beats, active = the cursor is inside it, entries = the generators of its stack with their live_path for vibevj_query). The main timeline also lists its loop timelines (loops); with loop one of them (loop_timeline: beats, start, running, position).", "read");
+
+		ai.register("add_timeline_clip", [
+			path = "&string(): Asset root of a shader, video, picture or generator (e.g. assets/Shaders/Sources/3D/trance.glsl).",
+			lane = "int(0,64): Lane, 0 = the top lane. Default 0.",
+			beat = "float(): Where the clip starts, in beats. Default 0.",
+			length = "float(): Length in beats. Default 16 (a loop timeline: its beats); a video on the main timeline: the length of the video at the tempo now (taken once the video is open, a moment later: get_timeline).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			c = t.make_clip(args.path, args.has("lane") ? std.int(args.lane) : 0, args.has("beat") ? std.float(args.beat) : 0.0, args.has("length") ? std.float(args.length) : t.default_clip_beats());
+			if(!c)
+				return [ok = false, error = "Could not make a clip of " + args.path + " (an asset root?)."];
+			id = c.id;
+			snap = t.snapshot(c);
+			t.step("Add clip", [t, id](){ t.remove_clip(id); }, [t, snap](){ t.restore(snap); });
+			if(!args.has("length") && !t.clock)
+				t.fit_video_length(c, [snap]);
+			return [ok = true, clip = t.clip_json(c), waits_for_video_length = c.length_wait ? true : false];
+		}, "Puts an asset onto a lane of a timeline as a clip. It is active only while the cursor is inside it (Play, or set_transport position; a loop timeline while it runs). Returns the clip with its id.");
+
+		ai.register("set_timeline_clip", [
+			id = "&string(): The id of the clip (get_timeline).",
+			lane = "int(0,64): New lane.",
+			beat = "float(): New start in beats.",
+			length = "float(): New length in beats.",
+			fade_in = "float(): Beats from its start over which it fades in (0: none).",
+			fade_out = "float(): Beats before its end over which it fades out (0: none).",
+			curve = "enum(linear,equal_power,s_curve): The curve of its fades and of a crossfade into it.",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.clips.has(args.id))
+				return [ok = false, error = "No clip " + args.id + " (get_timeline lists them)."];
+			c = t.clips[args.id];
+			was = [lane = c.lane, beat = c.beat, length = c.length];
+			now = [lane = args.has("lane") ? std.int(args.lane) : c.lane, beat = args.has("beat") ? std.float(args.beat) : c.beat, length = args.has("length") ? std.float(args.length) : c.length];
+			id = args.id;
+			if(was.lane != now.lane || was.beat != now.beat || was.length != now.length) {
+				t.set_clip(args.id, now.lane, now.beat, now.length);
+				t.step("Move clip", [t, id, was](){ t.set_clip(id, was.lane, was.beat, was.length); }, [t, id, now](){ t.set_clip(id, now.lane, now.beat, now.length); });
+			}
+			if(args.has("fade_in") || args.has("fade_out") || args.has("curve"))
+				t.user_set_fades(id, args.has("fade_in") ? std.float(args.fade_in) : None, args.has("fade_out") ? std.float(args.fade_out) : None,
+					args.has("curve") ? tl_curve_index(args.curve) : None);
+			return [ok = true, clip = t.clip_json(c)];
+		}, "Moves or resizes a clip of a timeline; sets its fades (fade_in / fade_out in beats: it fades over the lanes below) and their curve (also the curve of a crossfade into it). Each change is a step of the undo history.");
+
+		ai.register("remove_timeline_clip", [id = "&string(): The id of the clip (get_timeline).", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			id = args.id;
+			snap = t.remove_clip(id);
+			if(!snap)
+				return [ok = false, error = "No clip " + id + " (get_timeline lists them)."];
+			t.step("Delete clip", [t, snap](){ t.restore(snap); }, [t, id](){ t.remove_clip(id); });
+			return [ok = true];
+		}, "Deletes a clip of a timeline with its generators.");
+
+		ai.register("set_timeline_loop", [
+			start = "float(): Loop start in beats.",
+			end = "float(): Loop end in beats.",
+			on = "int(0,1): Loop on (1) or off (0). The main timeline only.",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			r = t.tl.loop();
+			was = [x = r.x, y = r.y];
+			t.set_loop(args.has("start") ? std.float(args.start) : r.x, args.has("end") ? std.float(args.end) : r.y);
+			r = t.tl.loop();
+			now = [x = r.x, y = r.y];
+			if(was.x != now.x || was.y != now.y)
+				t.step("Loop range", [t, was](){ t.set_loop(was.x, was.y); }, [t, now](){ t.set_loop(now.x, now.y); });
+			if(args.has("on") && !t.clock)
+				this.timeline.loop_btn.value(std.int(args.on) ? 1 : 0);
+			return [ok = true, loop = [start = r.x, end = r.y, on = t.clock ? true : (this.timeline.loop_btn.value() ? true : false)]];
+		}, "Sets the loop range of a timeline. The main timeline: on switches the loop on or off; while it is on and the timeline plays, the cursor jumps from the end back to the start. A loop timeline: the range is its turn (start, and end - start = its beats).");
+
+		ai.register("set_timeline_lane", [
+			lane = "&int(0,64): The lane, 0 = the top lane.",
+			blend = "any(): Blend mode: its name (No Blend, Add, Add Mask, Mix, Multiply, MultiplyInput, Chroma R, Chroma G, Chroma B) or index.",
+			mix = "float(): Mix (with the blend mode Mix: the opacity of the lane).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			i = std.int(args.lane);
+			if(i < 0)
+				return [ok = false, error = "lane must be 0 or more."];
+			t.set_lane_count(i + 1);
+			if(args.has("blend"))
+				t.lanes[i].blend.value(t.blend_index(args.blend));
+			if(args.has("mix"))
+				t.lanes[i].mix.value(std.float(args.mix));
+			if(args.has("name"))
+				t.user_rename_lane(i, std.string(args.name));
+			return [ok = true, lane = t.lane_json(i)];
+		}, "Sets the blend mode, Mix and name of a lane of a timeline.");
+
+		// Lanes (#680, step 3)
+
+		ai.register("add_timeline_lane", [
+			lane = "int(0,64): Where the new lane goes, 0 = the top. Default: at the bottom.",
+			name = "string(): Its name. Default: Lane and its number.",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			pos = args.has("lane") ? std.int(args.lane) : t.lanes.size();
+			lane = t.user_add_lane(pos, args.has("name") ? std.string(args.name) : "");
+			if(!lane)
+				return [ok = false, error = "Not in show mode."];
+			return [ok = true, lane = t.lane_json(t.lane_pos(lane.id))];
+		}, "Adds a lane to a timeline. A step of the undo history.");
+
+		ai.register("remove_timeline_lane", [lane = "&int(0,64): The lane, 0 = the top.", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.delete_lane(std.int(args.lane)))
+				return [ok = false, error = "No lane " + args.lane + " (get_timeline lists them), or show mode."];
+			return [ok = true];
+		}, "Deletes a lane of a timeline with its clips and envelopes. A step of the undo history: undo brings it back with its links and MIDI mappings.");
+
+		ai.register("move_timeline_lane", [
+			lane = "&int(0,64): The lane, 0 = the top.",
+			to = "&int(0,64): Its new position.",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.user_move_lane(std.int(args.lane), std.int(args.to)))
+				return [ok = false, error = "Cannot move lane " + args.lane + " to " + args.to + " (positions 0 to " + (t.lanes.size() - 1) + ")."];
+			return [ok = true, lane = t.lane_json(std.int(args.to))];
+		}, "Moves a lane of a timeline up or down; its clips, envelopes, links and MIDI mappings go with it. A step of the undo history.");
+
+		// Several clips (#680, step 3)
+
+		ai.register("select_timeline_clips", [ids = "&array(): Ids of clips (get_timeline); [] selects none.", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.select_ids(args.ids))
+				return [ok = false, error = "Not every id is a clip (get_timeline lists them)."];
+			return [ok = true, selected = t.selected_clips().size()];
+		}, "Selects clips of a timeline, as Shift / Ctrl + click does.");
+
+		ai.register("copy_timeline_clips", [ids = ids_arg, paste = "float(): Paste the copies at this beat right away (Ctrl+V pastes at the cursor). Default: only copy.", duplicate = "int(0,1): 1: copies right after the clips (Ctrl+D).", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(args.has("ids") && !t.select_ids(args.ids))
+				return [ok = false, error = "Not every id is a clip (get_timeline lists them)."];
+			if(args.has("duplicate") && std.int(args.duplicate)) {
+				if(!t.duplicate_selected())
+					return [ok = false, error = "Nothing selected, or show mode."];
+			}
+			else {
+				if(!t.copy_selected())
+					return [ok = false, error = "Nothing selected."];
+				if(args.has("paste") && !t.place_copies(std.global("copy_paste").timeline_clips, std.float(args.paste), "Paste clips"))
+					return [ok = false, error = "Could not paste (show mode?)."];
+			}
+			made = [];
+			sel = t.selected_clips();
+			for(i = 0; i < sel.size(); i++)
+				made.push_back(t.clip_json(sel[i]));
+			return [ok = true, clips = made];
+		}, "Copies clips of a timeline (Ctrl+C), pastes them at a beat (paste) or duplicates them right after themselves (Ctrl+D). The copies keep the settings of every entry of their stacks and are selected afterwards; they are returned. Pasting is a step of the undo history.");
+
+		ai.register("paste_timeline_clips", [beat = "float(): Where the first copy starts. Default: the cursor.", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			data = std.global("copy_paste").timeline_clips;
+			if(!std.is_list(data) || data.size() == 0)
+				return [ok = false, error = "Nothing copied (copy_timeline_clips)."];
+			if(!t.place_copies(data, args.has("beat") ? std.float(args.beat) : t.cursor(), "Paste clips"))
+				return [ok = false, error = "Could not paste (show mode?)."];
+			made = [];
+			sel = t.selected_clips();
+			for(i = 0; i < sel.size(); i++)
+				made.push_back(t.clip_json(sel[i]));
+			return [ok = true, clips = made];
+		}, "Pastes the copied clips (also from another timeline) on the lanes they came from, the first one at beat. A step of the undo history.");
+
+		ai.register("set_transport", [
+			play = "int(0,1): Play (1) or pause (0).",
+			position = "float(): Move the cursor to this beat.",
+			bpm = "float(): The tempo.",
+		], [this](args){
+			if(args.has("bpm"))
+				this.timeline.bpm_ctrl.value(std.float(args.bpm));
+			if(args.has("position"))
+				this.timeline.cursor_pos.value(std.float(args.position));
+			if(args.has("play"))
+				this.timeline.play_btn.value(std.int(args.play) ? 1 : 0);
+			return [ok = true, position = this.timeline.cursor_pos.value(), playing = this.timeline.play_btn.value() ? true : false, bpm = this.timeline.bpm_ctrl.value()];
+		}, "Play / pause, the cursor position (beats) and the tempo of the main timeline, as the transport bar does. Loop timelines turn along it while it plays.");
+
+		// Envelopes
+
+		ai.register("add_timeline_envelope", [
+			lane = "&int(0,64): The lane, 0 = the top lane.",
+			target = "string(): Full path of the control the envelope drives (get_local_control of a generator gives full_path). Empty: the Mix of the lane.",
+			points = "array(): Breakpoints [[beat, value 0..1, curve -1..1], ...]; curve bends the segment that starts at the point (0 straight). Default: one point, flat at the Mix of the lane (or 0.5).",
+			show = "int(0,1): Show it on the lane (1, default) or not (0).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			i = std.int(args.lane);
+			if(i < 0)
+				return [ok = false, error = "lane must be 0 or more."];
+			t.set_lane_count(i + 1);
+			target_ctrl = None;
+			if(args.has("target") && args.target != "") {
+				target_ctrl = nanogui.current_context().get_control_by_path(args.target);
+				if(!target_ctrl)
+					return [ok = false, error = "No control " + args.target + " (use the full_path of get_local_control)."];
+			}
+			points = args.has("points") && args.points ? args.points : None;
+			env = None;
+			if(target_ctrl) {
+				env = t.add_envelope(i, 0, points);
+				env.ctrl.link_to(target_ctrl, "normalized");
+			}
+			else
+				env = t.add_mix_envelope(i, points);
+			snap = t.envelope_snapshot(i, env);
+			n = env.n;
+			t.step("Add envelope", [t, i, n](){ t.remove_envelope(i, n); }, [t, snap](){ t.restore_envelope(snap); });
+			if(!args.has("show") || std.int(args.show)) {
+				t.show_envelopes(i, true, false);
+				t.pick_envelope(i, t.lanes[i].envs.size() - 1);
+			}
+			return [ok = true, envelope = t.envelope_json(i, env)];
+		}, "Adds an envelope to a lane of a timeline: a curve over the whole timeline whose value at the playhead drives a control (a normalized link: 0..1 runs through the range of the control). Returns it with its number (envelope).");
+
+		ai.register("set_timeline_envelope", [
+			lane = "&int(0,64): The lane.",
+			envelope = "int(1,1000): The number of the envelope on the lane (get_timeline). Default: the one shown.",
+			points = "array(): New breakpoints [[beat, value 0..1, curve -1..1], ...].",
+			target = "string(): Full path of a control: the envelope drives it instead of what it drove.",
+			show = "int(0,1): Show this envelope on the lane (1) or hide the envelopes of the lane (0).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			i = std.int(args.lane);
+			if(i < 0 || i >= t.lanes.size())
+				return [ok = false, error = "No lane " + args.lane + "."];
+			lane = t.lanes[i];
+			n = args.has("envelope") ? std.int(args.envelope) : (lane.env_shown >= 0 && lane.env_shown < lane.envs.size() ? lane.envs[lane.env_shown].n : 0);
+			env = t.env_of(i, n);
+			if(!env)
+				return [ok = false, error = "No envelope " + n + " on lane " + i + " (get_timeline lists them)."];
+			if(args.has("target") && args.target != "") {
+				target_ctrl = nanogui.current_context().get_control_by_path(args.target);
+				if(!target_ctrl)
+					return [ok = false, error = "No control " + args.target + " (use the full_path of get_local_control)."];
+				old = env.ctrl.links();
+				for(k = 0; k < old.size(); k++)
+					env.ctrl.unlink_from(old[k]);
+				env.ctrl.link_to(target_ctrl, "normalized");
+			}
+			if(args.has("points")) {
+				was = t.tl.envelope_points(env.eid);
+				t.tl.envelope_points(env.eid, args.points);
+				now = t.tl.envelope_points(env.eid);
+				t.step("Edit envelope", [t, i, n, was](){ t.set_envelope_points(i, n, was); }, [t, i, n, now](){ t.set_envelope_points(i, n, now); });
+			}
+			if(args.has("show")) {
+				if(std.int(args.show)) {
+					t.show_envelopes(i, true, false);
+					for(k = 0; k < lane.envs.size(); k++) {
+						if(lane.envs[k].n == n)
+							t.pick_envelope(i, k);
+					}
+				}
+				else
+					t.show_envelopes(i, false, false);
+			}
+			return [ok = true, envelope = t.envelope_json(i, env)];
+		}, "Changes an envelope of a lane: its points, the control it drives, whether it is shown on the lane. A change of the points is a step of the undo history.");
+
+		ai.register("edit_timeline_envelope_points", [
+			lane = "&int(0,64): The lane.",
+			envelope = "int(1,1000): The number of the envelope on the lane. Default: the one shown.",
+			action = "&enum(select,move,copy,paste,delete): select: the points (indices) or those from beat to to; move: the selected ones by beats and value; copy: the selected ones; paste: the copied ones at beat (default the playhead), replacing the points in their span; delete: the selected ones.",
+			points = "array(): select: indices of points (get_timeline: points, sorted by beat).",
+			beat = "float(): select: from this beat; paste: where the first copied point goes (default the playhead).",
+			to = "float(): select: up to this beat.",
+			beats = "float(): move: beats to move the selected points by.",
+			value = "float(): move: how much to add to their values (0..1).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			i = std.int(args.lane);
+			if(i < 0 || i >= t.lanes.size())
+				return [ok = false, error = "No lane " + args.lane + "."];
+			lane = t.lanes[i];
+			n = args.has("envelope") ? std.int(args.envelope) : (lane.env_shown >= 0 && lane.env_shown < lane.envs.size() ? lane.envs[lane.env_shown].n : 0);
+			env = t.env_of(i, n);
+			if(!env)
+				return [ok = false, error = "No envelope " + n + " on lane " + i + " (get_timeline lists them)."];
+			a = std.string(args.action);
+			ok = true;
+			if(a == "select") {
+				sel = [];
+				pts = t.tl.envelope_points(env.eid);
+				if(args.has("points"))
+					sel = args.points;
+				else {
+					from = args.has("beat") ? std.float(args.beat) : 0.0;
+					upto = args.has("to") ? std.float(args.to) : 1000000000.0;
+					for(k = 0; k < pts.size(); k++) {
+						if(pts[k][0] >= from && pts[k][0] <= upto)
+							sel.push_back(k);
+					}
+				}
+				t.tl.envelope_select_none();
+				t.tl.envelope_selection(env.eid, sel);
+			}
+			else if(a == "move")
+				ok = t.move_points(args.has("beats") ? std.float(args.beats) : 0.0, args.has("value") ? std.float(args.value) : 0.0);
+			else if(a == "copy")
+				ok = t.copy_points();
+			else if(a == "paste")
+				ok = t.paste_points(args.has("beat") ? std.float(args.beat) : t.cursor(), i, n);
+			else if(a == "delete")
+				ok = t.delete_points();
+			else
+				return [ok = false, error = "action must be select, move, copy, paste or delete."];
+			if(!ok)
+				return [ok = false, error = a == "paste" ? "Nothing copied (copy first), or show mode." : "No point selected (select first), or show mode."];
+			return [ok = true, envelope = t.envelope_json(i, env)];
+		}, "Envelope points as with the mouse: select some (indices, or a span of beats), move the selected ones, copy them, paste them at a beat (the playhead) or delete them. Moving, pasting and deleting are steps of the undo history.");
+
+		// Cues (#680, step 5)
+
+		action_arg = "any(): What the cue does (a json object): [type = clip, view = <live_path of a Clipview, empty: the first>, row, col] launches a clip; [type = column, view, col] a column; [type = desk, command = \"goto 3 stack Main\"] a command line of the lighting desk; [type = midi, device = <MIDI output>, message = \"90 3C 7F\"] hex bytes; [type = loop, loop = <name>, run = 1 start / 0 stop]; [type = song, song = <name or number>]; [type = query, live_path, query, args] any AI query.";
+
+		ai.register("get_timeline_cues", [loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			out = [];
+			list = t.cues_state();
+			for(i = 0; i < list.size(); i++)
+				out.push_back(t.cue_json(t.cues[list[i].id]));
+			return [ok = true, cues = out];
+		}, "The cues of a timeline (a song of the show): id, beat, name, action (what it does), does (as text), fired (how often it ran), last (the result of the last run).", "read");
+
+		ai.register("add_timeline_cue", [
+			beat = "&float(): Where the cue is, in beats.",
+			name = "string(): Its name (its flag in the ruler shows it).",
+			action = action_arg,
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t || t.clock)
+				return t ? [ok = false, error = "Loop timelines have no cues."] : this.no_loop(args);
+			cue = t.user_add_cue(std.float(args.beat), args.has("name") ? std.string(args.name) : "", args.has("action") ? args.action : None);
+			if(!cue)
+				return [ok = false, error = "Not in show mode."];
+			return [ok = true, cue = t.cue_json(cue)];
+		}, "Adds a cue to a timeline (a song of the show): a flag in the ruler; when the playhead passes it while the timeline plays, its action runs. A step of the undo history.");
+
+		ai.register("set_timeline_cue", [
+			id = "&string(): The id of the cue (get_timeline_cues).",
+			beat = "float(): New beat.",
+			name = "string(): New name.",
+			action = action_arg,
+			fire = "int(0,1): 1: run it now (to try it).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.cues.has(args.id))
+				return [ok = false, error = "No cue " + args.id + " (get_timeline_cues lists them)."];
+			d = std.json();
+			if(args.has("beat"))
+				d.beat = std.float(args.beat);
+			if(args.has("name"))
+				d["name"] = std.string(args["name"]);
+			if(args.has("action"))
+				d.action = args.action;
+			if(d.size() > 0 && !t.user_set_cue(args.id, d))
+				return [ok = false, error = "Not in show mode."];
+			res = None;
+			if(args.has("fire") && std.int(args.fire))
+				res = t.run_cue(t.cues[args.id]);
+			return [ok = true, cue = t.cue_json(t.cues[args.id]), result = res];
+		}, "Changes a cue (its beat, name, action; a step of the undo history) or runs it now (fire).");
+
+		ai.register("remove_timeline_cue", [id = "&string(): The id of the cue (get_timeline_cues).", loop = loop_arg], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.user_remove_cue(args.id))
+				return [ok = false, error = "No cue " + args.id + " (get_timeline_cues lists them), or show mode."];
+			return [ok = true];
+		}, "Deletes a cue. A step of the undo history.");
+
+		ai.register("remove_timeline_envelope", [
+			lane = "&int(0,64): The lane.",
+			envelope = "&int(1,1000): The number of the envelope on the lane (get_timeline).",
+			loop = loop_arg,
+		], [this](args){
+			t = this.timeline_for(args);
+			if(!t)
+				return this.no_loop(args);
+			if(!t.delete_envelope(std.int(args.lane), std.int(args.envelope)))
+				return [ok = false, error = "No envelope " + args.envelope + " on lane " + args.lane + " (get_timeline lists them)."];
+			return [ok = true];
+		}, "Deletes an envelope of a lane (its links go with it). A step of the undo history.");
+
+		// Loop timelines (the view Loops)
+
+		ai.register("get_timeline_loops", [], [this](args){
+			lv = this.timeline.loops;
+			return [ok = true, loops = lv ? lv.list_json() : []];
+		}, "The loop timelines of the view Loops: guid, name, beats (one turn), start (the beat the turn starts at), rate, running, chase (its turn follows the main timeline), phase (0..1), position (the beat of its cursor), lanes, clips. Each is a timeline of its own: the timeline queries take its guid or name as loop.", "read");
+
+		ai.register("add_loop_timeline", [
+			name = "string(): Its name (shown in the Source list of synced controls).",
+			beats = "int(1,1024): How many beats one turn takes. Default 4.",
+		], [this](args){
+			lv = this.timeline.loops;
+			if(!lv)
+				return [ok = false, error = "The view Loops is not there."];
+			e = lv.add_loop(None);
+			if(args.has("name") && args.name != "")
+				lv.rename(e, args.name);
+			if(args.has("beats"))
+				e.length_ctrl.value(std.int(args.beats));
+			return [ok = true, loop = lv.loop_json(e)];
+		}, "Adds a loop timeline to the view Loops: a timeline of its own (lanes, clips, envelopes) that turns over its beats along the main timeline while it runs. It starts stopped: set_loop_timeline running 1.");
+
+		ai.register("set_loop_timeline", [
+			loop = "&string(): The loop timeline (its guid, name or index).",
+			name = "string(): A new name.",
+			beats = "int(1,1024): Beats of one turn.",
+			running = "int(0,1): Start (1, from where the main timeline is, so loops meet on the bars) or stop (0: its clips stop, it stands still).",
+			reset = "int(0,1): 1: back to the start of its turn, now.",
+			chase = "int(0,1): Chase (1): while it runs its turn follows the place of the main timeline (and so the timecode or MIDI clock the timeline chases); 0: it counts on by itself.",
+		], [this](args){
+			lv = this.timeline.loops;
+			e = lv ? lv.find(args.loop) : None;
+			if(!e)
+				return this.no_loop(args);
+			if(args.has("name") && args.name != "")
+				lv.rename(e, args.name);
+			if(args.has("beats"))
+				e.length_ctrl.value(std.int(args.beats));
+			if(args.has("running")) {
+				if(std.int(args.running))
+					e.clock.start(lv.main_pos());
+				else
+					e.clock.stop();
+			}
+			if(args.has("reset") && std.int(args.reset))
+				e.clock.reset();
+			if(args.has("chase"))
+				e.chase_btn.value(std.int(args.chase) ? 1 : 0);
+			return [ok = true, loop = lv.loop_json(e)];
+		}, "Starts, stops, resets, renames a loop timeline, sets its beats or its chase, as the buttons of its row do.");
+
+		ai.register("remove_loop_timeline", [loop = "&string(): The loop timeline (its guid, name or index)."], [this](args){
+			lv = this.timeline.loops;
+			e = lv ? lv.find(args.loop) : None;
+			if(!e)
+				return this.no_loop(args);
+			lv.delete_loop(e.clock.guid);
+			return [ok = true];
+		}, "Deletes a loop timeline with its clips. A step of the undo history (like its bin): undo makes it again in its place.");
+	}
+}

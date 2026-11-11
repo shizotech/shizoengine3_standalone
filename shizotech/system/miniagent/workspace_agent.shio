@@ -1,0 +1,624 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  workspace_agent.shio — the subprocess session agent of issue #907
+//
+//  Runs with:
+//      --workspace <dir> --config-spec <name|path[#profile]> --session-id <id>
+//      --history-file <json> --reasoning-effort low|medium|high --role <role> --mode normal|goal
+//
+//  stdout: one JSON object per line
+//      {"type":"ready","session_id":"...","history_messages":0}
+//      {"type":"delta","action":{...}}
+//      {"type":"stats","token_usage":0}
+//      {"type":"file","name":"...","bytes":0,"caption":"...","data":"<base64>"}
+//      {"type":"notify","message":"..."}
+//      {"type":"done","ok":true|false,"status":"finished|failed|question","report":"...","token_usage":0}
+//      {"type":"error","message":"..."}
+//      {"type":"warning","message":"..."}
+//
+//  stdin: JSON lines
+//      {"type":"prompt","text":"...","reasoning_effort":"low|medium|high"}
+//      {"type":"interrupt"}
+//      {"type":"mode","mode":"normal|goal"}
+//      {"type":"stop"}
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "miniagent"
+#include "model_config_cli"
+#include "goal_tools"
+#include "architecture"
+
+agent = None;
+session_id = "";
+workspace = "";
+config_spec = "";
+history_file = "";
+turn_result_file = "";
+role = "adaptive";
+mode = "normal";
+reasoning_effort = "medium";
+
+prompt_queue = [];
+stop_pending = false;
+stdin_closed = false;
+terminal = false;
+
+// issue #907 always-retry: no attempt cap; backoff is capped at 30 s.
+WS_AGENT_BACKOFF_MAX_MS = 30000;
+
+// ── protocol output ────────────────────────────────────────────────────────
+emit(obj) {
+    std.print(obj.compact_string());
+}
+
+// The workspace agent's local mind. It keeps the goal scheduler of this
+// workspace, and turns the agent's send_file / notify_user calls into protocol
+// lines that the SessionManager forwards to the Node listeners.
+class WorkspaceAgentMind {
+    goals = None;
+
+    __init__(_scheduler) {
+        goals = _scheduler;
+    }
+
+    share_file(path, caption = "") {
+        path = std.string(path ?? "");
+
+        if(!path || !fileio.exists(path))
+            return [ok = false, error = "file not found: " + path];
+
+        data = fileio.read_file(path);
+        name = fileio.file_name(path);
+        bytes = data.size();
+        caption = std.string(caption ?? "");
+
+        emit([
+            type = "file",
+            name = name,
+            bytes = bytes,
+            caption = caption,
+            data = std.base64_encode(data),
+        ]);
+
+        return [ok = true, name = name, bytes = bytes];
+    }
+
+    notify_user(msg) {
+        msg = std.string(msg ?? "");
+        emit([type = "notify", message = msg]);
+        return [ok = true, message = msg];
+    }
+
+    // Compatibility for a receptionist role running inside a workspace agent.
+    get_overview() {
+        return [
+            tasks = [],
+            tasks_scheduled = [],
+            tasks_finished = [],
+            tasks_failed = [],
+        ];
+    }
+
+    inspect_task(taskid) {
+        return [
+            ok = false,
+            taskid = std.string(taskid ?? ""),
+            name = "",
+            state = "lost",
+            active = json.bool(false),
+            report = "",
+            error = "not found",
+            token_usage = 0,
+            last_update_ms = 0,
+        ];
+    }
+
+    add_task(name, goal, role = "adaptive") {
+        return "";
+    }
+
+    update_task(taskid, message) {
+        return false;
+    }
+
+    stop_task(taskid) {
+        return false;
+    }
+}
+
+token_usage() {
+    total = 0;
+
+    try {
+        g = std.global("_global_token_usage");
+        u = g["usage"];
+
+        if(std.is_json(u) && u.has("total_tokens"))
+            total = std.int(u.total_tokens);
+    } catch(e) {}
+
+    return total;
+}
+
+result_report(res) {
+    out = "";
+
+    if(std.is_json(res)) {
+        if(res.has("result") && !std.is_none(res.result))
+            out = std.string(res.result ?? "");
+
+        if(!out && res.has("reports") && std.is_json(res.reports) && res.reports.size())
+            out = std.string(res.reports[0].report ?? "");
+
+        if(!out && res.has("error"))
+            out = std.string(res.error ?? "");
+    }
+
+    return out;
+}
+
+save_turn_result(prompt, status, report) {
+    chat = agent.export_chat();
+    if(!std.is_json(chat)) return false;
+
+    return fileio.write_json(turn_result_file, [
+        prompt = prompt,
+        status = status,
+        report = report,
+        history_size = chat.size(),
+        token_usage = token_usage(),
+        completed = std.millis(),
+    ], true, true);
+}
+
+save_chat_history() {
+    // Parallel tool starts can call this at the same time. Serialize the snapshot and
+    // retry the atomic write; a transient save failure must not kill the session.
+    lock = std.critical_section_named("workspace_agent_history:" + history_file);
+    saved = false;
+
+    try {
+        chat = agent.export_chat();
+
+        if(std.is_json(chat)) {
+            for(i = 0; i < 5; i++) {
+                if(fileio.write_json(history_file, chat, true, true)) {
+                    saved = true;
+                    break;
+                }
+                std.sleep(50);
+            }
+
+            // Last resort: write without the atomic rename when a reader holds the target.
+            if(!saved)
+                saved = fileio.write_json(history_file, chat, true, false);
+        }
+    } catch(e) {
+        std.error("[workspace_agent] chat history save failed: ", e);
+    }
+
+    lock.release();
+
+    if(!saved)
+        emit([type = "warning", message = "Cannot save session chat history: " + history_file]);
+
+    return saved;
+}
+
+// ── one turn ──────────────────────────────────────────────────────────────
+run_turn(prompt, effort) {
+    status = "";
+    report = "";
+    attempts = 0;
+
+    for(1) {
+        res = None;
+
+        try {
+            agent.set_reasoning_effort(effort);
+            res = agent.task(prompt);
+        } catch(e) {
+            res = [signal = "failed", result = std.string(e)];
+        }
+
+        save_chat_history();
+
+        // A runtime stop wins over a model signal that arrived in the same turn.
+        if(stop_pending) {
+            status = "stopped";
+            report = "The task was stopped.";
+            break;
+        }
+
+        event = std.is_json(res) ? std.string(res.signal ?? "") : "";
+
+        if(event == "finished" || event == "failed" || event == "question") {
+            status = event;
+            report = std.is_json(res) ? std.string(res.result ?? "") : "";
+
+            if(!report)
+                report = result_report(res);
+
+            break;
+        }
+
+        if(mode != "goal") {
+            status = std.is_json(res) && std.string(res.signal ?? "") == "finished" ? "finished" : "failed";
+            report = result_report(res);
+            break;
+        }
+
+        attempts++;
+        std.sleep(math.min(WS_AGENT_BACKOFF_MAX_MS, 500 * attempts));
+    }
+
+    // A stop that arrived after the model signal still turns the turn into
+    // a runtime stopped result (the model's finished|failed|question stay the
+    // model signals; stopped is the runtime's).
+    if(stop_pending) {
+        status = "stopped";
+        report = "The task was stopped.";
+    }
+
+    if(!status) {
+        status = "failed";
+        report = "The turn ended without a terminal result.";
+    }
+
+    // Exactly one stats line and one done line per turn.
+    emit([type = "stats", token_usage = token_usage()]);
+
+    if(!save_turn_result(prompt, status, report))
+        std.error("[workspace_agent] could not persist turn result: ", turn_result_file);
+
+    emit([
+        type = "done",
+        ok = json.bool(status == "finished"),
+        status = status,
+        report = report,
+        token_usage = token_usage(),
+    ]);
+
+    terminal = true;
+
+    return [status = status, report = report];
+}
+
+// ── stdin protocol reader (runs as a script task) ───────────────────────
+read_protocol() {
+    for(1) {
+        line = std.input();
+
+        if(line.strip().empty()) {
+            stdin_closed = true;
+            break;
+        }
+
+        data = None;
+
+        try {
+            data = std.json(line, true);
+        } catch(e) {
+            data = None;
+        }
+
+        if(!std.is_json(data)) {
+            emit([type = "error", message = "Invalid protocol line"]);
+            continue;
+        }
+
+        type = std.string(data.type ?? "");
+
+        if(type == "prompt") {
+             text = std.string(data.text ?? "");
+             effort = std.string(data.reasoning_effort ?? reasoning_effort).lowercase();
+
+             if(text.strip().empty()) {
+                 emit([type = "error", message = "Empty prompt"]);
+                 continue;
+             }
+             if(effort != "low" && effort != "medium" && effort != "high") {
+                 emit([type = "error", message = "reasoning_effort must be low, medium, or high"]);
+                 continue;
+             }
+
+             // A prompt while the agent is generating updates the running task;
+             // it does not spawn a new task. Otherwise it is the next queued turn.
+             if(agent && agent.running) {
+                 agent.set_reasoning_effort(effort);
+                 agent.task_update(text);
+             }
+             else {
+                 prompt_queue.push_back([text = text, reasoning_effort = effort]);
+             }
+         }
+        else if(type == "interrupt") {
+            if(agent && agent.running)
+                agent.stop();
+        }
+        else if(type == "mode") {
+            m = std.string(data.mode ?? "normal");
+
+            if(m != "goal")
+                m = "normal";
+
+            mode = m;
+        }
+        else if(type == "stop") {
+            stop_pending = true;
+
+            if(agent && agent.running)
+                agent.stop();
+        }
+        else {
+            emit([type = "error", message = "Unknown protocol type"]);
+        }
+    }
+}
+
+// ── command line ─────────────────────────────────────────────────────────
+workspace = std.string(std.argvoption("--workspace") ?? "");
+config_spec = std.string(std.argvoption("--config-spec") ?? "");
+history_file = std.string(std.argvoption("--history-file") ?? "");
+session_id = std.string(std.argvoption("--session-id") ?? "");
+reasoning_effort = std.string(std.argvoption("--reasoning-effort") ?? "medium").lowercase();
+role = std.string(std.argvoption("--role") ?? "");
+mode = std.string(std.argvoption("--mode") ?? "");
+
+if(!role)
+    role = "adaptive";
+
+if(mode != "goal")
+    mode = "normal";
+if(reasoning_effort != "low" && reasoning_effort != "medium" && reasoning_effort != "high") {
+    emit([type = "error", message = "Invalid --reasoning-effort; expected low, medium, or high"]);
+    std.exitprocess(1);
+}
+
+if(workspace) {
+    try {
+        std.cd(workspace);
+    } catch(e) {
+        emit([type = "error", message = "Cannot enter workspace: " + std.string(e)]);
+        std.exitprocess(1);
+    }
+}
+
+if(!history_file) {
+    emit([type = "error", message = "Missing --history-file"]);
+    std.exitprocess(1);
+}
+turn_result_file = history_file + ".result.json";
+
+cfg = ModelConfig();
+loaded = false;
+
+// --config-spec is name|path[#profile]. An empty spec means the default config.
+legacy_config_file = std.string(std.argvoption("--config-file") ?? "");
+
+if(!config_spec && legacy_config_file) {
+    loaded = cfg.load(legacy_config_file, false);
+} else {
+    loaded = model_config_load_spec(
+        cfg,
+        config_spec,
+        MODEL_CONFIG_PACKAGE,
+        MODEL_CONFIG_DEFAULT_KEY,
+        false
+    );
+}
+
+if(!loaded) {
+    label = config_spec ? config_spec : (legacy_config_file ? legacy_config_file : "default");
+    emit([type = "error", message = "Cannot load config spec: " + label]);
+    std.exitprocess(1);
+}
+
+try {
+    agent = miniagent(cfg, role);
+} catch(e) {
+    emit([type = "error", message = "Cannot create agent: " + std.string(e)]);
+    std.exitprocess(1);
+}
+
+task_space = GoalSpace(workspace + "/.agentspace");
+if(!task_space.exists())
+    task_space.init(__DIR__ + "/agentspace_template");
+task_scheduler = GoalScheduler(task_space, None);
+mind = WorkspaceAgentMind(task_scheduler);
+agent.env.mind = mind;
+goal_tools_add(agent);
+
+architecture_board = ArchitectureBoard(None, workspace + "/.megamind/architecture", "adaptive", false);
+
+agent.on_action = [](action) {
+    emit([type = "delta", action = action]);
+
+    // chat.json is the source of truth; persist it as soon as a tool starts.
+    if(action.tool_start) {
+        try {
+            save_chat_history();
+        } catch(e) {
+            std.error("[workspace_agent] could not save chat history on tool call: ", e);
+        }
+    }
+};
+
+// goal_finish is an alias for a finalize finished/failed signal, not a separate state contract.
+agent.add_tool(
+    "goal_finish",
+    "Finish a goal run. status=finished when the goal is met, status=failed when it cannot be completed. Include a short report.",
+    [
+        status = "&string(): finished or failed",
+        report = "&string(): final report",
+    ],
+    [](agt, args) {
+        st = std.string(args.status ?? "").strip();
+
+        if(st != "finished" && st != "failed")
+            return [ok = false, error = "status must be finished or failed"];
+
+        agt.finalize_run(st, std.string(args.report ?? ""), true);
+
+        return "Goal finished.";
+    }
+);
+
+agent.add_tool(
+    "create_workspace_task",
+    "Create a ONE-OFF workspace task in the workspace's .agentspace goal store. This tool is never for recurring work. The goal engine's recurring Goal IS the recurring-task feature: use create_recurring_goal for every task the user wants repeated on a schedule. One-off tasks are proposed by default; activate=yes only when the user explicitly asks to start it now, and an active task is automatically queued by the goal engine.",
+    [
+        title = "&string(): short task title",
+        instructions = "&string(): task instructions and acceptance criteria in Markdown",
+        activate = "string(): yes only when the user explicitly asked to activate it; otherwise leave proposed",
+    ],
+    [&task_scheduler](agt, args) {
+        created = goal_tool_create(task_scheduler, [
+            title = args.title,
+            instructions = args.instructions,
+            schedule_type = "manual",
+            activate = args.activate ?? "no",
+        ]);
+        if(!created.ok || created.status != "active")
+            return created;
+
+        queued = task_scheduler.request_run(created.id);
+        if(!queued.ok)
+            return [ok = false, created = created, error = "The task was created but the goal engine could not queue it: " + queued.error];
+        created.queued = true;
+        return created;
+    }
+);
+
+
+
+agent.add_tool("architecture_overview", "Read the current architecture and pending changes for this workspace. Does not run jobs or change source files.", None, [&architecture_board](agt, args) {
+    architecture_board.reload();
+    view = architecture_board.state();
+    return [ok = true, project = view.project, summary = view.summary, nodes = view.nodes, edges = view.edges, pending = view.pending, job = view.job];
+});
+
+agent.add_tool("architecture_add_node", "Propose a node in the workspace architecture graph. This creates a validated pending change only; the owner reviews and applies it in the Architecture tab.", [
+    label = "&string(): concise display name",
+    kind = "&string(): module, file, service, ui, data, external, test, or config",
+    group = "&string(): optional related subsystem or grouping",
+    path = "&string(): optional relevant workspace-relative path",
+    purpose = "&string(): one-sentence responsibility",
+], [&architecture_board](agt, args) {
+    return architecture_board.add_edit([op = "add_node", note = "Proposed by workspace agent", node = [label = args.label, kind = args.kind, group = args.group, path = args.path, purpose = args.purpose]]);
+});
+
+agent.add_tool("architecture_update_node", "Propose changing one field of an existing architecture node. This creates a validated pending change only.", [
+    node_id = "&string(): id returned by architecture_overview",
+    field = "&string(): one of label, kind, group, path, purpose",
+    value = "&string(): the replacement value",
+], [&architecture_board](agt, args) {
+    field = std.string(args.field);
+    if(field != "label" && field != "kind" && field != "group" && field != "path" && field != "purpose")
+        return [ok = false, error = "field must be label, kind, group, path, or purpose"];
+    changes = std.json();
+    changes[field] = args.value;
+    return architecture_board.add_edit([op = "update_node", target = args.node_id, node = changes, note = "Proposed by workspace agent"]);
+});
+
+agent.add_tool("architecture_remove_node", "Propose removing an existing architecture node and its edges. This creates a validated pending change only.", [node_id = "&string(): id returned by architecture_overview"], [&architecture_board](agt, args) {
+    return architecture_board.add_edit([op = "remove_node", target = args.node_id, note = "Proposed by workspace agent"]);
+});
+
+agent.add_tool("architecture_add_edge", "Propose a relationship between two existing architecture node IDs. This creates a validated pending change only.", [
+    source = "&string(): source node id",
+    target = "&string(): target node id",
+    kind = "&string(): calls, data, includes, events, or network",
+    label = "&string(): optional short relationship label",
+], [&architecture_board](agt, args) {
+    return architecture_board.add_edit([op = "add_edge", note = "Proposed by workspace agent", edge = [source = args.source, target = args.target, kind = args.kind, label = args.label]]);
+});
+
+agent.add_tool("architecture_update_edge", "Propose changing the kind or label of an existing architecture relationship. This creates a validated pending change only.", [
+    edge_id = "&string(): edge id returned by architecture_overview",
+    field = "&string(): kind or label",
+    value = "&string(): the replacement value",
+], [&architecture_board](agt, args) {
+    field = std.string(args.field);
+    if(field != "kind" && field != "label")
+        return [ok = false, error = "field must be kind or label"];
+    changes = std.json();
+    changes[field] = args.value;
+    return architecture_board.add_edit([op = "update_edge", target = args.edge_id, edge = changes, note = "Proposed by workspace agent"]);
+});
+
+agent.add_tool("architecture_remove_edge", "Propose removing an existing architecture relationship by edge ID. This creates a validated pending change only.", [edge_id = "&string(): edge id returned by architecture_overview"], [&architecture_board](agt, args) {
+    return architecture_board.add_edit([op = "remove_edge", target = args.edge_id, note = "Proposed by workspace agent"]);
+});
+
+try {
+    messages = agent.llm_api.context.body.messages;
+    if(std.is_json(messages) && messages.size()) {
+        messages[0].content += "\n\nWorkspace capabilities: use get_goals before task creation or changes. IMPORTANT TERMINOLOGY: the goal engine's Goal is its scheduled work item; a recurring task IS a recurring Goal, not a separate feature and not merely a simple objective. For every user request to repeat work, ALWAYS use create_recurring_goal (or create_goal with schedule_type=recurring if that tool is unavailable) and choose days (daily, weekdays, weekends, or named weekdays) or every (for example 5m, 30m, 2h, or 2d); sub-day intervals run continuously from activation and need no time window. Do not use create_workspace_task or a one-off goal for recurring work. Use create_workspace_task ONLY for one-off work; activate=yes only when the user explicitly asks to start it now, and the tool queues an active task automatically. Keep new recurring schedules proposed unless the user explicitly approves activation, and report the resulting schedule. Use create_goal for other one-time or windowed scheduled work, and set_goal_status only with the user's explicit approval. Use architecture_overview before proposing architecture changes, then use the architecture_add_node, architecture_update_node, architecture_remove_node, architecture_add_edge, architecture_update_edge, or architecture_remove_edge tools. These tools create validated pending changes only; do not edit architecture.json directly, claim edits are applied, or run architecture jobs. The owner reviews pending changes in the Architecture tab.";
+        if(mode == "goal")
+            messages[0].content += "\n\nGoal mode: finish the run by calling goal_finish(status=\"finished\" or \"failed\", report=\"...\"). Do not call finalize for a goal run.";
+    }
+} catch(e) {}
+
+history_messages = 0;
+
+if(fileio.exists(history_file)) {
+    saved_chat = fileio.read_json(history_file, true);
+
+    if(!std.is_json(saved_chat)) {
+        emit([type = "error", message = "Cannot read session chat history: " + history_file]);
+        std.exitprocess(1);
+    }
+
+    history_messages = saved_chat.size();
+
+    try {
+        agent.import_chat(saved_chat);
+    } catch(e) {
+        emit([type = "error", message = "Cannot import session chat history: " + std.string(e)]);
+        std.exitprocess(1);
+    }
+}
+
+emit([type = "ready", session_id = session_id, history_messages = history_messages]);
+
+reader_thread = std.thread(read_protocol);
+reader_thread.run();
+
+for(1) {
+    if(stop_pending)
+        break;
+
+    if(prompt_queue.size()) {
+        p = prompt_queue[0];
+        prompt_queue.erase(0);
+
+        run_turn(p.text, p.reasoning_effort);
+
+        if(terminal)
+            break;
+
+        continue;
+    }
+
+    if(stdin_closed)
+        break;
+
+    std.sleep(50);
+}
+
+// A stop while the agent is idle still has to produce one terminal done line;
+// if a turn already emitted its done (terminal), no second line is sent.
+if(stop_pending && !terminal) {
+    emit([type = "stats", token_usage = token_usage()]);
+    emit([
+        type = "done",
+        ok = json.bool(false),
+        status = "stopped",
+        report = "The task was stopped.",
+        token_usage = token_usage(),
+    ]);
+    terminal = true;
+}
+
+std.sleep(20);
+std.exitprocess(0);

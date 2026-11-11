@@ -79,17 +79,18 @@ wait_for(cond, ms) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  rt_stub_receptionist — the miniagent handle a Megamind exposes as
-//  host.receptionist: send_prompt() is the follow-up channel of a running turn.
+//  host.receptionist: task_update() is the follow-up channel of a running turn.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class rt_stub_receptionist {
 
 	prompts = [];
 	stops = 0;
+	running = false;
 
-	send_prompt(msg) {
+	task_update(msg) {
 		prompts.push_back(std.string(msg));
-		return [ok = true, reports = [[report = "injected: " + std.string(msg)]], execution_time_ms = 1];
+		return None;
 	}
 
 	stop() {
@@ -145,6 +146,7 @@ class rt_stub_host {
 	// watchdog's clean room — the whole turn is exactly one silent episode.
 	request(prompt, on_finish_cb = None, on_action_cb = None) {
 		_receptionist_active = true;
+		receptionist.running = true;
 
 		if(on_action_cb && !prompt.starts("STUBQUIET")) {
 			on_action_cb([text = "thinking: "]);
@@ -170,6 +172,7 @@ class rt_stub_host {
 		];
 
 		_receptionist_active = false;
+		receptionist.running = false;
 
 		if(on_finish_cb)
 			on_finish_cb(result);
@@ -273,6 +276,7 @@ class rt_stub_host {
 class rt_stub_agent {
 
 	env = [];
+	task_result = None;
 	on_action = None;
 
 	prompts = [];		// every prompt the Router handed to the agent
@@ -309,10 +313,8 @@ class rt_stub_agent {
 		turns++;
 		prompts.push_back(std.string(prompt));
 
-		// miniagent resets env.reports at the start of every turn
-		if(std.is_json(env)) {
-			env.reports = [];
-		}
+		// miniagent resets task_result at the start of every turn
+		task_result = None;
 
 		// the test's way to make the TURN fail (not the routing)
 		if(std.string(prompt).starts("FAILTURN")) {
@@ -356,16 +358,18 @@ class rt_stub_agent {
 			rep = "picked " + node;
 		}
 
-		// The real role ends every turn with finish(report), which puts the answer
-		// into agent.env.reports; miniagent then hands back
-		// [ok = false, error = "Agent returned nothing (maybe crashed)."] for the
-		// stopped turn. Router._turn_result must fold the report in - this stub
-		// reproduces that shape on purpose.
+		// The real role ends every turn with finish(report), which sets
+		// agent.task_result; miniagent then hands back that canonical result
+		// for the stopped turn. Router._turn_result reads it - this stub
+		// reproduces the canonical shape on purpose.
 		if(callbacks.has("finish")) {
 			callbacks["finish"]([report = rep]);
 		}
 
-		return [ok = false, error = "Agent returned nothing (maybe crashed).", execution_time_ms = 1];
+		// The role's finish sets ragt.task_result; this stub stands in for the
+		// miniagent the Router sees, so it carries the same canonical result.
+		task_result = [signal = "finished", result = rep, from_tool = json.bool(true), execution_time_ms = 1];
+		return task_result;
 	}
 }
 
@@ -583,8 +587,8 @@ stub_agent = rt_stub_agent(rtr, callbacks, [
 	[cue = "http", node = WEB_NAME],
 ]);
 
-// the stub plays the real agent: finish(report) writes into the AGENT's env, and
-// Router._turn_result reads agent.env.reports — so they must share one env.
+// the stub plays the real agent: finish(report) sets task_result, and
+// Router._turn_result reads agent.task_result — so they must share one env.
 stub_agent.env = ragt.env;
 
 rtr.agent = stub_agent;
@@ -931,13 +935,13 @@ check("get_last_actions records the routing", std.string(acts).contains("start_t
 empty_rep = callbacks["finish"]([report = "   "]);
 check("finish refuses an empty report", std.string(empty_rep).contains("must not be empty"), std.string(empty_rep));
 
-reports_before = ragt.env.reports.size();
 fin_res = callbacks["finish"]([report = "the fleet has two nodes"]);
 check("finish accepts a report", std.string(fin_res) == "OK", std.string(fin_res));
 check("the report becomes the turn's answer",
-	ragt.env.reports.size() == reports_before + 1 &&
-	std.string(ragt.env.reports[ragt.env.reports.size() - 1].report) == "the fleet has two nodes",
-	std.string(ragt.env.reports));
+	std.is_json(ragt.task_result) &&
+	std.string(ragt.task_result.signal) == "finished" &&
+	std.string(ragt.task_result.result) == "the fleet has two nodes",
+	std.string(ragt.task_result));
 check("finish ends the turn", ragt.stopped, "");
 check("the report is recorded in the action ring", std.string(callbacks["get_last_actions"]([limit = 3])).contains("turn_report"), "");
 

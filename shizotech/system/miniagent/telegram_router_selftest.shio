@@ -223,10 +223,11 @@ class tg_fake_bot {
 class tg_stub_receptionist {
 
     prompts = [];
+    running = false;
 
-    send_prompt(msg) {
+    task_update(msg) {
         prompts.push_back(std.string(msg));
-        return [ok = true, reports = [[report = "injected: " + std.string(msg)]], execution_time_ms = 1];
+        return None;
     }
 
     stop() { }
@@ -279,6 +280,7 @@ class tg_stub_host {
 
     request(prompt, on_finish_cb = None, on_action_cb = None) {
         _receptionist_active = true;
+        receptionist.running = true;
         requests.push_back(std.string(prompt));
 
         result = [
@@ -288,6 +290,7 @@ class tg_stub_host {
         ];
 
         _receptionist_active = false;
+        receptionist.running = false;
 
         if(on_finish_cb)
             on_finish_cb(result);
@@ -378,6 +381,7 @@ class tg_stub_host {
 class tg_stub_agent {
 
     env = [];
+    task_result = None;
     on_action = None;
 
     prompts = [];
@@ -414,10 +418,8 @@ class tg_stub_agent {
         turns++;
         prompts.push_back(std.string(prompt));
 
-        // miniagent resets env.reports at the start of every turn
-        if(std.is_json(env)) {
-            env.reports = [];
-        }
+        // miniagent resets task_result at the start of every turn
+        task_result = None;
 
         // an arbitrary question: the agent ANSWERS and routes nothing. That is a
         // normal turn, not a failure (router_api.md: ok vs routed).
@@ -469,17 +471,30 @@ class tg_stub_agent {
         return this.report("picked " + node);
     }
 
-    // The real role ends every turn with finish(report) (the answer lands in
-    // agent.env.reports) and miniagent then hands back
-    // [ok = false, error = "Agent returned nothing (maybe crashed)."] for the
-    // stopped turn. Router._turn_result must fold the report in - reproduced here
-    // on purpose, because that is exactly the live bug the owner reported.
+    // The real role ends every turn with finish(report) / finalize(), which
+    // sets agent.task_result. Router._turn_result reads that canonical result.
     report(rep) {
         if(callbacks.has("finish")) {
             callbacks["finish"]([report = rep]);
         }
 
-        return [ok = false, error = "Agent returned nothing (maybe crashed).", execution_time_ms = 1];
+        task_result = [signal = "finished", result = rep, from_tool = json.bool(true), execution_time_ms = 1];
+        return task_result;
+    }
+}
+
+// A TelegramRouter whose answer of one turn throws (boom = true): the worker thread
+// of the bot must survive it (#762: one error ended it, later messages were never
+// answered).
+class tg_fragile_router : TelegramRouter {
+    boom = false;
+
+    tg_answer_text(res) {
+        if(boom) {
+            boom = false;
+            std.runtime_error("answer exploded");
+        }
+        return super.tg_answer_text(res);
     }
 }
 
@@ -506,7 +521,7 @@ if(fileio.exists(TRUSTED_FILE)) {
 
 bot = tg_fake_bot();
 
-rtr = TelegramRouter(
+rtr = tg_fragile_router(
     ModelConfig(),
     [
         name = ROUTER_WIRE,
@@ -594,7 +609,7 @@ stub_agent = tg_stub_agent(rtr, callbacks, [
 ]);
 
 // finish(report) writes into the AGENT's env and Router._turn_result reads
-// agent.env.reports — the stub and the real role tools must share one env.
+// agent.task_result — the stub and the real role tools share the same result surface.
 stub_agent.env = ragt.env;
 
 rtr.agent = stub_agent;
@@ -651,6 +666,17 @@ q_answered = wait_for([bot]() { return bot.has_for(CHAT_A, "the fleet has"); }, 
 check("an arbitrary question gets the agent's answer", q_answered, bot.last_for(CHAT_A));
 check("a question is not framed as a failure", !bot.has_for(CHAT_A, "failed") && !bot.has_for(CHAT_A, "Routing") && !bot.has_for(CHAT_A, "Agent returned nothing"), bot.last_for(CHAT_A));
 check("a question routes no task", rtr.tasks_summary().size() == tasks_q, std.string(rtr.tasks_summary()));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4a. A turn that throws: the chat hears about it, the bot keeps working
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.clear();
+rtr.boom = true;
+bot.on_any_message([chatid = CHAT_A, text = "QUESTION: does this break?"]);
+check("a turn that throws is reported in the chat", wait_for([bot]() { return bot.has_for(CHAT_A, "answer exploded"); }, 8000), bot.last_for(CHAT_A));
+bot.on_any_message([chatid = CHAT_A, text = "QUESTION: still there?"]);
+check("the next message is still answered (the worker thread lives)", wait_for([bot]() { return bot.has_for(CHAT_A, "the fleet has"); }, 8000), bot.last_for(CHAT_A));
 
 // the question turn streams too -> its draft ids must be valid as well
 bad_drafts2 = 0;

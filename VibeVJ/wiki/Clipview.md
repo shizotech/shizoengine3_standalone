@@ -15,7 +15,7 @@ column, by MIDI or with autoplay. A [CueList](CueList.md) is the same thing show
 | Clip | Each cell | The clip picture (click to start it) and its name tag below (click to select it). |
 | *Preview* | Bottom left window | The finished picture of the whole Clipview. Its switch *No Alpha* turns the transparency of the picture off. |
 | *Layer* | Bottom right window | What the selected clip or layer is made of, and its settings. |
-| *In* | Bottom left corner | A port for a picture from outside. *(Not used by the layers yet.)* |
+| *In* | Bottom left corner | A port for a picture from outside: the clips whose input is off get it. See [The In port](#the-in-port). |
 | *Out* | Bottom right corner | The finished picture as a port. Link it to an output: see [Output and devices](Output-and-Devices.md#show-the-picture-on-a-display-or-projector). |
 
 - A new Clipview has 3 layers and 4 columns. The grid grows as you fill it: it always keeps one free row and one free
@@ -65,6 +65,9 @@ Click the name tag of a layer to select it. The *Layer* window then shows:
    A clip without a picture shows its name; a *Phaser* shows the lamps it drives, in 2D or 3D
    ([Phaser](Output-and-Devices.md#effects-over-fixtures)).
 3. Drag another asset onto the clip, or onto the list in the *Layer* window, to stack it onto the clip as an effect.
+4. Or take generators that are set up already: Alt + drag them out of a Patchview onto a cell. They move into the clip
+   with their links and MIDI mappings; with Ctrl when you let go the clip gets copies. Several generators become one
+   clip with a stack of them. See [Select and move generators](Generators.md#select-and-move-generators).
 
 What can become a clip is on [Generators](Generators.md#what-a-generator-is) and [Assets](Assets.md).
 
@@ -156,6 +159,18 @@ rules.
   others at 0.
 - A project saved before #374 is migrated when it loads (format 3 → 4): every saved Absolute value from 1 up gets
   +1, so an existing link stays on the layer it was wired to. The files of the project are kept in `.backup_v3`.
+- An input at 0 (off) gets no layer. The first input of the clip then takes the picture on the [In port](#the-in-port).
+
+### The In port
+
+*In* at the bottom left of the Clipview takes a picture from outside: [link](Linking.md#make-a-link) the *Out* of a
+generator, a video or a camera to it.
+
+- Every clip whose first input is set to 0 (off) gets that picture there: the one input of a generator, or the first
+  input of a shader named `input` or `iChannel0`. The other inputs of a clip at 0 stay empty.
+- A new clip starts with its first input at 1 (the layer below): set it to 0 to use *In*.
+- Like the layer inputs, a clip gets it when it is live.
+- With nothing linked to *In*, an input at 0 stays empty, as in projects of before.
 
 ## Macros
 

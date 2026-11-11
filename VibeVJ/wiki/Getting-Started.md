@@ -97,10 +97,11 @@ Every project is a folder in `VibeVJ/projects/<project name>/`. It holds:
 - the values of all controls, your links and MIDI mappings,
 - the generators in the timeline area,
 - your fixtures,
+- the pages of controls of the [web remote](Web-Remote.md#put-controls-on-a-page-in-vibevj),
 - the project settings in *Settings* › *Project* and *Settings* › *Links* (see [Settings](Settings.md)).
 
-Not in the project: the settings in *Settings* › *Appearance*, for example the accent colour and *Calm notches*. They
-are personal and valid for every project.
+Not in the project: the settings in *Settings* › *Appearance*, for example the accent colour and *Calm notches*, and
+the port, network and paired phones of the web remote. They are personal and valid for every project.
 
 To copy or back up a project, copy its folder.
 
@@ -133,6 +134,8 @@ To make a template, save a project and copy its folder from `VibeVJ/projects/` i
 
 ## Next steps
 
+- Learn by doing: the [tutorials](Tutorials.md) build a whole result step by step, from visuals on the beat to the
+  night of the show.
 - Find your way around the window and build your own layout: [The screen](The-Screen.md).
 - Learn the generator window: [Generators](Generators.md). See what comes with VibeVJ: [Assets](Assets.md).
 - Make things move: [Linking](Linking.md).

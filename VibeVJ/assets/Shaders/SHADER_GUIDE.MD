@@ -82,6 +82,18 @@ uniform sampler2D input2;
 uniform sampler2D mask;
 ```
 
+### Clip uniforms (the timeline, #680)
+
+A shader on a lane of the timeline is a clip there: it renders only while the playhead is inside the clip. Declare
+these uniforms (without an `//@` annotation, so they get no control) and the engine sets them every frame:
+
+```glsl
+uniform float CLIP_POS;   // 0 at the start of the clip, 1 at its end
+uniform float CLIP_TIME;  // seconds since the start of the clip
+```
+
+They stay 0 in a Clipview or a Patchview: write the shader so it also looks right there.
+
 ### Auto-Binding Behavior
 
 If a shader input has the **same name** as another pass within the shader node, it is **automatically bound** (and not shown in the UI).
@@ -102,6 +114,18 @@ uniform sampler2D A;  // Will bind to src/A.glsl automatically
 | `main_image` | Automatically binds to the `__init__` pass (first shader) |
 | `feedback` | Binds to itself (the current shader), use this for feedback effects |
 | `RenderMaskInput` | Binds to the render mask input |
+| `AUDIO`, `WAVE` | The FFT texture of the running audio analysis (AudioInputAnalysis), while nothing is linked into the port (#586) |
+
+#### The sound: `AUDIO`
+
+A sampler named `AUDIO` (or `WAVE`) gets the texture of the audio analysis by itself while an AudioInputAnalysis runs,
+also in a clip of a Clipview and on the timeline; a link into its port (or a picture a Clipview sets) wins. The texture
+is 512 × 2, one float channel: row 0 the spectrum (512 bands, log spaced from 20 Hz to half the sample rate, 0 .. 1),
+row 1 the waveform (512 samples, -1 .. 1). Read it with `texelFetch(AUDIO, ivec2(i, 0), 0).r` (spectrum) and
+`ivec2(i, 1)` (waveform). Declare `uniform int AUDIO_ON;` (no annotation) to know whether there is one: the engine
+sets it to 1 while the input has a picture. `textureSize` of an empty sampler is not 0 on every driver (Mesa). The
+assets of `Sources/Audio/Spectrum.glsl` and its siblings (`src/lib/common.glsl`) have helpers (`audioBand`,
+`spectrumAt`, `waveAt`, `freqToX`) and a made-up beat for when there is no analysis (`test_signal`).
 
 Each effect shader needs exactly one primary "input" sampler.
 
@@ -126,9 +150,20 @@ The `//@settings` directive sets shader default properties:
 | `dtype` or `type` | Component format | `uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `uint64`, `int64`, `float16`, `float32`, `float64` |
 | `format` | Pixel format | `r`, `ra`, `rgb`, `rgba`, `bgr`, `bgra`, `depth`, `depthstencil` |
 | `rendersize` | Fixed render size | `rendersize=(width,height)` |
+| `renderscale` | Size of a pass as a share of the shader's size | `renderscale=0.25` or `renderscale=(0.5,0.25)` |
+| `draw` | The pass draws points or quads instead of a picture ([3.4](#34-point-passes)) | `draw=points`, `draw=quads` |
+| `count` | How many points a `draw` pass draws: numbers and `int` uniforms, multiplied | `count=particles`, `count=columns*rows`, `count=4096` |
+| `blend` | How the points of a `draw` pass add up | `add` (default), `alpha` (premultiplied), `max`, `none` |
 
 **Notes:**
 - `rendersize` fixes the render size for this shader
+- `renderscale` makes a pass of a multi-pass shader smaller (or bigger) than the shader: `renderscale=0.25` renders it
+  at a quarter of the width and height, and it follows the project size and *Render scale*. For blur pyramids and
+  estimates that need no full resolution (#586). Another pass reads it with the same `uv` (`fragCoord / iResolution.xy`
+  of the reading pass); `iResolution` of the small pass is its own size.
+- The textures of passes are not filtered (nearest): a pass that reads a smaller one at full size gets blocks. Read it
+  with your own bilinear or B-spline sampling from `texelFetch` (the blur shaders of `Effects/Feedback&Blur` have one).
+- A uniform declared in several passes is one control; give every declaration the same annotation.
 - Component and pixel formats can be fixed per shader
 
 ---
@@ -228,7 +263,8 @@ uniform int test_enum;
 uniform bool active;
 ```
 - UI: Toggle button
-- Default value: `false`
+- Default value: `false`; `//@button value=1` starts it on, `value=0` off (before #586 any `value=`, also `0`, switched
+  it on: the text "0" was set as it is)
 
 **Push Button:**
 ```glsl
@@ -253,7 +289,25 @@ uniform int text;
   text from those int uniforms. The uniform below the annotation only names the field (#566: `//@text` was not
   parsed, so `Text.glsl` showed one block instead of "HTTP")
 
+#### Readout (values the shader gives out)
+
+```glsl
+//@settings dtype=uint8 format=rgba rendersize=(1,1)
+//@readout names=(life,turning,turn_pulse,coverage)
+```
+- In a pass file (not on a uniform): the first pixel of this pass goes out as up to four **pure outputs** under
+  *Values* in the tab *Control*, one per channel (r, g, b, a), 0..1, named and captioned like uniforms. Other
+  controls link from them (`Sources/Mapping/Grow*`: how much of a growing shape is grown, #586)
+- The loader makes the pass uint8 RGBA and reads it back from the GPU (asynchronously: the value is a frame or two
+  late). A pass renders only when another pass reads it, so let the main pass read it (a texelFetch whose result
+  can change the colour, e.g. `if (texelFetch(O, ivec2(0), 0).a > 2.0) rgb = vec3(1.0);`); while nothing shows the
+  shader the values stand still
+- Keep the state that needs precision in a float32 pass and copy only the values into the uint8 readout pass
+
 ---
+
+The controls of the annotation types are made in `engine/generators/extensions/glsl/annotation_controls.shio`, which the
+Python assets use too (`#@` instead of `//@` above a variable, #853, wiki page *Python-Generators*).
 
 ### 3.3 Multi-line Annotation Accumulation
 
@@ -272,6 +326,61 @@ This is equivalent to:
 //@slider min=0.0 max=1.0 value=0.5
 uniform float cycle;
 ```
+
+### 3.4 Point passes
+
+A fragment shader colours every pixel once; it cannot put a million dots where they want to be. A pass with
+`//@settings draw=points` draws points instead (#586): the GPU runs `mainPoint` once per point (as the vertex shader),
+which places the point, and `pointPixel` for the pixels of the point (as the fragment shader). The positions usually
+come from a texture another pass writes (a simulation), or from an input picture. The cost is fixed by `count`, not by
+where the points are, and no point is lost when two meet. `Sources/Simulations/Particles2.glsl` (a million particles)
+and `Effects/Morph&Mirror/Instancer.glsl` (`draw=quads`) use it.
+
+```glsl
+//@settings draw=points count=particles blend=add dtype=float16 format=rgba
+uniform sampler2D S;                  // another pass: one particle a texel
+//@int min=1 max=1048576 value=262144
+uniform int particles;                // count=particles: the value of this control is the number of points
+
+// Once a point: id is 0 .. count-1. position is clip space (x, y from -1 to 1; w for a perspective), size the
+// width in pixels, color what the point adds, data free for pointPixel. The defaults: outside of the picture (not
+// drawn), 1 pixel, white, 0. A color of 0 is not drawn.
+void mainPoint(int id, inout vec4 position, inout float size, inout vec4 color, inout vec4 data) {
+    vec4 p = texelFetch(S, ivec2(id % 1024, id / 1024), 0);
+    position = vec4(p.xy, 0.0, 1.0);
+    size = 2.0;
+    color = vec4(1.0, 0.6, 0.2, 1.0) * 0.3;
+}
+
+// Optional: the colour of a pixel of the point. coord goes from (0, 0) at the top left of the point to (1, 1).
+// Without it a point is a soft round dot of color.
+vec4 pointPixel(vec4 color, vec4 data, vec2 coord) {
+    return color * (1.0 - smoothstep(0.5, 1.0, length(coord * 2.0 - 1.0)));
+}
+```
+
+- The pass is compiled twice from the same file, with the Shadertoy header in both: its uniforms, controls and inputs
+  work in `mainPoint` and in `pointPixel` (`iTime`, `iResolution` of the pass, samplers of other passes, `input`).
+  `SHZ_VERTEX` / `SHZ_FRAGMENT` are defined in the two stages for code that only one of them can compile. A pass
+  without `mainImage` needs none.
+- `count=` takes numbers and names of `int` uniforms joined by `*`: `count=columns*rows` multiplies the values of two
+  controls, every frame. The uniform must be used in the code (an unused one is removed by the compiler and gets no
+  control). Without `count` nothing is drawn.
+- `draw=points` draws GL points: cheap, for many small points. A point smaller than a pixel is drawn one pixel big and
+  fainter. Drivers stop at a largest point size (64 to 2047 pixels) and drop a point whose centre leaves the picture.
+  `draw=quads` draws each point as two triangles (6 vertices, the corners placed for it): no size limit and no
+  popping at the edge, for big copies of a shape. `coord` works the same in both.
+- The target is cleared to transparent black every frame, then the points are blended: `add` sums them (light,
+  glowing clouds; use `dtype=float16` or `float32` so they can go past 1 and tonemap in a later pass), `alpha` is
+  premultiplied over (colour times alpha in `rgb`; an alpha of 0 adds), `max` keeps the brightest, `none` the last.
+  There is no depth buffer: with `alpha` draw the far points first (the order of `id`).
+- Another pass reads the drawn picture by the name of the pass, like any pass; `__init__` usually tonemaps it, adds
+  trails (`feedback`) and a background.
+- Projection mapping (the *Transform* tab) does not apply to a point pass. The hover preview of the *Assets* tab runs
+  only `__init__` and puts its test picture on every sampler, so it shows that picture instead of the points.
+- In the engine: `nanogui.shader` `points(n)` (-1 = the picture, the default), `point_blend`, `point_quads` and a
+  `vertex_source`; the loader builds the sources from `shadertoy.shio` (`points_vertex_main`, `points_fragment_main`).
+  `python3 compile_scripts/check_glsl.py` compiles and links both stages. Test: `_testing/nanogui/shader_points.shio`.
 
 ---
 
@@ -391,6 +500,33 @@ Usage in `__init__.glsl`:
 - Files in subdirectories are **NOT rendered** as passes
 - They are **only accessible via `#include`**
 - This enables modular code organization without creating additional passes
+- An `#include` inside an included file is relative to **that file's** folder: `src/lib/common.glsl` includes
+  `mapping.glsl`, not `lib/mapping.glsl` (#586)
+- The loader strips the included text and puts the line after the `#include` **directly behind its last line**.
+  End an included file with code (a `}`), not with a comment, and never put a `#define`, `#if` or a `//@` annotation
+  on the line right after an `#include` (it would be glued behind the `}` and lost); an empty line or code is fine
+- A pass may read a pass that reads it back (a cycle, e.g. a fluid whose first pass reads the velocity of its last):
+  passes render once a frame and are marked before their inputs render, so the pass where the cycle closes gets the
+  texture of the last frame (`Sources/Simulations/fluidstream`, `Sources/Mapping/MaskFluid`).
+  The inputs of a pass are pulled in no fixed order (a hash map in `shader.cpp`), so a cycle works only when it is
+  entered through one pass: let the passes outside the cycle (the main pass, a height or colour pass) read only its
+  last pass, and let passes of the cycle read back only that last pass. Then that pass is always in progress when the
+  back reads happen. A pass that reads back another pass of the cycle gets the last frame or the current one by
+  chance (#586: MaskPhysarum's main pass reads only Y2, its X1 and C read Y2 back; MaskReaction reads only S8)
+- An input that nothing is linked to reads no texture: the shader binds every sampler without a link to a unit that
+  holds texture 0, so `textureSize(name, 0).x > 1` is false in any pass and a shader can fall back to something of its
+  own (#880, 2026-11-03). Builds before that left the sampler at unit 0 (or the unit it had when it was last linked);
+  in a pass with other inputs that unit held one of them, and the test saw that texture (2026-11-01: Auto of RegionChase, MaskRain,
+  EdgeSweep and MaskSwarm took another pass for the mask in a Patchview). For those builds the assets test an optional input only in a pass
+  that reads nothing else, and let the other passes read that pass: the mapping shaders ask in pass M or in a pass N
+  of one pixel (`mp_mask_mode_pass` / `mp_mask_mode_from(N)` in their `lib/mask.glsl`; the Grow assets ask about
+  Seed picture in a pass I of its own, `lib/growth.glsl`, and MaskRipples, MaskFire, MaskSand about their picture:
+  one optional input per pass). A linked input always has a
+  unit of its own, so reading the picture itself is safe in any pass
+- `iFrame` counts the renders of each pass on its own, and the passes of a shader that was just added do not all
+  start in the same frame. An event that one pass sends to the others for a single frame (a state pass that says
+  "plant the seeds now" at its frame 3) was lost in the app: send it for a few frames, or again until it took effect
+  (`Sources/Mapping/Grow*`, `lib/growth.glsl`, #586)
 
 ---
 
@@ -460,8 +596,9 @@ vec3 remap(vec3 value, float min_val, float max_val) {
 | **Passes** | Additional `.glsl` files in `src/` |
 | **Includes** | `#include path.glsl` relative to `src/` |
 | **Inputs** | `uniform sampler2D`, auto-binding by name |
-| **Annotations** | `//@settings`, `//@slider`, `//@float`, `//@int`, `//@vec2/3/4`, `//@ivec2/3/4`, `//@slidervec2/3/4`, `//@rgb`, `//@rgba`, `//@enum`, `//@button`, `//@pushbutton`, `//@text` |
+| **Annotations** | `//@settings`, `//@slider`, `//@float`, `//@int`, `//@vec2/3/4`, `//@ivec2/3/4`, `//@slidervec2/3/4`, `//@rgb`, `//@rgba`, `//@enum`, `//@button`, `//@pushbutton`, `//@text`, `//@readout` |
 | **Shadertoy** | Auto-detected via `mainImage` function |
+| **Point passes** | `//@settings draw=points` / `draw=quads`: `mainPoint` places each point, `pointPixel` colours it |
 
 ---
 

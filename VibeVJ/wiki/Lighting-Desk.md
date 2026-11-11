@@ -34,7 +34,12 @@ does. Links, MIDI and the Art-Net mapping of a console keep working on top of it
 
 ## The programmer
 
-Drag *Programmer* from `FixturesEffects` into a view.
+Drag *Programmer* from `FixturesEffects` into a view, or open it in the
+[fixture setup](Output-and-Devices.md#set-up-your-lamps): *Programmer* in its toolbar puts it under the stage (the plan
+or 3D) instead of the universe map, so what you select and set shows on the lamps of the setup at once. A second click
+brings the universe map back. Both are the same programmer: what you set in one shows in the other.
+
+![The programmer in the fixture setup: the group Pars selected and set to red, the lamps red on the plan above](media/fixture-setup-programmer.png)
 
 - **Selection (left):** click a group or a lamp to select it. Ctrl+click adds it to the selection or takes it out.
   *All lamps* selects every lamp, the virtual ones too.
@@ -86,6 +91,43 @@ before.
 2. Below the values: pick the stack (*New stack* makes one), the number (*Cue* 0: the next one), the *Fade* in seconds.
 3. *Store cue*. A cue with that number already there takes the new values on top of its own.
 4. *Clear* and set the next look.
+
+## Effect timelines
+
+A cue can carry an effect timeline: lanes of keys and waves that play while its stack plays the cue, on top of the
+cue's own values. A dimmer that breathes over 8 beats, a colour that goes from red to blue and back, a chase over the
+pars: drawn once, then it runs with the BPM.
+
+1. *Timeline* (left of the stack in the store row): the plan, the values and the palettes make room for the timeline
+   of a cue of that stack. The list at the top picks the cue (*New cue*: the next number).
+2. *Beats*: how long the timeline is (4 beats are a bar). *Loop*: it starts again at its end; off, it stops on its last
+   values.
+3. Select lamps, pick the attribute (Dimmer, Colour, Pan, Tilt, Strobe, Zoom) and *Add lane*. The lane moves the
+   group the selection is, the selected lamps, or all lamps when none is selected.
+4. Click into the lane: a key at that beat (on the quarter beats; Shift: anywhere), its height the value. A colour
+   lane takes the colour the programmer has for its first lamp, else white. Drag a key to move it, right click it to
+   change how it goes to the next key (step: a square, linear, smooth: a larger circle), Ctrl+click deletes it.
+5. Instead of keys a lane can run a wave (*Keys* → Sine, Saw, Square, Triangle, Random): *Beats* is one round of it,
+   *Depth* how far it goes up and down from *Mid*.
+6. *Spread* sets the lamps one after the other: each this part of the timeline (of a wave: of its round) later than
+   the one before. 1 is a chase over all of it.
+
+Go on the stack plays the cue and its timeline; the orange line in the lanes is where it plays now. A colour lane and a
+dimmer lane together dim the colour of lamps without a dimmer channel. Every change is a step of the [undo](#undo)
+history, and the timeline is saved with its cue. An agent writes it with `set_cue_timeline` (see the Chat or MCP).
+
+## The Phaser plays a cue
+
+A [Phaser](Output-and-Devices.md#effects-over-fixtures) runs its own waves, and each of its phasers can instead play a
+cue of the desk: open the ⚙ of a phaser and pick the cue under *Cue* (*None*: its own wave again). It then sends what
+the cue sends (the cues of its stack before it count, as in the stack) and plays the cue's effect timeline on the
+clock of the Phaser: the [timeline](Timeline.md) of VibeVJ (it has to play) or a *Speed master*. The stack does not
+have to play, so a Phaser in a clip brings the look of a cue with the clip.
+
+- The Level slider of the phaser scales the cue's dimmers (on a lamp without dimmer: its colour), as the master of an
+  executor does.
+- *Blend* and *Priority* mix it with other phasers as for any phaser. The settings of a wave are hidden.
+- A cue that is deleted leaves the phaser silent (*Cue (gone)*).
 
 ## Record what you see
 
@@ -292,7 +334,7 @@ Now palettes, cues, executors, the Phaser and the Art-Net mapping of a console m
 
 ## What is saved
 
-The palettes and the cue stacks are saved with the project (`desk.json`, with *Go starts* and *On a DJ phrase* of each
+The palettes and the cue stacks are saved with the project (`desk.json`, with the effect timelines of the cues, with *Go starts* and *On a DJ phrase* of each
 stack, and which inputs of the groups sent), the executors, LampValues, CueTrigger and the *Lamps* of a ColorSelector
 with their view. The programmer is not saved.
 

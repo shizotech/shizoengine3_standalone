@@ -1,0 +1,418 @@
+//A native asset as a generator (#201). The generator of a GLSL shader (shader_loader.shio) with a passthrough shader
+//whose input is the picture of the C ABI plugin, like the FFGL loader (#428): preview, OUT, render size, Spout, NDI,
+//display, video router, transform and projection mapping come from the shader generator.
+//- The plugin renders on the CPU into a std.buffer (render()); the buffer is uploaded into the texture of a hidden image
+//  in the frames the picture changed. That texture is the input native_out of passthrough.glsl.
+//- Its controls are made by the control builder of the shader annotations (shader_annotation_control) from what it
+//  declares (describe()), in the section Controls of the Control tab: the same kinds give the same UI, and the name of
+//  a control is its ID like the uniform name of a shader (links, MIDI mappings, projects and presets find it by that).
+//  A move goes to the plugin with set(). A text control (C ABI 1.3) is the text field of a shader's //@text.
+//- Its picture inputs (C ABI 1.3) are samplers of the passthrough shader (native_passthrough_source): they get the
+//  ports (IN) and the entries of Inputs of a shader input. What is linked into one is drawn by a hidden shader at the
+//  size the input asks for and read back from the GPU (pixel_readback: a pixel buffer object, one or two frames late,
+//  no stall); the buffer goes to the plugin with input() (no copy). Nothing is read back while nothing is linked.
+//- Its value outputs are pure outputs in the section Values, set every frame from update().
+//- The time of the Time section (Free / Manual / Sync), the beat and the tempo of the timeline go to update() every frame.
+//- The state of the plugin beyond its controls (save / load of shz_asset_def) is saved with the generator (extra of
+//  save_state of shader_loader), buffers in it as base64 (native_state_to_json): a project is JSON text.
+//- The section Plugin: the plugin, its version and reloads, Reload plugin and Watch (a rebuilt library is loaded again
+//  by itself, std.native_reload: the object keeps running with the new code, the window is built again when the
+//  declarations changed). Over MCP: the queries get_native_plugin and reload_native_plugin.
+//The part without a window (src/__init__.native, the import of the plugin, the annotation of a control, the
+//passthrough source, the reload) is native_asset.shio.
+
+#include "engine/generators/extensions/glsl/shader_loader"
+#include "engine/generators/extensions/native/native_asset"
+
+managed native_obj = None;  //the asset object of the plugin
+native_spec = None;         //src/__init__.native: [asset, namespace, package]
+native_info = None;         //what it declares (describe())
+native_pixels = None;       //the std.buffer render() fills
+native_image = None;        //a hidden image: its texture is the input of the passthrough shader
+native_texture = None;
+native_size = None;         //the size of the texture now
+native_value_ctrls = [];    //the outputs of the values, in the order of describe().values
+native_inputs = [];         //per picture input: [copy (the hidden shader that reads it back), source (what is linked)]
+native_area = None;
+native_generator = None;
+native_last_ms = 0;
+native_stopped = false;     //an error of the plugin in update / render: it is not called again
+native_signature_now = "";  //native_signature() of the window as built
+native_reloads = 0;         //the reloads of the plugin the window knows
+native_watch_btn = None;    //Watch: a rebuilt library is loaded again by itself
+native_plugin_lbl = None;
+native_watch_ms = 0;        //the last look at the library
+native_watch_time = -1.0;   //the time of the rebuilt library at the last look (it is loaded once it stays the same)
+native_failed_time = -1.0;  //the time of a library whose reload failed (not tried again)
+
+native_error_label(section, text) {
+	section.label(text).text_color(vec4f(0.937, 0.416, 0.353, 1.0));
+	std.error(text);
+}
+
+//An error of the plugin while it runs: reported once, the plugin is not called again (its picture stays)
+native_stop(what, err) {
+	native_stopped = true;
+	std.error("Native asset " + native_info.type + ": " + what + " failed, it is stopped: " + err);
+}
+
+//A move of a control goes to the plugin; a colour also to the colour picker of the control
+native_wire_control(index, built) {
+	ctrl = built.ctrl;
+	vec_ctrls = built.vec_ctrls;
+	picker = built.color_selector;
+	sync_picker = [picker](value) {
+		if(!picker)
+			return;
+		if(value.size() == 3)
+			picker.rgb(vec3f(value[0], value[1], value[2]));
+		else if(value.size() == 4)
+			picker.rgba(vec4f(value[0], value[1], value[2], value[3]));
+	};
+	cb = [index, ctrl, vec_ctrls, sync_picker](v) {
+		if(!native_obj)
+			return;
+		value = native_control_value(ctrl, vec_ctrls);
+		//While a project or a preset loads, a value is restored, not moved: no control_changed of the plugin (a
+		//pushbutton for an action would act on the load, #770 is the same for the inputs of the desk)
+		engine = std.global("engine");
+		restoring = engine && engine.load_in_progress ? 1 : 0;
+		try {
+			native_obj.set(index, value, restoring);
+		}
+		catch(e) {
+			std.error("Native asset " + native_info.type + ": " + e);
+		}
+		sync_picker(value);
+	};
+	if(vec_ctrls) {
+		for(vc : vec_ctrls)
+			vc.callback(cb);
+		sync_picker(native_control_value(ctrl, vec_ctrls));
+	}
+	else
+		ctrl.callback(cb);
+}
+
+//A text control (C ABI 1.3): the text field of a shader's //@text; the plugin keeps it within max_length (the field
+//shows what it kept)
+native_text_control(section, index, c) {
+	ctrl = section.controltext(c.name, "uniforms").caption(c.display_name ? c.display_name : shader_uniform_caption(c.name));
+	ctrl.value(c.value);
+	ctrl.tooltip((c.doc ? c.doc + ". " : "") + "At most " + std.string(c.max_length) + " characters");
+	ctrl.callback([index, ctrl](v) {
+		if(!native_obj)
+			return;
+		engine = std.global("engine");
+		restoring = engine && engine.load_in_progress ? 1 : 0;
+		try {
+			native_obj.set(index, std.string(v ?? ""), restoring);
+			kept = native_obj.get(index);
+			if(kept != std.string(v ?? ""))
+				ctrl.value(kept);
+		}
+		catch(e) {
+			std.error("Native asset " + native_info.type + ": " + e);
+		}
+	});
+}
+
+native_resize(w, h) {
+	native_size = vec2i(w, h);
+	native_texture.size(native_size);
+}
+
+native_update_plugin_label() {
+	if(!native_plugin_lbl || !native_spec)
+		return;
+	info = std.native_plugins(native_spec.namespace);
+	if(!info)
+		return;
+	native_plugin_lbl.caption(info.name + " " + info.version + (info.reloads ? ", reloaded " + std.string(info.reloads) + "x" : ""));
+}
+
+//After a reload (of this window or of another generator of the plugin): the window is built again when the plugin now
+//declares other controls, values or inputs; a plugin that was stopped by an error gets another chance
+native_after_reload() {
+	info = std.native_plugins(native_spec.namespace);
+	if(!info || info.reloads == native_reloads)
+		return;
+	native_reloads = info.reloads;
+	native_stopped = false;
+	native_update_plugin_label();
+	if(!native_obj)
+		return;
+	if(native_signature(native_obj.describe()) != native_signature_now)
+		native_generator.request_reload(); //the module is loaded again at the start of the next frame, with its state
+}
+
+//Loads the plugin's library again (std.native_reload); the window is built again when the declarations changed.
+//[ok, report / error]
+native_reload_now() {
+	if(!native_spec)
+		return [ok = 0, error = "no plugin"];
+	res = native_reload_plugin(native_spec);
+	if(!res.ok)
+		native_failed_time = std.native_plugins(native_spec.namespace).file_time;
+	native_after_reload();
+	return res;
+}
+
+//The section Plugin: what is loaded, Reload plugin, Watch
+native_plugin_section() {
+	plugin_vec = control_area.controlvector("Plugin", "native_plugin").expanded(false);
+	plugin_vec.tooltip("The C ABI plugin of this asset: load a rebuilt library again while VibeVJ runs\n[[wiki:Assets#native-assets]]");
+	content = plugin_vec.content().layout(nanogui.layout_vertical());
+	native_plugin_lbl = content.label("");
+	reload_btn = content.button("Reload plugin").icon(nanogui.icon("sync"));
+	reload_btn.tooltip("Loads the library of the plugin again (after a build): the asset keeps its controls and state, the window is built again when its controls changed");
+	reload_btn.on_click([reload_btn]() {
+		if(nanogui.show_mode())
+			return; //show mode (#285): no editing while performing
+		native_reload_now();
+	});
+	native_watch_btn = content.pushbutton("Watch the library").pushed(true);
+	native_watch_btn.tooltip("Loads the library again by itself when it was rebuilt (not in show mode)");
+	native_update_plugin_label();
+}
+
+//Once a second: another generator reloaded the plugin, or (Watch) its library was rebuilt and its file stayed the same
+//since the last look
+native_watch() {
+	now = std.millis();
+	if(now - native_watch_ms < 1000)
+		return;
+	native_watch_ms = now;
+	info = std.native_plugins(native_spec.namespace);
+	if(!info)
+		return;
+	if(info.reloads != native_reloads)
+		native_after_reload();
+	if(!info.changed || !native_watch_btn || !native_watch_btn.pushed() || nanogui.show_mode()) {
+		native_watch_time = -1.0;
+		return;
+	}
+	if(info.file_time == native_failed_time)
+		return;
+	if(info.file_time != native_watch_time) {
+		native_watch_time = info.file_time; //still being written? the next look decides
+		return;
+	}
+	native_watch_time = -1.0;
+	native_reload_now();
+}
+
+//The MCP queries of a native asset
+native_register_queries(generator) {
+	generator.register("get_native_plugin", [], [](args) {
+		if(!native_spec)
+			return [ok = 0, error = "the plugin is not loaded"];
+		return [ok = 1, plugin = std.native_plugins(native_spec.namespace), asset = native_obj ? native_obj.describe() : None,
+			watch = native_watch_btn ? (native_watch_btn.pushed() ? 1 : 0) : 0, stopped = native_stopped ? 1 : 0];
+	}, "The C ABI plugin of this native asset: its library (path, version, reloads, changed: rebuilt since it was loaded), what the asset declares (describe()), whether Watch is on and whether the plugin was stopped by an error", "read");
+	generator.register("reload_native_plugin", [], [](args) {
+		if(nanogui.show_mode())
+			return [ok = 0, error = "show mode: no reloads while performing"];
+		return native_reload_now();
+	}, "Loads the rebuilt library of the plugin of this native asset again (std.native_reload): the asset keeps its controls, inputs and state; when it declares other controls the window is built again in the next frame. Returns the report (version, previous_version, reloads, objects) or the error (the old library then stays)", "write");
+}
+
+native_entry(generator, area, asset_dir, passthrough_path) {
+	native_area = area;
+	native_generator = generator;
+	//The plugin first: its picture inputs become samplers of the passthrough shader (ports like a shader's inputs)
+	opened = native_asset_open(asset_dir);
+	if(opened) {
+		native_spec = opened.spec;
+		native_obj = opened.obj;
+		native_info = opened.info;
+		inputs_of = native_info.inputs;
+		loader_source_filter = [inputs_of](src) { return native_passthrough_source(src, inputs_of); };
+	}
+
+	//The input of the passthrough shader is the plugin's picture, it gets no IN control of its own
+	hidden_inputs = [native_out = 1];
+	entry(generator, area, passthrough_path);
+	time_vec.visible(true); //the passthrough shader has no iTime, the plugin gets the time
+
+	section = control_area.controlvector("Controls", "uniforms").expanded(true);
+	section.tooltip("The controls the native asset declares\n[[wiki:Assets#native-assets]]");
+
+	if(!opened) {
+		native_error_label(section, "The plugin of " + fileio.pure_name(asset_dir) + " could not be loaded (the log says why)");
+		return;
+	}
+	if(native_info.doc)
+		section.tooltip(native_info.doc + "\n[[wiki:Assets#native-assets]]");
+
+	for(i, c : native_info.controls) {
+		if(c.kind == "text") {
+			native_text_control(section, i, c);
+			continue;
+		}
+		ann = native_control_annotation(c);
+		built = shader_annotation_control(section, c.name, ann.kind, ann.attrs);
+		if(!built) {
+			std.warn("Native asset " + native_info.type + ": the control " + c.name + " has the unknown kind " + c.kind);
+			continue;
+		}
+		if(c.doc)
+			built.ctrl.tooltip(c.doc);
+		native_wire_control(i, built);
+	}
+
+	if(native_info.values.size() > 0) {
+		values_vec = control_area.controlvector("Values", "native_values").expanded(true);
+		values_vec.tooltip("Numbers the native asset gives every frame: [[link]] them into controls of other generators");
+		for(vd : native_info.values) {
+			out_ctrl = values_vec.controlslider(vd.name, "native_values").min(vd["min"]).max(vd["max"]).as_output(true);
+			out_ctrl.caption(vd.display_name ? vd.display_name : shader_uniform_caption(vd.name));
+			out_ctrl.tooltip((vd.doc ? vd.doc + ". " : "") + "A [[pure output]]: [[link]] it into what should follow it");
+			native_value_ctrls.push_back(out_ctrl);
+		}
+	}
+
+	for(ind : native_info.inputs)
+		native_inputs.push_back([copy = None, source = None]);
+
+	if(native_info.pixels != "none") {
+		native_pixels = std.buffer();
+		native_image = area.image().visible(false);
+		native_texture = native_image.texture();
+		native_texture.pixel_format("rgba").component_format(native_info.pixels == "rgba32f" ? "float32" : "uint8");
+		//row 0 of the plugin is the top row; uploaded as it is it showed at the bottom of the picture
+		native_texture.flip_y(true);
+		native_resize(native_info.width, native_info.height);
+		shaders[0].shader.input("native_out", native_image);
+	}
+
+	native_signature_now = native_signature(native_info);
+	info = std.native_plugins(native_spec.namespace);
+	native_reloads = info ? info.reloads : 0;
+	native_plugin_section();
+	native_register_queries(generator);
+
+	//The plugin's own state (the cells of Life, ...) with the generator: projects and presets
+	loader_save_state = []() {
+		if(!native_obj)
+			return None;
+		data = native_obj.serialize();
+		return data.has("state") ? native_state_to_json(data.state) : None;
+	};
+	loader_load_state = [](extra) {
+		if(!native_obj || std.is_none(extra))
+			return;
+		try {
+			native_obj.deserialize([state = native_state_from_json(extra)]);
+		}
+		catch(e) {
+			std.error("Native asset " + native_info.type + ": its saved state could not be loaded: " + e);
+		}
+	};
+}
+
+//The pictures linked into the inputs to the plugin: a hidden shader per linked input draws it at the size the input
+//asks for and reads it back (pixel_readback); its buffer goes to the plugin when new pixels arrived
+native_feed_inputs() {
+	for(i, ind : native_info.inputs) {
+		st = native_inputs[i];
+		linked = shaders[0].shader.input(ind.name);
+		if(!linked) {
+			if(st.source) {
+				native_obj.input(i, None);
+				st.copy.pixel_readback(false);
+				st.copy.input("src", None);
+				st.source = None;
+			}
+			continue;
+		}
+		w = ind.width;
+		h = ind.height;
+		if(ind.follow_size && native_size) {
+			w = native_size.x;
+			h = native_size.y;
+		}
+		if(!st.copy) {
+			st.copy = native_area.shader().visible(false);
+			st.copy.keep_aspect_ratio(false);
+			st.copy.output_pixel_format("rgba");
+			st.copy.output_component_format(ind.pixels == "rgba32f" ? "float32" : "uint8");
+			st.copy.fragment_source(NATIVE_INPUT_COPY_SRC);
+		}
+		size = st.copy.render_size();
+		if(size.x != w || size.y != h)
+			st.copy.render_size(vec2i(w, h));
+		if(st.source != linked) {
+			st.copy.input("src", linked);
+			st.copy.pixel_readback(true);
+			st.source = linked;
+		}
+		pixels = st.copy.pixel_buffer();
+		//only a buffer of this size (the first frames after a link or a new size have none yet)
+		if(pixels && pixels.size() == native_input_bytes(ind.pixels, w, h)) {
+			try {
+				native_obj.input(i, pixels, w, h);
+			}
+			catch(e) {
+				std.error("Native asset " + native_info.type + ": " + e);
+			}
+		}
+	}
+}
+
+//Every frame: the time, the beat and the tempo to the plugin, its values to the outputs, its picture into the texture
+update(generator, tl_pos, pos_delta) {
+	if(!native_obj)
+		return;
+	if(native_spec)
+		native_watch();
+	if(native_stopped)
+		return;
+	if(native_info.inputs.size())
+		native_feed_inputs();
+	now = std.millis();
+	dt = native_last_ms > 0 ? (now - native_last_ms) / 1000.0 : 0.0;
+	native_last_ms = now;
+	timeline = std.global("timeline");
+	bpm = timeline ? timeline.bpm_ctrl.value() : 0.0;
+	values = None;
+	try {
+		values = native_obj.update(dt, time_ctrl.value(), tl_pos, bpm);
+	}
+	catch(e) {
+		native_stop("update", e);
+		return;
+	}
+	for(i = 0; i < math.min(values.size(), native_value_ctrls.size()); i++)
+		native_value_ctrls[i].value(values[i]);
+
+	if(!native_texture || !shaders[0].shader.rendering_enabled())
+		return;
+	w = native_info.width;
+	h = native_info.height;
+	if(native_info.follow_size) {
+		render_size = shaders[0].shader.render_size();
+		w = math.max(std.int(render_size.x), 1);
+		h = math.max(std.int(render_size.y), 1);
+	}
+	changed = 0;
+	try {
+		changed = native_obj.render(native_pixels, w, h);
+	}
+	catch(e) {
+		native_stop("render", e);
+		return;
+	}
+	if(native_size.x != w || native_size.y != h) {
+		native_resize(w, h);
+		changed = 1;
+	}
+	if(changed)
+		native_texture.upload_data(native_pixels);
+}
+
+//The module is freed (a reload of the generator, its window closed): the hidden shaders of the inputs go with the area
+on_free() {
+	native_obj = None;
+	native_inputs = [];
+}

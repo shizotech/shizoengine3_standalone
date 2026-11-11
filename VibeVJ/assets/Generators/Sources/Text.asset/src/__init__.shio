@@ -1,0 +1,499 @@
+//Text generator (the Text TOP of TouchDesigner): text as a picture, for clips, overlays and effects (#586)
+//The picture is a shader as big as the project: its fragment shader paints the Background, its render_draw callback
+//draws the text with NanoVG into the same texture (fonts of the program: Sans, Sans bold, Mono, or a .ttf / .otf
+//file). Out gives that texture, so the text goes into a Clipview, an effect or a display like any picture.
+//  Text:      lines are parted by | (or a line break); {value} is replaced by Value (Decimals), e.g. "{value} BPM"
+//  Look:      Size (pixels of a 1080p picture, so it scales with the project), Align / Vertical align around
+//             Position, Line height, Letter spacing, Rotation, Color, Outline (width, colour), Shadow (blur,
+//             distance, colour: distance 0 is a glow), Background (with alpha: 0 lets the layers below through)
+//  Animation: None, Typewriter (Chars per beat, then Hold beats, then again, with a blinking Cursor), Scroll left
+//             (a ticker), Scroll up (credits), Lines (one line at a time, a new one every Every beats), Words (one
+//             word at a time); Beat pulse makes the text jump at each beat. Time Sync counts the beats of the
+//             timeline (it stops with it), Free counts seconds (one "beat" a second). Restart starts it again.
+//update() works out what is shown (the lines, how many characters, the scroll position) into view.attr.frame; the
+//render_draw callback runs without the module scope (like on_draw), so it only reads that and the widget it captures.
+//The control IDs below are what projects, links and MIDI mappings store: keep them.
+import nanogui;
+
+using nanogui; //For nvg*
+using eigen;
+
+managed view = None;     // the shader: Background + the text, its texture is Out
+managed out = None;
+
+PANEL_W = 236;
+FONT_FACES = ["sans", "sans-bold", "mono"];
+
+text_ctrl = None;
+value_ctrl = None;
+decimals = None;
+upper = None;
+font = None;
+font_file = None;
+size = None;
+align = None;
+valign = None;
+pos_x = None;
+pos_y = None;
+line_height = None;
+spacing = None;
+rotation = None;
+color = None;
+opacity = None;
+outline = None;
+outline_color = None;
+shadow_blur = None;
+shadow_distance = None;
+shadow_color = None;
+background = None;
+animation = None;
+timing = None;
+chars_per_beat = None;
+hold = None;
+cursor = None;
+scroll_speed = None;
+every = None;
+beat_pulse = None;
+restart = None;
+
+free_time = 0.0;   // seconds since the start (Time Free)
+start_time = 0.0;  // the time Restart was pressed
+restart_was = false;
+last_ms = -1;
+last_bg = "";
+font_tried_path = "-";  // Font file: the path tried last, the one that loaded and its NanoVG name
+font_loaded_path = "";
+font_loaded_name = "";
+
+shader_src = R"(
+#version 330 core
+uniform vec4 bg;
+void main()
+{
+    fragColor = vec4(bg.rgb * bg.a, bg.a);
+}
+)";
+
+dispatcher(generator, cmd, value) {
+	if(cmd == "active") {
+		if(value && !generator.active_btn.value())
+			return None;
+		view.rendering_enabled(value);
+		return None;
+	}
+	if(cmd == "get_default_output")
+		return out;
+	//The picture alone, for vibevj_capture (engine/interfaces/ai_capture.shio)
+	if(cmd == "get_capture_widget")
+		return view;
+	return None;
+}
+
+//A colour row like the //@rgb of a shader: R, G, B (and A) sliders and a colour picker. Returns the sliders
+color_controls(parent, name, caption, tip, rgba, with_alpha) {
+	vec = parent.controlvector(name).caption(caption).tooltip(tip);
+	picker = vec.color_selector();
+	names = with_alpha ? ["R", "G", "B", "A"] : ["R", "G", "B"];
+	sliders = [];
+	cb = None;
+	for(i = 0; i < names.size(); i++)
+		sliders.push_back(vec.controlslider(names[i]).value(rgba[i]));
+	if(with_alpha) {
+		picker.rgba(vec4f(rgba[0], rgba[1], rgba[2], rgba[3]));
+		picker.on_color_change([sliders](c) {
+			sliders[0].value(c.x);
+			sliders[1].value(c.y);
+			sliders[2].value(c.z);
+			sliders[3].value(c.w);
+		});
+		cb = [sliders, picker](v) {
+			picker.rgba(vec4f(sliders[0].value(), sliders[1].value(), sliders[2].value(), sliders[3].value()));
+		};
+	}
+	else {
+		picker.rgb(vec3f(rgba[0], rgba[1], rgba[2]));
+		picker.on_color_change([sliders](c) {
+			sliders[0].value(c.x);
+			sliders[1].value(c.y);
+			sliders[2].value(c.z);
+		});
+		cb = [sliders, picker](v) {
+			picker.rgb(vec3f(sliders[0].value(), sliders[1].value(), sliders[2].value()));
+		};
+	}
+	for(s : sliders)
+		s.callback(cb);
+	return sliders;
+}
+
+rgba_of(sliders, alpha) {
+	return vec4f(sliders[0].value(), sliders[1].value(), sliders[2].value(), sliders.size() > 3 ? sliders[3].value() : alpha);
+}
+
+entry(generator, area) {
+	//Room for the controls and a picture of 16:9 beside them
+	generator.window.fixed_size(vec2i(PANEL_W + 404, 400));
+	area.layout(None);
+
+	panel = area.vscroll().anchor_left(0).anchor_top(0).anchor_bottom(0).fixed_width(PANEL_W)
+		.content().layout(nanogui.layout_vertical().spacing(4));
+
+	view = area.shader().anchor_left(PANEL_W + 4).anchor_top(0).anchor_bottom(0).anchor_right(0);
+	view.fragment_source(shader_src);
+	view.render_size(vec2i(generator.engine.project_width.value(), generator.engine.project_height.value()));
+	view.uniform("bg", vec4f(0, 0, 0, 0));
+	view.tooltip("The picture of the text, as big as the project: Out gives it");
+
+	text_ctrl = panel.controltext("Text").value("MAKE SOME|NOISE").tooltip("The text. | starts a new line; {value} is replaced by Value. [[link]] a text into it or map it");
+	val_vec = panel.controlvector("Number").tooltip("{value} in the text shows Value").expanded(false);
+	value_ctrl = val_vec.controlfloat("Value").decimals(3).tooltip("Replaces {value} in the text: [[link]] the BPM, a count, a fader into it");
+	decimals = val_vec.controlint("Decimals").min(0).max(6).value(0).tooltip("Digits after the point of Value");
+
+	look = panel.controlvector("Font").tooltip("The font and its size");
+	font = look.controlcombo("Font face").caption("Font").tooltip("Sans, Sans bold, Mono (the fonts of the program) or a font file");
+	font.items(["Sans", "Sans bold", "Mono", "Font file"]); //index-based (0 = sans, 1 = sans bold, 2 = mono, 3 = file)
+	font.value(1);
+	font_file = look.controltext("Font file").value("").tooltip("Font Font file: the path of a .ttf or .otf file (absolute, or from the folder of the program)");
+	size = look.controlslider("Size").unit("px").min(8).max(400).value(150).tooltip("The height of the letters, in pixels of a 1080p picture: it scales with the size of the project");
+	upper = look.controlbutton("Uppercase").push(1).tooltip("Shows the text in capital letters");
+	spacing = look.controlslider("Letter spacing").min(-0.2).max(1.0).value(0.02).tooltip("Space between the letters, in parts of Size");
+	line_height = look.controlslider("Line height").min(0.5).max(3.0).value(1.05).tooltip("The distance of two lines, in parts of Size");
+
+	place = panel.controlvector("Place").tooltip("Where the text stands");
+	align = place.controlcombo("Align").tooltip("Left, Center, Right of Position");
+	align.items(["Left", "Center", "Right"]).segmented(true); //index-based
+	align.value(1);
+	valign = place.controlcombo("Vertical align").tooltip("The text below (Top), around (Middle) or above (Bottom) Position");
+	valign.items(["Top", "Middle", "Bottom"]).segmented(true); //index-based
+	valign.value(1);
+	pos_x = place.controlslider("X").value(0.5).tooltip("Position across, 0 left to 1 right");
+	pos_y = place.controlslider("Y").value(0.5).tooltip("Position up and down, 0 top to 1 bottom");
+	rotation = place.controlslider("Rotation").unit("°").min(-180).max(180).value(0).tooltip("Turns the text around Position");
+
+	colors = panel.controlvector("Colors").tooltip("Colours, outline and shadow");
+	color = color_controls(colors, "Color", "Color", "The colour of the letters", [1.0, 1.0, 1.0], false);
+	opacity = colors.controlslider("Opacity").value(1.0).tooltip("0: the letters are invisible (only outline and shadow show)");
+	outline = colors.controlslider("Outline").unit("px").min(0).max(24).value(0).tooltip("A line around the letters, pixels of a 1080p picture. 0: none");
+	outline_color = color_controls(colors, "Outline color", "Outline color", "The colour of the outline", [0.0, 0.0, 0.0], false);
+	shadow_blur = colors.controlslider("Shadow blur").unit("px").min(0).max(60).value(0).tooltip("A soft copy behind the letters. With Shadow distance 0 it is a glow. 0: none");
+	shadow_distance = colors.controlslider("Shadow distance").unit("px").min(0).max(60).value(0).tooltip("How far the shadow lies down and right of the letters");
+	shadow_color = color_controls(colors, "Shadow color", "Shadow color", "The colour of the shadow or glow", [0.55, 0.3, 1.0], false);
+	background = color_controls(colors, "Background", "Background", "The colour behind the text. A: 0 lets the layers below show through", [0.0, 0.0, 0.0, 0.0], true);
+
+	anim = panel.controlvector("Animation").tooltip("How the text moves");
+	animation = anim.controlcombo("Animation").tooltip("None, Typewriter (letter by letter), Scroll left (a ticker), Scroll up (credits), Lines (one line at a time), Words (one word at a time)");
+	animation.items(["None", "Typewriter", "Scroll left", "Scroll up", "Lines", "Words"]); //index-based: new kinds only at the end
+	timing = anim.controlcombo("Time").tooltip("Sync: counts the [[beat|beats]] of the [[timeline]] and stops with it. Free: runs always, one beat a second");
+	timing.items(["Free", "Sync"]).segmented(true); //index-based (0 = free, 1 = sync)
+	chars_per_beat = anim.controlslider("Chars per beat").min(0.25).max(32).value(6).tooltip("Typewriter: how many letters come per beat");
+	hold = anim.controlslider("Hold").unit("beats").min(0).max(32).value(4).tooltip("Typewriter: how long the whole text stays before it starts again");
+	cursor = anim.controlbutton("Cursor").push(1).value(1).tooltip("Typewriter: a blinking cursor after the last letter");
+	scroll_speed = anim.controlslider("Scroll speed").min(0).max(2).value(0.25).tooltip("Scroll left / up: how far it moves per beat, in parts of the picture");
+	every = anim.controlslider("Every").unit("beats").min(0.25).max(16).value(1).tooltip("Lines / Words: beats until the next one");
+	beat_pulse = anim.controlslider("Beat pulse").value(0).tooltip("The text jumps bigger at every beat and shrinks back");
+	restart = anim.controlbutton("Restart").tooltip("Starts the animation again. Map a MIDI pad to it or [[link]] a trigger into it");
+
+	out = panel.control("OUT", "output_ctrls").caption("Out").as_output(true).tooltip("The picture of the text: [[link]] it into an input, a Clipview or a display\n[[wiki:Assets#text]]");
+	out.value(view);
+	out.callback([](v) {
+		out.value(view);
+	});
+
+	view.attr.frame = [lines = [], cursor = false];
+
+	//Runs without the module scope: only view.attr.frame and the captured view
+	view.render_draw([view]() {
+		fr = view.attr.frame;
+		if(!fr || !fr.has("lines") || fr.lines.size() == 0)
+			return;
+		rs = view.render_size();
+		W = rs.x * 1.0;
+		H = rs.y * 1.0;
+		k = H / 1080.0;
+		px = fr.font_px * k;
+
+		//A font file is loaded by update() (font_name); a window opened later loads it here once
+		face = fr.face;
+		if(fr.font_name != "") {
+			if(nvgFindFont(fr.font_name) < 0)
+				nvgCreateFont(fr.font_name, fr.font_path);
+			if(nvgFindFont(fr.font_name) >= 0)
+				face = fr.font_name;
+		}
+		nvgFontFace(face);
+		nvgFontSize(px);
+		nvgTextLetterSpacing(fr.spacing * px);
+		//1 left, 2 center, 4 right; 16 middle (each line is placed by its own middle)
+		nvgTextAlign([1, 2, 4][fr.align] + 16);
+
+		lines = fr.lines;
+		n = lines.size();
+		lh = px * fr.line_height;
+		//Typewriter: placed as the whole text, so the lines do not move while they come
+		block = math.max(n, fr.layout_lines) * lh;
+		ax = fr.x * W;
+		ay = fr.y * H;
+		top = fr.valign == 0 ? 0.0 : (fr.valign == 1 ? -block * 0.5 : -block);
+		lx = 0.0;
+
+		//Scroll left: one line that runs in from the right; Scroll up: the block runs up from below
+		if(fr.anim == 2) {
+			b = nvgTextBounds(vec2f(0, 0), lines[0]);
+			tw = b[0];
+			travel = tw + W;
+			sx = W - (fr.scroll * W - math.floor(fr.scroll * W / travel) * travel);
+			ax = 0.0;
+			nvgTextAlign(1 + 16);
+			lx = sx;
+		}
+		if(fr.anim == 3) {
+			travel = block + H;
+			sy = H - (fr.scroll * H - math.floor(fr.scroll * H / travel) * travel);
+			ay = 0.0;
+			top = sy;
+		}
+
+		nvgSave();
+		nvgTranslate(vec2f(ax, ay));
+		if(fr.rotation != 0.0)
+			nvgRotate(fr.rotation * math.PI / 180.0);
+		if(fr.pulse != 1.0)
+			nvgScale(vec2f(fr.pulse, fr.pulse));
+
+		//The cursor: a bar after the last letter of the last line (measured with the line, so it follows the alignment)
+		cur_x = 0.0;
+		cur_y = 0.0;
+		if(fr.cursor) {
+			last = lines[n - 1];
+			b = nvgTextBounds(vec2f(lx, top + (n - 0.5) * lh), last);
+			cur_x = b[3] + px * 0.06;
+			if(last == "")
+				cur_x = lx + [0.0, 0.0, 0.0][fr.align];
+			cur_y = top + (n - 0.5) * lh;
+		}
+
+		//Shadow (or glow), outline, letters: each drawn as all lines
+		passes = [];
+		if(fr.shadow_blur > 0.0 || fr.shadow_distance > 0.0)
+			passes.push_back([kind = 0]);
+		if(fr.outline > 0.0)
+			passes.push_back([kind = 1]);
+		if(fr.color.w > 0.0)
+			passes.push_back([kind = 2]);
+		for(p : passes) {
+			offsets = [vec2f(0, 0)];
+			if(p.kind == 0) {
+				nvgFontBlur(fr.shadow_blur * k);
+				nvgFillColor(fr.shadow_color);
+				d = fr.shadow_distance * k * 0.7071;
+				offsets = [vec2f(d, d)];
+				//a glow needs several soft copies to be seen: more for a wider blur
+				if(fr.shadow_distance <= 0.0) {
+					offsets = [];
+					copies = math.clamp(math.round(fr.shadow_blur / 4.0), 3, 10);
+					for(j = 0; j < copies; j++)
+						offsets.push_back(vec2f(0, 0));
+				}
+			}
+			else if(p.kind == 1) {
+				nvgFontBlur(0.0);
+				nvgFillColor(fr.outline_color);
+				r = fr.outline * k;
+				offsets = [];
+				rings = r > 6.0 ? 3 : (r > 2.5 ? 2 : 1);
+				for(ring = 1; ring <= rings; ring++) {
+					rr = r * ring / rings;
+					steps = ring == rings ? 16 : 8;
+					for(j = 0; j < steps; j++) {
+						a = j * 2.0 * math.PI / steps;
+						offsets.push_back(vec2f(math.cos(a) * rr, math.sin(a) * rr));
+					}
+				}
+			}
+			else {
+				nvgFontBlur(0.0);
+				nvgFillColor(fr.color);
+			}
+			for(o : offsets) {
+				for(i = 0; i < n; i++) {
+					if(lines[i] != "")
+						nvgText(vec2f(lx + o.x, top + (i + 0.5) * lh + o.y), lines[i]);
+				}
+				if(fr.cursor && p.kind == 2) {
+					nvgBeginPath();
+					nvgRect(vec2f(cur_x + o.x, cur_y - px * 0.36 + o.y), vec2f(math.max(px * 0.08, 2.0), px * 0.72));
+					nvgFill();
+				}
+			}
+		}
+		nvgFontBlur(0.0);
+		nvgRestore();
+	});
+}
+
+format_value(v, d) {
+	if(d <= 0)
+		return std.string(std.int(math.round(v)));
+	f = math.pow(10, d);
+	r = math.round(math.abs(v) * f);
+	whole = math.floor(r / f);
+	frac = std.string(std.int(r - whole * f));
+	for(frac.size() < d)
+		frac = "0" + frac;
+	return (v < 0 && r > 0 ? "-" : "") + std.string(std.int(whole)) + "." + frac;
+}
+
+//The characters of s as a list (UTF-8: one entry per character, not per byte)
+chars_of(s) {
+	list = [];
+	for(c : s)
+		list.push_back(c);
+	return list;
+}
+
+update(generator, tl_pos, pos_delta) {
+	if(!view)
+		return;
+	now = std.millis();
+	if(last_ms < 0)
+		last_ms = now;
+	dt = (now - last_ms) / 1000.0;
+	last_ms = now;
+	if(dt > 0.25)
+		dt = 0.25;
+	free_time += dt;
+
+	//The size of the project
+	w = generator.engine.project_width.value();
+	h = generator.engine.project_height.value();
+	rs = view.render_size();
+	if(w > 0 && h > 0 && (rs.x != w || rs.y != h))
+		view.render_size(vec2i(w, h));
+
+	bg = rgba_of(background, 1.0);
+	bg_key = std.string(bg.x) + "," + bg.y + "," + bg.z + "," + bg.w;
+	if(bg_key != last_bg) {
+		last_bg = bg_key;
+		view.uniform("bg", bg);
+	}
+
+	t_now = timing.value() == 1 ? tl_pos : free_time;
+	r = restart.value() ? true : false;
+	if(r && !restart_was)
+		start_time = t_now;
+	restart_was = r;
+	t = t_now - start_time;
+	if(t < 0.0) {
+		start_time = t_now;
+		t = 0.0;
+	}
+
+	//The text: {value}, uppercase, the lines
+	txt = std.string(text_ctrl.value() ?? "");
+	if(txt.contains("{value}"))
+		txt = txt.replace("{value}", format_value(std.float(value_ctrl.value()), decimals.value()));
+	if(upper.value())
+		txt = txt.uppercase();
+	lines = txt.replace("\r", "").replace("\n", "|").split("|");
+	if(lines.size() == 0)
+		lines = [""];
+
+	anim = animation.value();
+	show_cursor = false;
+	layout_lines = 1;
+	if(anim == 1) {
+		//Typewriter: Chars per beat, then Hold beats with all of it, then again
+		total = 0;
+		for(l : lines)
+			total += chars_of(l).size();
+		cps = math.max(chars_per_beat.value(), 0.01);
+		cycle = total / cps + hold.value();
+		tl = cycle > 0.0 ? t - math.floor(t / cycle) * cycle : 0.0;
+		left = std.int(math.min(total, math.floor(tl * cps)));
+		shown = [];
+		for(l : lines) {
+			cs = chars_of(l);
+			if(left <= 0 && shown.size() > 0)
+				break;
+			take = math.min(cs.size(), left);
+			part = "";
+			for(i = 0; i < take; i++)
+				part += cs[i];
+			shown.push_back(part);
+			left -= take;
+		}
+		layout_lines = lines.size();
+		lines = shown;
+		show_cursor = cursor.value() && (t * 2.0 - math.floor(t * 2.0)) < 0.5;
+	}
+	else if(anim == 2) {
+		//Scroll left: all lines in one row
+		lines = [lines.combine_string("     ").removesuffix("     ")];
+	}
+	else if(anim == 4) {
+		e = math.max(every.value(), 0.01);
+		lines = [lines[std.int(math.floor(t / e)) % lines.size()]];
+	}
+	else if(anim == 5) {
+		words = [];
+		for(l : lines) {
+			for(wd : l.split(" ")) {
+				if(wd != "")
+					words.push_back(wd);
+			}
+		}
+		if(words.size() == 0)
+			words = [""];
+		e = math.max(every.value(), 0.01);
+		lines = [words[std.int(math.floor(t / e)) % words.size()]];
+	}
+
+	pulse = 1.0;
+	if(beat_pulse.value() > 0.0)
+		pulse = 1.0 + beat_pulse.value() * 0.35 * math.exp(-(t_now - math.floor(t_now)) * 6.0);
+
+	ff = font.value();
+	path = std.string(font_file.value() ?? "").strip();
+	if(ff == 3 && path != font_tried_path) {
+		//Once per path: a wrong path is not read again every frame. NanoVG keeps 63 characters of a font name
+		font_tried_path = path;
+		font_loaded_path = "";
+		if(path != "" && fileio.exists(path)) {
+			font_loaded_name = "textfont_" + std.random_hash(10);
+			if(nanogui.nvgCreateFont(font_loaded_name, path) >= 0)
+				font_loaded_path = path;
+			else
+				std.warn("Text: the font file " + path + " could not be loaded");
+		}
+		else if(path != "")
+			std.warn("Text: there is no font file " + path);
+	}
+	col = rgba_of(color, 1.0);
+	col.w = opacity.value();
+
+	view.attr.frame = [
+		lines = lines,
+		layout_lines = layout_lines,
+		anim = anim,
+		scroll = t * scroll_speed.value(),
+		cursor = show_cursor,
+		face = FONT_FACES[math.clamp(ff, 0, 2)],
+		font_path = font_loaded_path,
+		font_name = (ff == 3 && font_loaded_path != "") ? font_loaded_name : "",
+		font_px = size.value(),
+		spacing = spacing.value(),
+		line_height = line_height.value(),
+		align = math.clamp(align.value(), 0, 2),
+		valign = math.clamp(valign.value(), 0, 2),
+		x = pos_x.value(),
+		y = pos_y.value(),
+		rotation = rotation.value(),
+		pulse = pulse,
+		color = col,
+		outline = outline.value(),
+		outline_color = rgba_of(outline_color, 1.0),
+		shadow_blur = shadow_blur.value(),
+		shadow_distance = shadow_distance.value(),
+		shadow_color = rgba_of(shadow_color, 1.0),
+	];
+}

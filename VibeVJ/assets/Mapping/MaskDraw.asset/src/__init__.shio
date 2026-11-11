@@ -1,0 +1,949 @@
+//MaskDraw (#586): draw a mask with the mouse for projection mapping. Rectangles, ellipses, polygons, freehand shapes
+//and a magnetic lasso that follows the edges of the Background picture (a photo of the building, the camera, the live
+//output); single points snap onto the nearest corner or edge (S). Out is the mask (white = a shape, black = free) at
+//the size of the project, the form the mask ports of the mapping shaders take; IDs is every shape in a flat colour of
+//its own (an ID map, for RegionChase). The editor is nanogui.mask_editor (modules/shzmodule_nanogui/mask_editor.h);
+//the shapes are normalized, so a new project size keeps them in place.
+//v2: curved outlines (the pen of the polygon tool, smooth points, curves fitted to a lasso), animated shapes (keys over
+//a phase driven by the Phase control, the beats or the timeline clip), following a moving Background (re-snap) and
+//SVG import / export.
+
+import nanogui;
+using eigen;
+
+managed ed = None;
+maskdraw_engine = None;
+in_ctrl = None;
+out_ctrl = None;
+ids_ctrl = None;
+
+tool_ctrl = None;
+view_ctrl = None;
+snap_btn = None;
+mode_ctrl = None;
+feather_ctrl = None;
+grow_ctrl = None;
+shape_label = None;
+syncing = false;
+opacity_ctrl = None;
+follow_shape_btn = None;
+lock_shape_btn = None;
+drive_ctrl = None;
+phase_ctrl = None;
+phase_out = None;
+beats_ctrl = None;
+pingpong_btn = None;
+key_ctrl = None;
+key_time = None;
+ease_ctrl = None;
+key_x = None;
+key_y = None;
+key_scale = None;
+key_rot = None;
+key_label = None;
+svg_path = None;
+svg_fit = None;
+svg_label = None;
+selected_key = -1;
+clip_phase = 0.0;
+curves_btn = None;
+tolerance_ctrl = None;
+follow_btn = None;
+follow_rate = None;
+follow_radius = None;
+keep_form_btn = None;
+
+TOOLS = ["select", "rect", "ellipse", "polygon", "freehand", "lasso"];
+VIEWS = ["overlay", "picture", "mask", "ids"];
+MODES = ["add", "subtract", "intersect"];
+DRIVES = ["phase", "beats", "clip"];
+EASES = ["linear", "in", "out", "inout", "smooth", "hold"];
+FITS = ["contain", "stretch", "bounds", "none"];
+SIDE_W = 240;
+ROW = 25;
+
+def sync_panel();
+def sync_keys();
+
+//A number with two decimals ("0.25")
+fmt2(x) {
+	v = std.int(math.round(math.abs(x) * 100));
+	f = v - (v / 100) * 100;
+	s = std.string(v / 100) + "." + (f < 10 ? "0" : "") + std.string(f);
+	if(x < 0 && v > 0)
+		s = "-" + s;
+	return s;
+}
+
+//The place of v in list, -1 when it is not in it
+index_of(list, v) {
+	for(i, x : list)
+		if(x == v)
+			return i;
+	return -1;
+}
+
+dispatcher(generator, cmd, value) {
+	//as a clip of the timeline: Drive "Clip" runs the keys once over the length of the clip
+	if(cmd == "clip_position" || cmd == "clip_start") {
+		clip_phase = std.float(value.pos ??? 0.0);
+		return None;
+	}
+	if(cmd == "get_default_input")
+		return in_ctrl;
+	if(cmd == "get_default_output")
+		return out_ctrl;
+	return None;
+}
+
+//One step of the undo history of the program (generators.shio, edit_step): the shapes before and after
+record(name, before, after, key = "") {
+	if(!maskdraw_engine)
+		return;
+	if(maskdraw_engine.load_in_progress)
+		return;
+	step = maskdraw_engine.env.edit_step ??? None;
+	if(!std.is_function(step))
+		return;
+	target = ed;
+	step("Mask: " + name, [target, before]() {
+		try {
+			target.set_shapes(before);
+		}
+		catch(e) {}
+		sync_panel();
+	}, [target, after]() {
+		try {
+			target.set_shapes(after);
+		}
+		catch(e) {}
+		sync_panel();
+	}, key);
+}
+
+//The shapes and the keys of the whole mask, for a step that changes both
+mask_state() {
+	return [shapes = ed.shapes(), mask_keys = ed.keys(-1)];
+}
+
+record_state(name, before, after, key = "") {
+	if(!maskdraw_engine || maskdraw_engine.load_in_progress)
+		return;
+	if(before.compact_string() == after.compact_string())
+		return;
+	step = maskdraw_engine.env.edit_step ??? None;
+	if(!std.is_function(step))
+		return;
+	target = ed;
+	step("Mask: " + name, [target, before]() {
+		try {
+			target.set_shapes(before.shapes);
+			target.set_mask_keys(before.mask_keys);
+		}
+		catch(e) {}
+		sync_panel();
+	}, [target, after]() {
+		try {
+			target.set_shapes(after.shapes);
+			target.set_mask_keys(after.mask_keys);
+		}
+		catch(e) {}
+		sync_panel();
+	}, key);
+}
+
+//The keys the panel shows: of the selected shape, of the whole mask without a selection
+key_target() {
+	return ed.selected();
+}
+
+//The key list and the fields of the selected key
+sync_keys() {
+	if(!ed || !key_ctrl)
+		return;
+	syncing = true;
+	t = key_target();
+	keys = ed.keys(t);
+	items = [];
+	for(i, k : keys)
+		items.push_back((i + 1) + ": " + fmt2(k.time) + " " + k.ease);
+	if(keys.size() == 0) {
+		items.push_back("No keys");
+		selected_key = -1;
+	}
+	else if(selected_key < 0 || selected_key >= keys.size()) {
+		//the key nearest to the phase
+		selected_key = 0;
+		for(i, k : keys)
+			if(math.abs(k.time - ed.phase()) < math.abs(keys[selected_key].time - ed.phase()))
+				selected_key = i;
+	}
+	key_ctrl.items(items);
+	key_ctrl.value(math.max(0, selected_key));
+	k = selected_key >= 0 ? keys[selected_key] : None;
+	key_label.caption((t >= 0 ? "Keys of " + ed.shape(t).name : "Keys of the whole mask") + ", phase " + fmt2(ed.phase()));
+	key_time.value(k ? k.time : ed.phase());
+	ease_ctrl.value(k ? math.max(0, index_of(EASES, k.ease)) : 3);
+	key_x.value(k ? k.offset[0] * 100.0 : 0.0);
+	key_y.value(k ? k.offset[1] * 100.0 : 0.0);
+	key_scale.value(k ? k.scale[0] * 100.0 : 100.0);
+	key_rot.value(k ? k.rotation : 0.0);
+	syncing = false;
+}
+
+//A field of the selected key changed: one step per key and field while it is dragged
+apply_key(field, value) {
+	if(syncing || !ed || selected_key < 0)
+		return;
+	t = key_target();
+	keys = ed.keys(t);
+	if(selected_key >= keys.size())
+		return;
+	k = keys[selected_key];
+	change = std.json();
+	if(field == "x")
+		change.offset = [value / 100.0, k.offset[1]];
+	else if(field == "y")
+		change.offset = [k.offset[0], value / 100.0];
+	else if(field == "scale")
+		change.scale = [value / 100.0, value / 100.0];
+	else
+		change[field] = value;
+	before = mask_state();
+	selected_key = ed.set_key(t, selected_key, change);
+	record_state("Key " + field, before, mask_state(), "maskdraw_key_" + field + "_" + t);
+	sync_keys();
+}
+
+//The phase the keys are shown at: the Phase control, the beats (a loop of Beats beats) or the clip on the timeline
+drive_phase(tl_pos) {
+	d = drive_ctrl ? std.int(drive_ctrl.value()) : 0;
+	if(d == 1) {
+		n = math.max(0.25, std.float(beats_ctrl.value()));
+		if(pingpong_btn.value()) {
+			u = math.mod(tl_pos, 2.0 * n) / n;
+			return u <= 1.0 ? u : 2.0 - u;
+		}
+		return math.mod(tl_pos, n) / n;
+	}
+	if(d == 2)
+		return clip_phase;
+	return std.float(phase_ctrl.value());
+}
+
+//The settings of the selected shape in the panel; without a selection they are the ones new shapes get
+sync_panel() {
+	if(!ed || !mode_ctrl)
+		return;
+	syncing = true;
+	i = ed.selected();
+	s = i >= 0 ? ed.shape(i) : None;
+	if(s) {
+		//an animated shape shows (and changes) what it is at the phase now
+		now = ed.pose(i) ?? s;
+		keys = s.keys ??? [];
+		shape_label.caption(s.name + " (" + s.tool + ", " + (s.type == "ellipse" ? "ellipse" : s.points.size() + " points") + (s.has("handles") ? ", curved" : "") + (keys.size() > 0 ? ", " + keys.size() + " keys" : "") + ")");
+		mode_ctrl.value(math.max(0, index_of(MODES, s.mode)));
+		feather_ctrl.value(now.feather);
+		grow_ctrl.value(now.grow);
+		opacity_ctrl.value(now.opacity ??? 1.0);
+		follow_shape_btn.value((s.follow ??? 0) ? 1 : 0);
+		lock_shape_btn.value((s.locked ??? 0) ? 1 : 0);
+	}
+	else {
+		shape_label.caption("No shape selected: these are for new shapes");
+		mode_ctrl.value(math.max(0, index_of(MODES, ed.new_shape_mode())));
+		feather_ctrl.value(ed.new_shape_feather());
+		grow_ctrl.value(ed.new_shape_grow());
+		opacity_ctrl.value(1.0);
+		follow_shape_btn.value(0);
+		lock_shape_btn.value(0);
+	}
+	syncing = false;
+	sync_keys();
+}
+
+//A setting of the panel changed: on the selected shape (one step per shape and setting while it is dragged), else
+//for new shapes
+apply_setting(key, value) {
+	if(syncing || !ed)
+		return;
+	i = ed.selected();
+	if(i < 0) {
+		if(key == "mode")
+			ed.new_shape_mode(value);
+		else if(key == "feather")
+			ed.new_shape_feather(value);
+		else if(key == "grow")
+			ed.new_shape_grow(value);
+		return;
+	}
+	before = ed.shapes();
+	change = std.json();
+	change[key] = value;
+	ed.set_shape(i, change);
+	names = [mode = "Shape mode", feather = "Feather", grow = "Grow", opacity = "Opacity", follow = "Follow", locked = "Lock"];
+	record(names[key] ??? key, before, ed.shapes(), "maskdraw_" + key + "_" + i);
+	if(key == "follow" || key == "locked")
+		sync_panel();
+}
+
+//A command of the panel (order, delete, ...) as one step
+panel_action(name, action) {
+	if(!ed)
+		return;
+	before = ed.shapes();
+	action();
+	after = ed.shapes();
+	if(before.compact_string() != after.compact_string())
+		record(name, before, after);
+	sync_panel();
+}
+
+//Builds a lasso outline through anchor points along the edges of the Background: every part between two anchors is
+//the path the lasso takes (the same as with the mouse)
+lasso_through(points, width) {
+	//every anchor first onto the nearest corner or edge, as a click of the lasso goes onto the edge near it
+	anchors = [];
+	for(p : points)
+		anchors.push_back(ed.snap_point(p, width, true) ??? p);
+	outline = [];
+	n = anchors.size();
+	for(i = 0; i < n; i++) {
+		a = anchors[i];
+		b = anchors[(i + 1) % n];
+		part = ed.lasso_path(a, b, width);
+		for(k = 0; k < part.size() - 1; k++)
+			outline.push_back(part[k]);
+	}
+	return outline;
+}
+
+describe_shapes() {
+	return [shapes = ed.shapes(), selected = ed.selected(), selected_point = ed.selected_point(), tool = ed.tool(),
+		view = ed.view(), invert = ed.invert(), output_size = [ed.output_size().x, ed.output_size().y],
+		edges_ready = ed.edges_ready(), background = ed.input() ? 1 : 0, view_rect = ed.view_rect(),
+		drafting = ed.drafting(), draft = ed.draft_points(), phase = ed.phase(), animated = ed.animated(),
+		drive = DRIVES[math.clamp(std.int(drive_ctrl.value()), 0, 2)], poses = ed.animated() ? ed.poses() : None,
+		mask_keys = ed.keys(-1), lasso_curves = ed.lasso_curves(), follow = ed.follow()];
+}
+
+describe_animation(t) {
+	return [ok = true, shape = t, keys = ed.keys(t), phase = ed.phase(), drive = DRIVES[math.clamp(std.int(drive_ctrl.value()), 0, 2)],
+		beats = beats_ctrl.value(), pingpong = pingpong_btn.value(), pose = t >= 0 ? ed.pose(t) : None];
+}
+
+//The queries for the AI and MCP (vibevj_query)
+register_queries(generator) {
+	generator.register("mask_shapes", [], [](args) {
+		return [ok = true, value = describe_shapes()];
+	}, "The shapes of the mask (normalized 0..1 from the top left of the picture; type polygon with points or ellipse with center, radius, angle; mode add / subtract / intersect; feather, grow in pixels of the output), the selection, the tool, the output size, whether the edges of the Background are ready for mask_lasso / mask_snap, view_rect: where the output is on the screen [x, y, w, h] (window pixels, for driving the mouse)");
+
+	generator.register("mask_add_shape", [shape = "&json(): [type = \"polygon\", points = [[x, y], ...]] or [type = \"rect\", min = [x, y], max = [x, y]] or [type = \"ellipse\", center = [x, y], radius = [rx, ry], angle = deg]; optional mode (add, subtract, intersect), feather, grow, name, color \"#rrggbb\" (IDs)"], [](args) {
+		before = ed.shapes();
+		i = -1;
+		try {
+			i = ed.add_shape(args.shape);
+		}
+		catch(e) {
+			return [ok = false, error = e];
+		}
+		ed.selected(i);
+		record("Add shape", before, ed.shapes());
+		sync_panel();
+		return [ok = true, index = i, value = ed.shape(i)];
+	}, "Adds a shape on top of the others (a step of the undo history)");
+
+	generator.register("mask_set_shape", [index = "&int(): Index (mask_shapes)", shape = "&json(): The keys to change, as in mask_add_shape"], [](args) {
+		before = ed.shapes();
+		try {
+			ed.set_shape(std.int(args.index), args.shape);
+		}
+		catch(e) {
+			return [ok = false, error = e];
+		}
+		record("Change shape", before, ed.shapes());
+		sync_panel();
+		return [ok = true, value = ed.shape(std.int(args.index))];
+	}, "Changes keys of a shape: points, mode, feather, grow, visible, name, color (a step of the undo history)");
+
+	generator.register("mask_remove_shape", [index = "&int(): Index (mask_shapes); -1 removes all"], [](args) {
+		before = ed.shapes();
+		i = std.int(args.index);
+		if(i < 0)
+			ed.set_shapes([]);
+		else if(!ed.remove_shape(i))
+			return [ok = false, error = "no shape " + i];
+		record(i < 0 ? "Remove all shapes" : "Remove shape", before, ed.shapes());
+		sync_panel();
+		return [ok = true, count = ed.shape_count()];
+	}, "Removes a shape, or all (a step of the undo history)");
+
+	generator.register("mask_lasso", [points = "&array(): Anchor points [[x, y], ...] 0..1 around the shape, at least 3; the outline runs from each to the next along the strongest edges of the Background", width = "int(): How far (pixels of the edge map) the path may leave the straight way (default 16)", mode = "string(): add, subtract or intersect (default add)", add = "int(): 0 only returns the outline (default 1: adds it as a shape)"], [](args) {
+		if(!ed.edges_ready()) {
+			ed.refresh_edges();
+			return [ok = false, error = "the edges of the Background are not read yet (is a picture linked into Background?): try again in a moment"];
+		}
+		if(args.points.size() < 3)
+			return [ok = false, error = "points: at least 3"];
+		outline = lasso_through(args.points, std.int(args.width ?? 16));
+		if((args.add ??? 1) == 0)
+			return [ok = true, points = outline];
+		before = ed.shapes();
+		i = ed.add_shape([type = "polygon", tool = "lasso", points = outline, mode = args.mode ?? "add"]);
+		ed.selected(i);
+		record("Draw lasso", before, ed.shapes());
+		sync_panel();
+		return [ok = true, index = i, points = outline.size()];
+	}, "Draws a magnetic lasso shape through anchor points, like the Lasso tool with the mouse: between two anchors the outline follows the edges of the Background");
+
+	generator.register("mask_snap", [point = "&array(): [x, y] 0..1", radius = "float(): Search radius in pixels of the edge map (default 12)", corners = "int(): 1 corners first (default), 0 only edges"], [](args) {
+		if(!ed.edges_ready()) {
+			ed.refresh_edges();
+			return [ok = false, error = "the edges of the Background are not read yet: try again in a moment"];
+		}
+		p = ed.snap_point(args.point, std.float(args.radius ?? 12.0), (args.corners ??? 1) != 0);
+		return [ok = true, value = p, found = p != None];
+	}, "The nearest corner or strong edge of the Background near a point (None when there is none)");
+
+	generator.register("mask_value", [points = "&array(): [[x, y], ...] 0..1"], [](args) {
+		values = [];
+		ids = [];
+		for(p : args.points) {
+			values.push_back(ed.mask_value(p));
+			ids.push_back(ed.id_value(p));
+		}
+		return [ok = true, values = values, ids = ids];
+	}, "The mask (0 black .. 1 white) and the colour of the IDs (0xRRGGBB as a number, 0: no shape) at points, as the outputs give them");
+
+	generator.register("mask_tool", [tool = "string(): select, rect, ellipse, polygon, freehand, lasso", view = "string(): overlay, picture, mask, ids", snap_points = "int(): 1 polygon points snap onto corners and edges", lasso_curves = "int(): 1 a lasso / freehand outline is fitted with Bezier curves", curve_tolerance = "float(): How far (pixels of the output) the curves may leave the drawn path"], [](args) {
+		if(args.has("tool") && index_of(TOOLS, args.tool) >= 0)
+			tool_ctrl.value(index_of(TOOLS, args.tool));
+		if(args.has("view") && index_of(VIEWS, args.view) >= 0)
+			view_ctrl.value(index_of(VIEWS, args.view));
+		if(args.has("snap_points"))
+			snap_btn.value(std.int(args.snap_points) != 0 ? 1 : 0);
+		if(args.has("lasso_curves"))
+			curves_btn.value(std.int(args.lasso_curves) != 0 ? 1 : 0);
+		if(args.has("curve_tolerance"))
+			tolerance_ctrl.value(std.float(args.curve_tolerance));
+		return [ok = true, value = describe_shapes()];
+	}, "Sets the tool of the mouse and what the editor shows");
+
+	generator.register("mask_smooth", [index = "&int(): Shape (mask_shapes)", point = "&int(): Point of it", smooth = "int(): 1 smooth (handles along the line between its neighbours, default), 0 a corner"], [](args) {
+		before = ed.shapes();
+		try {
+			ed.smooth_point(std.int(args.index), std.int(args.point), (args.smooth ??? 1) != 0);
+		}
+		catch(e) {
+			return [ok = false, error = e];
+		}
+		record("Smooth point", before, ed.shapes());
+		sync_panel();
+		return [ok = true, value = ed.shape(std.int(args.index))];
+	}, "Makes a point of a polygon smooth (a curve through it) or a corner (a step of the undo history). Handles of every point can also be set with mask_set_shape: handles [[in x, in y, out x, out y], ...] offsets from the points, smooth [0 / 1, ...]");
+
+	generator.register("mask_keys", [index = "int(): Shape (mask_shapes); -1 or none: the keys of the whole mask"], [](args) {
+		t = std.int(args.index ??? -1);
+		if(t >= ed.shape_count())
+			return [ok = false, error = "no shape " + t];
+		return describe_animation(t);
+	}, "The keys of an animated shape or of the whole mask (time 0..1, ease to the next key, offset [x, y] normalized, scale [x, y], rotation degrees, opacity; a shape's keys also points / handles / center / radius / angle, feather, grow), the phase now and what drives it, the shape as it is shown now (pose)");
+
+	generator.register("mask_add_key", [index = "&int(): Shape (mask_shapes); -1: the whole mask", time = "float(): The phase 0..1 of the key (default: the phase now)", key = "json(): Values of the key to set right away: offset, scale, rotation, opacity, ease, feather, grow, points, handles, center, radius, angle"], [](args) {
+		t = std.int(args.index);
+		if(t >= ed.shape_count())
+			return [ok = false, error = "no shape " + t];
+		before = mask_state();
+		i = -1;
+		try {
+			i = ed.add_key(t, args.has("time") ? std.float(args.time) : ed.phase());
+			if(args.has("key"))
+				i = ed.set_key(t, i, args.key);
+		}
+		catch(e) {
+			return [ok = false, error = e];
+		}
+		record_state("Add key", before, mask_state());
+		selected_key = i;
+		sync_panel();
+		r = describe_animation(t);
+		r.index = i;
+		return r;
+	}, "Adds a key to a shape (or the whole mask) holding what it is at that phase (the first key of a still shape: as it is); a key at that time is replaced. A step of the undo history. A shape with keys changes only by its keys: mouse edits, mask_set_shape and the panel write into the key at the phase now (one is made there)");
+
+	generator.register("mask_set_key", [index = "&int(): Shape (mask_shapes); -1: the whole mask", key_index = "&int(): The key (mask_keys)", key = "&json(): The values to change: time, ease (linear, in, out, inout, smooth, hold), offset [x, y], scale [x, y] or a number, rotation, opacity, feather, grow, points, handles, center, radius, angle"], [](args) {
+		t = std.int(args.index);
+		before = mask_state();
+		i = -1;
+		try {
+			i = ed.set_key(t, std.int(args.key_index), args.key);
+		}
+		catch(e) {
+			return [ok = false, error = e];
+		}
+		record_state("Change key", before, mask_state());
+		selected_key = i;
+		sync_panel();
+		r = describe_animation(t);
+		r.index = i;
+		return r;
+	}, "Changes a key of a shape or of the whole mask (a step of the undo history)");
+
+	generator.register("mask_remove_key", [index = "&int(): Shape (mask_shapes); -1: the whole mask", key_index = "int(): The key (mask_keys); -1: all of them"], [](args) {
+		t = std.int(args.index);
+		before = mask_state();
+		k = std.int(args.key_index ??? -1);
+		if(k < 0)
+			ed.clear_keys(t);
+		else if(!ed.remove_key(t, k))
+			return [ok = false, error = "no key " + k];
+		record_state(k < 0 ? "Remove keys" : "Remove key", before, mask_state());
+		selected_key = -1;
+		sync_panel();
+		return describe_animation(t);
+	}, "Removes a key (or all keys) of a shape or of the whole mask; a shape without keys stays as it was shown (a step of the undo history)");
+
+	generator.register("mask_phase", [phase = "float(): Sets the Phase control (0..1, Drive phase)", drive = "string(): phase (the Phase control, linkable: an envelope of the timeline, an LFO), beats (a loop of Beats beats of the timeline), clip (once over the clip when MaskDraw is a clip on the timeline)", beats = "float(): The beats of one loop (Drive beats)", pingpong = "int(): 1 the loop runs forth and back"], [](args) {
+		if(args.has("drive") && index_of(DRIVES, args.drive) >= 0)
+			drive_ctrl.value(index_of(DRIVES, args.drive));
+		if(args.has("beats"))
+			beats_ctrl.value(std.float(args.beats));
+		if(args.has("pingpong"))
+			pingpong_btn.value(std.int(args.pingpong) != 0 ? 1 : 0);
+		if(args.has("phase")) {
+			phase_ctrl.value(std.float(args.phase));
+			if(std.int(drive_ctrl.value()) == 0)
+				ed.phase(std.float(args.phase));
+		}
+		return describe_animation(-1);
+	}, "What drives the keys of the animated shapes and the phase now (the mask follows in the next frame)");
+
+	generator.register("mask_follow", [index = "int(): Shape (mask_shapes) whose follow / locked is set; -1: none", follow = "int(): 1 the shape re-snaps onto the moving Background", locked = "int(): 1 the shape is never moved by following or re-snapping", on = "int(): 1 following runs (continuously, Rate times a second)", rate = "float(): Steps a second", radius = "float(): How far (pixels of the output) a shape may move in one step", keep_form = "int(): 1 only moved as a whole (default), 0 its points also go onto the edges", rotate = "int(): 1 it may turn", scale = "int(): 1 it may grow / shrink", resnap = "int(): 1 re-snap now (index, or every shape that follows) onto the frame now, a step of the undo history"], [](args) {
+		t = std.int(args.index ??? -1);
+		if(t >= 0 && t < ed.shape_count() && (args.has("follow") || args.has("locked"))) {
+			before = ed.shapes();
+			change = std.json();
+			if(args.has("follow"))
+				change.follow = std.int(args.follow) != 0 ? 1 : 0;
+			if(args.has("locked"))
+				change.locked = std.int(args.locked) != 0 ? 1 : 0;
+			ed.set_shape(t, change);
+			record("Follow", before, ed.shapes());
+		}
+		if(args.has("on"))
+			follow_btn.value(std.int(args.on) != 0 ? 1 : 0);
+		if(args.has("rate"))
+			follow_rate.value(std.float(args.rate));
+		if(args.has("radius"))
+			follow_radius.value(std.float(args.radius));
+		if(args.has("keep_form"))
+			keep_form_btn.value(std.int(args.keep_form) != 0 ? 1 : 0);
+		if(args.has("rotate"))
+			ed.follow_rotate(std.int(args.rotate) != 0);
+		if(args.has("scale"))
+			ed.follow_scale(std.int(args.scale) != 0);
+		if((args.resnap ??? 0) != 0)
+			ed.resnap(t);
+		sync_panel();
+		return [ok = true, on = ed.follow(), rate = ed.follow_rate(), radius = ed.follow_radius(), keep_form = ed.follow_keep_form(),
+			rotate = ed.follow_rotate(), scale = ed.follow_scale(), shapes = ed.shapes()];
+	}, "The live video lasso: shapes with follow on re-snap onto the edges of the moving Background (track an object that moves a few pixels a frame), locked ones never move");
+
+	generator.register("mask_svg", [import_path = "string(): An SVG file to read (paths, polygons, rects, circles, ellipses, groups with transforms)", text = "string(): The SVG itself instead of a file", fit = "string(): contain (default: its viewBox into the output keeping the aspect), stretch, bounds (the box of its shapes), none (SVG units = pixels)", replace = "int(): 1 the shapes there were are removed", export_path = "string(): Write the shapes as an SVG into this file"], [](args) {
+		r = [ok = true];
+		if(args.has("import_path") || args.has("text")) {
+			text = args.text ?? "";
+			if(args.has("import_path")) {
+				if(!fileio.exists(args.import_path))
+					return [ok = false, error = "no file " + args.import_path];
+				text = fileio.read_string(args.import_path);
+			}
+			try {
+				r.imported = ed.svg_import(text, args.fit ?? "contain", (args.replace ??? 0) != 0);
+			}
+			catch(e) {
+				return [ok = false, error = e];
+			}
+			sync_panel();
+		}
+		if(args.has("export_path")) {
+			fileio.write_string(args.export_path, ed.svg_export());
+			r.exported = args.export_path;
+		}
+		else if(!args.has("import_path") && !args.has("text"))
+			r.svg = ed.svg_export();
+		r.count = ed.shape_count();
+		return r;
+	}, "SVG import (a step of the undo history) and export (the shapes as they are shown now, pixels of the output; mode, feather, grow and names in data-mask-* attributes, which the import reads back). Without arguments it returns the SVG text");
+}
+
+entry(generator, area) {
+	maskdraw_engine = generator.engine;
+	if(generator.window)
+		generator.window.fixed_size(vec2f(980, 640));
+	register_queries(generator);
+	area.layout(None);
+
+	//The bar: tool and view
+	bar = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(ROW).layout(nanogui.layout_horizontal().spacing(6));
+	tool_ctrl = bar.controlcombo("Tool", "maskdraw").caption("Tool").items(["Select", "Rect", "Ellipse", "Polygon", "Freehand", "Lasso"]).segmented(true).fixed_width(470)
+		.tooltip("What the mouse does on the picture. Select (V): pick a shape, drag it or its points. Rect (R), Ellipse (E): drag. Polygon (P): click the points. Freehand (F): draw with the button held. Lasso (L): click, then move along an edge of the picture, the outline follows it\n[[wiki:Output-and-Devices#drawing-a-mask-maskdraw]]");
+	tool_ctrl.undoable(false).no_load_callbacks();
+	view_ctrl = bar.controlcombo("View", "maskdraw").caption("Show").items(["Overlay", "Picture", "Mask", "IDs"]).segmented(true).fixed_width(300)
+		.tooltip("What is under the outlines: the Background with the mask over it, the Background only, the mask (Out), the IDs (every shape in its own colour)");
+	view_ctrl.undoable(false);
+
+	//The editor
+	ed = area.mask_editor().anchor_left(0).anchor_top(ROW + 2).anchor_right(SIDE_W + 4).anchor_bottom(ROW + 2);
+	//no tooltip: it would come up while you draw; the line at the bottom of the editor says what the tool does
+	ed.output_size(vec2i(maskdraw_engine.project_width.value(), maskdraw_engine.project_height.value()));
+
+	tool_ctrl.callback([](v) {
+		i = std.int(v);
+		if(i >= 0 && i < TOOLS.size() && ed.tool() != TOOLS[i])
+			ed.tool(TOOLS[i]);
+	});
+	ed.on_tool([](name) {
+		i = index_of(TOOLS, name);
+		if(i >= 0 && std.int(tool_ctrl.value()) != i)
+			tool_ctrl.value(i);
+	});
+	view_ctrl.callback([](v) {
+		i = std.int(v);
+		if(i >= 0 && i < VIEWS.size())
+			ed.view(VIEWS[i]);
+	});
+	ed.on_edit([](name, before, after) {
+		record(name, before, after);
+		sync_panel();
+	});
+	ed.on_select([](shape, point) {
+		selected_key = -1;
+		sync_panel();
+	});
+
+	//The panel: the selected shape, snapping, the whole mask
+	side = area.vscroll().anchor_right(0).anchor_top(ROW + 2).anchor_bottom(ROW + 2).fixed_width(SIDE_W);
+	panel = side.content().layout(nanogui.layout_vertical().spacing(4));
+	panel.label("Shape").font_size(15);
+	shape_label = panel.label("No shape selected").wrap(true);
+	mode_ctrl = panel.controlcombo("Mode", "maskdraw_shape").caption("Mode").items(["Add", "Subtract", "Intersect"]).segmented(true).fixed_height(ROW)
+		.tooltip("Add: the shape is white. Subtract: a hole in what the shapes before it made. Intersect: only what is inside it stays. Shapes are applied in their order (X switches add / subtract)");
+	mode_ctrl.undoable(false).no_load_callbacks();
+	mode_ctrl.callback([](v) {
+		apply_setting("mode", MODES[math.clamp(std.int(v), 0, 2)]);
+	});
+	feather_ctrl = panel.controlfloat("Feather", "maskdraw_shape").caption("Feather").unit("px").fixed_height(ROW)
+		.tooltip("A soft edge this many pixels of the output wide (0: sharp, anti-aliased)");
+	feather_ctrl.undoable(false).no_load_callbacks();
+	feather_ctrl.callback([](v) {
+		apply_setting("feather", math.max(0.0, std.float(v)));
+	});
+	grow_ctrl = panel.controlfloat("Grow", "maskdraw_shape").caption("Grow").unit("px").fixed_height(ROW)
+		.tooltip("Moves the edge of the shape out by this many pixels of the output (negative: in), for a mask a little larger or smaller than what you traced");
+	grow_ctrl.undoable(false).no_load_callbacks();
+	grow_ctrl.callback([](v) {
+		apply_setting("grow", std.float(v));
+	});
+	opacity_ctrl = panel.controlslider("Opacity", "maskdraw_shape").caption("Opacity").value(1.0).fixed_height(ROW)
+		.tooltip("How much of the shape reaches the mask (0: none). With keys it fades over the phase");
+	opacity_ctrl.undoable(false).no_load_callbacks();
+	opacity_ctrl.callback([](v) {
+		apply_setting("opacity", math.clamp(std.float(v), 0.0, 1.0));
+	});
+
+	order = panel.widget().fixed_height(ROW).layout(nanogui.layout_horizontal().spacing(4));
+	up_btn = order.button("Up").fixed_width(52).tooltip("Later in the order: applied after the shapes below it (])");
+	up_btn.on_click([]() {
+		i = ed.selected();
+		if(i >= 0)
+			panel_action("Order of shapes", [i]() { ed.move_shape(i, i + 1); ed.selected(math.min(i + 1, ed.shape_count() - 1)); });
+	});
+	down_btn = order.button("Down").fixed_width(52).tooltip("Earlier in the order ([)");
+	down_btn.on_click([]() {
+		i = ed.selected();
+		if(i >= 0)
+			panel_action("Order of shapes", [i]() { ed.move_shape(i, i - 1); ed.selected(math.max(i - 1, 0)); });
+	});
+	hide_btn = order.button("Hide").fixed_width(52).tooltip("Switches the selected shape off and on (H): it stays, the mask leaves it out");
+	hide_btn.on_click([]() {
+		i = ed.selected();
+		if(i >= 0)
+			panel_action("Hide shape", [i]() { ed.set_shape(i, [visible = !ed.shape(i).visible]); });
+	});
+	del_btn = order.button("Delete").fixed_width(60).tooltip("Removes the selected shape (Delete; with a point selected the point first)");
+	del_btn.on_click([]() {
+		i = ed.selected();
+		if(i >= 0)
+			panel_action("Delete shape", [i]() { ed.remove_shape(i); });
+	});
+	row2 = panel.widget().fixed_height(ROW).layout(nanogui.layout_horizontal().spacing(4));
+	smooth_btn = row2.button("Smooth").fixed_width(70).tooltip("The selected point smooth (a curve through it, with handles) or back to a corner (C; Shift+C: every point of the shape; Alt+click a point). Drag a handle to bend the curve, Alt+drag: only that side");
+	smooth_btn.on_click([]() {
+		i = ed.selected();
+		p = ed.selected_point();
+		if(i < 0 || p < 0)
+			return;
+		s = ed.pose(i);
+		curved = s.has("handles") && (s.handles[p][0] != 0 || s.handles[p][1] != 0 || s.handles[p][2] != 0 || s.handles[p][3] != 0);
+		panel_action(curved ? "Corner point" : "Smooth point", [i, p, curved]() { ed.smooth_point(i, p, !curved); });
+	});
+	follow_shape_btn = row2.controlbutton("Follows", "maskdraw_shape").caption("Follows").push(1).fixed_width(80)
+		.tooltip("The shape re-snaps onto the edges of the Background while Follow the picture is on: it tracks a moving object (Following, below)");
+	follow_shape_btn.undoable(false).no_load_callbacks();
+	follow_shape_btn.callback([](v) {
+		apply_setting("follow", v ? 1 : 0);
+	});
+	lock_shape_btn = row2.controlbutton("Lock", "maskdraw_shape").caption("Lock").push(1).fixed_width(70)
+		.tooltip("Following and re-snapping never move this shape");
+	lock_shape_btn.undoable(false).no_load_callbacks();
+	lock_shape_btn.callback([](v) {
+		apply_setting("locked", v ? 1 : 0);
+	});
+
+	panel.label("Snapping").font_size(15);
+	snap_btn = panel.controlbutton("Snap points", "maskdraw").caption("Snap points").push(1).fixed_height(ROW)
+		.tooltip("Polygon points and dragged points jump onto the nearest corner or edge of the Background (Shift turns it around for one click)");
+	snap_btn.callback([](v) {
+		ed.snap_points(v);
+	});
+	snap_sel = panel.button("Snap selected points").fixed_height(ROW).tooltip("The selected point onto the nearest corner or edge of the Background (S); with no point selected every point of the shape (Shift+S)");
+	snap_sel.on_click([]() {
+		ed.refresh_edges();
+		ed.snap_selected(ed.selected_point() < 0);
+		sync_panel();
+	});
+	snap_radius = panel.controlfloat("Snap radius", "maskdraw").caption("Snap radius").unit("px").value(12).fixed_height(ROW)
+		.tooltip("How far (pixels of the screen) a point looks for a corner or an edge");
+	snap_radius.callback([](v) {
+		ed.snap_radius(math.max(1.0, std.float(v)));
+	});
+	lasso_width = panel.controlfloat("Lasso width", "maskdraw").caption("Lasso width").unit("px").value(10).fixed_height(ROW)
+		.tooltip("How far (pixels of the screen) around the cursor the lasso looks for the edge to follow: small for edges close together, large for a rough hand");
+	lasso_width.callback([](v) {
+		ed.lasso_width(math.max(1.0, std.float(v)));
+	});
+	lasso_spacing = panel.controlfloat("Lasso spacing", "maskdraw").caption("Lasso points").unit("px").value(40).fixed_height(ROW)
+		.tooltip("Every how many pixels of the screen the lasso fixes a point by itself while you move; click to fix one yourself");
+	lasso_spacing.callback([](v) {
+		ed.lasso_spacing(math.max(5.0, std.float(v)));
+	});
+	edges_btn = panel.button("Read the picture again").fixed_height(ROW).tooltip("The lasso and the snapping follow a still of the Background, taken when a lasso starts. This takes a new one now (after the picture changed)");
+	edges_btn.on_click([]() {
+		ed.refresh_edges();
+	});
+
+	panel.label("Curves").font_size(15);
+	curves_btn = panel.controlbutton("Lasso curves", "maskdraw").caption("Lasso curves").push(1).fixed_height(ROW)
+		.tooltip("A lasso or freehand outline becomes a few Bezier curves (smooth, easy to edit) instead of many short lines; corners stay corners. The Polygon tool makes curves by dragging: a click is a corner, press and drag pulls out the handles of a smooth point");
+	curves_btn.callback([](v) {
+		ed.lasso_curves(v);
+	});
+	tolerance_ctrl = panel.controlfloat("Curve tolerance", "maskdraw").caption("Curve tolerance").unit("px").value(1.0).fixed_height(ROW)
+		.tooltip("How far (pixels of the output) the fitted curves may leave the drawn path: small follows every bump, large gives fewer points");
+	tolerance_ctrl.callback([](v) {
+		ed.curve_tolerance(math.max(0.05, std.float(v)));
+	});
+
+	panel.label("Animation").font_size(15);
+	drive_ctrl = panel.controlcombo("Drive", "maskdraw").caption("Drive").items(["Phase", "Beats", "Clip"]).segmented(true).fixed_height(ROW)
+		.tooltip("What moves the keys: Phase (the control below: [[link]] an envelope of the timeline, an LFO or any output into it), Beats (one loop every Beats beats of the timeline), Clip (once over the clip when MaskDraw lies on the timeline)\n[[wiki:Output-and-Devices#animated-masks]]");
+	phase_ctrl = panel.controlslider("Phase", "maskdraw").caption("Phase").value(0.0).fixed_height(ROW)
+		.tooltip("Where the keys are shown, 0..1 (Drive Phase). [[link]] something into it to move the mask");
+	beats_ctrl = panel.controlfloat("Beats", "maskdraw").caption("Beats").value(4.0).min(0.25).max(1024).fixed_height(ROW)
+		.tooltip("Drive Beats: the beats of one loop from phase 0 to 1");
+	phase_out = panel.controlslider("Phase now", "maskdraw").caption("Phase now").value(0.0).as_output(true).fixed_height(ROW)
+		.tooltip("The phase the keys are shown at now, whatever drives it. A [[pure output]]: [[link]] it into what should move along with the mask");
+	phase_out.undoable(false);
+	pingpong_btn = panel.controlbutton("Ping-pong", "maskdraw").caption("Ping-pong").push(1).fixed_height(ROW)
+		.tooltip("Drive Beats: forth and back (0 to 1, then 1 to 0), so the loop has no jump");
+	key_label = panel.label("Keys").wrap(true);
+	key_ctrl = panel.controlcombo("Key", "maskdraw_key").caption("Key").items(["No keys"]).fixed_height(ROW)
+		.tooltip("The keys of the selected shape (of the whole mask when no shape is selected). Picking one shows the mask at its time (Drive Phase)");
+	key_ctrl.undoable(false).no_load_callbacks();
+	key_ctrl.callback([](v) {
+		if(syncing)
+			return;
+		selected_key = std.int(v);
+		keys = ed.keys(key_target());
+		if(selected_key >= 0 && selected_key < keys.size() && std.int(drive_ctrl.value()) == 0)
+			phase_ctrl.value(keys[selected_key].time);
+		sync_keys();
+	});
+	key_row = panel.widget().fixed_height(ROW).layout(nanogui.layout_horizontal().spacing(4));
+	add_key_btn = key_row.button("Add key").fixed_width(110).tooltip("A key at the phase now, holding the shape (the whole mask) as it is shown. Once a shape has keys, editing it with the mouse makes a key at the phase");
+	add_key_btn.on_click([]() {
+		t = key_target();
+		before = mask_state();
+		selected_key = ed.add_key(t, ed.phase());
+		record_state("Add key", before, mask_state());
+		sync_panel();
+	});
+	del_key_btn = key_row.button("Delete key").fixed_width(110).tooltip("Removes the selected key (the last one: the shape stays as it is shown, without keys)");
+	del_key_btn.on_click([]() {
+		t = key_target();
+		if(selected_key < 0)
+			return;
+		before = mask_state();
+		ed.remove_key(t, selected_key);
+		selected_key = -1;
+		record_state("Delete key", before, mask_state());
+		sync_panel();
+	});
+	key_time = panel.controlslider("Key time", "maskdraw_key").caption("Time").value(0.0).fixed_height(ROW)
+		.tooltip("The phase of the selected key");
+	key_time.undoable(false).no_load_callbacks();
+	key_time.callback([](v) { apply_key("time", math.clamp(std.float(v), 0.0, 1.0)); });
+	ease_ctrl = panel.controlcombo("Ease", "maskdraw_key").caption("Ease").items(["Linear", "In", "Out", "In-out", "Smooth", "Hold"]).fixed_height(ROW)
+		.tooltip("How the way from the selected key to the next one runs: Linear, In (slow start), Out (slow end), In-out, Smooth, Hold (jumps at the next key)");
+	ease_ctrl.undoable(false).no_load_callbacks();
+	ease_ctrl.callback([](v) { apply_key("ease", EASES[math.clamp(std.int(v), 0, 5)]); });
+	key_x = panel.controlfloat("Key move X", "maskdraw_key").caption("Move X").unit("%").fixed_height(ROW)
+		.tooltip("The selected key moves the shape (the whole mask) by this much of the width");
+	key_x.undoable(false).no_load_callbacks();
+	key_x.callback([](v) { apply_key("x", std.float(v)); });
+	key_y = panel.controlfloat("Key move Y", "maskdraw_key").caption("Move Y").unit("%").fixed_height(ROW)
+		.tooltip("The selected key moves the shape (the whole mask) by this much of the height");
+	key_y.undoable(false).no_load_callbacks();
+	key_y.callback([](v) { apply_key("y", std.float(v)); });
+	key_scale = panel.controlfloat("Key scale", "maskdraw_key").caption("Scale").unit("%").value(100).fixed_height(ROW)
+		.tooltip("The selected key scales the shape round its centre (the whole mask round the middle of the output)");
+	key_scale.undoable(false).no_load_callbacks();
+	key_scale.callback([](v) { apply_key("scale", std.float(v)); });
+	key_rot = panel.controlfloat("Key rotation", "maskdraw_key").caption("Rotate").unit("deg").fixed_height(ROW)
+		.tooltip("The selected key turns the shape (the whole mask), degrees clockwise");
+	key_rot.undoable(false).no_load_callbacks();
+	key_rot.callback([](v) { apply_key("rotation", std.float(v)); });
+
+	panel.label("Following").font_size(15);
+	follow_btn = panel.controlbutton("Follow the picture", "maskdraw").caption("Follow the picture").push(1).fixed_height(ROW)
+		.tooltip("The shapes with Follows on re-snap onto the edges of the Background Rate times a second: they track an object that moves in a live video (a few pixels a frame). Lock keeps a shape where it is\n[[wiki:Output-and-Devices#following-a-moving-picture]]");
+	follow_btn.callback([](v) {
+		ed.follow(v);
+	});
+	follow_rate = panel.controlfloat("Follow rate", "maskdraw").caption("Rate").unit("/s").value(15).min(0.5).max(120).fixed_height(ROW)
+		.tooltip("Steps a second; each reads a small copy of the frame (at most 640 pixels wide)");
+	follow_rate.callback([](v) {
+		ed.follow_rate(std.float(v));
+	});
+	follow_radius = panel.controlfloat("Follow radius", "maskdraw").caption("Radius").unit("px").value(12).min(1).max(200).fixed_height(ROW)
+		.tooltip("How far (pixels of the output) a shape may move in one step: more than the object moves between two steps, less than the distance to the next edge that is not its own");
+	follow_radius.callback([](v) {
+		ed.follow_radius(std.float(v));
+	});
+	keep_form_btn = panel.controlbutton("Keep form", "maskdraw").caption("Keep form").push(1).value(1).fixed_height(ROW)
+		.tooltip("On: a shape is only moved as a whole, its form stays as drawn (it does not drift). Off: its points also go onto the edges, the outline adapts to an object that changes its form");
+	keep_form_btn.callback([](v) {
+		ed.follow_keep_form(v);
+	});
+	resnap_btn = panel.button("Re-snap now").fixed_height(ROW).tooltip("The selected shape (with none selected: every shape that follows) onto the edges of the Background frame now, one step (Ctrl+Z takes it back)");
+	resnap_btn.on_click([]() {
+		ed.resnap(ed.selected());
+	});
+
+	panel.label("SVG").font_size(15);
+	svg_path = panel.controltext("SVG file", "maskdraw").caption("File").fixed_height(ROW)
+		.tooltip("An SVG file (a path from the VibeVJ folder or a full path): outlines drawn in Inkscape / Illustrator over a photo of the building, or exported from its CAD plans");
+	svg_fit = panel.controlcombo("SVG fit", "maskdraw").caption("Fit").items(["Contain", "Stretch", "Bounds", "None"]).segmented(true).fixed_height(ROW)
+		.tooltip("Import: Contain puts the page (viewBox) of the SVG into the output keeping its aspect, Stretch fills the output, Bounds fits the box of the shapes, None takes SVG units as pixels");
+	svg_row = panel.widget().fixed_height(ROW).layout(nanogui.layout_horizontal().spacing(4));
+	svg_in = svg_row.button("Import").fixed_width(110).tooltip("Adds the outlines of the SVG as shapes (curves kept; a hole of a compound path subtracts)");
+	svg_in.on_click([]() {
+		path = std.string(svg_path.value());
+		if(path == "" || !fileio.exists(path)) {
+			svg_label.caption("No file " + path);
+			return;
+		}
+		try {
+			n = ed.svg_import(fileio.read_string(path), FITS[math.clamp(std.int(svg_fit.value()), 0, 3)], false);
+			svg_label.caption(n + " shapes read");
+		}
+		catch(e) {
+			svg_label.caption("" + e);
+		}
+		sync_panel();
+	});
+	svg_out = svg_row.button("Export").fixed_width(110).tooltip("Writes the shapes as they are shown now into the file (an SVG of the output size)");
+	svg_out.on_click([]() {
+		path = std.string(svg_path.value());
+		if(path == "") {
+			svg_label.caption("Type a file name first");
+			return;
+		}
+		fileio.write_string(path, ed.svg_export());
+		svg_label.caption("Written: " + path);
+	});
+	svg_label = panel.label("").wrap(true);
+
+	panel.label("Mask").font_size(15);
+	invert_btn = panel.controlbutton("Invert", "maskdraw").caption("Invert").push(1).fixed_height(ROW)
+		.tooltip("White where no shape is, black on the shapes");
+	invert_btn.callback([](v) {
+		ed.invert(v);
+	});
+	opacity = panel.controlslider("Overlay", "maskdraw").caption("Overlay").value(0.55).fixed_height(ROW)
+		.tooltip("How strongly the mask covers the Background in the view Overlay");
+	opacity.undoable(false);
+	opacity.callback([](v) {
+		ed.overlay_opacity(v);
+	});
+	clear_btn = panel.button("Remove all shapes").fixed_height(ROW).tooltip("Starts the mask over (Ctrl+Z brings the shapes back)");
+	clear_btn.on_click([]() {
+		panel_action("Remove all shapes", []() { ed.set_shapes([]); });
+	});
+
+	//The ports
+	in_ctrl = area.control("IN").caption("Background").anchor_left(0).anchor_right(0.6667, "percent").anchor_bottom(0).fixed_height(ROW)
+		.tooltip("The picture to draw on: [[link]] the camera photo of the building, a video or the output into it. The lasso and the snapping follow its edges; it is not part of the mask\n[[wiki:Output-and-Devices#drawing-a-mask-maskdraw]]");
+	in_ctrl.callback([](v) {
+		ed.input(v);
+	});
+	in_ctrl.on_unlink([](a, b) {
+		if(b == in_ctrl)
+			ed.input(None);
+	});
+	out_ctrl = area.control("OUT").caption("Mask").anchor_left(0.3333, "percent").anchor_right(0.3333, "percent").anchor_bottom(0).fixed_height(ROW).as_output(true)
+		.tooltip("The mask: white on the shapes, black elsewhere, at the size of the project. [[link]] it into the Mask port of a mapping shader\n[[wiki:Output-and-Devices#drawing-a-mask-maskdraw]]");
+	out_ctrl.callback([](v) {
+		out_ctrl.value(ed);
+	});
+	out_ctrl.value(ed);
+	ids_ctrl = area.control("IDS").caption("IDs").anchor_left(0.6667, "percent").anchor_right(0).anchor_bottom(0).fixed_height(ROW).as_output(true)
+		.tooltip("Every shape in a flat colour of its own, black elsewhere (an ID map): [[link]] it into a shader that treats each region on its own, e.g. RegionChase with its ID map\n[[wiki:Output-and-Devices#drawing-a-mask-maskdraw]]");
+	ids_ctrl.callback([](v) {
+		ids_ctrl.value(ed.ids_output());
+	});
+	ids_ctrl.value(ed.ids_output());
+
+	sync_panel();
+}
+
+//The mask follows the size of the project
+update(generator, tl_pos, pos_delta) {
+	if(!ed || !maskdraw_engine)
+		return;
+	w = maskdraw_engine.project_width.value();
+	h = maskdraw_engine.project_height.value();
+	size = ed.output_size();
+	if(w > 0 && h > 0 && (size.x != w || size.y != h))
+		ed.output_size(vec2i(w, h));
+	//the keys follow their drive (the mask is made again only when the phase changed and something has keys)
+	before = ed.phase();
+	ed.phase(drive_phase(tl_pos));
+	if(phase_out && math.abs(std.float(phase_out.value()) - ed.phase()) > 0.0001)
+		phase_out.value(ed.phase());
+	if(key_label && ed.animated() && math.abs(ed.phase() - before) > 0.004)
+		key_label.caption((key_target() >= 0 ? "Keys of " + ed.shape(key_target()).name : "Keys of the whole mask") + ", phase " + fmt2(ed.phase()));
+}
+
+save_state() {
+	return ed.serialize();
+}
+
+load_state(state) {
+	if(!state)
+		return;
+	ed.deserialize(state);
+	sync_panel();
+}

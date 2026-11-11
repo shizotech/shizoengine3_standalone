@@ -33,6 +33,7 @@
 
 #include "goal_time"
 #include "goal_frontmatter"
+#include "miniagent_storage"
 
 GOAL_SCHEMA_VERSION = 1;
 
@@ -100,6 +101,21 @@ goal_mkdir(path) {
 	}
 	catch(e) {}
 	return fileio.exists(path);
+}
+
+// The workspace id reported by a scheduler: the basename of the tree, or the
+// directory above a .agentspace folder.
+goal_workspace_id(root) {
+	r = std.string(root ?? "");
+	if(!r)
+		return "";
+	id = fileio.file_name(r);
+	if(id == ".agentspace") {
+		parent = fileio.file_dir(r);
+		if(parent)
+			id = fileio.file_name(parent);
+	}
+	return id;
 }
 
 // write tmp + rename: a reader never sees a half written file
@@ -417,31 +433,36 @@ goal_days_list(v, errors) {
 	return out;
 }
 
-// schedule.every: an interval in whole days ("2d", "14d") -> int days, None = not set.
+// Keep day intervals on their local-calendar cadence; sub-day intervals use elapsed minutes.
 // A bare number is refused on purpose: in a duration "2" means 2 minutes.
 goal_every_field(sch_in, errors) {
 	v = gj(sch_in, "every", None);
 	if(std.is_none(v))
-		return None;
+		return [days = None, seconds = None];
 
 	text = std.string(v).strip().lowercase();
 	if(gt_is_int_text(text)) {
-		errors.push_back("schedule.every: needs a day unit (examples: 2d, 3d, 14d)");
-		return None;
+		errors.push_back("schedule.every: add a unit (examples: 5m, 2h, 2d)");
+		return [days = None, seconds = None];
 	}
 
 	secs = gt_parse_duration(text);
-	if(std.is_none(secs) || secs % GT_DAY != 0) {
-		errors.push_back("schedule.every: needs whole days (examples: 2d, 3d, 14d)");
-		return None;
+	if(std.is_none(secs) || secs < 60 || secs > GOAL_EVERY_MAX_DAYS * GT_DAY) {
+		errors.push_back("schedule.every: between 1m and " + std.string(GOAL_EVERY_MAX_DAYS) + "d");
+		return [days = None, seconds = None];
 	}
-
-	days = secs / GT_DAY;
-	if(days < 1 || days > GOAL_EVERY_MAX_DAYS) {
-		errors.push_back("schedule.every: between 1d and " + std.string(GOAL_EVERY_MAX_DAYS) + "d");
-		return None;
+	if(secs < GT_DAY) {
+		if(secs % 60 != 0) {
+			errors.push_back("schedule.every: intervals under 1d must be whole minutes (examples: 5m, 30m, 2h)");
+			return [days = None, seconds = None];
+		}
+		return [days = None, seconds = secs];
 	}
-	return days;
+	if(secs % GT_DAY != 0) {
+		errors.push_back("schedule.every: intervals of 1d or longer must be whole days (examples: 2d, 14d)");
+		return [days = None, seconds = None];
+	}
+	return [days = secs / GT_DAY, seconds = None];
 }
 
 // the phase of an interval schedule: an explicit start_date wins, else the day the
@@ -631,8 +652,14 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 			end_secs = None;
 	}
 
-	if(stype && stype != "manual" && std.is_none(start_secs) && !window_name && !gj(sch_in, "start"))
-		errors.push_back("schedule.start: required (or schedule.window: a named window from the preferences)");
+	every_config = goal_every_field(sch_in, errors);
+	every = every_config.days;
+	interval_seconds = every_config.seconds;
+	if(stype && stype != "manual" && std.is_none(start_secs) && !window_name && !gj(sch_in, "start") && std.is_none(interval_seconds))
+		errors.push_back("schedule.start: required (or schedule.window: a named window from the preferences), unless using a sub-day schedule.every interval");
+
+	if(!std.is_none(interval_seconds) && (window_name || gj(sch_in, "start") || gj(sch_in, "end") || gj(sch_in, "duration")))
+		errors.push_back("schedule.every under 1d is a continuous interval and cannot be combined with window, start, end or duration");
 
 	if(!std.is_none(start_secs) && std.is_none(end_secs) && std.is_none(duration_secs))
 		duration_secs = gt_parse_duration(gj(prefs, "default_duration", "4h")) ?? 4 * 3600;
@@ -651,11 +678,9 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 	}
 
 	days = [];
-	every = goal_every_field(sch_in, errors);
-
 	if(stype == "recurring" || stype == "windowed") {
-		if(!std.is_none(every)) {
-			// an interval replaces the weekday set: both at once is ambiguous
+		if(!std.is_none(every) || !std.is_none(interval_seconds)) {
+			// an interval replaces the weekday set: both at once are ambiguous
 			if(gj(sch_in, "days"))
 				errors.push_back("schedule: give either days or every, not both");
 		}
@@ -666,7 +691,7 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 				errors.push_back("schedule.days: no weekday selected");
 		}
 	}
-	else if(!std.is_none(every))
+	else if(!std.is_none(every) || !std.is_none(interval_seconds))
 		errors.push_back("schedule.every: only for type recurring or windowed");
 
 	start_date = None;
@@ -696,6 +721,7 @@ goal_validate(data, body, prefs, folder_id, folder_status) {
 		date = date_days,
 		days = days,
 		every = every,
+		interval_seconds = interval_seconds,
 		start_date = start_date,
 		end_date = end_date,
 		misfire = misfire,
@@ -798,13 +824,61 @@ goal_window_for_day(def, zone, day, anchor_day = None) {
 	return w;
 }
 
+goal_interval_window(def, index, anchor_seconds) {
+	sch = def.schedule;
+	zone = gt_zone(sch.timezone);
+	if(!zone.ok)
+		return None;
+	start = anchor_seconds + index * sch.interval_seconds;
+	day = gt_floor_div(start + gt_offset_at(zone, start), GT_DAY);
+
+	if(!std.is_none(sch.start_date) && day < sch.start_date)
+		return None;
+	if(!std.is_none(sch.end_date) && day > sch.end_date)
+		return None;
+
+	return [
+		start = start,
+		end = start + sch.interval_seconds,
+		day = day,
+		akey = def.id + "@" + gt_format_utc(start),
+	];
+}
+
+goal_interval_anchor_time(sch, anchor_seconds = None) {
+	if(!std.is_none(sch.start_date)) {
+		zone = gt_zone(sch.timezone);
+		return gt_local_to_utc(zone, sch.start_date * GT_DAY);
+	}
+	if(!std.is_none(anchor_seconds))
+		return anchor_seconds;
+	return 0;
+}
+
 // windows overlapping [from, to] (UTC secs), oldest first
 goal_windows_between(def, from, to, anchor_day = None) {
 	out = [];
 	out.clear();
 	sch = def.schedule;
 
-	if(sch.type == "manual" || std.is_none(sch.start))
+	if(sch.type == "manual")
+		return out;
+
+	if(!std.is_none(sch.interval_seconds)) {
+		anchor = goal_interval_anchor_time(sch, anchor_day);
+		first = math.max(0, gt_floor_div(from - anchor, sch.interval_seconds) - 1);
+		last = gt_floor_div(to - anchor, sch.interval_seconds);
+		if(last - first > 499)
+			first = last - 499;
+		for(i = first; i <= last; i++) {
+			w = goal_interval_window(def, i, anchor);
+			if(!std.is_none(w) && w.end > from && w.start <= to)
+				out.push_back(w);
+		}
+		return out;
+	}
+
+	if(std.is_none(sch.start))
 		return out;
 
 	zone = gt_zone(sch.timezone);
@@ -836,7 +910,22 @@ goal_next_windows(def, now, count = 5, anchor_day = None) {
 	out.clear();
 	sch = def.schedule;
 
-	if(sch.type == "manual" || std.is_none(sch.start))
+	if(sch.type == "manual")
+		return out;
+
+	if(!std.is_none(sch.interval_seconds)) {
+		anchor = goal_interval_anchor_time(sch, anchor_day);
+		index = math.max(0, gt_floor_div(now - anchor, sch.interval_seconds));
+		for(n = 0; n < 800 && out.size() < count; n++) {
+			w = goal_interval_window(def, index, anchor);
+			if(!std.is_none(w) && w.end > now)
+				out.push_back(w);
+			index++;
+		}
+		return out;
+	}
+
+	if(std.is_none(sch.start))
 		return out;
 
 	zone = gt_zone(sch.timezone);
@@ -885,6 +974,16 @@ goal_schedule_text(def) {
 	if(sch.type == "once")
 		return "once on " + gt_format_date(sch.date) + " " + times + where;
 
+	if(!std.is_none(sch.interval_seconds)) {
+		interval = "";
+		secs = sch.interval_seconds;
+		if(secs % 3600 == 0)
+			interval = std.string(secs / 3600) + "h";
+		else
+			interval = std.string(secs / 60) + "m";
+		return sch.type + " every " + interval + where;
+	}
+
 	if(!std.is_none(sch.every)) {
 		what = "every " + std.string(sch.every) + "d";
 		if(!std.is_none(sch.start_date))
@@ -905,10 +1004,12 @@ goal_schedule_text(def) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class GoalSpace {
-	root = ".agentspace";
-
-	__init__(_root = ".agentspace") {
-		root = std.string(_root ?? ".agentspace");
+	root = "";
+	
+	__init__(_root = "") {
+		root = std.string(_root ?? "");
+		if(!root)
+			root = miniagent_node_agentspace();
 		for(root.length() > 1 && (root.ends("/") || root.ends("\\")))
 			root = root.substr(0, root.length() - 1);
 	}
@@ -1243,6 +1344,8 @@ class GoalScheduler {
 	space = None;
 	ledger = None;
 	host = None;
+	workspace_id = "";
+	root = "";
 	prefs = [];
 	defs = [];				// id -> applied (valid) definition
 	running = false;
@@ -1250,21 +1353,30 @@ class GoalScheduler {
 	thread = None;
 	notify_enabled = true;
 	last_scan = 0;
-	inbox = [];				// task_finished pushes from the host
+	terminal_events = [];		// taskid -> terminal event, stored once
+	terminal_seen = [];		// taskids already accepted, so a duplicate listener event is ignored
+	notified = [];			// notification key -> already reported
 	clock = None;			// test hook: a function returning epoch seconds
 	last_overview = "";		// the last state/overview.md written
 
 	__init__(_space, _host = None, opts = None) {
 		space = std.is_string(_space) ? GoalSpace(_space) : _space;
+		if(!space)
+			space = GoalSpace("");
 		host = _host;
+		root = space.root;
+		workspace_id = goal_workspace_id(root);
 		goal_mkdir(space.runtime_dir());
 		ledger = GoalLedger(space.runtime_dir() + "/ledger.json");
 		ledger.now_fn = [this]() { return this.clock_now(); };
 		defs = std.json();
-		inbox = [];
-		inbox.clear();
+		terminal_events = std.json();
+		terminal_seen = std.json();
+		notified = std.json();
 
 		if(gj_is_map(opts)) {
+			if(opts.has("workspace_id"))
+				workspace_id = gj_str(opts, "workspace_id", workspace_id);
 			if(gj(opts, "tick_ms"))
 				tick_ms = std.int(opts.tick_ms);
 			if(opts.has("notify"))
@@ -1290,9 +1402,7 @@ class GoalScheduler {
 		return gt_now();
 	}
 
-	// the phase day of an interval schedule ("every 2d"): the local day the goal
-	// became active, so the cadence starts where the owner created it.
-	// An explicit schedule.start_date wins (goal_every_anchor).
+	// Day intervals stay on the local calendar; sub-day intervals use exact elapsed seconds.
 	interval_anchor(def) {
 		since = 0;
 		try {
@@ -1301,6 +1411,13 @@ class GoalScheduler {
 		catch(e) {}
 		if(!since)
 			since = clock_now();
+		if(!std.is_none(def.schedule.interval_seconds)) {
+			if(!std.is_none(def.schedule.start_date)) {
+				zone = gt_zone(def.schedule.timezone);
+				return gt_local_to_utc(zone, def.schedule.start_date * GT_DAY);
+			}
+			return since;
+		}
 		zone = gt_zone(def.schedule.timezone);
 		return gt_floor_div(since + gt_offset_at(zone, since), GT_DAY);
 	}
@@ -1350,13 +1467,32 @@ class GoalScheduler {
 		catch(e) {}
 	}
 
+	// At most one notification for an event key. Terminal run events are
+	// settled once, and repeated ticks must not double-report them.
+	notify_once(key, msg) {
+		k = std.string(key ?? "");
+		if(k && gj(notified, k, false))
+			return;
+		if(k)
+			notified[k] = true;
+		notify(msg);
+	}
+
 	on_host_task_finished(task) {
 		cs = std.critical_section_named(GOAL_LOCK);
-		inbox.push_back([
-			taskid = gj_str(task, "taskid", ""),
-			state = gj_str(task, "state", ""),
-			report = gj_str(task, "report", ""),
-		]);
+		tid = gj_str(task, "taskid", "");
+		st = gj_str(task, "state", "");
+		terminal = st == "finished" || st == "failed" || st == "question" || st == "stopped" || st == "lost";
+		if(tid && terminal && !gj(terminal_seen, tid, false)) {
+			terminal_seen[tid] = true;
+			terminal_events[tid] = [
+				taskid = tid,
+				state = st,
+				report = gj_str(task, "report", ""),
+				error = gj_str(task, "error", ""),
+				last_update_ms = std.int(gj(task, "last_update_ms", 0)),
+			];
+		}
 		cs.release();
 	}
 
@@ -1417,7 +1553,7 @@ class GoalScheduler {
 				g.errors = r.errors;
 				msg = "goal " + f.id + ": the edit is invalid, the last valid revision stays active:\n- " + gfm_join(r.errors, "\n- ");
 				ledger.event("definition_invalid", f.id, msg, [revision = r.revision, errors = r.errors]);
-				notify(msg);
+				notify_once("invalid:" + f.id + ":" + r.revision, msg);
 			}
 
 			// a folder move is still a status change, even with a broken file
@@ -1468,27 +1604,78 @@ class GoalScheduler {
 
 	// ── 2. runs ─────────────────────────────────────────────────────────────
 
-	// the latest record of a host task -> [state, report] (state "" = unknown)
+	// The latest record of a host task:
+	// [ok, taskid, state, report, error, active, last_update_ms]
+	// "lost" only when the host definitively says not found; exceptions / None /
+	// other transient results are "unknown" and keep the run open.
 	poll_task(taskid) {
-		if(!host || !taskid)
-			return [state = "", report = ""];
+		tid = std.string(taskid ?? "");
+		out = [ok = 0, taskid = tid, state = "unknown", report = "", error = "", active = 0, last_update_ms = 0];
+		if(!host || !tid)
+			return out;
 
 		rec = None;
 		try {
-			rec = host.inspect_task(taskid);
+			rec = host.inspect_task(tid);
 		}
-		catch(e) {}
+		catch(e) {
+			out.error = std.string(e);
+			return out;
+		}
 
-		if(!gj_is_map(rec))
-			return [state = "lost", report = "", last_update_ms = 0];
+		if(std.is_none(rec)) {
+			out.error = "inspect returned None";
+			return out;
+		}
 
-		return [state = gj_str(rec, "state", ""), report = gj_str(rec, "report", ""), last_update_ms = std.int(gj(rec, "last_update_ms", 0))];
+		if(std.is_string(rec)) {
+			if(rec == "Not found.") {
+				out.ok = 1;
+				out.state = "lost";
+				out.error = rec;
+				return out;
+			}
+			out.error = rec;
+			return out;
+		}
+
+		if(!gj_is_map(rec)) {
+			out.error = "inspect returned a non-map value";
+			return out;
+		}
+
+		out.ok = 1;
+		host_ok = gj(rec, "ok", true) ? true : false;
+		st = gj_str(rec, "state", "");
+		out.report = gj_str(rec, "report", "");
+		out.error = gj_str(rec, "error", "");
+		out.last_update_ms = std.int(gj(rec, "last_update_ms", 0));
+
+		if(host_ok && st)
+			out.state = st;
+		else if(!host_ok && st == "lost")
+			out.state = "lost";
+		else {
+			out.state = "unknown";
+			if(!out.error)
+				out.error = "inspect returned no usable state";
+		}
+
+		act = gj(rec, "active", None);
+		if(std.is_none(act)) {
+			s = out.state;
+			out.active = (s == "running" || s == "research" || s == "implement" || s == "starting" || s == "waiting" || s == "dispatching") ? 1 : 0;
+		}
+		else {
+			out.active = act ? 1 : 0;
+		}
+		return out;
 	}
 
 	settle_runs() {
 		cs = std.critical_section_named(GOAL_LOCK);
-		pushed = inbox.copy();
-		inbox.clear();
+		pushed = terminal_events.copy();
+		terminal_events.clear();
 		cs.release();
 
 		for(akey, a : ledger.data.activations) {
@@ -1498,24 +1685,28 @@ class GoalScheduler {
 			for(r : a.runs) {
 				if(!goal_run_open(r))
 					continue;
+				if(gj(r, "settled", false) || gj(r, "terminal_reported", false))
+					continue;
 
 				st = "";
 				report = "";
-
-				for(p : pushed) {
-					if(p.taskid && p.taskid == gj_str(r, "taskid", "")) {
-						st = p.state;
-						report = p.report;
-					}
-				}
-
 				last_ms = 0;
+				tid = gj_str(r, "taskid", "");
 
-				if(!st) {
-					pr = poll_task(gj_str(r, "taskid", ""));
-					st = pr.state;
-					report = pr.report;
-					last_ms = pr.last_update_ms;
+				if(tid && pushed.has(tid)) {
+					ev = pushed[tid];
+					st = gj_str(ev, "state", "");
+					report = gj_str(ev, "report", "");
+					last_ms = std.int(gj(ev, "last_update_ms", 0));
+				}
+				else if(tid) {
+					pr = poll_task(tid);
+					st = gj_str(pr, "state", "");
+					report = gj_str(pr, "report", "");
+					last_ms = std.int(gj(pr, "last_update_ms", 0));
+				}
+				else {
+					st = "unknown";
 				}
 
 				if(st == "finished" || st == "failed" || st == "question" || st == "stopped" || st == "lost") {
@@ -1549,11 +1740,16 @@ class GoalScheduler {
 			try { host.stop_task(taskid); } catch(e) {}
 		}
 		ledger.event("run_stalled", a.goal, "run " + gj(r, "n", 0) + " made no progress for " + (idle / 60) + " min, stopped (stall_timeout)", [akey = a.akey, taskid = taskid]);
-		notify("Goal " + a.goal + ": run " + gj(r, "n", 0) + " was stuck for " + (idle / 60) + " min and was stopped; it is retried while attempts are left.");
+		notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":stalled", "Goal " + a.goal + ": run " + gj(r, "n", 0) + " was stuck for " + (idle / 60) + " min and was stopped; it is retried while attempts are left.");
 	}
 
 	finish_run(a, r, state, report) {
+		if(gj(r, "settled", false) || gj(r, "terminal_reported", false))
+			return false;
+
 		t_now = clock_now();
+		r.settled = true;
+		r.terminal_reported = true;
 		r.state = state;
 		r.ended = t_now;
 		r.report = goal_clip(report, GOAL_REPORT_CHARS);
@@ -1577,7 +1773,7 @@ class GoalScheduler {
 			a.ended = t_now;
 			//Not the report again (owner report, double [done] / [notify]): the task's own question event
 			//(task_finished / task_state -> question) carries it to the same chat, notify says what it means
-			notify("Goal " + a.goal + " needs you: its task asked a question (see the task message).");
+			notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":question", "Goal " + a.goal + " needs you: its task asked a question (see the task message).");
 			return;
 		}
 
@@ -1596,7 +1792,9 @@ class GoalScheduler {
 					a.verify_pending = true;
 			}
 
-			notify("Goal " + a.goal + ": " + label + " finished (report in the task message).");
+			// The task's own terminal event (task_finished) already carries the
+			// report. A second [notify] here was the duplicate the owner saw:
+			// one message per completed task is the contract.
 			return;
 		}
 
@@ -1612,7 +1810,7 @@ class GoalScheduler {
 			a.verify_pending = false;
 			a.successes = 0;
 			a.last_report = "VERIFICATION FAILED - fix these gaps:\n" + r.report;
-			notify("Goal " + a.goal + ": verification failed, the next run gets the gaps (see the task message).");
+			notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":verify_failed", "Goal " + a.goal + ": verification failed, the next run gets the gaps (see the task message).");
 		}
 
 		max_attempts = gj(a.policy, "max_attempts", 3);
@@ -1625,7 +1823,7 @@ class GoalScheduler {
 
 		a.state = "failed";
 		a.ended = t_now;
-		notify("Goal " + a.goal + ": " + label + " " + state + " - no attempts left for this window (report in the task message).");
+		notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":failed", "Goal " + a.goal + ": " + label + " " + state + " - no attempts left for this window (report in the task message).");
 	}
 
 	// ── 3. window end ───────────────────────────────────────────────────────
@@ -1644,7 +1842,7 @@ class GoalScheduler {
 				r.checkpoint_at = t_now;
 				if(host && taskid) {
 					try {
-						host.update_task(taskid, "The work window of this goal ends now (" + why + "). Save your progress: commit or stash work in progress on a branch, update the plan / notes, then signal finished with what is done and what is left. Do not start anything new.");
+						host.update_task(taskid, "The work window of this goal ends now (" + why + "). Save your progress: commit or stash work in progress on a branch, update the plan / notes, then finalize(signal='finished', result='what is done and what is left'). Do not start anything new.");
 					}
 					catch(e) {}
 				}
@@ -1769,7 +1967,7 @@ class GoalScheduler {
 		a.ended = clock_now();
 		msg = "Goal " + def.id + ": window " + goal_window_text(def, w) + " was " + (why == "skip" ? "skipped (started late, misfire: skip)" : "missed (the scheduler was not running)");
 		ledger.event("window_" + a.state, def.id, msg, [akey = w.akey]);
-		notify(msg);
+		notify_once("window:" + w.akey + ":" + a.state, msg);
 		return a;
 	}
 
@@ -1782,7 +1980,8 @@ class GoalScheduler {
 
 			g = ledger.goal(id);
 			since = gj(g, "active_since", t_now);
-			lookback_from = math.max(since, t_now - 8 * GT_DAY);
+			lookback_seconds = std.is_none(def.schedule.interval_seconds) ? 8 * GT_DAY : def.schedule.interval_seconds * 2;
+			lookback_from = math.max(since, t_now - lookback_seconds);
 
 			windows = goal_windows_between(def, lookback_from, t_now, interval_anchor(def));
 			missed_latest = None;
@@ -1808,7 +2007,7 @@ class GoalScheduler {
 					zone = gt_zone(def.schedule.timezone);
 					note = late > GOAL_START_GRACE + tick_ms / 1000 && w.start >= since ? " (late start)" : "";
 					ledger.event("window_activated", id, "window " + goal_window_text(def, w) + " activated" + note, [akey = w.akey]);
-					notify("Goal " + id + " starts" + (a.state == "dry_run" ? " (DRY RUN)" : "") + ": " + def.title + "\nWindow " + goal_window_text(def, w) + note);
+					notify_once("window:" + w.akey, "Goal " + id + " starts" + (a.state == "dry_run" ? " (DRY RUN)" : "") + ": " + def.title + "\nWindow " + goal_window_text(def, w) + note);
 					continue;
 				}
 
@@ -1830,7 +2029,7 @@ class GoalScheduler {
 				a = new_activation(def, cw, "catch_up");
 				a.missed_window = [start = missed_latest.start, end = missed_latest.end];
 				ledger.event("window_catch_up", id, "missed window " + goal_window_text(def, missed_latest) + " runs now (misfire: catch_up)", [akey = cw.akey]);
-				notify("Goal " + id + ": catching up a missed window now.");
+				notify_once("catchup:" + cw.akey, "Goal " + id + ": catching up a missed window now.");
 			}
 		}
 	}
@@ -2048,6 +2247,8 @@ class GoalScheduler {
 		}
 
 		if(!taskid) {
+			r.settled = true;
+			r.terminal_reported = true;
 			r.state = "failed";
 			r.ended = t_now;
 			r.report = "the host refused the task";
@@ -2056,7 +2257,7 @@ class GoalScheduler {
 			ledger.event("dispatch_failed", def.id, "the host did not accept the run", [akey = a.akey]);
 			// the owner must hear about a refused dispatch now, not only when the
 			// window runs out of attempts
-			notify("Goal " + def.id + ": " + (kind == "verify" ? "the verification run" : "run " + std.string(n)) + " could not start - the host refused the task. Next attempt " + gt_format_local(gt_zone(def.schedule.timezone), a.retry_at) + ".");
+			notify_once("run:" + a.akey + ":" + std.string(n) + ":refused", "Goal " + def.id + ": " + (kind == "verify" ? "the verification run" : "run " + std.string(n)) + " could not start - the host refused the task. Next attempt " + gt_format_local(gt_zone(def.schedule.timezone), a.retry_at) + ".");
 			return;
 		}
 
@@ -2082,7 +2283,7 @@ class GoalScheduler {
 
 		if(kind == "verify") {
 			p += "## Your job: verify\n\nCheck the acceptance criteria below against the actual state of the work (files, tests, branches), not against the report. ";
-			p += "Signal finished when they are met. Signal failed with the concrete gaps when they are not — the next run gets your list.\n\n";
+			p += "finalize(signal='finished', result=...) when they are met. finalize(signal='failed', result='the concrete gaps') when they are not — the next run gets your list.\n\n";
 			p += "## Report of the last run\n\n" + goal_clip(gj_str(a, "last_report", ""), 3000) + "\n\n";
 		}
 
@@ -2124,7 +2325,7 @@ class GoalScheduler {
 		p += "## Rules\n\n";
 		if(def.policy.allow.size())
 			p += "- Allowed actions: " + gfm_join(def.policy.allow, ", ") + ".\n";
-		p += "- Never do without the owner's explicit approval: " + gfm_join(def.policy.require_approval, ", ") + ". Ask with signal(question) instead.\n";
+		p += "- Never do without the owner's explicit approval: " + gfm_join(def.policy.require_approval, ", ") + ". Ask with finalize(signal='question', result=...) instead.\n";
 		p += "- Repository edits: work on a branch / isolated worktree, never on a shared main checkout.\n";
 		if(def.policy.plan_updates == "allow")
 			p += "- Keep " + def.dir + "/plan.md current: tick off what you finished, add what you discovered (short checklist).\n";
@@ -2134,7 +2335,7 @@ class GoalScheduler {
 			p += "- Do not edit plan.md or goal.md.\n";
 		p += "- Never edit goal.md or anything under .agentspace/.runtime/ (the scheduler owns them).\n";
 		p += "- Your memory across runs of this goal is the Mind topic .megamind/goal_" + def.id.replace("-", "_") + "/ (read its index.md first, update it before you finish).\n";
-		p += "- End with signal(): finished (what was done, what is left, evidence such as tests run), question (you need the owner), or failed (why).\n";
+		p += "- End with finalize(signal='finished|failed|question', result=...): finished (what was done, what is left, evidence such as tests run), question (you need the owner), or failed (why).\n";
 
 		return p;
 	}
@@ -2154,6 +2355,8 @@ class GoalScheduler {
 				known = run_still_known(r);
 				if(known)
 					continue;
+				r.settled = true;
+				r.terminal_reported = true;
 				r.state = "lost";
 				r.ended = t_now;
 				r.report = "interrupted: the node restarted while the run was active";
@@ -2242,6 +2445,11 @@ class GoalScheduler {
 		cs.release();
 	}
 
+	// Synchronous alias: one tick, for callers that drive the scheduler themselves.
+	update() {
+		tick();
+	}
+
 	// ── overview (CLI, receptionist tools, router) ──────────────────────────
 
 	goal_summary(id, def) {
@@ -2250,12 +2458,18 @@ class GoalScheduler {
 		nxt = goal_next_windows(def, t_now, 1, interval_anchor(def));
 		last = None;
 		open = None;
+		active_run = None;
 
 		for(akey, a : ledger.data.activations) {
 			if(gj_str(a, "goal", "") != id)
 				continue;
-			if(!goal_activation_closed(a))
+			if(!goal_activation_closed(a)) {
 				open = a;
+				for(r : a.runs) {
+					if(goal_run_open(r))
+						active_run = r;
+				}
+			}
 			else if(!last || gj(a, "created", 0) > gj(last, "created", 0))
 				last = a;
 		}
@@ -2271,6 +2485,8 @@ class GoalScheduler {
 			next_window = nxt.size() ? goal_window_text(def, nxt[0]) : "",
 			active_window = open ? goal_window_text(def, open) : "",
 			active_state = open ? gj_str(open, "state", "") : "",
+			active_run_state = active_run ? gj_str(active_run, "state", "") : "",
+			active_taskid = active_run ? gj_str(active_run, "taskid", "") : "",
 			last_outcome = last ? gj_str(last, "state", "") + " (" + gt_format_local(zone, gj(last, "start", t_now)) + ")" : "",
 			revision = def.revision,
 			invalid_edit = gj_str(g, "invalid_revision", "") != "",
