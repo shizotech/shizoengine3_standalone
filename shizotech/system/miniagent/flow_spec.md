@@ -39,7 +39,7 @@ scheduler immediately.
 
 `shz miniagent --web` (or `shz miniagent.node --web`):
 
-1. `__init__.shio` sees `--web` / `--node` / `--web=<port>` and loads `node.shio`.
+1. `__init__.shio` sees `--web` / `--node` / `--web=<port>` and loads `node.shio`. `--init` / `--init=<...>` is forwarded to `node.shio` too; `node_init_workspace()` registers cwd and returns before any model/ShizoNet/web startup.
 2. `node.shio` creates a `Node`: a `WorkspaceRegistry`, the Node's own `Workspace`, one
    `Receptionist` connector (a single receptionist agent), and the ShizoNet AI node service.
 3. `Node.start_node_goals()` starts the Node's own Workspace `GoalScheduler` on
@@ -164,6 +164,18 @@ scheduler immediately.
     node `notify`, and `file` (send_file) are rendered. Node online/offline, running progress,
     and tool calls are silent unless `--verbose-events` is used.
 
+## 3b. Isolated Telegram client (`telegram_client.shio`)
+
+`shz miniagent.telegram_client --bot-token ... --workspace_dir <dir>` creates one project
+workspace with a private registry under `<workspace_dir>/.client_registry`; it does not use the
+node's ShizoNet service or workspace tree. The receptionist agent runs 24/7 and answers trusted
+chats; it also has read-only workspace file tools so it can answer questions about the workspace
+immediately, without waiting for the worker or its work window. `Workspace.add_task` is called
+only inside the configured local work window. Requests outside the window are queued in
+`ClientMind.queue` and dispatched when the window opens; active worker sessions are stopped at
+close. The GoalScheduler is hosted by `ClientMind`, so it obeys the same window and queue. Reports
+longer than the message limit and `send_file` documents are sent as Telegram documents.
+
 ## 4. The single finalize contract
 
 | State | Produced by | Meaning |
@@ -185,3 +197,22 @@ does not notify a plain finished run again. Notify, file and task-finished hooks
 on `SessionManager` / `Workspace` / `Node` (`add_notify_listener`, `add_file_listener`,
 `add_task_finished_listener`); the web API and ShizoNet service both register them instead of
 overwriting each other.
+## 13. Compaction, handover and listener lifecycle
+
+- An internal compaction run (`compact_handover`) is not a user turn. `miniagent` sets
+  `internal_run` while the handover model call runs, so its `text`, `reasoning`, `tool_start` and
+  `tool_end` deltas are not streamed to the web UI. The session's chat shows only the real turn
+  (and its final `done` report).
+- `compact_handover` calls the model with `finalize`, which sets `stopped=true`. A successful
+  handover must reset `stopped=false` and `running=true` before the real task continues; otherwise
+  `task()` returns `failed` with "Agent was stopped during its run." The web UI then shows a
+  failed session after a perfectly good compaction.
+- The `on_usage` context warning is injected once per compaction episode (`compaction_requested`),
+  and the flag is reset after the handover, so a long open-ended task can compact repeatedly,
+  not only once.
+- A warning run that finalizes with `finished` is treated as a handover, not as the task's
+  terminal result; the real task prompt is restored after every compaction.
+- A stopped / deleted `Workspace` removes its scheduler and architecture-board task-finished
+  listeners by owner (`remove_task_finished_listener(owner)`). A listener whose captured `this`
+  was released otherwise throws `class not valid`, printed as `[workspaces] finished listener failed`.
+

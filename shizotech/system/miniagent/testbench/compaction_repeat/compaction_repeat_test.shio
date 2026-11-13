@@ -1,0 +1,154 @@
+#include "../../miniagent"
+
+// Scratch stub: no network, no real LLM. Two normal turns trigger the
+// context warning; each warning run finalizes with a handover; the third
+// normal turn finalizes the real task.
+
+class stub_context
+{
+	body = [messages=[[role="system", content="STUB SYSTEM"]]];
+	
+	token_count_prompt(prompt) {
+		return 100;		// below half of max_tokens -> no start compaction
+	}
+}
+
+class stub_llm
+{
+	context = stub_context();
+	
+	on_text = None;
+	on_tool = None;
+	on_reason = None;
+	on_usage = None;
+	
+	prompts = [];
+	warning_runs = 0;
+	normal_runs = 0;
+	handover_seq = 0;
+	stop_flag = false;
+	agent = None;
+	
+	task(prompt) {
+		this.stop_flag = false;
+		this.prompts.push_back(prompt);
+		this.context.body.messages.push_back([role="user", content=prompt]);
+		
+		if(prompt.contains("YOUR CONTEXT IS ABOUT TO RUN OUT")) {
+			this.warning_runs++;
+			this.handover_seq++;
+			
+			h = "HANDOVER " + std.string(this.handover_seq) + "\n"
+				+ "### Task\nORIGINAL_TASK_PROMPT\n"
+				+ "### Done\nWork completed so far: file edits, tests and verification.\n"
+				+ "### Facts\nAll relevant paths and decisions are preserved in this handover.\n"
+				+ "### In progress\nContinue the real task from the current state.\n"
+				+ "### Next\nFinish the remaining work.\n"
+				+ "### Avoid\nDo not restart the completed work.";
+			
+			if(std.is_function(this.on_text))
+				this.on_text(h);
+			
+			this.agent.finalize_run("finished", h, true);
+			return h;
+		}
+		
+		this.normal_runs++;
+		
+		if(this.normal_runs < 3) {
+			if(std.is_function(this.on_text))
+				this.on_text("NORMAL_DRAFT_" + std.string(this.normal_runs));
+			if(std.is_function(this.on_usage))
+				this.on_usage([total_tokens = 850]);
+			return "PARTIAL_NORMAL_" + std.string(this.normal_runs);
+		}
+		
+		if(std.is_function(this.on_text))
+			this.on_text("NORMAL_FINAL_TEXT");
+		this.agent.finalize_run("finished", "REAL_FINAL_REPORT", true);
+		return "REAL_FINAL_REPORT";
+	}
+	
+	stop() {
+		this.stop_flag = true;
+	}
+}
+
+cfg = ModelConfig();
+cfg.url = "http://localhost:8000";
+cfg.name = "stub";
+cfg.token = "none";
+cfg.max_tokens = 1000;
+
+agt = miniagent(cfg, "util/simple_rag");
+agt.add_finalize();
+
+old = agt.llm_api;
+stub = stub_llm();
+stub.agent = agt;
+stub.on_text = old.on_text;
+stub.on_tool = old.on_tool;
+stub.on_reason = old.on_reason;
+stub.on_usage = old.on_usage;
+agt.llm_api = stub;
+
+actions = [];
+agt.on_action = [actions](action) {
+	actions.push_back(action);
+};
+
+original_prompt = "ORIGINAL_TASK_PROMPT";
+result = agt.task(original_prompt);
+
+checks = [];
+fail = 0;
+
+check(name, cond) {
+	checks.push_back([name=name, ok=json.bool(cond)]);
+	if(!cond) {
+		std.print("FAIL " + name);
+		fail++;
+	}
+}
+
+check("two compactions happened", stub.warning_runs == 2);
+check("the real task continued after each compaction", stub.normal_runs == 3);
+check("exactly five generations: normal, warning, normal, warning, normal", stub.prompts.size() == 5);
+
+check("warning finalize is not the terminal result",
+	std.is_json(result) && result.signal == "finished" && std.string(result.result ?? "") == "REAL_FINAL_REPORT");
+check("warning handover text is not the user-facing result",
+	std.string(result.result ?? "") != "HANDOVER 1" && std.string(result.result ?? "") != "HANDOVER 2");
+
+check("the first real prompt is the original task prompt",
+	stub.prompts[0] == original_prompt);
+check("prompt after first compaction preserves the original task prompt",
+	stub.prompts[2].contains(original_prompt) && stub.prompts[2].contains("HANDOVER 1"));
+check("prompt after second compaction preserves the original task prompt",
+	stub.prompts[4].contains(original_prompt) && stub.prompts[4].contains("HANDOVER 2"));
+
+check("warning run prompts are internal warning text",
+	stub.prompts[1].contains("YOUR CONTEXT IS ABOUT TO RUN OUT") && stub.prompts[3].contains("YOUR CONTEXT IS ABOUT TO RUN OUT"));
+
+seen_warning_action = false;
+for(a : actions) {
+	if(a.has("text") && std.is_string(a.text) && (a.text.contains("HANDOVER") || a.text.contains("YOUR CONTEXT IS ABOUT TO RUN OUT")))
+		seen_warning_action = true;
+}
+check("warning/handover text is not emitted to on_action", !seen_warning_action);
+
+seen_normal_action = false;
+for(a : actions) {
+	if(a.has("text") && std.is_string(a.text) && a.text == "NORMAL_FINAL_TEXT")
+		seen_normal_action = true;
+}
+check("the real task text still reaches on_action", seen_normal_action);
+
+check("compaction flag is reset after the handovers",
+	agt.compaction_requested == false && agt.internal_run == false);
+
+std.print(std.string(checks.size()) + " checks");
+if(fail == 0)
+	std.print("PASSED");
+else
+	std.print("FAILED: " + std.string(fail) + " checks failed");

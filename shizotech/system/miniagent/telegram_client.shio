@@ -1,0 +1,2250 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  telegram_client.shio — an isolated Telegram client for a friend
+//
+//  Usage:
+//      shz miniagent.telegram_client --bot-token <token> --workspace_dir <dir>
+//          [--work-start 09:00] [--work-end 17:00] [--timezone Europe/Berlin]
+//          [--trusted <path>] [--config <name|path[#profile]>]
+//          [--receptionist-config <name|path[#profile]>]
+//          [--worker-config <name|path[#profile]>]
+//
+//  What it is:
+//    * ONE project workspace, created/initialized if missing.
+//    * NO ShizoNet: no Router, no shizonet.server, no node polling.
+//    * A 24/7 receptionist agent answers trusted Telegram chats.
+//    * A worker agent runs ONLY inside the configured local work window.
+//      Requests outside the window are queued; at the next window they are
+//      dispatched. At window close, active worker sessions are stopped and
+//      checkpointed (their session state is saved by SessionManager).
+//    * Outgoing reports and send_file documents go to the Telegram chat.
+//    * Text files sent by the user are read and attached verbatim to the
+//      delegated/queued task.
+//
+//  Trusted chats file (default <workspace_dir>/trusted_chats.json):
+//      {"chats":[{"chatid":123456,"name":"Peter","added":1700000000000}]}
+//  Bootstrap: the first chat that messages the bot becomes trusted.
+//
+//  Commands in a trusted chat:
+//      /help /id /tasks [state] /status /window /queue
+//      /allow <chatid> [name] /deny <chatid> /forget
+//      /stop [taskid] /update <taskid> <message>
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "miniagent"
+#include "workspaces"
+#include "goal_time"
+#include "model_config_cli"
+
+import tgbot;
+
+TC_MAX_MSG = 3900;
+TC_REPORT_CHARS = 2500;
+TC_NOTIFY_CHARS = 3500;
+TC_CAPTION_CHARS = 1000;
+TC_FILE_MAX = 262144;
+TC_FILE_PROMPT_CHARS = 12000;
+TC_DEDUPE_MS = 1500;
+TC_COALESCE_MS = 1500;
+TC_MAX_QUEUED_OUT = 100;
+TC_DEFAULT_START = 9 * 60;
+TC_DEFAULT_END = 17 * 60;
+TC_QUEUE_PREFIX = "queued-";
+
+TC_TEXT_EXT = ["md", "markdown", "txt", "text", "json", "yaml", "yml", "toml", "ini", "csv", "tsv", "log",
+    "xml", "html", "htm", "css", "js", "ts", "py", "shio", "c", "cc", "cpp", "h", "hpp", "cs", "java",
+    "go", "rs", "sh", "bat", "ps1", "sql", "cmake", "diff", "patch"];
+
+// ── tiny helpers ─────────────────────────────────────────────────────────────
+
+tc_opt(opts, key, def = "") {
+    if(!std.is_json(opts) || !opts.has(key))
+        return def;
+
+    v = opts[key];
+
+    if(std.is_none(v))
+        return def;
+
+    return v;
+}
+
+tc_str(v, def = "") {
+    if(std.is_none(v))
+        return def;
+    return std.string(v);
+}
+
+tc_pad2(n) {
+    n = std.int(n);
+
+    if(n < 10 && n >= 0)
+        return "0" + std.string(n);
+
+    return std.string(n);
+}
+
+tc_minutes_text(min) {
+    n = std.int(min);
+    return tc_pad2(n / 60) + ":" + tc_pad2(n % 60);
+}
+
+tc_parse_hhmm(text, def = 0) {
+    s = std.string(text ?? "").strip();
+
+    if(!s)
+        return def;
+
+    parts = s.split(":");
+
+    if(parts.size() != 2)
+        return -1;
+
+    h = std.int(parts[0]);
+    m = std.int(parts[1]);
+
+    if(h < 0 || h > 23 || m < 0 || m > 59)
+        return -1;
+
+    return h * 60 + m;
+}
+
+tc_clip(txt, max_len = TC_MAX_MSG) {
+    s = std.string(txt ?? "");
+
+    if(s.length() <= max_len)
+        return s;
+
+    return s.substr(0, max_len) + "\n... (truncated)";
+}
+
+tc_join(list, sep = ", ") {
+    out = "";
+
+    for(i, v : list) {
+        if(i > 0)
+            out += sep;
+        out += std.string(v);
+    }
+
+    return out;
+}
+
+tc_get(obj, key, def = "") {
+    if(!std.is_json(obj) || !obj.has(key))
+        return def;
+
+    v = obj[key];
+
+    if(std.is_none(v))
+        return def;
+
+    return v;
+}
+
+tc_config_spec_absolute(spec) {
+    parts = model_config_split_profile(std.string(spec ?? ""));
+    raw = std.string(parts.path).strip();
+
+    if(!raw)
+        return "";
+
+    path = model_config_resolve_existing(spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
+
+    if(!path)
+        path = model_config_resolve(spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
+
+    abs = fileio.absolute_path(std.string(path));
+
+    if(parts.profile)
+        return abs + "#" + std.string(parts.profile);
+
+    return abs;
+}
+
+tc_write_agents_md(path) {
+    p = std.string(path) + "/AGENTS.md";
+
+    if(fileio.exists(p))
+        return true;
+
+    try {
+        fileio.write_text(p,
+            "# Telegram client workspace\n\n" +
+            "This workspace belongs to one isolated Telegram client.\n" +
+            "- Keep one project workspace.\n" +
+            "- Worker tasks run only inside the configured local work window.\n" +
+            "- Requests outside the window are queued and dispatched at the next window.\n");
+        return true;
+    }
+    catch(e) {
+        std.error("[telegram_client] cannot write AGENTS.md: ", e);
+        return false;
+    }
+}
+
+tc_prune_store(store, keep_path) {
+    keep = fileio.absolute_path(std.string(keep_path));
+    removed = 0;
+
+    for(w : store.list()) {
+        if(w.id == "root")
+            continue;
+
+        p = fileio.absolute_path(std.string(w.path));
+
+        if(p == keep)
+            continue;
+
+        try {
+            res = store.delete(w.id);
+            if(std.is_json(res) && res.ok)
+                removed++;
+        }
+        catch(e) {}
+    }
+
+    return removed;
+}
+
+// ── turn-result normalizer (same shape as node_turn_result) ──────────────────
+
+tc_turn_result(agent, res, crash = "", execution_time_ms = -1) {
+    out = res;
+
+    if(!std.is_json(out))
+        out = [ok = false, reports = []];
+
+    if(!std.is_json(out.reports))
+        out.reports = [];
+
+    if(execution_time_ms >= 0 && !out.has("execution_time_ms"))
+        out.execution_time_ms = execution_time_ms;
+
+    tr = None;
+
+    if(agent && std.is_json(agent.task_result))
+        tr = agent.task_result;
+
+    signal = "";
+    from_tool = true;
+    text = "";
+
+    if(tr) {
+        signal = std.string(tr.signal ?? "");
+        from_tool = tr.from_tool ? true : false;
+        if(tr.has("result"))
+            text = std.string(tr.result ?? "");
+    }
+    else if(std.is_json(out)) {
+        signal = std.string(out.signal ?? "");
+        from_tool = out.has("from_tool") ? (out.from_tool ? true : false) : true;
+        if(out.has("result"))
+            text = std.string(out.result ?? "");
+    }
+
+    if(signal == "failed" && !from_tool)
+        out.stopped = true;
+
+    if(crash) {
+        out.ok = false;
+        out.error = crash;
+        out.reports = [[
+            report = "The Telegram receptionist crashed: " + crash,
+            time = std.millis(),
+            time_str = std.timestamp(),
+        ]];
+        return out;
+    }
+
+    if(text) {
+        out.ok = !(signal == "failed");
+        out.error = out.ok ? "" : text;
+        out.reports = [[
+            report = text,
+            time = std.millis(),
+            time_str = std.timestamp(),
+        ]];
+        return out;
+    }
+
+    if(agent && std.is_json(agent.env) && agent.env.has("reports") && std.is_json(agent.env.reports) && agent.env.reports.size()) {
+        out.ok = true;
+        out.reports = agent.env.reports.copy();
+        out.error = "";
+        return out;
+    }
+
+    if(!out.reports.size()) {
+        if(out.stopped)
+            out.reports = [[
+                report = "The Telegram receptionist turn was stopped.",
+                time = std.millis(),
+                time_str = std.timestamp(),
+            ]];
+        else
+            out.reports = [[
+                report = "The Telegram receptionist turn ended without a report.",
+                time = std.millis(),
+                time_str = std.timestamp(),
+            ]];
+    }
+
+    return out;
+}
+
+// ── the window-enforcing host wrapper ──────────────────────────────────────
+
+class ClientMind {
+    workspace = None;
+    client = None;
+    queue = [];
+    goals = None;
+    window_start = TC_DEFAULT_START;
+    window_end = TC_DEFAULT_END;
+    timezone = "local";
+
+    __init__(_workspace, _client, start_min, end_min, tz = "local") {
+        workspace = _workspace;
+        client = _client;
+        queue = [];
+        goals = None;
+        window_start = std.int(start_min);
+        window_end = std.int(end_min);
+        timezone = std.string(tz ?? "local");
+    }
+
+    queued_view(item) {
+        return [
+            ok = true,
+            taskid = std.string(item.id),
+            name = std.string(item.name),
+            state = "planned",
+            active = json.bool(false),
+            report = "Queued for the next work window (" + client.tg_window_text() + ")",
+            error = "",
+            token_usage = 0,
+            last_update_ms = std.int(item.at),
+        ];
+    }
+
+    get_overview() {
+        if(!workspace)
+            return [tasks = [], tasks_scheduled = [], tasks_finished = [], tasks_failed = []];
+
+        ov = workspace.get_overview();
+
+        if(!std.is_json(ov))
+            ov = [tasks = [], tasks_scheduled = [], tasks_finished = [], tasks_failed = []];
+
+        if(!std.is_json(ov.tasks))
+            ov.tasks = [];
+        if(!std.is_json(ov.tasks_scheduled))
+            ov.tasks_scheduled = [];
+        if(!std.is_json(ov.tasks_finished))
+            ov.tasks_finished = [];
+        if(!std.is_json(ov.tasks_failed))
+            ov.tasks_failed = [];
+
+        for(item : queue)
+            ov.tasks_scheduled.push_back(queued_view(item));
+
+        return ov;
+    }
+
+    inspect_task(taskid) {
+        tid = std.string(taskid ?? "");
+
+        for(item : queue) {
+            if(std.string(item.id) == tid)
+                return queued_view(item);
+        }
+
+        if(workspace) {
+            info = workspace.inspect_task(tid);
+
+            if(std.is_json(info))
+                return info;
+        }
+
+        return [
+            ok = false,
+            taskid = tid,
+            name = "",
+            state = "lost",
+            active = json.bool(false),
+            report = "",
+            error = "not found",
+            token_usage = 0,
+            last_update_ms = 0,
+        ];
+    }
+
+    add_task(name, goal, role = "adaptive") {
+        name = std.string(name ?? "").strip();
+        goal = std.string(goal ?? "").strip();
+        role = std.string(role ?? "adaptive");
+
+        if(!name)
+            name = "Task-" + std.random_hash(6);
+
+        if(!role)
+            role = "adaptive";
+
+        att = client.tg_take_attachments();
+
+        if(att.size()) {
+            goal += "\n\nAttached files, verbatim:\n";
+
+            for(f : att)
+                goal += "\n--- " + std.string(f.name) + " ---\n" + std.string(f.content) + "\n";
+        }
+
+        if(workspace && client.tg_window_open()) {
+            tid = "";
+
+            try {
+                tid = workspace.add_task(name, goal, role);
+            }
+            catch(e) {
+                std.error("[telegram_client] workspace add_task failed: ", e);
+                tid = "";
+            }
+
+            if(tid) {
+                client.tg_task_owner[tid] = client.tg_current_chat;
+                return tid;
+            }
+        }
+
+        id = TC_QUEUE_PREFIX + std.random_hash(10);
+
+        queue.push_back([
+            id = id,
+            name = name,
+            goal = goal,
+            role = role,
+            at = std.millis(),
+            chat = client.tg_current_chat,
+        ]);
+
+        client.tg_turn_queued++;
+
+        return id;
+    }
+
+    update_task(taskid, message) {
+        tid = std.string(taskid ?? "");
+        msg = std.string(message ?? "");
+
+        for(item : queue) {
+            if(std.string(item.id) == tid) {
+                item.goal = std.string(item.goal) + "\nFollow-up: " + msg;
+                return true;
+            }
+        }
+
+        if(workspace)
+            return workspace.update_task(tid, msg);
+
+        return false;
+    }
+
+    stop_task(taskid) {
+        tid = std.string(taskid ?? "");
+
+        for(i = 0; i < queue.size(); i++) {
+            if(std.string(queue[i].id) == tid) {
+                queue.erase(i);
+                return true;
+            }
+        }
+
+        if(workspace)
+            return workspace.stop_task(tid);
+
+        return false;
+    }
+
+    dispatch_queue() {
+        if(!workspace || !client.tg_window_open())
+            return 0;
+
+        started = 0;
+        names = [];
+
+        for(queue.size()) {
+            if(!client.tg_window_open())
+                break;
+
+            item = queue[0];
+            tid = "";
+
+            try {
+                tid = workspace.add_task(item.name, item.goal, item.role);
+            }
+            catch(e) {
+                std.error("[telegram_client] queued task start failed: ", e);
+                tid = "";
+            }
+
+            queue.erase(0);
+
+            if(!tid) {
+                client.tg_notify("[queue] could not start: " + std.string(item.name), None, 0);
+                continue;
+            }
+
+            client.tg_task_owner[tid] = item.chat;
+            started++;
+            names.push_back(item.name);
+        }
+
+        if(started)
+            client.tg_notify("[window] dispatched " + std.string(started) + " queued task(s): " + tc_join(names), None, 0);
+
+        return started;
+    }
+
+    stop_active() {
+        if(!workspace)
+            return 0;
+
+        ov = workspace.get_overview();
+
+        if(!std.is_json(ov) || !std.is_json(ov.tasks))
+            return 0;
+
+        n = 0;
+
+        for(t : ov.tasks) {
+            if(t.active) {
+                try {
+                    if(workspace.stop_task(t.taskid))
+                        n++;
+                }
+                catch(e) {}
+            }
+        }
+
+        return n;
+    }
+
+    notify_user(msg) {
+        return client.tg_notify_current(msg);
+    }
+
+    share_file(path, caption = "") {
+        if(!workspace)
+            return [ok = false, error = "no workspace"];
+
+        return workspace.share_file(path, caption);
+    }
+
+    background_capacity() {
+        if(!workspace)
+            return [workers = 0, busy = 0];
+
+        try {
+            return workspace.background_capacity();
+        }
+        catch(e) {
+            return [workers = 0, busy = 0];
+        }
+    }
+
+    add_task_finished_listener(cb, owner = "") {
+        if(!workspace)
+            return false;
+
+        try {
+            workspace.add_task_finished_listener(cb, owner);
+            return true;
+        }
+        catch(e) {
+            try {
+                workspace.add_task_finished_listener(cb);
+                return true;
+            }
+            catch(e2) {}
+        }
+
+        return false;
+    }
+
+    remove_task_finished_listener(owner) {
+        if(!workspace)
+            return false;
+
+        return workspace.remove_task_finished_listener(owner);
+    }
+}
+
+// ── local receptionist turn loop (no node.shio host) ────────────────────────
+
+class ClientReceptionist {
+    agent = None;
+    owner = None;
+    queue = [];
+    updates = [];
+    running = true;
+    thread = None;
+    _active = false;
+
+    __init__(cfg, _owner) {
+        owner = _owner;
+        agent = miniagent(cfg, "receptionist");
+         agent.set_reasoning_effort("low");
+         agent.env.mind = owner;
+
+         // The receptionist answers questions about THIS workspace, not the
+         // directory the client was launched from.
+         if(owner && owner.workspace && std.string(owner.workspace.path ?? ""))
+             agent.filesystem = fileio.container(std.string(owner.workspace.path));
+
+        queue = [];
+        updates = [];
+        running = true;
+        _active = false;
+        thread = None;
+
+        rt = std.thread([this]() { this.loop(); });
+        rt.run();
+        thread = rt;
+    }
+
+    __deinit__() {
+        stop();
+    }
+
+    stop() {
+        running = false;
+
+        if(agent) {
+            try { agent.stop(); } catch(e) {}
+        }
+
+        if(thread) {
+            try { thread.join(); } catch(e) {}
+            thread = None;
+        }
+
+        queue = [];
+        updates = [];
+        _active = false;
+
+        if(owner)
+            owner.client.tg_current_chat = None;
+
+        return true;
+    }
+
+    update(message) {
+        if(!_active)
+            return false;
+
+        updates.push_back(std.string(message));
+
+        try { agent.stop(); } catch(e) {}
+
+        return true;
+    }
+
+    request(prompt, on_action = None) {
+        req = [
+            id = std.random_hash(),
+            prompt = std.string(prompt),
+            finished = false,
+            result = None,
+            on_action_cb = on_action,
+        ];
+
+        queue.push_back(req);
+
+        for(!req.finished)
+            std.sleep(100);
+
+        return req.result;
+    }
+
+    loop() {
+        for(running) {
+            if(!queue.size()) {
+                std.sleep(100);
+                continue;
+            }
+
+            req = queue[0];
+
+            try {
+                run_request(req);
+            }
+            catch(e) {
+                std.error("[telegram_client] receptionist request failed: ", e);
+                req.result = [ok = false, error = std.string(e), reports = [[
+                    report = "The Telegram receptionist crashed: " + std.string(e),
+                    time = std.millis(),
+                    time_str = std.timestamp(),
+                ]]];
+            }
+
+            req.finished = true;
+            queue.erase(0);
+            std.sleep(10);
+        }
+    }
+
+    run_request(req) {
+        result = None;
+        crash = "";
+        start_ms = std.millis();
+
+        updates = [];
+        _active = true;
+
+        try {
+            agent.on_action = req.on_action_cb;
+            agent.clear_chat();
+            result = agent.task(req.prompt);
+
+            for(updates.size() && running) {
+                msg = "";
+
+                for(i = 0; i < updates.size(); i++)
+                    msg += updates[i] + "\n\n";
+
+                updates = [];
+                result = agent.task("# Follow-up from the user\n" + msg.strip(), true);
+            }
+        }
+        catch(e) {
+            crash = std.string(e);
+            std.error("[telegram_client] receptionist turn crashed: ", e);
+        }
+
+        updates = [];
+        _active = false;
+
+        result = tc_turn_result(agent, result, crash, std.millis() - start_ms);
+
+        req.result = result;
+    }
+}
+
+// ── the Telegram client ─────────────────────────────────────────────────────
+
+class TelegramClient {
+    workspace = None;
+    workspace_record = [];
+    manager = None;
+    store = None;
+    registry_root = "";
+    workspace_dir = "";
+    cfg = None;
+    cfg_spec = "";
+
+    mind = None;
+    receptionist = None;
+    bot = None;
+
+    tg_path = "";
+    tg_inbox = "";
+    tg_chats = [];
+    tg_queue = [];
+    tg_out = [];
+    tg_thread = None;
+    tg_running = false;
+
+    tg_last_chat = 0;
+    tg_last_text = "";
+    tg_last_ms = 0;
+    tg_terminal_seen = [];
+    tg_lock = "telegram_client:chats";
+
+    tg_current_chat = None;
+    tg_attachments = [];
+    tg_turn_queued = 0;
+
+    tg_task_owner = [];      // taskid -> chatdata
+    tg_coalesce_ms = TC_COALESCE_MS;
+
+    tg_window_start = TC_DEFAULT_START;
+    tg_window_end = TC_DEFAULT_END;
+    tg_timezone = "local";
+    tg_zone = None;
+    tg_clock = None;
+    tg_was_open = false;
+
+    __init__(cfg, opts, bot = None, workspace = None, receptionist = None, clock = None) {
+        this.cfg = cfg;
+        opts = std.is_json(opts) ? opts : [];
+
+        ws = std.string(tc_opt(opts, "workspace_dir", ""));
+
+        if(ws)
+            workspace_dir = fileio.absolute_path(ws);
+        else
+            workspace_dir = fileio.absolute_path(std.wd() + "/telegram_client_workspace");
+
+        cfg_spec = tc_config_spec_absolute(tc_opt(opts, "cfg_spec", ""));
+
+        tg_path = std.string(tc_opt(opts, "trusted", ""));
+
+        if(!tg_path)
+            tg_path = workspace_dir + "/trusted_chats.json";
+
+        tg_inbox = fileio.file_dir(tg_path);
+
+        if(!tg_inbox)
+            tg_inbox = workspace_dir;
+
+        tg_inbox += "/telegram_inbox";
+
+        tg_window_start = std.int(tc_opt(opts, "work_start", TC_DEFAULT_START));
+        tg_window_end = std.int(tc_opt(opts, "work_end", TC_DEFAULT_END));
+        tg_timezone = std.string(tc_opt(opts, "timezone", "local"));
+        tg_coalesce_ms = std.int(tc_opt(opts, "coalesce_ms", TC_COALESCE_MS));
+        tg_clock = clock;
+
+        tg_zone = gt_zone(tg_timezone);
+
+        if(!std.is_json(tg_zone) || !tg_zone.ok) {
+            std.warn("[telegram_client] unknown time zone '", tg_timezone, "', using local time");
+            tg_zone = gt_zone("local");
+        }
+
+        tg_chats = [];
+        tg_queue = [];
+        tg_out = [];
+        tg_terminal_seen = [];
+        tg_task_owner = [];
+        tg_current_chat = None;
+        tg_attachments = [];
+        tg_turn_queued = 0;
+        tg_was_open = false;
+        tg_running = false;
+        tg_thread = None;
+
+        tg_load();
+
+        if(workspace) {
+            this.workspace = workspace;
+
+            if(workspace.path)
+                workspace_dir = fileio.absolute_path(std.string(workspace.path));
+        }
+        else {
+            tc_create_workspace();
+        }
+
+        if(this.workspace) {
+            mind = ClientMind(this.workspace, this, tg_window_start, tg_window_end, tg_timezone);
+
+            if(!workspace || this.workspace.scheduler) {
+                tc_setup_scheduler();
+            }
+
+            tc_attach_listeners();
+        }
+
+        if(receptionist)
+            this.receptionist = receptionist;
+
+        if(bot)
+            attach_bot(bot);
+    }
+
+    __deinit__() {
+        stop();
+    }
+
+    // ── workspace lifecycle ────────────────────────────────────────────────
+
+    tc_create_workspace() {
+        fileio.mkdir(workspace_dir);
+
+        registry_root = workspace_dir + "/.client_registry";
+        fileio.mkdir(registry_root);
+
+        store = WorkspaceStore(registry_root);
+        res = store.create(
+            "TelegramClient",
+            workspace_dir,
+            "root",
+            "isolated Telegram client workspace"
+        );
+
+        if(!std.is_json(res) || !res.ok) {
+            std.error("[telegram_client] cannot initialize workspace: ", tc_str(res.error ?? "failed"));
+            return false;
+        }
+
+        workspace_record = res.workspace.copy();
+
+        tc_prune_store(store, workspace_dir);
+
+        manager = SessionManager(store, cfg_spec, "");
+        manager.register_workspace(workspace_record.id, workspace_record.path);
+
+        workspace = Workspace(workspace_record, manager, cfg_spec, "");
+
+        tc_write_agents_md(workspace_dir);
+
+        return true;
+    }
+
+    tc_setup_scheduler() {
+        if(!workspace || !mind)
+            return false;
+
+        if(workspace.scheduler) {
+            try { workspace.scheduler.stop(); } catch(e) {}
+        }
+
+        space = GoalSpace(workspace.path + "/.agentspace");
+        sch = GoalScheduler(space, mind, [workspace_id = workspace.id]);
+
+        workspace.scheduler = sch;
+        mind.goals = sch;
+
+        return true;
+    }
+
+    tc_attach_listeners() {
+        if(!workspace)
+            return;
+
+        try {
+            workspace.add_file_listener([this](f) { this.tg_send_shared_file(f); });
+        }
+        catch(e) {
+            std.error("[telegram_client] file listener failed: ", e);
+        }
+
+        try {
+            workspace.add_notify_listener([this](m) { this.tg_send_notify(m); });
+        }
+        catch(e) {
+            std.error("[telegram_client] notify listener failed: ", e);
+        }
+
+        try {
+            workspace.add_task_finished_listener([this](t) { this.tg_send_task_terminal(t); }, "telegram_client");
+        }
+        catch(e) {
+            std.error("[telegram_client] finished listener failed: ", e);
+        }
+    }
+
+    attach_bot(bot) {
+        this.bot = bot;
+
+        if(this.bot) {
+            this.bot.on_any_message = [this](chatdata) { this.tg_handle_message(chatdata); };
+        }
+
+        return this.bot ? true : false;
+    }
+
+    ensure_receptionist() {
+        if(receptionist)
+            return receptionist;
+
+        if(!cfg)
+            return None;
+
+        try {
+            receptionist = ClientReceptionist(cfg, mind);
+        }
+        catch(e) {
+            std.error("[telegram_client] cannot start receptionist: ", e);
+            receptionist = None;
+        }
+
+        return receptionist;
+    }
+
+    start(start_thread = true) {
+        ensure_receptionist();
+
+        tg_running = true;
+        tg_sync_window();
+
+        if(start_thread && !tg_thread) {
+            tg_thread = std.thread([this]() { this.tg_worker(); });
+            tg_thread.run();
+        }
+
+        return true;
+    }
+
+    stop() {
+        tg_running = false;
+
+        if(tg_thread) {
+            try { tg_thread.join(); } catch(e) {}
+            tg_thread = None;
+        }
+
+        if(receptionist) {
+            try { receptionist.stop(); } catch(e) {}
+            receptionist = None;
+        }
+
+        if(mind && mind.goals) {
+            try { mind.goals.stop(); } catch(e) {}
+        }
+
+        if(workspace) {
+            try { workspace.stop(); } catch(e) {}
+            workspace = None;
+        }
+
+        return true;
+    }
+
+    // ── window logic ───────────────────────────────────────────────────────
+
+    tg_window_open(now = None) {
+        if(std.is_none(now))
+            now = tg_clock ? tg_clock() : gt_now();
+
+        l = gt_utc_to_local(tg_zone, now);
+        mins = l.hour * 60 + l.minute;
+
+        if(tg_window_start == tg_window_end)
+            return true;
+
+        if(tg_window_start < tg_window_end)
+            return mins >= tg_window_start && mins < tg_window_end;
+
+        return mins >= tg_window_start || mins < tg_window_end;
+    }
+
+    tg_window_text() {
+        now = tg_clock ? tg_clock() : gt_now();
+        open = tg_window_open(now);
+
+        return "Work window: " + tc_minutes_text(tg_window_start) + " - " + tc_minutes_text(tg_window_end) +
+            " (" + tg_timezone + ")\nNow: " + gt_format_local(tg_zone, now) + "\n" +
+            (open ? "OPEN - worker requests run now." : "CLOSED - requests are queued for the next window.");
+    }
+
+    tg_sync_window() {
+        if(!mind)
+            return 0;
+
+        open = tg_window_open();
+
+        if(open) {
+            if(mind.goals) {
+                try { mind.goals.start(); } catch(e) { std.error("[telegram_client] goal scheduler start failed: ", e); }
+            }
+
+            n = mind.dispatch_queue();
+
+            if(n)
+                tg_notify("[window] opened; dispatched " + std.string(n) + " queued task(s).", None, 0);
+        }
+        else {
+            n = mind.stop_active();
+
+            if(mind.goals) {
+                try { mind.goals.stop(); } catch(e) { std.error("[telegram_client] goal scheduler stop failed: ", e); }
+            }
+
+            if(tg_was_open || n)
+                tg_notify("[window] closed; stopped " + std.string(n) + " active worker task(s).", None, 0);
+        }
+
+        tg_was_open = open;
+
+        return open ? 1 : 0;
+    }
+
+    // ── trust list ─────────────────────────────────────────────────────────
+
+    tg_load() {
+        data = fileio.read_json(tg_path, true);
+        list = [];
+
+        if(std.is_json(data) && data.has("chats") && std.is_json(data.chats)) {
+            for(i = 0; i < data.chats.size(); i++) {
+                c = data.chats[i];
+
+                if(std.is_json(c) && c.has("chatid") && std.int(c.chatid) != 0) {
+                    list.push_back([
+                        chatid = std.int(c.chatid),
+                        name = std.string(tc_get(c, "name", "")),
+                        added = std.int(tc_get(c, "added", 0)),
+                    ]);
+                }
+            }
+        }
+
+        cs = std.critical_section_named(tg_lock);
+        tg_chats = list;
+        cs.release();
+
+        return tg_chats.size();
+    }
+
+    tg_save() {
+        out = [chats = []];
+
+        cs = std.critical_section_named(tg_lock);
+
+        for(i = 0; i < tg_chats.size(); i++)
+            out.chats.push_back(tg_chats[i].copy());
+
+        cs.release();
+
+        try {
+            dir = fileio.file_dir(tg_path);
+
+            if(dir && !fileio.exists(dir))
+                fileio.mkdir(dir);
+        }
+        catch(e) {}
+
+        try {
+            fileio.write_text(tg_path, std.string(out));
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram_client] cannot write trust file ", tg_path, ": ", e);
+            return false;
+        }
+    }
+
+    tg_is_trusted(chatid) {
+        want = std.int(chatid);
+        found = false;
+
+        cs = std.critical_section_named(tg_lock);
+
+        for(i = 0; i < tg_chats.size(); i++) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                found = true;
+                break;
+            }
+        }
+
+        cs.release();
+
+        return found;
+    }
+
+    tg_trust(chatid, chat_name = "") {
+        want = std.int(chatid);
+
+        if(want == 0 || tg_is_trusted(want))
+            return false;
+
+        cs = std.critical_section_named(tg_lock);
+        tg_chats.push_back([chatid = want, name = std.string(chat_name), added = std.millis()]);
+        cs.release();
+
+        tg_save();
+
+        return true;
+    }
+
+    tg_untrust(chatid) {
+        want = std.int(chatid);
+        removed = false;
+
+        cs = std.critical_section_named(tg_lock);
+
+        for(i = tg_chats.size() - 1; i >= 0; i--) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                tg_chats.erase(i);
+                removed = true;
+            }
+        }
+
+        cs.release();
+
+        if(removed)
+            tg_save();
+
+        return removed;
+    }
+
+    tg_chat_list() {
+        out = [];
+
+        cs = std.critical_section_named(tg_lock);
+
+        for(i = 0; i < tg_chats.size(); i++)
+            out.push_back(tg_chats[i].copy());
+
+        cs.release();
+
+        return out;
+    }
+
+    tg_trusted_text() {
+        list = tg_chat_list();
+
+        if(!list.size())
+            return "none yet — the first chat that messages the bot becomes trusted";
+
+        out = "";
+
+        for(i = 0; i < list.size(); i++) {
+            out += "- " + std.string(list[i].chatid);
+
+            if(list[i].name)
+                out += " (" + std.string(list[i].name) + ")";
+
+            out += "\n";
+        }
+
+        return out;
+    }
+
+    // ── inbound ────────────────────────────────────────────────────────────
+
+    tg_handle_message(chatdata) {
+        if(!std.is_json(chatdata)) {
+            std.print("[telegram_client] message without chatdata\n");
+            return;
+        }
+
+        chat_id = std.int(tc_get(chatdata, "chatid", 0));
+        txt = std.string(tc_get(chatdata, "text", "")).strip();
+
+        if(chat_id == 0)
+            return;
+
+        if(!tg_is_trusted(chat_id)) {
+            if(tg_chats.size() > 0) {
+                std.print("[telegram_client] ignored message from untrusted chat ", chat_id, "\n");
+                return;
+            }
+
+            who = std.string(tc_get(chatdata, "username", ""));
+
+            if(!who)
+                who = std.string(tc_get(chatdata, "first_name", ""));
+
+            tg_trust(chat_id, who);
+            std.print("[telegram_client] bootstrap: chat ", chat_id, " (", who, ") is now trusted\n");
+            tg_send(chatdata, tg_welcome_text());
+        }
+
+        doc = None;
+        d = tc_get(chatdata, "document", None);
+
+        if(std.is_json(d) && std.string(tc_get(d, "fileid", "")))
+            doc = d;
+
+        if(!txt)
+            txt = std.string(tc_get(chatdata, "caption", "")).strip();
+
+        reply_text = "";
+        r = tc_get(chatdata, "reply", None);
+
+        if(std.is_json(r)) {
+            reply_text = std.string(tc_get(r, "text", "")).strip();
+
+            if(!reply_text)
+                reply_text = std.string(tc_get(r, "caption", "")).strip();
+
+            reply_text = tc_clip(reply_text, 600);
+        }
+
+        dedupe_key = txt;
+
+        if(doc)
+            dedupe_key += "#file:" + std.string(tc_get(doc, "fileuid", tc_get(doc, "fileid", "")));
+
+        if(chat_id == tg_last_chat && dedupe_key == tg_last_text && std.millis() - tg_last_ms < TC_DEDUPE_MS) {
+            std.print("[telegram_client] duplicate delivery from chat ", chat_id, " ignored\n");
+            return;
+        }
+
+        tg_last_chat = chat_id;
+        tg_last_text = dedupe_key;
+        tg_last_ms = std.millis();
+
+        if(!txt && !doc) {
+            if(tc_get(chatdata, "photo", None) || tc_get(chatdata, "voice", None) || tc_get(chatdata, "video", None))
+                tg_send(chatdata, "I read text and text files (.md, .txt, .json, code). Photos, voice and video are not supported yet.");
+
+            return;
+        }
+
+        if(txt.starts("/") && !doc) {
+            tg_command(chatdata, txt);
+            return;
+        }
+
+        tg_enqueue(chatdata, txt, doc, reply_text);
+    }
+
+    tg_enqueue(chatdata, txt, doc = None, reply_text = "") {
+        cs = std.critical_section_named(tg_lock);
+
+        tg_queue.push_back([
+            chatdata = chatdata,
+            chatid = std.int(tc_get(chatdata, "chatid", 0)),
+            text = std.string(txt),
+            doc = doc,
+            reply = std.string(reply_text ?? ""),
+            at = std.millis(),
+        ]);
+
+        cs.release();
+    }
+
+    tg_command(chatdata, txt) {
+        chat_id = std.int(chatdata.chatid ?? 0);
+        parts = txt.split(" ", 3, true);
+        cmd = std.string(parts[0]).lowercase();
+        arg = "";
+        who = "";
+
+        if(parts.size() > 1)
+            arg = std.string(parts[1]).strip();
+
+        if(parts.size() > 2)
+            who = std.string(parts[2]).strip();
+
+        if(cmd == "/help" || cmd == "/start") {
+            tg_send(chatdata, tg_help_text());
+            return;
+        }
+
+        if(cmd == "/id") {
+            tg_send(chatdata, "This chat: " + std.string(chat_id) + "\nTrusted chats:\n" + tg_trusted_text() + "File: " + tg_path);
+            return;
+        }
+
+        if(cmd == "/tasks") {
+            tg_send(chatdata, tg_tasks_text(arg));
+            return;
+        }
+
+        if(cmd == "/status") {
+            tg_send(chatdata, tg_status_text());
+            return;
+        }
+
+        if(cmd == "/window") {
+            tg_send(chatdata, tg_window_text());
+            return;
+        }
+
+        if(cmd == "/queue") {
+            tg_send(chatdata, tg_queue_text());
+            return;
+        }
+
+        if(cmd == "/allow") {
+            if(!arg) {
+                tg_send(chatdata, "usage: /allow <chatid> [name]");
+                return;
+            }
+
+            new_id = std.int(arg);
+
+            if(new_id == 0) {
+                tg_send(chatdata, "Not a chat id: " + arg);
+                return;
+            }
+
+            if(tg_trust(new_id, who))
+                tg_send(chatdata, "Trusted " + std.string(new_id) + ".\nTrusted chats:\n" + tg_trusted_text());
+            else
+                tg_send(chatdata, "Already trusted: " + std.string(new_id));
+
+            return;
+        }
+
+        if(cmd == "/deny") {
+            if(!arg) {
+                tg_send(chatdata, "usage: /deny <chatid>");
+                return;
+            }
+
+            if(tg_untrust(std.int(arg)))
+                tg_send(chatdata, "Dropped " + arg + ".\nTrusted chats:\n" + tg_trusted_text());
+            else
+                tg_send(chatdata, "Not trusted: " + arg);
+
+            return;
+        }
+
+        if(cmd == "/forget") {
+            tg_untrust(chat_id);
+            tg_send(chatdata, "This chat is no longer trusted. The bot ignores it until it is listed in " + tg_path + " again.");
+            return;
+        }
+
+        if(cmd == "/stop") {
+            if(!arg) {
+                n = mind.stop_active();
+                tg_send(chatdata, "Stopped " + std.string(n) + " active worker task(s).");
+                return;
+            }
+
+            if(mind.stop_task(arg))
+                tg_send(chatdata, "Stopped task " + arg + ".");
+            else
+                tg_send(chatdata, "Task not found: " + arg);
+
+            return;
+        }
+
+        if(cmd == "/update") {
+            if(parts.size() < 3) {
+                tg_send(chatdata, "usage: /update <taskid> <message>");
+                return;
+            }
+
+            if(mind.update_task(parts[1], parts[2]))
+                tg_send(chatdata, "Updated task " + std.string(parts[1]) + ".");
+            else
+                tg_send(chatdata, "Task not found or already finished: " + std.string(parts[1]));
+
+            return;
+        }
+
+        tg_send(chatdata, "Unknown command. /help");
+    }
+
+    // ── inbound turn handling ──────────────────────────────────────────────
+
+    tg_next_ready() {
+        now = std.millis();
+        found = -1;
+
+        cs = std.critical_section_named(tg_lock);
+
+        for(i = 0; i < tg_queue.size() && found < 0; i++) {
+            it = tg_queue[i];
+            newest = it.at;
+
+            for(j = i + 1; j < tg_queue.size(); j++) {
+                if(tg_queue[j].chatid == it.chatid && tg_queue[j].at > newest)
+                    newest = tg_queue[j].at;
+            }
+
+            if(now - newest >= tg_coalesce_ms)
+                found = i;
+        }
+
+        cs.release();
+
+        return found;
+    }
+
+    tg_run_item(idx) {
+        cs = std.critical_section_named(tg_lock);
+        first = tg_queue[idx];
+        items = [];
+
+        for(i = 0; i < tg_queue.size(); i++) {
+            if(tg_queue[i].chatid == first.chatid) {
+                items.push_back(tg_queue[i]);
+                tg_queue.erase(i);
+                i--;
+            }
+        }
+
+        cs.release();
+
+        try {
+            tg_run_turn(items);
+        }
+        catch(e) {
+            std.error("[telegram_client] turn failed: ", e);
+            tg_send(first.chatdata, "This message failed on the Telegram client: " + std.string(e));
+        }
+    }
+
+    tg_run_turn(items) {
+        chatdata = items[items.size() - 1].chatdata;
+        parts = [];
+        files = [];
+        notes = [];
+        att = [];
+
+        for(it : items) {
+            t = std.string(it.text);
+
+            if(it.reply)
+                t += (t ? "\n" : "") + "(in reply to: \"" + it.reply + "\")";
+
+            if(t)
+                parts.push_back(t);
+
+            if(it.doc) {
+                f = tg_fetch_document(it.doc);
+
+                if(f.ok) {
+                    files.push_back(f);
+                    att.push_back([name = f.name, content = f.content]);
+                }
+                else {
+                    notes.push_back("(The user attached '" + f.name + "'; it was not read: " + f.error + ")");
+                }
+            }
+        }
+
+        prompt = tg_turn_prompt(parts, files, notes);
+
+        tg_attachments = att;
+        tg_current_chat = chatdata;
+        tg_turn_queued = 0;
+
+        res = None;
+
+        try {
+            if(receptionist)
+                res = receptionist.request(prompt);
+            else
+                res = [ok = false, error = "No receptionist is attached."];
+        }
+        catch(e) {
+            res = [ok = false, error = std.string(e)];
+        }
+
+        tg_current_chat = None;
+        tg_attachments = [];
+
+        out = tg_answer_text(res);
+
+        if(tg_turn_queued > 0) {
+            out += "\n\nQueued " + std.string(tg_turn_queued) + " request(s) for the next work window (" + tg_window_text() + ").";
+            tg_turn_queued = 0;
+        }
+
+        tg_send_report(chatdata, out);
+    }
+
+    tg_turn_prompt(parts, files, notes) {
+        out = "";
+
+        if(parts.size() == 1) {
+            out = parts[0];
+        }
+        else if(parts.size() > 1) {
+            out = "The user sent " + std.string(parts.size()) + " messages in a row; later ones correct or extend earlier ones:\n";
+
+            for(i, p : parts)
+                out += "\n" + std.string(i + 1) + ". " + p;
+        }
+        else if(files.size()) {
+            out = "The user sent a file without a message. Find out from its content what they want done; ask if it is unclear.";
+        }
+
+        for(f : files) {
+            out += "\n\nAttached file '" + f.name + "' (" + std.string(f.bytes) + " bytes, kept at " + f.path + "). " +
+                "It is attached verbatim to the task you delegate in this turn; do not copy it into the task text.\n````\n" +
+                tc_clip(f.content, TC_FILE_PROMPT_CHARS) + "\n````";
+        }
+
+        for(n : notes)
+            out += "\n\n" + n;
+
+        return out;
+    }
+
+    tg_answer_text(res) {
+        if(!std.is_json(res))
+            return "The receptionist turn returned nothing usable.";
+
+        out = "";
+
+        if(res.has("result") && !std.is_none(res.result))
+            out = std.string(res.result ?? "");
+
+        if(!out && res.has("reports") && std.is_json(res.reports) && res.reports.size())
+            out = std.string(res.reports[0].report ?? "");
+
+        if(!out && res.has("error"))
+            out = std.string(res.error ?? "");
+
+        if(!out && res.has("ok") && !res.ok)
+            out = "The receptionist turn failed.";
+
+        if(!out)
+            out = "The receptionist turn ended without a report.";
+
+        return out;
+    }
+
+    // ── outbound ──────────────────────────────────────────────────────────
+
+    tg_send(chatdata, txt) {
+        msg = tc_clip(txt);
+
+        if(!bot) {
+            std.print("[telegram_client:", std.string(chatdata.chatid ?? 0), "] ", msg, "\n");
+            return false;
+        }
+
+        try {
+            bot.send_rich(chatdata, [markdown = msg]);
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram_client] send to ", std.string(chatdata.chatid ?? 0), " failed: ", e);
+            return false;
+        }
+    }
+
+    tg_broadcast(txt) {
+        list = tg_chat_list();
+
+        for(i = 0; i < list.size(); i++)
+            tg_send([chatid = std.int(list[i].chatid)], txt);
+
+        return list.size();
+    }
+
+    tg_send_report(chatdata, txt, attach_chars = TC_REPORT_CHARS) {
+        txt = std.string(txt ?? "");
+
+        if(!txt)
+            return false;
+
+        msg = tc_clip(txt, TC_MAX_MSG);
+
+        if(txt.length() > attach_chars) {
+            name = "report-" + std.string(std.millis()) + ".md";
+            path = tg_inbox + "/out-" + name;
+
+            try {
+                if(!fileio.exists(tg_inbox))
+                    fileio.mkdir(tg_inbox);
+
+                fileio.write_string(path, txt);
+            }
+            catch(e) {
+                std.error("[telegram_client] cannot write report: ", e);
+                return tg_send(chatdata, msg);
+            }
+
+            tg_send(chatdata, msg + "\n(the full report is attached)");
+            tg_send_file(chatdata, path, "full report");
+
+            try { fileio.remove(path); } catch(e) {}
+
+            return true;
+        }
+
+        return tg_send(chatdata, msg);
+    }
+
+    tg_broadcast_report(txt) {
+        list = tg_chat_list();
+
+        for(i = 0; i < list.size(); i++)
+            tg_send_report([chatid = std.int(list[i].chatid)], txt);
+
+        return list.size();
+    }
+
+    tg_send_file(chatdata, path, caption = "") {
+        if(!bot) {
+            std.print("[telegram_client:", std.string(chatdata.chatid ?? 0), "] (document) ", path, " ", caption, "\n");
+            return false;
+        }
+
+        try {
+            opts = [];
+
+            if(caption)
+                opts.caption = tc_clip(std.string(caption), TC_CAPTION_CHARS);
+
+            bot.send_document(chatdata, path, opts);
+            return true;
+        }
+        catch(e) {
+            std.error("[telegram_client] sending document ", path, " failed: ", e);
+            return false;
+        }
+    }
+
+    tg_file_path(f) {
+        name = tg_safe_name(std.string(f.name ?? "file"));
+        path = tg_inbox + "/out-" + std.string(std.millis()) + "-" + name;
+
+        try {
+            if(!fileio.exists(tg_inbox))
+                fileio.mkdir(tg_inbox);
+
+            if(f.has("data"))
+                fileio.write_file(path, std.base64_decode(std.string(f.data)));
+            else
+                fileio.write_string(path, std.string(f.text ?? ""));
+        }
+        catch(e) {
+            std.error("[telegram_client] cannot write attachment ", name, ": ", e);
+            return "";
+        }
+
+        return path;
+    }
+
+    tg_send_file_to_chat(f, chatid) {
+        path = tg_file_path(f);
+
+        if(!path)
+            return 0;
+
+        caption = tc_clip(std.string(f.caption ?? ""), TC_CAPTION_CHARS);
+        ok = tg_send_file([chatid = std.int(chatid)], path, caption);
+
+        try { fileio.remove(path); } catch(e) {}
+
+        return ok ? 1 : 0;
+    }
+
+    tg_broadcast_file(f) {
+        path = tg_file_path(f);
+
+        if(!path)
+            return 0;
+
+        caption = tc_clip(std.string(f.caption ?? ""), TC_CAPTION_CHARS);
+        list = tg_chat_list();
+
+        for(i = 0; i < list.size(); i++)
+            tg_send_file([chatid = std.int(list[i].chatid)], path, caption);
+
+        try { fileio.remove(path); } catch(e) {}
+
+        return list.size();
+    }
+
+    tg_notify(txt, files = None, chatid = 0) {
+        txt = std.string(txt ?? "");
+        cid = std.int(chatid);
+
+        cs = std.critical_section_named(tg_lock);
+
+        if(files && files.size()) {
+            fl = [];
+
+            for(f : files)
+                fl.push_back(std.is_json(f) ? f.copy() : f);
+
+            tg_out.push_back([text = txt, files = fl, chatid = cid]);
+        }
+        else {
+            tg_out.push_back([text = txt, chatid = cid]);
+        }
+
+        for(tg_out.size() > TC_MAX_QUEUED_OUT)
+            tg_out.erase(0);
+
+        cs.release();
+    }
+
+    tg_notify_current(msg) {
+        cid = 0;
+
+        if(tg_current_chat && std.is_json(tg_current_chat))
+            cid = std.int(tc_get(tg_current_chat, "chatid", 0));
+
+        tg_notify(std.string(msg ?? ""), None, cid);
+
+        return [ok = true, message = std.string(msg ?? "")];
+    }
+
+    tg_send_shared_file(f) {
+        if(!std.is_json(f))
+            return false;
+
+        tg_notify("", [f], 0);
+        return true;
+    }
+
+    tg_send_notify(m) {
+        m = std.string(m ?? "");
+        files = [];
+
+        if(m.length() > TC_NOTIFY_CHARS)
+            files.push_back([name = "notify-" + std.string(std.millis()) + ".md", caption = "", text = m]);
+
+        tg_notify(m, files, 0);
+
+        return true;
+    }
+
+    tg_send_task_terminal(task) {
+        if(!std.is_json(task))
+            return false;
+
+        tid = std.string(task.taskid ?? "");
+
+        if(!tid)
+            return false;
+
+        for(i = 0; i < tg_terminal_seen.size(); i++) {
+            if(tg_terminal_seen[i] == tid)
+                return false;
+        }
+
+        tg_terminal_seen.push_back(tid);
+
+        txt = tg_render_task(task);
+        files = [];
+        rep = std.string(task.report ?? "");
+
+        if(rep.length() > TC_REPORT_CHARS) {
+            task_name = tg_safe_name(std.string(task.name ?? "task"));
+            files.push_back([
+                name = "report-" + task_name + ".md",
+                caption = "task " + std.string(task.name ?? "task"),
+                text = rep,
+            ]);
+        }
+
+        cid = 0;
+
+        if(tg_task_owner.has(tid) && std.is_json(tg_task_owner[tid]))
+            cid = std.int(tc_get(tg_task_owner[tid], "chatid", 0));
+
+        tg_notify(txt, files, cid);
+
+        return true;
+    }
+
+    tg_render_task(task) {
+        state = std.string(task.state ?? "");
+        name = std.string(task.name ?? "task");
+        rep = std.string(task.report ?? "");
+        err = std.string(task.error ?? "");
+
+        label = "[done]";
+
+        if(state == "failed")
+            label = "[failed]";
+        else if(state == "lost")
+            label = "[lost]";
+        else if(state == "stopped")
+            label = "[stopped]";
+        else if(state == "question")
+            label = "[question]";
+
+        out = label + ": task " + name + " " + state;
+        body = "";
+
+        if(rep) {
+            body = tc_clip(rep, TC_REPORT_CHARS);
+
+            if(rep.length() > TC_REPORT_CHARS)
+                body += "\n(the full report is attached)";
+        }
+
+        if(err && (state == "failed" || state == "lost" || state == "stopped")) {
+            if(body)
+                body += "\n";
+
+            body += "error: " + tc_clip(err, TC_REPORT_CHARS);
+        }
+
+        if(!body)
+            body = "(the task reported nothing)";
+
+        return out + "\n" + body;
+    }
+
+    tg_flush_out() {
+        n = 0;
+
+        for(tg_out.size()) {
+            cs = std.critical_section_named(tg_lock);
+            item = tg_out[0];
+            tg_out.erase(0);
+            cs.release();
+
+            if(std.is_json(item)) {
+                txt = std.string(item.text ?? "");
+                files = item.files ?? [];
+                cid = std.int(item.chatid ?? 0);
+
+                if(txt) {
+                    if(cid)
+                        tg_send_report([chatid = cid], txt);
+                    else
+                        tg_broadcast_report(txt);
+                }
+
+                for(f : files) {
+                    if(cid)
+                        tg_send_file_to_chat(f, cid);
+                    else
+                        tg_broadcast_file(f);
+                }
+            }
+            else {
+                tg_broadcast_report(std.string(item));
+            }
+
+            n++;
+        }
+
+        return n;
+    }
+
+    // ── worker thread ─────────────────────────────────────────────────────
+
+    tg_worker() {
+        for(tg_running) {
+            sent = 0;
+
+            try {
+                sent = tg_flush_out();
+            }
+            catch(e) {
+                std.error("[telegram_client] sending notifications failed: ", e);
+            }
+
+            try {
+                tg_sync_window();
+            }
+            catch(e) {
+                std.error("[telegram_client] window sync failed: ", e);
+            }
+
+            ran = false;
+
+            try {
+                idx = tg_next_ready();
+
+                if(idx >= 0) {
+                    ran = true;
+                    tg_run_item(idx);
+                }
+            }
+            catch(e) {
+                std.error("[telegram_client] queued message failed: ", e);
+            }
+
+            if(!sent && !ran)
+                std.sleep(50);
+        }
+    }
+
+    // ── text helpers ──────────────────────────────────────────────────────
+
+    tg_safe_name(name) {
+        out = "";
+
+        for(c : std.string(name)) {
+            ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "." || c == "-" || c == "_";
+            out += ok ? c : "_";
+        }
+
+        if(!out || out.starts("."))
+            out = "file" + out;
+
+        return out.length() > 80 ? out.substr(out.length() - 80) : out;
+    }
+
+    tg_is_text_file(name, mime) {
+        m = std.string(mime ?? "").lowercase();
+
+        if(m.starts("text/") || m == "application/json" || m.ends("+json") || m.ends("xml") || m.contains("yaml") || m.contains("markdown"))
+            return true;
+
+        ext = std.string(fileio.file_ext(std.string(name))).lowercase();
+
+        if(ext.starts("."))
+            ext = ext.substr(1);
+
+        for(e : TC_TEXT_EXT) {
+            if(e == ext)
+                return true;
+        }
+
+        return false;
+    }
+
+    tg_fetch_document(doc) {
+        name = std.string(tc_get(doc, "filename", "file"));
+        size = std.int(tc_get(doc, "filesize", 0));
+        mime = std.string(tc_get(doc, "mimetype", ""));
+        fail = [ok = false, name = name, content = "", path = "", bytes = size, error = ""];
+
+        if(size > TC_FILE_MAX) {
+            fail.error = "too large (" + std.string(size / 1024) + " KB, the limit is " + std.string(TC_FILE_MAX / 1024) + " KB)";
+            return fail;
+        }
+
+        if(!tg_is_text_file(name, mime)) {
+            fail.error = "not a text file (send .md, .txt, .json, code ...)";
+            return fail;
+        }
+
+        if(!bot) {
+            fail.error = "no bot attached";
+            return fail;
+        }
+
+        got = None;
+
+        try {
+            got = bot.download_file(std.string(tc_get(doc, "fileid", "")));
+        }
+        catch(e) {
+            got = None;
+        }
+
+        content = std.is_json(got) ? std.string(tc_get(got, "content", "")) : "";
+
+        if(!content) {
+            fail.error = "the download failed";
+            return fail;
+        }
+
+        if(content.length() > TC_FILE_MAX) {
+            fail.error = "too large (the limit is " + std.string(TC_FILE_MAX / 1024) + " KB)";
+            return fail;
+        }
+
+        path = tg_inbox + "/" + std.string(std.millis()) + "-" + tg_safe_name(name);
+
+        try {
+            if(!fileio.exists(tg_inbox))
+                fileio.mkdir(tg_inbox);
+
+            fileio.write_text(path, content);
+        }
+        catch(e) {
+            path = "(not saved: " + std.string(e) + ")";
+        }
+
+        return [ok = true, name = name, content = content, path = path, bytes = content.length(), error = ""];
+    }
+
+    tg_take_attachments() {
+        att = tg_attachments;
+        tg_attachments = [];
+        return att;
+    }
+
+    // ── text outputs ──────────────────────────────────────────────────────
+
+    tg_queue_text() {
+        if(!mind || !mind.queue.size())
+            return "No queued work.";
+
+        out = "Queued work (dispatched at the next work window):\n";
+
+        for(item : mind.queue)
+            out += "- " + std.string(item.name) + "  id " + std.string(item.id) + "\n";
+
+        return out;
+    }
+
+    tg_tasks_text(filter = "") {
+        if(!mind)
+            return "No workspace.";
+
+        ov = mind.get_overview();
+        want = std.string(filter ?? "").strip();
+        out = "Tasks:\n";
+        count = 0;
+
+        for(t : ov.tasks) {
+            if(want && std.string(t.state) != want)
+                continue;
+
+            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] id " + std.string(t.taskid) + "\n";
+            count++;
+        }
+
+        for(t : ov.tasks_scheduled) {
+            if(want && std.string(t.state) != want)
+                continue;
+
+            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] id " + std.string(t.taskid) + "\n";
+            count++;
+        }
+
+        for(t : ov.tasks_finished) {
+            if(want && std.string(t.state) != want)
+                continue;
+
+            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] id " + std.string(t.taskid) + "\n";
+            count++;
+        }
+
+        for(t : ov.tasks_failed) {
+            if(want && std.string(t.state) != want)
+                continue;
+
+            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] id " + std.string(t.taskid) + "\n";
+            count++;
+        }
+
+        if(!count) {
+            if(want)
+                return "No tasks in state '" + want + "'.";
+            return "No tasks yet.";
+        }
+
+        return out;
+    }
+
+    tg_status_text() {
+        if(!mind)
+            return "Telegram client not ready.";
+
+        ov = mind.get_overview();
+        active = ov.tasks.size();
+        queued = mind.queue.size();
+
+        return "Telegram client\n" +
+            "workspace: " + workspace_dir + "\n" +
+            "window: " + tg_window_text() + "\n" +
+            "trusted chats:\n" + tg_trusted_text() +
+            "queued: " + std.string(queued) + "\n" +
+            "active workers: " + std.string(active) + "\n";
+    }
+
+    tg_welcome_text() {
+        return "This chat is now the trusted chat of the Telegram client.\n" +
+            "Workspace: " + workspace_dir + "\n" +
+            tg_window_text() + "\n" +
+            "/help for commands.";
+    }
+
+    tg_help_text() {
+        return "Telegram client\n" +
+            "workspace: " + workspace_dir + "\n" +
+            tg_window_text() + "\n" +
+            "plain text   one receptionist turn; work is delegated to the worker\n" +
+            "/tasks [state]   local workspace tasks (running, planned, finished, failed)\n" +
+            "/status         client, window, queue and trust state\n" +
+            "/window         configured work window and current local time\n" +
+            "/queue          requests waiting for the next window\n" +
+            "/stop [taskid]  stop one task, or all active worker tasks\n" +
+            "/update <taskid> <message>  forward a follow-up to a running/queued task\n" +
+            "/id             this chat id and the trust list\n" +
+            "/allow <chatid> [name]   /deny <chatid>   /forget\n" +
+            "/help           this list\n" +
+            "Only trusted chats are served. The first chat that messages the bot becomes trusted when the list is empty.\n" +
+            "Worker tasks run only inside the work window. Requests outside it are queued and start at the next window; active worker tasks are stopped at close.\n" +
+            "A text file sent with a caption is read and attached verbatim to the task. Long reports and send_file documents arrive as documents.";
+    }
+
+    }
+
+// ── main host ─────────────────────────────────────────────────────────────
+
+tg_client_is_main() {
+    raw = std.argv(0);
+    arg0 = "";
+
+    if(raw)
+        arg0 = std.string(raw);
+
+    if(arg0.find("telegram_client_selftest") >= 0)
+        return false;
+
+    return arg0.find("telegram_client") >= 0;
+}
+
+tg_client_host_get_cfg(cfg, cfg_spec) {
+    return model_config_cli_get(cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, true, true, "", "config-");
+}
+
+if(tg_client_is_main()) {
+    cfg = ModelConfig();
+
+    if(model_config_cli_handle_config_commands())
+        return;
+
+    cfg_spec = std.argvoption("--config");
+    rec_spec = std.argvoption("--receptionist-config");
+
+    if(!rec_spec)
+        rec_spec = cfg_spec;
+
+    worker_spec = std.argvoption("--worker-config");
+
+    if(!worker_spec)
+        worker_spec = cfg_spec;
+
+    if(!tg_client_host_get_cfg(cfg, rec_spec))
+        return;
+
+    model_config_cli_print_loaded("Telegram client config", cfg, rec_spec);
+
+    token_opt = std.argvoption("--bot-token");
+    token = "";
+
+    if(token_opt)
+        token = std.string(token_opt).strip();
+
+    ws_opt = std.argvoption("--workspace_dir");
+
+    if(!ws_opt)
+        ws_opt = std.argvoption("--workspace-dir");
+
+    workspace_dir = "";
+
+    if(ws_opt)
+        workspace_dir = std.string(ws_opt).strip();
+
+    if(!token || !workspace_dir) {
+        std.print("usage: shz miniagent.telegram_client --bot-token <token> --workspace_dir <dir> " +
+            "[--work-start HH:MM] [--work-end HH:MM] [--timezone <zone>] [--trusted <path>] " +
+            "[--config <name|path[#profile]>] [--receptionist-config <...>] [--worker-config <...>]\n");
+        return;
+    }
+
+    start_opt = std.argvoption("--work-start");
+    end_opt = std.argvoption("--work-end");
+    tz_opt = std.argvoption("--timezone");
+    trusted_opt = std.argvoption("--trusted");
+
+    start_min = tc_parse_hhmm(start_opt, TC_DEFAULT_START);
+    end_min = tc_parse_hhmm(end_opt, TC_DEFAULT_END);
+
+    if(start_min < 0 || end_min < 0) {
+        std.print("invalid work window: use HH:MM for --work-start and --work-end\n");
+        return;
+    }
+
+    opts = [
+        workspace_dir = fileio.absolute_path(workspace_dir),
+        cfg_spec = tc_config_spec_absolute(worker_spec),
+        work_start = start_min,
+        work_end = end_min,
+    ];
+
+    if(tz_opt)
+        opts.timezone = std.string(tz_opt);
+
+    if(trusted_opt)
+        opts.trusted = std.string(trusted_opt);
+
+    bot = telegram.bot(token);
+    client = TelegramClient(cfg, opts, bot);
+
+    if(!client.workspace) {
+        std.error("Telegram client workspace could not be initialized.\n");
+        return;
+    }
+
+    client.start();
+
+    std.print("Telegram client up\n");
+    std.print("workspace: ", client.workspace_dir, "\n");
+    std.print("work window: ", tc_minutes_text(client.tg_window_start), " - ", tc_minutes_text(client.tg_window_end), " (", client.tg_timezone, ")\n");
+    std.print("trusted chats: ", client.tg_chats.size(), "  file: ", client.tg_path, "\n");
+    std.print("waiting for messages... (Ctrl+C to stop)\n");
+
+    std.sleep(-1);
+
+    client.stop();
+}

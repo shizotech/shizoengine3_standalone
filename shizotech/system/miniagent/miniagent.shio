@@ -45,6 +45,9 @@ class miniagent
 	
 	running = false;
 	stopped = false;
+	internal_run = false;		// output of an internal compaction/handover run is not user-facing
+	compaction_requested = false;	// one warning per compaction episode, reset after its handover so compaction can repeat
+	_injected_internal = false;	// the injected prompt is an internal warning, not a user turn
 	
 	//The result of the task, usually set through finalize(), if the agent doesnt have/call finalize, its the returned text by the run itself.
 	task_result = None;
@@ -103,7 +106,7 @@ class miniagent
 			env["text"] += txt;
 			env["text_capture"] += txt;
 			
-			if(std.is_function(on_action)) {
+			if(!internal_run && std.is_function(on_action)) {
 				on_action([
 					text = txt,
 				]);
@@ -112,7 +115,7 @@ class miniagent
 		
 		llm_api.on_tool = [this](toolname, toolargs)
 		{
-			if(std.is_function(on_action)) {
+			if(!internal_run && std.is_function(on_action)) {
 				on_action([
 					tool = [
 						name = toolname,
@@ -123,7 +126,7 @@ class miniagent
 		};
 		
 		llm_api.on_reason = [this](txt) {
-			if(std.is_function(on_action)) {
+			if(!internal_run && std.is_function(on_action)) {
 				on_action([
 					reasoning = txt,
 				]);
@@ -132,9 +135,14 @@ class miniagent
 		
 		llm_api.on_usage = [this](usage) {
 			ctx_perc = usage.total_tokens / std.float(model_config.max_tokens);
-			if(ctx_perc >= compaction_treshold)
+			//One warning per compaction episode. The task loop resets
+			//compaction_requested after every handover, so a long task can
+			//compact again when the context crosses the threshold again.
+			if(ctx_perc >= compaction_treshold && !compaction_requested && !_injected_prompt) {
+				compaction_requested = true;
 				std.print("compaction...");
-				task_update("<!---SYTEM MESSAGE---!>\nYOUR CONTEXT IS ABOUT TO RUN OUT!\nYOU HAVE TO EXIT THE CURRENT TURN IMMEDIATELY.\nWRITE A HANDOVER TO CONTINUE WORK IN A NEW RUN _OR_ EXIT WITH A SHORT NOTICE.");
+				task_update("<!---SYTEM MESSAGE---!>\nYOUR CONTEXT IS ABOUT TO RUN OUT!\nYOU HAVE TO EXIT THE CURRENT TURN IMMEDIATELY.\nWRITE A HANDOVER TO CONTINUE WORK IN A NEW RUN _OR_ EXIT WITH A SHORT NOTICE.", true);
+			}
 		};
 		
 		add_tool(
@@ -288,11 +296,16 @@ class miniagent
 			env.text = "";
 			env.text_capture = "";
 
-		initial_prompt = prompt;
+		initial_prompt = prompt;		// the real task prompt; never replaced by an internal warning
+		if(continue_task && env.task)
+			initial_prompt = env.task;	// a continued task keeps its original prompt
 
-		running = true;
-		stopped = false;
+		//No stale result or injection may leak into this task.
+		task_result = None;
+		internal_run = false;
+		compaction_requested = false;
 		_injected_prompt = None;
+		_injected_internal = false;
 
 		//First, check if chat history needs compaction
 		if(model_config.max_tokens) {
@@ -309,6 +322,13 @@ class miniagent
 				prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover for context:\n\n" + handover;				
 			}
 		}
+
+		running = true;
+		stopped = false;
+		internal_run = false;
+		compaction_requested = false;
+		_injected_prompt = None;
+		_injected_internal = false;
 
 		try
 		{
@@ -328,9 +348,51 @@ class miniagent
 				res = llm_api.task(prompt);
 				
 				if(_injected_prompt && !stopped) {
+					//A live injection interrupted this generation. The agent's
+					//own turn continues with the injected prompt; an internal
+					//warning must not replace the real task prompt.
 					prompt = _injected_prompt;
-					initial_prompt = prompt;
+					if(!_injected_internal)
+						initial_prompt = prompt;
+					internal_run = _injected_internal;
+					if(!_injected_internal)
+						compaction_requested = false;
 					_injected_prompt = None;
+					_injected_internal = false;
+					do_run = true;
+					continue;
+				}
+
+				//An internal warning/handover generation ended: its report is a
+				//handover for the real task, never the user-facing answer.
+				if(internal_run) {
+					handover = "";
+					if(task_result && std.is_json(task_result))
+						handover = std.string(task_result.result ?? "");
+
+					usable = handover && (std.string(task_result.signal ?? "") == "continue" || handover.length() >= 200);
+
+					if(!usable) {
+						std.print("warning handover unusable, falling back to compact_handover...");
+						task_result = None;
+						handover = compact_handover();
+					}
+
+					if(!handover) {
+						std.print("warning compaction failed; continuing with the original task prompt.");
+						handover = "Context compaction failed; continue the real task from the current state.";
+					}
+
+					clear_chat();
+					task_result = None;
+					stopped = false;
+					running = true;
+					internal_run = false;
+					compaction_requested = false;
+					_injected_prompt = None;
+					_injected_internal = false;
+
+					prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover for context:\n\n" + handover;
 					do_run = true;
 					continue;
 				}
@@ -350,8 +412,13 @@ class miniagent
 						res = llm_api.task("<---SYTEM MESSAGE--->\nYou ended the turn without calling 'finalize()'. Always use 'finalize' at the end of a turn.");
 						if(_injected_prompt && !stopped) {
 							prompt = _injected_prompt;
-							initial_prompt = prompt;
+							if(!_injected_internal)
+								initial_prompt = prompt;
+							internal_run = _injected_internal;
+							if(!_injected_internal)
+								compaction_requested = false;
 							_injected_prompt = None;
+							_injected_internal = false;
 							do_run = true;
 							continue;
 						}
@@ -381,9 +448,11 @@ class miniagent
 						clear_chat();
 						prompt = initial_prompt + "\n\n<---SYTEM MESSAGE--->\nThis is a handover task, work has already begun.\nNotes from the previous agent:\n\n" + std.string(task_result.result ?? "");
 						task_result = None;
-						stopped = false;
-						running = true;
-						do_run = true;
+					stopped = false;
+					running = true;
+					internal_run = false;
+					compaction_requested = false;
+					do_run = true;
 						continue;
 					}
 
@@ -414,7 +483,7 @@ class miniagent
 		}
 	}
 
-	task_update(prompt) {
+	task_update(prompt, internal = false) {
 		if(!prompt)
 			return None;
 		if(!running) {
@@ -422,6 +491,7 @@ class miniagent
 			return None;
 		}
 		_injected_prompt = prompt;
+		_injected_internal = json.bool(internal);
 		//Ends the current generation only; the running task continues with the
 		//injected prompt and its own task_result.
 		stop(false);
@@ -440,6 +510,8 @@ class miniagent
 	//Every child created through subagent()/simple_agent() is registered in
 	//_child_agents, and a child's own stop() recurses into its children, so one
 	//call here reaches every descendant that can generate.
+	//reset_states = false ends only the current generation (the stream), not
+	//the descendants: that is what task_update() / internal compaction need.
 	stop(reset_states = true)
 	{
 		if(reset_states) {
@@ -453,20 +525,22 @@ class miniagent
 		}
 		catch(e) { }
 		
-		//Children are created and pruned from tool threads while a stop walks the
-		//tree, so iterate over a snapshot taken under the tree lock: a concurrent
-		//mutation must never make this loop skip a running child.
-		children = [];
-		cs = std.critical_section_named("miniagent_tree");
-		children = _child_agents.copy();
-		cs.release();
-		
-		for(i = 0; i < children.size(); i++) {
-			try {
-				if(children[i] && std.is_function(children[i].stop))
-					children[i].stop();
+		if(reset_states) {
+			//Children are created and pruned from tool threads while a stop walks the
+			//tree, so iterate over a snapshot taken under the tree lock: a concurrent
+			//mutation must never make this loop skip a running child.
+			children = [];
+			cs = std.critical_section_named("miniagent_tree");
+			children = _child_agents.copy();
+			cs.release();
+			
+			for(i = 0; i < children.size(); i++) {
+				try {
+					if(children[i] && std.is_function(children[i].stop))
+						children[i].stop();
+				}
+				catch(e) { }		
 			}
-			catch(e) { }		
 		}
 	}
 	
@@ -506,11 +580,26 @@ class miniagent
 					return None;
 				
 				compaction_chat = export_chat();
-				res = llm_api.task("<!---SYTEM MESSAGE---!>\nWrite a handover for a fresh agent.\nInclude previous tasks and work done.\nThe new agent must understand what has happened so far.\nPass the handover via 'finalize' as report.");
+				internal_run = true;
+				task_result = None;		// no stale finalize may become this handover
+				res = None;
+				try {
+					res = llm_api.task("<!---SYTEM MESSAGE---!>\nWrite a handover for a fresh agent.\nInclude previous tasks and work done.\nThe new agent must understand what has happened so far.\nPass the handover via 'finalize' as report with signal 'finished'.");
+				} catch(e) {
+					std.error("[miniagent] compaction run failed: ", e);
+				}
+				internal_run = false;
 				if(task_result && task_result.result) {
 					res = std.string(task_result.result ?? "");
 					clear_chat();
 					task_result = None;
+					// finalize_run() stopped the agent; a compaction run must not
+					// leave the real task marked as stopped.
+					stopped = false;
+					running = true;
+					compaction_requested = false;
+					_injected_prompt = None;
+					_injected_internal = false;
 					return res;
 				}
 				
@@ -531,7 +620,10 @@ class miniagent
 	//Forcefully ends a turn with a signal and a result. from_tool distinguishes a
 	//model's finalize()/finish() call from an external stop that ended the turn.
 	finalize_run(signal, result, from_tool = false) {
-		stop();
+		//An internal compaction/handover run ends only its own generation; it
+		//must not stop the descendants of the real task. A 'continue' finalize
+		//is a hand-over of the same task, so it also ends only the generation.
+		stop(!internal_run && signal != "continue");
 		task_result = [
 			signal=signal,
 			result=result,
@@ -580,7 +672,7 @@ class miniagent
 			image_type = image_type,
 		];
 		
-		stop();
+		stop(false);
 		
 		return "The user will provide you with the requested image.\nStop now and wait for the user to sent the image.";
 	}
@@ -597,7 +689,7 @@ class miniagent
 			
 			toolid = std.random_hash();
 			
-			if(this.on_action) {
+			if(!this.internal_run && this.on_action) {
 				this.on_action([
 					tool_start=[
 						id=toolid,
@@ -619,7 +711,7 @@ class miniagent
 				];
 			}
 			
-			if(this.on_action) {
+			if(!this.internal_run && this.on_action) {
 				this.on_action([
 					tool_end=[
 						id=toolid,
@@ -801,11 +893,11 @@ class miniagent
 	
 	report_back(txt)
 	{
-		if(std.is_function(on_action)) {
-			on_action([
-				text = txt,
-			]);
-		}
+		if(!internal_run && std.is_function(on_action)) {
+				on_action([
+					text = txt,
+				]);
+			}
 	}
 	
 	//Internally used by some tools

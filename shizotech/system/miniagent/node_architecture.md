@@ -51,6 +51,8 @@ stripe, lamp bank, CRT overlay) without changing API or task logic.
 
 `Receptionist` is the connector around a single receptionist agent: it answers node requests
 and handles follow-ups (`Node.request` / `Node.update_receptionist`). It is not a worker pool.
+The agent has read-only workspace tools (`list_dir`, `file_info`, `file_line_count`, `read_file`)
+to answer questions about the node's own workspace; it has no write, command or execution tool.
 `AiService` is the ShizoNet AI node service; routers talk to `Node`, and the node pushes
 workspace task lifecycle, notify and file events.
 

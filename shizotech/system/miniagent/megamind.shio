@@ -1,0 +1,756 @@
+﻿
+#include "miniagent"
+
+// Contract C6: normalize one receptionist turn into the result the owner sees.
+// The role's finish(summary) tool puts the turn's report into
+// receptionist.env.reports, but miniagent only returns them when
+// env.use_finalize is set, so a turn that ended with finish() came back as
+// "Agent was stopped." although everything worked. Fold them in: the report IS
+// the answer, and the turn is a success. Every result carries a human-readable
+// report, so a node-side failure ("Goals are not enabled on this node: ...")
+// reaches the chat instead of a bare "Agent was stopped.".
+//
+//	agent				the receptionist miniagent (its env.reports are folded)
+//	res					what receptionist.task() returned (may be None)
+//	crash					"" , or the text of the exception that escaped the turn
+//	execution_time_ms		turn duration, used when res carries none
+megamind_turn_result(agent, res, crash = "", execution_time_ms = -1) {
+	out = res;
+
+	if(!std.is_json(out))
+		out = [ok = false, reports = []];
+
+	if(!std.is_json(out.reports))
+		out.reports = [];
+
+	if(execution_time_ms >= 0 && !out.has("execution_time_ms"))
+		out.execution_time_ms = execution_time_ms;
+
+	tr = None;
+
+	if(agent && std.is_json(agent.task_result))
+		tr = agent.task_result;
+
+	signal = "";
+	from_tool = true;
+	text = "";
+
+	if(tr) {
+		signal = std.string(tr.signal ?? "");
+		from_tool = tr.from_tool ? true : false;
+		if(tr.has("result"))
+			text = std.string(tr.result ?? "");
+	} else if(std.is_json(out)) {
+		signal = std.string(out.signal ?? "");
+		from_tool = out.has("from_tool") ? (out.from_tool ? true : false) : true;
+		if(out.has("result"))
+			text = std.string(out.result ?? "");
+	}
+
+	if(signal == "failed" && !from_tool)
+		out.stopped = true;
+
+	if(crash) {
+		out.ok = false;
+		out.error = crash;
+		out.reports = [[
+			report = "The node's receptionist crashed: " + crash,
+			time = std.millis(),
+			time_str = std.timestamp(),
+		]];
+		return out;
+	}
+
+	if(text) {
+		out.ok = !(signal == "failed");
+		out.error = out.ok ? "" : text;
+		out.reports = [[
+			report = text,
+			time = std.millis(),
+			time_str = std.timestamp(),
+		]];
+		return out;
+	}
+
+	if(agent && std.is_json(agent.env) && agent.env.has("reports") && std.is_json(agent.env.reports) && agent.env.reports.size()) {
+		out.ok = true;
+		out.reports = agent.env.reports.copy();
+		out.error = "";
+		return out;
+	}
+
+	if(!out.reports.size()) {
+		if(out.stopped)
+			out.reports = [[
+				report = "The receptionist turn was stopped.",
+				time = std.millis(),
+				time_str = std.timestamp(),
+			]];
+		else
+			out.reports = [[
+				report = "The node's receptionist turn ended without a report: " + (out.error ?? ""),
+				time = std.millis(),
+				time_str = std.timestamp(),
+			]];
+	}
+
+	return out;
+}
+
+MEGAMIND_DEFAULT_ROLE = "adaptive";
+
+class Megamind {
+	
+	running = true;
+	
+	managed receptionist = None;
+	managed worker_threads = [];
+	
+	tasks = [];
+	tasks_scheduled = [];
+	//TODO: keep only a fixed number, not inifinite entries, also add timestamps everyhwere
+	tasks_finished = [];
+	tasks_failed = [];
+	
+	request_queue = [];
+	
+	//Worker threads, for background_capacity()
+	max_workers = 1;
+	//Last request a person sent (std.millis), the goal scheduler yields to it
+	last_interactive_ms = 0;
+	//GoalScheduler of this node (goal_engine.shio), None without an .agentspace
+	goals = None;
+
+	//Notification and file listeners. on_notify keeps its single slot for the
+	//node service; add_notify_listener/add_file_listener are additive.
+	_notify_listeners = [];
+	
+	__init__(cfg, worker_cfg = None, _max_workers = 1) {
+		
+		max_workers = _max_workers;
+		
+		receptionist = create_receptionist(cfg);
+		receptionist.set_reasoning_effort("low");
+		receptionist.env.mind = this;
+		
+		rt = std.thread(this.receptionist_thread);
+		rt.run();
+		worker_threads.push_back(rt);
+		
+		ht = std.thread(this.health_thread);
+		ht.run();
+		worker_threads.push_back(ht);
+		
+		std.print("Starting " + max_workers + " workers.");
+		
+		if(!worker_cfg)
+			worker_cfg = cfg;
+		
+		for(i = 0; i < max_workers; i++) {
+			t = std.thread(this.worker_thread);
+			t.run(worker_cfg);
+			worker_threads.push_back(t);
+		}
+	}
+	
+	//The agents of the node. Tests override these with stand-ins (tests/megamind_tasks_test.shio).
+	create_receptionist(cfg) {
+		return miniagent(cfg, "receptionist");
+	}
+	
+	create_worker(cfg, role = MEGAMIND_DEFAULT_ROLE) {
+		return miniagent(cfg, role);
+	}
+	
+	__deinit__() {
+		running = false;
+		for(i = 0; i < worker_threads.size(); i++) {
+			worker_threads[i].join();
+		}
+	}
+	
+	//interactive = false for requests the node sends itself (health checks)
+	request(prompt, on_finish_cb = None, on_action_cb = None, interactive = true) {
+		if(interactive)
+			last_interactive_ms = std.millis();
+		
+		new_request = [
+			id = std.random_hash(),
+			prompt = prompt,
+			finished = false,
+			result = None,
+			on_finish_cb = on_finish_cb,
+			on_action_cb = on_action_cb,
+		];
+		
+		request_queue.push_back(new_request);
+		
+		for(!new_request.finished) {
+			std.sleep(100);
+		}
+		
+		return new_request.result;
+	}
+	
+	//Used in receptionist's tools
+	get_overview() {
+		//TODO: truncate fields automatically + also show last finished / failed tasks maybe
+		
+		tasks_cpy = tasks.copy();
+		tasks_cpy.remove_all_keys("report");
+		tasks_cpy.remove_all_keys("worker");
+		
+		tasks_scheduled_cpy = tasks_scheduled.copy();
+		
+		tasks_finished_cpy = tasks_finished.copy();
+		tasks_finished_cpy.remove_all_keys("report");
+		tasks_finished_cpy.remove_all_keys("worker");
+		tasks_finished_cpy.remove_all_keys("raw_output");
+		tasks_finished_cpy.remove_all_keys("milestones");
+		
+		tasks_failed_cpy = tasks_failed.copy();
+		tasks_failed_cpy.remove_all_keys("report");
+		tasks_failed_cpy.remove_all_keys("worker");
+		tasks_failed_cpy.remove_all_keys("raw_output");
+		tasks_failed_cpy.remove_all_keys("milestones");
+		
+		result = [
+			tasks = tasks_cpy,
+			tasks_scheduled = tasks_scheduled_cpy,
+			tasks_finished = tasks_finished_cpy,
+			tasks_failed = tasks_failed_cpy,
+		];
+		
+		return result;
+	}
+	
+	//role: the agent role of the task. The default "adaptive" runs on the worker
+	//thread's own agent; another role gets an agent of its own for this task. Either
+	//may delegate subtasks (start_task / fork / file_task_batch), limited by
+	//max_running_agents of the model config (agent_slots.shio).
+	add_task(name, goal, role = MEGAMIND_DEFAULT_ROLE) {
+		taskid = std.random_hash();
+		r = std.string(role ?? "");
+		if(!r)
+			r = MEGAMIND_DEFAULT_ROLE;
+		tasks_scheduled.push_back([name=name, task=goal, taskid=taskid, state="planned", role=r]);
+		return taskid;
+	}
+	
+	stop_task(taskid) {
+		//Wasnt processed by the scheduler yet, save to kill
+		//This operation is atomic, however in the future might want to put a named critical_section here if shizoscript changes
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				tasks_scheduled.erase(i);
+				return true;
+			}
+		}
+		
+		//Already running: stopping the worker agent stops its whole subagent tree
+		//(miniagent.stop() walks every registered child), so the delegated work of
+		//the task ends too. Dropping only the scheduled entry, as this used to,
+		//left a running task generating after the user asked for a stop.
+		for(i = 0; i < tasks.size(); i++) {
+			if(tasks[i].taskid == taskid) {
+				tasks[i].state = "stopped";
+				
+				if(tasks[i].worker)
+					tasks[i].worker.stop();
+				
+				return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	update_task(taskid, message) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid) {
+				if(!tasks_scheduled[i].user_updates)
+					tasks_scheduled[i].user_updates = [];
+
+				tasks_scheduled[i].user_updates.push_back(message);
+				return true;
+			}
+		}
+		//Can only send task updates to running (or not yet running) agents.
+		//If the task is finished already, must create a new task.
+		for(i = 0; i < tasks.size(); i++) {
+			if(tasks[i].taskid == taskid) {
+				t = tasks[i];
+				
+				//the worker is writing the result already: too late for this task
+				if(t.closing || t.state == "stopped")
+					return false;
+				
+				if(t.state == "research")
+					if(!t.user_updates)
+						t.user_updates = [];
+					t.user_updates.push_back(message);
+					return true;
+				
+				//implement: the WORKER THREAD continues the task with the message
+				//(_run_task). This used to call worker.send_prompt() here, which ran
+				//the rest of the task on the caller's thread - the receptionist's
+				//tool call: the receptionist turn did not end until the task was
+				//done (no worker could start meanwhile), and the worker thread saw
+				//the task "stopped" and started the next task on the same agent.
+				if(t.state == "implement") {
+					if(!t.pending_updates)
+						t.pending_updates = [];
+					t.pending_updates.push_back(message);
+					
+					//ends the current generation; the worker continues with the update
+					if(t.worker)
+						t.worker.stop();
+					return true;
+				}
+				return false;
+			}
+		}
+		
+		return false;
+	}
+	
+	//A follow-up for the receptionist turn that runs right now (shizonet_ai.shio
+	//ai_request_update). The turn is stopped and the receptionist thread continues
+	//it with the message, so the conversation stays on one thread. false: no turn
+	//is running, nothing to add the message to.
+	update_receptionist(message) {
+		if(!_receptionist_active)
+			return false;
+		
+		_receptionist_updates.push_back(std.string(message));
+		
+		try {
+			receptionist.stop();
+		}
+		catch(e) {}
+		
+		return true;
+	}
+	
+	inspect_task(taskid) {
+		for(i = 0; i < tasks_scheduled.size(); i++) {
+			if(tasks_scheduled[i].taskid == taskid)
+				return tasks_scheduled[i];
+		}
+		for(i = 0; i < tasks.size(); i++) {
+			if(tasks[i].taskid == taskid)
+				return tasks[i];
+		}
+		for(i = 0; i < tasks_finished.size(); i++) {
+			if(tasks_finished[i].taskid == taskid)
+				return tasks_finished[i];
+		}
+		for(i = 0; i < tasks_failed.size(); i++) {
+			if(tasks_failed[i].taskid == taskid)
+				return tasks_failed[i];
+		}
+		
+		return "Not found.";
+	}
+	
+	notify_user(msg) {
+		if(_notify_cb) {
+			try { _notify_cb(msg); } catch(e) { std.error("notify callback failed: ", e); }
+		}
+
+		for(i = 0; i < _notify_listeners.size(); i++) {
+			try { _notify_listeners[i](msg); } catch(e) { std.error("notify listener failed: ", e); }
+		}
+	}
+
+	on_notify(cb) {
+		_notify_cb = cb;
+	}
+
+	add_notify_listener(cb) {
+		if(std.is_function(cb))
+			_notify_listeners.push_back(cb);
+	}
+	
+	//A file for the owner's chat (the send_file tool, roles/SHARED.shio). Every listener
+	//(the shizonet node service) gets [name, bytes, caption, data (base64)]. ("bytes", not "size":
+	//f.size would be the size() method of the json)
+	on_file(cb) {
+		_file_listeners.push_back(cb);
+	}
+
+	add_file_listener(cb) {
+		if(std.is_function(cb))
+			_file_listeners.push_back(cb);
+	}
+	
+	share_file(path, caption = "") {
+		if(!_file_listeners.size())
+			return [ok = false, error = "no chat is connected to this node, the file was not sent"];
+		
+		data = fileio.read_file(path);
+		f = [
+			name = fileio.file_name(path),
+			bytes = data.size(),
+			caption = std.string(caption ?? ""),
+			data = std.base64_encode(data),
+		];
+		
+		sent = 0;
+		for(i = 0; i < _file_listeners.size(); i++) {
+			try {
+				_file_listeners[i](f);
+				sent++;
+			}
+			catch(e) {
+				std.error("file listener failed: ", e);
+			}
+		}
+		
+		if(!sent)
+			return [ok = false, error = "the file could not be handed to the chat"];
+		return [ok = true, name = f.name, bytes = f.bytes];
+	}
+	
+	on_action(cb) {
+		receptionist.on_action = cb;
+	}
+	
+	on_task_finished(cb) {
+		_task_finish_cb = cb;
+	}
+	
+	//Additional finished-task listeners (on_task_finished keeps its single slot
+	//for the shizonet node service; the goal scheduler listens here).
+	add_task_finished_listener(cb) {
+		_task_finish_listeners.push_back(cb);
+	}
+	
+	//Never throws: a listener that fails must not take the worker thread down
+	//(a throwing on_task_finished callback used to end the worker thread for good,
+	//every later task stayed "planned").
+	_emit_task_finished(task) {
+		if(_task_finish_cb) {
+			try {
+				_task_finish_cb(task);
+			}
+			catch(e) {
+				std.error("task finished callback failed: ", e);
+			}
+		}
+		
+		for(i = 0; i < _task_finish_listeners.size(); i++) {
+			try {
+				_task_finish_listeners[i](task);
+			}
+			catch(e) {
+				std.error("task finished listener failed: ", e);
+			}
+		}
+	}
+	
+	//Room for background work (goal_engine.shio GoalScheduler.capacity_ok)
+	background_capacity() {
+		idle = 1000000000;
+		
+		if(last_interactive_ms > 0)
+			idle = (std.millis() - last_interactive_ms) / 1000;
+		
+		if(_receptionist_active || request_queue.size())
+			idle = 0;
+		
+		return [
+			workers = max_workers,
+			busy = tasks.size() + tasks_scheduled.size(),
+			interactive_idle_secs = idle,
+		];
+	}
+	
+	health_thread() {
+		for(this.running) {
+			std.sleep(1000 * 60 * 30);
+			if(!tasks.size())
+				continue;
+			request("Check the status of the running tasks (check for stuck tasks or infinite repetition loops, stop stuck tasks, do not touch healthy tasks).", None, None, false);
+		}
+	}
+	
+	receptionist_thread() {
+		for(this.running) {		
+			if(!request_queue.size())
+				std.sleep(100);
+				continue;
+			
+			req = request_queue[0];
+			
+			//Nothing in here may end this thread: request() waits for
+			//req.finished, a dead receptionist thread is a node that never
+			//answers again.
+			try {
+				_run_request(req);
+			}
+			catch(e) {
+				std.error("[megamind] request failed: ", e);
+				_receptionist_active = false;
+				req.result = [ok = false, error = std.string(e), reports = [[
+					report = "The node's receptionist crashed: " + std.string(e),
+					time = std.millis(),
+					time_str = std.timestamp(),
+				]]];
+			}
+			
+			req.finished = true;
+			request_queue.erase(0);
+		
+			std.sleep(10); //Let tasks start
+		}
+	}
+	
+	_run_request(req) {
+		result = None;
+		crash = "";
+		start_ms = std.millis();
+		
+		_receptionist_updates = [];
+		_receptionist_active = true;
+		try {
+			receptionist.on_action = req.on_action_cb;
+			receptionist.clear_chat();
+			result = receptionist.task(req.prompt);
+			
+			//follow-ups that arrived during the turn (update_receptionist):
+			//the same conversation goes on, on this thread
+			for(_receptionist_updates.size() && this.running) {
+				msg = "";
+				for(i = 0; i < _receptionist_updates.size(); i++)
+					msg += _receptionist_updates[i] + "\n\n";
+				_receptionist_updates = [];
+				result = receptionist.task("# Follow-up from the user\n" + msg.strip(), true);
+			}
+		}
+		catch(e) {
+			//An empty catch left result = None: the caller got nothing at all
+			//and the chat stayed silent. Report the crash (contract C6).
+			crash = std.string(e);
+			std.error("[megamind] receptionist turn crashed: ", e);
+		}	
+		_receptionist_updates = [];
+		_receptionist_active = false;
+		
+		//The turn result the owner sees: finish(summary) reports win, a
+		//crash or a stop becomes a readable report.
+		result = megamind_turn_result(receptionist, result, crash, std.millis() - start_ms);
+		
+		if(req.on_finish_cb) {
+			try {
+				req.on_finish_cb(result);
+			}
+			catch(e) {
+				//A throwing callback must not strand the request: the
+				//result is delivered to the caller below either way.
+				std.error("[megamind] receptionist finish callback failed: ", e);
+			}
+		}
+		
+		req.result = result;
+	}
+	
+	worker_thread(cfg) {
+		
+		managed worker = create_worker(cfg);
+		
+		for(this.running) {
+			for(tasks_scheduled.size()) {
+				task = tasks_scheduled[0];
+				tasks_scheduled.erase(0);
+				tasks.push_back(task);
+				task.state = "research";
+				
+				//Nothing may end this thread: a worker thread that died on an
+				//exception left its task "running" forever and every later task
+				//"planned" (with one worker: the whole node stuck).
+				try {
+					_run_task(worker, task, cfg);
+				}
+				catch(e) {
+					std.error("[megamind] worker failed: ", e);
+				}
+			}
+			
+			std.sleep(100);
+		}
+	}
+	
+	//One task on this worker thread: research, implement (continued with every
+	//update that arrives while it runs), then the record and the events.
+	_run_task(worker, task, cfg = None) {
+		root_slot = None;
+		crash = "";
+		
+		//a task of another role gets an agent of its own (the default role uses
+		//the worker thread's agent)
+		role = task.role ? std.string(task.role) : MEGAMIND_DEFAULT_ROLE;
+		if(role != MEGAMIND_DEFAULT_ROLE) {
+			try {
+				worker = create_worker(cfg, role);
+			}
+			catch(e) {
+				crash = "cannot create an agent with the role '" + role + "': " + std.string(e);
+			}
+		}
+		
+		//The worker is the task's from now on, so stop_task() reaches a task that
+		//still waits for the receptionist or for a max_running_agents slot.
+		//(the stop flag of the previous task's signal() must not skip the wait)
+		worker.stopped = false;
+		task.worker = worker;
+		task.start_time = std.timestamp();
+		task.last_update_ms = std.millis();
+		
+		try {
+			if(crash)
+				std.runtime_error(crash);
+			
+			//Dont start yet when receptionist is still generating text
+			for(this._receptionist_active && task.state != "stopped") {
+				std.sleep(1);
+			}
+			
+			//The root of the task takes a max_running_agents slot from the pool;
+			//its subagents borrow it while the root waits for them.
+			if(task.state != "stopped")
+				root_slot = agent_slot(worker, None);
+			
+			worker.clear_chat();
+			worker.env.clear();
+			worker.env.mind = this;	//send_file of the worker tree (roles/SHARED.shio)
+			worker.set_reasoning_effort("medium");
+			
+			worker.on_action = [task](action) {
+				
+				task.last_update = std.timestamp();
+				task.last_update_ms = std.millis();
+				
+				if(action.reasoning)
+					task.raw_output += action.reasoning;
+				if(action.text)
+					task.raw_output += action.text;
+				if(task.raw_output && task.raw_output.length() > 2000)
+					task.raw_output = task.raw_output.substr(task.raw_output.length() - 2000);
+				
+				if(action.milestone) {
+					task.milestones.push_back([
+						content=action.milestone,
+						timestamp=std.timestamp(),
+					]);
+				}
+			};
+			
+			//task() clears the agent's own stop flag: a stop that came before
+			//it must be checked here, else the stopped task would run anyway
+			if(task.state != "stopped")
+				worker.task("# Instruction\nI will give you a task description and you will research what is needed to complete the task.\nYou should not start the task or look for solutions right now, just gather context and required files and code lines and emit a report via signal().\nNOTE: If the task is simple or trivial, just return immediately via signal().\n\n# Task Description\n" + task.task);
+			
+			research = worker.env.signal_report;
+			
+			if(task.state == "stopped") {
+				task.report = "The task was stopped before the implementation.";
+			}
+			else {
+				prompt = "# Task Name\n" + task.name + "\n\n# Goal\n" + task.task;
+				
+				if(research)
+					prompt += "\n\n# Research\n" + research;
+				if(task.user_updates) {
+					prompt += "\n\n# Updates\n";
+					for(i = 0; i < task.user_updates.size(); i++) {
+						prompt += task.user_updates[i] + "\n\n";
+					}
+				}
+
+				task.state = "implement";
+
+				worker.clear_chat();
+				worker.set_reasoning_effort("high");
+				worker.task(prompt);
+				
+				//update_task() during the implementation stopped the generation:
+				//continue the same conversation with the update(s)
+				for(task.state != "stopped" && task.pending_updates && task.pending_updates.size()) {
+					msg = "";
+					for(i = 0; i < task.pending_updates.size(); i++)
+						msg += task.pending_updates[i] + "\n\n";
+					task.pending_updates = [];
+					worker.task("# Update from the user\nContinue the task with this update:\n\n" + msg.strip(), true);
+				}
+			}
+		}
+		catch(e) {
+			crash = std.string(e);
+			std.print(e);
+		}
+		
+		//from here on update_task() answers "finished" (no yield until the
+		//record is written, so no update can get lost in between)
+		task.closing = true;
+		
+		if(root_slot)
+			root_slot.release();
+		
+		task.end_time = std.timestamp();
+		task.worker = None;
+		
+		if(crash) {
+			task.state = "failed";
+			if(!task.report)
+				task.report = "The worker crashed: " + crash;
+		}
+		else if(task.state != "stopped") {
+			task.state = worker.env.signal_event;
+			task.report = worker.env.signal_report;
+			
+			if(!task.state)
+				task.state = "failed";
+			
+			//A stop that arrived before the worker ever signalled is a stop,
+			//not a crash.
+			if(task.state == "failed" && worker.stopped && !worker.env.signal_event)
+				task.state = "stopped";
+		}
+		
+		if(task.state == "stopped" && !task.report)
+			task.report = "The task was stopped.";
+		if(task.state == "failed" && !task.report)
+			task.report = "The worker ended without a result (it never called signal()).";
+		
+		for(i = 0; i < tasks.size(); i++) {
+			if(tasks[i].taskid == task.taskid)
+				tasks.erase(i);
+				break;
+		}
+		
+		if(task.state == "failed") {
+			tasks_failed.push_back(task);
+			if(tasks_failed.size() > 5)
+				tasks_failed.erase(0);
+		}
+		else {
+			tasks_finished.push_back(task);
+			if(tasks_finished.size() > 5)
+				tasks_finished.erase(0);
+		}
+		
+		std.print("--- " + task.name + " " + task.state + " ---");
+		
+		//A crash is a finished task too: routers and the goal scheduler
+		//must hear about it instead of waiting for a task that is gone.
+		_emit_task_finished(task);
+	}
+	
+	_receptionist_active = false;
+	_receptionist_updates = [];
+	_notify_cb = None;
+	_task_finish_cb = None;
+	_task_finish_listeners = [];
+	_file_listeners = [];
+}

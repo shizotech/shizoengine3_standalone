@@ -1,0 +1,1 @@
+Open local images and view them.

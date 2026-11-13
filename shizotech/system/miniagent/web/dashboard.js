@@ -964,6 +964,7 @@ function renderSessionHistory(events, chatHistory, liveText) {
   const promptHistorySize = num(state.session && state.session.chat_history_size_at_prompt);
   const historySize = hist.length;
 
+  let reportRendered = false;
   state.renderingHistory = true;
 
   if (historySize) {
@@ -998,7 +999,7 @@ function renderSessionHistory(events, chatHistory, liveText) {
     });
 
     if (live || !savedAssistant) {
-      renderCurrentTurnEvents(list, Boolean(live));
+      reportRendered = renderCurrentTurnEvents(list, Boolean(live));
     }
 
     if (live) {
@@ -1018,6 +1019,14 @@ function renderSessionHistory(events, chatHistory, liveText) {
       String(ev.text || ev.prompt || ev.message || '') === prompt);
     if (prompt && !hasUser) addUser(prompt);
     list.forEach((ev) => applySessionEvent(ev));
+    reportRendered = list.some((ev) => ev && ev.type === 'done' && ev.report);
+  }
+
+  // The terminal report is stored on the session; when the saved answer skipped
+  // the event render, the done-event report would otherwise vanish on reload.
+  const terminal = ['done', 'failed', 'question', 'stopped'].includes(status);
+  if (terminal && state.session && state.session.report && !reportRendered) {
+    addReport(state.session.report);
   }
 
   if (!historySize && !prompt && !live && !list.length) setChatEmpty();
@@ -1026,7 +1035,7 @@ function renderSessionHistory(events, chatHistory, liveText) {
 }
 
 function renderCurrentTurnEvents(list, skipText = false) {
-  if (!Array.isArray(list) || !list.length) return;
+  if (!Array.isArray(list) || !list.length) return false;
 
   let start = -1;
   for (let i = list.length - 1; i >= 0; i--) {
@@ -1037,6 +1046,8 @@ function renderCurrentTurnEvents(list, skipText = false) {
       if (list[i] && list[i].type === 'done') { start = i; break; }
     }
   }
+
+  let reportRendered = false;
 
   for (let i = start + 1; i < list.length; i++) {
     const ev = list[i];
@@ -1050,10 +1061,13 @@ function renderCurrentTurnEvents(list, skipText = false) {
       else if (action.text != null && !skipText) addAgentText(String(action.text));
     } else if (ev.type === 'done' && ev.report) {
       addReport(ev.report);
+      reportRendered = true;
     } else if (ev.type === 'error') {
       addError(ev.message || ev.error || 'Agent reported an error');
     }
   }
+
+  return reportRendered;
 }
 
 function chatContentText(content) {

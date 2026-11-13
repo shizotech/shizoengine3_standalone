@@ -151,6 +151,28 @@ ws_chat_from_events(events) {
     return chat;
 }
 
+// A short project-agent note for every real workspace. Generic and never
+// overwrites an existing file: a project's own AGENTS.md is the authority.
+ensure_agents_md(path) {
+    p = ws_str(path);
+    if(!p)
+        return false;
+
+    target = p + "/AGENTS.md";
+    if(fileio.exists(target))
+        return true;
+
+    text = "# AGENTS.md\n\nThis is a Miniagent workspace.\n\n" +
+           "- `.megamind/` holds sessions and architecture.\n" +
+           "- `.agentspace/` holds goals and scheduling preferences.\n" +
+           "- Register or inspect it with `shz miniagent --init` and the node web UI.\n";
+    if(fileio.write_text(target, text))
+        return true;
+
+    std.error("[workspaces] could not write AGENTS.md at ", target);
+    return false;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  WorkspaceStore — physical directory tree + registry + settings
 // ═══════════════════════════════════════════════════════════════════════════
@@ -264,7 +286,18 @@ class WorkspaceStore {
 
     save() {
         fileio.mkdir(root);
-        return fileio.write_json(registry_path, [workspaces = items], true, true);
+
+        try {
+            ok = fileio.write_json(registry_path, [workspaces = items], true, true);
+
+            if(!ok)
+                std.error("[workspaces] could not persist workspace registry at ", registry_path);
+
+            return ok;
+        } catch(e) {
+            std.error("[workspaces] could not persist workspace registry: ", e);
+            return false;
+        }
     }
 
     load() {
@@ -299,8 +332,11 @@ class WorkspaceStore {
             if(!w.path)
                 continue;
             ensure_megamind(w.path);
-            if(w.id != "root" && !ensure_agentspace(w.path))
-                return false;
+            if(w.id != "root") {
+                ensure_agents_md(w.path);
+                if(!ensure_agentspace(w.path))
+                    return false;
+            }
         }
 
         return true;
@@ -420,6 +456,7 @@ class WorkspaceStore {
 
         fileio.mkdir(phys);
         ensure_megamind(phys);
+        ensure_agents_md(phys);
         if(!ensure_agentspace(phys)) {
             cs.release();
             return [ok = false, error = "could not initialize the workspace goal engine"];
@@ -440,7 +477,12 @@ class WorkspaceStore {
         ];
 
         items.push_back(w);
-        save();
+
+        if(!save()) {
+            items.erase(items.size() - 1);
+            cs.release();
+            return [ok = false, error = "could not persist the workspace registry"];
+        }
 
         cs.release();
 
@@ -471,14 +513,23 @@ class WorkspaceStore {
             }
         }
 
+        removed = None;
+
         for(i = 0; i < items.size(); i++) {
             if(items[i].id == id) {
+                removed = items[i].copy();
                 items.erase(i);
                 break;
             }
         }
 
-        save();
+        if(!save()) {
+            if(removed)
+                items.push_back(removed);
+
+            cs.release();
+            return [ok = false, error = "could not persist the workspace registry"];
+        }
 
         cs.release();
 
@@ -529,6 +580,7 @@ class SessionManager {
     pump_active = [];
     deleting_sessions = [];
     listeners = [];
+    listener_owners = [];    // parallel to listeners: the owner that registered it
     notifications = [];
     notify_listeners = [];
     file_listeners = [];
@@ -547,6 +599,7 @@ class SessionManager {
         pump_active = [];
         deleting_sessions = [];
         listeners = [];
+        listener_owners = [];
         notifications = [];
         notify_listeners = [];
         file_listeners = [];
@@ -1627,9 +1680,41 @@ class SessionManager {
         return stopped;
     }
 
-    add_task_finished_listener(cb) {
-        if(std.is_function(cb))
-            listeners.push_back(cb);
+    add_task_finished_listener(cb, owner = "") {
+        if(!std.is_function(cb))
+            return false;
+
+        cs = std.critical_section_named("workspace_listeners");
+        listeners.push_back(cb);
+        listener_owners.push_back(ws_str(owner));
+        cs.release();
+
+        return true;
+    }
+
+    // A workspace scheduler / architecture board unregisters its listener when
+    // the workspace is stopped. Otherwise the manager would call a listener whose
+    // captured `this` was released, which throws "class not valid".
+    remove_task_finished_listener(owner) {
+        owner = ws_str(owner);
+
+        if(!owner)
+            return false;
+
+        cs = std.critical_section_named("workspace_listeners");
+        removed = false;
+
+        for(i = 0; i < listeners.size(); i++) {
+            if(listener_owners[i] == owner) {
+                listeners.erase(i);
+                listener_owners.erase(i);
+                removed = true;
+                i--;
+            }
+        }
+
+        cs.release();
+        return removed;
     }
 
     // One terminal event per task turn. The durable result is written first,
@@ -1672,7 +1757,11 @@ class SessionManager {
             last_update_ms = s.updated,
         ];
 
-        for(cb : listeners) {
+        cs = std.critical_section_named("workspace_listeners");
+        current_listeners = listeners.copy();
+        cs.release();
+
+        for(cb : current_listeners) {
             try {
                 cb(task);
             } catch(e) {
@@ -1824,8 +1913,12 @@ class Workspace {
         }
     }
 
-    add_task_finished_listener(cb) {
-        manager.add_task_finished_listener(cb);
+    add_task_finished_listener(cb, owner = "") {
+        manager.add_task_finished_listener(cb, owner);
+    }
+
+    remove_task_finished_listener(owner) {
+        return manager.remove_task_finished_listener(owner);
     }
 
     add_notify_listener(cb) {
@@ -1859,9 +1952,26 @@ class Workspace {
             stopped++;
         }
 
+        if(board) {
+            try {
+                board.stop();
+            } catch(e) {}
+            board = None;
+            stopped++;
+        }
+
         stopped += manager.stop_workspace(id);
 
         return stopped;
+    }
+
+    __deinit__() {
+        if(scheduler) {
+            try { scheduler.stop(); } catch(e) {}
+        }
+        if(board) {
+            try { board.stop(); } catch(e) {}
+        }
     }
 }
 
@@ -1971,9 +2081,6 @@ class WorkspaceRegistry {
             removed_sessions.push_back(ws_str(s.id));
         }
 
-        w.stop();
-        workspaces.erase(id);
-
         res = store.delete(id);
 
         if(!res.ok)
@@ -1983,6 +2090,9 @@ class WorkspaceRegistry {
                 code = 409,
                 sessions_removed = removed_sessions,
             ];
+
+        w.stop();
+        workspaces.erase(id);
 
         return [
             ok = true,

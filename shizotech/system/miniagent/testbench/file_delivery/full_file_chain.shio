@@ -1,0 +1,271 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  testbench/file_delivery/full_file_chain.shio — scratch integration check
+//
+//  The missing hop of tests/feedback_chain_test.shio: a workspace worker's
+//  `send_file` is a `file` protocol line on stdout, not a call to Node.share_file.
+//  This script feeds exactly that protocol line into the real SessionManager
+//  (workspaces.shio), then the real Node file-listener delegation, the real
+//  ShizoNet AI service, the real Router and the real TelegramRouter/fake bot.
+//
+//  Run from release/shizotech/system/miniagent:
+//      shz testbench/file_delivery/full_file_chain.shio
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../../telegram_router"
+#include "../../workspaces"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name, "\n");
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info, "\n");
+	}
+}
+
+wait_for(cond, ms) {
+	for(w = 0; w < ms / 10; w++) {
+		if(cond())
+			return true;
+
+		std.sleep(10);
+	}
+
+	return cond();
+}
+
+// ── fake Telegram transport ────────────────────────────────────────────────
+class fd_fake_bot {
+
+	sent = [];
+	docs = [];
+	on_any_message = None;
+
+	send_rich(chatdata, options) {
+		cid = std.is_json(chatdata) ? std.int(chatdata.chatid ?? 0) : std.int(chatdata);
+		sent.push_back([chatid = cid, text = std.string(options.markdown ?? "")]);
+		return [ok = true, message_id = sent.size()];
+	}
+
+	send_rich_draft(chatdata, draft_id, options) { return [ok = true]; }
+
+	send_document(chatdata, path, options = None) {
+		docs.push_back([
+			chatid = std.int(chatdata.chatid ?? 0),
+			name = fileio.file_name(path),
+			content = fileio.read_string(path),
+			caption = std.string((options ?? []).caption ?? ""),
+		]);
+		return [ok = true];
+	}
+
+	doc_with(needle) {
+		for(d : docs) {
+			if(std.string(d.content).contains(needle))
+				return d;
+		}
+		return None;
+	}
+
+	has_for(chatid, needle) {
+		for(s : sent) {
+			if(std.int(s.chatid) == std.int(chatid) && std.string(s.text).contains(needle))
+				return true;
+		}
+		return false;
+	}
+}
+
+// ── fake subprocess stdout: two protocol lines, then exit ─────────────────
+class fd_fake_proc {
+	lines = [];
+
+	__init__(_lines) {
+		lines = _lines;
+	}
+
+	read_line(stream, timeout = 0) {
+		if(stream == "stdout") {
+			if(lines.size()) {
+				line = lines[0];
+				lines.erase(0);
+				return std.string(line);
+			}
+			return "";
+		}
+		return "";
+	}
+
+	running() { return lines.size() > 0; }
+	write_line(obj) { return true; }
+	error() { return ""; }
+}
+
+// ── the host surface Node exposes to ai_node_attach ───────────────────────
+// Node.add_file_listener() is exactly this delegation to registry.manager.
+class fd_host {
+	manager = None;
+	name = "SHZ_FD_NODE";
+	description = "file delivery node";
+	cfg = ModelConfig();
+	max_workers = 1;
+	request_queue = [];
+	_receptionist_active = false;
+	goals = None;
+
+	get_overview() {
+		return [tasks = [], tasks_scheduled = [], tasks_finished = [], tasks_failed = []];
+	}
+
+	tasks() { return []; }
+
+	add_file_listener(cb) { manager.add_file_listener(cb); }
+	add_notify_listener(cb) { manager.add_notify_listener(cb); }
+	add_task_finished_listener(cb, owner = "") { manager.add_task_finished_listener(cb, owner); }
+}
+
+std.print("workspace worker file chain: protocol -> SessionManager -> Node -> ShizoNet -> Router -> Telegram\n");
+
+OUT_DIR = "testbench/file_delivery/out";
+TRUSTED_FILE = OUT_DIR + "/fd_trusted.json";
+CHAT = 777777;
+
+try {
+	if(!fileio.exists(OUT_DIR))
+		fileio.mkdir(OUT_DIR);
+}
+catch(e) {}
+
+fileio.write_text(TRUSTED_FILE, std.string([chats = [[chatid = CHAT, name = "file delivery test", added = std.millis()]]]));
+
+bot = fd_fake_bot();
+
+// Router first: it must own UDP 6454.
+rtr = TelegramRouter(ModelConfig(), [
+	name = "FD_ROUTER",
+	role = "receptionist",
+	description = "file delivery router",
+	trusted_chats = TRUSTED_FILE,
+	poll_ms = 100,
+	draft_ms = 0,
+	stall_ms = 500,
+]);
+
+rtr.attach_bot(bot);
+
+check("the transport is attached", !std.is_none(rtr.tg_bot));
+check("the front end starts with one trusted chat", rtr.tg_chats.size() == 1, std.string(rtr.tg_chats));
+
+ws_path = fileio.absolute_path(OUT_DIR + "/workspace");
+store = WorkspaceStore(ws_path);
+manager = SessionManager(store, "", "");
+manager.register_workspace("fdws", ws_path);
+
+host = fd_host();
+host.manager = manager;
+
+node_server = shizonet.server("SHZ_FD_NODE", 6455);
+node = ai_node_attach(node_server, host, [name = "SHZ_FD_NODE", description = "file delivery node"]);
+
+check("the node service is attached", !std.is_none(node));
+check("the host registered a Node file listener", manager.file_listeners.size() == 1, std.string(manager.file_listeners.size()));
+check("the router discovers the node", wait_for([rtr]() { return rtr.nodes().size() > 0; }, 12000), std.string(rtr.nodes().size()));
+
+// ── the worker's protocol lines ───────────────────────────────────────────
+FILE_PATH = OUT_DIR + "/fd_report.html";
+fileio.write_string(FILE_PATH, "<html><body><h1>Weekly report</h1>FD_MARKER</body></html>");
+
+data = fileio.read_file(FILE_PATH);
+
+// exactly the shape WorkspaceAgentMind.share_file() emits:
+// {"type":"file","name":...,"bytes":...,"caption":...,"data":"<base64>"}
+file_line = std.string([
+	type = "file",
+	name = fileio.file_name(FILE_PATH),
+	bytes = data.size(),
+	caption = "the weekly report",
+	data = std.base64_encode(data),
+]);
+
+done_line = std.string([
+	type = "done",
+	ok = json.bool(true),
+	status = "finished",
+	report = "the report was sent",
+	token_usage = 0,
+]);
+
+// Fake session record (the real SessionManager pump consumes stdout lines).
+SID = "fd_session";
+s = [
+	id = SID,
+	workspace_id = "fdws",
+	title = "file delivery session",
+	mode = "normal",
+	reasoning_effort = "medium",
+	status = "running",
+	prompt = "",
+	events = [],
+	chat_history_size_at_prompt = 0,
+	token_usage = 0,
+	created = std.millis(),
+	updated = std.millis(),
+	role = "adaptive",
+	report = "",
+	error = "",
+	seq = 0,
+	attempts = 0,
+];
+
+manager.sessions[SID] = s;
+manager.procs[SID] = fd_fake_proc([file_line, done_line]);
+manager.stop_requested[SID] = false;
+manager.terminal_reported[SID] = false;
+fileio.mkdir(ws_path + "/.megamind/sessions/" + SID);
+
+// our own listener counts the SessionManager dispatch separately from Node
+file_hits = [n = 0];
+manager.add_file_listener([](f) { file_hits.n++; });
+
+parsed_line = std.json(file_line, true);
+check("the worker protocol line is well formed",
+	std.is_json(parsed_line) && std.string(parsed_line.type) == "file" &&
+	std.string(parsed_line.name) == "fd_report.html" && std.int(parsed_line.bytes) == data.size(),
+	std.string(file_line));
+
+manager.pump(SID);
+
+check("the SessionManager parsed the worker's file line", file_hits.n == 1, std.string(file_hits.n));
+
+arrived = wait_for([bot]() { return bot.doc_with("FD_MARKER") != None; }, 8000);
+check("the document reaches the Telegram chat", arrived, std.string(bot.docs.size()));
+
+sd = bot.doc_with("FD_MARKER");
+check("it keeps its name and caption", sd && sd.name.ends("fd_report.html") && sd.caption == "the weekly report", std.string(sd));
+check("the chat announces the file and its size",
+	bot.has_for(CHAT, "[file] SHZ_FD_NODE: fd_report.html (" + std.string(fileio.size(FILE_PATH)) + " bytes)"), std.string(bot.sent));
+
+// teardown
+check("the node service stops", node.stop());
+rtr.tg_stop_worker();
+rtr.running = false;
+
+try { rtr.stop(); } catch(e) {}
+if(!std.is_none(rtr.service)) {
+	try { rtr.service.stop(); } catch(e) {}
+}
+
+try { fileio.remove(FILE_PATH); } catch(e) {}
+try { fileio.remove(TRUSTED_FILE); } catch(e) {}
+
+std.print("\n", passed, " passed, ", failed, " failed\n");
+
+if(failed == 0)
+	std.print("ALL PASSED\n");
+else
+	std.print("FAILED: ", failed, " checks\n");

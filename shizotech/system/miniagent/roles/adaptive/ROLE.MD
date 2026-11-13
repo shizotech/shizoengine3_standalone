@@ -115,7 +115,7 @@ Gather context in this order, then act:
    skill: re-check `list_skills()`. If it is genuinely absent, the harness is broken — report it,
    do not invent it.
 2. **Docs** — `AGENTS.MD` / `README.md` in the root and in the directories you will touch.
-3. **The Mind** — `.megamind/` (see The Mind). Read the relevant topic's `index.md`, then follow
+3. **The Mind** — `.megamind/topics/` (see The Mind). Read the relevant topic's `index.md`, then follow
    the edges you need, so you do not repeat a finished investigation or walk into a known dead end.
 4. **Code** — last. The actual implementation is authoritative over any doc or note.
 
@@ -259,7 +259,7 @@ Build game
 
 The Mind is shared, so split the writes:
 
-- Each child writes only its own node: `.megamind/<topic>/notes/<owner>.md`.
+- Each child writes only its own node: `.megamind/topics/<topic>/notes/<owner>.md`.
 - The graph files — `index.md`, `roadmap.md`, `taskboard.md` — are **owned by the parent**.
   Children report the nodes and edges they produced, the parent links them into `index.md`.
   A node that is not in the index does not exist.
@@ -354,7 +354,7 @@ Trust child reports. Re-verify where the puzzle pieces do not fit, plus the inte
 
 # The Mind
 
-`.megamind/` is the shared workspace for every agent in the current task hierarchy. Use it — it is
+`.megamind/topics/` is the shared workspace for every agent in the current task hierarchy. Use it — it is
 how the next agent, or you after a context reset, knows what already happened.
 
 The Mind is a **knowledge graph**, not a dump. Topics are its subgraphs, files are its **nodes**,
@@ -363,17 +363,17 @@ after a dozen runs; a Mind that is linked, merged and pruned stays usable foreve
 
 ### Topics
 
-Never write flat into `.megamind/`. Each distinct mental task owns one topic directory:
+Never write flat into `.megamind/topics/`. Each distinct mental task owns one topic directory:
 
 ```text
-.megamind/fixing_issues/
-.megamind/committing_git/
-.megamind/fixing_the_scrollbar/
+.megamind/topics/fixing_issues/
+.megamind/topics/committing_git/
+.megamind/topics/fixing_the_scrollbar/
 ```
 
 Topic name: short lowercase phrase, words joined by underscores, no punctuation, no ids, no
-timestamps, still readable in a month. Before writing: list `.megamind/`, reuse an existing topic
-when it is the same mental task, otherwise create one. The `.megamind/` root contains only topic
+timestamps, still readable in a month. Before writing: list `.megamind/topics/`, reuse an existing topic
+when it is the same mental task, otherwise create one. The `.megamind/topics/` root contains only topic
 directories — never a stray file, never a topic named after a date, never a second topic for a
 problem a topic already covers.
 
@@ -382,7 +382,7 @@ problem a topic already covers.
 A topic is a small graph with one entry point. Keep exactly this shape:
 
 ```text
-.megamind/<topic>/
+.megamind/topics/<topic>/
 ├── index.md               ← the graph: node list + edges. Entry point, always.
 ├── roadmap.md             ← direction, progress, key discoveries
 ├── taskboard.md           ← checklist with statuses

@@ -31,8 +31,11 @@ Notes for changes:
   send headers, so the token is accepted as a query value; `since` stops the page from
   replaying the history it already rendered. The route sets `Content-Type: text/event-stream`.
 * Selecting a session loads the complete transcript from `chat.json` (via `GET /api/sessions/<id>`)
-  and the in-flight `live_text`, then starts the stream at the latest sequence. The bounded
-  `session.json.events` window is only a live/replay buffer, never the chat transcript.
+   and the in-flight `live_text`, then starts the stream at the latest sequence. The bounded
+   `session.json.events` window is only a live/replay buffer, never the chat transcript.
+   A terminal `done`/`failed` report is rendered from the session's `report` (or the `done`
+   event) even when `chat.json` already contains the final assistant text; switching away and
+   back therefore keeps the finalize report bubble.
 * The worker serializes and retries `chat.json` saves after every turn and at tool starts; a
   transient save failure emits a warning instead of killing the session.
 * The dashboard hides miniagent's synthetic `<---SYTEM MESSAGE--->` finalize reminder prompts;
@@ -92,3 +95,8 @@ user message immediately, then reloads the session and reconciles it with saved 
 
 `web_ui_protect` denies the legacy standalone `/chat` and `/tasks` pages but serves `/architecture/`
 because the dashboard's Architecture tab embeds `architecture/index.html`.
+* The agent's internal compaction/handover run is not shown in the chat: `miniagent` suppresses
+  its deltas and resets the stopped state after the handover, so a session turn shows one real
+  answer, not the handover draft plus a second answer. A `done` status `failed` with "Agent was
+  stopped during its run." is the old compaction bug, not an intentional stop.
+

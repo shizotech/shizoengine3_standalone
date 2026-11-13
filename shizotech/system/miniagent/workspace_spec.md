@@ -21,6 +21,8 @@ sessions, architecture and tasks live inside the workspace directory, not in the
 `store_root = std.user_path() + "/miniagent/workspaces"`
 
 - The registry root is a container, not a project workspace; it has no `.agentspace`.
+- `shz miniagent --init` (or `shz miniagent.node --init`) registers the current directory as a real workspace, creates `.megamind`/`.agentspace`, writes `AGENTS.md` if missing, and returns without starting the node/web/ShizoNet. An already registered directory is reused.
+- `WorkspaceStore.ensure_agents_md(path)` writes a short project-agent `AGENTS.md` when missing; it never overwrites an existing project file. It runs on workspace creation and on load of registered non-root workspaces.
 - `workspaces.json` is the registry.
 - `settings.json` holds `max_sessions` (default 2).
 - `WorkspaceStore.ensure_agentspace` initializes each real workspace/subworkspace with `.agentspace/` when registered and repairs missing template files on load (2026-11-06). The synthetic `root` workspace does not get its own `.agentspace/`.
@@ -152,7 +154,10 @@ Main: selected workspace header, sessions, chat with normal/goal toggle, archite
 tasks tab. Selecting a different session only replaces the browser's SSE listener; it never stops the
 session worker. On selection the dashboard reloads the complete `chat.json` transcript plus the
 in-flight `live_text`, then resumes the SSE stream from the latest sequence; it does not rebuild the
-transcript from the bounded `session.json.events` window.
+ transcript from the bounded `session.json.events` window. For a terminal session, the dashboard
+ also renders the stored `session.report` (or the `done` event report) as a report bubble, even if
+ `chat.json` already contains the final assistant text, so the finalize report survives a
+ session switch.
 SSE keeps the chat fluid; animations for running/working states. No CDN.
 The session agent initializes the workspace goal store and registers the validated `get_goals`,
 `create_goal`, `create_recurring_goal`, `update_goal`, `set_goal_status`, and `run_goal_now` tools plus
@@ -188,3 +193,17 @@ reasoning effort is persisted with the session and applied before every turn.
   (the first prompt renames it); there is no session popup. Tasks are split into Active, Proposed, Templates and
   Finished; the task menu can start a normal/goal session task. Architecture has Analyze,
   Review plan, Apply and Discard buttons and imports an existing legacy model.
+## Listener lifecycle and compaction
+
+`Workspace.add_task_finished_listener(cb, owner)` forwards the owner tag to the shared
+`SessionManager`; `GoalScheduler` registers with `goal:<workspace_id>` and `ArchitectureBoard`
+with `arch:<path>`. `Workspace.stop()` unregisters both before releasing them, so a later session
+finish does not call a listener whose captured `this` is gone (`class not valid`).
+
+The session agent's compaction handover run is internal: its streamed text/tool deltas are
+suppressed (`internal_run`), and after `finalize` the agent clears `stopped` so the real prompt
+still runs. The web UI therefore shows one real answer per turn, not the handover draft plus a
+second answer. `compaction_requested` is reset after each handover, so a long task can compact
+repeatedly; the warning run's report is consumed as a handover, and the original task prompt is
+restored. A warning run that finalizes with `finished` is still a handover, not the task result.
+
