@@ -184,7 +184,10 @@ reasoning effort is persisted with the session and applied before every turn.
   `active_run_state` and `active_taskid` while work is dispatched, distinct from the goal's configured status.
   `POST /api/workspaces/<id>/goals` creates a validated goal (via `goal_tool_create`),
   `POST /api/workspaces/<id>/goals/<goal_id>/run` queues an active goal in the scheduler, and
-  `POST /api/workspaces/<id>/goals/<goal_id>/status` moves a proposed goal to active/paused.
+  `POST /api/workspaces/<id>/goals/<goal_id>/status` moves a proposed goal to active/paused. With
+  `clear_dry_run: "yes"` and `status: "active"`, it first edits the goal policy to `dry_run: false`
+  so the scheduler dispatches a worker; without it, an activated dry-run goal only writes the prompt
+  to history.md and stays quiet.
 - The dashboard has one sidebar: workspace tree with the selected workspace's sessions nested
   below it. Selecting a workspace refreshes the already-open Architecture or Tasks tab; task responses
   from a previous workspace are ignored. The visible Tasks or Global Tasks view refreshes every five seconds

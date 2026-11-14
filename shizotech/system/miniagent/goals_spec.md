@@ -24,8 +24,8 @@ GoalScheduler.tick()  ── windows, misfires, retries, stop policy, limits ─
 | `goal_engine.shio` | `GoalSpace` (the tree), validation, `GoalLedger` (runtime state), `GoalScheduler` |
 | `goal_tools.shio` | the agent operations: `get_goals`, `create_goal`, `update_goal`, `set_goal_status`, `run_goal_now` |
 | `goals.shio` | the CLI: `shz miniagent.goals ...` |
-| `agentspace_template/` | what `goals init` creates |
-| `goals_selftest.shio` | 172 checks, fake host + fake clock, no LLM |
+| `agentspace_template/` | what `goals init` creates; a goal already in another status folder is not recreated as a proposed duplicate |
+| `goals_selftest.shio` | 192 checks, fake host + fake clock, no LLM |
 
 ## The tree
 
@@ -46,6 +46,9 @@ GoalScheduler.tick()  ── windows, misfires, retries, stop policy, limits ─
 `<status>` is the folder: `proposed`, `active`, `paused`, `completed`, `cancelled`,
 `archived`. Only `active/` runs. A front matter `status:` that disagrees is a warning; the
 folder wins. Moving the folder is the status change (the CLI and the tools do exactly that).
+Duplicate folders with the same id are collapsed to the last one in `GOAL_STATUSES` order,
+which is the definition `rescan()` applies; `find()` uses the same folder, so edits and the
+scheduler never point at different copies.
 Sub-day `every` schedules accept whole-minute intervals from `1m` through `23h59m`, start at goal activation (or local midnight on `start_date`), and do not need a named window or clock time. Intervals of `1d` or longer remain whole local-calendar days.
 
 The Node's own Workspace finds its tree at `std.user_path()/miniagent/node/.agentspace` or through

@@ -2182,11 +2182,36 @@ workspaces_delete_workspace(ctx, workspace_id) {
 }
 
 // Activate / pause / cancel a goal of this workspace (the task menu).
-workspaces_goal_status(ctx, workspace_id, goal_id, status) {
+// clear_dry_run only applies when activating: it edits the goal file policy so
+// the scheduler dispatches workers instead of writing a prompt to history.md.
+workspaces_goal_status(ctx, workspace_id, goal_id, status, clear_dry_run = false) {
     scheduler = workspaces_get_scheduler(ctx, workspace_id);
 
     if(!scheduler) {
         return [ok = false, error = "goal scheduler unavailable"];
+    }
+
+    if(clear_dry_run && status == "active") {
+        f = scheduler.space.find(goal_id);
+
+        if(f) {
+            r = scheduler.space.load(f);
+
+            if(r.ok && r.def.policy.dry_run) {
+                upd = goal_tool_update(scheduler, [
+                    id = goal_id,
+                    revision = r.revision,
+                    dry_run = "no",
+                ]);
+
+                if(!upd.ok) {
+                    return [
+                        ok = false,
+                        error = "could not clear dry_run: " + gj_str(upd, "error", ""),
+                    ];
+                }
+            }
+        }
     }
 
     res = scheduler.space.move(goal_id, status);
@@ -2201,6 +2226,31 @@ workspaces_goal_status(ctx, workspace_id, goal_id, status) {
     }
 
     return res;
+}
+
+// Delete a goal: remove every folder copy and let the scheduler notice the
+// removal (it stops open runs, keeps project files).
+workspaces_delete_goal(ctx, workspace_id, goal_id) {
+    scheduler = workspaces_get_scheduler(ctx, workspace_id);
+
+    if(!scheduler) {
+        return [ok = false, error = "goal scheduler unavailable"];
+    }
+
+    removed = scheduler.space.remove(goal_id);
+
+    if(!removed) {
+        return [ok = false, error = "no goal '" + goal_id + "'"];
+    }
+
+    try {
+        scheduler.rescan();
+        scheduler.write_overview();
+    } catch(e) {
+        std.error("[workspaces] goal rescan failed: ", e);
+    }
+
+    return [ok = true, removed = goal_id];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2691,11 +2741,31 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
             return node_api_err("Invalid request body");
 
         status = node_api_get(body, "status", "active");
+        clear = node_api_get(body, "clear_dry_run", "0").lowercase();
+        clear_dry_run = clear == "yes" || clear == "true" || clear == "1";
 
-        res = workspaces_goal_status(ctx, workspace_id, goal_id, status);
+        res = workspaces_goal_status(ctx, workspace_id, goal_id, status, clear_dry_run);
 
         if(!res.ok)
             return node_api_err(res.error, 409);
+
+        return node_api_ok(res);
+    });
+
+    server.route("DELETE", "^/api/workspaces/([0-9a-zA-Z_-]+)/goals/([0-9a-zA-Z_-]+)$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        workspace_id = std.string(req.matches[0]);
+        goal_id = std.string(req.matches[1]);
+
+        if(!ctx.store.get(workspace_id))
+            return node_api_err("unknown workspace", 404);
+
+        res = workspaces_delete_goal(ctx, workspace_id, goal_id);
+
+        if(!res.ok)
+            return node_api_err(res.error, 404);
 
         return node_api_ok(res);
     });

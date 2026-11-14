@@ -1980,7 +1980,7 @@ function taskRenderSignature(data) {
   const goals = arr(data && data.goals).map((g) => [
     g.id, g.title, g.status, g.active_run_state, g.active_taskid,
     g.active_window, g.next_window, g.last_outcome,
-    g.errors, g.invalid_edit, g.schedule, g.revision
+    g.errors, g.invalid_edit, g.dry_run, g.schedule, g.revision
   ]);
   const sessions = arr(data && data.sessions).map((s) => [
     s.taskid, s.id, s.name, s.title, s.state, s.status, s.active,
@@ -2011,6 +2011,15 @@ function goalCard(g, workspaceId) {
     '<div class="task-name">' + esc(g.title || g.id || 'Task') + '</div>' +
     '<span class="task-state ' + esc(stateClass) + '">' + esc(displayState) + '</span>';
   card.appendChild(top);
+
+  const dryRun = Boolean(g.dry_run === true || g.dry_run === 1 ||
+    String(g.dry_run).toLowerCase() === 'true' || String(g.dry_run) === '1');
+  if (dryRun) {
+    const p = document.createElement('div');
+    p.className = 'task-report';
+    p.textContent = 'Dry run only: the scheduler writes the prompt to history.md and starts no worker.';
+    card.appendChild(p);
+  }
 
   if (g.schedule) {
     const p = document.createElement('div');
@@ -2058,10 +2067,19 @@ function goalCard(g, workspaceId) {
   if (!invalid && st === 'proposed') {
     const btn = document.createElement('button');
     btn.className = 'btn btn-small';
-    btn.textContent = 'Activate';
-    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active'));
+    btn.textContent = dryRun ? 'Activate live' : 'Activate';
+    btn.title = dryRun ? 'Move to active and clear dry_run so the scheduler dispatches a worker' : 'Move to active';
+    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', dryRun));
     actions.appendChild(btn);
   } else if (!invalid && st === 'active') {
+    if (dryRun) {
+      const live = document.createElement('button');
+      live.className = 'btn btn-small';
+      live.textContent = 'Run live';
+      live.title = 'Clear dry_run; the scheduler dispatches the next window';
+      live.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', true));
+      actions.appendChild(live);
+    }
     const btn = document.createElement('button');
     btn.className = 'btn btn-small btn-ghost';
     btn.textContent = 'Pause';
@@ -2070,8 +2088,9 @@ function goalCard(g, workspaceId) {
   } else if (!invalid && st === 'paused') {
     const btn = document.createElement('button');
     btn.className = 'btn btn-small';
-    btn.textContent = 'Resume';
-    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active'));
+    btn.textContent = dryRun ? 'Resume live' : 'Resume';
+    btn.title = dryRun ? 'Resume and clear dry_run' : 'Resume';
+    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', dryRun));
     actions.appendChild(btn);
   }
 
@@ -2332,10 +2351,15 @@ async function reloadTaskView(workspaceId) {
   }
 }
 
-async function setGoalStatus(workspaceId, goalId, status) {
+async function setGoalStatus(workspaceId, goalId, status, clearDryRun = false) {
   try {
-    await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals/' + encodeURIComponent(goalId) + '/status', { status });
-    toast('Goal ' + status + '.', 'success');
+    const body = { status };
+    // Activating/resuming is meant to run live. Always clear dry_run, even if the
+    // card was rendered from stale data; the backend treats it as a no-op when
+    // the goal is not a dry run.
+    if (status === 'active' || clearDryRun) body.clear_dry_run = 'yes';
+    await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals/' + encodeURIComponent(goalId) + '/status', body);
+    toast(status === 'active' ? 'Goal active (dry_run cleared).' : 'Goal ' + status + '.', 'success');
     await reloadTaskView(workspaceId);
   } catch (e) {
     toast('Goal update failed: ' + e.message, 'error');

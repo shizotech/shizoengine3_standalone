@@ -100,3 +100,4 @@ because the dashboard's Architecture tab embeds `architecture/index.html`.
   answer, not the handover draft plus a second answer. A `done` status `failed` with "Agent was
   stopped during its run." is the old compaction bug, not an intentional stop.
 
+* A goal with `dry_run: true` is shown as **Dry run only** in the Tasks tab. **Activate live** / **Run live** clears that policy (through `clear_dry_run: "yes"` on the status route) before moving it to active; the scheduler then dispatches a worker instead of writing only a prompt to `history.md`.
