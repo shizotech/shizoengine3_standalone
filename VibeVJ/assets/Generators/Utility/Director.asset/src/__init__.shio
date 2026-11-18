@@ -1,0 +1,694 @@
+// Director generator: an AI model makes typed decisions for the show (score / yes-no / one of a list, each with a
+// confidence), the decision models of the Jev kind, run on any OpenAI-compatible chat API: a local vLLM, Ollama or
+// LM Studio (also models that see: a picture of VibeVJ or a camera goes with the request) or a cloud API.
+//
+// - The state: the tempo master deck of the first ProlinkBridge (track, key, genre, phrase and mood of rekordbox, beats
+//   to the next cue, levels of the waveform), the inputs linked into the generator (Energy, Break, Crowd, ...), the
+//   decisions before. Logic and request: engine/director/director.shio.
+// - Behaviour: a prompt of the VJ for the whole show (saved with the project), goes into the system prompt.
+// - Chat: short instructions for now ("keep it dark", "no strobe on this track") that run out after 2 / 5 / 15 min, with
+//   the track or never (until removed with ×). Each one asks the model at once; its note answers in the chat.
+// - When: on every new phrase of the master deck, every N bars, or with Decide now. The answers are applied on the next
+//   downbeat (Pro DJ Link, else the timeline), so a model that takes half a second still switches on the bar.
+// - Mode Suggest only shows the answers, Auto sets the outputs; an answer below Confidence changes nothing.
+// - The outputs (Intensity, Strobe, Palette, Scene, Confidence, Decided) are links like any other.
+// - Log writes every decision (state, answers, what was applied) as JSON lines to <user path>/VibeVJ/director/: a
+//   recorded show to look at later, or to test other models and prompts with.
+// - The API key: "token" of configs/director_api.json, else the key of the Chat (configs/openai_api.json) when the URL
+//   is the one of the Chat. It is not saved with the project.
+// - AI queries (MCP, Chat): director_status, director_decide, director_say, director_unsay, set_director.
+#include "engine/director/director"
+
+import nanogui;
+
+using eigen;
+
+MODE_OFF = 0;
+MODE_SUGGEST = 1;
+MODE_AUTO = 2;
+PICTURE_NONE = 0;
+PICTURE_WINDOW = 1;
+PICTURE_CAMERA = 2;
+PICTURE_WIDTH = 512;
+CHAT_CONFIG = "configs/openai_api.json";
+DIRECTOR_CONFIG = "configs/director_api.json";
+MODE_NAMES = ["off", "suggest", "auto"];
+CHAT_KEEP = 40;
+//"Track" without a known track (no Pro DJ Link): the instruction holds this long instead
+TRACK_FALLBACK_MS = 900000;
+
+status = None;
+answer_label = None;
+reason_label = None;
+mode = None;
+decide_btn = None;
+
+intensity_out = None;
+strobe_out = None;
+palette_out = None;
+scene_out = None;
+confidence_out = None;
+decided_out = None;
+
+energy_in = None;
+break_in = None;
+crowd_in = None;
+
+behaviour_area = None;
+palette_text = None;
+scene_text = None;
+
+on_phrase = None;
+every_bars = None;
+on_downbeat = None;
+min_gap = None;
+
+api_text = None;
+model_text = None;
+picture = None;
+structured = None;
+threshold = None;
+log_btn = None;
+
+chat_log = None;
+chat_box = None;
+dur_box = None;
+default_min = None;
+shown_default = -1.0;
+active_box = None;
+active_labels = [];
+instructions = [];
+chat_lines = [];
+rebuild_active = true;
+ask_again = "";
+last_track_id = "";
+last_tick_ms = 0.0;
+
+//request state: busy while a thread waits for the model; result is picked up by update()
+busy = false;
+result_ready = None;
+pending = None;
+pending_state = None;
+last_request_ms = -100000.0;
+last_decided_ms = -100000.0;
+last_phrase_key = "";
+last_bar = None;
+last_beat_in_bar = 0;
+decide_was = false;
+decisions = std.json();
+last_state = None;
+last_result = None;
+last_reason = "";
+log_path = "";
+log_lines = [];
+
+def set_status(text);
+def take_picture(which);
+def start_request(why);
+
+dispatcher(generator, cmd, value) {
+
+}
+
+//The first ProlinkBridge of the project (std.global("prolink_sources"), ProlinkBridge.asset), or None
+prolink_device() {
+	sources = std.global("prolink_sources").get();
+	if(!sources)
+		return None;
+	for(k, d : sources)
+		if(d)
+			return d;
+	return None;
+}
+
+//The questions from the option fields: every question with options, intensity and strobe always
+make_questions() {
+	qs = [
+		director_question("intensity", "score", "How intense should the visuals be right now (0 calm, 1 peak)?"),
+		director_question("strobe", "bool", "Should the strobe / flash effects be on until the next decision?"),
+	];
+	pal = director_options(palette_text.value());
+	if(pal.size() >= 2)
+		qs.push_back(director_question("palette", "choice", "Which colour palette fits the music now?", pal));
+	sc = director_options(scene_text.value());
+	if(sc.size() >= 2)
+		qs.push_back(director_question("scene", "choice", "Which scene of the show fits the music now?", sc));
+	return qs;
+}
+
+//The key of the API: "token" of configs/director_api.json, else the Chat's (configs/openai_api.json) when the URL is
+//the Chat's. Not a control: a project can be shared without it
+api_token(url) {
+	try {
+		if(fileio.exists(DIRECTOR_CONFIG)) {
+			own = fileio.read_json(DIRECTOR_CONFIG);
+			if(own && own.token)
+				return std.string(own.token);
+		}
+		if(fileio.exists(CHAT_CONFIG)) {
+			cfg = fileio.read_json(CHAT_CONFIG);
+			if(cfg && cfg.url && std.string(cfg.url).removesuffix("/") == std.string(url).removesuffix("/"))
+				return std.string(cfg.token ?? "");
+		}
+	}
+	catch(e) {}
+	return "";
+}
+
+//API URL and model of the Chat, for a new Director
+chat_defaults() {
+	try {
+		if(fileio.exists(CHAT_CONFIG)) {
+			cfg = fileio.read_json(CHAT_CONFIG);
+			if(cfg && cfg.url)
+				return [url = std.string(cfg.url), model = std.string(cfg.name ?? "")];
+		}
+	}
+	catch(e) {}
+	return [url = "http://localhost:11434/v1", model = ""];
+}
+
+current_state() {
+	dev = prolink_device();
+	m = dev ? dev.master() : None;
+	data = None;
+	if(m && m.track && m.track.id) {
+		try {
+			data = dev.track(m.track.id);
+		}
+		catch(e) {}
+	}
+	levels = [energy = energy_in.value(), break = break_in.value(), crowd = crowd_in.value()];
+	return director_state(m, data, levels, decisions);
+}
+
+//The track id of the master deck ("" without Pro DJ Link or a track)
+master_track_id() {
+	dev = prolink_device();
+	m = dev ? dev.master() : None;
+	return (m && m.track) ? std.string(m.track.id ?? "") : "";
+}
+
+//A line in the chat ("You: ...", "Director: ...", "Ran out: ...")
+chat_add(who, text) {
+	chat_lines.push_back(std.date("%H:%M") + " " + who + ": " + text);
+	for(chat_lines.size() > CHAT_KEEP)
+		chat_lines.erase(0);
+	//newest on top: the textarea cannot be scrolled from a script, the newest line must be seen
+	if(chat_log) {
+		shown = [];
+		for(i = chat_lines.size() - 1; i >= 0; i--)
+			shown.push_back(chat_lines[i]);
+		chat_log.text(shown.combine_string("\n").removesuffix("\n"));
+	}
+}
+
+//A short instruction of the VJ (or an agent), asks the model at once. dur: director_duration (ms, track)
+say(text, dur) {
+	t = std.string(text ?? "").strip();
+	if(!t)
+		return None;
+	track = "";
+	ttl = dur.ms;
+	if(dur.track) {
+		track = master_track_id();
+		if(!track)
+			ttl = TRACK_FALLBACK_MS;
+	}
+	it = director_instruction(t, ttl, track, std.millis());
+	instructions.push_back(it);
+	chat_add("You", t + " [" + director_instruction_left(it, std.millis()) + "]");
+	rebuild_active = true;
+	if(mode.value() == MODE_OFF)
+		chat_add("Director", "Mode is Off: I will follow it when Mode is Suggest or Auto.");
+	else if(busy)
+		ask_again = "instruction";
+	else
+		start_request("instruction");
+	return it;
+}
+
+//Removes the instruction made at at_ms (the × of its row); -1 removes all
+unsay(at_ms) {
+	keep = [];
+	for(it : instructions)
+		if(at_ms >= 0 && it.at != at_ms)
+			keep.push_back(it);
+	removed = instructions.size() - keep.size();
+	instructions = keep;
+	rebuild_active = true;
+	return removed;
+}
+
+send_chat() {
+	if(!chat_box)
+		return;
+	text = std.string(chat_box.value() ?? "").strip();
+	if(!text)
+		return;
+	typed = std.string(dur_box.value() ?? "").strip();
+	dur = director_duration(typed, default_min.value());
+	if(!dur.ok) {
+		chat_add("Director", "'" + typed + "' is no time: 10 (minutes), 30s, 1.5h, track or show");
+		return;
+	}
+	chat_box.value("");
+	//the next one takes the default again, unless a time is typed
+	dur_box.value("");
+	say(text, dur);
+}
+
+//The rows of the instructions that hold, each with how long and a ×. Built in update(), not in a callback of a row
+build_active() {
+	rebuild_active = false;
+	active_box.clear_children();
+	active_labels = [];
+	now = std.millis();
+	for(i = instructions.size() - 1; i >= 0; i--) {
+		it = instructions[i];
+		row = active_box.widget().fixed_height(22).layout(nanogui.layout_horizontal().spacing(4));
+		lbl = row.label("").fixed_width(350);
+		lbl.caption("[" + director_instruction_left(it, now) + "] " + it.text).tooltip(it.text);
+		at_ms = it.at;
+		row.button("").icon(nanogui.icon("times")).fixed_size(vec2f(22, 22)).tooltip("Remove this instruction")
+			.on_click([at_ms]() { unsay(at_ms); });
+		active_labels.push_back([lbl = lbl, it = it]);
+	}
+}
+
+//Starts a request on a thread (the model can take seconds, the frame does not wait)
+start_request(why) {
+	if(busy)
+		return;
+	busy = true;
+	last_request_ms = std.millis();
+	last_reason = why;
+	st = current_state();
+	qs = make_questions();
+	url = api_text.value();
+	lines = director_instruction_lines(instructions, std.millis());
+	guide = [behaviour = behaviour_area ? behaviour_area.text() : "", instructions = lines];
+	cfg = [
+		url = url,
+		token = api_token(url),
+		model = model_text.value(),
+		picture = picture.value(),
+		structured = structured.value() ? true : false,
+		guide = guide,
+	];
+	set_status("Asking the model (" + why + ")…");
+	worker = std.thread([st, qs, cfg, why]() {
+		res = None;
+		try {
+			png = None;
+			if(cfg.picture != PICTURE_NONE)
+				png = take_picture(cfg.picture);
+			body = director_body(cfg.model, st, qs, png, cfg.structured, cfg.guide);
+			r = director_request(cfg.url, cfg.token, body);
+			if(r.ok)
+				res = director_parse(r.body, qs);
+			else
+				res = [ok = false, answers = std.json(), error = r.error];
+			res.ms = r.ms;
+		}
+		catch(e) {
+			res = [ok = false, answers = std.json(), error = std.string(e), ms = 0];
+		}
+		res.questions = qs;
+		res.why = why;
+		res.instructions = cfg.guide.instructions;
+		pending_state = st;
+		result_ready = res;
+		busy = false;
+	});
+	worker.run();
+}
+
+//A PNG of the VibeVJ window or of the picture of a Camera generator (engine/interfaces/ai_capture.shio), or None
+take_picture(which) {
+	eng = std.global("engine");
+	cap = eng ? eng.ai_capture : None;
+	if(!cap)
+		return None;
+	shot = None;
+	if(which == PICTURE_CAMERA) {
+		cam = cap.camera(None);
+		shot = cap.capture(cam.get_live_path(), true, PICTURE_WIDTH);
+	}
+	else
+		shot = cap.capture("", false, PICTURE_WIDTH);
+	png = fileio.read_file(shot.path);
+	try {
+		fileio.remove(shot.path);
+	}
+	catch(e) {}
+	return png;
+}
+
+//Puts the answers on the outputs (Auto) and shows them; returns the ids that were applied
+apply_result(res) {
+	applied = [];
+	words = [];
+	tips = [];
+	sum = 0.0;
+	n = 0;
+	for(q : res.questions) {
+		if(!res.answers.has(q.id))
+			continue;
+		a = res.answers[q.id];
+		sum += a.confidence;
+		n++;
+		sure = director_gate(a, threshold.value());
+		shown = q.kind == "score" ? director_fixed2(a.value) : (q.kind == "bool" ? (a.value ? "yes" : "no") : std.string(a.value));
+		//an unsure answer gets a "?": it changed nothing
+		words.push_back(q.id + " " + shown + (sure ? "" : "?"));
+		tips.push_back(q.id + " " + shown + ": " + std.string(std.int(math.round(a.confidence * 100))) + "% sure" + (sure ? "" : ", below Confidence: not applied"));
+		if(!sure || mode.value() != MODE_AUTO)
+			continue;
+		if(q.id == "intensity")
+			intensity_out.value(a.number);
+		else if(q.id == "strobe")
+			strobe_out.value(a.number);
+		else if(q.id == "palette")
+			palette_out.value(a.number);
+		else if(q.id == "scene")
+			scene_out.value(a.number);
+		decisions[q.id] = a.value;
+		applied.push_back(q.id);
+	}
+	if(n > 0)
+		confidence_out.value(sum / n);
+	if(applied.size())
+		last_decided_ms = std.millis();
+	text = words.combine_string(" · ").removesuffix(" · ");
+	answer_label.caption(text ? text : "—").tooltip(tips.combine_string("\n").removesuffix("\n"));
+	note = res.note ?? "";
+	reason_label.caption((res.why ?? last_reason) + (note ? ": " + note : "")).tooltip(note);
+	//the reply to an instruction or a Decide now goes into the chat; the ones of every phrase only into the line above
+	if(note && (res.why == "instruction" || res.why == "Decide now" || res.why == "asked by AI"))
+		chat_add("Director", note);
+	return applied;
+}
+
+write_log(st, res, applied) {
+	if(!log_btn.value())
+		return;
+	try {
+		if(!log_path) {
+			dir = std.user_path() + "/VibeVJ";
+			fileio.mkdir(dir);
+			dir += "/director";
+			fileio.mkdir(dir);
+			log_path = dir + "/director-" + std.date("%Y%m%d-%H%M%S") + ".jsonl";
+		}
+		entry = director_log_entry(st, res, applied, res.ms ??? 0, mode.value() == MODE_AUTO ? "auto" : "suggest", res.instructions);
+		log_lines.push_back(entry.compact_string());
+		//JSON lines; fileio has no append, a show has a few hundred decisions
+		fileio.write_text(log_path, log_lines.combine_string("\n"));
+	}
+	catch(e) {
+		std.warn("Director: the log could not be written: " + e);
+	}
+}
+
+set_status(text) {
+	status.caption(text).tooltip(text);
+}
+
+//The behaviour prompt is no control (a long text): saved here. Chat instructions are for now and are not saved
+save_state() {
+	return [behaviour = behaviour_area ? behaviour_area.text() : ""];
+}
+
+load_state(state) {
+	if(state && state.has("behaviour") && behaviour_area)
+		behaviour_area.text(std.string(state.behaviour));
+}
+
+register_queries(generator) {
+	generator.register("director_status", [], [](args) {
+		return [
+			mode = MODE_NAMES[mode.value()],
+			busy = busy ? 1 : 0,
+			reason = last_reason,
+			state = last_state ?? current_state(),
+			answers = last_result ? last_result.answers : std.json(),
+			error = last_result ? last_result.error : "",
+			decisions = decisions,
+			questions = make_questions(),
+			note = last_result ? (last_result.note ?? "") : "",
+			behaviour = behaviour_area.text(),
+			instructions = director_instruction_lines(instructions, std.millis()),
+			chat = chat_lines,
+			api = api_text.value(),
+			model = model_text.value(),
+			log = log_path,
+		];
+	}, "Director: mode, the state of the show it sends, the questions, the last answers of the model (value, confidence) and what is applied now.");
+
+	generator.register("director_decide", [], [](args) {
+		if(busy)
+			return [ok = false, error = "A request is still running."];
+		start_request("asked by AI");
+		return [ok = true];
+	}, "Director: asks the model now (the answers come within seconds; director_status shows them).");
+
+	generator.register("director_say", [
+		text = "&string(): A short instruction for now, e.g. 'keep it dark until the drop', 'no strobe'",
+		minutes = "float(): How long it holds in minutes (default: Default time of the generator); 0: until removed",
+		track = "int(): 1: holds until the master deck plays another track",
+	], [](args) {
+		typed = "";
+		if(args.has("track") && std.int(args.track))
+			typed = "track";
+		else if(args.has("minutes"))
+			typed = std.float(args.minutes) <= 0 ? "show" : std.string(std.float(args.minutes));
+		dur = director_duration(typed, default_min.value());
+		if(!dur.ok)
+			return [ok = false, error = "minutes must be a number"];
+		it = say(args.text, dur);
+		if(!it)
+			return [ok = false, error = "No text."];
+		return [ok = true, holds = director_instruction_left(it, std.millis()), at = it.at];
+	}, "Director: a short instruction of the VJ for now, like the chat of the generator (some minutes, this track, or until removed). The model is asked at once; its note answers in director_status (note, chat).");
+
+	generator.register("director_unsay", [
+		at = "int(): 'at' of the instruction from director_say; -1 or nothing removes all",
+	], [](args) {
+		at_ms = args.has("at") ? std.float(args["at"]) : -1;
+		return [ok = true, removed = unsay(at_ms)];
+	}, "Director: removes a short instruction (or all).");
+
+	generator.register("set_director", [
+		mode = "string(): off, suggest or auto",
+		behaviour = "string(): The rules of the VJ for the whole show (a prompt, several lines), e.g. 'dark techno, little colour, strobe only on drops, never red'",
+		palette = "string(): Palette options, comma separated (empty: no palette question)",
+		scenes = "string(): Scene options, comma separated (empty: no scene question)",
+		threshold = "float(): Confidence an answer needs to be applied, 0..1",
+		every_bars = "int(): Ask every N bars (0: only on phrase changes and Decide now)",
+	], [](args) {
+		if(args.has("mode")) {
+			want = std.string(args.mode).lowercase();
+			mi = MODE_SUGGEST;
+			for(i, name : MODE_NAMES)
+				if(name == want)
+					mi = i;
+			mode.value(mi);
+		}
+		if(args.has("behaviour")) behaviour_area.text(std.string(args.behaviour));
+		if(args.has("palette")) palette_text.value(std.string(args.palette));
+		if(args.has("scenes")) scene_text.value(std.string(args.scenes));
+		if(args.has("threshold")) threshold.value(math.clamp(std.float(args.threshold), 0.0, 1.0));
+		if(args.has("every_bars")) every_bars.value(math.max(std.int(args.every_bars), 0));
+		return [ok = true, questions = make_questions()];
+	}, "Director: sets mode, the behaviour prompt for the whole show, the palette and scene options, the confidence threshold and how often it asks.");
+}
+
+entry(generator, area) {
+	generator.window.fixed_size(vec2f(420, 760));
+	top_area = area.vscroll().anchor(0).anchor_bottom(0);
+	area = top_area.content().layout(nanogui.layout_vertical());
+
+	status = area.label("Waiting for the first phrase").fixed_height(22);
+	answer_label = area.label("—").fixed_height(22);
+	reason_label = area.label("").fixed_height(22);
+
+	mode = area.controlcombo("MODE").caption("Mode").tooltip("Off: no requests. Suggest: asks the model and shows the answers, the outputs stay. Auto: sure answers set the outputs");
+	mode.items(["Off", "Suggest", "Auto"]).segmented(true); //index-based (MODE_OFF = 0, MODE_SUGGEST = 1, MODE_AUTO = 2)
+	mode.value(MODE_SUGGEST);
+	decide_btn = area.controlbutton("DECIDE NOW").caption("Decide now").tooltip("Asks the model now. Map a MIDI pad to it");
+
+	//Chat: short instructions for now, the notes of the model
+	chat_log = area.textarea().wrap_text(true).editable(false).fixed_height(96);
+	chat_log.tooltip("Your instructions and the replies of the model, the newest on top");
+	//one row: the instruction, how long it holds (empty: Default time), Send
+	chat_row = area.widget().fixed_height(26).layout(nanogui.layout_horizontal().spacing(4));
+	chat_box = chat_row.textbox("").editable(true).placeholder("Tell the Director what to do now").fixed_size(vec2f(250, 26));
+	chat_box.tooltip("A short instruction for now: 'keep it dark until the drop', 'no strobe', 'more colour'. Enter sends. The newest wins over Behaviour");
+	dur_box = chat_row.textbox("").editable(true).fixed_size(vec2f(74, 26));
+	dur_box.tooltip("How long it holds: 10 (minutes), 30s, 1.5h, track (until the next track) or show (until you remove it). Empty: Default time");
+	//on_change also comes when a field loses the focus: only Enter (the field still has it) sends
+	chat_box.on_change([](v) {
+		if(chat_box.focused())
+			send_chat();
+	});
+	dur_box.on_change([](v) {
+		if(dur_box.focused())
+			send_chat();
+	});
+	chat_row.button("Send").fixed_size(vec2f(56, 26)).tooltip("Sends the instruction (Enter does too)").on_click([]() { send_chat(); });
+	default_min = area.controlfloat("DEFAULT MINUTES").caption("Default time").unit("min").min(0.5).max(240).value(5).tooltip("How long an instruction holds when no time is typed next to it");
+	//below the field, so the field does not move when an instruction comes or goes
+	active_box = area.widget().layout(nanogui.layout_vertical());
+
+	intensity_out = area.controlslider("INTENSITY").caption("Intensity").as_output(true).tooltip("How intense the visuals should be, 0 calm to 1 peak. A [[pure output]]: [[link]] it into what should follow the energy");
+	strobe_out = area.controlslider("STROBE").caption("Strobe").as_output(true).tooltip("1 while the model wants strobe / flash effects, until the next decision");
+	palette_out = area.controlint("PALETTE").caption("Palette").as_output(true).tooltip("The palette the model picked: 0 for the first of Palettes, 1 for the second, … [[link]] it into the Index of Select");
+	scene_out = area.controlint("SCENE").caption("Scene").as_output(true).tooltip("The scene the model picked: 0 for the first of Scenes, 1 for the second, …");
+	confidence_out = area.controlslider("CONFIDENCE").caption("Confidence").as_output(true).tooltip("How sure the model was of its last answers (their average), 0 to 1");
+	decided_out = area.controlslider("DECIDED").caption("Decided").as_output(true).tooltip("1 for 100 ms when an answer was applied, for a flash or a trigger");
+
+	b_cnt = area.collapsable("Behaviour").content().layout(nanogui.layout_vertical());
+	b_cnt.label("Rules for the whole show, in your words:").fixed_height(20);
+	behaviour_area = b_cnt.textarea().wrap_text(true).fixed_height(110);
+	behaviour_area.tooltip("The model reads it with every request (saved with the project). E.g.: Dark techno night. Little colour, mostly cold. Strobe only on drops, never two phrases in a row. Never red. Calm in breaks.");
+
+	in_cnt = area.collapsable("Inputs").content().layout(nanogui.layout_vertical());
+	energy_in = in_cnt.controlslider("ENERGY").caption("Energy").tooltip("[[link]] the energy of the audio analysis (or anything 0..1) into it: the model reads it");
+	break_in = in_cnt.controlslider("BREAK").caption("Break").tooltip("[[link]] Break of the audio analysis into it: the model reads it");
+	crowd_in = in_cnt.controlslider("CROWD").caption("Crowd").tooltip("[[link]] how much the crowd moves into it (Motion of CrowdMotion in Generators › Python, with a camera on the crowd; or a sensor): the model reads it");
+
+	q_cnt = area.collapsable("Questions").content().layout(nanogui.layout_vertical());
+	palette_text = q_cnt.controltext("PALETTES").caption("Palettes").tooltip("The palettes the model picks from, comma separated. Fewer than two: no palette question").value("warm, cold, neon, mono");
+	scene_text = q_cnt.controltext("SCENES").caption("Scenes").tooltip("The scenes the model picks from, comma separated (the names of your clips or looks). Fewer than two: no scene question").value("calm, groove, build, peak");
+
+	when_cnt = area.collapsable("When").content().layout(nanogui.layout_vertical());
+	on_phrase = when_cnt.controlbutton("ON PHRASE").caption("On every phrase").push(1).value(1).tooltip("Asks when the master deck enters a new phrase (rekordbox phrases, else the ones found in the waveform) or loads a track");
+	every_bars = when_cnt.controlint("EVERY BARS").caption("Every bars").min(0).max(256).value(0).tooltip("Also asks every N bars (Pro DJ Link, else the timeline). 0: off");
+	on_downbeat = when_cnt.controlbutton("ON DOWNBEAT").caption("Apply on the downbeat").push(1).value(1).tooltip("Waits with the answers for the next downbeat, so a change lands on the bar");
+	min_gap = when_cnt.controlfloat("MIN GAP").caption("At most every").unit("s").min(1).max(600).value(8).tooltip("Seconds between two requests at least (a cloud API costs per request)");
+
+	m_cnt = area.collapsable("Model").content().layout(nanogui.layout_vertical());
+	defaults = chat_defaults();
+	api_text = m_cnt.controltext("API URL").caption("API URL").tooltip("An OpenAI-compatible API: Ollama http://localhost:11434/v1, LM Studio http://localhost:1234/v1, vLLM http://localhost:8000/v1, or a cloud API. Key: token of configs/director_api.json, else the Chat's").value(defaults.url);
+	model_text = m_cnt.controltext("MODEL").caption("Model").tooltip("The model name of the server (a vision model to send a picture)").value(defaults.model);
+	picture = m_cnt.controlcombo("PICTURE").caption("Picture").tooltip("Sends a picture with every request, for models that see: the VibeVJ window or the picture of the Camera generator");
+	picture.items(["None", "VibeVJ", "Camera"]).segmented(true); //index-based (PICTURE_NONE = 0, PICTURE_WINDOW = 1, PICTURE_CAMERA = 2)
+	structured = m_cnt.controlbutton("STRUCTURED").caption("JSON schema").push(1).value(1).tooltip("Asks the server to answer in the JSON schema of the questions (vLLM, Ollama, LM Studio, OpenAI). Off for a server that refuses it");
+	threshold = m_cnt.controlslider("THRESHOLD").caption("Confidence").min(0).max(1).value(0.6).tooltip("How sure the model must be for an answer to change an output");
+	log_btn = m_cnt.controlbutton("LOG").caption("Log decisions").push(1).value(0).tooltip("Writes every decision (state, answers, what was applied) as JSON lines to VibeVJ/director/ in the user folder");
+
+	register_queries(generator);
+}
+
+update(generator, tl_pos, pos_delta) {
+	now = std.millis();
+	decided_out.value(now - last_decided_ms < 100 ? 1.0 : 0.0);
+
+	//the chat: instructions that ran out (time, another track), the time left of the others, once a second
+	if(now - last_tick_ms >= 1000) {
+		last_tick_ms = now;
+		tid = master_track_id();
+		still = director_active(instructions, now, tid);
+		if(still.size() != instructions.size()) {
+			for(it : instructions) {
+				gone = true;
+				for(k : still)
+					if(k.at == it.at)
+						gone = false;
+				if(gone)
+					chat_add("Ran out", it.text);
+			}
+			instructions = still;
+			rebuild_active = true;
+		}
+		for(e : active_labels)
+			e.lbl.caption("[" + director_instruction_left(e.it, now) + "] " + e.it.text);
+	}
+	if(rebuild_active && active_box)
+		build_active();
+	if(dur_box && default_min.value() != shown_default) {
+		shown_default = default_min.value();
+		dur_box.placeholder(director_duration("", shown_default).text);
+	}
+
+	dev = prolink_device();
+	m = dev ? dev.master() : None;
+
+	//the bar: Pro DJ Link, else the timeline (4 beats)
+	downbeat = false;
+	bar_n = None;
+	if(m && m.playing) {
+		bib = m.beatInBar ??? 0;
+		downbeat = bib == 1 && last_beat_in_bar != 1;
+		last_beat_in_bar = bib;
+		if(!std.is_none(m.beat) && m.beat >= 0)
+			bar_n = math.floor((m.beat - 1) / 4.0);
+	}
+	else if(pos_delta > 0) {
+		bar_n = math.floor(tl_pos / 4.0);
+		downbeat = !std.is_none(last_bar) && bar_n != last_bar;
+	}
+
+	//an answer came: apply it now or on the next downbeat
+	if(result_ready) {
+		pending = result_ready;
+		result_ready = None;
+		if(!pending.ok) {
+			set_status(pending.error);
+			if(pending.why == "instruction" || pending.why == "Decide now")
+				chat_add("Director", "No answer: " + pending.error);
+			last_result = pending;
+			write_log(pending_state, pending, []);
+			pending = None;
+		}
+	}
+	if(pending && (!on_downbeat.value() || downbeat || std.is_none(bar_n))) {
+		applied = apply_result(pending);
+		last_state = pending_state;
+		last_result = pending;
+		write_log(pending_state, pending, applied);
+		set_status((mode.value() == MODE_AUTO ? "Applied " + std.string(applied.size()) : "Suggested") + " · " + std.string(pending.ms ??? 0) + " ms");
+		reason_label.caption("Asked: " + last_reason);
+		pending = None;
+	}
+
+	if(mode.value() == MODE_OFF) {
+		last_bar = bar_n;
+		return;
+	}
+
+	why = "";
+	pressed = decide_btn.value() ? true : false;
+	if(pressed && !decide_was)
+		why = "Decide now";
+	decide_was = pressed;
+
+	if(!why && on_phrase.value() && m) {
+		data = None;
+		if(m.track && m.track.id) {
+			try {
+				data = dev.track(m.track.id);
+			}
+			catch(e) {}
+		}
+		key = director_phrase_key(m, data);
+		if(key && key != last_phrase_key) {
+			if(last_phrase_key)
+				why = "new phrase";
+			last_phrase_key = key;
+		}
+	}
+	n_bars = every_bars.value();
+	if(!why && n_bars > 0 && !std.is_none(bar_n) && !std.is_none(last_bar) && bar_n != last_bar && bar_n % n_bars == 0)
+		why = "every " + std.string(n_bars) + " bars";
+	last_bar = bar_n;
+
+	//an instruction came while the model was busy: ask again with it
+	if(!why && ask_again && !busy) {
+		why = ask_again;
+		ask_again = "";
+	}
+	if(why && !busy && (why == "Decide now" || why == "instruction" || now - last_request_ms >= min_gap.value() * 1000.0))
+		start_request(why);
+}

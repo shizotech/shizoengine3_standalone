@@ -1,0 +1,488 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  gateway_config.shio — the settings of the Telegram gateway + its runner
+//
+//      #include "gateway_config"
+//
+//      s = gateway_settings_load();        // [enabled, bot_token, config, name]
+//      gateway_settings_save(s);
+//      gateway_settings_public(s);         // the same without the token (for the API)
+//
+//      run = GatewayRunner(default_config_spec);
+//      run.autostart();                    // starts the gateway when it is enabled
+//      run.apply(settings);                // save + start / stop / restart
+//      run.status();                       // [running, pid, started, restarts, log]
+//      run.stop();
+//
+//  The settings file is std.config_path("miniagent", "telegram_gateway") — next
+//  to the trust list of the gateway. The web interface edits it (Settings ›
+//  Telegram gateway), `shz miniagent --telegram-gateway` reads it when no
+//  --bot-token is given, and a node (`shz miniagent --node`) starts the gateway
+//  as a process of its own when it is enabled: the gateway is not part of the
+//  node, it only sees the nodes on ShizoNet, this one included.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "node_api"
+
+import subprocess;
+
+GATEWAY_SETTINGS_KEY = "telegram_gateway";
+GATEWAY_LOG_KEPT = 60;
+GATEWAY_RESTART_MIN_MS = 3000;
+GATEWAY_RESTART_MAX_MS = 60000;
+
+gateway_settings_path() {
+    return std.string(std.config_path("miniagent", GATEWAY_SETTINGS_KEY));
+}
+
+gateway_settings_defaults() {
+    return [
+        enabled = false,
+        bot_token = "",
+        config = "",            // model config spec of the router agent ("" = the default)
+        name = "TelegramGateway",
+    ];
+}
+
+gateway_settings_load(path = "") {
+    p = std.string(path ?? "");
+
+    if(!p)
+        p = gateway_settings_path();
+
+    out = gateway_settings_defaults();
+    data = None;
+
+    if(fileio.exists(p)) {
+        try {
+            data = fileio.read_json(p, true);
+        } catch(e) {
+            data = None;
+        }
+    }
+
+    if(std.is_json(data)) {
+        if(data.has("enabled"))
+            out.enabled = data.enabled ? true : false;
+        if(data.has("bot_token"))
+            out.bot_token = std.string(data.bot_token ?? "").strip();
+        if(data.has("config"))
+            out.config = std.string(data.config ?? "").strip();
+        if(data.has("name") && data.name)
+            out.name = std.string(data.name).strip();
+    }
+
+    return out;
+}
+
+gateway_settings_save(settings, path = "") {
+    p = std.string(path ?? "");
+
+    if(!p)
+        p = gateway_settings_path();
+
+    cur = gateway_settings_defaults();
+
+    if(std.is_json(settings)) {
+        if(settings.has("enabled"))
+            cur.enabled = settings.enabled ? true : false;
+        if(settings.has("bot_token"))
+            cur.bot_token = std.string(settings.bot_token ?? "").strip();
+        if(settings.has("config"))
+            cur.config = std.string(settings.config ?? "").strip();
+        if(settings.has("name") && settings.name)
+            cur.name = std.string(settings.name).strip();
+    }
+
+    try {
+        dir = fileio.file_dir(p);
+
+        if(dir && !fileio.exists(dir))
+            fileio.mkdir(dir);
+    } catch(e) {}
+
+    saved = [
+        enabled = json.bool(cur.enabled),
+        bot_token = cur.bot_token,
+        config = cur.config,
+        name = cur.name,
+    ];
+
+    if(!fileio.write_json(p, saved, true, true))
+        return [ok = false, error = "could not write " + p];
+
+    return [ok = true, settings = cur];
+}
+
+// what the API shows: never the token itself
+gateway_settings_public(settings) {
+    tok = std.string(settings.bot_token ?? "");
+    hint = "";
+
+    if(tok.length() > 8)
+        hint = tok.substr(0, 4) + "…" + tok.substr(tok.length() - 4);
+    else if(tok)
+        hint = "set";
+
+    return [
+        enabled = json.bool(settings.enabled ? true : false),
+        token_set = json.bool(tok ? true : false),
+        token_hint = hint,
+        config = std.string(settings.config ?? ""),
+        name = std.string(settings.name ?? ""),
+        path = gateway_settings_path(),
+    ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GatewayRunner — the gateway as a child process of a node
+// ─────────────────────────────────────────────────────────────────────────────
+
+class GatewayRunner {
+    default_config = "";
+    proc = None;
+    wanted = false;         // the gateway should run
+    running = true;         // the runner itself
+    thread = None;
+    started = 0;
+    restarts = 0;
+    last_exit = "";
+    log = [];
+    backoff = GATEWAY_RESTART_MIN_MS;
+
+    __init__(_default_config = "") {
+        default_config = std.string(_default_config ?? "");
+        proc = None;
+        wanted = false;
+        running = true;
+        thread = None;
+        started = 0;
+        restarts = 0;
+        last_exit = "";
+        log = [];
+        backoff = GATEWAY_RESTART_MIN_MS;
+    }
+
+    note(line) {
+        text = std.string(line ?? "").strip();
+
+        if(!text)
+            return;
+
+        log.push_back([time = std.millis(), text = text]);
+
+        for(log.size() > GATEWAY_LOG_KEPT)
+            log.erase(0);
+    }
+
+    alive() {
+        return proc && proc.running();
+    }
+
+    command(settings) {
+        args = [
+            std.string(std.local_executable()),
+            __DIR__ + "/__init__.shio",
+            "--telegram-gateway",
+        ];
+
+        spec = std.string(settings.config ?? "");
+
+        if(!spec)
+            spec = default_config;
+
+        if(spec) {
+            args.push_back("--config");
+            args.push_back(spec);
+        }
+
+        return args;
+    }
+
+    spawn() {
+        settings = gateway_settings_load();
+
+        if(!settings.bot_token) {
+            note("not started: no bot token is set");
+            return false;
+        }
+
+        p = subprocess.process();
+        p.terminate_on_destroy(true);
+        p.pipes(false, true, true);
+
+        ok = false;
+
+        try {
+            ok = p.start(command(settings), std.string(std.wd() ?? "."), false);
+        } catch(e) {
+            note("could not start the gateway: " + std.string(e));
+            return false;
+        }
+
+        if(!ok) {
+            note("could not start the gateway: " + std.string(p.error()));
+            return false;
+        }
+
+        proc = p;
+        started = std.millis();
+        note("gateway started (pid " + std.string(p.pid()) + ")");
+        return true;
+    }
+
+    drain() {
+        if(!proc)
+            return;
+
+        for(i = 0; i < 50; i++) {
+            line = proc.read_line("stdout", 0);
+
+            if(line.empty())
+                line = proc.read_line("stderr", 0);
+
+            if(line.empty())
+                break;
+
+            note(line);
+        }
+    }
+
+    kill() {
+        p = proc;
+
+        if(!p)
+            return;
+
+        if(p.running()) {
+            p.terminate();
+
+            for(i = 0; i < 20 && p.running(); i++)
+                std.sleep(50);
+
+            if(p.running())
+                p.kill();
+        }
+
+        drain();
+        proc = None;
+    }
+
+    loop() {
+        for(this.running) {
+            if(wanted) {
+                if(!alive()) {
+                    if(proc) {
+                        drain();
+                        last_exit = "the gateway process ended (exit code " + std.string(proc.returncode() ??? "?") + ")";
+                        note(last_exit);
+                        proc = None;
+
+                        // wait before the next try, longer every time it dies at once
+                        waited = 0;
+
+                        for(this.running && wanted && waited < backoff) {
+                            std.sleep(100);
+                            waited += 100;
+                        }
+
+                        backoff = math.min(GATEWAY_RESTART_MAX_MS, backoff * 2);
+                        restarts++;
+                    }
+
+                    if(this.running && wanted && !spawn()) {
+                        // nothing to start with (no token): wait for new settings
+                        wanted = false;
+                    }
+                } else {
+                    drain();
+
+                    // it runs for a while: the next failure starts from the short wait again
+                    if(std.millis() - started > GATEWAY_RESTART_MAX_MS)
+                        backoff = GATEWAY_RESTART_MIN_MS;
+                }
+            } else if(proc) {
+                kill();
+            }
+
+            std.sleep(250);
+        }
+    }
+
+    ensure_thread() {
+        if(thread)
+            return;
+
+        t = std.thread([this]() { this.loop(); });
+        t.run();
+        thread = t;
+    }
+
+    // start it when the settings say so (node start)
+    autostart() {
+        settings = gateway_settings_load();
+
+        if(!settings.enabled || !settings.bot_token)
+            return false;
+
+        wanted = true;
+        ensure_thread();
+        std.print("Telegram gateway: starting (settings: " + gateway_settings_path() + ")");
+        return true;
+    }
+
+    // new settings from the web interface: save, then start / stop / restart
+    apply(settings) {
+        res = gateway_settings_save(settings);
+
+        if(!res.ok)
+            return res;
+
+        cur = res.settings;
+        ensure_thread();
+
+        // a running gateway is restarted: token, name or model may have changed
+        if(proc) {
+            wanted = false;
+            kill();
+        }
+
+        backoff = GATEWAY_RESTART_MIN_MS;
+        wanted = (cur.enabled && cur.bot_token) ? true : false;
+
+        if(cur.enabled && !cur.bot_token)
+            note("enabled, but no bot token is set");
+
+        return [ok = true, settings = cur];
+    }
+
+    status() {
+        lines = [];
+
+        for(l : log)
+            lines.push_back(l);
+
+        return [
+            running = json.bool(alive() ? true : false),
+            wanted = json.bool(wanted ? true : false),
+            pid = alive() ? proc.pid() : 0,
+            started = alive() ? started : 0,
+            restarts = restarts,
+            last_exit = last_exit,
+            log = lines,
+        ];
+    }
+
+    stop() {
+        wanted = false;
+        running = false;
+
+        if(thread) {
+            try {
+                thread.join();
+            } catch(e) {}
+            thread = None;
+        }
+
+        kill();
+        return true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  API: GET / PUT /api/gateway (Settings › Telegram gateway of the web interface)
+//
+//  host.gateway is the GatewayRunner of the node (None: the node was started with
+//  --no-gateway or is a stub; the settings can still be read and saved).
+// ─────────────────────────────────────────────────────────────────────────────
+
+gateway_runner_of(host) {
+    try {
+        g = host["gateway"];
+
+        if(!std.is_none(g))
+            return g;
+    } catch(e) {}
+
+    return None;
+}
+
+gateway_api_state(host) {
+    run = gateway_runner_of(host);
+    status = [running = json.bool(false), wanted = json.bool(false), pid = 0, started = 0, restarts = 0, last_exit = "", log = []];
+
+    if(run) {
+        try {
+            status = run.status();
+        } catch(e) {}
+    }
+
+    return [
+        settings = gateway_settings_public(gateway_settings_load()),
+        status = status,
+        managed = json.bool(run ? true : false),
+    ];
+}
+
+gateway_api_register(server, host, api_token = "") {
+    api_token = std.string(api_token ?? "");
+
+    server.route("GET", "^/api/gateway$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        return node_api_ok(gateway_api_state(host));
+    });
+
+    // {enabled?, bot_token?, config?, name?}: only what is sent changes; an empty
+    // bot_token keeps the stored one, clear_token = true removes it
+    server.route("PUT", "^/api/gateway$", [host, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        body = node_api_body(req);
+
+        if(std.is_none(body))
+            return node_api_err("Invalid request body");
+
+        cur = gateway_settings_load();
+
+        if(body.has("enabled")) {
+            v = std.string(body.enabled).lowercase();
+            cur.enabled = (v == "1" || v == "true" || v == "yes");
+        }
+
+        tok = node_api_get(body, "bot_token").strip();
+
+        if(tok)
+            cur.bot_token = tok;
+
+        if(body.has("clear_token")) {
+            v = std.string(body.clear_token).lowercase();
+
+            if(v == "1" || v == "true" || v == "yes")
+                cur.bot_token = "";
+        }
+
+        if(body.has("config"))
+            cur.config = node_api_get(body, "config").strip();
+
+        if(body.has("name") && node_api_get(body, "name").strip())
+            cur.name = node_api_get(body, "name").strip();
+
+        if(cur.enabled && !cur.bot_token)
+            return node_api_err("A bot token is needed to enable the gateway (create a bot with @BotFather).");
+
+        run = gateway_runner_of(host);
+        res = None;
+
+        if(run)
+            res = run.apply(cur);
+        else
+            res = gateway_settings_save(cur);
+
+        if(!res.ok)
+            return node_api_err(res.error, 500);
+
+        return node_api_ok(gateway_api_state(host));
+    });
+}

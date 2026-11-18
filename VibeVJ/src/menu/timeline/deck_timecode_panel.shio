@@ -1,0 +1,648 @@
+//Timecode from the decks and TCNet: the settings, the status and the track offsets of prolink.timecode_out()
+//(modules/shzmodule_prolink, tempo/timecode_out.h), as a panel that VibeVJ shows in the TC popup of the timeline
+//(timecode.shio) and the DJ Watch program in its tab "Timecode" (_standalones/djwatch_standalone). Both load this file at
+//run time with std.module().load_file: with a prolink module built before timecode_out existed it does not compile, then
+//only this panel is missing.
+//The sender runs on a thread of the module and reads the decks of a prolink device (follow); the panel sets it up:
+//- the timecode: the offset of the track that plays (the list below: title + artist + duration; "Unlisted" for the
+//  others) + the position of the deck + the latency offset. The deck: on-air follow (the deck stays until it was quiet
+//  2 s, then the loudest deck that plays on air), the tempo master, or a fixed deck. Paused: the frame holds (Hold)
+//- out as Art-Net timecode (UDP 6454), LTC (an audio output) and MTC (a MIDI output: the MIDI sender of nanogui,
+//  mididevice.send_sync, told every frame what the sender says, as the MTC of the timeline in timecode.shio)
+//- TCNet: VibeVJ / DJ Watch as the master node, decks 1..n as layers 1..n (Resolume, ChamSys MagicQ, grandMA3)
+import nanogui;
+import prolink;
+
+DTC_SOURCE_NAMES = ["On air (follow)", "Tempo master", "Deck 1", "Deck 2", "Deck 3", "Deck 4", "Deck 5", "Deck 6"]; //index-based
+DTC_RATES = ["24", "25", "29.97df", "30"];
+DTC_LAYERS = ["1 layer", "2 layers", "3 layers", "4 layers", "5 layers", "6 layers", "7 layers", "8 layers"]; //index-based
+
+//The settings of a new project: everything off
+dtc_defaults() {
+	return [source = "onair", deck = 1, rate = "25", latency_ms = 0, hold = 1,
+		artnet = [on = 0, ip = "255.255.255.255", port = 6454],
+		ltc = [on = 0, device = "", level_db = -6],
+		mtc = [on = 0, device = ""],
+		tcnet = [on = 0, iface = "", name = "SHIZO", layers = 4, timecode = 0]];
+}
+
+dtc_index(list, v) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == v)
+			return i;
+	}
+	return -1;
+}
+
+//Seconds as "5:03"
+dtc_duration(s) {
+	t = std.int(math.round(s));
+	if(t <= 0)
+		return "";
+	m = std.int(math.floor(t / 60.0));
+	r = t - m * 60;
+	return std.string(m) + ":" + (r < 10 ? "0" : "") + std.string(r);
+}
+
+class deck_timecode_panel
+{
+	out = None;            //prolink.timecode_out()
+	cfg = None;            //the settings (dtc_defaults)
+	app = "VibeVJ";        //the device name of the TCNet node
+	on_change = None;      //fn() after the user changed a setting or an offset (DJ Watch saves then)
+	device = None;         //the prolink device followed
+	ticks = 0;
+	last_status = None;
+	mtc_dev = None;
+	mtc_dev_name = "";     //the MIDI output mtc_dev is
+	mtc_sent = None;
+	mtc_outputs = [];
+	ltc_names = [];
+	rows = [];             //the rows of the track list: [label, box, shown (the offset text shown)]
+	rows_key = "";
+	width = 320;
+	parent = None;
+	tcnet_parent = None;
+	managed tc_label = None;
+	managed info_label = None;
+	managed source_box = None;
+	managed rate_box = None;
+	managed hold_btn = None;
+	managed latency_box = None;
+	managed artnet_btn = None;
+	managed artnet_ip = None;
+	managed artnet_port = None;
+	managed artnet_label = None;
+	managed mtc_btn = None;
+	managed mtc_box = None;
+	managed mtc_label = None;
+	managed ltc_btn = None;
+	managed ltc_box = None;
+	managed ltc_level = None;
+	managed ltc_label = None;
+	managed unlisted_box = None;
+	managed list = None;
+	managed list_box = None;
+	managed import_path = None;
+	managed import_list = None;
+	managed import_label = None;
+	managed tcnet_btn = None;
+	managed layers_box = None;
+	managed tcnet_tc_btn = None;
+	managed tcnet_name = None;
+	managed tcnet_iface = None;
+	managed tcnet_label = None;
+
+	//Builds the timecode part into `area` and the TCNet part into `tcnet_area` (None: also into `area`), both widgets
+	//with a vertical layout, `w` wide. `app_name`: how the TCNet node calls itself ("VibeVJ", "DJ Watch")
+	__init__(area, tcnet_area, w, app_name) {
+		parent = area;
+		tcnet_parent = tcnet_area ?? area;
+		width = w;
+		app = app_name;
+		out = prolink.timecode_out();
+		cfg = dtc_defaults();
+
+		//The timecode now
+		tc_label = area.label("--:--:--:--").font_size(26).fixed_width(width).fixed_height(32)
+			.tooltip("The timecode that goes out now: the offset of the track + the position of the deck + the latency");
+		info_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		source_box = row.combobox().fixed_width(width - 172).items(DTC_SOURCE_NAMES)
+			.tooltip("The deck that gives the timecode. On air (follow): the deck stays while it plays on air; 2 s after it went quiet the loudest deck that plays on air takes over (without a mixer: playing is enough). Tempo master: the master deck. Deck n: that deck");
+		source_box.on_change([this](index, text){
+			if(index == 0)
+				this.set_fields([source = "onair"]);
+			else if(index == 1)
+				this.set_fields([source = "master"]);
+			else if(index >= 2)
+				this.set_fields([source = "deck", deck = index - 1]);
+		});
+		rate_box = row.combobox().fixed_width(100).items(DTC_RATES).tooltip("The frame rate of the timecode (Art-Net, LTC, MTC, TCNet). 29.97df: drop frame");
+		rate_box.on_change([this](index, text){
+			if(index >= 0 && index < DTC_RATES.size())
+				this.set_fields([rate = DTC_RATES[index]]);
+		});
+		hold_btn = row.pushbutton("Hold").fixed_width(72)
+			.tooltip("A paused deck: its frame goes on being sent (Art-Net, LTC; desks see a timecode that stands). Off: nothing while it pauses. Without a position (no deck, a deck that loads) nothing is sent either way, never 00:00:00:00");
+		hold_btn.on_change([this](v){
+			this.set_fields([hold = v ? 1 : 0]);
+		});
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		row.label("Latency (ms)").font_size(13).fixed_width(100);
+		latency_box = row.textbox("0").editable(true).alignment("left").fixed_width(70)
+			.tooltip("Shifts the timecode: + sends it earlier (the light or the video comes late), - later. -2000 to 2000 ms");
+		latency_box.on_change([this](text){
+			this.set_fields([latency_ms = math.clamp(std.float(std.string(text).trim()), -2000.0, 2000.0)]);
+		});
+
+		//Art-Net
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		artnet_btn = row.pushbutton("Art-Net").fixed_width(80).tooltip("Art-Net timecode (OpTimeCode, UDP) to a lighting desk or media server");
+		artnet_btn.on_change([this](v){
+			this.set_part("artnet", [on = v ? 1 : 0]);
+		});
+		artnet_ip = row.textbox("").editable(true).alignment("left").fixed_width(width - 150).placeholder("IP address")
+			.tooltip("The desk (its IPv4 address) or a broadcast: 2.255.255.255 for the 2.x Art-Net network, 255.255.255.255 for every card. Enter to take it");
+		artnet_ip.on_change([this](text){
+			this.set_part("artnet", [ip = std.string(text).trim()]);
+		});
+		artnet_port = row.textbox("").editable(true).alignment("left").fixed_width(70).placeholder("Port").tooltip("Art-Net: 6454");
+		artnet_port.on_change([this](text){
+			v = std.int(std.string(text).trim());
+			if(v > 0 && v < 65536)
+				this.set_part("artnet", [port = v]);
+			else
+				this.show_settings();
+		});
+		artnet_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+
+		//MTC: the MIDI sender of nanogui
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		mtc_btn = row.pushbutton("MTC").fixed_width(80).tooltip("MIDI Time Code to a MIDI output: quarter frames while the deck plays, a full frame where it jumps or stands");
+		mtc_btn.on_change([this](v){
+			this.set_part("mtc", [on = v ? 1 : 0]);
+		});
+		mtc_box = row.combobox().fixed_width(width - 80).tooltip("The MIDI output of the MTC (not the one the timeline sends its own MIDI clock / MTC to)");
+		mtc_box.on_open([this](){
+			this.fill_mtc_outputs();
+		});
+		mtc_box.on_change([this](index, text){
+			if(index >= 0 && index < this.mtc_outputs.size())
+				this.set_part("mtc", [device = this.mtc_outputs[index]]);
+		});
+		mtc_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+
+		//LTC: an audio output
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		ltc_btn = row.pushbutton("LTC").fixed_width(80).tooltip("LTC, timecode as sound, on an audio output (all its channels): to a desk's LTC input, or through a virtual cable (VB-CABLE, BlackHole) to Resolume");
+		ltc_btn.on_change([this](v){
+			this.set_part("ltc", [on = v ? 1 : 0]);
+		});
+		ltc_box = row.combobox().fixed_width(width - 150).tooltip("The audio output of the LTC");
+		ltc_box.on_open([this](){
+			this.fill_ltc_outputs();
+		});
+		ltc_box.on_change([this](index, text){
+			if(index >= 0 && index < this.ltc_names.size())
+				this.set_part("ltc", [device = this.ltc_names[index]]);
+		});
+		ltc_level = row.textbox("").editable(true).alignment("left").fixed_width(70).placeholder("dB")
+			.tooltip("The level of the LTC in dB (-60 to 0, default -6)");
+		ltc_level.on_change([this](text){
+			this.set_part("ltc", [level_db = math.clamp(std.float(std.string(text).trim()), -60.0, 0.0)]);
+		});
+		ltc_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+
+		//Track offsets
+		area.label("Track offsets: the timecode where each track starts").font_size(13).fixed_width(width).fixed_height(22);
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		row.label("Unlisted").font_size(13).fixed_width(64);
+		unlisted_box = row.textbox("23:00:00:00").editable(true).alignment("left").fixed_width(100)
+			.tooltip("The offset of tracks that are not in the list or have no offset of their own");
+		unlisted_box.on_change([this](text){
+			if(!this.out.set_unlisted(std.string(text).trim()))
+				this.refresh_tracks(true);
+			this.changed();
+		});
+		fill_btn = row.button("Auto-fill").fixed_width(math.max(70, (width - 164) / 2))
+			.tooltip("Every track of the list gets an offset one hour apart in list order: 01:00:00:00, 02:00:00:00 ... (more than 22 tracks: a shorter step)");
+		fill_btn.on_click([this](){
+			this.out.auto_fill();
+			this.refresh_tracks(true);
+			this.changed();
+		});
+		clear_btn = row.button("Clear").fixed_width(math.max(60, (width - 164) / 2))
+			.tooltip("Empty the list (tracks come back when they are loaded on a deck)");
+		clear_btn.on_click([this](){
+			this.out.clear_tracks(true);
+			this.refresh_tracks(true);
+			this.changed();
+		});
+		list = area.vscroll().fixed_width(width).fixed_height(120);
+		list_box = list.content().layout(nanogui.layout_vertical());
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		import_path = row.textbox("").editable(true).alignment("left").fixed_width(width - 170).placeholder("rekordbox playlist (.txt / .xml)")
+			.tooltip("The path of a rekordbox playlist: a txt export (Export a playlist to a file) or rekordbox.xml (File > Export Collection in xml format). Its tracks come into the list in its order, known ones keep their offset");
+		import_list = row.textbox("").editable(true).alignment("left").fixed_width(90).placeholder("Playlist")
+			.tooltip("rekordbox.xml: the name of the playlist (empty: the first)");
+		import_btn = row.button("Import").fixed_width(80).tooltip("Add the tracks of the playlist to the list");
+		import_btn.on_click([this](){
+			this.import_playlist(this.import_path.value(), this.import_list.value());
+		});
+		import_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+
+		//TCNet
+		t = tcnet_parent;
+		row = t.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		tcnet_btn = row.pushbutton("TCNet").fixed_width(80)
+			.tooltip(app + " as the TCNet master node (the role of ShowKontrol / the PRO DJ LINK Bridge): the decks as layers with position, play state, tempo, beat, on air, track names, beat grid and waveform, for Resolume, ChamSys MagicQ, grandMA3. UDP 60000-60001 and 65023: not with another TCNet master on this computer");
+		tcnet_btn.on_change([this](v){
+			this.set_part("tcnet", [on = v ? 1 : 0]);
+		});
+		layers_box = row.combobox().fixed_width(width - 190).items(DTC_LAYERS)
+			.tooltip("Decks 1..n as layers 1..n (MagicQ shows 4; layers 5-8 are named A, B, M, C in some receivers)");
+		layers_box.on_change([this](index, text){
+			if(index >= 0)
+				this.set_part("tcnet", [layers = index + 1]);
+		});
+		tcnet_tc_btn = row.pushbutton("Offsets").fixed_width(110)
+			.tooltip("The SMPTE time of the layers with the track offsets (the timecode above, per deck). Off: the position in the track, as the Bridge sends it");
+		tcnet_tc_btn.on_change([this](v){
+			this.set_part("tcnet", [timecode = v ? 1 : 0]);
+		});
+		row = t.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		tcnet_name = row.textbox("").editable(true).alignment("left").fixed_width(100).placeholder("Node name")
+			.tooltip("The name of this node in TCNet, 8 characters at most");
+		tcnet_name.on_change([this](text){
+			this.set_part("tcnet", [name = std.string(text).trim()]);
+		});
+		tcnet_iface = row.textbox("").editable(true).alignment("left").fixed_width(width - 100).placeholder("Network card (empty = all)")
+			.tooltip("The network card of the receivers: its name (Windows: \"Ethernet 2\", Linux: eth1, macOS: en7) or its address. Empty: every card (255.255.255.255)");
+		tcnet_iface.on_change([this](text){
+			this.set_part("tcnet", [iface = std.string(text).trim()]);
+		});
+		tcnet_label = t.label("").font_size(13).fixed_width(width).fixed_height(20);
+
+		apply();
+		show_settings();
+		refresh_tracks(true);
+	}
+
+	// =========================================================================
+	// Settings
+	// =========================================================================
+
+	//What timecode_out.configure() gets: the settings without the MTC (the script sends that) and with the app name
+	apply() {
+		c = std.json();
+		for(k, v : cfg) {
+			if(k != "mtc")
+				c[k] = v;
+		}
+		c.tcnet.device = app;
+		out.configure(c);
+	}
+
+	changed() {
+		if(on_change)
+			on_change();
+	}
+
+	//Top-level settings: [source, deck, rate, latency_ms, hold]
+	set_fields(fields) {
+		for(k, v : fields)
+			cfg[k] = v;
+		apply();
+		show_settings();
+		refresh_tracks(true); //offsets as text in the new rate
+		changed();
+	}
+
+	//The settings of a part: artnet, ltc, mtc, tcnet
+	set_part(name, fields) {
+		if(!cfg.has(name))
+			return false;
+		p = cfg[name];
+		for(k, v : fields) {
+			if(k == "on" || k == "port" || k == "layers" || k == "timecode")
+				p[k] = std.int(v);
+			else if(k == "level_db")
+				p[k] = std.float(v);
+			else
+				p[k] = std.string(v);
+		}
+		if(name == "mtc")
+			stop_mtc_if_off();
+		else
+			apply();
+		show_settings();
+		changed();
+		return true;
+	}
+
+	//The settings and the track list (without what only holds while it runs: seen, current)
+	save_state() {
+		t = out.tracks();
+		entries = [];
+		for(e : t.entries)
+			entries.push_back([title = e.title, artist = e.artist, duration = e.duration, has_offset = e.has_offset, offset_s = e.offset_s,
+				offset = e.offset, imported = e.imported]);
+		return [settings = cfg, tracks = [unlisted = t.unlisted, unlisted_s = t.unlisted_s, entries = entries]];
+	}
+
+	//Saved settings over the defaults (a key it does not know stays out)
+	load_state(st) {
+		cfg = dtc_defaults();
+		if(st && st.has("settings") && std.is_json(st.settings)) {
+			for(k, v : st.settings) {
+				if(!cfg.has(k))
+					continue;
+				if(std.is_json(cfg[k]) && std.is_json(v)) {
+					part = cfg[k];
+					for(k2, v2 : v)
+						part[k2] = v2;
+				}
+				else if(!std.is_json(cfg[k]))
+					cfg[k] = v;
+			}
+		}
+		if(st && st.has("tracks") && st.tracks)
+			out.set_tracks(st.tracks);
+		else
+			out.set_tracks([entries = []]);
+		stop_mtc_if_off();
+		apply();
+		show_settings();
+		refresh_tracks(true);
+	}
+
+	any_on() {
+		return cfg.artnet.on || cfg.ltc.on || cfg.mtc.on || cfg.tcnet.on;
+	}
+
+	//"Art-Net · TCNet": what is on
+	summary() {
+		text = "";
+		for(name : ["artnet", "ltc", "mtc", "tcnet"]) {
+			if(cfg[name].on)
+				text += (text == "" ? "" : " · ") + [artnet = "Art-Net", ltc = "LTC", mtc = "MTC", tcnet = "TCNet"][name];
+		}
+		return text;
+	}
+
+	//The decks of this prolink device give the timecode (None: nothing goes out)
+	follow(dev) {
+		device = dev;
+		out.follow(dev);
+	}
+
+	status() {
+		return out.status();
+	}
+
+	tracks() {
+		return out.tracks();
+	}
+
+	//An offset of the list by index; "" = none (the unlisted one). False for a wrong index or text
+	set_offset(index, text) {
+		ok = out.set_track_offset(std.int(index), std.string(text).trim());
+		refresh_tracks(true);
+		if(ok)
+			changed();
+		return ok;
+	}
+
+	import_playlist(path, playlist) {
+		r = out.import_playlist(std.string(path).trim(), std.string(playlist ?? "").trim());
+		import_label.caption(r.ok ? std.string(r.tracks) + " tracks in the playlist, " + std.string(r.added) + " new in the list" : r.error);
+		refresh_tracks(true);
+		if(r.ok)
+			changed();
+		return r;
+	}
+
+	// =========================================================================
+	// MTC (the MIDI sender of nanogui)
+	// =========================================================================
+
+	fill_mtc_outputs() {
+		names = ["Off: no MIDI output"];
+		mtc_outputs = [""];
+		n = nanogui.midi_device_count();
+		for(i = 0; i < n; i++) {
+			name = nanogui.midi_device_name(i);
+			if(dtc_index(mtc_outputs, name) < 0) {
+				names.push_back(name);
+				mtc_outputs.push_back(name);
+			}
+		}
+		if(cfg.mtc.device != "" && dtc_index(mtc_outputs, cfg.mtc.device) < 0) {
+			names.push_back(cfg.mtc.device + " (not connected)");
+			mtc_outputs.push_back(cfg.mtc.device);
+		}
+		mtc_box.items(names);
+		mtc_box.selected(math.max(0, dtc_index(mtc_outputs, cfg.mtc.device)));
+	}
+
+	//MTC off or another device: the device before stops
+	stop_mtc_if_off() {
+		if(mtc_dev && (!cfg.mtc.on || cfg.mtc.device == "" || mtc_dev_name != cfg.mtc.device)) {
+			mtc_dev.send_sync([mtc = 0, playing = 0]);
+			mtc_dev = None;
+		}
+		mtc_sent = None;
+	}
+
+	//Every frame: the timecode to the MIDI sender (it runs on between the updates on a thread of its own)
+	send_mtc(st) {
+		if(!cfg.mtc.on || cfg.mtc.device == "")
+			return None;
+		if(!mtc_dev || ticks % 60 == 0) {
+			mtc_dev = nanogui.midi_device(cfg.mtc.device);
+			mtc_dev_name = cfg.mtc.device;
+			if(!mtc_dev)
+				return None;
+		}
+		if(!st || !st.valid) {
+			if(!mtc_sent || mtc_sent.playing)
+				mtc_sent = mtc_dev.send_sync([mtc = 1, playing = 0]);
+			return None;
+		}
+		mtc_sent = mtc_dev.send_sync([mtc = 1, rate = st.rate, playing = st.running ? 1 : 0, time = st.time]);
+	}
+
+	fill_ltc_outputs() {
+		names = ["Default output"];
+		ltc_names = [""];
+		for(name : out.ltc_devices()) {
+			if(dtc_index(ltc_names, name) < 0) {
+				names.push_back(name);
+				ltc_names.push_back(name);
+			}
+		}
+		if(cfg.ltc.device != "" && dtc_index(ltc_names, cfg.ltc.device) < 0) {
+			names.push_back(cfg.ltc.device + " (not connected)");
+			ltc_names.push_back(cfg.ltc.device);
+		}
+		ltc_box.items(names);
+		ltc_box.selected(math.max(0, dtc_index(ltc_names, cfg.ltc.device)));
+	}
+
+	// =========================================================================
+	// Showing
+	// =========================================================================
+
+	show_settings() {
+		src = cfg.source == "master" ? 1 : (cfg.source == "deck" ? 1 + math.clamp(std.int(cfg.deck), 1, 6) : 0);
+		if(source_box.selected() != src)
+			source_box.selected(src);
+		r = math.max(0, dtc_index(DTC_RATES, cfg.rate));
+		if(rate_box.selected() != r)
+			rate_box.selected(r);
+		set_pushed(hold_btn, cfg.hold);
+		set_text(latency_box, std.string(std.int(math.round(std.float(cfg.latency_ms)))));
+		set_pushed(artnet_btn, cfg.artnet.on);
+		set_text(artnet_ip, cfg.artnet.ip);
+		set_text(artnet_port, std.string(cfg.artnet.port));
+		set_pushed(mtc_btn, cfg.mtc.on);
+		if(mtc_box.items().size() == 0 || (mtc_outputs.size() > 0 && mtc_outputs[math.max(0, mtc_box.selected())] != cfg.mtc.device))
+			mtc_box.items([cfg.mtc.device == "" ? "Off: no MIDI output" : cfg.mtc.device]).selected(0);
+		set_pushed(ltc_btn, cfg.ltc.on);
+		if(ltc_box.items().size() == 0 || (ltc_names.size() > 0 && ltc_names[math.max(0, ltc_box.selected())] != cfg.ltc.device))
+			ltc_box.items([cfg.ltc.device == "" ? "Default output" : cfg.ltc.device]).selected(0);
+		set_text(ltc_level, std.string(std.int(math.round(std.float(cfg.ltc.level_db)))));
+		set_pushed(tcnet_btn, cfg.tcnet.on);
+		l = math.clamp(std.int(cfg.tcnet.layers), 1, 8) - 1;
+		if(layers_box.selected() != l)
+			layers_box.selected(l);
+		set_pushed(tcnet_tc_btn, cfg.tcnet.timecode);
+		set_text(tcnet_name, cfg.tcnet.name);
+		set_text(tcnet_iface, cfg.tcnet.iface);
+		if(ltc_names.size() == 0)
+			ltc_names = [cfg.ltc.device];
+		if(mtc_outputs.size() == 0)
+			mtc_outputs = [cfg.mtc.device];
+	}
+
+	set_pushed(b, v) {
+		if(b.pushed() != (v ? true : false))
+			b.pushed(v ? true : false);
+	}
+
+	set_text(box, text) {
+		if(box.value() != text)
+			box.value(text);
+	}
+
+	//The rows of the track list: again when the tracks changed (count, names), else only the offsets and the marker
+	refresh_tracks(force) {
+		t = out.tracks();
+		set_text(unlisted_box, t.unlisted);
+		key = std.string(t.entries.size());
+		for(e : t.entries)
+			key += "|" + e.title + "/" + e.artist + "/" + std.string(std.int(e.duration));
+		if(force || key != rows_key) {
+			if(key != rows_key) {
+				list_box.clear_children();
+				rows = [];
+				for(i = 0; i < t.entries.size(); i++)
+					make_row(i);
+				rows_key = key;
+			}
+		}
+		for(i = 0; i < t.entries.size() && i < rows.size(); i++) {
+			e = t.entries[i];
+			r = rows[i];
+			name = (i == t.current ? "▶ " : "") + e.title + (e.artist != "" ? " — " + e.artist : "") + (e.duration > 0 ? "  " + dtc_duration(e.duration) : "");
+			if(r.label.caption() != name) {
+				r.label.caption(name);
+				r.label.tooltip(name + (e.seen ? "\nLoaded on a deck" : "") + (e.imported ? "\nFrom a playlist" : ""));
+			}
+			//An offset changed elsewhere (auto-fill, MCP, another rate) comes into the box; typing is left alone
+			if(force || r.shown != e.offset) {
+				r.shown = e.offset;
+				set_text(r.box, e.offset);
+			}
+		}
+	}
+
+	make_row(i) {
+		//A fixed width: in the vertical layout of the list a row with anchors only was 0 wide and took no clicks
+		row = list_box.widget().fixed_width(width - 14).fixed_height(26).layout(nanogui.layout_horizontal());
+		lbl = row.label("").font_size(13).fixed_width(width - 150);
+		box = row.textbox("").editable(true).alignment("left").fixed_width(100).placeholder("unlisted")
+			.tooltip("The timecode where this track starts (hh:mm:ss:ff). Empty: the unlisted offset");
+		del = row.button("").icon(nanogui.icon("trash_alt")).danger("hover").fixed_width(26).tooltip("Remove the track from the list");
+		index = i;
+		box.on_change([this, index](text){
+			if(!this.set_offset(index, text))
+				this.refresh_tracks(true);
+		});
+		del.on_click([this, index](){
+			this.out.remove_track(index);
+			this.refresh_tracks(true);
+			this.changed();
+		});
+		rows.push_back([label = lbl, box = box, shown = ""]);
+		list_box.fixed_height(math.max(1, rows.size()) * 28);
+	}
+
+	//Fields shown or hidden, rows added: the widgets around take the new height
+	relayout() {
+		w = list_box;
+		for(i = 0; i < 5 && w; i++) {
+			w.refresh_layout();
+			try {
+				w = w.parent();
+			}
+			catch(e) {
+				w = None;
+			}
+		}
+	}
+
+	//Every frame: MTC; the status and the list a few times a second while it shows
+	tick() {
+		ticks++;
+		st = None;
+		if(cfg.mtc.on)
+			st = out.status();
+		send_mtc(st);
+		if(ticks % 6 != 0)
+			return None;
+		visible = parent.visible() || tcnet_parent.visible();
+		if(!visible && ticks % 60 != 0)
+			return None;
+		show_status(st ?? out.status());
+		if(ticks % 30 == 0) {
+			before = rows.size();
+			refresh_tracks(false);
+			if(rows.size() != before)
+				relayout();
+		}
+	}
+
+	show_status(st) {
+		last_status = st;
+		if(!st)
+			return None;
+		set_caption(tc_label, st.valid ? st.text : "--:--:--:--");
+		info = "";
+		if(!st.following)
+			info = "No DJ connection (a Prolink generator, DJ Watch or the network card)";
+		else if(!st.valid)
+			info = cfg.source == "deck" ? "Deck " + std.string(cfg.deck) + " has no position yet" : "No deck plays";
+		else
+			info = "Deck " + std.string(st.deck) + (st.title != "" ? " · " + st.title : "") + " · " + (st.listed ? "offset " : "unlisted ") + st.offset
+				+ (st.held ? " · held" : (st.running ? "" : " · paused"));
+		set_caption(info_label, info);
+		info_label.tooltip(info);
+		set_caption(artnet_label, st.artnet.text);
+		set_caption(ltc_label, st.ltc.text);
+		set_caption(tcnet_label, st.tcnet.text);
+		tcnet_label.tooltip(st.tcnet.text);
+		mtc = "Off";
+		if(cfg.mtc.on) {
+			if(cfg.mtc.device == "")
+				mtc = "Choose a MIDI output";
+			else if(!mtc_dev)
+				mtc = cfg.mtc.device + " is not connected";
+			else
+				mtc = (st.valid ? (st.running ? "Sends " : "Holds ") + st.text : "Stopped (no timecode)") + " to " + cfg.mtc.device
+					+ (mtc_sent && mtc_sent.has("quarter_frames") ? " · " + std.string(mtc_sent.quarter_frames) + " quarter frames" : "");
+		}
+		set_caption(mtc_label, mtc);
+	}
+
+	set_caption(l, text) {
+		if(l.caption() != text)
+			l.caption(text);
+	}
+
+	//For AI agents: the settings, what goes out, the track list
+	state_json() {
+		return [ok = true, available = true, settings = cfg, status = out.status(), tracks = out.tracks()];
+	}
+}

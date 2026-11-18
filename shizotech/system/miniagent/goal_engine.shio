@@ -146,8 +146,14 @@ goal_text_revision(text) {
 	h = 1469598103;
 	for(c : std.string(text)) {
 		code = GOAL_HASH_ALPHABET.find(c);
-		if(code < 0)
+		if(code < 0) {
+			// Not printable ASCII: mix in its bytes (as Base64 text). With the byte
+			// length alone "ö" and "ü", or any two CJK characters, were the same:
+			// an edit of such text did not change the revision.
+			for(b : std.base64_encode(c))
+				h = gt_mod((h ^ (300 + GOAL_HASH_ALPHABET.find(b))) * 16777619 + 7, 2821109907456);
 			code = 200 + c.length();
+		}
 		h = gt_mod((h ^ code) * 16777619 + 7, 2821109907456);
 	}
 
@@ -1273,6 +1279,24 @@ goal_run_open(r) {
 	return st == "dispatching" || st == "running" || st == "checkpoint";
 }
 
+// A window that was blocked (question) or failed (no attempts left) while another
+// run of it still works (max_parallel_workers > 1): that run must still be settled,
+// stopped at the window end and counted as background work.
+goal_activation_has_open_run(a) {
+	for(r : gj(a, "runs", [])) {
+		if(goal_run_open(r))
+			return true;
+	}
+	return false;
+}
+
+// How far activate_due() looks back for windows that started unseen.
+goal_lookback_seconds(def) {
+	if(std.is_none(def.schedule.interval_seconds))
+		return 8 * GT_DAY;
+	return def.schedule.interval_seconds * 2;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GoalLedger — the runtime state (one json, written atomically)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1364,15 +1388,20 @@ class GoalLedger {
 		return data.activations[akey];
 	}
 
-	// drop the oldest closed activations
-	trim() {
+	// drop the oldest closed activations. keep_fn(a) -> true protects an activation
+	// the scheduler still looks back at: without its record the window would read
+	// as never activated (reported as missed, or run again with misfire: catch_up).
+	trim(keep_fn = None) {
 		if(data.activations.size() <= GOAL_ACTIVATIONS_KEPT)
 			return;
 
 		closed = [];
 		for(k, a : data.activations) {
-			if(goal_activation_closed(a))
-				closed.push_back([akey = k, t = gj(a, "created", 0)]);
+			if(!goal_activation_closed(a))
+				continue;
+			if(keep_fn && keep_fn(a))
+				continue;
+			closed.push_back([akey = k, t = gj(a, "created", 0)]);
 		}
 		closed = goal_sort(closed, "t");
 
@@ -1396,6 +1425,7 @@ class GoalScheduler {
 	defs = [];				// id -> applied (valid) definition
 	running = false;
 	tick_ms = GOAL_TICK_MS;
+	wake_now = false;			// a run was requested in this process: do not sleep out the tick
 	thread = None;
 	notify_enabled = true;
 	last_scan = 0;
@@ -1503,6 +1533,9 @@ class GoalScheduler {
 
 	loop() {
 		for(running) {
+			// cleared BEFORE the tick: a request that arrives while it runs is not lost
+			wake_now = false;
+
 			try {
 				tick();
 			}
@@ -1511,7 +1544,7 @@ class GoalScheduler {
 			}
 
 			slept = 0;
-			for(running && slept < tick_ms) {
+			for(running && !wake_now && slept < tick_ms) {
 				std.sleep(250);
 				slept += 250;
 			}
@@ -1541,6 +1574,17 @@ class GoalScheduler {
 		notify(msg);
 	}
 
+	// is `taskid` an open run of one of this scheduler's goals? (call with GOAL_LOCK held)
+	owns_open_run(taskid) {
+		for(akey, a : ledger.data.activations) {
+			for(r : a.runs) {
+				if(goal_run_open(r) && gj_str(r, "taskid", "") == taskid)
+					return true;
+			}
+		}
+		return false;
+	}
+
 	on_host_task_finished(task) {
 		cs = std.critical_section_named(GOAL_LOCK);
 		tid = gj_str(task, "taskid", "");
@@ -1555,6 +1599,14 @@ class GoalScheduler {
 				error = gj_str(task, "error", ""),
 				last_update_ms = std.int(gj(task, "last_update_ms", 0)),
 			];
+
+			// a run of ours ended: settle it now, not at the next tick (the goal showed
+			// as running for up to a tick after its session had finished)
+			try {
+				if(owns_open_run(tid))
+					wake_now = true;
+			}
+			catch(e) {}
 		}
 		cs.release();
 	}
@@ -1570,6 +1622,13 @@ class GoalScheduler {
 			seen.push_back(f.id);
 			g = ledger.goal(f.id);
 			r = space.load(f, prefs);
+
+			// The folder was moved (pause / resume / delete) after it was listed: it
+			// is not an invalid edit, and its listed status is out of date - applying
+			// it would undo the status change another rescan() already applied. The
+			// next scan sees the goal where it is now.
+			if(!r.ok && !fileio.is_directory(f.dir))
+				continue;
 
 			if(r.ok) {
 				prev_rev = gj_str(g, "revision", "");
@@ -1603,6 +1662,17 @@ class GoalScheduler {
 						g.active_since = t_now;
 				}
 
+				// The schedule the windows are computed from. The named window and the
+				// default time zone come from the preferences, so this is the validated
+				// schedule, not the text of goal.md. When it changes, the past windows
+				// of the new schedule never existed (activate_due: schedule_since).
+				sig = r.def.schedule.compact_string();
+				if(gj_str(g, "schedule_sig", "") != sig) {
+					if(gj_str(g, "schedule_sig", ""))
+						g.schedule_since = t_now;
+					g.schedule_sig = sig;
+				}
+
 				g.invalid_revision = "";
 				g.errors = [];
 				g.warnings = r.warnings;
@@ -1619,6 +1689,21 @@ class GoalScheduler {
 				notify_once("invalid:" + f.id + ":" + r.revision, msg);
 			}
 
+			// After a restart `defs` is empty: the last valid revision is the text the
+			// ledger kept. Without it the goal would stop running without a word.
+			if(!defs.has(f.id) && gj_str(g, "text", "") && !gj(g, "removed", false)) {
+				kept = gfm_read_text(g.text);
+				if(kept.ok && kept.has_front) {
+					kv = goal_validate(kept.data, kept.body, prefs, f.id, gj_str(g, "status", f.status));
+					if(kv.ok) {
+						kv.def.revision = gj_str(g, "revision", "");
+						kv.def.dir = f.dir;
+						kv.def.path = f.path;
+						defs[f.id] = kv.def;
+					}
+				}
+			}
+
 			// a folder move is still a status change, even with a broken file
 			if(defs.has(f.id) && gj_str(g, "status", "") != f.status) {
 				prev_status = gj_str(g, "status", "");
@@ -1632,6 +1717,11 @@ class GoalScheduler {
 		// removed definitions: no new activations, open runs are cancelled
 		for(id, g : ledger.data.goals) {
 			if(goal_list_has(seen, id) || gj(g, "removed", false))
+				continue;
+			// Listed in no folder: look again before its runs are stopped. A goal that
+			// moved between two status folders while they were listed (a resume), or
+			// one that was created after the listing, is not removed.
+			if(space.find(id))
 				continue;
 			g.removed = true;
 			ledger.event("definition_removed", id, "goal folder removed: no new runs, open runs are stopped");
@@ -1655,7 +1745,7 @@ class GoalScheduler {
 			stop_mode = def.policy.stop_policy;
 
 		for(akey, a : ledger.data.activations) {
-			if(gj_str(a, "goal", "") != id || goal_activation_closed(a))
+			if(gj_str(a, "goal", "") != id || (goal_activation_closed(a) && !goal_activation_has_open_run(a)))
 				continue;
 
 			a.closing = true;
@@ -1742,7 +1832,7 @@ class GoalScheduler {
 		cs.release();
 
 		for(akey, a : ledger.data.activations) {
-			if(goal_activation_closed(a))
+			if(goal_activation_closed(a) && !goal_activation_has_open_run(a))
 				continue;
 
 			for(r : a.runs) {
@@ -1811,6 +1901,8 @@ class GoalScheduler {
 			return false;
 
 		t_now = clock_now();
+		// blocked / failed already (by a parallel run): this run is only settled
+		was_closed = goal_activation_closed(a);
 		r.settled = true;
 		r.terminal_reported = true;
 		r.state = state;
@@ -1832,8 +1924,10 @@ class GoalScheduler {
 		}
 
 		if(state == "question") {
-			a.state = "blocked";
-			a.ended = t_now;
+			if(!was_closed) {
+				a.state = "blocked";
+				a.ended = t_now;
+			}
 			//Not the report again (owner report, double [done] / [notify]): the task's own question event
 			//(task_finished / task_state -> question) carries it to the same chat, notify says what it means
 			notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":question", "Goal " + a.goal + " needs you: its task asked a question (see the task message).");
@@ -1875,6 +1969,9 @@ class GoalScheduler {
 			a.last_report = "VERIFICATION FAILED - fix these gaps:\n" + r.report;
 			notify_once("run:" + a.akey + ":" + std.string(gj(r, "n", 0)) + ":verify_failed", "Goal " + a.goal + ": verification failed, the next run gets the gaps (see the task message).");
 		}
+
+		if(was_closed)
+			return;
 
 		max_attempts = gj(a.policy, "max_attempts", 3);
 
@@ -1928,7 +2025,8 @@ class GoalScheduler {
 		t_now = clock_now();
 
 		for(akey, a : ledger.data.activations) {
-			if(goal_activation_closed(a))
+			closed = goal_activation_closed(a);
+			if(closed && !goal_activation_has_open_run(a))
 				continue;
 
 			def = defs.has(a.goal) ? defs[a.goal] : None;
@@ -1961,7 +2059,7 @@ class GoalScheduler {
 			}
 
 			// close the activation when nothing runs and nothing more may start
-			if(open_runs == 0) {
+			if(open_runs == 0 && !closed) {
 				more = can_start_more(a, def, t_now);
 				if(!more) {
 					if(activation_succeeded(a))
@@ -2024,10 +2122,29 @@ class GoalScheduler {
 		return a;
 	}
 
+	// Is the window of this closed activation still inside the look-back of
+	// activate_due()? Then ledger.trim() must keep its record.
+	activation_in_lookback(a) {
+		if(gj_str(a, "kind", "") == "manual" || !defs.has(gj_str(a, "goal", "")))
+			return false;
+
+		// a catch-up ran later than the window whose key it holds
+		win_end = gj(gj(a, "missed_window", None), "end", gj(a, "end", 0));
+		return win_end > clock_now() - goal_lookback_seconds(defs[a.goal]);
+	}
+
 	record_missed(def, w, why) {
 		a = new_activation(def, w, "missed");
 		a.state = why == "skip" ? "skipped" : "missed";
 		a.ended = clock_now();
+
+		// misfire: catch_up runs the LATEST missed window; the older ones are only
+		// recorded, the catch-up notification covers them
+		if(why == "superseded") {
+			ledger.event("window_missed", def.id, "Goal " + def.id + ": window " + goal_window_text(def, w) + " was missed; the catch-up of a later window covers it", [akey = w.akey]);
+			return a;
+		}
+
 		msg = "Goal " + def.id + ": window " + goal_window_text(def, w) + " was " + (why == "skip" ? "skipped (started late, misfire: skip)" : "missed (the scheduler was not running)");
 		ledger.event("window_" + a.state, def.id, msg, [akey = w.akey]);
 		notify_once("window:" + w.akey + ":" + a.state, msg);
@@ -2042,9 +2159,10 @@ class GoalScheduler {
 				continue;
 
 			g = ledger.goal(id);
-			since = gj(g, "active_since", t_now);
-			lookback_seconds = std.is_none(def.schedule.interval_seconds) ? 8 * GT_DAY : def.schedule.interval_seconds * 2;
-			lookback_from = math.max(since, t_now - lookback_seconds);
+			// windows of a schedule that did not exist yet are not "missed": the goal
+			// became active, or its schedule changed (an edit, the preferences), later
+			since = math.max(gj(g, "active_since", t_now), gj(g, "schedule_since", 0));
+			lookback_from = math.max(since, t_now - goal_lookback_seconds(def));
 
 			windows = goal_windows_between(def, lookback_from, t_now, interval_anchor(def));
 			missed_latest = None;
@@ -2078,6 +2196,10 @@ class GoalScheduler {
 					continue;
 
 				if(def.schedule.misfire == "catch_up") {
+					// only the latest one is caught up: an older one left without a
+					// record would be caught up by the next tick, one run per tick
+					if(missed_latest)
+						record_missed(def, missed_latest, "superseded");
 					missed_latest = w;
 					continue;
 				}
@@ -2178,10 +2300,12 @@ class GoalScheduler {
 		return true;
 	}
 
-	background_running() {
+	// open runs of every goal (goal = "") or of one goal, in every window - also in
+	// one that is blocked / failed while another run of it still works
+	goal_open_runs(goal = "") {
 		n = 0;
 		for(akey, a : ledger.data.activations) {
-			if(goal_activation_closed(a))
+			if(goal && gj_str(a, "goal", "") != goal)
 				continue;
 			for(r : a.runs) {
 				if(goal_run_open(r))
@@ -2191,8 +2315,14 @@ class GoalScheduler {
 		return n;
 	}
 
+	background_running() {
+		return goal_open_runs();
+	}
+
 	// does the node have room for background work right now?
-	capacity_ok(def) {
+	// `a` is the activation that wants to start: a manual one ("run now", a task a
+	// person just made) IS the interactive use, so it does not yield to it
+	capacity_ok(def, a = None) {
 		max_bg = std.int(gj(prefs, "max_background_tasks", 1));
 		if(max_bg > 0 && background_running() >= max_bg && def.priority != "urgent")
 			return [ok = false, why = "max_background_tasks reached"];
@@ -2215,9 +2345,10 @@ class GoalScheduler {
 		if(busy >= workers - reserve)
 			return [ok = false, why = "no free worker (" + busy + "/" + workers + " busy, " + reserve + " reserved for interactive work)"];
 
+		manual = gj_is_map(a) && gj_str(a, "kind", "") == "manual";
 		yield_secs = gt_parse_duration(gj(prefs, "yield_after_interactive", "0")) ?? 0;
 		idle = gj(cap, "interactive_idle_secs", 1000000000);
-		if(yield_secs > 0 && idle < yield_secs)
+		if(!manual && yield_secs > 0 && idle < yield_secs)
 			return [ok = false, why = "yielding to interactive use"];
 
 		return [ok = true, why = ""];
@@ -2263,7 +2394,12 @@ class GoalScheduler {
 				continue;
 			}
 
-			cap = capacity_ok(def);
+			// max_parallel_workers is per goal: a manual run or a catch-up next to the
+			// scheduled window waits for the run that is working
+			if(kind == "work" && goal_open_runs(a.goal) >= a.policy.max_parallel_workers)
+				continue;
+
+			cap = capacity_ok(def, a);
 			if(!cap.ok) {
 				if(gj_str(a, "waiting_for", "") != cap.why) {
 					a.waiting_for = cap.why;
@@ -2319,8 +2455,10 @@ class GoalScheduler {
 			a.retry_at = t_now + def.policy.retry_backoff;
 			ledger.event("dispatch_failed", def.id, "the host did not accept the run", [akey = a.akey]);
 			// the owner must hear about a refused dispatch now, not only when the
-			// window runs out of attempts
-			notify_once("run:" + a.akey + ":" + std.string(n) + ":refused", "Goal " + def.id + ": " + (kind == "verify" ? "the verification run" : "run " + std.string(n)) + " could not start - the host refused the task. Next attempt " + gt_format_local(gt_zone(def.schedule.timezone), a.retry_at) + ".");
+			// window runs out of attempts - and must not be promised an attempt that
+			// will not come (the last attempt, or a retry after the window end)
+			again = a.failures < gj(a.policy, "max_attempts", 3) && a.retry_at < a.end;
+			notify_once("run:" + a.akey + ":" + std.string(n) + ":refused", "Goal " + def.id + ": " + (kind == "verify" ? "the verification run" : "run " + std.string(n)) + " could not start - the host refused the task. " + (again ? "Next attempt " + gt_format_local(gt_zone(def.schedule.timezone), a.retry_at) + "." : "No attempts left for this window."));
 			return;
 		}
 
@@ -2410,7 +2548,7 @@ class GoalScheduler {
 	recover() {
 		t_now = clock_now();
 		for(akey, a : ledger.data.activations) {
-			if(goal_activation_closed(a))
+			if(goal_activation_closed(a) && !goal_activation_has_open_run(a))
 				continue;
 			for(r : a.runs) {
 				if(!goal_run_open(r))
@@ -2454,6 +2592,12 @@ class GoalScheduler {
 		goal_mkdir(dir);
 		path = dir + "/" + std.string(gt_now()) + "-" + std.random_hash(4) + ".json";
 		ok = goal_write_atomic(path, [action = "run", goal = id, dry_run = dry_run ? 1 : 0, at = gt_now()].string());
+
+		// the scheduler of THIS process starts it now ("Run now" of the web interface, a tool
+		// of an agent); a request of another process (shz miniagent.goals run) waits for the tick
+		if(ok)
+			wake_now = true;
+
 		return ok ? [ok = true, queued = true] : [ok = false, error = "could not write " + path];
 	}
 
@@ -2501,7 +2645,7 @@ class GoalScheduler {
 		dispatch();
 		handle_window_ends();
 		ledger.data.last_tick = clock_now();
-		ledger.trim();
+		ledger.trim([this](a) { return this.activation_in_lookback(a); });
 		ledger.save();
 		write_overview();
 

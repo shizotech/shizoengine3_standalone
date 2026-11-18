@@ -189,6 +189,9 @@ Found out by building one with an outside MCP client (2026-10-24). The paths are
    column into a free row and give each other quick effects (see *Phaser* below): the light changes with the columns
    and autoplay. The lamps must exist in the fixture setup first.
 9. **Save:** `vibevj_save_project` with `name` the first time (a new project has none), without arguments after that.
+   `vibevj_load_project` that answers "could not be loaded completely" (an error in a file of the project, 2026-11-10):
+   the project is open **without a name** and its files are unchanged, so a save cannot write the half-loaded state
+   over them. Read the reason in the answer and the Log; do not save it under the old name.
 
 ## A show on the timeline (clips on lanes, #680)
 
@@ -226,11 +229,18 @@ has the live_path `timeline` (a query only it has goes there without a live_path
 | `select_timeline_clips` | `ids` (`[]`: none) | selects clips (`selected` in `get_timeline`) |
 | `copy_timeline_clips` | `ids` (default the selection), `paste` (a beat), `duplicate` (1) | copies them (Ctrl+C); pastes at `paste` or duplicates right after them; returns the copies |
 | `paste_timeline_clips` | `beat` (default the cursor) | pastes the copied clips on the lanes they came from |
-| `get_timecode` / `set_timecode` | `on`, `source` (`mtc`, `clock`, `ltc`), `device`, `offset` | the timecode / clock chase of the main timeline (below) |
+| `get_timecode` / `set_timecode` | `on`, `source` (`mtc`, `clock`, `ltc`, `link`), `device`, `offset` | the timecode / clock / Ableton Link chase of the main timeline (below) |
 | `set_timecode_output` | `device` (empty: none), `clock`, `mtc` (0 / 1), `rate` | VibeVJ as the master: MIDI clock / MTC to a MIDI output |
 | `send_test_timecode` | `time`, `rate`, `play`, `locate`, `speed` | MTC into the virtual MIDI device *Shizo Virtual MIDI* |
 | `send_test_clock` | `bpm`, `play`, `beat`, `off` | MIDI clock into the virtual MIDI device *Shizo Test Clock* |
 | `send_test_ltc` | `time`, `rate`, `play`, `reverse`, `off` | the LTC messages of the audio analysis, made here (no sound) |
+| `get_tempo_output` | | tempo to lighting desks and Ableton Link: `available`, `settings`, `status` (`sentBpm`, per target `on` / `ok` / `text` / `sent`, `scan`), `link` (the session) |
+| `set_tempo_output` | `target` (`link`, `osc`, `ma3`, `ma2`, `daslight`, `chamsys`, `os2l`), `on`, `ip`, `port`, `address`, `command`, `user`, `password`, `phase`, `start_stop` | one target; the popup shows it |
+| `send_tempo_test` / `search_grandma2` | `target` / none | a test message (tempo once, or 8 beats at 120 BPM); the grandMA2 search (`status.scan`) |
+| `get_deck_timecode` | | timecode from the decks and TCNet (not the timeline): `available`, `settings`, `status` (`valid`, `text`, `time`, `deck`, `title`, `offset`, `listed`, `following`, per output `on` / `ok` / `text` / `sent`; `tcnet.receivers`), `tracks` (`unlisted`, `current`, `entries`) |
+| `set_deck_timecode` | `source` (`onair`, `master`, `deck`), `deck`, `rate`, `latency_ms`, `hold`, `artnet` / `ltc` / `mtc` / `tcnet` (0 / 1) and their fields as `artnet_ip`, `artnet_port`, `ltc_device`, `ltc_level_db`, `mtc_device`, `tcnet_layers`, `tcnet_name`, `tcnet_iface`, `tcnet_timecode` | the popups *Decks to timecode* and *TCNet* show it |
+| `set_track_offset` | `index` (-1 + `title`, `artist`, `duration`: add), `offset` (`""`: none), `unlisted`, `auto_fill`, `remove` | the track offsets |
+| `import_track_offsets` | `path`, `playlist`, `auto_fill` | a rekordbox playlist (txt export or `rekordbox.xml`) into the track offsets |
 
 Every query of a timeline (`get_timeline`, `add_timeline_clip`, `set_timeline_clip`, `remove_timeline_clip`,
 `set_timeline_lane`, `set_timeline_loop`, the envelope, lane, cue and copy queries) takes `loop`: the guid, name or
@@ -286,7 +296,44 @@ is for the main timeline, i.e. the song that plays.
   moved (`after_move` in `__init__.shio`). To a virtual device the messages come in as its input: send to
   *Shizo Virtual MIDI* and read it back with `set_timecode` `device` *Shizo Virtual MIDI* (`get_timecode` `clock` /
   `timecode`), the chase off. `get_timecode` `output.sent` counts what went out. Messages of the sender thread reach a device through the queue of `nanogui.mididevicehandler()`: a script outside the app (a test) must make the handler first, or nothing comes in (`_testing/nanogui/midi_clock.shio`). Saved in `timecode.json`
-  (`source`, `out_device`, `out_clock`, `out_mtc`, `out_rate`).
+  (`source`, `out_device`, `out_clock`, `out_mtc`, `out_rate`, `tempo`).
+- **Tempo to lighting desks and Ableton Link:** `set_tempo_output` per target; the C++ sender `prolink.tempo_out()`
+  (prolink module, `tempo/`) gets the cursor, BPM and Play every frame in `after_move` and sends from its own thread:
+  Link (lead tempo and bar, or follow), OSC float, grandMA3 `/cmd`, grandMA2 Telnet with login (whole numbers, every
+  15 s), Daslight / ChamSys taps and OS2L beats. The panel is `src/menu/timeline/tempo_panel.shio`, loaded at run time
+  (`tempo` None in `timecode_chase` and `available` false with an older prolink module); the DJ Watch program uses the
+  same panel. The desks get `sentBpm` (steadied: tenths, a dead band against the CDJ jitter) while `set_bpm(bpm, true)`
+  (ProlinkBridge, audio analysis) set the tempo in the last 1.5 s or MIDI clock is chased; a typed tempo is exact.
+  Status texts come every 100 ms. Check against fakes: smoke phase `tempoout` (`_testing/linux_app/smoke.py`); an
+  independent Link peer: `modules/shzmodule_prolink/test/test_tempo --link 20808 <s> lead <bpm> | follow`.
+  Leading with the bar, small drifts are nudged out through the session tempo (at most 2 %, 2 s; jump only beyond
+  0.4 beat): `get_timecode` `tempo.link` has `offsetMs`, `nudge`, `jumps`, `nudges`.
+- **DJ events as MIDI (DJ MIDI Out generator, `assets/Generators/Network/DJMidiOut.asset`):** reads the device of a
+  ProlinkBridge / ProlinkDecks (`std.global("prolink_sources")`, never their `events()`), sends notes (beat, downbeat,
+  phrase, phrase kind, drop, buildup, track load, cue) and CCs (BPM, pitch, phases, phrase, levels per deck) to the MIDI
+  output in its control `OUTPUT DEVICE` (a name; a virtual device of the app works, its `on_output` sees the
+  messages), switched by `SEND MIDI`; per line `NOTE <NAME> ON / CH / NUM`, `CC <NAME> ...`; SoundSwitch `SOUNDSWITCH`.
+  Set them with the generic control tools. Test: `_testing/nanogui/dj_midi_out.shio`.
+- **Now playing / history:** `device.now_playing()` and `device.history_options()` of the prolink module (the mix status:
+  which deck the audience hears); ProlinkBridge shows it in its control `NOW PLAYING`, ProlinkDecks has `HISTORY RULE`,
+  `NOW PLAYING MODE`, `WRITE PLAYLIST` (the playlist file goes to `Documents/prolink-history/set-<date>-<time>.csv`).
+- **Timecode from the decks and TCNet** (2026-11-13): the C++ sender `prolink.timecode_out()` (prolink module,
+  `tempo/timecode_*`, `tempo/tcnet.*`) reads the decks of the first device of `std.global("prolink_sources")` (a
+  ProlinkBridge / ProlinkDecks generator; `follow` again every 120 frames) on its own thread: timecode = offset of the
+  track (title + artist + duration; else the unlisted offset 23:00:00:00) + position of the deck + `latency_ms`; out as
+  Art-Net (every frame, the held frame while paused with `hold`), LTC (an audio output) and TCNet (VibeVJ as the master
+  node: Time 60 Hz on UDP 60001, requests on 65023). MTC goes through `mididevice.send_sync` of the panel every frame
+  (`send_mtc`); not to the device the timeline sends its own MTC / clock to. The panel is
+  `src/menu/timeline/deck_timecode_panel.shio` (loaded at run time like the tempo panel; DJ Watch tab *Timecode*). The
+  status comes every 50 ms. Tracks loaded on a deck come into the list by themselves; `set_track_offset` `auto_fill` 1
+  gives the list 01:00:00:00, 02:00:00:00, ... Saved in `timecode.json` (`deck_timecode` = `settings`, `tracks`).
+  Check without CDJs: a ProlinkBridge with *Source* Demo (`set_local_control` of its `SOURCE` to 1; deck 1 plays from
+  11 s); smoke phase `decktc` (Art-Net to a socket, MTC read back through *Shizo Test Clock* with `get_timecode`,
+  TCNet with `tcnet_iface` 127.0.0.1).
+- **Ableton Link chase:** `set_timecode` `source` `link`: the Link peer follows (does not lead); the cursor keeps its
+  bar and takes the beat in the bar of the session, the BPM follows it; Play / Stop with the session's start / stop
+  state when a program sends one, else it plays while a peer is there. `get_timecode` `link`: running, peers, bpm, beat,
+  phase.
 - **Fades (step 5):** `fade_in` / `fade_out` in beats; a clip with fades and no crossfade fades over the lanes below
   (`fading` true on the lane, `transition` its gain now by its `curve`: equal power is sin(t * pi / 2)); a crossfade
   weighs the two clips by the curve of the later one (`XFADE_CURVE` of the LayerBlend; linear 1 - t / t, equal power
@@ -479,6 +526,42 @@ The wiki page *Assets* (sections *Shaders › Sound*, *Generators › Sources*, 
   `Position`, `.@Values.Input 1` ... `Input 8`, `Fade`; `Output`, `Picked`), `Filter.asset` (`Mode` 0 One euro,
   1 Average, 2 Median, 3 Envelope, 4 Slope; `Input`, `Output`). Set the inputs with `set_local_control`, read the
   outputs with `get_local_control`; they update once a frame.
+- The DJ mixer (wiki *Output and devices › Mixer data*, 2026-11): `assets/Generators/Network/ProlinkBridge.asset` has
+  `CROSSFADER` and per mixer channel the group `mixer_ch1` ... `mixer_ch4` with `FADER`, `VU`, `EQ LOW`, `EQ MID`,
+  `EQ HIGH`, and `FADER` / `VU` of the channel of the deck it follows (Tempo from); `ProlinkDecks.asset` has `FADER`, `VU`, `EQ LOW/MID/HIGH`
+  in each `deck1` ... `deck4` group (pure outputs, 0 when the mixer sends none). Settings of both: `MIXER DATA`
+  (source Network card: the DJM bridge identity), `ENHANCED ON AIR`, `LIVE HOLD`. To try without a mixer: the tool
+  `modules/shzmodule_prolink/test/fake_djm.cpp` with the card 127.0.0.1 (Linux).
+
+## Director: an AI model decides in the beat (decision models of the Jev kind)
+`assets/Generators/Utility/Director.asset` asks a model on an OpenAI-compatible API (a local Ollama / LM Studio / vLLM,
+also a vision model, or a cloud API) typed questions about the show and puts the sure answers on outputs to link:
+`INTENSITY` (score 0..1), `STROBE` (yes / no as 1 / 0), `PALETTE` and `SCENE` (the index of the option it picked),
+`CONFIDENCE`, `DECIDED` (a 100 ms pulse). Logic and request: `engine/director/director.shio`.
+- The state it sends: the tempo master deck of the first ProlinkBridge (track, key, genre, rekordbox phrase with the next
+  one and beats left, mood, beats to cue, low / mid / high), the inputs `ENERGY`, `BREAK`, `CROWD` (link the audio
+  analysis into them; `CROWD`: `outputs.outputs@Outputs.motion` of `assets/Generators/Python/CrowdMotion.py`, whose
+  `input_ctrls@input` gets the `OUT` of a Camera generator; it also has `activity`, `burst` and the picture of the
+  moving pixels), the decisions before. `PICTURE` 1 / 2 sends a PNG of the VibeVJ
+  window / the Camera generator (vision models only).
+- What the VJ says: *Behaviour*, a prompt for the whole show (a textarea, saved with the project in the state of the
+  generator, not a control; it goes into the system prompt), and the chat: short instructions that hold for a typed
+  time (`10`, `30s`, `1.5h`), the track of the master deck (`track`) or until removed (`show`); empty: `DEFAULT MINUTES`
+  (5). Not saved. Each one asks the model at once; the newest wins. The
+  model answers with a `note` (one sentence) that goes into the chat.
+- When: a new phrase of the master deck (`ON PHRASE`), every `EVERY BARS` bars, `DECIDE NOW`; never more often than
+  `MIN GAP` s. The answer waits for the next downbeat (`ON DOWNBEAT`). `MODE` 0 Off, 1 Suggest (only shown), 2 Auto;
+  an answer below `THRESHOLD` changes nothing.
+- Queries: `director_status` (the state sent, the answers with confidence, what is applied), `director_decide` (ask now;
+  the answer comes within seconds), `set_director` (`mode` off / suggest / auto, `behaviour`, `palette` and `scenes` as
+  comma separated options, `threshold`, `every_bars`), `director_say` (`text`, `minutes` any, 0 = until
+  removed, left out = `DEFAULT MINUTES`, or `track` 1; returns `at`), `director_unsay` (`at`, or nothing for all). `director_status` also gives
+  `behaviour`, `instructions` (with the time left), `note` and `chat`. Use `set_director` to set up a show for the
+  model: the names of the scenes, the rules the VJ wants. Then link `SCENE` into the `Index` of `Select.asset` or a
+  Clipview row. Pass on what the VJ asks for "now" with `director_say`, not by changing `behaviour`.
+- The key of a cloud API is not a control: `token` of `configs/director_api.json`, else the Chat's when the URL is the
+  Chat's. `LOG` writes every decision as JSON lines to `<std.user_path()>/VibeVJ/director/`.
+- Tested without a model: `_testing/director.shio` (a mock server, the demo set of ProlinkBridge replayed).
 
 ## A CueList (the order of its cues)
 
@@ -735,7 +818,63 @@ Use the tool 'vibevj_fixture_setup(action, args)' for the lamps, groups and Art-
   then 'set_fixture' per lamp with 'x' / 'y' (metres on the plan, the plan seen from above; a larger 'y' is nearer the
   audience at the bottom), 'z' (height) and 'mount'. Moving heads on a truss: 'z' 5, 'mount' hanging (beam down); pars
   on the floor at the front: 'z' 0, 'mount' floor (beam up). The user sees it with *3D* in the toolbar of the fixture
-  setup (Devices › Fixtures › Fixture setup opens it in a tab of its own).
+  setup (the toolbox button at the right end of the top bar › *Fixture setup*, or Devices › Fixtures › Fixture setup,
+  opens it in a tab of its own; closing that tab only hides it, it comes back as it was, #975).
+- The room around the lamps (trusses, set, decoration) is the stage (#980): Tools › *Stage*, model files (STEP, 3MF, STL,
+  OBJ, GLB) from `assets/Stage` placed in 3D, saved as `stage.json` of the project; the fixture setup's 3D view shows
+  them. Queries of the live_path `stage` (Chat: `vibevj_stage`): `list_stage_files`, `add_stage_object` (`path` in
+  assets/Stage or anywhere, copied in; on the floor by default: `z` is then the height of its lowest point; waits for
+  the model and returns `model.dimensions` and `model.world_box`), `set_stage_object` (`x y z rx ry rz scale unit up
+  hangs_on visible on_floor`), `list_stage`, `duplicate_stage_objects`, `remove_stage_objects`, `convert_step` /
+  `get_step_status`, `add_stage_build` (trusses, stage decks, stairs, ground support towers, crank stands, speakers,
+  front barriers, curtains, DJ booths made from their measures, no file: `type` and `build` = the measures that differ,
+  e.g. `{type: truss, build: {length: 3}, z: 6}`, a circle `{path: arc, radius: 2}`, a stage `{type: deck, build:
+  {cols: 4, rows: 6, height: 1.0}}` of 2 × 1 m decks; stairs' back edge at the deck's front edge; returns `nodes`, the
+  ends of a truss and the top of a tower in the world, where the next piece joins (the Stage menu snaps a dragged
+  truss there; over MCP place it yourself: a truss end on a tower top is the node of the tower + the truss's half
+  height, a truss's own node z minus its z); `set_stage_object` `build` changes
+  them). Folders (order in the list, show / hide together, they move nothing): `add_stage_folder` (`name`,
+  `objects`, `in_folder`), `set_stage_folder` (`visible`, `name`, `in_folder`), `remove_stage_folder` (`with_objects`),
+  `folder` of `set_stage_object` / `add_stage_build` (id, name or path "Rig / Front"); `list_stage` gives `folders`
+  and each object's `folder` and `shown` (its own `visible` and all its folders on). Symmetry: `symmetry` of
+  `add_stage_build` / `add_stage_object` / `add_stage_screen` = `mirror` (at x = 0 of the stage, or of what it hangs
+  on) or `radial2` .. `radial8` (around the middle / the centre of what it hangs on, e.g. 6 panels around a truss
+  circle: hang the first on the circle); `set_stage_object` on any piece moves the others with it; `list_stage` gives
+  `symmetry` (mode, others); removing them is per object over MCP. The first `convert_step` installs OpenCASCADE (about 170 MB): it answers `needs_install` until it
+  is called with `install = true`, which only the user may decide. Place lamps on a truss from `world_box` of the truss
+  (`set_fixture` z = its bottom, mount hanging, `hangs_on` the truss: the lamp then moves and turns with it; x, y, z
+  stay in the world; `list_fixtures` gives `hangs_on`). LEDs on the stage: a LEDMapper's `select` (scene, group) then
+  `set_stage_place` (`x y z rx ry rz`, `width` = metres of the whole picture, `hangs_on` an object of the stage): the
+  middle of the group's LEDs at x y z, the picture upright facing the audience; the Stage menu draws them in the
+  colours sent (`set_test` 1 lights the selection white when no picture comes in). `set_stage_place` also takes
+  `color_source`: picture, front / top / side (the picture projected over all groups of that projection by where their
+  LEDs stand), effect (the LEDMapper's 3D effect: `set_effect3d` effect plane / sphere / noise / rainbow, direction
+  x / y / z, speed, size, hue_a, hue_b; it runs through the box of all its effect LEDs). `add_group` makes a new group
+  for the next `add_segment`s (a 3D arrangement: one group per plane, e.g. hexagons at several depths). Materials of
+  the bodies of a model (`set_stage_object` `materials`: `{"Diffuser": "acrylic_opal"}`; presets solid, petg, spandex,
+  acrylic_opal, acrylic_clear, glass_clear, glass_frosted, or `{preset, transmission, diffusion}`): with the stage's
+  Simulation on, LEDs within 0.5 m shine through a translucent body and the lamps' beams light the models.
+  LEDs along an edge of a model: `list_stage_edges` (`object`) lists its sharp edges (index, part, closed, length,
+  the points in the object's frame); `add_leds_along_edge` (`object`, `edge`, `outline` true: on along the whole
+  outline the edge belongs to, a ring when it closes; `leds_per_m` 60; `ledmapper` index of the LEDMappers that take
+  strips, 0 the first) adds a segment with as many LEDs as the length needs to the group "Edges of <name>" of that
+  LEDMapper, hanging on the object. On a LEDMapper itself: `add_path_segment` (`points` x, y, z, ... in the frame of
+  `hangs_on`, `leds` or `leds_per_m`, `group_name`). The group's colours as any group's (`select` it, `set_stage_place`
+  `color_source effect`).
+  LED walls and screens (#980): `add_stage_screen` (`type` led / screen, `x y z` = the middle of its bottom edge, `rz`,
+  `screen` {cols, rows, panel_w, panel_h, panel_px, panel_py | width, height, depth, source, brightness}) returns its
+  size and pixels (`screen.size`: the output it needs); `source` is the name of a video router that is on
+  (`list_picture_sources`; a shader's video router: `set_local_control` `ctrls.ctrls.video_router.@Outputs.Outputs.VideoRouter.Enable Router` 1
+  and `...VideoRouterName`). The picture shows on the wall with the stage's Simulation on. `set_stage_object` takes
+  `screen` to change it.
+  Scans of the venue (Gaussian splats, #980): `add_stage_object` with a `.ply` / `.splat` (`kind` splat; read by
+  `nanogui.splats3d`, its box from its splat centres). `align_stage_scan` (`floor`: three world points on its floor, `eye`
+  a point above it: level at z 0; `measure` two world points + `real` metres: its real size; `reset`). `set_stage_object`
+  `splat` {quality low / medium / high, height (shown up to it above its floor)}. Measured materials (#980, Stage › Materials ›
+  Measure a material with a camera: done by the user, a physical LED behind a test piece) are files in
+  `assets/Stage/Materials`; their preset ids are `user:<file name>` and `set_stage_object` `materials` takes them like
+  `acrylic_opal`. To find floor points, read `world_box`
+  (the floor is often its smallest axis before alignment) or ask the user to click them in the Stage menu.
 - Lamps without a node are red ("No node") and send nothing; the 3D view and the Phaser work anyway. Do not pick a
   node of a real rig unless the user asks: the lamps then really move.
 - Virtual lamps (#679): the type 'assets/Fixtures/Virtual/ProjectionZone.json' (a dimmer and a colour) needs no node and
@@ -791,6 +930,23 @@ Light and video as from a lighting console (#719, wiki page Lighting-Desk). MCP:
   (HTP dimmers, LTP the rest) until Release. Over the desk interface: `set_group_input` (group, function color|dimmer|
   pan|tilt, value: 0..1 or [r, g, b]) and `release_group`; `group_inputs` in get_desk_state. A ColorSelector row has
   *Lamps* (all lamps or a group): its colour goes to them directly, no link needed.
+- **Shows per track** (DJ Link, `engine/patch/desk_show_runtime.shio`, generators *Track show* and *Cue call*; wiki
+  Lighting-Desk § Shows per track): `get_track_show` (decks with `pos` in beats + fraction and `bar` "bar 9.1", the
+  track `signature`; `master` is the deck `device.lead()` names; track shows with cues; rules; limits with `armed` /
+  `on_seconds`; `log` of what ran / was held and why; `cue_call`). `add_track_cue` (deck `master` or 1-6, `beat` default the playhead floored to the beat, `bars`,
+  `name`, `crew`, `action`, `end_action`), `import_track_cues` (deck, kinds all|memory|hot: rekordbox cues with their
+  names), `set_track_show` (track id or deck; `enabled` master|onair|always|never, `lock_phrases`, `cues` replaces
+  all, `remove` 1), `set_show_rules` (`name_rules`, `phrase_rules`, `lookahead`, `limits` each replace their list;
+  `crews`, `backoff_bars`, `stop_after`, `standby_beats`), `arm_special`, `get_cue_call`. Actions are texts as typed
+  in the UI (`go Main`, `goto 3 Main`, `off Main`, `clip 1 2`, `column 3`, `desk <command>`, `midi 90 3C 7F @ <dev>`,
+  `osc <ip>[:port] /address [values]`)
+  or `{type: stack, stack, op: go|goto|off, cue}` / the timeline cue actions. A cue runs when the deck *plays through*
+  its first beat (jump back: again; jump forward / paused: not), its end action when the playhead leaves it after it
+  started. Beats are the track's (beat 1 = first beat of the grid), not the timeline's. Stack actions run at once
+  (no quantize). A touch of a stack by the operator (go/off/command/master) holds the automation back for
+  `backoff_bars`. Test without CDJs: a ProlinkBridge with *Source* Demo (`set_local_control` `SOURCE` 1); the smoke
+  phase `deskshow` cuts the demo set with a jump back and forward (2026-11-13: a heartbeat `ms` that goes back in a
+  recording is a restart of DJ Watch and drops every track: rewrite it when cutting recordings).
 - Devices › Fixtures › Masters: `SPEED_1` .. `SPEED_4`
   (group `speed_masters`); a phaser follows a speed master by its setting *Speed master*.
 
@@ -834,7 +990,14 @@ picture), 'vibevj_list_cameras', 'vibevj_camera_capture'. The in-app Chat gets e
 vision model, e.g. a Qwen VL model); over MCP it comes as an image in the tool result, plus 'path' / 'absolute_path' of
 the PNG ('image': 0 sends only the file, for a model that takes no images in tool results: open the file yourself).
 
-**A camera.** 'vibevj_list_cameras' lists the Camera generators (assets/Generators/Input/Camera.asset). None: add one to
+**A webcam, without a generator (#924).** 'vibevj_list_cameras' has in 'devices' the cameras of the computer (name,
+id, 'shown_by': the Camera generators that show it) and the "Test pattern". 'vibevj_camera_capture' with 'camera' (a
+name or id of 'devices') opens that camera in the background, takes one picture and closes it again (the first picture
+of a webcam can take a few seconds; a camera a Camera generator shows is looked through that one). One call per
+camera: a picture of each. 'fixtures' / 'values' work the same. The answer has 'camera' (name, id, the size of the
+device). A camera another program holds cannot be opened (an error says so).
+
+**A Camera generator.** 'vibevj_list_cameras' lists in 'cameras' the Camera generators (assets/Generators/Input/Camera.asset). None: add one to
 a view ('add_item' of a Patchview; 'vibevj_get_testarea' gives one). On its live_path: 'list_cameras' (the devices and
 "Test pattern"), 'set_camera' (name or id), 'get_camera_status' ('picture' 1 once frames arrive; the first one can take a
 second or two). The camera must see the stage: ask the user where it points if the picture does not show the lamps.
@@ -895,7 +1058,12 @@ in 'get_fixture_values'.
   values and its effect timeline) on the Phaser's clock, whether the stack plays or not; Level scales its dimmers.
   It runs with the timeline of VibeVJ like every phaser: Play has to run.
 - LEDMapper: 'get_layout', 'add_segment', 'set_group', 'select', 'set_test', 'add_lamps', 'list_presets',
-  'insert_preset', 'remove_selected'.
+  'insert_preset', 'remove_selected'. Camera scan (#980): 'select' a segment or group, then 'scan_leds' (camera: the
+  live_path of a Camera generator, or of any generator whose picture is a camera such as an NDI receiver; wait_ms per
+  LED, 300; fit) lights one LED after the other and puts each where the camera sees it (shape "points"); it runs over
+  frames: poll 'get_scan_status' (state dark / led / done / stopped, done, seen, result), 'stop_scan'. It sends to the
+  real LEDs: only on the user's rig when they asked for it, the room dark. Checked without a camera with a shader whose
+  picture is a moving dot as the camera (every LED found on its path).
 - MapLab: 'get_outputs' (per output: its effects, the guid of its LEDMapper, whether that maps what goes out) and
   'led_mapping' {index, action: open / close / remove}. The LED mapping of an output is a LEDMapper of its own (#755),
   over the projection area, fed with the end of the output's effects; it is a generator of its own, so its queries go

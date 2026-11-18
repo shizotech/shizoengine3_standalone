@@ -132,6 +132,9 @@ A template is a project to start from, for example a layout you build every show
 To make a template, save a project and copy its folder from `VibeVJ/projects/` into `VibeVJ/templates/`. Without a
 `templates` folder the tab has no section *Templates*.
 
+*openair* is an open-air floor on the [stage](Stage.md#the-open-air-example): a forest clearing as a scan, a stage
+with LED walls, PA, an LED tunnel and a mapping wall, to look at and to start from.
+
 ## Next steps
 
 - Learn by doing: the [tutorials](Tutorials.md) build a whole result step by step, from visuals on the beat to the

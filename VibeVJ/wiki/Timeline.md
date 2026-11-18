@@ -244,8 +244,8 @@ you are working on.
 ## Cues
 
 A cue is a flag on the ruler that does something when the playhead passes it while the timeline plays: start a clip
-of a Clipview at the drop, take a cue of the lighting desk at the chorus, send a MIDI note to another program, start a
-loop timeline.
+of a Clipview at the drop, take a cue of the lighting desk at the chorus, send a MIDI note or an OSC message to another
+program, start a loop timeline.
 
 1. Double click on the ruler where it should be. An orange flag appears, the *Cue* panel opens on the right.
 2. Choose what it *Does* and fill in the fields below. *Fire now* runs it, to try it.
@@ -260,6 +260,7 @@ loop timeline.
 | *Loop timeline: start / stop* | The name of the [loop timeline](#loop-timelines), *Start* or *Stop*. |
 | *Song: go to a song* | The name or number of a [song](#shows): the show goes on with it. |
 | *AI query of a generator* | Any query an AI agent can run: the live_path of the generator, the query and its arguments as JSON. |
+| *OSC: send a message* | `<ip>[:<port>] /address [values]`, e.g. `192.168.1.20:7000 /composition/layers/1/clips/2/connect 1` for Resolume; port 8000 when none is given. Whole numbers go as int, numbers with a point as float, other words as text. |
 
 - A cue runs only when the playhead runs over it while the timeline plays, also when it is reached by the
   [timecode](#timecode). A jump past it (a click on the ruler, a locate of the master) does not run it. When the
@@ -377,13 +378,16 @@ envelopes of a lane: everything of [Clips and lanes](#clips-and-lanes) works her
 For a show that runs to a fixed time or to the tempo of another program, the timeline can follow a master: a DAW, a
 show controller or a lighting desk. The playhead then goes where the master is, starts and stops with it, and jumps
 when it jumps. The other way round, VibeVJ can be the master and send MIDI clock and MIDI Time Code
-([Send](#send-vibevj-as-the-master)).
+([Send](#send-vibevj-as-the-master)), and its tempo and beats to lighting desks and Ableton Link
+([below](#tempo-to-lighting-desks-and-ableton-link)). From the CDJs it makes timecode per track
+([Timecode from the decks](#timecode-from-the-decks)) and sends the decks over [TCNet](#tcnet).
 
 | *Source* | What comes in | The playhead |
 |---|---|---|
 | *MIDI Time Code* | MTC on a MIDI input: the time of the master, 24, 25, 29.97 drop frame or 30 frames a second | (timecode − offset) × BPM / 60 beats |
 | *MIDI clock* | MIDI clock on a MIDI input: 24 clocks a beat, Start, Continue, Stop and the song position | the song position in beats; the *BPM* of the timeline follows the tempo of the clock |
 | *LTC (audio input)* | SMPTE timecode as sound (LTC), read by the generator [*Audio Input Analysis*](Audio.md#ltc-timecode-as-sound) on its input | (timecode − offset) × BPM / 60 beats |
+| *Ableton Link* | the tempo and the beat of an Ableton Link session in the network (Ableton Live, Resolume, Traktor, rekordbox, apps) | keeps its bar and takes the beat in the bar of the session (4 beats a bar); the *BPM* follows the session |
 
 1. Connect the master: MIDI to a MIDI input of the computer (in the DAW: send MIDI Time Code or MIDI clock to that
    port), LTC to the sound input the *Audio Input Analysis* listens to.
@@ -403,6 +407,10 @@ when it jumps. The other way round, VibeVJ can be the master and send MIDI clock
   slow does not let the timeline drift away. The frame rates of MTC, 24, 25, 29.97 drop frame and 30, are read from the
   timecode; the popup shows the time that comes in, the rate and how far the playhead is off.
 - LTC that plays backwards (a tape or a DAW scrubbing back) moves the playhead back with it.
+- *Ableton Link* needs no input and no offset: VibeVJ takes part in the session itself. The bars of the timeline stay
+  on the bars of the session (position 0, 4, 8 ... on the first beat). Programs with *Start/Stop Sync* start and stop
+  the timeline; without it the timeline plays while a Link session is there. While it chases Link, VibeVJ does not
+  lead the session (*Ableton Link* under [Tempo to lighting desks](#tempo-to-lighting-desks-and-ableton-link) follows).
 - While chasing, the ruler shows the timecode (or the tempo of the clock) next to *Timeline*, and the [loop](#loop)
   does not catch the playhead. [Loop timelines](#loop-timelines) with *Chase* on go with the playhead.
 - *Chase* has a notch: map it to [MIDI](MIDI.md) or link it. The source, the input, the offset and the output are
@@ -427,6 +435,90 @@ device then follows the timeline of VibeVJ.
   playhead every frame, so a loop or a jump of the timeline comes out as a jump.
 - To the virtual MIDI device (*Shizo Virtual MIDI*) they come in as its input, and on Linux and macOS other programs
   get them from its port of the system.
+
+### Tempo to lighting desks and Ableton Link
+
+Under *Tempo to lighting desks and Ableton Link* in the popup of *TC*: the tempo and the beats of the timeline go to a
+lighting desk or another program, while the timeline plays and also while it follows the CDJs
+([ProlinkBridge](Output-and-Devices.md#prolink-cdjs)) or the audio analysis. Pick a target in the list, turn it on with
+*Send*, fill in its address; several targets can send at once ("· on" after their names). The line below says what
+goes out ("Sends 128.0 BPM to grandMA2 192.168.1.20 · logged in") or what is wrong.
+
+| Target | What goes out |
+|---|---|
+| *Ableton Link* | VibeVJ leads the Link session: its tempo and, with *Bar*, its bar phase; *Start/Stop* sends Play and Stop |
+| *OSC tempo* | the tempo as a float to an OSC address (QLC+, any OSC receiver) |
+| *grandMA3 / onPC* | a command line over OSC (`/cmd`), default `Master 3.1 At BPM {bpm}` |
+| *grandMA2 / onPC* | a command line over Telnet with login, default `SpecialMaster 3.16 At {bpm}` (whole numbers) |
+| *Daslight* | a tap on every beat (OSC, 255 then 0) |
+| *ChamSys MagicQ* | a tap on every beat (OSC without a value) |
+| *OS2L* | a beat message on every beat (the protocol of VirtualDJ; the Wolfmix software WTOOLS) |
+
+- The messages go out from a thread of their own, a few milliseconds from their beat, not with the frames.
+- The desks get the tempo to a tenth and steadied: the jitter of the players (137.9 / 138.0 / 137.9 ...) does not reach
+  them, a real change (a pitch fader, a new track) goes out within half a second. A typed tempo goes out at once.
+  Ableton Link and the beats get the exact tempo.
+- *Send test* sends the tempo once (120 BPM when there is none) or eight beats at 120 BPM, to check the mapping on the
+  desk.
+- Ableton Link with *Bar*: when the beat of the session drifts a few milliseconds from the deck, VibeVJ nudges the
+  tempo of the session a little (at most 2 %, over two seconds) until it is back on the beat, so the programs that
+  follow it hear no jump. Only when it is more than 0.4 beat off does it jump.
+- The settings are saved with the project. Setting up each desk: [Lighting desk](Lighting-Desk.md#tempo-to-lighting-desks).
+
+### Timecode from the decks
+
+![The popup Decks to timecode next to the popup of TC: deck 1 gives 01:00:08:06 (its track starts at 01:00:00:00), Art-Net on, the track offsets below](media/timeline-deck-timecode.png)
+
+*Decks to timecode* at the top of the popup of *TC* makes SMPTE timecode from the CDJs (or Denon players) of a
+[ProlinkBridge or ProlinkDecks generator](Output-and-Devices.md#prolink-cdjs), for a light or video show programmed on
+a timecode per track (grandMA, ChamSys, Resolume, a media server). It has nothing to do with the timeline: it goes on
+while the timeline stands.
+
+**The timecode = the offset of the track + where the deck is in the track.** Give every track of the set its own
+hour (01:00:00:00, 02:00:00:00, ...) and program its show on that hour: when the DJ plays the track, at any time and
+from any point, the desk gets the right time.
+
+1. Add a *ProlinkBridge* (or *ProlinkDecks*) generator and connect it to the DJ gear.
+2. Click *TC*, then *Decks to timecode*. Choose the deck: *On air (follow)*, *Tempo master* or a fixed deck, and the
+   frame rate.
+3. Turn on the outputs you need and fill in their address:
+   - *Art-Net*: the IP address of the desk, or a broadcast (2.255.255.255); port 6454.
+   - *MTC*: a MIDI output (not the one the timeline sends its own MIDI clock / MTC to).
+   - *LTC*: an audio output; the timecode as sound for a desk's LTC input, or through a virtual cable (VB-CABLE on
+     Windows, BlackHole on macOS) to Resolume.
+4. Load the tracks of the set on the decks (each one comes into the list), or *Import* the rekordbox playlist of the
+   set: a txt export of the playlist, or `rekordbox.xml` with the name of the playlist. Then *Auto-fill* gives them
+   01:00:00:00, 02:00:00:00, ... in the order of the list, or type an offset per track.
+
+- A track is known by its title, artist and length. A track that is not in the list, or has no offset, gets the
+  *Unlisted* offset (23:00:00:00): program a fallback look there.
+- *On air (follow)*: the deck stays while it plays on air (with a DJM: channel open; with *Enhanced on air* also
+  through a short fader dip). Two seconds after it went quiet, the loudest deck that plays on air takes over: the one
+  whose channel meter is highest when the mixer sends [mixer data](Output-and-Devices.md#mixer-data), else its
+  waveform times its fader, else its waveform. Without a mixer playing is enough.
+- The position comes from the CDJ-3000 itself, from older players through the beat grid. It runs smoothly and never
+  goes backwards while the deck plays; a cue or a loop jumps. *Hold*: a paused deck goes on sending its frame (the desk
+  sees a timecode that stands); off: nothing while it pauses. No deck with a position: nothing goes out, never
+  00:00:00:00.
+- *Latency (ms)*: + sends the timecode earlier, for light or video that comes late.
+- The line under each output says what goes out ("Sends 01:00:08:05 (25) to 2.255.255.255:6454 · 239 packets").
+- The settings and the track offsets are saved with the project. [DJ Watch](Output-and-Devices.md#prolink-cdjs) has
+  the same in its tab *Timecode*.
+
+### TCNet
+
+*TCNet* at the top of the popup of *TC*: VibeVJ is the TCNet master node, as ShowKontrol or the PRO DJ LINK Bridge are.
+The decks go out as layers 1 to 4 (up to 8) with their position, play state, tempo, beat, on air, track names, beat
+grid and waveform. Resolume (clips that follow a layer by the track name), ChamSys MagicQ and grandMA3 take them.
+*On air* of a layer is the channel fader when the mixer sends [mixer data](Output-and-Devices.md#mixer-data) (Resolume
+can fade the layer with it), else full or nothing.
+
+- Turn on *TCNet*, choose the number of layers and, with more than one network card, the card of the receivers. The
+  line below names the receivers that answered.
+- *Offsets*: the SMPTE time of a layer is the timecode with the [track offsets](#timecode-from-the-decks); off: the
+  position in the track, as the Bridge sends it.
+- Only one TCNet master in the network: the line below warns when it sees another one. Not with ShowKontrol or the
+  Bridge on the same computer (they take the same ports, UDP 60000, 60001 and 65023).
 
 ## Snap windows
 

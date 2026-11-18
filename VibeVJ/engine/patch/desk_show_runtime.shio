@@ -1,0 +1,684 @@
+//Shows per track while the program runs (#719): engine.desk.shows. Reads the decks of DJ Link every frame (the device of
+//a ProlinkBridge / ProlinkDecks generator, std.global("prolink_sources"): player(n) and track(id) only, events() belongs
+//to the generator), runs the track cues, the rules on the names of the DJ's cues and on phrases and the look-ahead
+//actions (engine/patch/desk_show.shio finds them), keeps the limits of the stacks, leaves a stack alone for some bars
+//after the operator touched it and stops what the automation started when no deck plays any more. The cue call of the
+//master deck for the Cue call generator and the web remote (/cuecall). The data is `show` of desk.json
+//(desk_runtime.data.show: saved, a step of the undo history like the rest of the desk).
+//
+//- Stack actions (go / goto / off of a cue stack) run at once in the frame (no quantize: the cue is on the beat
+//  already). The other actions (clip, column, desk command, MIDI, ...) run after the frame of the desk, through
+//  tl_cue_run of the timeline cues (src/menu/timeline/cues.shio).
+//- A limit's max on-time and duty cycle also stop a stack started by hand; min gap, the duty cycle before a start and
+//  the arming of specials only hold back the automation.
+//- The operator touches a stack: Go, Back, Off, Goto, Flash, its master (Executors, Programmer, command line, MCP).
+//  The automation leaves it alone for backoff_bars bars (at the BPM of the deck) and does not stop it when the decks stop.
+//- Thread safety: everything takes the section "desk" of the desk (queries of AI agents and the web remote run on
+//  other threads).
+
+#include "engine/patch/desk_show"
+
+def tl_cue_run(action, timeline);
+
+DESK_SHOW_DECKS = 6;            //players 1..6 are read
+DESK_SHOW_INFO_MS = 1000;       //track(id) is read again this often (cues, phrases and the signature come in parts)
+DESK_SHOW_QUIET_MS = 3000;      //nothing runs this long after a project loads (the DJ plays already)
+DESK_SHOW_LOG = 100;            //what ran, kept for the UI and agents
+DESK_SHOW_CALL_MS = 3000;       //the cue call is worked out this long after the last one who looked
+
+class desk_show_runtime {
+	desk = None;            //the desk_runtime (it owns this)
+	trackers = None;        //deck n -> desk_show_tracker_new()
+	infos = None;           //track id -> [info, ms]
+	decks = None;           //deck n -> what the last frame saw: [n, pos, playing, on_air, master, bpm, track, title, entry]
+	owned = None;           //stack id -> ms: stacks the automation started and that still play
+	touched = None;         //stack id -> ms: when the operator last touched the stack
+	limit_states = None;    //stack id -> desk_limit_state_new()
+	armed = None;           //limit id -> true: specials the operator armed (not saved)
+	masters_seen = None;    //stack id -> the master last set (a change is a touch)
+	log = None;             //[[ms, kind, what, deck, action, ok, why]], the newest last
+	log_count = 0;          //goes up with each entry (the UI draws again)
+	last_drive_ms = 0;      //when a deck last played (master or on air)
+	call = None;            //the cue call of the master deck
+	call_wanted_ms = 0;
+	queued = None;          //[[action, what]]: actions that are no stack, run after the frame of the desk
+	quiet_ms = 0;
+	running_queued = false; //tl_cue_run of a queued action runs: a desk command of it is no touch of the operator
+	master_entry = None;    //the show of the track of the master deck (locks the phrases of the desk)
+	master_n = 0;
+
+	__init__(_desk) {
+		desk = _desk;
+		reset();
+	}
+
+	//A project loads (or a new desk): nothing of the last one goes on
+	reset() {
+		trackers = std.json();
+		infos = std.json();
+		decks = std.json();
+		owned = std.json();
+		touched = std.json();
+		limit_states = std.json();
+		armed = std.json();
+		masters_seen = std.json();
+		log = [];
+		queued = [];
+		call = None;
+		master_entry = None;
+		master_n = 0;
+		quiet_ms = std.millis_steady() + DESK_SHOW_QUIET_MS;
+		last_drive_ms = std.millis_steady();
+	}
+
+	show_data() {
+		return desk.data.show;
+	}
+
+	note(kind, what, deck_n, action, ok, why = "") {
+		log.push_back([ms = std.millis_steady(), kind = kind, what = std.string(what), deck = deck_n,
+			action = desk_action_text(desk.data, action), ok = ok ? true : false, why = std.string(why)]);
+		for(log.size() > DESK_SHOW_LOG)
+			log.erase(0);
+		log_count++;
+	}
+
+	// =========================================================================
+	// The decks
+	// =========================================================================
+
+	//A deck of the prolink module (player(n)) as desk_show_step takes it. lead_n: the deck device.lead() names (the
+	//tempo master, else the live deck that plays), -1 with a module without lead(): then its master flag
+	deck_of(n, m, lead_n = -1) {
+		if(!m)
+			return [n = n, pos = -1.0, playing = false, on_air = false, master = false, bpm = 0.0, track = "", title = ""];
+		beat = std.float(m.beat ??? -1);
+		pos = beat >= 1.0 ? beat + math.clamp(std.float(m.beatPhase ?? 0.0), 0.0, 0.999) : -1.0;
+		trk = m.track ?? None;
+		tid = trk && std.type(trk) == "json" ? std.string(trk.id ?? "") : "";
+		return [n = n, pos = pos, playing = (m.playing ?? false) && (m.moving ??? true) ? true : false,
+			on_air = m.onAir ? true : false, master = lead_n >= 0 ? n == lead_n : (m.master ? true : false),
+			bpm = std.float(m.effectiveBpm ?? m.bpm ?? 0.0), track = tid,
+			title = trk && std.type(trk) == "json" ? std.string(trk.title ?? "") : ""];
+	}
+
+	//track(id) of the device, read again every DESK_SHOW_INFO_MS
+	info_of(dev, id, now) {
+		if(!id)
+			return None;
+		if(infos.has(id) && now - infos[id].ms < DESK_SHOW_INFO_MS)
+			return infos[id].info;
+		info = None;
+		try {
+			info = dev.track(id);
+		}
+		catch(e) {}
+		infos[id] = [info = info, ms = now];
+		//only the tracks on the decks are kept
+		if(infos.size() > 16)
+			infos.erase(infos.key(0));
+		return info;
+	}
+
+	//Every frame (desk_runtime.tick, in the section "desk"): beat is where the timeline is
+	tick(now, beat) {
+		sh = show_data();
+		enforce_limits(now, beat);
+		used = desk_show_used(sh);
+		if(!used && now > call_wanted_ms + DESK_SHOW_CALL_MS) {
+			master_entry = None;
+			return;
+		}
+		dev = desk.prolink_device();
+		//"the master deck" of the shows: the deck lead() names (the one whose tempo goes out: the tempo master, else
+		//the deck that plays on air), as the tempo output does
+		lead_n = -1;
+		if(dev) {
+			try {
+				ld = dev.lead();
+				lead_n = ld ? std.int(ld.n ?? 0) : 0;
+			}
+			catch(e) {
+				lead_n = -1;
+			}
+		}
+		master_now = None;
+		driving = false;
+		for(n = 1; n <= DESK_SHOW_DECKS; n++) {
+			m = None;
+			if(dev) {
+				try {
+					m = dev.player(n);
+					if(m && !(m.present ??? true))
+						m = None;
+				}
+				catch(e) {}
+			}
+			nk = std.string(n);
+			if(!m && !trackers.has(nk))
+				continue;
+			deck = deck_of(n, m, lead_n);
+			info = deck.track && dev ? info_of(dev, deck.track, now) : None;
+			entry = info ? desk_show_track_of(sh, info) : None;
+			if(!trackers.has(nk))
+				trackers[nk] = desk_show_tracker_new();
+			found = desk_show_step(trackers[nk], deck, entry, info, sh);
+			if(deck.playing && (deck.master || deck.on_air))
+				driving = true;
+			if(now >= quiet_ms)
+				apply(found, deck, info, now, beat);
+			deck.entry = entry ? entry.id : "";
+			deck.signature = info ? std.string(info.signature ?? "") : "";
+			decks[nk] = deck;
+			if(deck.master)
+				master_now = [deck = deck, entry = entry, info = info];
+			if(!m) {
+				trackers.erase(nk);
+				decks.erase(nk);
+			}
+		}
+		master_entry = master_now ? master_now.entry : None;
+		master_n = master_now ? master_now.deck.n : 0;
+		if(driving)
+			last_drive_ms = now;
+		stop_idle(now, beat);
+		if(now <= call_wanted_ms + DESK_SHOW_CALL_MS)
+			call = master_now ? desk_show_cue_call(sh, master_now.deck, master_now.entry, master_now.info) : None;
+	}
+
+	//Runs what desk_show_step found
+	apply(found, deck, info, now, beat) {
+		sh = show_data();
+		for(ev : found) {
+			t = ev.type;
+			if(t == "enter") {
+				note("entered", ev.cue.name, deck.n, ev.cue.enter_action ?? None, true);
+				if(ev.cue.enter_action ?? None)
+					fire(ev.cue.enter_action, "Track cue " + ev.cue.name + " (entered)", deck, now, beat);
+			}
+			else if(t == "start") {
+				note(ev.late ? "started late" : "started", ev.cue.name, deck.n, ev.cue.action ?? None, true);
+				if(ev.cue.action ?? None)
+					fire(ev.cue.action, "Track cue " + ev.cue.name, deck, now, beat);
+			}
+			else if(t == "exit") {
+				note("exited", ev.cue.name, deck.n, ev.started ? ev.cue.end_action ?? None : None, true);
+				if(ev.started && (ev.cue.end_action ?? None))
+					fire(ev.cue.end_action, "Track cue " + ev.cue.name + " (end)", deck, now, beat);
+			}
+			else if(t == "name")
+				fire(ev.rule.action ?? None, "Cue name " + std.string(ev.rb.comment ?? ""), deck, now, beat);
+			else if(t == "phrase") {
+				picked = desk_show_pick_phrase(sh, deck, ev.phrase, info, math.random_float(0.0, 1.0));
+				for(rule : picked)
+					fire(rule.action ?? None, "Phrase " + std.string(ev.phrase.name ?? "") + ": " + std.string(rule.name ?? ""), deck, now, beat);
+			}
+			else if(t == "ahead")
+				fire(ev.rule.action ?? None, std.string(ev.rule.name ?? "") + " (" + desk_num_text(ev.rule.beats ?? 0) + " beats before " + std.string(ev.rule.target ?? "") + ")", deck, now, beat);
+		}
+	}
+
+	//An action of the automation: a stack at once (back-off and limits first), anything else after the frame
+	fire(action, what, deck, now, beat) {
+		if(!action || std.type(action) != "json") {
+			note("no action", what, deck.n, None, true);
+			return;
+		}
+		sid = desk_action_stack(action);
+		if(!sid) {
+			queued.push_back([action = action.copy(), what = what, deck = deck.n]);
+			return;
+		}
+		s = desk_stack(desk.data, sid);
+		if(!s) {
+			note("held", what, deck.n, action, false, "the stack is gone");
+			return;
+		}
+		sh = show_data();
+		op = std.string(action.op ?? "go");
+		if(touched.has(sid) && now - touched[sid] < desk_show_backoff_ms(sh.backoff_bars ?? 4.0, deck.bpm ? deck.bpm : 120.0)) {
+			note("held", what, deck.n, action, false, "the operator has " + s.name + " (back-off)");
+			return;
+		}
+		if(op != "off") {
+			lim = desk_limit_of(sh, sid);
+			why = desk_limit_may_start(lim, limit_state(sid), now, lim && armed.has(lim.id));
+			if(why) {
+				note("held", what, deck.n, action, false, why);
+				return;
+			}
+			desk.run_go(sid, op == "goto" ? "goto" : "go", std.float(action.cue ?? 1.0), now, beat);
+			owned[sid] = now;
+		}
+		else {
+			desk.run_go(sid, "off", 0, now, beat);
+			owned.erase(sid);
+		}
+		note("ran", what, deck.n, action, true);
+	}
+
+	//After the frame of the desk (outside its section): the actions that are no stack
+	run_queued() {
+		if(!queued || !queued.size())
+			return;
+		list = queued;
+		queued = [];
+		running_queued = true;
+		for(q : list) {
+			r = [ok = false, error = "no timeline"];
+			try {
+				r = tl_cue_run(q.action, desk.engine.timeline);
+			}
+			catch(e) {
+				r = [ok = false, error = std.string(e)];
+			}
+			managed _grd = std.critical_section("desk");
+			note(r.ok ? "ran" : "failed", q.what, q.deck, q.action, r.ok, r.ok ? "" : std.string(r.error ?? ""));
+		}
+		running_queued = false;
+	}
+
+	limit_state(sid) {
+		if(!limit_states.has(sid))
+			limit_states[sid] = desk_limit_state_new();
+		return limit_states[sid];
+	}
+
+	//Every frame: the stacks with a limit that run too long go off
+	enforce_limits(now, beat) {
+		sh = show_data();
+		for(lim : sh.limits) {
+			sid = std.string(lim.stack ?? "");
+			if(!sid)
+				continue;
+			st = limit_state(sid);
+			on = desk.playbacks.has(sid) && desk.playbacks[sid].on;
+			window = math.max(1.0, std.float(lim.window ?? 60.0));
+			desk_limit_note(st, on, now, window);
+			why = desk_limit_must_stop(lim, st, now);
+			if(why) {
+				desk.run_go(sid, "off", 0, now, beat);
+				desk_limit_note(st, false, now, window);
+				owned.erase(sid);
+				s = desk_stack(desk.data, sid);
+				note("limit", s ? s.name : sid, 0, [type = "stack", stack = sid, op = "off"], true, why);
+			}
+		}
+	}
+
+	//No deck played for stop_after seconds: what the automation started goes off
+	stop_idle(now, beat) {
+		sh = show_data();
+		after = std.float(sh.stop_after ?? 3.0);
+		if(after <= 0.0 || !owned.size() || now - last_drive_ms < after * 1000.0)
+			return;
+		for(i = 0; i < owned.size(); i++) {
+			sid = owned.key(i);
+			if(desk.playbacks.has(sid) && desk.playbacks[sid].on) {
+				desk.run_go(sid, "off", 0, now, beat);
+				s = desk_stack(desk.data, sid);
+				note("stopped", s ? s.name : sid, 0, [type = "stack", stack = sid, op = "off"], true, "no deck plays");
+			}
+		}
+		owned = std.json();
+	}
+
+	//The operator did something with a stack (Go, Back, Off, Flash, its master): the automation leaves it alone
+	touch(sid) {
+		if(running_queued || !sid)
+			return;
+		touched[sid] = std.millis_steady();
+		owned.erase(sid);
+	}
+
+	//The master of a stack was set (every frame by the Executors): a change is a touch
+	master_set(sid, v) {
+		if(masters_seen.has(sid) && math.abs(masters_seen[sid] - v) > 0.001)
+			touch(sid);
+		masters_seen[sid] = v;
+	}
+
+	//Does the track of the master deck have a show that locks out phrases (the phrases of the stacks too)
+	locks_master_phrases() {
+		return desk_show_locks_phrases(master_entry);
+	}
+
+	// =========================================================================
+	// What the UI, the web remote and agents do
+	// =========================================================================
+
+	//The deck a request means: "master" / "" / 0 the master deck, else its number. 0 when there is none
+	deck_number(ref) {
+		r = std.string(ref ?? "");
+		if(!r || r == "master" || r == "0")
+			return master_n;
+		return desk_is_number(r) ? std.int(std.float(r)) : 0;
+	}
+
+	//What a deck has: [n, title, artist, signature, pos, bar, playing, master, on_air, show (the track's show or None)]
+	deck_view(ref) {
+		managed _grd = std.critical_section("desk");
+		n = deck_number(ref);
+		if(!decks.has(std.string(n)))
+			return None;
+		d = decks[std.string(n)];
+		info = d.track && infos.has(d.track) ? infos[d.track].info : None;
+		entry = info ? desk_show_track_of(show_data(), info) : None;
+		return [n = n, title = info ? std.string(info.title ?? "") : d.title, artist = info ? std.string(info.artist ?? "") : "",
+			signature = d.signature ?? "", pos = d.pos, bar = d.pos >= 1.0 ? desk_show_bar_text(d.pos) : "",
+			playing = d.playing, master = d.master, on_air = d.on_air, bpm = d.bpm, show = entry, has_info = info ? true : false,
+			cues = info && info.has("cues") && std.type(info.cues) == "json" ? info.cues.size() : 0];
+	}
+
+	//The show of the track on a deck, made when make and the track has none. None without a track
+	entry_for(n, make) {
+		d = decks.has(std.string(n)) ? decks[std.string(n)] : None;
+		if(!d || !d.track || !infos.has(d.track) || !infos[d.track].info)
+			return None;
+		info = infos[d.track].info;
+		entry = desk_show_track_of(show_data(), info);
+		if(!entry && make)
+			entry = desk_show_track_add(show_data(), info);
+		//the signature came later than the show (the track was not complete then)
+		if(entry && !entry.signature && info.signature)
+			entry.signature = std.string(info.signature);
+		return entry;
+	}
+
+	//A change of the show as a step of the undo history: change(show) does it, returns what the caller gets
+	edit(name, change) {
+		managed _grd = std.critical_section("desk");
+		undo_from = desk.snapshot();
+		r = change(show_data());
+		desk.record_step(name, undo_from);
+		desk.changed();
+		return r;
+	}
+
+	//A cue at the playhead of a deck (beat: elsewhere), bars long. Returns [ok, cue, error]
+	add_cue_here(ref, name = "", bars = 4.0, crew = "Lighting", beat = None) {
+		managed _grd = std.critical_section("desk");
+		n = deck_number(ref);
+		d = decks.has(std.string(n)) ? decks[std.string(n)] : None;
+		if(!d || !d.track)
+			return [ok = false, error = "No track on deck " + (n ? std.string(n) : "master") + "."];
+		at = std.is_none(beat) ? d.pos : std.float(beat);
+		if(at < 1.0)
+			return [ok = false, error = "The deck has no beat yet (beat grid)."];
+		//on the beat: the cue starts where the beat the playhead is in started
+		if(std.is_none(beat))
+			at = math.floor(at + 0.05);
+		me = this;
+		cue = edit("Add track cue", [me, n, at, name, bars, crew](sh) {
+			entry = me.entry_for(n, true);
+			if(!entry)
+				return None;
+			return desk_show_cue_insert(entry, desk_show_cue_new(at, at + math.max(0.25, std.float(bars)) * 4.0, name, crew));
+		});
+		if(!cue)
+			return [ok = false, error = "The track of deck " + n + " is not known yet (metadata)."];
+		return [ok = true, cue = cue];
+	}
+
+	//The rekordbox cues of the track on a deck as its cues (kinds: all, memory, hot): [ok, added, error]
+	import_cues(ref, kinds = "all", crew = "Lighting") {
+		managed _grd = std.critical_section("desk");
+		n = deck_number(ref);
+		d = decks.has(std.string(n)) ? decks[std.string(n)] : None;
+		if(!d || !d.track || !infos.has(d.track) || !infos[d.track].info)
+			return [ok = false, error = "No track on deck " + (n ? std.string(n) : "master") + "."];
+		info = infos[d.track].info;
+		me = this;
+		added = edit("Import track cues", [me, n, info, kinds, crew](sh) {
+			entry = me.entry_for(n, true);
+			return entry ? desk_show_import(entry, info, kinds, crew) : 0;
+		});
+		return [ok = true, added = added];
+	}
+
+	//A special of a limit armed (the automation may start it) or not
+	arm(limit_id, on) {
+		managed _grd = std.critical_section("desk");
+		if(on)
+			armed[limit_id] = true;
+		else
+			armed.erase(limit_id);
+		desk.changed();
+	}
+
+	//The cue call of the master deck (worked out each frame while someone asks for it)
+	cue_call() {
+		managed _grd = std.critical_section("desk");
+		call_wanted_ms = std.millis_steady();
+		return call ? call.copy() : [deck = 0, title = "", pos = -1.0, bar = "", playing = false, phrase = "", show = false,
+			rows = [], next_phrase = None, waiting = "No master deck (DJ Link: a ProlinkBridge or ProlinkDecks generator)"];
+	}
+
+	//An action of an agent: a text (desk_action_parse) or [type, ...] (a stack by name too). [ok, action, error]
+	action_from(v) {
+		if(std.is_none(v) || v == "")
+			return [ok = true, action = None, error = ""];
+		if(std.type(v) == "string")
+			return desk_action_parse(desk.data, v);
+		if(std.type(v) != "json" || !v.has("type"))
+			return [ok = false, action = None, error = "An action is a text (go Main, off Main, clip 1 2, ...) or {type, ...}"];
+		a = v.copy();
+		if(a.type == "stack") {
+			s = desk_stack(desk.data, std.string(a.stack ?? "")) ?? desk_find_stack(desk.data, std.string(a.stack ?? ""));
+			if(!s)
+				return [ok = false, action = None, error = "No cue stack " + std.string(a.stack ?? "")];
+			a.stack = s.id;
+			if(!a.has("op"))
+				a.op = "go";
+		}
+		return [ok = true, action = a, error = ""];
+	}
+
+	//What an agent sees: the decks, the show, the log, the cue call
+	describe(ref = "") {
+		managed _grd = std.critical_section("desk");
+		sh = show_data();
+		deck_list = [];
+		for(i = 0; i < decks.size(); i++) {
+			d = decks[i];
+			deck_list.push_back([n = d.n, title = d.title, pos = math.round(d.pos * 100.0) / 100.0, bar = d.pos >= 1.0 ? desk_show_bar_text(d.pos) : "",
+				playing = d.playing, master = d.master, on_air = d.on_air, signature = d.signature ?? "", show = d.entry ?? ""]);
+		}
+		tracks = [];
+		for(t : sh.tracks) {
+			cues = [];
+			for(c : t.cues)
+				cues.push_back([id = c.id, name = c.name, beat = c.beat, end_beat = c.end_beat, at = desk_show_bar_text(c.beat), crew = c.crew,
+					action = desk_action_text(desk.data, c.action ?? None), end_action = desk_action_text(desk.data, c.end_action ?? None), late = c.late ?? false]);
+			tracks.push_back([id = t.id, title = t.title, artist = t.artist, dur = t.dur, signature = t.signature, enabled = t.enabled,
+				lock_phrases = t.lock_phrases ??? true, cues = cues]);
+		}
+		limits = [];
+		for(l : sh.limits) {
+			s = desk_stack(desk.data, l.stack ?? "");
+			st = limit_states.has(l.stack ?? "") ? limit_states[l.stack] : None;
+			e = l.copy();
+			e.stack_name = s ? s.name : "";
+			e.armed = armed.has(l.id);
+			e.on_seconds = st ? math.round(desk_limit_on_seconds(st, std.millis_steady(), math.max(1.0, std.float(l.window ?? 60.0))) * 10.0) / 10.0 : 0.0;
+			limits.push_back(e);
+		}
+		rules = std.json();
+		for(k : ["name_rules", "phrase_rules", "lookahead"]) {
+			list = [];
+			for(r : sh[k]) {
+				e = r.copy();
+				e.action = desk_action_text(desk.data, r.action ?? None);
+				list.push_back(e);
+			}
+			rules[k] = list;
+		}
+		recent = [];
+		for(i = 0; i < log.size(); i++)
+			recent.push_back(log[i]);
+		call_wanted_ms = std.millis_steady();
+		return [decks = deck_list, master_deck = master_n, tracks = tracks, name_rules = rules.name_rules, phrase_rules = rules.phrase_rules,
+			lookahead = rules.lookahead, limits = limits, crews = sh.crews, backoff_bars = sh.backoff_bars, stop_after = sh.stop_after,
+			standby_beats = sh.standby_beats, owned = owned.size(), log = recent, cue_call = call ? call.copy() : None];
+	}
+
+	// =========================================================================
+	// AI agents (the interface of the desk, live_path "desk")
+	// =========================================================================
+
+	register(ai) {
+		me = this;
+		ai.register("get_track_show", [], [me](args) {
+			return me.describe();
+		}, "Lighting desk, shows per track (DJ Link): the decks (track, position in beats and bars, signature, its show), the track shows with their cues (beat ranges and actions), the rules on rekordbox cue names, the phrase triggers, the look-ahead actions, the limits of stacks, what ran lately (log) and the cue call.");
+
+		ai.register("add_track_cue", [
+			deck = "string(): master (default) or a deck number 1-6",
+			beat = "float(): Where the cue starts in beats of the track (default: the beat of the playhead)",
+			bars = "float(): How long it lasts in bars (default 4)",
+			name = "string(): Its name",
+			crew = "string(): The crew of the cue call (Lighting, Video, SFX, Laser, ...)",
+			action = "any(): What it does when it starts: a text 'go <stack>', 'goto <n> <stack>', 'off <stack>', 'clip <row> <col>', 'column <col>', 'desk <command>', 'midi 90 3C 7F @ <device>', or {type, ...}",
+			end_action = "any(): What it does when the playhead leaves it after it started (same forms; often 'off <stack>')",
+		], [me](args) {
+			act = me.action_from(args.action ?? None);
+			if(!act.ok)
+				return [ok = false, error = act.error];
+			end_act = me.action_from(args.end_action ?? None);
+			if(!end_act.ok)
+				return [ok = false, error = end_act.error];
+			r = me.add_cue_here(args.deck ?? "", std.string(args.name ?? ""), args.has("bars") ? std.float(args.bars) : 4.0,
+				std.string(args.crew ?? "Lighting"), args.has("beat") ? std.float(args.beat) : None);
+			if(!r.ok)
+				return r;
+			managed _grd = std.critical_section("desk");
+			r.cue.action = act.action;
+			r.cue.end_action = end_act.action;
+			return [ok = true, cue = r.cue.copy()];
+		}, "Lighting desk: adds a cue to the show of the track on a deck (made for it when it has none; found again by its signature on any USB stick). It runs its action when the deck plays through its first beat, its end action when the playhead leaves it.");
+
+		ai.register("import_track_cues", [
+			deck = "string(): master (default) or a deck number 1-6",
+			kinds = "string(): all (default), memory or hot",
+		], [me](args) {
+			return me.import_cues(args.deck ?? "", std.string(args.kinds ?? "all"));
+		}, "Lighting desk: the memory and / or hot cues rekordbox stored for the track on a deck become cues of its show (with their names; no action yet: give them one with set_track_show).");
+
+		ai.register("set_track_show", [
+			track = "string(): The id of a track show (get_track_show), or empty for the track on 'deck'",
+			deck = "string(): master (default) or a deck number, when track is empty",
+			enabled = "string(): When its cues run: master (the tempo master deck), onair (channel open on the DJM), always (any deck), never",
+			lock_phrases = "int(0,1): The track's cues lock out phrase triggers and look-ahead on phrases (default true)",
+			cues = "any(): All its cues: [{name, beat, end_beat, crew, action, end_action, enter_action, late}] (replaces them; action forms as in add_track_cue)",
+			remove = "int(0,1): Delete this track show",
+		], [me](args) {
+			managed _grd = std.critical_section("desk");
+			sh = me.show_data();
+			entry = args.track ?? "" ? desk_show_by_id(sh.tracks, std.string(args.track)) : me.entry_for(me.deck_number(args.deck ?? ""), true);
+			if(!entry)
+				return [ok = false, error = "No track show " + std.string(args.track ?? "") + " / no track on the deck"];
+			cues = None;
+			if(args.has("cues") && std.is_json(args.cues)) {
+				cues = [];
+				for(c : args.cues) {
+					cue = desk_show_cue_new(c.beat ?? 1.0, c.end_beat ?? -1.0, std.string(c.name ?? ""), std.string(c.crew ?? "Lighting"));
+					for(k : ["action", "end_action", "enter_action"]) {
+						act = me.action_from(c[k] ?? None);
+						if(!act.ok)
+							return [ok = false, error = "cue " + std.string(c.name ?? "") + ": " + act.error];
+						cue[k] = act.action;
+					}
+					cue.late = c.late ? true : false;
+					cues.push_back(cue);
+				}
+			}
+			eid = entry.id;
+			me.edit("Track show", [args, eid, cues](show) {
+				e = desk_show_by_id(show.tracks, eid);
+				if(!e)
+					return None;
+				if(args.has("remove") && args["remove"]) {
+					desk_show_remove_id(show.tracks, eid);
+					return None;
+				}
+				if(args.has("enabled") && DESK_SHOW_SCOPES.has_value(std.string(args.enabled)))
+					e.enabled = std.string(args.enabled);
+				if(args.has("lock_phrases"))
+					e.lock_phrases = args.lock_phrases ? true : false;
+				if(cues) {
+					e.cues = [];
+					for(c : cues)
+						desk_show_cue_insert(e, c);
+				}
+				return None;
+			});
+			return [ok = true, track = eid];
+		}, "Lighting desk: sets the show of a track: when it runs (master deck, on air, any deck, never), whether its cues lock out the phrase triggers, all its cues, or deletes it.");
+
+		ai.register("set_show_rules", [
+			name_rules = "any(): [{pattern ('DROP', '@strobe', 'build*'), kinds (all|memory|hot), players (master|onair|always), crew, action, on}]: a rekordbox cue whose name (or a word of it) matches runs the action when the deck plays through it",
+			phrase_rules = "any(): [{name, phrase (''|intro|verse|buildup|drop|break|outro), players, mood (''|high|mid|low), bars_min, bars_max, bpm_min, bpm_max (0: no limit), weight (1-1000), solo (true: runs alone; false: blends with the other blend ones), crew, action, on}]",
+			lookahead = "any(): [{name, target (drop|buildup|break|phrase|memory|cue), beats (how many beats before), players, crew, action, on}]",
+			limits = "any(): [{stack (name), max_on (s), min_gap (s), duty (0..1 of window), window (s), special (true: the automation never starts it until armed)}]",
+			crews = "any(): The crews of the cue call, e.g. [\"Lighting\", \"Video\", \"SFX\", \"Laser\"]",
+			backoff_bars = "float(): Bars the automation leaves a stack alone after the operator touched it",
+			stop_after = "float(): Seconds without a playing deck before the automation stops what it started (0: never)",
+			standby_beats = "float(): Beats before an item when the cue call says standby",
+		], [me](args) {
+			managed _grd = std.critical_section("desk");
+			lists = std.json();
+			for(k : ["name_rules", "phrase_rules", "lookahead", "limits"]) {
+				if(!args.has(k) || !std.is_json(args[k]))
+					continue;
+				out = [];
+				for(src : args[k]) {
+					r = desk_show_rule_new(k);
+					for(f, v : src)
+						r[f] = v;
+					if(k == "limits") {
+						s = desk_stack(me.desk.data, std.string(r.stack ?? "")) ?? desk_find_stack(me.desk.data, std.string(r.stack ?? ""));
+						if(!s)
+							return [ok = false, error = "limits: no cue stack " + std.string(r.stack ?? "")];
+						r.stack = s.id;
+					}
+					else {
+						act = me.action_from(src.action ?? None);
+						if(!act.ok)
+							return [ok = false, error = k + ": " + act.error];
+						r.action = act.action;
+					}
+					out.push_back(r);
+				}
+				lists[k] = out;
+			}
+			me.edit("Show rules", [args, lists](show) {
+				for(k, v : lists)
+					show[k] = v;
+				if(args.has("crews") && std.is_json(args.crews) && args.crews.size())
+					show.crews = args.crews.copy();
+				for(k : ["backoff_bars", "stop_after", "standby_beats"]) {
+					if(args.has(k))
+						show[k] = math.max(0.0, std.float(args[k]));
+				}
+				return None;
+			});
+			return [ok = true];
+		}, "Lighting desk: the rules of the shows per track that need no show file: names of rekordbox cues as triggers, phrase triggers (filters, weighted random pick, solo / blend), look-ahead actions (fog 16 beats before the drop, blackout 1 beat before), safety limits of stacks (strobes, blinders, specials), the crews of the cue call, back-off and stop. A list given replaces the one there.");
+
+		ai.register("arm_special", [
+			stack = "&string(): A cue stack with a limit that is special, by name or number",
+			armed = "&int(0,1): true: the automation may start it",
+		], [me](args) {
+			s = desk_find_stack(me.desk.data, std.string(args.stack ?? ""));
+			lim = s ? desk_limit_of(me.show_data(), s.id) : None;
+			if(!lim)
+				return [ok = false, error = "No limit of a stack " + std.string(args.stack ?? "")];
+			me.arm(lim.id, args.armed ? true : false);
+			return [ok = true, armed = args.armed ? true : false];
+		}, "Lighting desk: arms or disarms a special (a stack whose limit is special: CO2, pyro). Disarmed (the default, also after a load) the automation never starts it.");
+
+		ai.register("get_cue_call", [], [me](args) {
+			return me.cue_call();
+		}, "Lighting desk: the cue call of the master deck: per crew the next thing (track cue, named rekordbox cue, look-ahead, phrase trigger) in bars.beats and standby / 3 / 2 / 1 / go, the phrase now and the next phrase.");
+	}
+}

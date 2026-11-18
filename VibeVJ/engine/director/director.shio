@@ -1,0 +1,468 @@
+//Director: typed decisions of an AI model for a live show (the decision models of the Jev kind, run on any
+//OpenAI-compatible chat API: a local vLLM / Ollama / LM Studio or a cloud API).
+//
+//- The state of the show is a small JSON (director_state): the tempo master deck of Pro DJ Link (track, key, genre,
+//  phrase and mood of rekordbox, beats to the next cue), the levels linked into the generator, what was decided last.
+//- The questions are typed (director_question): "score" (0 = calm .. 1 = peak), "bool" (yes / no) and "choice" (one of
+//  a list). One request asks all of them; the answer is a JSON schema (response_format json_schema), every answer has a
+//  value and a confidence (0..1), so the caller acts only on sure answers (director_gate).
+//- A picture (the VibeVJ window or a camera, PNG) can go with the request for models that see (image_url content).
+//- The VJ guides the model with a behaviour prompt for the whole show (into the system prompt) and with short
+//  instructions that run out (director_instruction: for some minutes, this track, or until removed); the newest win.
+//  The model answers with a short note too ("note" of the answer): what it does and why, the reply to an instruction.
+//
+//Used by the Director generator (assets/Generators/Utility/Director.asset). Everything here but director_request is a
+//pure function; _testing/director.shio tests them and a request against a mock server.
+
+import curl;
+
+def director_is_number(s);
+def director_num_text(v);
+
+DIRECTOR_SYSTEM_PROMPT = """You are the decision engine of a live visual show (VJ) that runs next to a DJ.
+You get the state of the show as JSON: the track and its phrase from the DJ players, the levels of the music, what the crowd does, what was decided before.
+Answer every question with a value of its type and how sure you are (confidence 0 to 1).
+- score: 0 is calm, 1 is the peak of the night
+- bool: true or false
+- choice: exactly one of the options
+Follow the energy of the music: build-ups rise, drops are the peaks, breaks and intros are calm. Change things on phrase changes, do not flicker.
+The VJ can give you rules for the whole show and short instructions for now. Instructions for now win over the rules for the show and over your own taste; the newest instruction wins.
+Add a note: one short sentence (at most 15 words) for the VJ, what you do and why; if there is a new instruction, say how you follow it.
+Answer with the JSON only.""";
+
+DIRECTOR_NOTE_MAX = 200;
+
+DIRECTOR_DEFAULT_TIMEOUT_MS = 20000;
+
+//A question: id (a JSON key: letters, digits, _), kind ("score", "bool", "choice"), the question, options (choice)
+director_question(id, kind, text, options = None) {
+	q = [id = id, kind = kind, text = text];
+	if(kind == "choice")
+		q.options = options ?? [];
+	return q;
+}
+
+//The options of a text field "warm, cold, neon": trimmed, empty ones left out
+director_options(text) {
+	list = [];
+	for(part : std.string(text ?? "").split(",")) {
+		p = part.strip();
+		if(p)
+			list.push_back(p);
+	}
+	return list;
+}
+
+//A short instruction of the VJ: runs out after ttl_ms (0: no time limit), or when the master deck plays another track
+//than track_id ("" : not bound to a track). now: std.millis()
+director_instruction(text, ttl_ms, track_id, now) {
+	return [
+		text = std.string(text ?? "").strip(),
+		at = now,
+		until = ttl_ms > 0 ? now + ttl_ms : 0,
+		track = std.string(track_id ?? ""),
+	];
+}
+
+//How long a chat instruction holds, from what the VJ typed: "" the default, "10" / "10m" / "10 min" minutes, "30s",
+//"1.5h", "track" (until the master deck plays another track), "show" or "0" (until removed).
+//Returns [ok, ms (0: no time limit), track (true: bound to the track), text (for the chat)]
+director_duration(text, default_minutes) {
+	t = std.string(text ?? "").strip().lowercase();
+	if(!t)
+		t = std.string(default_minutes);
+	if(t == "track" || t == "t")
+		return [ok = true, ms = 0, track = true, text = "this track"];
+	if(t == "show" || t == "0" || t == "-")
+		return [ok = true, ms = 0, track = false, text = "until removed"];
+	unit = 60000.0;
+	num = t;
+	if(t.ends("min"))
+		num = t.removesuffix("min");
+	else if(t.ends("m"))
+		num = t.removesuffix("m");
+	else if(t.ends("s")) {
+		num = t.removesuffix("s");
+		unit = 1000.0;
+	}
+	else if(t.ends("h")) {
+		num = t.removesuffix("h");
+		unit = 3600000.0;
+	}
+	num = num.strip();
+	if(!director_is_number(num) || std.float(num) <= 0)
+		return [ok = false, ms = 0, track = false, text = ""];
+	ms = std.float(num) * unit;
+	if(ms < 1000)
+		ms = 1000;
+	return [ok = true, ms = ms, track = false, text = director_num_text(std.float(num)) + (unit == 1000.0 ? " s" : (unit == 60000.0 ? " min" : " h"))];
+}
+
+//A number as short text: 5 (not 5.000000), 1.5
+director_num_text(v) {
+	f = std.float(v);
+	if(f == std.int(f))
+		return std.string(std.int(f));
+	t = std.string(f);
+	if(t.contains(".")) {
+		for(t.ends("0"))
+			t = t.removesuffix("0");
+		t = t.removesuffix(".");
+	}
+	return t;
+}
+
+//The instructions that still hold at now on the track track_id (a list of director_instruction)
+director_active(instructions, now, track_id) {
+	list = [];
+	tid = std.string(track_id ?? "");
+	for(it : instructions ?? []) {
+		if(it.until > 0 && now >= it.until)
+			continue;
+		if(it.track && tid && it.track != tid)
+			continue;
+		list.push_back(it);
+	}
+	return list;
+}
+
+//How long an instruction holds, for the model and the VJ: "3 min left", "this track", "until removed"
+director_instruction_left(it, now) {
+	if(it.until > 0) {
+		s = math.max(0, std.int((it.until - now) / 1000));
+		if(s >= 60)
+			return std.string(std.int(math.ceil(s / 60.0))) + " min left";
+		return std.string(s) + " s left";
+	}
+	if(it.track)
+		return "this track";
+	return "until removed";
+}
+
+//The phrase of rekordbox (or the one found in the waveform) at a beat: [name, group, beats_left, next] or None
+director_phrase_at(track_data, beat) {
+	if(!track_data || !track_data.phrases || beat < 0)
+		return None;
+	phrases = track_data.phrases;
+	for(i = 0; i < phrases.size(); i++) {
+		p = phrases[i];
+		end_beat = p.endBeat ??? p.beat;
+		if(beat >= p.beat && beat < end_beat) {
+			r = [name = p.name ?? "", beats_left = end_beat - beat];
+			if(p.group)
+				r.group = p.group;
+			if(i + 1 < phrases.size())
+				r.next = phrases[i + 1].name ?? "";
+			return r;
+		}
+	}
+	return None;
+}
+
+//The phrase key of a deck: changes when the deck enters another phrase or loads another track ("" without phrases)
+director_phrase_key(m, track_data) {
+	if(!m)
+		return "";
+	id = m.track ? std.string(m.track.id ?? "") : "";
+	p = director_phrase_at(track_data, m.beat ??? -1);
+	if(!p)
+		return id;
+	return id + "/" + p.name + "/" + std.string(std.int((m.beat ??? 0) + p.beats_left));
+}
+
+//A value 0..1 as text with 2 decimals ("0.85"; std.string of a float gives "0.850000")
+director_fixed2(v) {
+	i = std.int(math.round(math.clamp(std.float(v ??? 0), 0.0, 1.0) * 100.0));
+	if(i >= 100)
+		return "1.00";
+	return "0." + (i < 10 ? "0" : "") + std.string(i);
+}
+
+//Rounds to 2 decimals: the state is read by a model, 0.73 says as much as 0.7312345
+director_round(v) {
+	return math.round(std.float(v ??? 0) * 100.0) / 100.0;
+}
+
+//The state of the show. m: master() of a prolink device (or None), track_data: its track(id) (or None),
+//levels: [name = 0..1, ...] (the inputs of the generator), last: the decisions before ([id = value]),
+//extra: more JSON (crowd, ...). What the VJ wants goes into director_body (behaviour, instructions), not here
+director_state(m, track_data, levels, last = None, extra = None) {
+	s = [time = std.date("%H:%M")];
+	if(m) {
+		deck = [
+			bpm = director_round(m.effectiveBpm),
+			playing = m.playing ? 1 : 0,
+			on_air = m.onAir ? 1 : 0,
+			beat_in_bar = m.beatInBar ??? 0,
+		];
+		if(!std.is_none(m.progress))
+			deck.progress = director_round(m.progress);
+		if(!std.is_none(m.beatsToCue) && m.beatsToCue >= 0)
+			deck.beats_to_cue = m.beatsToCue;
+		deck.low = director_round(m.low);
+		deck.mid = director_round(m.mid);
+		deck.high = director_round(m.high);
+		s.deck = deck;
+		t = m.track;
+		if(t && t.title) {
+			track = [title = t.title];
+			if(t.artist) track.artist = t.artist;
+			if(t.genre) track.genre = t.genre;
+			if(t.key) track.key = t.key;
+			if(t.bpm) track.bpm = director_round(t.bpm);
+			if(track_data && track_data.mood) track.mood = track_data.mood;
+			s.track = track;
+		}
+		p = director_phrase_at(track_data, m.beat ??? -1);
+		if(p)
+			s.phrase = p;
+	}
+	if(levels && levels.size()) {
+		lv = std.json();
+		for(k, v : levels)
+			lv[k] = director_round(v);
+		s.levels = lv;
+	}
+	if(last && last.size())
+		s.last = last;
+	if(extra)
+		for(k, v : extra)
+			s[k] = v;
+	return s;
+}
+
+//The JSON schema of the answer: [<id> = [value = ..., confidence = 0..1], ...], every question required
+director_schema(questions) {
+	props = std.json();
+	required = [];
+	for(q : questions) {
+		value = None;
+		if(q.kind == "bool")
+			value = [type = "boolean"];
+		else if(q.kind == "choice")
+			value = [type = "string", enum = q.options];
+		else
+			value = [type = "number", minimum = 0, maximum = 1];
+		props[q.id] = [
+			type = "object",
+			properties = [value = value, confidence = [type = "number", minimum = 0, maximum = 1]],
+			required = ["value", "confidence"],
+			additionalProperties = json.bool(false),
+		];
+		required.push_back(q.id);
+	}
+	props["note"] = [type = "string"];
+	required.push_back("note");
+	return [type = "object", properties = props, required = required, additionalProperties = json.bool(false)];
+}
+
+//The user message: the state, the instructions of the VJ for now and the questions as text (also for servers that ignore
+//the schema). instructions: lines ("[3 min left] keep it dark"), newest first
+director_prompt(state, questions, instructions = None) {
+	lines = "State of the show:\n" + state.compact_string() + "\n\n";
+	if(instructions && instructions.size()) {
+		lines += "Instructions of the VJ for now (newest first, they win):\n";
+		for(t : instructions)
+			lines += "- " + t + "\n";
+		lines += "\n";
+	}
+	lines += "Questions:\n";
+	for(q : questions) {
+		line = "- " + q.id + " (" + q.kind;
+		if(q.kind == "choice")
+			line += ": " + q.options.combine_string(" | ").removesuffix(" | ");
+		lines += line + "): " + q.text + "\n";
+	}
+	lines += "\nAnswer as JSON: {\"<id>\": {\"value\": ..., \"confidence\": 0..1}, ..., \"note\": \"...\"} with every id.";
+	return lines;
+}
+
+//The lines of the instructions for director_prompt, newest first: "[3 min left] keep it dark"
+director_instruction_lines(instructions, now) {
+	lines = [];
+	for(i = (instructions ?? []).size() - 1; i >= 0; i--)
+		lines.push_back("[" + director_instruction_left(instructions[i], now) + "] " + instructions[i].text);
+	return lines;
+}
+
+//The body of POST <api>/chat/completions. image_png: the bytes of a PNG (std.buffer / binary) or None.
+//guide: [behaviour = "rules of the VJ for the whole show", instructions = director_instruction_lines(...)] or None
+director_body(model, state, questions, image_png = None, structured = true, guide = None) {
+	text = director_prompt(state, questions, guide ? guide.instructions : None);
+	system = DIRECTOR_SYSTEM_PROMPT;
+	behaviour = guide ? std.string(guide.behaviour ?? "").strip() : "";
+	if(behaviour)
+		system += "\n\nRules of the VJ for this show:\n" + behaviour;
+	content = text;
+	if(image_png) {
+		content = [
+			[type = "text", text = text],
+			[type = "image_url", image_url = [url = "data:image/png;base64," + std.base64_encode(image_png)]],
+		];
+	}
+	body = [
+		messages = [
+			[role = "system", content = system],
+			[role = "user", content = content],
+		],
+		temperature = 0.2,
+		max_tokens = 400,
+		stream = json.bool(false),
+	];
+	if(model)
+		body.model = model;
+	if(structured)
+		body.response_format = [
+			type = "json_schema",
+			json_schema = [name = "director_decisions", strict = json.bool(true), schema = director_schema(questions)],
+		];
+	return body;
+}
+
+//The JSON object in a text: models without a schema sometimes wrap it in ```json ... ``` or a sentence
+director_extract_json(text) {
+	t = std.string(text ?? "");
+	a = t.find("{");
+	b = t.rfind("}");
+	if(a < 0 || b <= a)
+		return None;
+	try {
+		return std.json(t.substr(a, b - a + 1));
+	}
+	catch(e) {}
+	return None;
+}
+
+//A string that is a plain decimal number ("0.8", "-1", "3"), checked without std.float (it warns on text)
+director_is_number(s) {
+	s = std.string(s).strip();
+	digits = 0;
+	dots = 0;
+	for(i, c : s.chars()) {
+		if(c >= "0" && c <= "9")
+			digits++;
+		else if(c == "." && dots == 0)
+			dots++;
+		else if(c == "-" && i == 0)
+			continue;
+		else
+			return false;
+	}
+	return digits > 0;
+}
+
+//One answer checked against its question: [value, number, confidence] or None (a wrong type, an option not in the list).
+//number: what an output shows (score 0..1, bool 0 / 1, choice the index of the option)
+director_check_answer(q, a) {
+	if(std.is_none(a))
+		return None;
+	value = a;
+	conf = 0.5;
+	if(std.type(a) == "json" && a.has("value")) {
+		value = a["value"];
+		if(!std.is_none(a["confidence"]))
+			conf = math.clamp(std.float(a["confidence"]), 0.0, 1.0);
+	}
+	if(std.is_none(value))
+		return None;
+	if(q.kind == "bool") {
+		s = std.string(value).lowercase();
+		if(s == "true" || s == "1" || s == "yes")
+			return [value = true, number = 1.0, confidence = conf];
+		if(s == "false" || s == "0" || s == "no")
+			return [value = false, number = 0.0, confidence = conf];
+		return None;
+	}
+	if(q.kind == "choice") {
+		want = std.string(value).strip().lowercase();
+		for(i, o : q.options)
+			if(std.string(o).lowercase() == want)
+				return [value = o, number = std.float(i), confidence = conf];
+		return None;
+	}
+	t = std.type(value);
+	if(t != "int" && t != "float" && !(t == "string" && director_is_number(value)))
+		return None;
+	v = math.clamp(std.float(value), 0.0, 1.0);
+	return [value = v, number = v, confidence = conf];
+}
+
+//The answers of a reply of /chat/completions (the JSON text of the reply or its content):
+//[ok, answers = [<id> = [value, number, confidence]], error]. Questions without a valid answer are left out.
+director_parse(reply_text, questions) {
+	reply = None;
+	text = std.string(reply_text ?? "").strip();
+	if(text.starts("{")) {
+		try {
+			reply = std.json(text);
+		}
+		catch(e) {}
+	}
+	content = reply_text;
+	if(reply && reply.choices && reply.choices.size()) {
+		msg = reply.choices[0].message;
+		content = msg ? (msg.content ?? "") : "";
+	}
+	data = director_extract_json(content);
+	if(!data)
+		return [ok = false, answers = std.json(), note = "", error = "The model gave no JSON: " + std.string(content ?? "").substr(0, 200)];
+	answers = std.json();
+	for(q : questions) {
+		if(!data.has(q.id))
+			continue;
+		a = director_check_answer(q, data[q.id]);
+		if(a)
+			answers[q.id] = a;
+	}
+	note = "";
+	if(data.has("note") && std.type(data["note"]) == "string")
+		note = std.string(data["note"]).strip().substr(0, DIRECTOR_NOTE_MAX);
+	if(!answers.size())
+		return [ok = false, answers = answers, note = note, error = "No answer of the model fits the questions"];
+	return [ok = true, answers = answers, note = note, error = ""];
+}
+
+//Whether to act on an answer: its confidence reaches the threshold
+director_gate(answer, threshold) {
+	return answer && answer.confidence >= threshold;
+}
+
+//The endpoint of chat completions from the URL of the API ("http://localhost:8000/v1", ".../v1/" or the full path)
+director_endpoint(api_url) {
+	u = std.string(api_url ?? "").strip().removesuffix("/");
+	if(u.ends("/chat/completions"))
+		return u;
+	return u + "/chat/completions";
+}
+
+//Blocking request (call it on a std.thread, not in update()): [ok, http_code, body, error, ms]
+director_request(api_url, token, body, timeout_ms = DIRECTOR_DEFAULT_TIMEOUT_MS) {
+	headers = ["Content-Type" = "application/json"];
+	if(token)
+		headers["Authorization"] = "Bearer " + token;
+	started = std.millis();
+	c = curl.curl();
+	r = c.request("POST", director_endpoint(api_url), body.compact_string(), headers, timeout_ms);
+	ms = std.millis() - started;
+	if(!r || !r.ok)
+		return [ok = false, http_code = 0, body = "", error = "Request failed: " + std.string(r ? (r.error ?? "") : "no reply"), ms = ms];
+	code = r.http_code ??? 0;
+	if(code < 200 || code >= 300)
+		return [ok = false, http_code = code, body = r.body ?? "", error = "HTTP " + std.string(code) + ": " + std.string(r.body ?? "").substr(0, 300), ms = ms];
+	return [ok = true, http_code = code, body = r.body ?? "", error = "", ms = ms];
+}
+
+//One log line (JSON lines: state, the instructions of the VJ, answers, note, what was applied, how long the model took)
+director_log_entry(state, result, applied, ms, mode, instructions = None) {
+	return [
+		instructions = instructions ?? [],
+		note = result ? (result.note ?? "") : "",
+		t = std.date("%Y-%m-%d %H:%M:%S"),
+		mode = mode,
+		ms = ms,
+		state = state,
+		answers = result ? result.answers : std.json(),
+		error = result ? result.error : "",
+		applied = applied ?? [],
+	];
+}

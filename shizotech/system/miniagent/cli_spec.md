@@ -46,11 +46,13 @@ If the timeout expires while the process is still running, **do not terminate it
 
 A timeout is therefore not an error.
 
+A command that cannot be started is an error with its reason (`ok = false`, `error`, `hint`): a missing `command`, a `cwd` that does not exist, a program or script interpreter that is not found. A command that starts and fails is not an error of the tool: it returns `state: EXITED` with its exit code and output.
+
 ### Multi-line commands
 
-A `command` containing line breaks is not passed to the shell as one collapsed statement. It is written to a script file in a `.shz_cmd` directory inside `cwd` and executed line by line with the interpreter selected by `script_type` (`bat` on Windows, `sh` elsewhere). The file is named after the session (`shz_cmd_<session_id>.bat`) and removed when the session ends. This is how inline scripts, heredoc-like input and batch files with control flow are supported.
+A `command` containing line breaks is not passed to the shell as one collapsed statement. It runs as one script with the interpreter selected by `script_type` (`bat` on Windows, `sh` elsewhere): `sh` and `py` get the script text inline (`sh -c`, `python -c`), no file is written. `bat` and `ps1` need a file: it is written to the system temp directory, named after the session, and removed when the session ends. Nothing is written into `cwd`. This is how inline scripts, heredoc-like input and batch files with control flow are supported.
 
-A single-line command with an explicit `script_type` is stored as a script file as well.
+A single-line command with an explicit `script_type` runs the same way.
 
 ### Example
 
@@ -160,7 +162,7 @@ command_input(
 : Session to send input to.
 
 `input`
-: Data written to the process stdin. May be empty when only closing stdin.
+: Data written to the process stdin. May be empty or left out when only closing stdin.
 
 `close_stdin`
 : Optional flag to close the stdin pipe after writing, which tells the process that there is no more input.
@@ -174,6 +176,8 @@ The process remains running after the call unless the input itself causes it to 
 Input should not automatically be appended with a newline. The caller is responsible for providing exactly the desired input.
 
 This allows both ordinary interactive input and programs requiring precise byte/line input.
+
+Input to a session whose process has already exited is an error; the result carries the exit code and the output the process still printed, and the session is closed.
 
 Closing the stdin pipe (`close_stdin`) is the only reliable way to signal the end of the input. Sending `Ctrl+Z` as text does not work.
 
@@ -319,7 +323,19 @@ Command sessions should capture stdout and stderr.
 
 Output should be made available incrementally so long-running processes do not repeatedly inject their entire output history into the agent context.
 
-The harness should impose a bounded session output buffer to prevent unbounded memory or context growth.
+The output of one tool result is bounded (40 KB). An over-long output is not cut at the end: its **head and its tail** are kept (the start shows what ran, the errors are at the end), with a marker in between:
+
+```text
+...[output truncated: 139941 of 179930 bytes dropped here, the head and the tail are kept]...
+```
+
+The result then has `truncated`, `dropped_bytes`, `total_output_bytes` and a `truncation_note`. To get all of an output, send it to a file (`command > out.log 2>&1`) and read the file in parts.
+
+A wait that collects output until the process exits (`command_start` with a negative timeout, `command_wait`) keeps at most 200 KB while it blocks: the first 20 KB and the newest rest. What a very chatty process printed in between is dropped and counted in `dropped_bytes`.
+
+## Unknown sessions
+
+A `session_id` that is not registered (never existed, already exited and read, killed) is an error that lists the ids of the active sessions (`active_sessions`).
 
 ## Interactive processes
 

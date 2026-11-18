@@ -22,11 +22,14 @@
 //  in desk.json (group_inputs), their values with the controls.
 //- Inputs of generators (set_input): a ColorSelector row with Lamps sends its colour to them every frame while it runs.
 //- AI: the interface with live_path "desk": get_desk_state, desk_command (MCP: tools of their own).
+//- Shows per track (engine/patch/desk_show_runtime.shio, `shows`): cues at beats of the DJ's tracks, rules on the
+//  names of rekordbox cues and on phrases, look-ahead, limits of stacks, the cue call; `show` of desk.json.
 //- Thread safety: the queries of AI agents run on other threads, everything here takes the section "desk".
 
 #include "engine/patch/patch"
 #include "engine/patch/fx"
 #include "engine/patch/desk"
+#include "engine/patch/desk_show_runtime"
 
 DESK_LIVE_PATH = "desk";
 
@@ -52,6 +55,7 @@ class desk_runtime {
 	revision = 0;             //goes up with every change: the Programmer and the Executors draw again
 	message = "";             //what the last command did (the Programmer shows it)
 	managed ai = None;
+	managed shows = None;     //shows per track (desk_show_runtime)
 	cache = None;             //lamp id -> [f, ctrls, has_dimmer]
 	cache_revision = -1;
 	before = None;            //who -> [<id> = [<label> = v]]: what a control had before who sent to it
@@ -81,6 +85,7 @@ class desk_runtime {
 	__init__(_engine) {
 		engine = _engine;
 		data = desk_new();
+		data.show = desk_show_new();
 		prog = desk_programmer_new();
 		playbacks = std.json();
 		masters = std.json();
@@ -91,7 +96,7 @@ class desk_runtime {
 		video_values = std.json();
 		inputs = std.json();
 		group_ltp = std.json();
-		phrase_quiet_ms = std.millis() + 3000;
+		phrase_quiet_ms = std.millis_steady() + 3000;
 		engine.save_hooks["desk"] = [this]() {
 			managed _grd = std.critical_section("desk");
 			out = this.data.copy();
@@ -101,9 +106,11 @@ class desk_runtime {
 		engine.load_hooks["desk"] = [this](state) {
 			this.load(state);
 		};
+		shows = desk_show_runtime(this);
 		ai = AIInterface(desk_ai_target(), None, "engine/patch/desk_runtime.shio");
 		ai.add_capability("fixtures");
 		register_queries();
+		shows.register(ai);
 	}
 
 	//A project loads: its palettes and stacks (a project without desk.json starts with the start palettes)
@@ -118,6 +125,8 @@ class desk_runtime {
 			data = desk_new();
 		else
 			data = desk_normalize(state);
+		data.show = desk_show_normalize(data.has("show") ? data.show : None);
+		shows.reset();
 		base = std.json();
 		prog = desk_programmer_new();
 		playbacks = std.json();
@@ -127,7 +136,7 @@ class desk_runtime {
 		current_stack = "";
 		highlight = false;
 		phrase_key = None;
-		phrase_quiet_ms = std.millis() + 3000;
+		phrase_quiet_ms = std.millis_steady() + 3000;
 		changed();
 	}
 
@@ -335,18 +344,26 @@ class desk_runtime {
 	// =========================================================================
 
 	tick() {
+		tick_frame();
+		//the actions of the shows per track that are no stack (clips, MIDI, ...): outside the section of the desk
+		shows.run_queued();
+	}
+
+	tick_frame() {
 		if(!engine.fixture_menu || !engine.timeline || !engine.timeline.cursor_pos)
 			return;
 		managed _grd = std.critical_section("desk");
 		if(base_pending && !engine.load_in_progress)
 			apply_base();
 		frame = nanogui.current_context().frame_index();
-		now = std.millis();
+		now = std.millis_steady();
 		beat = engine.timeline.cursor_pos.value();
 		//what the timelines of cues run with (#755): the lamps and the BPM
 		DESK_TL.p = engine.patch;
 		DESK_TL.bpm = engine.timeline.bpm_ctrl ? std.float(engine.timeline.bpm_ctrl.value()) : 120.0;
 		poll_phrase();
+		//shows per track: track cues, cue names, phrase triggers, look-ahead, limits (they start stacks for this frame)
+		shows.tick(now, beat);
 		new_phrase = events.has("phrase") && events.phrase;
 		for(i = 0; i < data.stacks.size(); i++) {
 			stack = data.stacks[i];
@@ -429,10 +446,13 @@ class desk_runtime {
 		managed _grd = std.critical_section("desk");
 		undo_from = snapshot();
 		had_values = desk_programmer_count(prog) > 0;
-		was_on = [];
-		for(i = 0; i < playbacks.size(); i++)
+		was_on = std.json();
+		was_at = std.json();
+		for(i = 0; i < playbacks.size(); i++) {
 			was_on[playbacks.key(i)] = playbacks[i].on;
-		ctx = [patch = engine.patch, desk = data, prog = prog, playbacks = playbacks, now_ms = std.millis(),
+			was_at[playbacks.key(i)] = std.string(playbacks[i].index) + "/" + std.string(playbacks[i].go_ms) + "/" + playbacks[i].pending;
+		}
+		ctx = [patch = engine.patch, desk = data, prog = prog, playbacks = playbacks, now_ms = std.millis_steady(),
 			beat = engine.timeline && engine.timeline.cursor_pos ? engine.timeline.cursor_pos.value() : 0.0,
 			stack = current_stack, current = current_all(), highlight = highlight, changed = false, blind = blind,
 			take = -1.0, stored = ""];
@@ -459,8 +479,12 @@ class desk_runtime {
 		if(had_values && desk_programmer_count(prog) == 0)
 			release("programmer");
 		for(i = 0; i < playbacks.size(); i++) {
-			if((was_on[playbacks.key(i)] ?? false) && !playbacks[i].on)
-				release("stack:" + playbacks.key(i));
+			sid = playbacks.key(i);
+			if((was_on[sid] ?? false) && !playbacks[i].on)
+				release("stack:" + sid);
+			//a Go, Back, Off, Goto of the command line is a touch of the operator (the shows per track leave it alone)
+			if(!was_at.has(sid) || was_at[sid] != std.string(playbacks[i].index) + "/" + std.string(playbacks[i].go_ms) + "/" + playbacks[i].pending)
+				shows.touch(sid);
 		}
 		message = r.text;
 		//a command that stores, deletes or clears is a step of the undo history (setting values is not: too many)
@@ -639,7 +663,7 @@ class desk_runtime {
 		if(!tl)
 			return -1.0;
 		length = math.max(0.0001, std.float(tl.length));
-		return desk_timeline_time(desk_timeline_beats(pb, std.millis(), DESK_TL.bpm), length, tl.has("loop") ? tl.loop : true);
+		return desk_timeline_time(desk_timeline_beats(pb, std.millis_steady(), DESK_TL.bpm), length, tl.has("loop") ? tl.loop : true);
 	}
 
 	//"group:<id>", "lamp:<id>" or "all" of a target an agent names: a group or lamp by name or number, or one of those
@@ -750,7 +774,8 @@ class desk_runtime {
 			return None;
 		pb = playback(stack_id);
 		current_stack = stack_id;
-		now = std.millis();
+		shows.touch(stack_id);
+		now = std.millis_steady();
 		beat = engine.timeline && engine.timeline.cursor_pos ? engine.timeline.cursor_pos.value() : 0.0;
 		q = std.float(s.quantize ?? 0);
 		playing = engine.timeline && engine.timeline.play_btn && engine.timeline.play_btn.value();
@@ -830,9 +855,9 @@ class desk_runtime {
 		return phrase_wanted;
 	}
 
-	//The master deck of DJ Link (a ProlinkBridge or ProlinkDecks generator publishes its device), a connected one
-	//first: its master() or None. Never events(): the generator of the device takes them
-	prolink_master() {
+	//The device of DJ Link (a ProlinkBridge or ProlinkDecks generator publishes it), a connected one first, or None.
+	//Only master(), player(n), track(id): never events(), the generator of the device takes them
+	prolink_device() {
 		try {
 			sources = std.global("prolink_sources").get();
 			if(!sources)
@@ -841,14 +866,30 @@ class desk_runtime {
 			for(key, device : sources) {
 				if(!device)
 					continue;
-				if(device.connected()) {
-					found = device;
-					break;
-				}
+				if(device.connected())
+					return device;
 				if(!found)
 					found = device;
 			}
-			return found ? found.master() : None;
+			return found;
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//The master deck of DJ Link: lead() of prolink_device() (the tempo master, else the deck that plays on air), master()
+	//with a prolink module without lead(), or None
+	prolink_master() {
+		dev = prolink_device();
+		if(!dev)
+			return None;
+		try {
+			return dev.lead();
+		}
+		catch(e) {}
+		try {
+			return dev.master();
 		}
 		catch(e) {
 			return None;
@@ -870,7 +911,8 @@ class desk_runtime {
 		}
 		if(key != phrase_key) {
 			phrase_key = key;
-			if(key && std.millis() >= phrase_quiet_ms) {
+			//a track with a show of its own (cues) locks out the phrases (shows per track, lock_phrases)
+			if(key && std.millis_steady() >= phrase_quiet_ms && !shows.locks_master_phrases()) {
 				events.phrase = true;
 				events.phrase_name = phrase_now;
 				events.phrase_group = phrase_group_now ? phrase_group_now : desk_phrase_group(phrase_now);
@@ -935,10 +977,10 @@ class desk_runtime {
 			return;
 		}
 		if(!inputs.has(who) || moved)
-			inputs[who] = [values = values, ltp = desk_ltp(), ms = std.millis()];
+			inputs[who] = [values = values, ltp = desk_ltp(), ms = std.millis_steady()];
 		else {
 			inputs[who].values = values;
-			inputs[who].ms = std.millis();
+			inputs[who].ms = std.millis_steady();
 		}
 	}
 
@@ -957,7 +999,7 @@ class desk_runtime {
 	take(seconds = DESK_DEFAULT_FADE) {
 		managed _grd = std.critical_section("desk");
 		take_from = current_of(prog.values);
-		take_start = std.millis();
+		take_start = std.millis_steady();
 		take_time = math.max(0.0, std.float(seconds));
 		blind = false;
 		message = "Taken live" + (take_time > 0.0 ? " in " + desk_num_text(take_time) + " s" : "");
@@ -970,7 +1012,7 @@ class desk_runtime {
 		if(!values.size() && video_values.size())
 			release("video");
 		video_values = values;
-		video_ms = std.millis();
+		video_ms = std.millis_steady();
 	}
 
 	//What the lamps show now, one colour each, for the picture of a cue: [[id, r, g, b], ...] (colour x dimmer)
@@ -998,6 +1040,7 @@ class desk_runtime {
 
 	set_master(stack_id, v) {
 		masters[stack_id] = math.clamp(std.float(v), 0.0, 1.0);
+		shows.master_set(stack_id, masters[stack_id]);
 	}
 
 	//The master of a stack, 1 when no executor set one (not "?? 1.0": ?? takes the right side for 0 too)
@@ -1011,7 +1054,7 @@ class desk_runtime {
 		if(!s || !playbacks.has(stack_id))
 			return [on = false, cue = "-", index = -1, progress = 0.0];
 		pb = playbacks[stack_id];
-		return [on = pb.on, cue = desk_playback_text(pb, s), index = pb.on ? pb.index : -1, progress = pb.on ? desk_progress(pb, std.millis()) : 0.0];
+		return [on = pb.on, cue = desk_playback_text(pb, s), index = pb.on ? pb.index : -1, progress = pb.on ? desk_progress(pb, std.millis_steady()) : 0.0];
 	}
 
 	// =========================================================================

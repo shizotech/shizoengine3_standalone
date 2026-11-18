@@ -16,11 +16,19 @@
 //moving head turns its yoke around z (pan) and its head around x (tilt): its beam is stage3d_beam_dir. A model of a
 //GDTF import hangs in its GDTF frame (stage3d_gdtf_frame), its parts turned as stage3d_model_parts turns them.
 //`menu` is engine.fixture_menu (the colour and pan / tilt the lamps are sent), or None.
+//
+//The stage (#980, engine/stage/stage.shio, needs it included too): scene.sync_stage(stage, revision, selected, pickable)
+//shows its models where they stand; scene.stage_at(pos) is the object (its id) under a point. The fixture setup shows
+//them without picking them (a model in front of a lamp would take its clicks), the Stage menu picks them.
 
 STAGE3D_BEAM_LENGTH = 8.0; //metres: a beam reaches this far, and stops at the floor
 STAGE3D_BODY_COLOR = vec4f(0.34, 0.34, 0.36, 1.0);
 STAGE3D_MODEL_COLOR = vec4f(0.5, 0.5, 0.52, 1.0);
 STAGE3D_SCENE_WHITE = [r = 0.6, g = 0.6, b = 0.6]; //a lamp that has no colour: light as it is
+STAGE3D_STAGE_COLOR = vec4f(0.62, 0.62, 0.64, 1.0); //a model of the stage whose file gives no colour (#980)
+STAGE3D_LED_DOT = 0.018; //metres across an LED on the stage (#980), the simulation off
+STAGE3D_LED_GLOW = 0.06; //and with the simulation on: the light around it
+STAGE3D_LIT_REACH = 0.5; //metres around a body in which LEDs light its material (#980)
 
 class stage3d_scene {
 	view = None;
@@ -33,6 +41,14 @@ class stage3d_scene {
 	floor_y1 = 6.0; //where the audience is (the label of the setup)
 	built_count = -1;
 	lights_changed = true;
+	stage_items = std.json(); //stage object id -> [root, parts (item ids), key (stage_model_key), built, error, ...]
+	stage_meshes = std.json(); //model key -> the meshes of its parts (built once)
+	stage_seen = -1; //the revision of the stage last synced
+	stage_pending = false; //a model is still being read
+	stage_sel = ""; //the selection last synced (ids, comma separated)
+	led_items = std.json(); //LEDMapper id -> [[item, mesh, offset, count], ...]: its groups on the stage
+	led_key = ""; //what they were built from (the revisions of the LEDs and of the stage, the simulation)
+	mat_key = ""; //what the materials were set from (sync_materials)
 
 	__init__(view) {
 		this.view = view;
@@ -222,6 +238,11 @@ class stage3d_scene {
 	rebuild(lamps) {
 		view.clear();
 		this.lamps = std.json();
+		stage_items = std.json();
+		stage_seen = -1;
+		led_items = std.json();
+		led_key = "";
+		mat_key = "";
 		floor_key = "";
 		floor_items = [];
 		build_floor(lamps);
@@ -263,7 +284,9 @@ class stage3d_scene {
 			rotation = f.rotation ?? 0;
 			lean = f.lean ?? 0.0;
 			mount = f.mount ?? "floor";
-			if(f.x != rec.fx || f.y != rec.fy || z != rec.fz || rotation != rec.frot || lean != rec.flean || mount != rec.fmount) {
+			hang = f.hangs_on ?? "";
+			if(f.x != rec.fx || f.y != rec.fy || z != rec.fz || rotation != rec.frot || lean != rec.flean || mount != rec.fmount || hang != (rec.fhang ?? "")) {
+				rec.fhang = hang;
 				rec.fx = f.x;
 				rec.fy = f.y;
 				rec.fz = z;
@@ -271,7 +294,8 @@ class stage3d_scene {
 				rec.flean = lean;
 				rec.fmount = mount;
 				view.item(rec.root, [matrix = rec.model ? stage3d_gdtf_frame(f) : lamp_frame(f)]);
-				view.item(rec.pole, [visible = z > 0.05, matrix = scaled(1.0, 1.0, math.max(z, 0.001), f.x, f.y, z)]);
+				//(#980: a lamp that hangs on an object of the stage, a truss, has no pole down to the floor)
+				view.item(rec.pole, [visible = z > 0.05 && !(f.hangs_on ?? ""), matrix = scaled(1.0, 1.0, math.max(z, 0.001), f.x, f.y, z)]);
 				moved = true;
 				rec.light = None;
 			}
@@ -392,6 +416,243 @@ class stage3d_scene {
 	// =========================================================================
 
 	//The id of the lamp under a point of the view, or None
+	// =========================================================================
+	// The stage (#980)
+	// =========================================================================
+
+	//Brings the models of the stage up to date: objects added or gone, moved, another file, unit or up axis. Costs nothing
+	//while the revision is the same and no model is being read. selected: ids (a rim in the accent colour); pickable:
+	//pick() finds them
+	sync_stage(stage, revision, selected = [], pickable = true) {
+		if(!stage)
+			return;
+		sel = selected.size() ? selected.combine_string(",") : "";
+		if(revision == stage_seen && !stage_pending && sel == stage_sel)
+			return;
+		stage_seen = revision;
+		stage_sel = sel;
+		stage_pending = false;
+		seen = std.json();
+		for(o : stage.objects) {
+			seen[o.id] = true;
+			key = stage_model_key(o);
+			rec = stage_items[o.id] ?? None;
+			if(rec && rec.key != key) {
+				view.remove(rec.root);
+				rec = None;
+			}
+			if(!rec) {
+				rec = [root = view.add(None, [tag = "stage:" + o.id]), parts = [], names = [], key = key, built = false, error = "",
+					rim = -1.0, bounds = None];
+				stage_items[o.id] = rec;
+			}
+			if(!rec.built) {
+				model = stage_model_get(o, key);
+				if(std.is_none(model))
+					stage_pending = true;
+				else {
+					rec.built = true;
+					rec.error = model.ok ? "" : model.error;
+					if(model.ok) {
+						meshes = stage_part_meshes(key, model);
+						for(i = 0; i < meshes.size(); i++) {
+							c = model.parts[i].color;
+							color = c ? vec4f(c[0], c[1], c[2], 1.0) : STAGE3D_STAGE_COLOR;
+							rec.parts.push_back(view.add(meshes[i], [parent = rec.root, color = color, pick = pickable]));
+							rec.names.push_back(model.parts[i].name);
+						}
+						rec.bounds = model.bounds;
+						mat_key = "";
+						rec.rim = -1.0;
+						//#980: a scan: its splats as one item (no mesh)
+						sp = stage_splats_get(o);
+						if(o.kind == "splat" && sp) {
+							rec.parts.push_back(view.add(None, [parent = rec.root, splats = sp, pick = pickable, tag = "stage:" + o.id]));
+							rec.names.push_back("Scan");
+						}
+					}
+				}
+			}
+			wm = stage_world_matrix(stage, o);
+			view.item(rec.root, [matrix = wm, visible = stage_object_shown(stage, o) ? true : false]);
+			//#980: a scan: how many splats, and up to which height above its floor (its floor at z = 0 of its frame)
+			if(o.kind == "splat" && rec.built && rec.parts.size())
+				view.item(rec.parts[0], [max_splats = STAGE_SPLAT_QUALITY[o.splat.quality], zclip = o.splat.height > 0.0 ? [-1000.0, stage_splat_frame(stage, o)[11] + o.splat.height] : None]);
+			rim = selected.has_value(o.id) ? 0.9 : 0.0;
+			if(rim != rec.rim) {
+				rec.rim = rim;
+				for(id : rec.parts)
+					view.item(id, [rim = vec4f(PAL_ACCENT.x, PAL_ACCENT.y, PAL_ACCENT.z, rim)]);
+			}
+		}
+		gone = [];
+		for(i = 0; i < stage_items.size(); i++) {
+			id = stage_items.key(i);
+			if(!seen.has(id))
+				gone.push_back(id);
+		}
+		for(id : gone) {
+			view.remove(stage_items[id].root);
+			stage_items.erase(id);
+		}
+	}
+
+	//The LEDs of the LEDMappers on the stage (#980, engine/stage/stage_leds.shio): glowing points in the colours they are
+	//sent. Built again when a LEDMapper publishes, the stage changed (what they hang on moved) or the simulation is
+	//switched; every frame each LEDMapper's read-back gives the colours (one native copy per group). holder: the engine
+	//(stage_leds, stage_leds_revision); sim: the simulation is on (a bigger glow)
+	sync_leds(holder, stage, stage_revision, sim = false) {
+		leds = holder.stage_leds;
+		key = holder.stage_leds_revision + ":" + stage_revision + ":" + (sim ? 1 : 0);
+		if(key != led_key) {
+			led_key = key;
+			for(i = 0; i < led_items.size(); i++) {
+				for(r : led_items[i])
+					view.remove(r.item);
+			}
+			led_items = std.json();
+			for(i = 0; i < leds.size(); i++) {
+				mapper = leds[i];
+				recs = [];
+				for(g : mapper.groups) {
+					pts = stage_leds_points(stage, g, mapper.aspect);
+					if(!pts.size())
+						continue;
+					mesh = nanogui.mesh3d().points(pts);
+					item = view.add(mesh, [mode = "glow", point_size = sim ? STAGE3D_LED_GLOW : STAGE3D_LED_DOT, pick = false,
+						color = vec4f(1.0, 1.0, 1.0, 1.0)]);
+					lo = [x = 1e9, y = 1e9, z = 1e9];
+					hi = [x = -1e9, y = -1e9, z = -1e9];
+					for(j = 0; j + 2 < pts.size(); j += 3) {
+						lo = [x = math.min(lo.x, pts[j]), y = math.min(lo.y, pts[j + 1]), z = math.min(lo.z, pts[j + 2])];
+						hi = [x = math.max(hi.x, pts[j]), y = math.max(hi.y, pts[j + 1]), z = math.max(hi.z, pts[j + 2])];
+					}
+					recs.push_back([item = item, mesh = mesh, offset = g.offset, count = g.count, lo = lo, hi = hi]);
+				}
+				led_items[leds.key(i)] = recs;
+			}
+		}
+		if(!led_items.size())
+			return;
+		for(i = 0; i < led_items.size(); i++) {
+			mapper = leds[led_items.key(i)] ?? None;
+			if(!mapper || !mapper.shader)
+				continue;
+			buf = mapper.shader.pixel_buffer();
+			if(!buf)
+				continue;
+			for(r : led_items[i])
+				r.mesh.colors(buf, r.offset * 3, r.count);
+		}
+		view.redraw();
+	}
+
+	//The materials of the bodies of the stage (#980): with the simulation on, a translucent body is lit by the LEDs near
+	//it (the groups whose box is within STAGE3D_LIT_REACH of its box, at most 8) and every body by the beams of the lamps;
+	//off, everything is solid. Set again when the stage, the LEDs or the simulation changed
+	sync_materials(stage, stage_revision, sim) {
+		if(!stage)
+			return;
+		key = stage_revision + ":" + led_key + ":" + (sim ? 1 : 0) + ":" + stage_items.size();
+		if(key == mat_key)
+			return;
+		mat_key = key;
+		for(o : stage.objects) {
+			rec = stage_items[o.id] ?? None;
+			if(!rec || !rec.built || !rec.parts.size())
+				continue;
+			lit = [];
+			if(sim && rec.bounds) {
+				b = stage_world_box(stage_world_matrix(stage, o), rec.bounds);
+				r = STAGE3D_LIT_REACH;
+				for(i = 0; i < led_items.size(); i++) {
+					for(l : led_items[i]) {
+						if(lit.size() < 8 && l.lo.x <= b.max.x + r && l.hi.x >= b.min.x - r && l.lo.y <= b.max.y + r && l.hi.y >= b.min.y - r &&
+							l.lo.z <= b.max.z + r && l.hi.z >= b.min.z - r)
+							lit.push_back(l.item);
+					}
+				}
+			}
+			for(i = 0; i < rec.parts.size(); i++) {
+				m = stage_part_material(o, rec.names[i]);
+				translucent = sim && m.preset != "solid" && lit.size();
+				view.item(rec.parts[i], [material = translucent ? [m.transmission, m.diffusion] : None, lit_by = translucent ? lit : [],
+					receive = sim ? true : false]);
+			}
+		}
+	}
+
+	//The pictures on the screens and LED walls of the stage (#980): with the simulation on, each shows the picture of its
+	//video router (times its brightness), else it is dark. Every frame (a router can come and go); the view draws again
+	//only while a picture is shown
+	sync_screens(stage, sim) {
+		if(!stage)
+			return;
+		for(o : stage.objects) {
+			if(o.kind != "screen")
+				continue;
+			rec = stage_items[o.id] ?? None;
+			if(!rec || !rec.built)
+				continue;
+			k = -1;
+			for(i = 0; i < rec.names.size(); i++) {
+				if(rec.names[i] == "Display")
+					k = i;
+			}
+			if(k < 0)
+				continue;
+			pic = sim && stage_object_shown(stage, o) ? stage_picture(o.screen.source) : None;
+			b = o.screen.brightness;
+			view.item(rec.parts[k], pic ? [picture = pic, color = vec4f(b, b, b, 1.0)] : [picture = None, color = vec4f(0.02, 0.02, 0.025, 1.0)]);
+		}
+	}
+
+	//The number of LEDs on the stage this view shows
+	led_count() {
+		n = 0;
+		for(i = 0; i < led_items.size(); i++) {
+			for(r : led_items[i])
+				n += r.count;
+		}
+		return n;
+	}
+
+	//The meshes of the parts of a model (built once per model key)
+	stage_part_meshes(key, model) {
+		if(stage_meshes.has(key))
+			return stage_meshes[key];
+		list = [];
+		for(p : model.parts) {
+			mesh = p.t.size() ? nanogui.mesh3d().triangles(p.v, p.t) : nanogui.mesh3d().triangles(p.v);
+			//(#980: the picture of a screen goes on by these)
+			if(p.has("uv"))
+				mesh.uvs(p.uv);
+			list.push_back(mesh);
+		}
+		stage_meshes[key] = list;
+		return stage_meshes[key];
+	}
+
+	//The stage object (its id) under a point of the view, or None
+	stage_at(pos, slack = 4.0) {
+		hit = view.pick(pos, slack);
+		if(!hit || !hit.tag || !std.string(hit.tag).starts("stage:"))
+			return None;
+		return std.string(hit.tag).substr(6);
+	}
+
+	//What went wrong reading the model of an object ("" : nothing, or not read yet)
+	stage_error(id) {
+		rec = stage_items[id] ?? None;
+		return rec ? rec.error : "";
+	}
+
+	//The box of a stage object on the screen ([min, max] vec2f), None when it is not in front of the camera
+	stage_box(id) {
+		rec = stage_items[id] ?? None;
+		return rec ? view.screen_bounds(rec.root) : None;
+	}
+
 	lamp_at(pos, slack = 6.0) {
 		hit = view.pick(pos, slack);
 		if(!hit || !hit.tag || !lamps.has(hit.tag))

@@ -1,0 +1,657 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  node_lib.shio — the Node class: workspaces, task routing, ShizoNet, the API
+//
+//      #include "node_lib"
+//
+//      node = Node(cfg, worker_cfg_spec, 1, "Box", "GPU box");
+//      node.ensure_workspace_registry();     // the workspaces + the node's own one
+//      node.start_api_table(api_token);      // the JSON API as a route table
+//      node.start_shizonet();                // the AI node service + the peers
+//      node.start_web(opts);                 // optional: HTTP server + web pages
+//      node.stop();
+//
+//  node.shio is the command line around it (shz miniagent --node ...).
+//
+//  A Node runs no agent of its own. Every request is worker work in a workspace:
+//      add_task(name, goal, role, workspace_id)   a session in that workspace
+//      request(prompt, on_finish, on_action, workspace_id)
+//                                                 the same, blocking, with the
+//                                                 actions streamed to the caller
+//  Who decides WHERE a request goes is the caller: a person in the web interface,
+//  or the router agent of a gateway (telegram_router.shio), which picks the node
+//  and the workspace from the routing table every node publishes (AINodeInfo).
+//  The node that used to sit in between (a "receptionist" agent that re-delegated
+//  every request to a worker) is gone: one model turn less per request, and the
+//  conversation of a piece of work lives in one place, its session.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "miniagent"
+#include "workspaces"
+#include "web_ui"
+#include "shizonet_ai"
+#include "node_peers"
+#include "gateway_config"
+#include "model_config_cli"
+#include "goal_engine"
+
+NODE_REQUEST_POLL_MS = 100;
+
+// the result of one direct request, in the shape every front end reads:
+// [ok, reports = [[report, time, time_str]], error, taskid, workspace_id, state]
+node_request_result(ok, report, error = "", taskid = "", workspace_id = "", state = "") {
+    return [
+        ok = ok ? true : false,
+        error = std.string(error ?? ""),
+        taskid = std.string(taskid ?? ""),
+        workspace_id = std.string(workspace_id ?? ""),
+        state = std.string(state ?? ""),
+        reports = [[
+            report = std.string(report ?? ""),
+            time = std.millis(),
+            time_str = std.timestamp(),
+        ]],
+    ];
+}
+
+// Register a directory as a workspace (shz miniagent --init [dir], --workspace <dir>).
+// It does not load a model config, start ShizoNet, goals, the web UI or workers.
+// -> [ok, workspace, reused, error]
+node_register_workspace(dir = "", name = "", store = None) {
+    target = std.string(dir ?? "").strip();
+
+    if(!target)
+        target = std.string(std.wd() ?? "");
+
+    path = fileio.absolute_path(target);
+
+    if(!path)
+        return [ok = false, error = "could not resolve the directory '" + target + "'"];
+
+    if(fileio.exists(path) && !fileio.is_directory(path))
+        return [ok = false, error = "not a directory: " + path];
+
+    label = std.string(name ?? "").strip();
+
+    if(!label)
+        label = fileio.file_name(path);
+
+    if(!label)
+        label = "Workspace";
+
+    if(!store)
+        store = WorkspaceStore();
+
+    return store.create(label, path, "root", "Registered from the command line");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Node — owns every Workspace, routes tasks, hosts ShizoNet and the API
+// ─────────────────────────────────────────────────────────────────────────────
+
+class Node {
+    cfg = None;
+    worker_cfg_spec = "";
+    max_workers = 1;
+    name = "";
+    description = "";
+
+    net = None;             // the shizonet server
+    ai = None;              // AiService: the AI node protocol on it
+    peers = None;           // NodePeers: the other nodes / gateways on the network
+
+    registry = None;
+    node_workspace = None;
+    goals = None;
+
+    api_table = None;       // ApiRouter: every JSON route, with or without HTTP
+    api_token = "";
+    web = None;             // the ApiRouter when its HTTP server serves the pages
+    api = None;             // the ApiRouter when its HTTP server serves the API
+
+    running = true;
+    open_requests = [];     // session ids of the direct requests that run now
+    gateway = None;         // GatewayRunner (gateway_config.shio), set by node.shio
+
+    __init__(cfg, worker_cfg_spec, max_workers = 1, name = "", description = "") {
+        this.cfg = cfg;
+        this.worker_cfg_spec = std.string(worker_cfg_spec ?? "");
+        this.max_workers = std.int(max_workers);
+
+        if(this.max_workers <= 0)
+            this.max_workers = 1;
+
+        this.name = std.string(name ?? "");
+        this.description = std.string(description ?? "");
+
+        this.net = None;
+        this.ai = None;
+        this.peers = None;
+        this.registry = None;
+        this.node_workspace = None;
+        this.goals = None;
+        this.api_table = None;
+        this.api_token = "";
+        this.web = None;
+        this.api = None;
+        this.running = true;
+        this.open_requests = [];
+        this.gateway = None;
+    }
+
+    // ── workspaces ────────────────────────────────────────────────────────────
+
+    ensure_workspace_registry() {
+        if(this.registry)
+            return this.registry;
+
+        this.registry = WorkspaceRegistry(this.worker_cfg_spec, "");
+
+        // The node's own Workspace lives at <storage>/node, outside the project
+        // registry: the place for work that belongs to no project (the machine,
+        // a general question, a node-level goal). It is a Workspace like the
+        // others: the registry serves it under the id "node".
+        root = miniagent_node_root();
+        fileio.mkdir(root);
+        this.registry.store.ensure_megamind(root);
+
+        node_record = [
+            id = "node",
+            name = "General",
+            path = root,
+            parent = "",
+            created = std.millis(),
+            description = "Work that belongs to no project: this machine, general questions, node-level goals.",
+        ];
+
+        this.registry.manager.register_workspace("node", root);
+        this.node_workspace = this.registry.adopt(node_record);
+
+        if(this.node_workspace)
+            this.goals = this.node_workspace.scheduler;
+
+        return this.registry;
+    }
+
+    resolve_workspace(workspace_id) {
+        this.ensure_workspace_registry();
+
+        id = std.string(workspace_id ?? "").strip();
+
+        if(!id || id == "node")
+            return this.node_workspace;
+
+        w = this.registry.get(id);
+
+        if(w)
+            return w;
+
+        // a name instead of an id (a gateway, a person at the console)
+        want = id.lowercase();
+
+        for(rec : this.registry.store.list()) {
+            if(rec.id != "root" && std.string(rec.name).lowercase() == want)
+                return this.registry.get(rec.id);
+        }
+
+        return None;
+    }
+
+    // the routing table of this node: its workspaces, for a gateway and the peers
+    workspaces_summary(limit = 64) {
+        this.ensure_workspace_registry();
+        out = [];
+
+        if(this.node_workspace) {
+            out.push_back([
+                id = "node",
+                name = "General",
+                description = "Work that belongs to no project: this machine, general questions.",
+                path = std.string(this.node_workspace.path),
+                parent = "",
+            ]);
+        }
+
+        for(rec : this.registry.store.list()) {
+            if(rec.id == "root")
+                continue;
+
+            if(out.size() >= limit)
+                break;
+
+            out.push_back([
+                id = std.string(rec.id),
+                name = std.string(rec.name),
+                description = std.string(rec.description ?? ""),
+                path = std.string(rec.path),
+                parent = (std.string(rec.parent) == "root") ? "" : std.string(rec.parent),
+            ]);
+        }
+
+        return out;
+    }
+
+    // ── tasks ────────────────────────────────────────────────────────────────
+
+    add_task(name, goal, role = "adaptive", workspace_id = "", origin = "") {
+        w = resolve_workspace(workspace_id);
+
+        if(!w)
+            return [ok = false, error = "unknown workspace '" + std.string(workspace_id ?? "") + "' on node " + this.name];
+
+        taskid = w.add_task(name, goal, role, origin);
+
+        if(!taskid)
+            return [ok = false, error = "the workspace '" + std.string(w.name) + "' could not start a session"];
+
+        return taskid;
+    }
+
+    inspect_task(taskid) {
+        this.ensure_workspace_registry();
+
+        info = this.registry.manager.inspect_task(std.string(taskid ?? ""));
+
+        if(std.is_json(info) && info.ok)
+            return info;
+
+        return "Not found.";
+    }
+
+    update_task(taskid, message) {
+        this.ensure_workspace_registry();
+
+        res = this.registry.manager.send_prompt(std.string(taskid ?? ""), std.string(message ?? ""));
+        return res.ok ? true : false;
+    }
+
+    stop_task(taskid) {
+        this.ensure_workspace_registry();
+        return this.registry.manager.stop_session(std.string(taskid ?? ""));
+    }
+
+    get_overview() {
+        registry = this.ensure_workspace_registry();
+
+        active_tasks = [];
+        tasks_scheduled = [];
+        tasks_finished = [];
+        tasks_failed = [];
+
+        for(w : registry.list()) {
+            ov = w.get_overview();
+
+            for(t : ov.tasks) {
+                t.workspace_id = w.id;
+                active_tasks.push_back(t);
+            }
+
+            for(t : ov.tasks_scheduled) {
+                t.workspace_id = w.id;
+                tasks_scheduled.push_back(t);
+            }
+
+            for(t : ov.tasks_finished) {
+                t.workspace_id = w.id;
+                tasks_finished.push_back(t);
+            }
+
+            for(t : ov.tasks_failed) {
+                t.workspace_id = w.id;
+                tasks_failed.push_back(t);
+            }
+        }
+
+        return [
+            tasks = active_tasks,
+            tasks_scheduled = tasks_scheduled,
+            tasks_finished = tasks_finished,
+            tasks_failed = tasks_failed,
+        ];
+    }
+
+    tasks() {
+        ov = get_overview();
+        out = [];
+
+        for(t : ov.tasks)
+            out.push_back(t);
+        for(t : ov.tasks_scheduled)
+            out.push_back(t);
+        for(t : ov.tasks_finished)
+            out.push_back(t);
+        for(t : ov.tasks_failed)
+            out.push_back(t);
+
+        return out;
+    }
+
+    // ── direct requests ──────────────────────────────────────────────────────
+
+    // One worker turn, blocking: a session in the workspace runs the prompt, its
+    // actions (text / reasoning / tool calls) go to on_action as they happen, and
+    // the report of the turn is the result. This is what ai_request (ShizoNet),
+    // POST /api/request (HTTP) and the node console run.
+    request(prompt, on_finish = None, on_action = None, workspace_id = "") {
+        registry = this.ensure_workspace_registry();
+        manager = registry.manager;
+        result = None;
+
+        w = resolve_workspace(workspace_id);
+
+        if(!w) {
+            result = node_request_result(false, "Unknown workspace '" + std.string(workspace_id ?? "") + "' on node " + this.name + ".", "unknown workspace");
+        } else {
+            res = manager.create_session(w.id, "", "normal", std.string(prompt ?? ""), "adaptive", "medium", "net");
+
+            if(!res.ok) {
+                why = std.string(res.error ?? "the session could not be started");
+                result = node_request_result(false, "The request could not be started: " + why, why, "", w.id);
+            } else {
+                sid = std.string(res.session.id);
+                open_requests.push_back(sid);
+                last_seq = 0;
+
+                for(this.running) {
+                    s = manager.get_session(sid);
+
+                    if(!s)
+                        break;
+
+                    if(on_action) {
+                        for(e : manager.session_events(sid)) {
+                            if(e.seq <= last_seq)
+                                continue;
+
+                            last_seq = e.seq;
+
+                            if(e.type == "delta" && std.is_json(e.action)) {
+                                try {
+                                    on_action(e.action);
+                                } catch(err) {
+                                    std.error("[node] request action callback failed: ", err);
+                                }
+                            }
+                        }
+                    }
+
+                    if(s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped")
+                        break;
+
+                    std.sleep(NODE_REQUEST_POLL_MS);
+                }
+
+                for(i = 0; i < open_requests.size(); i++) {
+                    if(open_requests[i] == sid) {
+                        open_requests.erase(i);
+                        break;
+                    }
+                }
+
+                s = manager.get_session(sid);
+
+                if(!s) {
+                    result = node_request_result(false, "The session of the request is gone.", "session deleted", sid, w.id, "lost");
+                } else {
+                    state = manager.host_state(s.status);
+                    report = std.string(s.report ?? "");
+                    ok = s.status == "done" || s.status == "question";
+
+                    if(!report)
+                        report = ok ? "The task ended without a report." : "The task ended without a report (" + state + ").";
+
+                    result = node_request_result(ok, report, ok ? "" : std.string(s.error ? s.error : report), sid, w.id, state);
+                    result.stopped = s.status == "stopped";
+                }
+            }
+        }
+
+        if(on_finish) {
+            try {
+                on_finish(result);
+            } catch(e) {
+                std.error("[node] request finish callback failed: ", e);
+            }
+        }
+
+        return result;
+    }
+
+    requests_active() {
+        return open_requests.size();
+    }
+
+    // a follow-up for the request that runs now (ai_request_update)
+    update_request(message) {
+        if(!open_requests.size())
+            return false;
+
+        return update_task(open_requests[open_requests.size() - 1], message);
+    }
+
+    // stop the request that runs now (ai_request_stop, POST /api/request/stop)
+    stop_request() {
+        if(!open_requests.size())
+            return false;
+
+        return stop_task(open_requests[open_requests.size() - 1]);
+    }
+
+    // ── notifications / listeners (the shared SessionManager) ───────────────
+
+    notify_user(msg) {
+        registry = this.ensure_workspace_registry();
+        return registry.manager.notify_user(msg);
+    }
+
+    add_notify_listener(cb) {
+        this.ensure_workspace_registry().manager.add_notify_listener(cb);
+    }
+
+    add_file_listener(cb) {
+        this.ensure_workspace_registry().manager.add_file_listener(cb);
+    }
+
+    add_task_finished_listener(cb, owner = "") {
+        this.ensure_workspace_registry().manager.add_task_finished_listener(cb, owner);
+    }
+
+    remove_task_finished_listener(owner) {
+        return this.ensure_workspace_registry().manager.remove_task_finished_listener(owner);
+    }
+
+    share_file(path, caption = "") {
+        return this.ensure_workspace_registry().manager.share_file(path, caption);
+    }
+
+    // ── services ─────────────────────────────────────────────────────────────
+
+    // The JSON API as a route table (no HTTP yet): what ai_api serves to the other
+    // nodes. start_web / start_api put an HTTP server behind the same table.
+    start_api_table(token = "") {
+        if(this.api_table)
+            return this.api_table;
+
+        this.api_token = std.string(token ?? "");
+        registry = this.ensure_workspace_registry();
+
+        table = ApiRouter();
+        node_api_register(table, this, this.cfg, 0, this.api_token, true);
+        workspaces_api_register(table, this.cfg, this.api_token, registry);
+        gateway_api_register(table, this, this.api_token);
+        table.start();
+
+        this.api_table = table;
+        return table;
+    }
+
+    start_shizonet() {
+        if(this.ai)
+            return this.ai;
+
+        // every node serves its API over ShizoNet, with or without a web server
+        if(!this.api_table)
+            start_api_table(this.api_token);
+
+        server = shizonet.server(this.name);
+        this.net = server;
+
+        this.ai = ai_node_attach(server, this, [
+            name = this.name,
+            description = this.description,
+            model = this.cfg.name,
+        ]);
+
+        this.peers = NodePeers(server, this.ai.node_name());
+
+        // the web page hears about nodes that come and go through the live feed
+        feed = this.registry.live_feed();
+        feed.extra = [this]() {
+            return [peers_rev = this.peers ? this.peers.rev : 0];
+        };
+
+        std.print("Shizonet AI node online: " + this.ai.node_name());
+        return this.ai;
+    }
+
+    node_name() {
+        if(this.ai)
+            return this.ai.node_name();
+
+        return this.name ? this.name : "Node";
+    }
+
+    start_node_goals(root) {
+        root = std.string(root ?? "");
+
+        if(!root)
+            return None;
+
+        this.ensure_workspace_registry();
+
+        // the default place is the node workspace's own .agentspace: its scheduler runs already
+        if(this.node_workspace && this.node_workspace.scheduler &&
+           fileio.absolute_path(root) == fileio.absolute_path(std.string(this.node_workspace.path) + "/.agentspace")) {
+            this.goals = this.node_workspace.scheduler;
+            return this.goals;
+        }
+
+        space = GoalSpace(root);
+
+        if(!space.exists()) {
+            created = space.init(__DIR__ + "/agentspace_template");
+            std.print("Created " + root + "/ (" + created.size() + " files) from the template.");
+        }
+
+        if(this.node_workspace && this.node_workspace.scheduler) {
+            try {
+                this.node_workspace.scheduler.stop();
+            } catch(e) {}
+        }
+
+        sch = GoalScheduler(space, this.node_workspace, [workspace_id = "node"]);
+        sch.start();
+
+        this.node_workspace.scheduler = sch;
+        this.goals = sch;
+
+        std.print("Goal scheduler on " + root + "/ - shz miniagent.goals list");
+        return sch;
+    }
+
+    disable_node_goals() {
+        if(this.node_workspace && this.node_workspace.scheduler) {
+            try {
+                this.node_workspace.scheduler.stop();
+            } catch(e) {}
+            this.node_workspace.scheduler = None;
+        }
+
+        this.goals = None;
+        return true;
+    }
+
+    // HTTP: the web pages + the JSON API (shz miniagent --node --web)
+    start_web(opts) {
+        registry = this.ensure_workspace_registry();
+        this.api_token = std.string(opts.api_token ?? "");
+
+        ui = web_ui_start(this, this.cfg, opts, registry);
+
+        if(!ui)
+            return None;
+
+        this.web = ui.server;
+        this.api = ui.server;
+        this.api_table = ui.server;
+
+        return ui;
+    }
+
+    // HTTP: the JSON API only (--webserver / --port)
+    start_api(port, token) {
+        registry = this.ensure_workspace_registry();
+        this.api_token = std.string(token ?? "");
+
+        server = node_api_start(this, this.cfg, port, this.api_token);
+
+        if(!server)
+            return None;
+
+        workspaces_api_register(server, this.cfg, this.api_token, registry);
+        gateway_api_register(server, this, this.api_token);
+
+        this.api = server;
+        this.api_table = server;
+        return server;
+    }
+
+    stop() {
+        this.running = false;
+
+        if(this.peers) {
+            try {
+                this.peers.stop();
+            } catch(e) {}
+            this.peers = None;
+        }
+
+        if(this.registry) {
+            try {
+                this.registry.stop();
+            } catch(e) {}
+            this.registry = None;
+        }
+
+        if(this.ai) {
+            try {
+                this.ai.stop();
+            } catch(e) {}
+            this.ai = None;
+        }
+
+        table = this.api_table;
+        web_server = this.web;
+        api_server = this.api;
+
+        if(table) {
+            try { table.stop(); } catch(e) {}
+        }
+
+        if(web_server && web_server !== table) {
+            try { web_server.stop(); } catch(e) {}
+        }
+
+        if(api_server && api_server !== web_server && api_server !== table) {
+            try { api_server.stop(); } catch(e) {}
+        }
+
+        this.api_table = None;
+        this.web = None;
+        this.api = None;
+        this.goals = None;
+        this.node_workspace = None;
+        this.open_requests = [];
+
+        return true;
+    }
+}

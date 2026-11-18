@@ -189,10 +189,32 @@ class rt_stub_host {
 		];
 	}
 
-	add_task(name, goal) {
+	// the workspaces this node publishes in its AINodeInfo ([] = an older node)
+	published = [];
+	workspaces_summary(limit = 64) { return published; }
+
+	add_task(name, goal, role = "adaptive", workspace = "", origin = "") {
 		taskid = std.random_hash(16);
-		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+		tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned", workspace_id = workspace, origin = origin]);
 		return taskid;
+	}
+
+	// a finished session takes a new prompt: it runs again (SessionManager.send_prompt)
+	reopen_task(taskid, message) {
+		for(i = 0; i < tasks_finished.size(); i++) {
+			if(tasks_finished[i].taskid == taskid) {
+				task = tasks_finished[i];
+				tasks_finished.erase(i);
+				task.state = "planned";
+				task.report = "";
+				if(!task.user_updates)
+					task.user_updates = [];
+				task.user_updates.push_back(std.string(message));
+				tasks_scheduled.push_back(task);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	stop_task(taskid) {
@@ -217,7 +239,7 @@ class rt_stub_host {
 			}
 		}
 
-		return false;
+		return reopen_task(taskid, message);
 	}
 
 	inspect_task(taskid) {
@@ -615,7 +637,8 @@ check("one route_task is exactly one agent turn", stub_agent.turns == turns_befo
 gpu_task = rtr.inspect_task(gpu_res.taskid);
 
 check("delegated task is mirrored", std.is_json(gpu_task) && gpu_task.taskid == gpu_res.taskid, std.string(gpu_task));
-check("mirror records the remote request id", std.string(gpu_task.remote_request_id).length() > 0, std.string(gpu_task));
+check("mirror records the worker session of the node", std.string(gpu_task.remote_taskid).length() > 0 && std.string(gpu_task.remote_request_id).empty(), std.string(gpu_task));
+check("the routed task is a thread with a label", std.string(gpu_task.thread).starts("T") && std.int(gpu_task.turn) == 1, std.string(gpu_task));
 check("mirror records the owning node", gpu_task.node == GPU_NAME, std.string(gpu_task));
 check("a routed turn reports routed", gpu_res.ok && gpu_res.routed, std.string(gpu_res));
 
@@ -689,6 +712,10 @@ check("inspect_task on an unknown taskid says so", rtr.inspect_task("nope-not-a-
 // ─────────────────────────────────────────────────────────────────────────────
 //  4. Finished delegated work: report lands in the mirror
 // ─────────────────────────────────────────────────────────────────────────────
+
+// the worker session of the node ends its turn (the stub host finishes the task)
+web_remote = std.string(rtr.inspect_task(web_res.taskid).remote_taskid);
+hostB.finish_task(web_remote, "finished", "stub answer: the page was scraped");
 
 done = wait_for([rtr, web_res]() {
 		t = rtr.inspect_task(web_res.taskid);
@@ -843,32 +870,28 @@ if(std.is_json(role_res))
 	role_taskid = std.string(role_res.taskid ?? "");
 
 role_rec = rtr.inspect_task(role_taskid);
-check("the role's task is tracked as receptionist work",
-	std.is_json(role_rec) && std.string(role_rec.remote_request_id).length() > 0 && std.string(role_rec.remote_taskid).empty(),
+check("the role's task is a worker session on the node, no agent in between",
+	std.is_json(role_rec) && std.string(role_rec.remote_taskid).length() > 0 && std.string(role_rec.remote_request_id).empty(),
 	std.string(role_rec));
 
 role_rid = "";
 if(std.is_json(role_rec))
-	role_rid = std.string(role_rec.remote_request_id);
+	role_rid = std.string(role_rec.remote_taskid);
+
+check("the worker got the task text as given", std.is_json(hostA.find_scheduled(role_rid)) && std.string(hostA.find_scheduled(role_rid).task) == "VERYSLOW seam job", std.string(hostA.find_scheduled(role_rid)));
+check("the node knows the task came over the network", std.is_json(hostA.find_scheduled(role_rid)) && std.string(hostA.find_scheduled(role_rid).origin) == "net", std.string(hostA.find_scheduled(role_rid)));
 
 role_upd = callbacks["update_task"]([taskid = role_taskid, message = "seam follow-up"]);
-check("the role can follow up on routed work", std.string(role_upd) == "OK", std.string(role_upd));
+check("the role can follow up on routed work", std.string(role_upd).starts("OK"), std.string(role_upd));
 
-// router_api.md: a follow-up on a RUNNING turn is injected through
-// receptionist.send_prompt, one on a QUEUED request is appended to its prompt.
-// Both are delivery; assert delivery, not one mechanism.
-delivered = wait_for([hostA, svcA, role_rid]() {
-		if(hostA.receptionist.has("seam follow-up"))
-			return true;
-
-		if(svcA.requests.has(role_rid))
-			return std.string(svcA.requests[role_rid].prompt).contains("seam follow-up");
-
-		return false;
+// the follow-up is in the session of the task on the node
+delivered = wait_for([hostA, role_rid]() {
+		t = hostA.find_scheduled(role_rid);
+		return std.is_json(t) && std.string(t.user_updates ?? "").contains("seam follow-up");
 	}, 4000);
 
 check("the follow-up reached the remote node", delivered,
-	"prompts: " + std.string(hostA.receptionist.prompts) + " rid: " + role_rid);
+	"task: " + std.string(hostA.find_scheduled(role_rid)) + " rid: " + role_rid);
 
 role_stop = callbacks["stop_task"]([taskid = role_taskid, reason = "done testing"]);
 check("the role can stop routed work", std.string(role_stop) == "OK", std.string(role_stop));
@@ -916,7 +939,7 @@ li_inspect = callbacks["inspect_task"]([taskid = found_id]);
 check("inspect_task works on a taskid from the listing", std.string(li_inspect).contains(found_id), std.string(li_inspect));
 
 li_upd = callbacks["update_task"]([taskid = found_id, message = "fleet follow-up"]);
-check("update_task works on a taskid from the listing", std.string(li_upd) == "OK", std.string(li_upd));
+check("update_task works on a taskid from the listing", std.string(li_upd).starts("OK"), std.string(li_upd));
 
 li_stop = callbacks["stop_task"]([taskid = found_id, reason = "fleet test done"]);
 check("stop_task works on a taskid from the listing", std.string(li_stop) == "OK", std.string(li_stop));
@@ -1206,9 +1229,9 @@ check("add_task on an offline node reports why (C4)",
 	std.string(rtr.add_task_error()));
 rt_drop_node(rtr, DEAD_NAME);
 
-// the node refuses the delegation on the wire: an empty prompt
-check("a delegation refusal reports the node's reason (C4)",
-	std.is_none(rtr.add_task("Empty", "", GPU_NAME)) && std.string(rtr.add_task_error()).contains("missing 'prompt'"),
+// the node refuses a blocking request on the wire: an empty prompt
+check("a request refusal reports the node's reason (C4)",
+	std.is_none(rtr.add_task("Empty", "", GPU_NAME, "request")) && std.string(rtr.add_task_error()).contains("missing 'prompt'"),
 	std.string(rtr.add_task_error()));
 
 // the node refuses the worker task: an empty goal
@@ -1238,6 +1261,168 @@ for(i = 0; i < seen_events.size(); i++) {
 }
 create_err = std.is_json(create_ev) ? std.string(create_ev.error) : "no event";
 check("the creation task_state event carries an empty error (C1)", std.is_json(create_ev) && create_ev.has("error") && create_err == "", create_err);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  7b. Node + workspace routing, threads (issue #1015)
+//
+//  A node publishes its workspaces; start_task names one of them; a follow-up
+//  goes into the same session, also after the task finished (the thread is open
+//  again, turn 2); the thread table survives a restart of the router.
+// ─────────────────────────────────────────────────────────────────────────────
+
+hostA.published = [
+	[id = "node", name = "General", description = "no project", path = "/n", parent = ""],
+	[id = "ws_shop", name = "Shop Frontend", description = "the web shop", path = "/p/shop", parent = ""],
+	[id = "ws_api", name = "Shop API", description = "the backend", path = "/p/api", parent = ""],
+];
+svcA.update_props();
+
+table_ready = wait_for([rtr]() {
+		for(n : rtr.nodes_summary()) {
+			if(n.name == GPU_NAME && n.workspaces.size() == 3)
+				return true;
+		}
+		return false;
+	}, 12000);
+check("the routing table carries the workspaces of a node", table_ready, std.string(rtr.nodes_summary()));
+
+ctx_text = rtr.turn_context();
+check("the turn context lists the nodes with their workspaces", ctx_text.contains(GPU_NAME) && ctx_text.contains("Shop Frontend") && ctx_text.contains("Shop API"), ctx_text);
+
+rtr.turn_text = "make the login button blue";
+rtr.turn_origin = [chat = 4711];
+th_res = callbacks["start_task"]([node = GPU_NAME, workspace = "shop frontend", name = "Login-Button"]);
+check("start_task takes a workspace by name, any case", std.is_json(th_res) && th_res.workspace == "Shop Frontend" && std.string(th_res.thread).starts("T"), std.string(th_res));
+
+th_id = std.is_json(th_res) ? std.string(th_res.taskid) : "";
+th_rec = rtr.inspect_task(th_id);
+th_remote = std.is_json(th_rec) ? std.string(th_rec.remote_taskid) : "";
+th_task = hostA.find_scheduled(th_remote);
+check("the session starts in that workspace of the node", std.is_json(th_task) && std.string(th_task.workspace_id) == "ws_shop", std.string(th_task));
+check("without 'task' the worker gets the user's words verbatim", std.is_json(th_task) && std.string(th_task.task) == "make the login button blue", std.string(th_task));
+check("the thread remembers who asked", std.is_json(th_rec) && std.is_json(th_rec.origin) && std.int(th_rec.origin.chat) == 4711, std.string(th_rec));
+check("a task is found by its thread label", std.is_json(rtr.inspect_task(std.string(th_res.thread))) && rtr.inspect_task(std.string(th_res.thread)).taskid == th_id, std.string(th_res.thread));
+
+bad_ws = callbacks["start_task"]([node = GPU_NAME, workspace = "Nowhere", name = "Lost"]);
+check("an unknown workspace is refused with the list of the node's workspaces",
+	std.string(bad_ws).contains("NOT started") && std.string(bad_ws).contains("Nowhere") && std.string(bad_ws).contains("Shop API"), std.string(bad_ws));
+
+gen_res = callbacks["start_task"]([node = GPU_NAME, name = "Uptime", task = "what is the uptime of this box?"]);
+gen_task = hostA.find_scheduled(std.string(rtr.inspect_task(std.string(gen_res.taskid)).remote_taskid));
+check("no workspace: the node's General workspace", std.is_json(gen_res) && gen_res.workspace == "General" && std.is_json(gen_task) && std.string(gen_task.workspace_id) == "node", std.string(gen_res));
+
+// the worker finishes turn 1
+events_before = seen_events.size();
+hostA.finish_task(th_remote, "finished", "The button is blue now.");
+th_done = wait_for([rtr, th_id]() { return rtr.inspect_task(th_id).state == "finished"; }, 8000);
+check("turn 1 of the thread finishes with its report", th_done && std.string(rtr.inspect_task(th_id).report).contains("blue now"), std.string(rtr.inspect_task(th_id)));
+
+fin_events = [];
+for(i = events_before; i < seen_events.size(); i++) {
+	e = seen_events[i];
+	if((e.kind == "task_finished" || e.kind == "task_state") && std.string(e.taskid ?? "") == th_id && std.string(e.state ?? "") == "finished")
+		fin_events.push_back(e);
+}
+check("the finish is announced once, as the thread", fin_events.size() == 1 && std.string(fin_events[0].thread) == std.string(th_res.thread) &&
+	std.string(fin_events[0].workspace) == "Shop Frontend" && std.int(fin_events[0].origin_chat) == 4711 && std.int(fin_events[0].turn) == 1, std.string(fin_events));
+
+ctx_text = rtr.turn_context(4711);
+check("the context shows the thread with its last message and report", ctx_text.contains(std.string(th_res.thread)) && ctx_text.contains("make the login button blue") && ctx_text.contains("blue now"), ctx_text);
+check("the context of another chat does not show it", !rtr.turn_context(1234).contains(std.string(th_res.thread)), rtr.turn_context(1234));
+
+// a follow-up after the task finished: the same session, a new turn
+rtr.turn_text = "make it green instead";
+events_before = seen_events.size();
+fu = callbacks["update_task"]([taskid = std.string(th_res.thread)]);
+check("a follow-up reaches a FINISHED task by its thread label", std.string(fu).starts("OK"), std.string(fu));
+th_rec = rtr.inspect_task(th_id);
+check("the thread is open again, turn 2", std.is_json(th_rec) && th_rec.state == "generating" && std.int(th_rec.turn) == 2, std.string(th_rec));
+th_task = hostA.find_scheduled(th_remote);
+check("the SAME session on the node got the user's words", std.is_json(th_task) && std.string(th_task.user_updates).contains("make it green instead"), std.string(th_task));
+green_tasks = 0;
+for(t : hostA.tasks_scheduled) {
+	if(std.string(t.task) == "make it green instead")
+		green_tasks++;
+}
+check("no second task was started for the follow-up", green_tasks == 0, std.string(hostA.tasks_scheduled));
+
+reopened = [];
+for(i = events_before; i < seen_events.size(); i++) {
+	e = seen_events[i];
+	if(e.kind == "task_state" && std.string(e.taskid ?? "") == th_id && e.reopened)
+		reopened.push_back(e);
+}
+check("the reopening is an event (state generating, turn 2)", reopened.size() == 1 && reopened[0].state == "generating" && std.int(reopened[0].turn) == 2, std.string(reopened));
+
+events_before = seen_events.size();
+hostA.finish_task(th_remote, "finished", "The button is green now.");
+th_done2 = wait_for([rtr, th_id]() { return rtr.inspect_task(th_id).state == "finished"; }, 8000);
+check("turn 2 finishes with its own report", th_done2 && std.string(rtr.inspect_task(th_id).report).contains("green now"), std.string(rtr.inspect_task(th_id)));
+fin2 = [];
+for(i = events_before; i < seen_events.size(); i++) {
+	e = seen_events[i];
+	if((e.kind == "task_finished" || e.kind == "task_state") && std.string(e.taskid ?? "") == th_id && std.string(e.state ?? "") == "finished")
+		fin2.push_back(e);
+}
+check("turn 2 is announced once, with turn = 2", fin2.size() == 1 && std.int(fin2[0].turn) == 2, std.string(fin2));
+check("the thread keeps both turns", rtr.inspect_task(th_id).turns.size() == 2 && std.string(rtr.inspect_task(th_id).turns[0].report).contains("blue now") &&
+	std.string(rtr.inspect_task(th_id).turns[1].user).contains("green instead"), std.string(rtr.inspect_task(th_id).turns));
+
+// a follow-up for a task the node no longer has
+gone_res = callbacks["start_task"]([node = GPU_NAME, workspace = "Shop API", name = "Gone", task = "a task that vanishes"]);
+gone_remote = std.string(rtr.inspect_task(std.string(gone_res.taskid)).remote_taskid);
+hostA.stop_task(gone_remote);
+rtr.stop_task(std.string(gone_res.taskid));
+gone_upd = callbacks["update_task"]([taskid = std.string(gone_res.thread), message = "are you there?"]);
+check("a follow-up the node cannot place says why", std.string(gone_upd).contains("NOT delivered") && std.string(gone_upd).contains("does not exist"), std.string(gone_upd));
+
+// a turn the owner ran in the web interface of the node is not announced here
+events_before = seen_events.size();
+web_task = hostA.add_task("WebChat", "typed in the browser", "adaptive", "ws_shop", "web");
+hostA.finish_task(web_task, "finished", "answered in the browser");
+net_task = hostA.add_task("GoalRun", "a scheduled goal", "adaptive", "ws_shop", "");
+hostA.finish_task(net_task, "finished", "goal done");
+adopted = wait_for([seen_events, events_before, net_task]() {
+		for(i = events_before; i < seen_events.size(); i++) {
+			if(std.string(seen_events[i].taskid ?? "") == net_task || std.string(seen_events[i].remote_taskid ?? "") == net_task)
+				return true;
+		}
+		return false;
+	}, 6000);
+web_seen = false;
+for(i = events_before; i < seen_events.size(); i++) {
+	if(std.string(seen_events[i].taskid ?? "") == web_task || std.string(seen_events[i].report ?? "").contains("answered in the browser"))
+		web_seen = true;
+}
+check("work the node did on its own (a goal) is still announced", adopted, "");
+check("a turn of the node's web interface is not announced", !web_seen, std.string(seen_events));
+
+// the thread table on disk: a second router picks the threads up
+threads_file = std.user_path() + "/miniagent_selftest_threads_" + std.random_hash(6) + ".json";
+rtr.threads_path = threads_file;
+rtr._save_threads(true);
+saved = fileio.read_json(threads_file, true);
+check("the thread table is written", std.is_json(saved) && std.is_json(saved.threads) && saved.threads.size() >= 3, std.string(saved).substr(0, 300));
+saved_th = None;
+if(std.is_json(saved)) {
+	for(t : saved.threads) {
+		if(std.string(t.taskid) == th_id)
+			saved_th = t;
+	}
+}
+check("a saved thread carries what a follow-up needs", std.is_json(saved_th) && std.string(saved_th.remote_taskid) == th_remote && std.string(saved_th.node) == GPU_NAME &&
+	std.string(saved_th.workspace_name) == "Shop Frontend" && std.int(saved_th.turn) == 2 && std.int(saved_th.origin.chat) == 4711, std.string(saved_th));
+// a router that starts with that file has the threads again
+kept = rtr.remote_tasks;
+count_before = kept.size();
+rtr.remote_tasks = [];
+loaded = rtr._load_threads();
+back = rtr.inspect_task(std.string(th_res.thread));
+check("the thread table is read back at the start", loaded == count_before && std.is_json(back) && std.string(back.remote_taskid) == th_remote && std.int(back.turn) == 2, std.string(loaded) + " of " + std.string(count_before));
+check("a loaded thread can be continued", rtr.update_task(std.string(th_res.thread), "one more thing after the restart") && rtr.inspect_task(th_id).state == "generating" && std.int(rtr.inspect_task(th_id).turn) == 3, std.string(rtr.inspect_task(th_id)));
+rtr.stop_task(th_id);
+try { fileio.remove(threads_file); } catch(e) {}
+rtr.threads_path = "";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Teardown

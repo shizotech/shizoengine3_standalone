@@ -5,10 +5,18 @@
 //  Demo CLI host:     router.shio        (include THIS file, not router.shio)
 //
 //  The Router is the runtime substrate of the **router agent**: a miniagent running
-//  the "router" role (roles/router/) is the brain that decides which node owns a
-//  task, this class is the body that executes the agent's decisions — it discovers
-//  AI nodes over ShizoNet, delegates tasks to the right node's receptionist, mirrors
-//  their task state into a local table and forwards every node event to its owner.
+//  the "router" role (roles/router/) is the brain that decides which node AND which
+//  workspace own a request, this class is the body that executes the agent's
+//  decisions — it discovers AI nodes over ShizoNet, starts the work as a worker
+//  session in that workspace (ai_task_add: no agent in between), mirrors the task
+//  state into a local table and forwards every node event to its owner.
+//
+//  A routed task is a **thread**: the worker session on the node keeps the whole
+//  conversation, the mirror record here keeps where it lives (node, workspace,
+//  session) and the last messages of each side. A follow-up of the user goes into
+//  the same session (update_task), also after the task has finished, so the worker
+//  that answers it is the one that did the work — it never has to guess what
+//  "make it blue instead" refers to.
 //
 //      #include "router_api"
 //
@@ -19,7 +27,10 @@
 //      r.on_action([](a) { print(a); });
 //      r.request("summarize this repo");                  // one router-agent turn
 //      r.route_task("summarize this repo");               // agent turn + the routed task
-//      r.delegate("Box", "train the model");              // explicit node, no model
+//      r.add_task("Train", "train the model", "Box", "worker", "ml-project");
+//                                                         // explicit node + workspace, no model
+//      r.update_task(taskid, "use the big dataset");      // the same conversation, running or finished
+//      r.delegate("Box", "what is your uptime?");         // one blocking request (ai_request)
 //
 //  Subclassing works exactly like the other miniagent classes:
 //
@@ -51,6 +62,9 @@ ROUTER_MAX_ACTIONS_KEPT = 50;
 ROUTER_MAX_OUTPUT_CHARS = 2000;
 ROUTER_INFO_REFRESH_MS = 5000;
 ROUTER_MAX_POLL_FAILS = 3;
+ROUTER_MAX_TURNS_KEPT = 6;			// turns of a thread kept in the mirror (the session has all of them)
+ROUTER_TURN_TEXT_CHARS = 400;		// characters of a user message / a report kept per turn
+ROUTER_THREADS_SAVE_MS = 2000;		// the thread table is written at most this often
 
 // A task whose node disappears is NOT lost on the first missed poll: the node
 // may reconnect. It becomes lost only after this grace period (or after a
@@ -111,6 +125,9 @@ router_map_task_state(state) {
 	if(state == "planned") {
 		return "queued";
 	}
+	if(state == "queued") {
+		return "queued";
+	}
 	if(state == "research") {
 		return "generating";
 	}
@@ -139,6 +156,15 @@ router_map_task_state(state) {
 		return "lost";
 	}
 	return "generating";
+}
+
+// a text cut to max_len characters, on one line
+router_clip(text, max_len = 400) {
+	t = std.string(text ?? "").strip().replace("\r", " ").replace("\n", " ");
+	if(t.length() > max_len) {
+		t = t.substr(0, max_len) + "...";
+	}
+	return t;
 }
 
 router_first_line(text, max_len = 90) {
@@ -211,6 +237,16 @@ class Router {
 	turn_attachments = [];		// files of the current turn ([name, content]): appended
 								// verbatim to the goal this turn delegates, so a node
 								// gets an .md plan without the model copying it
+	turn_text = "";				// the user's message of the current turn, verbatim: what a
+								// task gets when the agent does not rephrase it
+	turn_origin = None;			// who asked in the current turn ([chat = id, ...]); kept on
+								// the threads the turn starts, so a report finds its chat
+	adopt_web = false;			// false: a task the owner ran in the web interface of a node
+								// is not announced here (they are looking at it there)
+	threads_path = "";			// where the thread table is kept across restarts ("" = not kept)
+	_threads_dirty = false;
+	_threads_saved = 0;
+	last_update_error = "";		// reason of the last update_task failure ("" on success)
 	last_actions = [];			// newest first, for the role's get_last_actions
 	last_route_error = "";		// C4: reason of the LAST add_task failure ("" on success)
 	threads = [];
@@ -281,6 +317,12 @@ class Router {
 			if(opts.has("on_action")) {
 				_action_cb = opts.on_action;
 			}
+			if(opts.has("threads_path") && opts.threads_path) {
+				threads_path = std.string(opts.threads_path);
+			}
+			if(opts.has("adopt_web")) {
+				adopt_web = opts.adopt_web ? true : false;
+			}
 		}
 
 		_lock = "router:" + name + ":" + std.random_hash(8);
@@ -302,6 +344,9 @@ class Router {
 		server.on_connect(this._on_connect);
 		server.on_disconnect(this._on_disconnect);
 
+		// the threads of the last run: a follow-up still finds its session
+		_load_threads();
+
 		// pick up everything that is already out there
 		refresh_nodes();
 
@@ -316,6 +361,11 @@ class Router {
 
 	__deinit__() {
 		running = false;
+
+		try {
+			_save_threads(true);
+		}
+		catch(e) {}
 
 		if(agent) {
 			try {
@@ -614,15 +664,16 @@ class Router {
 		];
 	}
 
-	// Role entry point (the router agent's start_task tool). Real user work goes to
-	// the node's RECEPTIONIST over ai_request: the remote receptionist is the one
-	// that decides how to execute it, exactly like a local Node receptionist.
-	// mode = "worker" bypasses it and drives the remote Workspace directly
-	// (ai_task_add) — CLI / management use.
+	// Role entry point (the router agent's start_task tool). The work starts as a
+	// worker session in a workspace of the node (ai_task_add, mode = "worker"): no
+	// agent sits in between, and the session is the thread of this piece of work.
+	// mode = "request" (the old name "receptionist" is accepted) sends the goal as
+	// one blocking ai_request instead — a node answers it with one worker turn in
+	// its own workspace; it is the path for hosts that offer nothing else.
 	//
-	// The target node is the AGENT's decision (it picks it from get_nodes() and
-	// passes it here). An empty node is a routing error, not something this class
-	// guesses. -> taskid, None on failure.
+	// The target node and workspace are the AGENT's decision (it picks them from
+	// get_nodes() and passes them here). An empty node is a routing error, not
+	// something this class guesses. -> taskid, None on failure.
 	// the delegated text: the goal plus the files of the current turn
 	_with_attachments(goal) {
 		if(!turn_attachments.size()) {
@@ -649,7 +700,7 @@ class Router {
 	// add_task keeps its contract (taskid | None); the wrapper only adds the
 	// exception path: a raise inside the routing must land in last_route_error too,
 	// otherwise the agent gets a bare "it refused" and the reason dies in the log.
-	add_task(name, goal, node_name = None, mode = "receptionist", workspace = "") {
+	add_task(name, goal, node_name = None, mode = "worker", workspace = "") {
 		last_route_error = "";
 
 		try {
@@ -683,6 +734,22 @@ class Router {
 			last_route_error = "node '" + std.string(rec.name) + "' is offline: it does not answer on the ShizoNet network right now";
 			std.error("[router] add_task: ", last_route_error);
 			return None;
+		}
+
+		// the workspace: an id or a name of the node's list, "" = its own workspace
+		ws_label = workspace;
+
+		if(mode == "worker") {
+			where = _resolve_workspace(rec, workspace);
+
+			if(!where.ok) {
+				last_route_error = std.string(where.error);
+				std.error("[router] add_task: ", last_route_error);
+				return None;
+			}
+
+			workspace = std.string(where.id);
+			ws_label = std.string(where.label);
 		}
 
 		// One goal, one task: the same goal on the same node and workspace while
@@ -732,6 +799,7 @@ class Router {
 			node = rec.name,
 			nodeid = rec.mac,
 			workspace = workspace,
+			workspace_name = ws_label,
 			remote_request_id = "",
 			remote_taskid = std.string(reply.taskid ?? ""),
 			name = std.string(reply.name ?? name),
@@ -740,28 +808,34 @@ class Router {
 			report = "",
 		]);
 
-		_note_action("add_task", [node = rec.name, taskid = taskid, task_name = name]);
+		_note_action("add_task", [node = rec.name, workspace = ws_label, taskid = taskid, task_name = name]);
 
 		return taskid;
 	}
 
-	// Follow-up on a mirrored task. Two wire channels (router_api.md):
-	//   ai_request-backed (delegated user work)  -> ai_request_update: the message
-	//     reaches the remote RECEPTIONIST turn that owns request_id.
-	//   ai_task_add-backed (direct Workspace)   -> ai_task_update: the remote task.
+	// A message for a routed task (a thread). Two wire channels (router_api.md):
+	//   ai_task_add-backed (a worker session) -> ai_task_update: the session gets the
+	//     message. Running: it is injected into the turn. Finished / question / failed
+	//     / stopped: the session starts a new turn with its whole conversation, and
+	//     the mirror record is OPEN again (a new turn of the same thread) — this is
+	//     how a follow-up reaches the worker that did the work.
+	//   ai_request-backed (a blocking request) -> ai_request_update: only while it runs.
 	// The user message is recorded in the local mirror in every case, so the owner
 	// always sees what it sent, even when the node rejected it.
-	// -> true when the node accepted the update, false otherwise.
+	// -> true when the node accepted the message, false otherwise (update_task_error()).
 	update_task(taskid, message) {
+		last_update_error = "";
 		rec = _find_task(taskid);
 
 		if(!rec) {
+			last_update_error = "no task '" + std.string(taskid) + "' in the router's table";
 			return false;
 		}
 
 		if(!rec.remote_taskid && !rec.remote_request_id) {
 			// no remote id at all: keep the update in the mirror so the owner can see it.
 			_append_update(rec, message);
+			last_update_error = "the task has no session on a node any more";
 			return false;
 		}
 
@@ -782,11 +856,36 @@ class Router {
 			accepted = true;
 		}
 
-		if(accepted) {
-			_note_action("update_task", [taskid = taskid, node = rec.node]);
+		if(!accepted) {
+			why = "the node did not answer";
+			if(std.is_json(reply)) {
+				why = std.string(reply.error ?? why);
+			}
+			if(why == "not found") {
+				why = rec.remote_taskid
+					? "the session of this task does not exist on node '" + std.string(rec.node) + "' any more"
+					: "the request has ended; a finished request cannot be continued";
+			}
+			last_update_error = why;
+			return false;
 		}
 
-		return accepted;
+		// a finished worker session took the message: the thread has a new turn
+		if(rec.remote_taskid && !router_is_open_state(std.string(rec.state ?? ""))) {
+			_reopen_task(rec, message);
+		}
+		else {
+			_note_turn_message(rec, message);
+		}
+
+		_note_action("update_task", [taskid = std.string(rec.taskid), node = rec.node, thread = std.string(rec.thread ?? "")]);
+
+		return true;
+	}
+
+	// the reason of the last update_task() failure ("" after a success)
+	update_task_error() {
+		return std.string(last_update_error ?? "");
 	}
 
 	stop_task(taskid) {
@@ -948,17 +1047,138 @@ class Router {
 
 		return [
 			taskid = std.string(rec.taskid ?? ""),
+			thread = std.string(rec.thread ?? ""),
 			node = std.string(rec.node ?? ""),
+			workspace = std.string(rec.workspace_name ?? rec.workspace ?? ""),
 			name = std.string(rec.name ?? ""),
 			state = st,
 			open = router_is_open_state(st),
+			turn = std.int(rec.turn ?? 1),
 			goal = router_first_line(rec.goal ?? ""),
+			last_message = _last_user_text(rec),
 			report = router_first_line(rec.report ?? ""),
 			last_error = std.string(rec.last_error ?? ""),
 			user_updates = updates,
 			created = std.int(rec.created ?? 0),
 			updated = std.int(rec.updated ?? 0),
 		];
+	}
+
+	// What the router agent is told before the user's message: the threads that are
+	// around (so "do that again" / "make it blue" / an answer to a question find
+	// their task without a tool call) and the nodes with their workspaces.
+	// origin_chat: 0 = every thread, else the threads of that chat.
+	turn_context(origin_chat = 0, max_threads = 8) {
+		out = "";
+		list = threads_summary(max_threads, origin_chat);
+
+		if(list.size()) {
+			out += "Tasks of this conversation, newest first (thread, node / workspace, state):\n";
+
+			for(t : list) {
+				out += "- " + std.string(t.thread) + "  " + std.string(t.node) + " / " + std.string(t.workspace ? t.workspace : "General") +
+					"  \"" + std.string(t.title) + "\"  " + std.string(t.state);
+				if(t.turns > 1) {
+					out += ", " + std.string(t.turns) + " turns";
+				}
+				out += ", " + std.string(t.minutes_ago) + " min ago\n";
+				if(t.last_message) {
+					out += "    user: " + std.string(t.last_message) + "\n";
+				}
+				if(t.last_report) {
+					out += "    " + (t.state == "question" ? "QUESTION of the task" : "report") + ": " + std.string(t.last_report) + "\n";
+				}
+			}
+		}
+		else {
+			out += "No task has been routed in this conversation yet.\n";
+		}
+
+		online = nodes_summary();
+
+		if(!online.size()) {
+			out += "\nNo AI node is online right now.\n";
+			return out;
+		}
+
+		out += "\nNodes online (name: workspaces):\n";
+
+		for(n : online) {
+			out += "- " + std.string(n.name);
+			if(n.description) {
+				out += " (" + router_clip(n.description, 120) + ")";
+			}
+			out += ":";
+			if(!n.workspaces.size()) {
+				out += " (publishes no workspaces)";
+			}
+			for(i, w : n.workspaces) {
+				out += (i ? ", " : " ") + std.string(w.name ? w.name : w.id);
+			}
+			out += "\n";
+		}
+
+		return out;
+	}
+
+	_last_user_text(rec) {
+		if(std.is_json(rec.turns) && rec.turns.size()) {
+			return std.string(rec.turns[rec.turns.size() - 1].user ?? "");
+		}
+		return router_first_line(rec.goal ?? "");
+	}
+
+	// The threads the router agent needs to place a message: newest first, with the
+	// last user message and the last report of each. origin_chat (0 = all) keeps it
+	// to the threads one chat started.
+	threads_summary(limit = 12, origin_chat = 0) {
+		res = [];
+		now = std.millis();
+
+		cs = std.critical_section_named(_lock);
+
+		for(i = remote_tasks.size() - 1; i >= 0 && res.size() < limit; i--) {
+			t = remote_tasks[i];
+
+			if(origin_chat && std.is_json(t.origin) && std.int(t.origin.chat ?? 0) != origin_chat) {
+				continue;
+			}
+			if(origin_chat && !std.is_json(t.origin)) {
+				continue;
+			}
+
+			st = std.string(t.state ?? "");
+			last_report = "";
+
+			if(std.is_json(t.turns)) {
+				for(j = t.turns.size() - 1; j >= 0 && !last_report; j--) {
+					last_report = std.string(t.turns[j].report ?? "");
+				}
+			}
+			if(!last_report) {
+				last_report = router_clip(t.report ?? "", ROUTER_TURN_TEXT_CHARS);
+			}
+
+			res.push_back([
+				thread = std.string(t.thread ?? ""),
+				taskid = std.string(t.taskid ?? ""),
+				node = std.string(t.node ?? ""),
+				workspace = std.string(t.workspace_name ?? t.workspace ?? ""),
+				title = std.string(t.name ?? ""),
+				state = st,
+				open = router_is_open_state(st),
+				turns = std.int(t.turn ?? 1),
+				minutes_ago = std.int((now - std.int(t.updated ?? now)) / 60000),
+				first_message = router_clip(t.goal ?? "", ROUTER_TURN_TEXT_CHARS),
+				last_message = _last_user_text(t),
+				last_report = last_report,
+				continuable = std.string(t.remote_taskid ?? "").length() > 0,
+			]);
+		}
+
+		cs.release();
+
+		return res;
 	}
 
 	notify_user(msg) {
@@ -1032,12 +1252,29 @@ class Router {
 		}
 		else if(ev.kind == "task_finished") {
 			dup = _task_state_announced(ev);
+
+			// A turn the owner ran in the web interface of the node: they are looking
+			// at it there. A task THIS router started is announced whatever its origin.
+			if(!adopt_web && std.string(ev.origin ?? "") == "web" && !_find_task(ev.taskid)) {
+				return "ok";
+			}
 		}
 
 		emit = _mirror_event(ev);
 
 		if(dup || !emit) {
 			return "ok";
+		}
+
+		// the event of a task in the mirror speaks of the thread, not of the session id
+		if(ev.kind == "task_finished") {
+			rec = _find_task(ev.taskid);
+
+			if(rec) {
+				_close_turn(rec);
+				ev.remote_taskid = std.string(ev.taskid);
+				_task_event_fields(rec, ev);
+			}
 		}
 
 		_emit_event(ev);
@@ -1172,6 +1409,8 @@ class Router {
 				tasks_planned = 0,
 				uptime_ms = 0,
 				goals = false,		// C5: node runs a GoalScheduler (ai_node_info)
+				api = false,		// the node serves its JSON API over ShizoNet (ai_api)
+				workspaces = [],	// [[id, name, description, path, parent]]: where work can go
 				seen = std.millis(),
 				offline_since = 0,	// when the node last went offline (grace clock)
 				last_info = 0,
@@ -1319,6 +1558,12 @@ class Router {
 			// so the router agent can tell "no goal system here" BEFORE delegating.
 			rec.goals = info.goals ? true : false;
 		}
+		if(info.has("api")) {
+			rec.api = info.api ? true : false;
+		}
+		if(info.has("workspaces") && std.is_json(info.workspaces)) {
+			rec.workspaces = info.workspaces;
+		}
 
 		rec.last_info = std.millis();
 		rec.seen = std.millis();
@@ -1344,7 +1589,67 @@ class Router {
 			uptime_ms = rec.uptime_ms,
 			goals = rec.goals ? true : false,	// C5: does this node run goals at all?
 			open_tasks = _count_open_tasks(rec.name),
+			workspaces = _workspaces_brief(rec),
 		];
+	}
+
+	// the workspaces of a node for the routing table: [[id, name, description]]
+	_workspaces_brief(rec) {
+		out = [];
+		list = rec.workspaces;
+
+		if(!std.is_json(list)) {
+			return out;
+		}
+
+		for(w : list) {
+			if(!std.is_json(w)) {
+				continue;
+			}
+			out.push_back([
+				id = std.string(w.id ?? ""),
+				name = std.string(w.name ?? ""),
+				description = router_clip(w.description ?? "", 160),
+			]);
+		}
+
+		return out;
+	}
+
+	// The workspace a task goes to. `want` is an id or a name (any case), "" is the
+	// node's own workspace ("General"). A node that published its workspaces is
+	// checked against them: a name the node does not have is an error that lists the
+	// ones it has, never a guess. An older node (no list) gets the value as given.
+	// -> [ok, id, label, error]
+	_resolve_workspace(rec, want) {
+		w_want = std.string(want ?? "").strip();
+		list = rec.workspaces;
+
+		if(!std.is_json(list) || !list.size()) {
+			return [ok = true, id = w_want, label = w_want, error = ""];
+		}
+
+		if(!w_want) {
+			w_want = "node";
+		}
+
+		low = w_want.lowercase();
+		names = "";
+
+		for(w : list) {
+			if(!std.is_json(w)) {
+				continue;
+			}
+			wid = std.string(w.id ?? "");
+			wname = std.string(w.name ?? "");
+
+			if(wid == w_want || wid.lowercase() == low || wname.lowercase() == low) {
+				return [ok = true, id = wid, label = wname ? wname : wid, error = ""];
+			}
+			names += (names ? ", " : "") + (wname ? wname : wid);
+		}
+
+		return [ok = false, id = "", label = "", error = "unknown workspace '" + w_want + "' on node '" + std.string(rec.name) + "'. Its workspaces: " + names];
 	}
 
 	_node_online(rec) {
@@ -1538,12 +1843,29 @@ class Router {
 		if(!rec.has("workspace")) {
 			rec.workspace = "";
 		}
+		if(!rec.has("workspace_name")) {
+			rec.workspace_name = std.string(rec.workspace);
+		}
+
+		// the thread: its first turn is the goal, its origin is who asked for it
+		rec.turn = 1;
+		rec.turns = [[
+			user = router_clip(rec.goal ?? "", ROUTER_TURN_TEXT_CHARS),
+			report = "",
+			state = "",
+			time = std.millis(),
+		]];
+		if(!rec.has("origin")) {
+			rec.origin = std.is_json(turn_origin) ? turn_origin.copy() : None;
+		}
 
 		cs = std.critical_section_named(_lock);
 		_task_seq++;
 		rec.seq = _task_seq;
+		rec.thread = "T" + std.string(rec.seq);
 		remote_tasks.push_back(rec);
 		count = remote_tasks.size();
+		_threads_dirty = true;
 		cs.release();
 
 		for(count > ROUTER_MAX_TASKS_KEPT) {
@@ -1558,7 +1880,7 @@ class Router {
 		// chat show the terminal state before the report (and two messages when a
 		// front end does not dedupe). Normal delegation still announces creation.
 		if(announce) {
-			_emit_event([
+			_emit_event(_task_event_fields(rec, [
 				kind = "task_state",
 				time = std.millis(),
 				node = rec.node,
@@ -1567,10 +1889,203 @@ class Router {
 				state = rec.state,
 				report = "",
 				error = "",
-			]);
+			]));
 		}
 
 		return rec.taskid;
+	}
+
+	// what every task event says about its thread (front ends route and label by it)
+	_task_event_fields(rec, ev) {
+		ev.taskid = std.string(rec.taskid ?? "");
+		ev.thread = std.string(rec.thread ?? "");
+		ev.workspace = std.string(rec.workspace_name ?? rec.workspace ?? "");
+		ev.turn = std.int(rec.turn ?? 1);
+
+		if(std.is_json(rec.origin)) {
+			ev.origin_chat = std.int(rec.origin.chat ?? 0);
+		}
+
+		return ev;
+	}
+
+	// the user's words of the current turn of a thread (kept short: the session has them all)
+	_note_turn_message(rec, message) {
+		cs = std.critical_section_named(_lock);
+		if(std.is_json(rec.turns) && rec.turns.size()) {
+			last = rec.turns[rec.turns.size() - 1];
+			last.user = router_clip(std.string(last.user ?? "") + " / " + std.string(message), ROUTER_TURN_TEXT_CHARS);
+		}
+		_threads_dirty = true;
+		cs.release();
+	}
+
+	// the report of the turn that just ended goes into the thread's history
+	_close_turn(rec) {
+		cs = std.critical_section_named(_lock);
+		if(std.is_json(rec.turns) && rec.turns.size()) {
+			last = rec.turns[rec.turns.size() - 1];
+			last.report = router_clip(rec.report ?? "", ROUTER_TURN_TEXT_CHARS);
+			last.state = std.string(rec.state ?? "");
+		}
+		_threads_dirty = true;
+		cs.release();
+	}
+
+	// A finished thread took a new message: it is open again, with a new turn.
+	// (Not through _set_task_state: a terminal state is final there, on purpose —
+	// only an accepted follow-up may open a thread again.)
+	_reopen_task(rec, message) {
+		cs = std.critical_section_named(_lock);
+		old = std.string(rec.state ?? "");
+		rec.state = "generating";
+		rec.turn = std.int(rec.turn ?? 1) + 1;
+		rec.report = "";
+		rec.last_error = "";
+		rec.output = "";
+		rec.poll_fails = 0;
+		rec.updated = std.millis();
+		rec.last_progress = std.millis();
+		rec.stall_announced = false;
+
+		if(!std.is_json(rec.turns)) {
+			rec.turns = [];
+		}
+		rec.turns.push_back([
+			user = router_clip(message, ROUTER_TURN_TEXT_CHARS),
+			report = "",
+			state = "",
+			time = std.millis(),
+		]);
+		for(rec.turns.size() > ROUTER_MAX_TURNS_KEPT) {
+			rec.turns.erase(0);
+		}
+		_threads_dirty = true;
+		cs.release();
+
+		_emit_event(_task_event_fields(rec, [
+			kind = "task_state",
+			time = std.millis(),
+			node = rec.node,
+			taskid = rec.taskid,
+			name = rec.name,
+			state = "generating",
+			prev = old,
+			reopened = true,
+			report = "",
+			error = "",
+		]));
+	}
+
+	// ── the thread table on disk ────────────────────────────────────────────────
+
+	_load_threads() {
+		if(!threads_path || !fileio.exists(threads_path)) {
+			return 0;
+		}
+
+		data = None;
+		try {
+			data = fileio.read_json(threads_path, true);
+		}
+		catch(e) {
+			data = None;
+		}
+
+		if(!std.is_json(data) || !std.is_json(data.threads)) {
+			return 0;
+		}
+
+		n = 0;
+		cs = std.critical_section_named(_lock);
+		for(t : data.threads) {
+			if(!std.is_json(t) || !std.string(t.taskid ?? "")) {
+				continue;
+			}
+			rec = t.copy();
+			rec.poll_fails = 0;
+			rec.last_poll = 0;
+			rec.output = "";
+			rec.last_error = std.string(rec.last_error ?? "");
+			rec.last_progress = std.millis();
+			rec.stall_announced = false;
+			if(!std.is_json(rec.user_updates)) {
+				rec.user_updates = [];
+			}
+			if(!std.is_json(rec.turns)) {
+				rec.turns = [];
+			}
+			remote_tasks.push_back(rec);
+			if(std.int(rec.seq ?? 0) > _task_seq) {
+				_task_seq = std.int(rec.seq);
+			}
+			n++;
+		}
+		cs.release();
+
+		return n;
+	}
+
+	// called from the poller thread: at most every ROUTER_THREADS_SAVE_MS, only when dirty
+	_save_threads(force = false) {
+		if(!threads_path) {
+			return false;
+		}
+		if(!_threads_dirty && !force) {
+			return false;
+		}
+		if(!force && std.millis() - _threads_saved < ROUTER_THREADS_SAVE_MS) {
+			return false;
+		}
+
+		out = [];
+		cs = std.critical_section_named(_lock);
+		for(t : remote_tasks) {
+			ups = [];
+			if(std.is_json(t.user_updates)) {
+				first = math.max(0, t.user_updates.size() - 5);
+				for(i = first; i < t.user_updates.size(); i++) {
+					ups.push_back(t.user_updates[i]);
+				}
+			}
+			out.push_back([
+				taskid = std.string(t.taskid ?? ""),
+				thread = std.string(t.thread ?? ""),
+				seq = std.int(t.seq ?? 0),
+				node = std.string(t.node ?? ""),
+				nodeid = std.string(t.nodeid ?? ""),
+				workspace = std.string(t.workspace ?? ""),
+				workspace_name = std.string(t.workspace_name ?? ""),
+				remote_request_id = std.string(t.remote_request_id ?? ""),
+				remote_taskid = std.string(t.remote_taskid ?? ""),
+				name = std.string(t.name ?? ""),
+				goal = std.string(t.goal ?? "").substr(0, 4000),
+				state = std.string(t.state ?? ""),
+				report = std.string(t.report ?? "").substr(0, 8000),
+				last_error = std.string(t.last_error ?? ""),
+				turn = std.int(t.turn ?? 1),
+				turns = std.is_json(t.turns) ? t.turns.copy() : [],
+				origin = std.is_json(t.origin) ? t.origin.copy() : None,
+				user_updates = ups,
+				created = std.int(t.created ?? 0),
+				updated = std.int(t.updated ?? 0),
+			]);
+		}
+		_threads_dirty = false;
+		_threads_saved = std.millis();
+		cs.release();
+
+		try {
+			dir = fileio.file_dir(threads_path);
+			if(dir && !fileio.exists(dir)) {
+				fileio.mkdir(dir);
+			}
+			return fileio.write_json(threads_path, [threads = out], true, true) ? true : false;
+		}
+		catch(e) {
+			std.error("[router] could not write ", threads_path, ": ", e);
+			return false;
+		}
 	}
 
 	// The mirror record of an OPEN task on `node_name`, in `workspace`, with
@@ -1661,6 +2176,10 @@ class Router {
 				match = t;
 				break;
 			}
+			if(std.string(t.thread ?? "") && std.string(t.thread).lowercase() == want.lowercase()) {
+				match = t;
+				break;
+			}
 		}
 		cs.release();
 
@@ -1677,6 +2196,7 @@ class Router {
 		}
 		rec.user_updates.push_back([message = std.string(message), time = std.millis()]);
 		rec.updated = std.millis();
+		_threads_dirty = true;
 		cs.release();
 	}
 
@@ -1716,7 +2236,15 @@ class Router {
 		// C2: a state change is progress — it restarts the stall watchdog.
 		_mark_task_progress(rec);
 
-		_emit_event([
+		// the turn of the thread ends with its terminal state
+		if(!router_is_open_state(new_state)) {
+			_close_turn(rec);
+		}
+		else {
+			_threads_dirty = true;
+		}
+
+		_emit_event(_task_event_fields(rec, [
 			kind = "task_state",
 			time = std.millis(),
 			node = node,
@@ -1726,7 +2254,7 @@ class Router {
 			prev = old,
 			report = report,
 			error = last_error,
-		]);
+		]));
 
 		return true;
 	}
@@ -1784,7 +2312,7 @@ class Router {
 			return;
 		}
 
-		_emit_event([
+		_emit_event(_task_event_fields(rec, [
 			kind = "task_stalled",
 			time = std.millis(),
 			node = node,
@@ -1793,7 +2321,7 @@ class Router {
 			state = state,
 			idle_ms = idle,
 			error = "",
-		]);
+		]));
 	}
 
 	_count_open_tasks(node_name) {
@@ -1941,12 +2469,14 @@ class Router {
 				taskid = std.string(ev.taskid),
 				node = std.string(ev.node),
 				nodeid = "",
+				workspace = std.string(ev.workspace_id ?? ""),
 				remote_request_id = "",
 				remote_taskid = std.string(ev.taskid),
 				name = std.string(ev.name ?? ""),
 				goal = "",
 				state = router_map_task_state(std.string(ev.state ?? "finished")),
 				report = std.string(ev.report ?? ""),
+				origin = None,
 			], false);
 			return true;
 		}
@@ -1961,10 +2491,14 @@ class Router {
 		if(ev.has("name") && ev.name) {
 			rec.name = std.string(ev.name);
 		}
+		if(ev.has("error") && ev.error && std.string(ev.state ?? "") != "finished") {
+			rec.last_error = std.string(ev.error);
+		}
 		rec.updated = std.millis();
 		// C2: the node pushed something about this task — it is alive.
 		rec.last_progress = std.millis();
 		rec.stall_announced = false;
+		_threads_dirty = true;
 		cs.release();
 
 		return true;
@@ -2121,6 +2655,13 @@ class Router {
 			}
 			catch(e) {
 				std.error("[router] polling the tasks failed: ", e);
+			}
+
+			try {
+				_save_threads();
+			}
+			catch(e) {
+				std.error("[router] saving the threads failed: ", e);
 			}
 		}
 	}

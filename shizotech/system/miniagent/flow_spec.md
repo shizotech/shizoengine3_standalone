@@ -1,35 +1,35 @@
-# miniagent runtime flow: web UI, Telegram router, goals and finalize
+# miniagent runtime flow: web UI, Telegram gateway, goals and finalize
 
 This is the operational contract after the workspace refactor. It describes what actually
-happens when a prompt is sent from the web UI or from the Telegram router, which directories
+happens when a prompt is sent from the web UI or from the Telegram gateway, which directories
 are read, how a workspace session subprocess is spawned, and how a task's terminal state
 reaches the owner.
 
 ## 1. Storage roots (no current-working-directory dependency)
 
 ```text
-std.user_path()/miniagent/
-  node/                              the Node's own goal/architecture store
+std.user_path()/miniagent/           (--data-dir <dir> moves this root)
+  node/                              the Node's own workspace ("General", id "node")
     .agentspace/                     node-level goals, preferences, ledger
+    .megamind/sessions/<sid>/        its sessions: session.json, chat.json, chat.json.result.json
     .megamind/architecture/          node-level architecture graph
-  workspaces/                        WorkspaceRegistry root (the root Workspace)
-    workspaces.json                  registry
+  workspaces/                        WorkspaceRegistry root
+    workspaces.json                  registry (id, name, path, parent, description)
     settings.json                    max_sessions
-    .megamind/sessions/<sid>/        root Workspace sessions: session.json, chat.json, chat.json.result.json
-    .megamind/architecture/          root Workspace architecture graph
-    <workspace>/                     a real project workspace
-      .agentspace/                   that workspace's goals, preferences, ledger
-      .megamind/sessions/<sid>/      session.json, chat.json, chat.json.result.json
-      .megamind/architecture/        that workspace's architecture graph
+<any folder>/                        a real project workspace (registered by path)
+  .agentspace/                       that workspace's goals, preferences, ledger
+  .megamind/sessions/<sid>/          session.json, chat.json, chat.json.result.json
+  .megamind/architecture/            that workspace's architecture graph
+<cwd of the node>/workspaces/<name>/ where a workspace created WITHOUT a path gets its folder
 ```
 
-`miniagent_storage.shio` owns the path helpers. `node.shio`, `goals.shio`, `web_ui.shio` and
+`miniagent_storage.shio` owns the path helpers. `node_lib.shio`, `goals.shio`, `web_ui.shio` and
 `workspaces.shio` use them, so starting a node from any directory does not create `./.agentspace`.
-The runnable node is a `Node` class (`node.shio`); it owns a `WorkspaceRegistry`, the registry's
-`root` Workspace as its own node Workspace, the `Receptionist` connector, and the ShizoNet
-`AiService` (`node_architecture.md`). `WorkspaceRegistry` loads and instantiates every `Workspace`
-from `std.user_path()/miniagent/workspaces`, owns one shared `SessionManager`, and `WorkspaceStore`
-owns `workspaces.json` and `settings.json`.
+The runnable node is a `Node` class (`node_lib.shio`); it owns a `WorkspaceRegistry`, its own
+node Workspace, the route table of the API and the ShizoNet `AiService`
+(`node_architecture.md`). There is no receptionist agent on a node (#1015). `WorkspaceRegistry`
+loads and instantiates every `Workspace` from `std.user_path()/miniagent/workspaces`, owns one
+shared `SessionManager`, and `WorkspaceStore` owns `workspaces.json` and `settings.json`.
 
 The registry root is a container, not a project workspace; it has no `.agentspace`. Every real
 workspace scheduler starts when the node/web UI starts, and a newly created workspace gets its
@@ -37,26 +37,37 @@ scheduler immediately.
 
 ## 2. Web UI prompt flow
 
-`shz miniagent --web` (or `shz miniagent.node --web`):
+`shz miniagent --node --web`:
 
-1. `__init__.shio` sees `--web` / `--node` / `--web=<port>` and loads `node.shio`. `--init` / `--init=<...>` is forwarded to `node.shio` too; `node_init_workspace()` registers cwd and returns before any model/ShizoNet/web startup.
-2. `node.shio` creates a `Node`: a `WorkspaceRegistry`, the Node's own `Workspace`, one
-   `Receptionist` connector (a single receptionist agent), and the ShizoNet AI node service.
+1. `__init__.shio` sees `--node` / `--web` / `--init` and loads `node.shio`
+   (`--telegram-gateway` loads `telegram_gateway.shio`; `--web` without `--node` still starts
+   the node and says so). `--init [<dir>]` registers the directory (default: cwd) and returns
+   before any model/ShizoNet/web startup.
+2. `node.shio` creates a `Node` (`node_lib.shio`): a `WorkspaceRegistry`, the Node's own
+   `Workspace`, the API route table and the ShizoNet AI node service. `--workspace <dir>`
+   registers folders first.
 3. `Node.start_node_goals()` starts the Node's own Workspace `GoalScheduler` on
    `std.user_path()/miniagent/node/.agentspace` (unless `--no-goals` / `--agentspace` says
    otherwise), with `workspace_id = "node"`.
 4. The `WorkspaceRegistry` starts every registered real workspace scheduler at node startup,
    before the web UI or API is bound. Each `Workspace` owns its `ArchitectureBoard` and
    `GoalScheduler`; the registry owns one shared `SessionManager` for all workspaces.
-5. `web_ui_start()` starts the HTTP server on port 13337 (or `--port`), registers the Node JSON
-   API, the chat protocol, and the workspace API. The dashboard is the connector to the
-   registry; it holds no node-scoped task or architecture data.
+5. `web_ui_start()` starts the HTTP server on port 13337 (or `--port`) on the route table
+   (Node JSON API, workspace API, gateway settings) and adds the routes for the other nodes
+   (`GET /api/nodes`, `/api/nodes/<id>/api/...`: the same API of a peer, asked over ShizoNet
+   with `ai_api`). The dashboard is the connector to the registries; it holds no task or
+   architecture data of its own. When the gateway settings say so, `GatewayRunner` starts
+   `shz miniagent --telegram-gateway` as a process of its own.
 6. The workspace API is backed by the `WorkspaceRegistry`:
    - `GET /api/workspaces` -> tree, settings, stats
    - `POST /api/workspaces/<id>/sessions` -> new session (title, mode, prompt, reasoning_effort)
    - `POST /api/sessions/<id>/prompt` -> prompt into an existing session
    - `POST /api/sessions/<id>/effort` -> persist low/medium/high reasoning effort for future turns
    - `GET /api/sessions/<id>/stream` -> SSE (`delta`, `user`, `status`, `done`, `error`, `stats`)
+   - `GET /api/sessions/<id>` -> the session with its saved chat and, while a turn runs, the
+     turn so far as items (`turn`, `turn_seq`): a page that opens it later draws all of it and
+     takes the stream from `turn_seq`
+   - `GET /api/live` -> the change feed the page long-polls instead of polling on a timer
 7. Creating a session (`Workspace.add_task` / `SessionManager.create_session`) writes
    `session.json` and `chat.json` below the workspace's `.megamind/sessions/<sid>/`, then spawns
    a subprocess in the workspace directory:
@@ -76,8 +87,14 @@ scheduler immediately.
    `config.json`, endpoint or API token is written next to the conversation.
 
 8. `workspace_agent.shio`:
-   - loads `chat.json` (the complete conversation, source of truth) and imports it into the agent;
+    - loads `<workspace>/.env/vars` at startup when it exists and exports each `KEY=VALUE` line
+      with `std.set_env`; the `SHARED.shio` command tools run in this process and inherit them;
+    - loads `chat.json` (the complete conversation, source of truth) and imports it into the agent;
    - creates `GoalSpace(workspace + "/.agentspace")` and a `GoalScheduler` for its goal tools;
+    - rescans that local scheduler once at startup (`notify = false`) so `get_goals` sees the
+      goals that already exist; the registry scheduler, not this local one, dispatches windows;
+    - goal tools rescan after create / update / status changes, so a new or moved goal is visible
+      to the next `get_goals` call;
    - registers `get_goals`, `create_goal`, `create_recurring_goal`, `update_goal`,
      `set_goal_status`, `run_goal_now`, `create_workspace_task`, `goal_finish`;
    - registers the architecture board at `workspace + "/.megamind/architecture"`;
@@ -114,55 +131,74 @@ scheduler immediately.
     - `GoalScheduler` ticks every 15 s, rescans the workspace `.agentspace`, activates windows
       exactly once, and calls `Workspace.add_task(...)`.
     - `Workspace.add_task` calls the shared `SessionManager.create_session(workspace_id, name, "normal",
-     goal, "adaptive")`, i.e. the goal run is a subprocess session in that same workspace
-      directory. The scheduler settles it through `inspect_task` / the finished listener.
+      goal, "adaptive")`, i.e. the goal run is a subprocess session in that same workspace
+       directory. The scheduler settles it through `inspect_task` / the finished listener.
+    - `max_sessions` is the number of sessions that run at once. When every slot is busy the session is
+      created with `status = "queued"` (not refused); `SessionManager.dispatch_queue()` starts queued
+      sessions FIFO when a session finishes, is stopped or is deleted, and when `max_sessions` is raised.
+      A queued task is still open for the goal scheduler and the router (`state = "queued"`).
     - The Node's own workspace scheduler works the same way for
       `std.user_path()/miniagent/node/.agentspace`; there is no node-level worker pool.
 
-## 3. Telegram router prompt flow
+## 3. Telegram gateway prompt flow
 
-`shz telegram_router.shio --bot-token ...`:
+`shz miniagent --telegram-gateway [--bot-token ...]` (not a node; a node starts it as a
+process of its own when the settings of the web interface say so):
 
 1. `TelegramRouter(cfg, opts)` builds a `Router` (a `miniagent` with the `router` role) and
-   starts the ShizoNet router service.
-2. The trusted-chat list is read from `trusted_chats` (default `std.config_path("miniagent",
+   starts the ShizoNet router service. The token comes from `--bot-token` or the saved
+   settings (`gateway_config.shio`); without one it exits with code 2.
+2. The chat list is read from `trusted_chats` (default `std.config_path("miniagent",
    "trusted_chats")`). No file / empty list -> the first chat that messages the bot becomes the
-   trusted chat and is written to disk. Untrusted chats are ignored.
+   owner chat and is written to disk. Unknown chats are ignored; the owner chats are told once
+   that a chat knocked. An entry with `role = "guest"` is bound to one node + workspace.
 3. The bot transport's `on_any_message` calls `TelegramRouter.tg_handle_message`:
    - text and text documents (`.md`, `.txt`, `.json`, code, up to 256 KB) are accepted;
    - the caption of a document is the instruction;
    - a burst of messages from the same chat within 1500 ms becomes one turn;
    - commands such as `/nodes`, `/tasks`, `/status`, `/goals`, `/goal ...`, `/allow`, `/deny`,
-     `/forget`, `/help`, `/id` are handled locally or in the worker thread.
+     `/forget`, `/guest ...`, `/guests`, `/help`, `/id` are handled locally or in the worker
+     thread; a guest chat has `/help /new /stop /status /id`.
 4. `tg_worker()` sends queued notifications and runs one router-agent turn at a time.
    Telegram HTTP never runs on the ShizoNet thread.
-5. The router-agent turn (`roles/router`) gets `get_nodes`, `get_node_overview`, `get_tasks`,
-   `start_task`, `update_task`, `stop_task`, `inspect_task`, `get_last_actions`, `notify`,
-   `finish(report)`. The agent reads the node table and picks a node; it does not keyword-match.
-6. `Router.add_task(node, goal)`:
-   - refuses an unknown/offline node with a concrete reason;
-   - is idempotent for the same goal on the same node while the task is open;
-   - default mode `receptionist` sends `ai_request` to the Node's `Receptionist` connector and
-     stores the mirror record with `remote_request_id`;
-   - mode `worker` sends `ai_task_add` to a `Workspace`; an optional workspace id defaults to
-     the Node's own workspace.
+5. An **owner** message is one router-agent turn (`roles/router`). The prompt is a
+   `<context>` block (`Router.turn_context(chat)`: the threads of this chat, the nodes with
+   their workspaces) followed by the message; `Router.turn_text` holds the message verbatim and
+   `Router.turn_origin = [chat]`. The agent has `get_nodes`, `get_node_overview`, `get_tasks`,
+   `get_goals`, `start_task`, `update_task`, `stop_task`, `inspect_task`, `get_last_actions`,
+   `notify`, `finish(report)`. It picks node **and workspace** from the table; it does not
+   keyword-match, and it asks back when it cannot place the message.
+   A **guest** message skips the agent: it starts a thread in the guest's workspace or
+   continues the guest's current one.
+6. `Router.add_task(name, goal, node, "worker", workspace)`:
+   - refuses an unknown/offline node and an unknown workspace with a concrete reason;
+   - is idempotent for the same goal on the same node + workspace while the task is open;
+   - sends `ai_task_add`: a worker session in that workspace (`origin = "net"`), no agent in
+     between. The mirror record is a **thread** (`T<n>`, `remote_taskid` = the session id);
+   - mode `request` sends one blocking `ai_request` turn instead (`Router.delegate`).
+   `Router.update_task(thread, message)` sends `ai_task_update`: into the running turn, or as
+   a new turn of the finished session (the thread is reopened).
 7. The router poller (`poll_ms`, default 1000) polls open mirror records:
-   - `ai_request_poll` for delegated receptionist turns;
-   - `ai_task` for workspace tasks;
+   - `ai_task` for worker threads;
+   - `ai_request_poll` for request turns;
    - node refresh every 5 s; the router announces node online/offline itself.
 8. Terminal task states are mirrored and emitted as `task_state`:
    `queued | generating | finished | failed | question | stopped | lost`.
-   `task_finished` from the Node is deduplicated against the poller transition; Telegram also
-   keeps one terminal message per taskid. A plain finished goal run produces one terminal task
-   message, not a second goal-status message.
+   `task_finished` from the Node is deduplicated against the poller transition; Telegram
+   keeps one terminal message per **turn** of a thread (`taskid#turn`). The message goes to
+   the chat that started the thread (`origin_chat`), what no chat started to the owner chats.
+   A session of the web interface (`origin = "web"`) is not announced.
 9. `lost` is definitive only: after the node has been offline for the grace period
    (`ROUTER_TASK_LOST_GRACE_MS`) or after a definitive `not found` with no report. Transient
    poll failures keep the task open and only update `last_error`. The node's completed
    `ai_request` stays pollable for one hour (`AI_REQUEST_TTL_MS`), so a late poll does not
    turn a completed task into `lost`.
 10. Telegram notifications are the owner-facing sink: `task_state` terminal, `task_stalled`,
-    node `notify`, and `file` (send_file) are rendered. Node online/offline, running progress,
+    node `notify`, and `file` (send_file) are rendered with the place of the task
+    (`T12 · GPUBox / Shop Frontend`). Node online/offline, running progress,
     and tool calls are silent unless `--verbose-events` is used.
+11. The thread table is saved (`gateway_threads.json` next to the trust file) and loaded at
+    start, so a follow-up after a restart of the gateway still reaches its session.
 
 ## 3b. Isolated Telegram client (`telegram_client.shio`)
 

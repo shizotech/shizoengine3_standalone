@@ -1,4 +1,4 @@
-<!-- generated from shizoscript_language_doc.md by post_compile.shio on 2026-11-14 - do not edit: edit the source and re-run post_compile.shio -->
+<!-- generated from shizoscript_language_doc.md by post_compile.shio on 2026-11-19 - do not edit: edit the source and re-run post_compile.shio -->
 
 # ShizoScript Code Generation
 
@@ -431,11 +431,15 @@ NOT AVAILABLE:
 :=
 ```
 
+`**` is a syntax error after an operand ("operator ** does not exist, use math.pow(a, b)"; it compiled as
+`a * (*b)` before, #936); `a * *p` with a space and `**pp` (a double dereference) stay valid.
 `:=` is not an assignment operator (it is rejected with a clear syntax error). Inside a list
 literal, `[key: value]` uses `:` as the key separator (see JSON Objects).
 
 Syntax errors (the script does not compile):
 - Leftover tokens after an expression: `std.print(1 + 2 3);`
+- An expression nested more than 600 levels deep (a chain of thousands of operators, thousands of nested lists or
+  calls): "Expression nested too deeply" (#936; it overflowed the native stack).
 - A missing `;` between two statements: `x = 1` followed by `y = 2;` on the next line.
 - A member access that ends with a dangling `.`: `x.;`
 - `else if` without a `(...)` condition: `if(0){} else if std.print("b");`
@@ -744,24 +748,24 @@ file is a compile error, the script does not run:
   `std.string`, `std.print` allows only `std.print`, `cabi_example.math` allows `cabi_example.math.square` but not
   `cabi_example.add`. The full path of every use is checked: a call `std.x()`, a function value `f = std.x;`, a child
   namespace, and a name of a `using` namespace (`using std; print("x");` is `std.print`). `using ns;` needs an
-  entry for `ns` itself. Message: `*** 'std.string' is not allowed in restricted mode: it is not on the allow list of
+  entry for `ns` itself. Message: `*** E3014: 'std.string' is not allowed in restricted mode: it is not on the allow list of
   the script.`
 - **Host builtins**: an entry `std` does not allow the builtins of std that start processes, touch the file system,
   the network or the environment, load code or act on the host process. Only an entry with the name of one allows
   it (`shz --restricted std,std.system`). The list (`shz_restricted_deny` in `core/shizoscript3_core/shz_script.cpp`):
-  `std.system`, `std.import`, `std.module`, `std.resolve_source_file`, `std.resolve_source_text`, `std.cd`, `std.wd`,
+  `std.system`, `std.import`, `std.module`, `std.resolve_source_file`, `std.resolve_source_text`, `std.preprocess`, `std.cd`, `std.wd`,
   `std.set_env`, `std.home`, `std.system_path`, `std.save_config`, `std.load_config`, `std.config_path`,
   `std.user_path`, `std.local_app_path`, `std.local_app_data`, `std.local_app_cache`, `std.path`,
   `std.local_executable`, `std.web_get`, `std.exitprocess`, `std.hideconsole`, `std.messagebox`,
   `std.kernel_compile`, `std.kernel_jit`, `std.kernel_aot_load`, `std.kernel_jit_compiler`, `std.kernel_cache_dir`
-  and the namespace `fileio`. The names are the same in every mode. Message: `*** 'std.system' is not allowed in
+  and the namespace `fileio`. The names are the same in every mode. Message: `*** E3014: 'std.system' is not allowed in
   restricted mode: it reaches out of the script (processes, files, network, environment or loading code), only an
   allow list entry 'std.system' allows it.`
 - **`#include`**: only files under the directory of the main script and under the `include_dirs` of the
   configuration (`shz --restricted-include <dir>`, it can be repeated). The file is looked for beside the including
   file, then in the include dirs; the search paths and the working directory are not used. An absolute path is
   refused, and so is a file that lies outside these directories once `..` and symbolic links are resolved (`../x`,
-  a link that points out): `*** Cannot include 'outside.shio': it is /home/me/outside.shio, outside the directory of
+  a link that points out): `*** E1014: Cannot include 'outside.shio': it is /home/me/outside.shio, outside the directory of
   the script (restricted mode).` A source without a path (`load_code`, the prompt) can include only from the
   include dirs.
 - Objects a host gives the script, and native code (plugins, modules), still run with the rights of the process:
@@ -784,7 +788,17 @@ def later(x);       // forward declaration of a function defined further down
 - A failed `#include` (file not found, invalid directive, syntax error inside the included file) is a compile error: the script does not run.
 - A file reached through different relative paths is included only once.
 - `#pragma once` marks the file as lexed-once: the file is lexed one time per compilation unit (one load of a script with the files it `#include`s, one per `std.module`), every later inclusion of it produces no tokens. The file is identified by its **resolved absolute path** - separators, `.` / `..` and, where the filesystem normalizes paths, the case are resolved, so `"helper"`, `"./helper"` and `"../dir/helper.shio"` are one file, the same rule as the bullet above. The directive is valid at every position of a file (also inside a block) and is removed before parsing. In a source without a path (a module loaded from a string, the prompt) it is accepted and does nothing. (#195)
-- Every other `#pragma <name>` is a syntax error that names it: `*** Unknown #pragma 'msgoff'. Only '#pragma once' exists.`; a `#pragma` with no name reports `*** #pragma needs a name: '#pragma once'.`. The preprocessor knows `#define`, `#include`, `#strict` and `#pragma once` only. (#195)
+- Every other `#pragma <name>` is a syntax error that names it: `*** E1010: Unknown #pragma 'msgoff'. Only '#pragma once' exists.`; a `#pragma` with no name reports `*** E1011: #pragma needs a name: '#pragma once'.`. The preprocessor knows `#define`, `#include`, `#strict` and `#pragma once` only. (#195)
+- A `#define` is continued on the next line by a `\` at the end of the line. It is not substituted as text like in C: it is expanded where it is used as a part of the syntax tree, so `#define X a + b` used as `X * 2` is `(a + b) * 2`.
+- The preprocessor is a pass of its own: it reads the characters into tokens (comments go), inlines the `#include` files, applies `#pragma once`, records `#strict`, replaces `__FILE__` / `__LINE__` / `__DIR__` and joins the lines of a `#define`; the parser reads only its tokens. Its errors are the 1000s of the table of compile error IDs (22.1). (#195)
+- `std.preprocess(source, path = "", errors = None)` runs it without compiling and returns the preprocessed **text**, `None` on an error (printed like a compile error). `source` is the text of a script, or the path of a `.shio` file (one line that names an existing file; `.shio` may be left out; a missing `x.shio` is `E1020`). `path` makes `source` text with that file name (for an `#include` beside it, `__FILE__`, `__DIR__` and the positions of errors). A list as `errors` gets `[id, message, file, line, column]` of each error, like `std.module().compile_errors()`. The text compiles to the same program as the source: one line per line with code (empty lines and comments are gone), the indentation of every line, `#define` lines as written (joined with `\`), `#strict` / `#strict off` where the strict state changes (an included file has its own), strings as written, `__FILE__` / `__DIR__` as string literals. A line break inside a comment between two tokens stays as `/*` line break `*/`, a comment between two tokens without a blank as `/**/` (a blank in front of `[` makes a list, not an index). `std.resolve_source_file` / `std.resolve_source_text` stay as they are: they only inline the `#include` lines and keep the rest of the text (comments, blank lines, the columns of every character), which the code editor needs. (#195)
+
+```
+text = std.preprocess("main.shio");                 // the file and its includes as one text
+errs = [];
+if (std.preprocess("#include \"x\"\n", "", errs) == None)
+    std.print(errs[0].id, " ", errs[0].message);    // 1015 File not found: x.shio
+```
 
 ---
 
@@ -953,6 +967,9 @@ that calls into the script are serialised by it.
 - **One lock per script, not per application.** Two scripts of an application (each with its own variables, like
   a script per purpose in an engine) can run on two threads at the same time with nothing between them.
   `std.module()` loads into the current script (its own program, its own main task) and shares its lock.
+  `load_file` / `load_code` return false (and `call_error()` is true) when the source does not compile and when its
+  global scope ends with a runtime error, also one after a `std.sleep` there (#937). After a runtime error the module
+  keeps what ran before it (the module is truthy, after a compile failure it is not).
 
 ### 16.2 Check-then-act across a blocking call
 
@@ -1126,6 +1143,337 @@ try {
 - Errors while evaluating call arguments are catchable too (`try { f(n.foo()); } catch(e) {}`).
 - `noexcept` functions turn an error into a `None` return value (see Functions).
 - `std.runtime_error("...")` raises an error; `std.error(...)` / `std.warn(...)` only log.
+
+### 22.1 Compile error IDs
+
+Every compile-time error (lexer, preprocessor, parser, code generator, kernels, strict checker) has a number and
+one fixed message, printed in front of the message: `*** E1004: unterminated string`. `{0}`, `{1}`, ... in the
+table are the names and values the message fills in. Runtime errors have no ID yet. (#195)
+
+- Ranges: **1000s** lexer / preprocessor (`#include`, `#strict`, `#pragma`, `#define`), **2000s** parser,
+  **3000s** code generator, **4000s** kernels, **5000s** strict checker (printed as `E5001: [strict] ...`; a strict
+  warning is printed without its ID, the error it turns into with `--strict-errors` with it).
+- A number is never reused: a removed error leaves its number unused, a new error takes the next free number of its
+  range. The words of a message may change, its number and meaning do not.
+- `m = std.module(); if (!m.load_code(code)) errs = m.compile_errors();` gives the errors of the last `load_code()` /
+  `load_file()` as a list of `[id, message, file, line, column]` (`id` 1004 for E1004, `message` the text after
+  `E1004: `), the first one is the cause; empty when the code compiled. A source that failed before and is loaded
+  again unchanged is not compiled again (#330) and returns the same list. C++: `shz_compiler::last_errors()`,
+  `shz_lexer::last_errors` (`core/shizoscript3_core/log/shz_error_ids.h` defines the IDs).
+
+| ID | Name | Message |
+|---|---|---|
+| E1000 | `lexer_failed` | `Cannot read the source.` - reading the characters into tokens (or cutting out the kernel declarations) failed without an error of its own (not printed) |
+| E1001 | `unterminated_comment` | `unterminated comment` |
+| E1002 | `unterminated_raw_string` | `unterminated raw string` |
+| E1003 | `invalid_raw_string_delimiter` | `invalid raw string delimiter` |
+| E1004 | `unterminated_string` | `unterminated string` |
+| E1005 | `invalid_escape` | `{0}` - {0} = what is wrong with the `\u` escape (malformed, a lone surrogate) |
+| E1006 | `malformed_exponent` | `Malformed exponent in numeric literal` |
+| E1007 | `invalid_strict_directive` | `Invalid #strict directive, expected '#strict', '#strict on' or '#strict off'.` |
+| E1008 | `unexpected_token_after_strict` | `Unexpected token after #strict directive.` |
+| E1009 | `strict_not_available` | `#strict is not available on this build (microcontroller): the strict checker is left out.` |
+| E1010 | `unknown_pragma` | `Unknown #pragma '{0}'. Only '#pragma once' exists.` |
+| E1011 | `pragma_needs_name` | `#pragma needs a name: '#pragma once'.` |
+| E1012 | `unexpected_token_after_pragma` | `Unexpected token after the #pragma directive.` |
+| E1013 | `invalid_include_directive` | `invalid include directive` |
+| E1014 | `cannot_include` | `Cannot include '{0}': {1}.` |
+| E1015 | `file_not_found` | `File not found: {0}` |
+| E1016 | `include_needs_file_name` | `#include needs a file name: #include "file"` |
+| E1017 | `invalid_directive` | `Invalid directive.` |
+| E1018 | `recursive_define` | `Recursive #define '{0}'.` |
+| E1019 | `too_many_nested_define_expansions` | `Too many nested #define expansions (limit {0}) while expanding '{1}'.` |
+| E1020 | `script_file_not_found` | `Cannot find script file {0}` |
+| E1021 | `preprocessor_failed` | `Cannot preprocess the source.` - the preprocessor (`#include`, `#pragma`, `#strict`, `#define`) failed without an error of its own (not printed) |
+| E1022 | `power_operator_missing` | `operator ** does not exist, use math.pow(a, b) (or "a * *b" with a space for a multiplication by a dereference)` |
+| E2000 | `parser_failed` | `Cannot parse the source.` - stage 2 / 3 failed without an error of its own (not printed) |
+| E2001 | `cannot_parse_token` | `Cannot parse token: {0}` |
+| E2002 | `expected_brackets_after_else_if` | `Expected '()' after 'else if'.` |
+| E2003 | `cannot_find_closing_bracket_for` | `Cannot find closing bracket for '{0}'.` |
+| E2004 | `expected_brackets_after` | `Expected '()' after '{0}'.` |
+| E2005 | `cannot_find_closing_bracket_code_block` | `Cannot find closing bracket for code block.` |
+| E2006 | `expected_code_block_after_keyword` | `Expected a code block after '{0}': { ... }, a statement on the same line or an indented line below.` |
+| E2007 | `expected_codeblock_after_statement` | `Expected codeblock after statement.` |
+| E2008 | `expected_code_block_after` | `Expected code block after '{0}'.` |
+| E2009 | `invalid_closing_bracket` | `Invalid closing bracket: {0}` |
+| E2010 | `missing_closing_round_bracket` | `Missing closing bracket for '('` |
+| E2011 | `missing_closing_square_bracket` | `Missing closing bracket for '['` |
+| E2012 | `missing_closing_curly_bracket` | `Missing closing bracket for '{'` |
+| E2013 | `cannot_find_closing_bracket` | `Cannot find closing bracket.` |
+| E2014 | `cannot_parse_command` | `Cannot parse command: {0}` |
+| E2015 | `comma_in_condition` | `',' is not an operator: a condition is one expression (use && or \|\|).` |
+| E2016 | `comma_after_return` | `',' after return: a function returns one value (return a list [a, b] for several).` |
+| E2017 | `cannot_parse_statement` | `Cannot parse statement.` |
+| E2018 | `expected_statement_after_comma` | `Expected a statement after ','.` |
+| E2019 | `invalid_statement` | `Invalid statement.` |
+| E2020 | `invalid_condition` | `Invalid condition` |
+| E2021 | `cannot_parse_condition` | `Cannot parse condition.` |
+| E2022 | `if_statement_without_condition` | `if statement without condition!` |
+| E2023 | `cannot_parse_conditional_block` | `Cannot parse conditional block.` |
+| E2024 | `expected_code_block_after_statement` | `Expected code block after statement.` |
+| E2025 | `cannot_parse_loop_iterable` | `Cannot parse what the loop iterates over.` |
+| E2026 | `loop_key_value_same_name` | `The key and the value of the loop need different names.` |
+| E2027 | `loop_needs_condition` | `Loop needs a condition.` |
+| E2028 | `cannot_parse_loop_start` | `Cannot parse start.` |
+| E2029 | `cannot_parse_loop_end` | `Cannot parse end.` |
+| E2030 | `invalid_for_condition` | `Invalid for condition` |
+| E2031 | `invalid_loop` | `Invalid loop.` |
+| E2032 | `invalid_try_block` | `Invalid try block.` |
+| E2033 | `catch_without_try` | `catch without try.` |
+| E2034 | `invalid_catch_block` | `Invalid catch block.` |
+| E2035 | `invalid_catch_condition` | `Invalid catch condition` |
+| E2036 | `cannot_parse_catch_condition` | `Cannot parse catch condition.` |
+| E2037 | `catch_needs_variable_name` | `catch(...) takes the name of a variable for the error message: catch(e) { }` |
+| E2038 | `cannot_parse_return` | `Cannot parse return.` |
+| E2039 | `invalid_token` | `Invalid token.` |
+| E2040 | `cannot_load_module` | `Cannot load module: {0}` |
+| E2041 | `integer_literal_out_of_range` | `Integer literal '{0}' is out of range (64 bit).` |
+| E2042 | `invalid_number_literal` | `Invalid number literal '{0}'.` |
+| E2043 | `float_literal_out_of_range` | `Invalid number literal '{0}' (not a number, or out of the range of a 64 bit float).` |
+| E2044 | `too_many_expressions_inside_bracket` | `Too many expressions inside bracket.` |
+| E2045 | `too_few_expressions_inside_bracket` | `Too few expressions inside bracket.` |
+| E2046 | `comma_in_brackets` | `',' is not an operator (a list is written [a, b]).` |
+| E2047 | `cannot_parse_sub_block` | `Cannot parse sub-block.` |
+| E2048 | `list_key_missing` | `A key of a list is missing before '{0}'.` |
+| E2049 | `no_value_to_assign` | `No value to assign to.` |
+| E2050 | `cannot_parse_initializer_list` | `Cannot parse initializer list.` |
+| E2051 | `too_many_expressions_inside_json` | `Too many expressions inside json.` |
+| E2052 | `no_expression_inside_json` | `No expression inside json.` |
+| E2053 | `cannot_parse_json` | `Cannot parse json.` |
+| E2054 | `invalid_call_or_def_expression` | `Invalid expression for call or def.` |
+| E2055 | `cannot_parse_function_call_def` | `Cannot parse function call or def.` |
+| E2056 | `unknown_symbol` | `Unknown symbol.` |
+| E2057 | `cannot_parse` | `Cannot parse whatever this is supposed to mean.` |
+| E2058 | `colon_assign_not_supported` | `The ':=' operator is not supported. Use '=' to assign, or ':' inside a list literal ([key: value]).` |
+| E2059 | `cannot_parse_left_side_assignment` | `Cannot parse left side of assignment.` |
+| E2060 | `assign_keywords_on_non_variable` | `Assign keywords ignored for non-variable expression.` |
+| E2061 | `cannot_parse_right_side_assignment` | `Cannot parse right side of assignment.` |
+| E2062 | `block_is_no_value` | `A block { } is not a value (a list is written [1, 2], an empty object std.json()).` |
+| E2063 | `tokens_before_compound_assignment` | `Unexpected tokens before a compound assignment (a missing ';' at the end of the statement before?).` |
+| E2064 | `missing_unary_operand` | `Missing operand for unary operator '{0}'.` |
+| E2065 | `unexpected_token_in_expression` | `Unexpected token '{0}' in expression.` |
+| E2066 | `missing_right_operand` | `Missing right-hand operand for '{0}' operator.` |
+| E2067 | `missing_ternary_true_branch` | `Missing true-branch for ternary operator '?'.` |
+| E2068 | `missing_ternary_colon` | `Missing ':' in ternary expression after '?'.` |
+| E2069 | `missing_ternary_false_branch` | `Missing false-branch for ternary operator ':'.` |
+| E2070 | `missing_right_operand_of_operator` | `Missing right-hand operand for operator '{0}'.` |
+| E2071 | `invalid_operator` | `Invalid operator '{0}'.` |
+| E2072 | `unexpected_token_after_expression` | `Unexpected token '{0}' after expression (missing operator or ';'?).` |
+| E2073 | `unexpected_end_after_dot` | `Unexpected end of expression after '.'.` |
+| E2074 | `invalid_function_call` | `Invalid function call` |
+| E2075 | `cannot_parse_expression` | `Cannot parse expression.` |
+| E2076 | `invalid_index_expression` | `Invalid '[]' expression.` |
+| E2077 | `invalid_expression` | `Invalid expression` |
+| E2078 | `parser_error` | `Parser error.` |
+| E2079 | `cannot_parse_function_call_at` | `Cannot parse function call. {0}{1}` |
+| E2080 | `new_not_supported` | `'new' is not supported, call the class directly: 'Name(...)'.` |
+| E2081 | `return_type_not_supported` | `Return type definition not supported yet` |
+| E2082 | `def_needs_function_name` | `def needs the name of a function: def name(params);` |
+| E2083 | `cannot_parse_lambda` | `Cannot parse lambda.` |
+| E2084 | `missing_semicolon_before_call` | `missing ';' before '{0}'? Every statement must end with ';'.` |
+| E2085 | `cannot_define_function_named` | `Cannot define a function named '{0}'.` |
+| E2086 | `unsupported_statement` | `{0}` - {0} = the hint for `while` / `switch` |
+| E2087 | `invalid_function_parameters` | `Invalid arguments` |
+| E2088 | `default_value_missing` | `Default value missing after '='.` |
+| E2089 | `invalid_parameter_name` | `Invalid parameter name.` |
+| E2090 | `cannot_parse_default_argument` | `Cannot parse default argument.` |
+| E2091 | `cannot_parse_function_body` | `Cannot parse function body.` |
+| E2092 | `missing_base_class_name` | `Missing base class name after '{0}'` |
+| E2093 | `missing_struct_name` | `Missing name after '{0}'` |
+| E2094 | `unknown_token_in_def` | `Unknown token in def.` |
+| E2095 | `unknown_struct_definition` | `Unknown struct definition.` |
+| E2096 | `cannot_parse_class_body` | `Cannot parse class body.` |
+| E2097 | `unknown_type` | `Unknown type: {0}` |
+| E2098 | `cannot_parse_function_call` | `Cannot parse function call.` |
+| E2099 | `invalid_arguments` | `Invalid arguments ({0}).` |
+| E2100 | `cannot_parse_argument` | `Cannot parse argument.` |
+| E2101 | `expression_nested_too_deeply` | `Expression nested too deeply (more than {0} levels): split it into several statements.` |
+| E3000 | `compile_failed` | `Cannot compile the program.` - the code generator failed without an error of its own (not printed) |
+| E3001 | `keywords_with_compound_assignment` | `Cannot use assignment keywords with compound assignment.` |
+| E3002 | `unknown_assignment_keyword` | `Unknown assignment keyword '{0}' (missing ';' at the end of the previous statement?).` |
+| E3003 | `multiple_assignment_keywords` | `Multiple assignment keywords in one group are not supported.` |
+| E3004 | `variable_double_definition` | `Variable '{0}' double definition.` |
+| E3005 | `variable_used_in_own_definition` | `'{0}' is used in its own definition (the new variable does not exist before this line).` |
+| E3006 | `variable_used_in_first_assignment` | `Variable '{0}' does not exist (it is used in its own first assignment).` |
+| E3007 | `invalid_command` | `Invalid command: {0}` |
+| E3008 | `cannot_assign_to_expression` | `Cannot assign to illegal expression.` |
+| E3009 | `static_class_member` | `'static' is not supported for class members. Declare it in a method ('static x = 0;' is shared by all instances) or use a global.` |
+| E3010 | `member_conflicts_with_method` | `Member '{0}' conflicts with a method of the same name.` |
+| E3011 | `member_double_definition` | `Member '{0}' double definition.` |
+| E3012 | `not_allowed_in_class` | `Not allowed in class definition.` |
+| E3013 | `instruction_not_implemented` | `Cannot compile instruction, not implemented.` |
+| E3014 | `namespace_not_allowed` | `{0}` - {0} = why restricted mode refuses the name (section 11) |
+| E3015 | `interface_has_no_value` | `'{0}' is an interface, it is only a type and has no value at runtime.` |
+| E3016 | `null_does_not_exist` | `'{0}' does not exist, use 'None'.` |
+| E3017 | `variable_not_captured` | `Variable '{0}' belongs to the function around this lambda: capture it, [{1}](...) { ... }.` |
+| E3018 | `variable_does_not_exist` | `Variable '{0}' does not exist.{1}` |
+| E3019 | `cannot_compile_json` | `Cannot compile json.` |
+| E3020 | `invalid_binary_operator` | `Invalid binary operator '{0}'` |
+| E3021 | `increment_needs_variable` | `The operand of '++' must be a variable, a member or an element.` |
+| E3022 | `decrement_needs_variable` | `The operand of '--' must be a variable, a member or an element.` |
+| E3023 | `invalid_unary_operator` | `Invalid unary operator '{0}'` |
+| E3024 | `cannot_resolve_function_call` | `Cannot resolve function call.` |
+| E3025 | `interface_cannot_be_instantiated` | `'{0}' is an interface, it cannot be instantiated.` |
+| E3026 | `function_not_captured` | `'{0}' belongs to the function around this lambda: capture it, [{1}](...) { ... }.` |
+| E3027 | `function_does_not_exist` | `Function '{0}' does not exist.{1}` |
+| E3028 | `anonymous_functions_not_allowed` | `Anonymous functions not allowed.` |
+| E3029 | `lambda_base_index_negative` | `Computed base_index is negative: {0}` |
+| E3030 | `lambda_index_out_of_bounds` | `Lambda index out of bounds: {0} (size={1})` |
+| E3031 | `lambda_pointer_null` | `Lambda pointer is null at index: {0}` |
+| E3032 | `variable_not_found` | `Variable '{0}' not found` |
+| E3033 | `function_definition_mismatch` | `Definition of function does not match declaration, or this function was defined more than once.` |
+| E3034 | `function_already_exists` | `Function already exists.` |
+| E3035 | `abstract_method_with_body` | `Abstract method '{0}' must have an empty body.` |
+| E3036 | `operator_method_parameter_count` | `Operator method '{0}' (operator {1}) must take exactly {2} parameter(s).` |
+| E3037 | `cannot_parse_function_definition` | `Cannot parse function definition.` |
+| E3038 | `cannot_compile_conditional_code` | `Cannot compile conditional code.` |
+| E3039 | `invalid_final_else` | `Invalid final else.` |
+| E3040 | `cannot_compile_condition` | `Cannot compile condition.` |
+| E3041 | `cannot_compile_conditionals` | `Cannot compile conditionals.` |
+| E3042 | `cannot_compile_loop_iterable` | `Cannot compile what the loop iterates over.` |
+| E3043 | `unknown_loop_variable_type` | `Unknown type '{0}' of the loop variable '{1}'.` |
+| E3044 | `cannot_compile_loop_initializer` | `Cannot compile loop initializer.` |
+| E3045 | `cannot_compile_loop_condition` | `Cannot compile loop condition.` |
+| E3046 | `cannot_compile_loop_body` | `Cannot compile loop body.` |
+| E3047 | `cannot_compile_loop_increment` | `Cannot compile loop increment.` |
+| E3048 | `cannot_compile_loop` | `Invalid loop.` |
+| E3049 | `cannot_compile_try_block` | `Cannot compile try block.` |
+| E3050 | `invalid_try_catch_block` | `Invalid try-catch block.` |
+| E3051 | `cannot_compile_return_statement` | `Cannot compile return statement.` |
+| E3052 | `break_outside_loop` | `'break' outside of a loop.` |
+| E3053 | `continue_outside_loop` | `'continue' outside of a loop.` |
+| E3054 | `invalid_json` | `Invalid json.` |
+| E3055 | `super_outside_method` | `'super' can only be used inside methods of a class.` |
+| E3056 | `super_without_method_call` | `'super' can only be used to call a base class method: super.method(...)` |
+| E3057 | `super_method_not_found` | `No base class of '{0}' defines a method '{1}'.` |
+| E3058 | `super_method_abstract` | `'{0}::{1}' is abstract and has no implementation to call.` |
+| E3059 | `this_member_does_not_exist` | `Class member 'this.{0}' doesnt exist.` |
+| E3060 | `cannot_return_namespace` | `Cannot return namespace.` |
+| E3061 | `cannot_call_namespace` | `Invalid function call (cannot call a namespace)` |
+| E3062 | `cannot_resolve_namespace` | `Cannot resolve namespace.` |
+| E3063 | `namespace_variable_assigned` | `'{0}.{1}' is a variable of a namespace, shared by every script: it cannot be assigned. Copy it into a variable of your own.` |
+| E3064 | `not_in_namespace` | `'{0}' does not exist in namespace '{1}'.{2}` |
+| E3065 | `cannot_compile_json_node` | `Cannot parse json.` |
+| E3066 | `cannot_compile_scoped_code` | `Cannot compile scoped code.` |
+| E3067 | `cannot_compile_scoped_block` | `Cannot compile scoped block.` |
+| E3068 | `cannot_compile_ternary_condition` | `Cannot compile ternary condition.` |
+| E3069 | `cannot_compile_ternary_true_expression` | `Cannot compile ternary true-expression.` |
+| E3070 | `cannot_compile_ternary_false_expression` | `Cannot compile ternary false-expression.` |
+| E3071 | `cannot_parse_ternary_operator` | `Cannot parse ternary operator.` |
+| E3072 | `cannot_parse_list` | `Cannot parse list.` |
+| E3073 | `import_namespace_refused` | `Cannot import namespace '{0}': {1}` |
+| E3074 | `cannot_import_namespace` | `Cannot import namespace '{0}'` |
+| E3075 | `cannot_parse_namespaces` | `Cannot parse namespaces.` |
+| E3076 | `cannot_compile_multi_command` | `Cannot compile multi command.` |
+| E3077 | `class_named_like_interface` | `Class '{0}' has the name of an interface.` |
+| E3078 | `interface_as_base_class` | `'{0}' is an interface, it is no base class: '{1}' satisfies it by having its methods.` |
+| E3079 | `base_class_does_not_exist` | `Base class '{0}' does not exist (it has to be defined before '{1}').` |
+| E3080 | `class_inherits_itself` | `Class '{0}' cannot inherit from itself.` |
+| E3081 | `base_class_listed_twice` | `Base class '{0}' is listed twice.` |
+| E3082 | `class_name_already_defined` | `'{0}' is already defined (a class needs a name of its own).` |
+| E3083 | `cannot_compile_class` | `Cannot compile class.` |
+| E3084 | `nested_classes_not_supported` | `Classes in classes not yet implemented.` |
+| E3085 | `noop_command` | `Noop` |
+| E3086 | `invalid_command_type` | `Invalid command type: {0}` |
+| E3087 | `static_needs_value` | `'static' needs a variable and a value: 'static x = 0;'.` |
+| E3088 | `static_with_keyword` | `'static' cannot be combined with '{0}'.` |
+| E3089 | `static_not_allowed_here` | `'static' cannot be used here.` |
+| E3090 | `not_enough_arguments_builtin` | `Not enough arguments for function {0}` |
+| E3091 | `too_many_arguments_builtin` | `Too many arguments for function {0}` |
+| E3092 | `interface_name_defined_twice` | `'{0}' is defined twice (interface names cannot be used by other interfaces or classes).` |
+| E3093 | `interface_extends_non_interface` | `Interface '{0}' can only extend interfaces, '{1}' is none (an interface has to be defined before it is extended).` |
+| E3094 | `interface_member_not_method` | `Interface '{0}' can only declare methods, like 'float area() {}'.` |
+| E3095 | `interface_method_with_body` | `Method '{0}.{1}' of an interface has no implementation, its body has to be empty: '{}'.` |
+| E3096 | `interface_method_keyword` | `Methods of interface '{0}' are always public and abstract, '{1}' is not allowed.` |
+| E3097 | `parameter_keywords_not_supported` | `parameter keywords not supported yet.` |
+| E3098 | `positional_argument_misplaced` | `cannot place positional argument here.` |
+| E3099 | `cannot_compile_call_arguments` | `Cannot compile the arguments of this call.` |
+| E3100 | `unknown_named_argument` | `There is no parameter '{0}' of '{1}'.{2}` |
+| E3101 | `argument_given_twice` | `Argument '{0}' of '{1}' is given twice.` |
+| E3102 | `positional_after_named_argument` | `A positional argument cannot follow a named argument (call of '{0}').` |
+| E3103 | `argument_missing` | `Argument '{0}' of '{1}' is missing: it has no default value, give it by position or as '{2} = value'.` |
+| E3104 | `command_nested_too_deeply` | `Expression nested too deeply (more than {0} levels): split it into several statements.` |
+| E4001 | `kernel_error` | `Kernel error: {0}` |
+| E4002 | `kernel_not_top_level` | `kernel declarations are only allowed at the top level of a file (not inside functions, classes or blocks)` |
+| E4003 | `kernel_struct_expected_brace` | `expected '{' after the struct name` |
+| E4004 | `kernel_constant_missing_semicolon` | `missing ';' at the end of the kernel constant` |
+| E4005 | `kernel_without_body` | `kernel declaration without a body ('{ ... }')` |
+| E4006 | `kernel_missing_closing_brace` | `missing '}' at the end of the kernel declaration` |
+| E4007 | `kernel_spans_files` | `a kernel declaration cannot span several files` |
+| E4008 | `launch_needs_domain` | `launch needs a domain: 'launch {0}(...) : count;'` |
+| E4009 | `launch_needs_domain_after_colon` | `launch needs a domain after ':'` |
+| E4010 | `kernels_not_available` | `Kernels are not available on this build (microcontroller).` |
+| E4011 | `kernel_method_needs_domain` | `{0}() of kernel '{1}' needs a domain: '{2}.{3}(count, ...)'` |
+| E4012 | `kernel_argument_count` | `kernel '{0}' expects {1} argument{2}{3} ({4}) but got {5}` |
+| E4013 | `kernel_argument_string` | `argument {0} of kernel '{1}' ('{2} {3}') cannot be a string` |
+| E4014 | `kernel_argument_number_for_buffer` | `argument {0} of kernel '{1}' ('{2} {3}') expects a std.buffer, not a number` |
+| E4015 | `kernel_argument_int_for_float` | `argument {0} of kernel '{1}' ('{2} {3}') expects {4} but got the int {5} (write {6}.0)` |
+| E4016 | `kernel_argument_float_for_int` | `argument {0} of kernel '{1}' ('{2} {3}') expects {4} but got the float {5}` |
+| E4017 | `kernel_argument_negative_unsigned` | `argument {0} of kernel '{1}' ('{2} {3}') is unsigned` |
+| E5001 | `strict_condition_not_explicit` | `Condition is {0}, compare it explicitly (e.g. 'x != 0').` |
+| E5002 | `strict_unknown_element_type` | `Unknown element type '{0}'.` |
+| E5003 | `strict_element_without_key` | `Element {0} of this {1} has no key ('name = value').` |
+| E5004 | `strict_key_in_list` | `A {0} has no keys, '{1}' makes it a map.` |
+| E5005 | `strict_value_type_mismatch` | `Value '{0}' of this {1} is {2}{3}.` |
+| E5006 | `strict_element_type_mismatch` | `Element {0} of this {1} is {2}{3}.` |
+| E5007 | `strict_value_may_be_none` | `This value may be None ({0}), check it before {1} (e.g. 'if (x != None)' or 'x ??? default').` |
+| E5008 | `strict_iter_returns_wrong_type` | `__iter__() of class '{0}' returns {1}, for(x : ...) needs a list, a JSON object, a string or a std.buffer.` |
+| E5009 | `strict_cannot_iterate` | `Cannot iterate over {0} with for(x : ...), it needs a list, a JSON object, a string, a std.buffer, a std.range or a class with __iter__().` |
+| E5010 | `strict_unknown_loop_variable_type` | `Unknown type '{0}' of the loop variable '{1}'.` |
+| E5011 | `strict_loop_variable_type_mismatch` | `The {0}s of this loop are {1}, not {2}{3}.` |
+| E5012 | `strict_void_returns_value` | `'{0}' is declared void but returns a value.` |
+| E5013 | `strict_missing_return_value` | `'{0}' has to return a value of type {1}.` |
+| E5014 | `strict_return_type_mismatch` | `'{0}' returns {1}, not {2}{3}.` |
+| E5015 | `strict_default_value_type` | `Default value of parameter '{0}' is {1}, not {2}.` |
+| E5016 | `strict_not_all_paths_return` | `Not all code paths of '{0}' return a value ({1}).` |
+| E5017 | `strict_not_enough_arguments` | `Not enough arguments for {0} ({1} given, {2} required).` |
+| E5018 | `strict_too_many_arguments` | `Too many arguments for {0} ({1} given, at most {2}).` |
+| E5019 | `strict_argument_type_mismatch` | `Argument {0} ('{1}') of {2} has to be {3}, not {4}{5}.` |
+| E5020 | `strict_abstract_class_instantiated` | `Class '{0}' cannot be instantiated, the abstract method '{1}' is not implemented.` |
+| E5021 | `strict_private_constructor` | `The constructor of class '{0}' is private.` |
+| E5022 | `strict_constructor_takes_no_arguments` | `Class '{0}' has no __init__ and takes no arguments ({1} given).` |
+| E5023 | `strict_not_a_function` | `{0} is not a function ({1}).` |
+| E5024 | `strict_private_method` | `Method '{0}' of class '{1}' is private.` |
+| E5025 | `strict_private_member` | `Member '{0}' of class '{1}' is private.` |
+| E5026 | `strict_class_has_no_member` | `{0} '{1}' has no member '{2}'.` |
+| E5027 | `strict_type_has_no_member` | `Type '{0}' has no member '{1}'.` |
+| E5028 | `strict_member_makes_json` | `Setting member '{0}' turns this {1} into a json object. Initialize it with [] (or std.json()) instead.` |
+| E5029 | `strict_member_assign_type` | `Member '{0}.{1}' is {2}, cannot assign {3}{4}.` |
+| E5030 | `strict_assign_to_class_method` | `Cannot assign to method '{0}' of class '{1}'.` |
+| E5031 | `strict_value_assign_type` | `Value '{0}' of this {1} cannot be {2}{3}.` |
+| E5032 | `strict_class_has_no_method` | `{0} '{1}' has no method '{2}'.` |
+| E5033 | `strict_container_method_argument_type` | `'{0}' of this {1} takes {2}, not {3}{4}.` |
+| E5034 | `strict_not_enough_method_arguments` | `Not enough arguments for '{0}.{1}' ({2} given, {3} required).` |
+| E5035 | `strict_too_many_method_arguments` | `Too many arguments for '{0}.{1}' ({2} given, at most {3}).` |
+| E5036 | `strict_type_has_no_method` | `Type '{0}' has no method '{1}'.` |
+| E5037 | `strict_assign_type_mismatch` | `Cannot assign {0} to '{1}' ({2}){3}.` |
+| E5038 | `strict_assign_to_fixed` | `Cannot assign to '{0}' ({1}).` |
+| E5039 | `strict_assign_to_method` | `Cannot assign to method '{0}'.` |
+| E5040 | `strict_element_assign_type` | `Element of this {0} cannot be {1}{2}.` |
+| E5041 | `strict_element_makes_json` | `Setting an element turns this {0} into a json object. Initialize it with [] (or std.json()) instead.` |
+| E5042 | `strict_compare_types` | `Comparing {0} with {1} ('{2}'). Convert explicitly with std.int(), std.float() or std.string().` |
+| E5043 | `strict_none_ordered` | `None cannot be ordered ('{0}').` |
+| E5044 | `strict_division_by_zero` | `Division by zero.` |
+| E5045 | `strict_modulo_by_zero` | `Modulo by zero.` |
+| E5046 | `strict_none_arithmetic` | `None used in arithmetic ('{0}').` |
+| E5047 | `strict_no_operator_method` | `Class '{0}' has no operator method {1}{2} for '{3}'.` |
+| E5048 | `strict_no_reverse_operator_method` | `Class '{0}' has no operator method {1} for '{2}' with {3} on the left.` |
+| E5049 | `strict_operator_types` | `Operator '{0}' cannot be used with {1} and {2}.` |
+| E5050 | `strict_bitwise_needs_int` | `Bitwise '{0}' needs int operands, not {1} and {2}.` |
+| E5051 | `strict_no_neg_operator` | `Class '{0}' has no operator method __neg__ for unary '-'.` |
+| E5052 | `strict_unary_operator_type` | `Operator '{0}' cannot be used with {1}.` |
+| E5053 | `strict_bitwise_not_needs_int` | `Bitwise '~' needs an int operand, not float.` |
+| E5054 | `strict_private_member_access` | `Member '{0}' is private.` |
+| E5055 | `strict_interface_has_no_value` | `'{0}' is an interface, it is only a type: it has no value at runtime and cannot be instantiated.` |
+| E5056 | `strict_member_default_type` | `Member '{0}.{1}' is {2}, its default value is {3}.` |
+| E5057 | `strict_interface_method_signature` | `'{0}.{1}' cannot be called like '{2}.{3}' of the interface it extends.` |
+| E5058 | `strict_override_parameter_count` | `'{0}.{1}' takes {2} parameter(s), the method it overrides in '{3}' takes {4}.` |
+| E5059 | `strict_override_return_type` | `'{0}.{1}' returns {2}, the method it overrides in '{3}' returns {4}.` |
+| E5060 | `strict_deinit_with_parameters` | `'{0}.__deinit__' is called without arguments, it cannot have parameters.` |
+| E5061 | `strict_deinit_return_type` | `'{0}.__deinit__' declares a return type, its result is never used.` |
+| E5062 | `strict_deinit_returns_value` | `'{0}.__deinit__' returns a value, its result is never used.` |
+| E5063 | `strict_init_without_super` | `'{0}.__init__' does not call super.__init__(...) of '{1}' (base constructors are not called automatically).` |
+| E5064 | `strict_mode_not_available` | `Strict mode (--strict) is not available on this build (microcontroller).` |
 
 ---
 

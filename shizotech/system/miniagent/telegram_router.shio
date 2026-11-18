@@ -1,53 +1,70 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  telegram_router.shio — the Telegram front end of the Router: the README
-//  example built for real (class TelegramRouter : Router).
+//  telegram_router.shio — the Telegram gateway: class TelegramRouter : Router
 //
-//  Usage:  shz telegram_router.shio --bot-token 123456:ABCDEF...
-//                [--name TelegramRouter] [--role router] [--poll 1000]
-//                [--stall 900000] [--trusted <path>] [--no-stream]
-//                [--verbose-events]
+//  Usage:  shz miniagent --telegram-gateway [--bot-token 123456:ABCDEF...]
+//                [--name TelegramGateway] [--poll 1000] [--stall 900000]
+//                [--trusted <path>] [--no-stream] [--verbose-events]
+//          (telegram_gateway.shio is the runnable; without --bot-token it reads
+//           the token saved in the web interface, gateway_config.shio)
+//
+//  The gateway is NOT a node. It runs no work and owns no workspace: it sees the
+//  AI nodes on ShizoNet and passes chat messages to them.
 //
 //  What it does:
-//    * node info and task state come from the Router only (no direct Node API
-//      calls); the Router talks to Nodes over ShizoNet.
 //    * plain text from a TRUSTED chat is ONE router-agent turn: the agent
-//      (roles/router) reads get_nodes(), picks the node and delegates. The
-//      answer of the turn is sent back to that chat.
-//    * the chat stays quiet. The owner sees only what deserves attention:
-//      the router agent's answer, and EVERY terminal fact about a task on any
-//      node — FINISHED / FAILED / LOST / STOPPED / a node QUESTION — carrying
-//      the node's report and, for a failure/loss/stop, the reason from the
-//      event's `error` field (C1). A task that reported nothing says so, it
-//      never ends in a bare line. A task that makes no progress for stall_ms
+//      (roles/router) gets the tasks of this chat and the nodes with their
+//      workspaces as context and either starts a worker session in a workspace
+//      of a node (start_task) or passes the message into the session of an
+//      existing task (update_task) — a routed task is a thread, a follow-up goes
+//      to the worker that did the work, also after it finished. When the agent
+//      cannot tell where a message belongs, it asks in the chat.
+//    * the worker gets the user's words verbatim (Router.turn_text), not a
+//      paraphrase.
+//    * the chat stays quiet. A chat sees only what deserves attention: the
+//      router agent's answer, and EVERY terminal fact about its tasks —
+//      FINISHED / FAILED / LOST / STOPPED / a QUESTION — with the thread label
+//      (T12), the node, the workspace and the worker's report, and for a
+//      failure/loss/stop the reason from the event's `error` field (C1). A task
+//      that reported nothing says so. A task that makes no progress for stall_ms
 //      (default 15 min) arrives exactly once per episode as [stalled] (C2).
-//      A notify from a node is its report or its question to the owner.
-//      /nodes shows per node whether it runs a goal system (goals).
+//      The report of a task goes to the chat that started it; what no chat
+//      started (a scheduled goal, a notify of a node) goes to the owner chats.
 //      Node online/offline, queued/running transitions and tool calls are NOT
 //      sent. --verbose-events restores the full event stream (tg_events = "all").
 //    * access control: only chats listed in the trusted_chats json are served.
 //      No file / empty list -> the FIRST chat that messages the bot becomes the
-//      trusted chat and is written to the file (bootstrap). Every other chat is
-//      ignored (console log only, the bot never answers strangers).
+//      owner chat and is written to the file (bootstrap). Every other chat is
+//      ignored (the bot never answers strangers; the owner chats are told once
+//      that a new chat knocked, with the command that lets it in).
+//    * guests: a chat can be let in for ONE workspace of one node
+//      (/guest add <chatid> <node> <workspace> [name]). A guest has no router
+//      agent and no commands that look at the fleet: every message goes into
+//      that workspace — the same conversation until /new — and only the reports
+//      of its own tasks come back. One bot serves the owner and the guests.
 //
 //  trusted_chats json (default: std.config_path("miniagent","trusted_chats")):
 //
-//      {"chats":[{"chatid":123456,"name":"Peter","added":1700000000000}]}
+//      {"chats":[{"chatid":123456,"name":"Peter","added":1700000000000},
+//                {"chatid":777,"name":"Anna","role":"guest","node":"GPUBox",
+//                 "workspace":"Shop Frontend"}]}
 //
 //    * follow-ups: messages a chat sends in quick succession (Telegram splits
 //      long texts, people correct themselves) become ONE turn; messages that
-//      arrive while a turn runs form the next turn. Every message is recorded
-//      in the router's action ring, so get_last_actions resolves "make it 6am
-//      instead" against the earlier request. A reply quotes the message it
-//      answers.
+//      arrive while a turn runs form the next turn. A reply quotes the message it
+//      answers; a quoted report names its thread.
 //    * files: a text document (.md plan, .txt, .json, code, ...) is downloaded,
 //      kept in telegram_inbox/ next to the trust file, shown to the router agent
-//      and attached verbatim to the goal the turn delegates (Router
+//      and attached verbatim to the task the turn starts or continues (Router
 //      turn_attachments). The caption is the instruction.
+//    * the threads are kept in gateway_threads.json next to the trust file: a
+//      follow-up finds its session after a restart of the gateway.
 //
-//  Commands in a trusted chat:
+//  Commands of an owner chat:
 //    /help /id /nodes /tasks [state] /status /goals [node]
 //    /goal <run|pause|resume|cancel|archive> <id> [node]
 //    /allow <chatid> [name]   /deny <chatid>   /forget
+//    /guest add <chatid> <node> <workspace> [name]   /guest remove <chatid>   /guests
+//  Commands of a guest chat: /help /new /stop /status /id
 //
 //  Subclass it the way the README shows (router_api.md §Events):
 //
@@ -66,10 +83,13 @@
 
 #include "router_api"
 #include "model_config_cli"
+#include "gateway_config"
 
 import tgbot;
 
 TG_TRUSTED_KEY = "trusted_chats";
+TG_THREADS_FILE = "gateway_threads.json";
+TG_KNOCKS_KEPT = 50;         // unknown chats the owner was told about (one notice each)
 TG_MAX_MSG = 3900;
 TG_REPORT_CHARS = 2500;      // a report longer than this goes in full as an attached .md file
 TG_NOTIFY_CHARS = 3500;      // the same for a notify
@@ -88,7 +108,10 @@ class TelegramRouter : Router
 {
     tg_bot = None;
     tg_path = "";
-    tg_chats = [];          // [{chatid, name, added}] — the trust list
+    tg_chats = [];          // [{chatid, name, added, role, node, workspace}] — the trust list;
+                            // role "owner" (default) | "guest" (one workspace of one node)
+    tg_knocks = [];         // chat ids of strangers the owner chats were told about
+    tg_guest_threads = [];  // guest chatid -> taskid of its current conversation
     tg_queue = [];          // inbound turns: [chatdata, text]
     tg_out = [];            // outbound event texts, or [text, files] (never sent on the shizonet thread)
     tg_thread = None;
@@ -160,12 +183,32 @@ class TelegramRouter : Router
             }
         }
 
+        if(!opts_path) {
+            opts_path = std.config_path("miniagent", TG_TRUSTED_KEY);
+        }
+
+        // the threads live next to the trust file (a follow-up after a restart
+        // still finds its session); opts.threads_path = "-" keeps them in memory
+        opts_dir = fileio.file_dir(opts_path);
+        if(!opts_dir) {
+            opts_dir = ".";
+        }
+
+        opts_threads = opts_dir + "/" + TG_THREADS_FILE;
+        if(opts && opts.has("threads_path") && opts.threads_path) {
+            opts_threads = std.string(opts.threads_path);
+        }
+        if(opts_threads == "-") {
+            opts_threads = "";
+        }
+
         super.__init__(cfg, [
             name = opts_name,
             role = opts_role,
-            description = "telegram front of the router fleet",
+            description = "telegram gateway of the node fleet",
             poll_ms = opts_poll,
             stall_ms = opts_stall,
+            threads_path = opts_threads,
         ]);
 
         tg_stream = opts_stream;
@@ -173,17 +216,9 @@ class TelegramRouter : Router
         tg_events = opts_events;
         tg_path = opts_path;
 
-        if(!tg_path) {
-            tg_path = std.config_path("miniagent", TG_TRUSTED_KEY);
-        }
-
         tg_load();
 
-        tg_inbox = fileio.file_dir(tg_path);
-        if(!tg_inbox) {
-            tg_inbox = ".";
-        }
-        tg_inbox += "/telegram_inbox";
+        tg_inbox = opts_dir + "/telegram_inbox";
 
         // the README hook: every node event of every node goes to the chat
         on_event([this](e) { this.tg_push_event(e); });
@@ -226,11 +261,20 @@ class TelegramRouter : Router
             for(i = 0; i < data.chats.size(); i++) {
                 c = data.chats[i];
                 if(std.is_json(c) && c.has("chatid") && std.int(c.chatid) != 0) {
-                    list.push_back([
+                    entry = [
                         chatid = std.int(c.chatid),
                         name = std.string(c.name ?? ""),
                         added = std.int(c.added ?? 0),
-                    ]);
+                    ];
+
+                    // a guest: one workspace of one node (an entry without a role is an owner)
+                    if(std.string(c.role ?? "") == "guest") {
+                        entry.role = "guest";
+                        entry.node = std.string(c.node ?? "");
+                        entry.workspace = std.string(c.workspace ?? "");
+                    }
+
+                    list.push_back(entry);
                 }
             }
         }
@@ -338,6 +382,85 @@ class TelegramRouter : Router
         return out;
     }
 
+    // the trust entry of a chat (a copy), None for a stranger
+    tg_chat_entry(chatid)
+    {
+        want = std.int(chatid);
+        found = None;
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = 0; i < tg_chats.size(); i++) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                found = tg_chats[i].copy();
+                break;
+            }
+        }
+        cs.release();
+
+        return found;
+    }
+
+    tg_is_guest(chatid)
+    {
+        c = tg_chat_entry(chatid);
+        return std.is_json(c) && std.string(tg_get(c, "role", "")) == "guest";
+    }
+
+    // the chats that own the gateway (everything that is not a guest)
+    tg_owner_chats()
+    {
+        out = [];
+
+        for(c : tg_chat_list()) {
+            if(std.string(tg_get(c, "role", "")) != "guest") {
+                out.push_back(c);
+            }
+        }
+
+        return out;
+    }
+
+    // Let a chat in for one workspace of one node. An owner chat is never turned
+    // into a guest by this (use /deny first).
+    tg_add_guest(chatid, node, workspace, chat_name = "")
+    {
+        want = std.int(chatid);
+
+        if(want == 0) {
+            return [ok = false, error = "not a chat id"];
+        }
+        if(!std.string(node).strip() || !std.string(workspace).strip()) {
+            return [ok = false, error = "a guest needs a node and a workspace"];
+        }
+
+        cur = tg_chat_entry(want);
+
+        if(std.is_json(cur) && std.string(tg_get(cur, "role", "")) != "guest") {
+            return [ok = false, error = "chat " + std.string(want) + " is an owner chat; /deny it first"];
+        }
+
+        cs = std.critical_section_named(tg_lock);
+        for(i = tg_chats.size() - 1; i >= 0; i--) {
+            if(std.int(tg_chats[i].chatid) == want) {
+                tg_chats.erase(i);
+            }
+        }
+        tg_chats.push_back([
+            chatid = want,
+            name = std.string(chat_name),
+            added = std.millis(),
+            role = "guest",
+            node = std.string(node).strip(),
+            workspace = std.string(workspace).strip(),
+        ]);
+        tg_guest_threads.erase(std.string(want));
+        cs.release();
+
+        tg_save();
+
+        return [ok = true];
+    }
+
     tg_trusted_text()
     {
         list = tg_chat_list();
@@ -351,6 +474,9 @@ class TelegramRouter : Router
             out += "- " + std.string(list[i].chatid);
             if(list[i].name) {
                 out += " (" + std.string(list[i].name) + ")";
+            }
+            if(std.string(tg_get(list[i], "role", "")) == "guest") {
+                out += "  guest of " + std.string(tg_get(list[i], "node", "?")) + " / " + std.string(tg_get(list[i], "workspace", "?"));
             }
             out += "\n";
         }
@@ -395,6 +521,7 @@ class TelegramRouter : Router
         if(!tg_is_trusted(chat_id)) {
             if(tg_chats.size() > 0) {
                 std.print("[telegram] ignored message from untrusted chat ", chat_id, "\n");
+                tg_knock(chat_id, chatdata);
                 return;
             }
 
@@ -455,6 +582,17 @@ class TelegramRouter : Router
 			return;
 		}
 
+		// a guest: its own small command set, no router agent
+		if(tg_is_guest(chat_id)) {
+			if(txt.starts("/") && !doc) {
+				tg_guest_command(chatdata, txt);
+				return;
+			}
+
+			tg_enqueue(chatdata, txt, doc, reply_text, "guest");
+			return;
+		}
+
 		if(txt.starts("/") && !doc) {
 			tg_command(chatdata, txt);
 			return;
@@ -462,6 +600,35 @@ class TelegramRouter : Router
 
 		tg_enqueue(chatdata, txt, doc, reply_text);
 	}
+
+    // A stranger wrote to the bot. It gets no answer; the owner chats hear of it
+    // once per chat, with the commands that let it in.
+    tg_knock(chat_id, chatdata)
+    {
+        key = std.string(chat_id);
+
+        cs = std.critical_section_named(tg_lock);
+        known = tg_knocks.has(key);
+        if(!known) {
+            tg_knocks[key] = std.millis();
+            for(tg_knocks.size() > TG_KNOCKS_KEPT) {
+                tg_knocks.erase(tg_knocks.key(0));
+            }
+        }
+        cs.release();
+
+        if(known) {
+            return;
+        }
+
+        who = std.string(tg_get(chatdata, "username", ""));
+        if(!who) {
+            who = std.string(tg_get(chatdata, "first_name", ""));
+        }
+
+        tg_notify_owners("[access] A chat that is not on the trust list wrote to this bot: " + key + (who ? " (" + who + ")" : "") +
+            ". It got no answer.\nLet it into one workspace:  /guest add " + key + " <node> <workspace> [name]\nMake it an owner chat:  /allow " + key + " [name]");
+    }
 
     tg_command(chatdata, txt)
     {
@@ -552,6 +719,137 @@ class TelegramRouter : Router
             return;
         }
 
+        if(cmd == "/guests") {
+            out = "";
+            for(c : tg_chat_list()) {
+                if(std.string(tg_get(c, "role", "")) == "guest") {
+                    out += "- " + std.string(c.chatid) + (c.name ? " (" + std.string(c.name) + ")" : "") + "  " + std.string(tg_get(c, "node", "?")) + " / " + std.string(tg_get(c, "workspace", "?")) + "\n";
+                }
+            }
+            tg_send(chatdata, out ? "Guests:\n" + out : "No guests. /guest add <chatid> <node> <workspace> [name]");
+            return;
+        }
+
+        if(cmd == "/guest") {
+            // /guest add <chatid> <node> <workspace...> | /guest remove <chatid>
+            words = [];
+            for(w : txt.split(" ")) {
+                if(w.strip()) {
+                    words.push_back(w.strip());
+                }
+            }
+
+            action = words.size() > 1 ? words[1].lowercase() : "";
+
+            if(action == "remove" && words.size() > 2) {
+                if(tg_is_guest(std.int(words[2])) && tg_untrust(std.int(words[2]))) {
+                    tg_send(chatdata, "Guest " + words[2] + " removed.");
+                }
+                else {
+                    tg_send(chatdata, "Not a guest: " + words[2]);
+                }
+                return;
+            }
+
+            if(action != "add" || words.size() < 5) {
+                tg_send(chatdata, "usage: /guest add <chatid> <node> <workspace> [name]   (a workspace name with blanks: put it in \"quotes\")\n       /guest remove <chatid>\n       /guests");
+                return;
+            }
+
+            // the workspace may be quoted and contain blanks; what follows it is the name
+            rest = "";
+            for(i = 4; i < words.size(); i++) {
+                rest += (i > 4 ? " " : "") + words[i];
+            }
+
+            ws_name = rest;
+            guest_name = "";
+
+            if(rest.starts("\"")) {
+                close = rest.find("\"", 1);
+                if(close > 0) {
+                    ws_name = rest.substr(1, close - 1);
+                    guest_name = rest.substr(close + 1).strip();
+                }
+            }
+            else if(words.size() > 5) {
+                ws_name = words[4];
+                guest_name = "";
+                for(i = 5; i < words.size(); i++) {
+                    guest_name += (i > 5 ? " " : "") + words[i];
+                }
+            }
+
+            // check the place against the routing table: a typo must not lock the guest out
+            node_rec = _find_node(words[3]);
+
+            if(!node_rec) {
+                tg_send(chatdata, "No node '" + words[3] + "' is known. /nodes lists them.");
+                return;
+            }
+
+            where = _resolve_workspace(node_rec, ws_name);
+
+            if(!where.ok) {
+                tg_send(chatdata, std.string(where.error));
+                return;
+            }
+
+            res = tg_add_guest(std.int(words[2]), node_rec.name, where.label ? where.label : ws_name, guest_name);
+
+            if(!res.ok) {
+                tg_send(chatdata, "Not added: " + std.string(res.error));
+                return;
+            }
+
+            tg_send(chatdata, "Chat " + words[2] + " is a guest of " + std.string(node_rec.name) + " / " + std.string(where.label ? where.label : ws_name) +
+                ". Every message it sends goes into that workspace; it sees only the reports of its own tasks.\nNote: a worker can run commands on that node - let in only people you trust with that machine.");
+            return;
+        }
+
+        tg_send(chatdata, "Unknown command. /help");
+    }
+
+    // the commands of a guest chat: nothing that looks at the fleet
+    tg_guest_command(chatdata, txt)
+    {
+        chat_id = std.int(chatdata.chatid ?? 0);
+        cmd = std.string(txt.split(" ")[0]).lowercase();
+        entry = tg_chat_entry(chat_id);
+        place = std.string(tg_get(entry, "workspace", "?"));
+
+        if(cmd == "/help" || cmd == "/start") {
+            tg_send(chatdata, "You are a guest of the workspace '" + place + "'.\n" +
+                "Write what you want done: every message goes to the agent of that workspace, in one conversation.\n" +
+                "/new      start a new conversation (the agent forgets the old one)\n" +
+                "/stop     stop the task that is running\n" +
+                "/status   what your current task is doing\n" +
+                "/id       this chat id\n" +
+                "You get a message when your task is done, failed or has a question. Text files (.md, .txt, code) can be sent with a caption.");
+            return;
+        }
+
+        if(cmd == "/id") {
+            tg_send(chatdata, "This chat: " + std.string(chat_id));
+            return;
+        }
+
+        key = std.string(chat_id);
+
+        if(cmd == "/new") {
+            cs = std.critical_section_named(tg_lock);
+            tg_guest_threads.erase(key);
+            cs.release();
+            tg_send(chatdata, "OK - your next message starts a new conversation.");
+            return;
+        }
+
+        // these ask the node: the worker thread
+        if(cmd == "/stop" || cmd == "/status") {
+            tg_enqueue(chatdata, cmd, None, "", "guest_cmd");
+            return;
+        }
+
         tg_send(chatdata, "Unknown command. /help");
     }
 
@@ -620,14 +918,14 @@ class TelegramRouter : Router
         for(i = 0; i < tg_queue.size() && found < 0; i++) {
             it = tg_queue[i];
 
-            if(it.kind != "turn") {
+            if(it.kind != "turn" && it.kind != "guest") {
                 found = i;
                 break;
             }
 
             newest = it.at;
             for(j = i + 1; j < tg_queue.size(); j++) {
-                if(tg_queue[j].kind == "turn" && tg_queue[j].chatid == it.chatid && tg_queue[j].at > newest) {
+                if(tg_queue[j].kind == it.kind && tg_queue[j].chatid == it.chatid && tg_queue[j].at > newest) {
                     newest = tg_queue[j].at;
                 }
             }
@@ -648,14 +946,14 @@ class TelegramRouter : Router
         first = tg_queue[idx];
         items = [];
 
-        if(first.kind != "turn") {
+        if(first.kind != "turn" && first.kind != "guest") {
             items.push_back(first);
             tg_queue.erase(idx);
         }
         else {
             // every queued message of this chat joins the turn, in order
             for(i = 0; i < tg_queue.size(); i++) {
-                if(tg_queue[i].kind == "turn" && tg_queue[i].chatid == first.chatid) {
+                if(tg_queue[i].kind == first.kind && tg_queue[i].chatid == first.chatid) {
                     items.push_back(tg_queue[i]);
                     tg_queue.erase(i);
                     i--;
@@ -670,18 +968,32 @@ class TelegramRouter : Router
                 return;
             }
 
+            if(first.kind == "guest_cmd") {
+                tg_send(first.chatdata, tg_guest_slow_command(first.chatid, first.text));
+                return;
+            }
+
+            if(first.kind == "guest") {
+                tg_run_guest_turn(items);
+                return;
+            }
+
             tg_run_turn(items);
         }
         catch(e) {
             // the messages are out of the queue: the chat learns that they failed
             tg_active = None;
             turn_attachments = [];
+            turn_text = "";
+            turn_origin = None;
             std.error("[telegram] the turn failed: ", e);
             tg_send(first.chatdata, "This message failed on the router: " + std.string(e));
         }
     }
 
-    tg_run_turn(items)
+    // the texts, files and notes of the queued messages of one chat
+    // -> [chatdata, chatid, parts, files, notes, user_text]
+    tg_collect(items)
     {
         chatdata = items[items.size() - 1].chatdata;
         parts = [];
@@ -707,17 +1019,35 @@ class TelegramRouter : Router
             }
         }
 
-        prompt = tg_turn_prompt(parts, files, notes);
-
         user_text = "";
         for(i, p : parts) {
             user_text += (i > 0 ? "\n" : "") + p;
         }
+
+        return [
+            chatdata = chatdata,
+            chatid = std.int(tg_get(chatdata, "chatid", 0)),
+            parts = parts,
+            files = files,
+            notes = notes,
+            user_text = user_text,
+        ];
+    }
+
+    tg_run_turn(items)
+    {
+        got = tg_collect(items);
+        chatdata = got.chatdata;
+        files = got.files;
+
+        // the agent sees the tasks of this chat and the nodes before the message
+        prompt = "<context>\n" + turn_context(got.chatid) + "</context>\n\n" + tg_turn_prompt(got.parts, files, got.notes);
+
         names = [];
         for(f : files) {
             names.push_back(f.name);
         }
-        _note_action("user_message", [chat = std.int(tg_get(chatdata, "chatid", 0)), text = tg_clip(user_text, 600), files = names]);
+        _note_action("user_message", [chat = got.chatid, text = tg_clip(got.user_text, 600), files = names]);
 
         tg_active = chatdata;
         tg_acc = "";
@@ -730,6 +1060,14 @@ class TelegramRouter : Router
         }
         turn_attachments = att;
 
+        // what a task of this turn gets when the agent does not rephrase it, and
+        // who the reports of its tasks go back to
+        turn_text = got.user_text;
+        if(!turn_text && files.size()) {
+            turn_text = "(see the attached file)";
+        }
+        turn_origin = [chat = got.chatid];
+
         res = None;
         try {
             res = route_task(prompt);
@@ -739,9 +1077,116 @@ class TelegramRouter : Router
         }
 
         turn_attachments = [];
+        turn_text = "";
+        turn_origin = None;
         tg_active = None;
 
         tg_send(chatdata, tg_answer_text(res));
+    }
+
+    // A guest turn: no agent. The message goes into the guest's workspace — into
+    // its current conversation, or a new one after /new or when there is none.
+    tg_run_guest_turn(items)
+    {
+        got = tg_collect(items);
+        chatdata = got.chatdata;
+        entry = tg_chat_entry(got.chatid);
+
+        if(!std.is_json(entry) || std.string(tg_get(entry, "role", "")) != "guest") {
+            return;
+        }
+
+        node = std.string(tg_get(entry, "node", ""));
+        place = std.string(tg_get(entry, "workspace", ""));
+        text = got.user_text;
+
+        for(n : got.notes) {
+            text += "\n\n" + n;
+        }
+
+        if(!text && !got.files.size()) {
+            return;
+        }
+        if(!text) {
+            text = "(see the attached file)";
+        }
+
+        att = [];
+        for(f : got.files) {
+            att.push_back([name = f.name, content = f.content]);
+        }
+
+        key = std.string(got.chatid);
+        turn_attachments = att;
+        turn_origin = [chat = got.chatid, guest = true];
+
+        answer = "";
+
+        try {
+            current = tg_guest_threads.has(key) ? std.string(tg_guest_threads[key]) : "";
+            continued = false;
+
+            // the running or finished conversation takes the message
+            if(current && _find_task(current)) {
+                continued = update_task(current, _with_attachments(text));
+            }
+
+            if(continued) {
+                answer = "";    // the report of the turn is the answer
+            }
+            else {
+                taskid = add_task("Guest-" + std.string(tg_get(entry, "name", key)) + "-" + std.random_hash(4), text, node, "worker", place);
+
+                if(taskid) {
+                    cs = std.critical_section_named(tg_lock);
+                    tg_guest_threads[key] = std.string(taskid);
+                    cs.release();
+                    answer = "On it. I'll write here when it is done.";
+                }
+                else {
+                    answer = "This could not be started: " + add_task_error();
+                }
+            }
+        }
+        catch(e) {
+            answer = "This message failed: " + std.string(e);
+        }
+
+        turn_attachments = [];
+        turn_origin = None;
+
+        if(answer) {
+            tg_send(chatdata, answer);
+        }
+    }
+
+    tg_guest_slow_command(chatid, txt)
+    {
+        key = std.string(chatid);
+        current = tg_guest_threads.has(key) ? std.string(tg_guest_threads[key]) : "";
+        rec = current ? _find_task(current) : None;
+
+        if(!rec) {
+            return "You have no task right now. Write what you want done.";
+        }
+
+        if(std.string(txt).lowercase() == "/stop") {
+            if(!router_is_open_state(std.string(rec.state ?? ""))) {
+                return "Your task is not running (" + std.string(rec.state) + ").";
+            }
+            stop_task(current);
+            return "Stop requested.";
+        }
+
+        st = std.string(rec.state ?? "?");
+        out = "Your task: " + st;
+        if(router_is_open_state(st)) {
+            out += " (running for " + std.string(std.int((std.millis() - std.int(rec.updated ?? std.millis())) / 60000)) + " min since the last change)";
+        }
+        else if(rec.report) {
+            out += "\n" + tg_clip(std.string(rec.report), TG_REPORT_CHARS);
+        }
+        return out;
     }
 
     // One message stays exactly the text the user typed. Several messages, a
@@ -959,10 +1404,12 @@ class TelegramRouter : Router
             cs.release();
 
             if(std.is_json(item)) {
-                tg_broadcast(std.string(item.text ?? ""));
+                // to: 0 = the owner chats, a chat id = that chat only (while it is trusted)
+                to = std.int(item.to ?? 0);
+                tg_broadcast(std.string(item.text ?? ""), to);
                 files = item.files ?? [];
                 for(i = 0; i < files.size(); i++) {
-                    tg_broadcast_file(files[i]);
+                    tg_broadcast_file(files[i], to);
                 }
             }
             else {
@@ -1010,10 +1457,21 @@ class TelegramRouter : Router
         }
     }
 
-    tg_broadcast(txt)
+    // the chats a notification goes to: one chat (while it is on the trust list),
+    // or every owner chat (to = 0). A guest never gets what is not its own.
+    tg_targets(to = 0)
+    {
+        if(to) {
+            return tg_is_trusted(to) ? [[chatid = std.int(to)]] : [];
+        }
+
+        return tg_owner_chats();
+    }
+
+    tg_broadcast(txt, to = 0)
     {
         msg = tg_clip(txt);
-        list = tg_chat_list();
+        list = tg_targets(to);
 
         for(i = 0; i < list.size(); i++) {
             tg_send([chatid = std.int(list[i].chatid)], msg);
@@ -1024,7 +1482,7 @@ class TelegramRouter : Router
 
     // a document for every trusted chat. f: [name, caption, text] (a long report) or [name, caption, data]
     // (base64, a file of a node's send_file). It is written next to the trust file, sent, and removed.
-    tg_broadcast_file(f)
+    tg_broadcast_file(f, to = 0)
     {
         name = tg_safe_name(std.string(f.name ?? "file"));
         path = tg_inbox + "/out-" + std.string(std.millis()) + "-" + name;
@@ -1047,7 +1505,7 @@ class TelegramRouter : Router
         }
 
         caption = tg_clip(std.string(f.caption ?? ""), TG_CAPTION_CHARS);
-        list = tg_chat_list();
+        list = tg_targets(to);
 
         for(i = 0; i < list.size(); i++) {
             tg_send_file([chatid = std.int(list[i].chatid)], path, caption);
@@ -1084,11 +1542,12 @@ class TelegramRouter : Router
 
     // queue an event notification (safe from any thread, never blocks).
     // files: documents sent after the text (see tg_broadcast_file)
-    tg_notify(txt, files = None)
+    // to: 0 = the owner chats, else one chat id
+    tg_notify(txt, files = None, to = 0)
     {
         cs = std.critical_section_named(tg_lock);
-        if(files && files.size()) {
-            tg_out.push_back([text = std.string(txt), files = files]);
+        if((files && files.size()) || to) {
+            tg_out.push_back([text = std.string(txt), files = files ? files : [], to = std.int(to)]);
         }
         else {
             tg_out.push_back(std.string(txt));
@@ -1099,23 +1558,33 @@ class TelegramRouter : Router
         cs.release();
     }
 
+    tg_notify_owners(txt)
+    {
+        tg_notify(txt, None, 0);
+    }
+
     tg_push_event(e)
     {
         kind = std.string(e.kind ?? "");
         taskid = std.string(e.taskid ?? "");
         st = std.string(e.state ?? "");
 
-        // One task, one terminal message. The Router de-duplicates its own
+        // One turn of a task, one terminal message. The Router de-duplicates its own
         // task_finished/task_state pair, but this guard makes the chat safe even
-        // if both kinds arrive: the first terminal message wins.
+        // if both kinds arrive: the first terminal message of a turn wins. (A
+        // thread that is continued ends again: its next turn is a new message.)
         if(taskid.length() > 0 && (kind == "task_finished" || kind == "task_state") &&
             (st == "finished" || st == "failed" || st == "lost" || st == "stopped" || st == "question")) {
+            seen_key = taskid + "#" + std.string(std.int(e.turn ?? 1));
             for(i = 0; i < tg_terminal_seen.size(); i++) {
-                if(tg_terminal_seen[i] == taskid) {
+                if(tg_terminal_seen[i] == seen_key) {
                     return;
                 }
             }
-            tg_terminal_seen.push_back(taskid);
+            tg_terminal_seen.push_back(seen_key);
+            for(tg_terminal_seen.size() > 400) {
+                tg_terminal_seen.erase(0);
+            }
         }
 
         msg = tg_render_event(e);
@@ -1124,7 +1593,67 @@ class TelegramRouter : Router
             return;
         }
 
-        tg_notify(msg, tg_event_files(e));
+        // the report of a task goes to the chat that started it; everything else
+        // (a goal run, a notify of a node, a task of a chat that is gone) to the owners
+        to = std.int(e.origin_chat ?? 0);
+
+        if(to && !tg_is_trusted(to)) {
+            to = 0;
+        }
+
+        // a guest sees its own reports without the fleet's names
+        if(to && tg_is_guest(to)) {
+            msg = tg_render_guest_event(e);
+            if(!msg) {
+                return;
+            }
+        }
+
+        tg_notify(msg, tg_event_files(e), to);
+    }
+
+    // what a guest reads: the state and the report, no node / thread plumbing
+    tg_render_guest_event(e)
+    {
+        kind = std.string(e.kind ?? "");
+        st = std.string(e.state ?? "");
+        rep = std.string(e.report ?? "");
+        err = std.string(e.error ?? "");
+
+        if(kind == "task_stalled") {
+            return "Your task has made no progress for a while. /status shows it, /stop ends it.";
+        }
+
+        if(!(kind == "task_finished" || kind == "task_state")) {
+            return "";
+        }
+
+        label = "Done.";
+        if(st == "failed") {
+            label = "That did not work.";
+        }
+        else if(st == "lost") {
+            label = "The task was lost (the machine went away).";
+        }
+        else if(st == "stopped") {
+            label = "Stopped.";
+        }
+        else if(st == "question") {
+            label = "A question for you:";
+        }
+        else if(st != "finished") {
+            return "";
+        }
+
+        body = rep ? tg_clip(rep, TG_REPORT_CHARS) : "";
+        if(rep.length() > TG_REPORT_CHARS) {
+            body += "\n(the full report is attached)";
+        }
+        if(!body && err) {
+            body = tg_clip(err, TG_REPORT_CHARS);
+        }
+
+        return label + (body ? "\n" + body : "");
     }
 
     // What deserves the owner's attention. Every terminal state is in: a task
@@ -1241,7 +1770,8 @@ class TelegramRouter : Router
                 label = "[question]";
             }
 
-            out = label + " " + node + ": task " + task_name + " " + st;
+            // "[done] T12 · GPUBox / Shop Frontend: task Login-Button finished"
+            out = label + " " + tg_event_place(e) + ": task " + task_name + " " + st;
 
             body = "";
 
@@ -1277,7 +1807,7 @@ class TelegramRouter : Router
                 mins = 1;
             }
 
-            return "[stalled] " + node + ": task " + task_name +
+            return "[stalled] " + tg_event_place(e) + ": task " + task_name +
                 " has made no progress for " + std.string(mins) +
                 " min (state " + st + "). Ask it for status with a message, or /tasks.";
         }
@@ -1311,6 +1841,26 @@ class TelegramRouter : Router
         }
 
         return "[" + kind + "] " + node + " " + std.string(e.message ?? "");
+    }
+
+    // "T12 · GPUBox / Shop Frontend" (the thread label and the workspace when the event has them)
+    tg_event_place(e)
+    {
+        out = "";
+        th = std.string(e.thread ?? "");
+        ws = std.string(e.workspace ?? "");
+
+        if(th) {
+            out += th + " · ";
+        }
+
+        out += std.string(e.node ?? "?");
+
+        if(ws) {
+            out += " / " + ws;
+        }
+
+        return out;
     }
 
     // live progress of the current turn as a streaming draft (optional).
@@ -1427,25 +1977,27 @@ class TelegramRouter : Router
 
     tg_welcome_text()
     {
-        return "This chat is now the trusted chat of router '" + name + "'.\n" +
-            "Plain text is routed to the node my router agent picks. /help for the commands.\n" +
+        return "This chat is now the owner chat of the gateway '" + name + "'.\n" +
+            "Write what you want done: I pass it to the right node and workspace and report back. /help for the commands.\n" +
             "Trust list: " + tg_path;
     }
 
     tg_help_text()
     {
-        return "Router '" + name + "' (role " + role + ")\n" +
-            "plain text   one router-agent turn: I pick the node and delegate\n" +
-            "/nodes       the fleet: name, capabilities, load, goals (does the node run a goal system)\n" +
-            "/tasks [state]  routed tasks of ALL nodes (state: open, finished, failed, stopped, lost)\n" +
-            "/status      router + trust state\n" +
+        return "Gateway '" + name + "'\n" +
+            "plain text   I pass it to the node and workspace it belongs to; a follow-up goes into the task it continues (also a finished one). If I cannot tell where it belongs, I ask.\n" +
+            "/nodes       the nodes: workspaces, model, load, goals\n" +
+            "/tasks [state]  the routed tasks (threads) of ALL nodes (state: open, finished, failed, stopped, lost, question)\n" +
+            "/status      gateway + trust state\n" +
             "/goals [node]   scheduled goals of the nodes (next window, last outcome)\n" +
             "/goal <run|pause|resume|cancel|archive> <id> [node]\n" +
-            "Several messages in a row are read as one request (corrections welcome). Send a text file (.md plan, .txt, .json) with a caption and it is passed on verbatim.\n" +
+            "Several messages in a row are read as one request (corrections welcome). A reply to a report continues that task. Send a text file (.md plan, .txt, .json) with a caption and it is passed on verbatim.\n" +
             "/id          this chat id + the trust list\n" +
-            "/allow <chatid> [name]   /deny <chatid>   /forget\n" +
+            "/allow <chatid> [name]   /deny <chatid>   /forget      owner chats\n" +
+            "/guest add <chatid> <node> <workspace> [name]   /guest remove <chatid>   /guests\n" +
+            "             a guest chat works in ONE workspace and sees only its own reports\n" +
             "/help        this list\n" +
-            "You get a message when a task finishes, fails, is lost, is stopped or asks a question on a node: the node's report, and for a failure/loss/stop the reason as 'error: ...' (a node that reported nothing says so). A task that makes no progress for 15 minutes is announced once as [stalled]. A refused delegation is answered with its reason. Node online/offline, queued/running progress and tool calls stay out of this chat.";
+            "You get a message when a task finishes, fails, is lost, is stopped or asks a question: its thread (T12), node, workspace and the worker's report, and for a failure/loss/stop the reason as 'error: ...'. A task that makes no progress for 15 minutes is announced once as [stalled]. Node online/offline, progress and tool calls stay out of this chat.";
     }
 
     tg_answer_text(res)
@@ -1465,6 +2017,11 @@ class TelegramRouter : Router
 			return out;
 		}
 
+		// the message went into an existing task (update_task): also a success
+		if(res.ok && out) {
+			return out;
+		}
+
 		if(!res.ok) {
 			return "The router agent turn failed: " + std.string(res.error ?? "no details");
 		}
@@ -1472,7 +2029,7 @@ class TelegramRouter : Router
 		if(!out) {
 			// the agent answered without routing a task (an arbitrary question is
 			// not a job): a normal answer, not a routing failure
-			out = "Nothing was routed. Ask me a job for the fleet, or use /nodes /tasks /status.";
+			out = "Nothing was routed. Tell me what to do and where, or use /nodes /tasks /status.";
 		}
 
 		return out;
@@ -1493,6 +2050,13 @@ class TelegramRouter : Router
             out += "- " + std.string(n.name);
             if(n.description) {
                 out += "  " + std.string(n.description);
+            }
+            ws_list = "";
+            for(w : n.workspaces) {
+                ws_list += (ws_list ? ", " : "") + std.string(w.name ? w.name : w.id);
+            }
+            if(ws_list) {
+                out += "\n  workspaces: " + ws_list;
             }
             out += "\n  capabilities: " + std.string(n.capabilities) +
                 "  model: " + std.string(n.model) +
@@ -1521,7 +2085,7 @@ class TelegramRouter : Router
 
         for(i = 0; i < list.size(); i++) {
             t = list[i];
-            out += "- " + std.string(t.name) + " [" + std.string(t.state) + "] on " + std.string(t.node);
+            out += "- " + (t.thread ? std.string(t.thread) + " " : "") + std.string(t.name) + " [" + std.string(t.state) + "] on " + std.string(t.node) + (t.workspace ? " / " + std.string(t.workspace) : "");
             if(t.report) {
                 out += "\n  " + tg_clip(t.report, 160);
             }
@@ -1538,7 +2102,7 @@ class TelegramRouter : Router
     {
         ov = get_overview();
 
-        out = "Router " + std.string(ov.name) + " (role " + std.string(ov.role) + ")\n";
+        out = "Gateway " + std.string(ov.name) + "\n";
         out += "uptime: " + std.string(std.int(ov.uptime_ms / 1000)) + "s\n";
         out += "nodes online: " + std.string(ov.nodes_online) + "\n";
         out += "tasks open: " + std.string(ov.tasks_open) + "  mirrored: " + std.string(ov.remote_tasks.size()) + "\n";
@@ -1589,13 +2153,22 @@ tg_host_get_cfg(cfg, cfg_spec)
 	return model_config_cli_get(cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, true, true, "", "config-");
 }
 
-if(tg_is_main()) {
+// The gateway program: shz miniagent --telegram-gateway (telegram_gateway.shio),
+// or this file run directly. The bot token comes from --bot-token, else from the
+// settings saved in the web interface (gateway_config.shio).
+tg_gateway_main()
+{
     cfg = ModelConfig();
 
     if(model_config_cli_handle_config_commands())
         return;
 
+    settings = gateway_settings_load();
+
     cfg_spec = std.argvoption("--config");
+
+    if(!cfg_spec && settings.config)
+        cfg_spec = settings.config;
 
     if(!tg_host_get_cfg(cfg, cfg_spec))
         return;
@@ -1605,12 +2178,15 @@ if(tg_is_main()) {
     if(save_spec)
         model_config_save_spec(cfg, save_spec);
 
-    model_config_cli_print_loaded("Telegram router config", cfg, cfg_spec);
+    model_config_cli_print_loaded("Gateway config", cfg, cfg_spec);
 
     token_opt = std.argvoption("--bot-token");
     token = "";
     if(token_opt) {
         token = std.string(token_opt).strip();
+    }
+    if(!token) {
+        token = std.string(settings.bot_token ?? "").strip();
     }
     name_opt = std.argvoption("--name");
     role_opt = std.argvoption("--role");
@@ -1619,11 +2195,12 @@ if(tg_is_main()) {
     trusted_opt = std.argvoption("--trusted");
 
     if(!token) {
-        std.print("usage: shz telegram_router.shio --bot-token <token> [--config <name|path>] [--name X] [--role router] [--poll ms] [--stall ms] [--trusted <path>] [--no-stream] [--verbose-events] [--list-configs] [--new-config <name>]\n");
-        return;
+        std.print("usage: shz miniagent --telegram-gateway --bot-token <token> [--config <name|path>] [--name X] [--poll ms] [--stall ms] [--trusted <path>] [--no-stream] [--verbose-events] [--list-configs] [--new-config <name>]\n" +
+            "       (no --bot-token: the token saved in the web interface of a node, Settings > Telegram gateway: " + gateway_settings_path() + ")\n");
+        std.exitprocess(2);
     }
 
-    opts = [name = "TelegramRouter"];
+    opts = [name = settings.name ? std.string(settings.name) : "TelegramGateway"];
 
     if(name_opt) {
         opts.name = std.string(name_opt);
@@ -1652,7 +2229,7 @@ if(tg_is_main()) {
     rtr = TelegramRouter(cfg, opts);
     rtr.attach_bot(bot);
 
-    std.print("Telegram router '", rtr.name, "' up (role: ", rtr.role, ", poll: ", rtr.poll_ms, "ms)\n");
+    std.print("Telegram gateway '", rtr.name, "' up (poll: ", rtr.poll_ms, "ms). It is not a node: it passes chat messages to the AI nodes on ShizoNet.\n");
     std.print("trusted chats: ", rtr.tg_chats.size(), "  file: ", rtr.tg_path, "\n");
     std.print("waiting for messages... (Ctrl+C to stop)\n");
 
@@ -1664,4 +2241,8 @@ if(tg_is_main()) {
     if(rtr.service) {
         try { rtr.service.stop(); } catch(e) {}
     }
+}
+
+if(tg_is_main()) {
+    tg_gateway_main();
 }

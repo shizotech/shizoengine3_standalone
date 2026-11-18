@@ -1,0 +1,1295 @@
+// The Stage menu (#980, engine/menus/stage/stage_editor.shio) on its nanogui.view3d: the example models of assets/Stage
+// put on the stage, read on a thread and built (parts, the colours of a 3MF), picked with the mouse, moved at their
+// height, raised with Shift, turned with R, hung on another object (it moves with it), hidden, put on the floor,
+// removed; a file that cannot be read; the lamps of the patch in the same view.
+//
+// Why it is here and not in _testing: the menu includes the app by paths relative to the app folder, so it runs from
+// the app folder (as engine/menus/fixtures/stage3d_check.shio):
+//   cd _shizoengine3 && shz engine/menus/stage/stage_check.shio
+//   (Linux, headless: LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s "-screen 0 1920x1080x24" shz engine/menus/stage/stage_check.shio)
+// Passes when it prints "ALL PASSED" and the process exits with code 0.
+import nanogui;
+using eigen;
+using nanogui;
+
+PATCH_ROOT = "";
+
+#include "engine/menus/stage/stage_editor"
+
+W = 1400;
+H = 860;
+TRUSS = "assets/Stage/Examples/Truss 2m.stl";
+HEX = "assets/Stage/Examples/Hexagon panel.3mf";
+
+ok = true;
+check(cond, what) {
+	if(!cond) {
+		std.print("FAIL " + what);
+		ok = false;
+	}
+}
+
+class fake_fixture_menu {
+	lamp_color(f) {
+		return None;
+	}
+	lamp_pan_tilt(f) {
+		return None;
+	}
+	lamp_gobo(f) {
+		return None;
+	}
+}
+
+class fake_engine {
+	patch = None;
+	stage = None;
+	stage_revision = 0;
+	ai_interfaces = [];   //the stand-in LEDMapper of the edge check
+	stage_leds = [];      //the LEDs of LEDMappers on the stage (#980)
+	stage_leds_revision = 0;
+	patch_revision = 0;
+	fixture_menu = None;
+	filebrowser = None;
+	screen = None;
+	env = [];
+	ai_capture = None;    //#980: the camera of the material measure
+	menu = None;          //#980: the undo history (menu.generators_menu.undo_history)
+	load_in_progress = false;
+
+	__init__() {
+		patch = patch_new();
+		stage = stage_new();
+		fixture_menu = fake_fixture_menu();
+	}
+
+	stage_changed() {
+		stage_revision++;
+	}
+	patch_changed() {
+		patch_revision++;
+	}
+}
+
+pump(ctx, n) {
+	f0 = ctx.frame_index();
+	for(i = 0; i < 4000; i++) {
+		std.sleep(1);
+		if(ctx.frame_index() - f0 >= n)
+			return true;
+	}
+	return false;
+}
+
+ctx = nanogui.context();
+scr = ctx.screen("980 stage", W, H, true, false, false);
+scr.visible(1);
+host = scr.widget();
+host.fixed_size(vec2f(W, H));
+host.size(vec2f(W, H));
+
+eng = fake_engine();
+eng.screen = scr;
+std.global("engine").set(eng);
+patch_add(eng.patch, "assets/Fixtures/MovingHeads/cheap_mh.json", 1, "", 0, 0, 0.0, 2.0);
+eng.patch.fixtures[0].z = 3.0;
+eng.patch.fixtures[0].mount = "hanging";
+
+ed = stage_editor(host);
+view = ed.view;
+scene = ed.scene;
+
+//the models are read on a thread: frames until both are built
+built(id) {
+	rec = scene.stage_items[id] ?? None;
+	return rec && rec.built;
+}
+wait_built(ids) {
+	for(i = 0; i < 400; i++) {
+		all = true;
+		for(id : ids) {
+			if(!built(id))
+				all = false;
+		}
+		if(all)
+			return true;
+		pump(ctx, 1);
+	}
+	return false;
+}
+
+// ---- adding ----
+ed.add_model(TRUSS, [x = 0.0, y = 0.0]);
+truss = eng.stage.objects[0];
+ed.add_model(HEX, [x = 3.0, y = 0.0]);
+hex = eng.stage.objects[1];
+check(eng.stage.objects.size() == 2 && truss.name == "Truss 2m" && hex.name == "Hexagon panel", "two objects added");
+check(ed.selected.size() == 1 && ed.selected[0] == hex.id, "the one added last is selected");
+check(wait_built([truss.id, hex.id]), "both models are read and built");
+pump(ctx, 2);
+check(view.error() == "", "the 3D view draws: " + view.error());
+check(scene.stage_items[truss.id].parts.size() == 1 && scene.stage_items[hex.id].parts.size() == 2, "a part per body (STL 1, 3MF 2)");
+frame = view.item(scene.stage_items[hex.id].parts[0]);
+check(frame && frame.color[0] > 0.9 && frame.color[2] > 0.9, "the colour of a body from the 3MF (PETG white)");
+diff = view.item(scene.stage_items[hex.id].parts[1]);
+check(diff && diff.color[0] < 0.85 && diff.color[2] > 0.9, "the second body in its own colour (opal, blue-ish)");
+check(scene.lamps.size() == 1, "the lamps of the patch are in the view too");
+ed.lamps_btn.pushed(false);
+pump(ctx, 2);
+check(scene.lamps.size() == 0, "Lamps off: no lamps");
+ed.lamps_btn.pushed(true);
+ed.fit_view();
+pump(ctx, 3);
+check(ed.status_label.caption().contains("2 objects") && ed.status_label.caption().contains("triangles"), "status: " + ed.status_label.caption());
+
+// ---- the mouse: pick, move, raise, turn ----
+screen_of(o) {
+	m = stage_model_get(o);
+	b = stage_world_box(stage_world_matrix(eng.stage, o), m.bounds);
+	c = [x = (b.min.x + b.max.x) / 2.0, y = (b.min.y + b.max.y) / 2.0, z = (b.min.z + b.max.z) / 2.0];
+	p = view.project(c);
+	return p.ok ? vec2f(p.x, p.y) : None;
+}
+p_hex = screen_of(hex);
+check(p_hex && scene.stage_at(p_hex) == hex.id, "a click on the hexagon picks it");
+p_truss = screen_of(truss);
+check(p_truss && scene.stage_at(p_truss) == truss.id, "a click on the truss picks it");
+
+drag(from, to, mods = 0) {
+	ed.button3d(from, 0, true, mods);
+	for(i = 1; i <= 6; i++)
+		ed.drag3d(from + (to - from) * (i / 6.0), vec2f(0, 0), 0, mods);
+	ed.button3d(to, 0, false, mods);
+	pump(ctx, 2);
+}
+x0 = hex.x;
+z0 = hex.z;
+drag(p_truss, p_truss + vec2f(0, 0));
+check(ed.selected.size() == 1 && ed.selected[0] == truss.id, "a click selects the truss");
+drag(p_hex, p_hex + vec2f(-120, 0));
+check(ed.selected[0] == hex.id && math.abs(hex.x - x0) > 0.2 && math.abs(hex.z - z0) < 0.001, "a drag moves the hexagon at its height (x " + x0 + " -> " + hex.x + ")");
+p_hex = screen_of(hex);
+drag(p_hex, p_hex + vec2f(0, -80), STAGE_MOD_SHIFT);
+check(hex.z > 0.2, "Shift+drag raises it (z " + hex.z + ")");
+ed.key3d(STAGE_KEY_R, 1, 0);
+check(math.abs(hex.rz - 15.0) < 0.001, "R turns it by 15°");
+ed.key3d(STAGE_KEY_R, 1, STAGE_MOD_SHIFT);
+check(math.abs(hex.rz) < 0.001, "Shift+R turns it back");
+//a click on the empty floor selects none
+corner = vec2f(30, H - 30);
+check(!scene.stage_at(corner), "nothing in the corner of the view");
+drag(corner, corner);
+check(ed.selected.size() == 0, "a click on the empty stage selects none");
+
+// ---- hanging, hiding, the floor ----
+check(stage_set_parent(eng.stage, hex.id, truss.id), "the hexagon hangs on the truss");
+eng.stage_changed();
+pump(ctx, 2);
+before = view.world_matrix(scene.stage_items[hex.id].root);
+truss.x += 1.0;
+eng.stage_changed();
+pump(ctx, 2);
+after = view.world_matrix(scene.stage_items[hex.id].root);
+check(math.abs(after[3] - before[3] - 1.0) < 0.001, "it moves with the truss");
+//moving the child in the world turns into its own frame: the truss turned 90° around z
+truss.rz = 90.0;
+d = stage_world_to_local(eng.stage, hex, [x = 1.0, y = 0.0, z = 0.0]);
+check(math.abs(d.y + 1.0) < 0.001 && math.abs(d.x) < 0.001, "a move in the world in the frame of the parent");
+truss.rz = 0.0;
+ed.toggle_visible(truss.id);
+pump(ctx, 2);
+check(view.item(scene.stage_items[truss.id].root).visible == 0, "a hidden object is not drawn");
+ed.toggle_visible(truss.id);
+hex.rx = 90.0;
+hex.z = 0.0;
+ed.selected = [hex.id];
+ed.to_floor();
+pump(ctx, 2);
+b = stage_world_box(stage_world_matrix(eng.stage, hex), stage_model_get(hex).bounds);
+check(math.abs(b.min.z) < 0.001, "Floor: its lowest point at height 0 (" + b.min.z + ")");
+
+// ---- duplicate, a file that cannot be read, remove ----
+ed.selected = [truss.id];
+ed.duplicate_selected();
+check(eng.stage.objects.size() == 4, "duplicate copies the truss and the hexagon on it");
+bad = stage_add_model(eng.stage, "assets/Stage/none.stl");
+eng.stage_changed();
+check(wait_built([bad.id]), "a missing file is done reading");
+pump(ctx, 2);
+check(scene.stage_error(bad.id).contains("does not exist"), "its error: " + scene.stage_error(bad.id));
+check(ed.status_label.caption().contains("cannot be read"), "the status says so: " + ed.status_label.caption());
+ed.selected = [truss.id];
+ed.remove_selected();
+pump(ctx, 2);
+check(!scene.stage_items.has(truss.id) && !scene.stage_items.has(hex.id), "remove: the truss and what hangs on it are gone from the view");
+check(eng.stage.objects.size() == 3, "remove: from the stage too");
+
+// ---- no new picture while nothing changes ----
+pump(ctx, 3);
+r0 = view.renders();
+pump(ctx, 6);
+check(view.renders() == r0, "no new picture while nothing changes (" + r0 + " -> " + view.renders() + ")");
+
+// ---- LEDs of a LEDMapper on the stage (stage_leds.shio): glowing points in the colours sent ----
+//a stand-in for a LEDMapper: its "shader" gives the read-back (R, G, B per LED); 3 LEDs red, green, blue
+class fake_led_shader {
+	buf = None;
+	__init__() {
+		buf = std.buffer();
+		buf.resize(9);
+		for(i = 0; i < 9; i++)
+			buf.write("u8", i, i == 0 || i == 4 || i == 8 ? 255 : 0);
+	}
+	pixel_buffer() {
+		return buf;
+	}
+}
+shader = fake_led_shader();
+//(at x -5: away from the lamp of the patch, whose pole would stand in front of it)
+row = [name = "Row", place = [on = 1, x = -5.0, y = 0.0, z = 1.0, rx = 0.0, ry = 0.0, rz = 0.0, width = 3.0, hangs_on = ""],
+	offset = 0, count = 3, leds = [0.25, 0.5, 0.5, 0.5, 0.75, 0.5]];
+stage_leds_publish(eng, "mapper1", "LEDMapper", 1.0, shader, [row]);
+ed.fit_view();
+view.camera([target = [x = -5.0, y = 0.0, z = 1.0], yaw = 0.0, pitch = 0.0, distance = 4.0]);
+view.keep_pixels(true);
+pump(ctx, 4);
+check(scene.led_count() == 3, "the LEDs of the LEDMapper are in the view (" + scene.led_count() + ")");
+check(ed.status_label.caption().contains("3 LEDs"), "the status counts them: " + ed.status_label.caption());
+check(ed.led_list && ed.led_list.child_count() == 1, "the list of LEDs on the stage has the group");
+col_at(p3) {
+	p = view.project(p3);
+	return p.ok ? view.pixel(vec2f(p.x, p.y)) : None;
+}
+//the row: 3 m for the picture, LEDs 0.75 m apart, the middle at x -5, height 1
+c_left = col_at([x = -5.75, y = 0.0, z = 1.0]);
+c_mid = col_at([x = -5.0, y = 0.0, z = 1.0]);
+c_right = col_at([x = -4.25, y = 0.0, z = 1.0]);
+check(c_left && c_left.x > 0.4 && c_left.y < 0.2, "the left LED red as sent");
+check(c_mid && c_mid.y > 0.4 && c_mid.x < 0.2, "the middle LED green as sent");
+check(c_right && c_right.z > 0.4 && c_right.x < 0.2, "the right LED blue as sent");
+//the LEDMapper sends other colours: the next frame shows them
+shader.buf.write("u8", 0, 0);
+shader.buf.write("u8", 1, 255);
+pump(ctx, 3);
+c_left = col_at([x = -5.75, y = 0.0, z = 1.0]);
+check(c_left && c_left.y > 0.4 && c_left.x < 0.2, "new colours: the left LED green now");
+//the simulation: a bigger glow (2 cm beside an LED: outside the dot of 1.8 cm, inside the glow of 6 cm)
+gap0 = col_at([x = -5.73, y = 0.0, z = 1.0]);
+ed.sim_btn.pushed(true);
+eng.stage.simulation = 1;
+pump(ctx, 3);
+gap1 = col_at([x = -5.73, y = 0.0, z = 1.0]);
+check(gap0 && gap1 && gap1.y > gap0.y + 0.02, "the simulation: light around the LEDs (" + gap0.y + " -> " + gap1.y + ")");
+//a material (#980): a panel 5 cm in front of the LED row; solid it hides them, translucent (Simulation on) they
+//shine through it
+panel_o = stage_add_model(eng.stage, HEX, -5.0, 0.0, 1.0);
+panel_o.rx = 90.0;
+panel_o.z = 1.0 - 0.26;
+panel_o.y = 0.08;
+eng.stage_changed();
+check(wait_built([panel_o.id]), "the panel is built");
+pump(ctx, 4);
+through = col_at([x = -5.0, y = 0.081, z = 1.0]);
+//(the panel is white: the LED behind shows as green above its grey)
+check(through && through.y < through.x + 0.05, "solid: the green LED behind the panel does not show (" + through.x + ", " + through.y + ", " + through.z + ")");
+stage_set_part_material(panel_o, "Diffuser", "acrylic_opal");
+stage_set_part_material(panel_o, "Frame", "acrylic_opal");
+eng.stage_changed();
+pump(ctx, 4);
+through = col_at([x = -5.0, y = 0.081, z = 1.0]);
+check(through && through.y > through.x + 0.04, "translucent: the green LED behind shines through the panel, one LED 3 cm behind opal: a faint glow (" + through.x + ", " + through.y + ")");
+ed.sim_btn.pushed(false);
+eng.stage.simulation = 0;
+eng.stage_changed();
+pump(ctx, 4);
+through = col_at([x = -5.0, y = 0.081, z = 1.0]);
+check(through && through.y < through.x + 0.05, "Simulation off: solid again (" + through.x + ", " + through.y + ")");
+stage_remove(eng.stage, [panel_o.id]);
+eng.stage_changed();
+
+//the LEDMapper goes: its LEDs go
+stage_leds_remove(eng, "mapper1");
+pump(ctx, 3);
+check(scene.led_count() == 0, "a LEDMapper that goes takes its LEDs");
+
+// ---- LEDs along the edges of a model (#980) ----
+//a stand-in LEDMapper: what add_path_segment gets
+class fake_mapper_iface {
+	got = None;
+	has_query(name) {
+		return name == "add_path_segment";
+	}
+	query(name, args, caller) {
+		got = args;
+		n = std.int(math.round(stage_path_length(args.points) * args.leds_per_m));
+		return [ok = true, value = [group = args.group_name, segment = "Edge 1", leds = n, length = stage_path_length(args.points)]];
+	}
+}
+mapper = fake_mapper_iface();
+eng.ai_interfaces["fake"] = mapper;
+hx = stage_add_model(eng.stage, HEX, 2.0, 0.0, 0.0);
+hx.rx = -90.0;
+eng.stage_changed();
+check(wait_built([hx.id]), "the panel for the edges is built");
+ed.selected = [hx.id];
+ed.edges_for = hx.id;
+ed.build_inspector();
+for(i = 0; i < 100 && !ed.edge_items.size(); i++)
+	pump(ctx, 1);
+check(ed.edge_items.size() == 1, "Show edges: the lines of its edges are in the view");
+chains = stage_model_edges_get(hx);
+check(chains && chains.size() == 54, "the edges of the hexagon panel: 54 pieces (" + (chains ? chains.size() : -1) + ")");
+//a point on a top outer edge of the frame (model z 0.06, the outer radius 0.3) on the screen
+view.camera([target = [x = 2.0, y = 0.0, z = 0.26], yaw = 0.0, pitch = 0.2, distance = 2.0]);
+pump(ctx, 3);
+ci = -1;
+for(i = 0; i < chains.size() && ci < 0; i++) {
+	v = chains[i].points;
+	if(chains[i].part == 0 && math.abs(v[2] - 0.06) < 1e-6 && math.abs(v[5] - 0.06) < 1e-6 &&
+		math.abs(math.sqrt(v[0] * v[0] + v[1] * v[1]) - 0.3) < 1e-3)
+		ci = i;
+}
+check(ci >= 0, "an outer top edge of the frame");
+v = chains[ci].points;
+mid = stage_point(stage_world_matrix(eng.stage, hx), [x = (v[0] + v[3]) / 2.0, y = (v[1] + v[4]) / 2.0, z = (v[2] + v[5]) / 2.0]);
+pr = view.project(mid);
+check(pr.ok && ed.edge_at(vec2f(pr.x, pr.y)) >= 0, "a click on it finds an edge");
+check(ed.edge_at(vec2f(5, 5)) < 0, "a click far away finds none");
+ed.leds_per_m = 60.0;
+ed.leds_on_edge(vec2f(pr.x, pr.y), false);
+got = mapper.got;
+check(got && got.hangs_on == hx.id && got.group_name == "Edges of " + hx.name, "the LEDMapper gets the strip, hanging on the panel");
+check(got && math.abs(stage_path_length(got.points) - 1.8) < 0.01, "the whole outline: 6 sides of 0.3 m (" + (got ? stage_path_length(got.points) : -1) + ")");
+check(ed.edge_note.contains("108 LEDs") && ed.edge_note.contains("closed"), "the note: " + ed.edge_note);
+ed.leds_on_edge(vec2f(pr.x, pr.y), true);
+check(math.abs(stage_path_length(mapper.got.points) - 0.3) < 0.01, "Shift: only that side (" + stage_path_length(mapper.got.points) + ")");
+ed.edges_for = "";
+pump(ctx, 2);
+check(ed.edge_items.size() == 0, "edges hidden again");
+
+// ---- screens and LED walls (#980): a video router's picture on them with the simulation on ----
+//a video router as the engine has them (engine/interfaces/videorouter.shio): a name and an output whose value is the
+//picture; this one red in its top half (GL orientation: v_uv.y > 0.5 is the top as shown), blue below
+pic = host.shader().fixed_size(vec2f(16, 16));
+pic.fragment_source("void main() { fragColor = v_uv.y > 0.5 ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0, 0.0, 1.0, 1.0); }");
+pic.render_size(vec2i(32, 32));
+class fake_out {
+	picture = None;
+	value() {
+		return picture;
+	}
+}
+out_ctrl = fake_out();
+out_ctrl.picture = pic;
+std.global("videorouter").instances = [[name = "Test picture", output_ctrl = out_ctrl]];
+check(stage_picture_sources().size() == 1 && stage_picture("Test picture") == pic, "the picture sources: the video routers");
+ed.add_screen();
+wall = eng.stage.objects[-1];
+wall.x = 0.0;
+wall.y = -2.0;
+wall.z = 0.0;
+wall.screen.source = "Test picture";
+eng.stage_changed();
+check(wall.kind == "screen" && ed.selected[0] == wall.id, "Screen: an LED wall added, selected");
+check(wait_built([wall.id]), "the wall is built");
+view.camera([target = [x = 0.0, y = -2.0, z = 0.75], yaw = 0.0, pitch = 0.1, distance = 6.0]);
+pump(ctx, 3);
+disp = scene.stage_items[wall.id].parts[1];
+check(view.item(disp).picture == 0, "simulation off: no picture on it");
+ed.sim_btn.pushed(true);
+eng.stage.simulation = 1;
+pump(ctx, 4);
+check(view.item(disp).picture == 1, "simulation on: the picture of its video router");
+top_c = col_at([x = 0.0, y = -1.99, z = 1.2]);
+bottom_c = col_at([x = 0.0, y = -1.99, z = 0.3]);
+check(top_c && top_c.x > top_c.z + 0.2 && bottom_c && bottom_c.z > bottom_c.x + 0.2, "upright: the top of the picture at the top of the wall (" + (top_c ? top_c.x + "," + top_c.z : "None") + " / " + (bottom_c ? bottom_c.x + "," + bottom_c.z : "None") + ")");
+wall.screen.source = "Gone";
+pump(ctx, 3);
+check(view.item(disp).picture == 0, "a video router that is not there: no picture");
+ed.sim_btn.pushed(false);
+eng.stage.simulation = 0;
+std.global("videorouter").instances = [];
+
+// ---- a scan of the venue (#980): Gaussian splats, its floor level by three clicks ----
+std.global("stage_splat_loader").set([]() { return nanogui.splats3d(); });
+//a floor of 9 x 9 splats in a frame that is y up (as many scanners write it), at y = -1
+ply = "ply\nformat ascii 1.0\nelement vertex 81\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n";
+for(i = 0; i < 9; i++) {
+	for(j = 0; j < 9; j++)
+		ply += (-2.0 + i * 0.5) + " -1 " + (-2.0 + j * 0.5) + " 200 160 90\n";
+}
+fileio.write_text("_stage_check_scan.ply", ply);
+scan = stage_add_model(eng.stage, "_stage_check_scan.ply", 0.0, 6.0, 0.0);
+eng.stage_changed();
+check(scan.kind == "splat", "a .ply: a scan");
+check(wait_built([scan.id]), "the scan is read and built");
+pump(ctx, 3);
+srec = scene.stage_items[scan.id];
+check(srec.parts.size() == 1 && view.item(srec.parts[0]).splats_drawn == 81, "its splats drawn (" + (srec.parts.size() ? view.item(srec.parts[0]).splats_drawn : -1) + ")");
+//three clicks on its floor (now standing upright in the world: y = 6 - 1 = 5... its floor is the plane y = 5)
+view.camera([target = [x = 0.0, y = 5.0, z = 0.0], yaw = 0.0, pitch = 0.3, distance = 8.0]);
+ed.select_ids([scan.id], false, false);
+ed.start_scan_mode("floor", scan.id);
+for(pw : [[x = -1.0, y = 5.0, z = -1.0], [x = 1.0, y = 5.0, z = -1.0], [x = 0.0, y = 5.0, z = 1.0]]) {
+	pump(ctx, 2);
+	q = view.project(pw);
+	ed.scan_click(vec2f(q.x, q.y));
+}
+check(ed.scan_mode == "" && ed.scan_note.contains("level"), "three clicks: its floor level (" + ed.scan_note + ")");
+wm = stage_world_matrix(eng.stage, scan);
+fz = stage_point(wm, [x = 1.0, y = -1.0, z = 0.5]).z;
+check(math.abs(fz) < 0.01, "its floor at height 0 now (" + fz + ")");
+scan.splat.height = 0.5;
+eng.stage_changed();
+pump(ctx, 3);
+check(view.item(srec.parts[0]).splats_drawn == 81, "a height to show: still all of the floor");
+fileio.remove("_stage_check_scan.ply");
+
+// ---- measuring a material with a camera (#980) ----
+//a camera: a dark room, an LED's spot in the middle; its width 0.003 + 1.2 * distance metres on a picture 0.2 m wide
+//(16:9); through the piece 40 % of the light of the bare LED (spread wider: fainter). The bare LED not burnt out (0.85)
+MM_SRC = "uniform float sig; uniform float flux; uniform int on; void main() { vec2 d = (v_uv - vec2(0.5)) * vec2(1.0, 9.0 / 16.0); " +
+	"float r2 = dot(d, d); float a = on != 0 ? flux * 0.00019 / (sig * sig) * exp(-r2 / (2.0 * sig * sig)) : 0.0; fragColor = vec4(vec3(0.05 + min(a, 0.9)), 1.0); }";
+mcam = host.shader().fixed_size(vec2f(16, 16));
+mcam.fragment_source(MM_SRC);
+mcam.render_size(vec2i(640, 360));
+mcam.uniform("on", 0);
+mcam.uniform("sig", 0.05);
+mcam.uniform("flux", 1.0);
+class fake_cam_gen {
+	pic = None;
+	dispatch(cmd) {
+		return cmd == "get_capture_widget" ? pic : None;
+	}
+	get_live_path() {
+		return "cam";
+	}
+}
+class fake_capture {
+	gen = None;
+	cameras() {
+		return [[live_path = "cam", status = [camera = "Fake"]]];
+	}
+	generator(lp) {
+		return gen;
+	}
+	camera(lp) {
+		return gen;
+	}
+}
+fg = fake_cam_gen();
+fg.pic = mcam;
+fc = fake_capture();
+fc.gen = fg;
+eng.ai_capture = fc;
+//(the spot of the model: sigma in units of the picture's width)
+spot(dist_m) {
+	return (0.003 + 1.2 * dist_m) / 0.2;
+}
+measure(what) {
+	ed.start_measure(what);
+	for(i = 0; i < 40 && ed.mm_state != ""; i++)
+		pump(ctx, 1);
+}
+pan = stage_add_model(eng.stage, HEX, 0.0, 9.0, 0.0);
+eng.stage_changed();
+check(wait_built([pan.id]), "the panel for the measure");
+ed.select_ids([pan.id], false, false);
+ed.mm_open = true;
+ed.mm_for = pan.id;
+ed.mm_part = "Diffuser";
+ed.mm_width_cm = 20.0;
+ed.build_inspector();
+measure("dark");
+check(ed.mm_dark && ed.mm_note.contains("Dark picture taken"), "the dark picture (" + ed.mm_note + ")");
+mcam.uniform("on", 1);
+mcam.uniform("sig", spot(0.0));
+mcam.uniform("flux", 1.0);
+measure("bare");
+check(!std.is_none(ed.mm_bare) && ed.mm_bare > 0.0, "the LED without the piece (" + ed.mm_note + ")");
+for(d : [0.002, 0.003, 0.005]) {
+	mcam.uniform("sig", spot(d));
+	mcam.uniform("flux", 0.4);
+	ed.mm_dist_mm = d * 1000.0;
+	measure("point");
+}
+check(ed.mm_points.size() == 3, "three distances measured (" + ed.mm_points.size() + ", " + ed.mm_note + ")");
+fitm = stage_material_fit(ed.mm_points, ed.mm_bare);
+check(fitm && math.abs(fitm.diffusion - 1.2) < 0.06, "the spread from the camera (" + (fitm ? fitm.diffusion : -1) + ", 1.2 made)");
+check(fitm && !std.is_none(fitm.transmission) && math.abs(fitm.transmission - 0.4) < 0.04, "the light that comes through (" + (fitm ? fitm.transmission : -1) + ", 0.4 made)");
+mcam.uniform("on", 0);
+measure("point");
+check(ed.mm_points.size() == 3 && ed.mm_note.contains("No light seen"), "no light: said, nothing added");
+ed.stop_measure();
+ed.mm_open = false;
+
+// ---- the move and turn tools (#980: keys 2 and 3, F: world / local axes) ----
+tb = stage_add_model(eng.stage, TRUSS, 0.0, -12.0, 0.0);
+eng.stage_changed();
+check(wait_built([tb.id]), "a truss for the tools");
+ed.select_ids([tb.id], false, false);
+view.camera([target = [x = 0.0, y = -12.0, z = 0.5], yaw = 0.6, pitch = 0.5, distance = 8.0]);
+pump(ctx, 3);
+ed.key3d(STAGE_KEY_2, 1, 0);
+check(ed.tool == "move", "2: the move tool");
+st = ed.tool_state();
+check(st && st.axes[0].x == 1.0, "world axes by default");
+//drag the x arrow by its tip half a metre along x (on the screen)
+tip = ed.screen(ed.tool_point(st.pivot, st.axes[0], st.size * 0.9));
+check(ed.tool_hit(tip) == 0, "the x arrow under the mouse");
+x0 = tb.x;
+y0 = tb.y;
+z0 = tb.z;
+c0 = ed.screen(st.pivot);
+e0 = ed.screen(ed.tool_point(st.pivot, st.axes[0], 1.0));
+to = tip + (e0 - c0) * 0.5;
+ed.button3d(tip, 0, true, 0);
+ed.drag3d(to, to - tip, 0, 0);
+ed.button3d(to, 0, false, 0);
+check(math.abs(tb.x - x0 - 0.5) < 0.051 && math.abs(tb.y - y0) < 1e-6 && math.abs(tb.z - z0) < 1e-6, "x arrow: moved along x only, 0.5 m (" + (tb.x - x0) + ")");
+check(math.abs((tb.x - x0) * 20.0 - math.round((tb.x - x0) * 20.0)) < 1e-6, "with Snap in steps of 5 cm");
+//z arrow: up
+st = ed.tool_state();
+tz = ed.screen(ed.tool_point(st.pivot, st.axes[2], st.size * 0.9));
+cz = ed.screen(st.pivot);
+ez = ed.screen(ed.tool_point(st.pivot, st.axes[2], 1.0));
+toz = tz + (ez - cz) * 1.0;
+ed.button3d(tz, 0, true, 0);
+ed.drag3d(toz, toz - tz, 0, 0);
+ed.button3d(toz, 0, false, 0);
+check(math.abs(tb.z - z0 - 1.0) < 0.051, "z arrow: 1 m up (" + (tb.z - z0) + ")");
+//F: the object's own axes; turned 90 around z its x arrow points along the world's y
+tb.rz = 90.0;
+eng.stage_changed();
+ed.key3d(STAGE_KEY_F, 1, 0);
+st = ed.tool_state();
+check(ed.tool_local && math.abs(st.axes[0].y - 1.0) < 1e-6, "F: local axes, x along the world's y");
+ed.key3d(STAGE_KEY_F, 1, 0);
+check(!ed.tool_local, "F again: the world's axes");
+//3: the turn tool. A drag along a ring turns it so that the point grabbed follows the mouse (#980: by the angle of the
+//mouse around the middle it turned the wrong way on rings seen flat): for each ring, here the z ring seen from above
+//at a slant and the x and y rings seen nearly edge-on
+ed.key3d(STAGE_KEY_3, 1, 0);
+check(ed.tool == "turn" && ed.step_text() == "15°", "3: the turn tool, steps of 15°");
+dist2(a, b) {
+	return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
+}
+turn_ring(i, along, k) {
+	st = ed.tool_state();
+	ring = ed.tool_ring(st, i);
+	g = ring[k];
+	check(ed.tool_hit(g) == i, "ring " + STAGE_AXIS_NAMES[i] + " under the mouse");
+	ed.button3d(g, 0, true, 0);
+	t0 = ed.tool_grab_t;
+	//the mouse goes 40 px along the ring's tangent (forward or back)
+	d = ed.tool_dir * (1.0 / ed.tool_dir.length());
+	to = g + d * (40.0 * along);
+	ed.drag3d(to, to - g, 0, 0);
+	v = ed.tool_value;
+	//the point grabbed is now nearer the mouse than it was
+	moved = ed.screen(ed.ring_point(st, i, t0 + v * math.PI / 180.0));
+	check(v != 0.0 && moved && dist2(moved, to) < dist2(g, to), "ring " + STAGE_AXIS_NAMES[i] + ": the grabbed point follows the mouse (" + v + "°)");
+	check(math.abs(v / 15.0 - math.round(v / 15.0)) < 1e-6, "ring " + STAGE_AXIS_NAMES[i] + ": in steps of 15°");
+	ed.button3d(to, 0, false, 0);
+	return v;
+}
+rz0 = tb.rz;
+v = turn_ring(2, 1.0, 6);
+dr = tb.rz - rz0;
+for(dr > 180.0)
+	dr -= 360.0;
+for(dr < -180.0)
+	dr += 360.0;
+check(math.abs(dr - v) < 1e-3 && math.abs(tb.rx) < 1e-6 && math.abs(tb.ry) < 1e-6, "z ring: turned around z only, by what it shows (" + dr + ")");
+turn_ring(2, -1.0, 30);
+//seen nearly from the side: the x and y rings are flat ellipses
+view.camera([target = [x = 0.0, y = -12.0, z = 0.5], yaw = 0.6, pitch = 0.08, distance = 8.0]);
+pump(ctx, 2);
+for(i = 0; i < 2; i++) {
+	for(k : [4, 10, 20, 28, 40]) {
+		ring = ed.tool_ring(ed.tool_state(), i);
+		if(ring && ed.tool_hit(ring[k]) == i) {
+			turn_ring(i, 1.0, k);
+			turn_ring(i, -1.0, k);
+		}
+	}
+}
+view.camera([target = [x = 0.0, y = -12.0, z = 0.5], yaw = 0.6, pitch = 0.5, distance = 8.0]);
+pump(ctx, 2);
+//C / Shift+C: the steps, round to free (then any angle)
+ed.key3d(STAGE_KEY_C, 1, 0);
+check(ed.step_text() == "30°", "C: 30° (" + ed.step_text() + ")");
+for(k = 0; k < 3; k++)
+	ed.key3d(STAGE_KEY_C, 1, 0);
+check(ed.step_text() == "free", "C: 45°, 90°, then free (" + ed.step_text() + ")");
+ed.key3d(STAGE_KEY_C, 1, 0);
+check(ed.step_text() == "1°", "C after free: 1°");
+ed.key3d(STAGE_KEY_C, 1, STAGE_MOD_SHIFT);
+check(ed.step_text() == "free", "Shift+C: back to free");
+st = ed.tool_state();
+ring = ed.tool_ring(st, 2);
+ed.button3d(ring[6], 0, true, 0);
+to = ring[6] + ed.tool_dir * (0.3 / ed.tool_dir.length() * 37.0);
+ed.drag3d(to, to - ring[6], 0, 0);
+check(math.abs(ed.tool_value - math.round(ed.tool_value)) > 1e-3, "free: an angle between the degrees (" + ed.tool_value + ")");
+ed.button3d(to, 0, false, 0);
+//the move tool has steps of its own
+ed.key3d(STAGE_KEY_2, 1, 0);
+check(ed.step_text() == "5 cm", "the move tool: 5 cm");
+ed.key3d(STAGE_KEY_C, 1, 0);
+check(ed.step_text() == "10 cm", "C with the move tool: 10 cm");
+ed.key3d(STAGE_KEY_C, 1, STAGE_MOD_SHIFT);
+ed.key3d(STAGE_KEY_3, 1, 0);
+check(ed.step_text() == "free", "and the turn tool keeps its own");
+for(k = 0; k < 3; k++)
+	ed.key3d(STAGE_KEY_C, 1, 0);
+check(ed.step_text() == "15°", "free, 1°, 5°, back to 15° (" + ed.step_text() + ")");
+//R turns by the angle steps
+ed.key3d(STAGE_KEY_C, 1, 0);
+rz1 = tb.rz;
+ed.key3d(STAGE_KEY_R, 1, 0);
+check(math.abs(tb.rz - rz1 - 30.0) < 1e-6 || math.abs(tb.rz - rz1 - 30.0 + 360.0) < 1e-6 || math.abs(tb.rz - rz1 - 30.0 - 360.0) < 1e-6, "R: by the angle steps, 30° (" + (tb.rz - rz1) + ")");
+ed.key3d(STAGE_KEY_C, 1, STAGE_MOD_SHIFT);
+check(ed.degrees(-90.0) == "-90°" && ed.degrees(7.5) == "+7.5°" && ed.degrees(0.0) == "0°", "the angle of a drag as text: -90°, +7.5° (" + ed.degrees(-90.0) + ")");
+ed.key3d(STAGE_KEY_1, 1, 0);
+check(ed.tool == "select" && !ed.tool_state(), "1: back, no arrows");
+
+//the tool palette at the bottom left of the view: clicks instead of the keys; the selection stays
+pal_click(i) {
+	q = ed.palette_pos(i);
+	c = vec2f(q.x + STAGE_PALETTE_BTN / 2.0, q.y + STAGE_PALETTE_BTN / 2.0);
+	check(ed.palette_hit(c) == i, "palette: button " + i + " under its middle");
+	ed.button3d(c, 0, true, 0);
+	ed.button3d(c, 0, false, 0);
+}
+sel = ed.selected.size();
+pal_click(1);
+check(ed.tool == "move" && ed.tool_state(), "palette: the move tool");
+local0 = ed.tool_local;
+pal_click(3);
+check(ed.tool_local != local0 && ed.tool == "move", "palette: the axes switched (world / local), the tool stays");
+pal_click(3);
+check(ed.tool_local == local0, "palette: and back");
+pal_click(2);
+check(ed.tool == "turn", "palette: the turn tool");
+pal_click(0);
+check(ed.tool == "select" && ed.selected.size() == sel && ed.drag_mode == "", "palette: select; a click on it does not change the selection");
+pal_click(4);
+check(ed.step_text() == "30°", "palette: the steps button, the next steps");
+q4 = ed.palette_pos(4);
+c4 = vec2f(q4.x + STAGE_PALETTE_STEP_W - 4.0, q4.y + STAGE_PALETTE_BTN / 2.0);
+check(ed.palette_hit(c4) == 4, "palette: the steps button is wider");
+ed.button3d(c4, 0, true, STAGE_MOD_SHIFT);
+ed.button3d(c4, 0, false, STAGE_MOD_SHIFT);
+check(ed.step_text() == "15°", "palette: Shift+click, back");
+q0 = ed.palette_pos(0);
+check(ed.palette_hit(vec2f(q0.x - 3.0, q0.y + 5.0)) < 0 && ed.palette_hit(vec2f(q0.x + 5.0, q0.y - 3.0)) < 0, "palette: beside it nothing");
+
+// ---- the Build button (#980): a piece of the library, its measures on the right ----
+nb = eng.stage.objects.size();
+pc = ed.add_build("deck", [cols = 2, rows = 2, height = 0.4]);
+pump(ctx, 2);
+check(pc && pc.kind == "build" && eng.stage.objects.size() == nb + 1 && ed.selected.size() == 1 && ed.selected[0] == pc.id, "Build: a stage of decks added, selected");
+check(wait_built([pc.id]), "Build: its model shown");
+ed.set_build(pc.id, "height", 0.8, false);
+pm = stage_model_get(pc);
+check(pm && math.abs(pm.bounds.max.z - 0.8) < 1e-6, "Build: a measure changed, the model follows");
+ed.set_build(pc.id, "skirt", "nothing", true);
+check(pc.build.skirt == "front", "Build: a wrong choice goes back to its default");
+check(ed.inspector && ed.inspector.child_count() > 10, "Build: its rows on the right (" + (ed.inspector ? ed.inspector.child_count() : 0) + ")");
+ed.remove_selected();
+
+// ---- folders (#980): Ctrl+G, hidden with its folder, a click on the folder selects all in it ----
+fa = ed.add_build("truss", [length = 2.0]);
+fb = ed.add_build("stand");
+check(wait_built([fa.id, fb.id]), "folders: two pieces built");
+ed.select_ids([fa.id, fb.id], false, false);
+rows0 = ed.object_list.child_count();
+ed.key3d(STAGE_KEY_G, 1, STAGE_MOD_CTRL);
+fd = eng.stage.folders.size() ? eng.stage.folders[-1] : None;
+check(fd && fa.folder == fd.id && fb.folder == fd.id && ed.folder_selected() == fd.id, "Ctrl+G: a folder with the two in it, the folder selected");
+check(ed.object_list.child_count() == rows0 + 1, "the list: the folder row above its two (" + ed.object_list.child_count() + ")");
+pump(ctx, 3);
+ed.toggle_folder_visible(fd.id);
+pump(ctx, 3);
+check(view.item(scene.stage_items[fa.id].root).visible == 0 && view.item(scene.stage_items[fb.id].root).visible == 0 && fa.visible == 1,
+	"the folder hidden: both not drawn, their own eyes stay on");
+ed.toggle_folder_visible(fd.id);
+pump(ctx, 3);
+check(view.item(scene.stage_items[fa.id].root).visible == 1, "shown again");
+ed.toggle_folder_open(fd.id);
+check(ed.object_list.child_count() == rows0 - 1, "closed: only the folder row instead of its two");
+ed.toggle_folder_open(fd.id);
+ed.select_ids([], false, false);
+check(ed.folder_selected() == "", "nothing selected: no folder");
+ed.select_folder(fd.id);
+check(ed.selected.size() == 2 && ed.folder_selected() == fd.id, "a click on the folder: both selected");
+//a subfolder: Ctrl+G while the folder is clicked makes an empty folder in it (and does not move the objects)
+ed.key3d(STAGE_KEY_G, 1, STAGE_MOD_CTRL);
+sf = eng.stage.folders[-1];
+check(eng.stage.folders.size() == 2 && sf.folder == fd.id && fa.folder == fd.id && fb.folder == fd.id && ed.folder_selected() == sf.id,
+	"Ctrl+G on a clicked folder: an empty subfolder in it, clicked; the objects stay");
+check(stage_set_folder(eng.stage, fb.id, sf.id) && stage_folder_contents(eng.stage, fd.id).objects.size() == 2, "an object into the subfolder: still in the folder");
+ed.select_folder(sf.id);
+sub2 = ed.new_subfolder(sf.id);
+check(sub2 && sub2.folder == sf.id && stage_folder_path(eng.stage, sub2.id) == fd.name + " / Folder 2 / Folder 3", "a subfolder of a subfolder (" + stage_folder_path(eng.stage, sub2.id) + ")");
+ed.toggle_folder_visible(sf.id);
+pump(ctx, 3);
+check(view.item(scene.stage_items[fb.id].root).visible == 0 && view.item(scene.stage_items[fa.id].root).visible == 1, "the subfolder hidden: only what is in it");
+ed.toggle_folder_visible(sf.id);
+stage_remove_folder(eng.stage, sub2.id, false);
+stage_remove_folder(eng.stage, sf.id, false);
+check(fb.folder == fd.id, "the subfolder ungrouped: its object back in the folder");
+//dragged in the list (#980): the pressed row's objects onto a folder row, a folder onto a folder, onto the head
+fx = stage_add_folder(eng.stage, "Drop here");
+ed.changed(true);
+ed.select_ids([fa.id, fb.id], false, false);
+ed.list_press = ["object", fa.id, [fa.id, fb.id]];
+check(ed.list_drop_ok(fx.id) && ed.list_drop(fx.id) && fa.folder == fx.id && fb.folder == fx.id, "drag: two selected objects onto a folder, both in it");
+check(!ed.list_drop_ok(fx.id), "drag: onto the folder they are in already: nothing to do");
+ed.list_press = ["folder", fx.id, []];
+check(!ed.list_drop_ok(fx.id), "drag: a folder not onto itself");
+fy = stage_add_folder(eng.stage, "Inner", [], fx.id);
+ed.list_press = ["folder", fx.id, []];
+check(!ed.list_drop_ok(fy.id), "drag: a folder not into a folder in it");
+ed.list_press = ["folder", fy.id, []];
+check(ed.list_drop(""), "drag: a folder onto the head: to the top");
+check(fy.folder == "", "drag: it is at the top");
+ed.list_press = ["folder", fy.id, []];
+check(ed.list_drop(fx.id) && fy.folder == fx.id, "drag: a folder into another one");
+ed.list_press = ["object", fb.id, [fb.id]];
+check(ed.list_drop(fy.id) && fb.folder == fy.id && fa.folder == fx.id, "drag: one object into a subfolder");
+ed.list_press = ["object", fa.id, [fa.id]];
+check(ed.list_drop("") && fa.folder == "", "drag: onto the head, out of folders");
+ed.list_press = None;
+check(!ed.list_drop_ok(fx.id), "drag: nothing pressed, nothing taken");
+//the selection is marked on the rows, the list is not built again (a dragged row would go away)
+lst0 = ed.object_list;
+ed.select_ids([fb.id], false, false);
+check(ed.object_list == lst0 && ed.list_rows.size() > 0, "select: the rows stay, only marked");
+stage_remove_folder(eng.stage, fx.id, false);
+stage_remove_folder(eng.stage, fy.id, false);
+stage_set_folder(eng.stage, fa.id, fd.id);
+stage_set_folder(eng.stage, fb.id, fd.id);
+stage_remove_folder(eng.stage, fd.id, false);
+eng.stage_changed();
+check(fa.folder == "" && eng.stage.folders.size() == 0, "ungrouped: the two stay");
+ed.select_ids([fa.id, fb.id], false, false);
+ed.remove_selected();
+
+// ---- joining (#980): a dragged truss end snaps onto a free end ----
+ja = ed.add_build("truss", [length = 2.0]);
+ja.x = 20.0;
+ja.y = 20.0;
+jb = ed.add_build("truss", [length = 2.0]);
+jb.x = 22.08;
+jb.y = 20.03;
+eng.stage_changed();
+check(wait_built([ja.id, jb.id]), "joining: two trusses");
+view.camera([target = [x = 21.0, y = 20.0, z = 0.5], yaw = 0.3, pitch = 0.6, distance = 6.0]);
+pump(ctx, 2);
+ed.select_ids([jb.id], false, false);
+ed.snap_btn.pushed(false);
+ed.apply_snap();
+check(std.is_none(ed.snap_at) && math.abs(jb.x - 22.08) < 1e-9, "joining: Snap off, nothing joins");
+ed.snap_btn.pushed(true);
+ed.apply_snap();
+check(ed.snap_at && math.abs(jb.x - 22.0) < 1e-6 && math.abs(jb.y - 20.0) < 1e-6 && math.abs(ed.snap_at.x - 21.0) < 1e-6, "joining: 8 cm away, joined end to end (" + jb.x + ", " + jb.y + ")");
+//with the move tool: drag the x arrow of the second towards the first, it stops joined
+jb.x = 23.0;
+eng.stage_changed();
+pump(ctx, 2);
+ed.set_tool("move");
+st = ed.tool_state();
+tip = ed.screen(ed.tool_point(st.pivot, st.axes[0], st.size * 0.9));
+c0 = ed.screen(st.pivot);
+e0 = ed.screen(ed.tool_point(st.pivot, st.axes[0], 1.0));
+//0.93 m back along x: 7 cm short of the joint, joined
+to = tip - (e0 - c0) * 0.93;
+ed.step_text();
+ed.button3d(tip, 0, true, 0);
+ed.drag3d(to, to - tip, 0, 0);
+joined = ed.snap_at ? true : false;
+ed.button3d(to, 0, false, 0);
+check(joined && math.abs(jb.x - 22.0) < 1e-6, "joining: the move tool's arrow dragged near the joint: joined (" + jb.x + ")");
+ed.set_tool("select");
+ed.select_ids([ja.id, jb.id], false, false);
+ed.remove_selected();
+
+// ---- symmetry (#980): X, new pieces with their counterparts that follow; removed together ----
+view.camera([target = [x = 3.0, y = 30.0, z = 0.5], yaw = 0.3, pitch = 0.6, distance = 10.0]);
+pump(ctx, 2);
+ed.key3d(STAGE_KEY_X, 1, 0);
+check(ed.sym_mode == "mirror", "X: mirror");
+n0 = eng.stage.objects.size();
+sa = ed.add_build("speaker", [pole = 0.0]);
+mem = stage_sym_members(eng.stage, sa.sym_group);
+check(eng.stage.objects.size() == n0 + 2 && mem.size() == 2 && math.abs(mem[1].x + sa.x) < 1e-9, "a piece with mirror on: its mirror at -x (" + sa.x + ", " + mem[1].x + ")");
+sa.y = 31.0;
+sa.build.height = 0.9;
+ed.changed(true);
+check(math.abs(mem[1].y - 31.0) < 1e-9 && math.abs(mem[1].build.height - 0.9) < 1e-9, "a change of it: the mirror follows (place and measures)");
+ed.palette_click(5, 0);
+ed.palette_click(5, 0);
+check(ed.sym_mode == "radial3", "the palette's symmetry button: next (" + ed.sym_mode + ")");
+ed.key3d(STAGE_KEY_X, 1, STAGE_MOD_SHIFT);
+ed.key3d(STAGE_KEY_X, 1, STAGE_MOD_SHIFT);
+ed.key3d(STAGE_KEY_X, 1, STAGE_MOD_SHIFT);
+check(ed.sym_mode == "off", "Shift+X: back to off");
+ed.select_ids([sa.id], false, false);
+ed.remove_selected();
+check(eng.stage.objects.size() == n0, "removed: with its mirror");
+
+// ---- Escape and the right button cancel a drag; Alt+drag copies ----
+ca = ed.add_build("booth");
+check(wait_built([ca.id]), "a booth to drag");
+pump(ctx, 2);
+x0 = ca.x;
+ed.set_tool("move");
+st = ed.tool_state();
+tip = ed.screen(ed.tool_point(st.pivot, st.axes[0], st.size * 0.9));
+c0 = ed.screen(st.pivot);
+e0 = ed.screen(ed.tool_point(st.pivot, st.axes[0], 1.0));
+to = tip + (e0 - c0) * 1.0;
+ed.button3d(tip, 0, true, 0);
+ed.drag3d(to, to - tip, 0, 0);
+moved = math.abs(ca.x - x0 - 1.0) < 0.06;
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+check(moved && math.abs(ca.x - x0) < 1e-9 && ed.drag_mode == "cancel", "Escape while dragging an arrow: back where it was");
+ed.drag3d(to + vec2f(30.0, 0.0), vec2f(30.0, 0.0), 0, 0);
+ed.button3d(to, 0, false, 0);
+check(math.abs(ca.x - x0) < 1e-9 && ed.drag_mode == "" && ed.selected.size() == 1, "the rest of that drag does nothing, still selected");
+ed.button3d(tip, 0, true, 0);
+ed.drag3d(to, to - tip, 0, 0);
+ed.button3d(to, 1, true, 0);
+ed.button3d(to, 1, false, 0);
+ed.button3d(to, 0, false, 0);
+check(math.abs(ca.x - x0) < 1e-9, "the right button while dragging: back too");
+ed.set_tool("select");
+//Alt+drag: a copy dragged away, the booth stays
+pump(ctx, 2);
+p0 = ed.screen(stage_object_pivot(eng.stage, ca));
+check(scene.stage_at(p0) == ca.id, "the booth under the mouse");
+n1 = eng.stage.objects.size();
+ed.button3d(p0, 0, true, STAGE_MOD_ALT);
+p1 = p0 + vec2f(80.0, 0.0);
+ed.drag3d(p1, vec2f(80.0, 0.0), 0, STAGE_MOD_ALT);
+ed.button3d(p1, 0, false, STAGE_MOD_ALT);
+cp = eng.stage.objects[-1];
+check(eng.stage.objects.size() == n1 + 1 && cp.id != ca.id && cp.kind == "build" && math.abs(ca.x - x0) < 1e-9 && cp.x > ca.x + 0.2 &&
+	ed.selected.size() == 1 && ed.selected[0] == cp.id, "Alt+drag: a copy dragged away and selected, the booth stays (" + ca.x + ", " + cp.x + ")");
+//Alt+click without moving: no copy
+ed.button3d(p0, 0, true, STAGE_MOD_ALT);
+ed.button3d(p0, 0, false, STAGE_MOD_ALT);
+check(eng.stage.objects.size() == n1 + 1, "Alt+click: no copy on top");
+//Alt+drag, then Escape: the copy goes
+ed.button3d(p0, 0, true, STAGE_MOD_ALT);
+ed.drag3d(p1, vec2f(80.0, 0.0), 0, STAGE_MOD_ALT);
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+ed.button3d(p1, 0, false, STAGE_MOD_ALT);
+check(eng.stage.objects.size() == n1 + 1, "Alt+drag and Escape: no copy");
+ed.select_ids([ca.id, cp.id], false, false);
+ed.remove_selected();
+
+// ---- undo (#980): a change of the stage is a step of the undo history ----
+class fake_history {
+	steps = [];
+	done = 0;
+	busy = false;
+	push(name, u, r, key = "") {
+		for(steps.size() > done)
+			steps.erase(steps.size() - 1);
+		steps.push_back([name = name, undo = u, redo = r, key = key, time = std.millis_steady()]);
+		done = steps.size();
+	}
+	extend(key, r, within = 1000) {
+		if(key == "" || done == 0 || done != steps.size() || steps[done - 1].key != key)
+			return false;
+		steps[done - 1].redo = r;
+		return true;
+	}
+	undo() {
+		busy = true;
+		steps[done - 1].undo();
+		done--;
+		busy = false;
+	}
+	redo() {
+		busy = true;
+		steps[done].redo();
+		done++;
+		busy = false;
+	}
+}
+hist = fake_history();
+eng.menu = [generators_menu = [undo_history = hist]];
+ed.record_step();
+n0 = eng.stage.objects.size();
+ub = ed.add_build("truss", [length = 3.0]);
+check(hist.steps.size() == 1 && eng.stage.objects.size() == n0 + 1, "undo: an added truss is a step (" + hist.steps.size() + ")");
+ub.x = 7.0;
+ed.changed(false);
+ub.x = 7.5;
+ed.changed(false);
+check(hist.steps.size() == 2, "undo: two numbers of the inspector in a row: one step (" + hist.steps.size() + ")");
+ed.toggle_folder_open("none");
+hist.undo();
+pump(ctx, 2);
+ub2 = stage_find(eng.stage, ub.id);
+check(ub2 && math.abs(ub2.x - ub.x) > 1e-9 || (ub2 && ub2.x != 7.5), "undo: the move back");
+hist.undo();
+pump(ctx, 2);
+check(eng.stage.objects.size() == n0 && !stage_find(eng.stage, ub.id), "undo again: the truss gone");
+hist.redo();
+hist.redo();
+pump(ctx, 2);
+ub3 = stage_find(eng.stage, ub.id);
+check(ub3 && math.abs(ub3.x - 7.5) < 1e-9 && hist.steps.size() == 2, "redo twice: back, no new step from the undo itself (" + hist.steps.size() + ")");
+fz = stage_add_folder(eng.stage, "Z");
+ed.changed(true);
+k = hist.steps.size();
+ed.toggle_folder_open(fz.id);
+check(hist.steps.size() == k, "undo: opening a folder is no step");
+ed.select_ids([ub3.id], false, false);
+ed.remove_selected();
+stage_remove_folder(eng.stage, fz.id, false);
+ed.changed(true);
+
+// ---- standing on things (#980): a booth dragged onto the decks goes up onto them; F shows the selection ----
+gd = ed.add_build("deck", [cols = 2, rows = 2, height = 0.6]);
+gd.x = 50.0;
+gd.y = 50.0;
+gd.z = 0.0;
+gb = ed.add_build("booth");
+gb.x = 54.0;
+gb.y = 50.0;
+gb.z = 0.0;
+ed.changed(true);
+check(wait_built([gd.id, gb.id]), "a deck and a booth");
+ed.select_ids([gb.id], false, false);
+ed.fit_view();
+check(math.abs(view.camera().target.x - 54.0) < 0.6 && math.abs(view.camera().target.y - 50.0) < 0.6, "F / Fit: the selected booth in the middle of the view");
+view.camera([target = [x = 52.0, y = 50.0, z = 0.5], yaw = 0.0, pitch = 0.5, distance = 9.0]);
+pump(ctx, 3);
+pv = stage_object_pivot(eng.stage, gb);
+g0 = ed.screen(pv);
+g1 = ed.screen([x = pv.x - 3.5, y = pv.y, z = pv.z]);
+check(scene.stage_at(g0) == gb.id, "the booth under the mouse");
+ed.button3d(g0, 0, true, 0);
+ed.drag3d(g1, g1 - g0, 0, 0);
+ed.button3d(g1, 0, false, 0);
+check(gb.x < 51.2 && math.abs(gb.z - 0.6) < 0.01, "dragged over the decks: it stands on them (" + gb.x + ", " + gb.z + ")");
+pump(ctx, 3);
+pv = stage_object_pivot(eng.stage, gb);
+g0 = ed.screen(pv);
+g1 = ed.screen([x = pv.x + 3.5, y = pv.y, z = pv.z]);
+ed.button3d(g0, 0, true, 0);
+ed.drag3d(g1, g1 - g0, 0, 0);
+ed.button3d(g1, 0, false, 0);
+check(gb.x > 53.0 && math.abs(gb.z) < 0.01, "and off them: on the floor again (" + gb.x + ", " + gb.z + ")");
+ed.select_ids([gd.id, gb.id], false, false);
+ed.remove_selected();
+
+// ---- a row from the inspector (#980), distribute ----
+rw = ed.add_build("truss", [length = 2.0]);
+rw.x = 60.0;
+rw.y = 60.0;
+ed.changed(true);
+check(wait_built([rw.id]), "a truss for a row");
+ed.select_ids([rw.id], false, false);
+ed.row_count = 3;
+ed.row_axis = 0;
+ed.row_step = 0.0;
+rc = ed.make_row(rw.id);
+check(rc.size() == 2 && math.abs(rc[1].x - 64.0) < 0.05 && ed.selected.size() == 3, "Make the row: 2 copies end to end, all 3 selected (" + (rc.size() ? rc[1].x : 0) + ")");
+rc[0].x = 61.0;
+ed.select_ids([rw.id, rc[0].id, rc[1].id], false, false);
+check(stage_distribute(eng.stage, ed.selected_objects()) && math.abs(rc[0].x - 62.0) < 0.05, "distribute evenly: the middle one back in the middle");
+ed.remove_selected();
+
+// ---- a number typed while dragging an arrow / a ring (#980) ----
+ty = ed.add_build("booth");
+ty.x = 70.0;
+ty.y = 70.0;
+ed.changed(true);
+check(wait_built([ty.id]), "a booth for typing");
+ed.select_ids([ty.id], false, false);
+view.camera([target = [x = 70.0, y = 70.0, z = 0.5], yaw = 0.3, pitch = 0.6, distance = 8.0]);
+pump(ctx, 3);
+ed.set_tool("move");
+st = ed.tool_state();
+tip = ed.screen(ed.tool_point(st.pivot, st.axes[0], st.size * 0.9));
+ed.button3d(tip, 0, true, 0);
+ed.drag3d(tip + vec2f(20.0, 0.0), vec2f(20.0, 0.0), 0, 0);
+for(k : [49, 46, 53])
+	ed.key3d(k, 1, 0);
+check(ed.tool == "move" && ed.tool_typed == "1.5" && math.abs(ty.x - 71.5) < 1e-9, "typed 1.5 while dragging the x arrow: exactly 1.5 m, the 1 no tool key (" + ty.x + ")");
+ed.key3d(45, 1, 0);
+check(math.abs(ty.x - 68.5) < 1e-9, "minus: the other way");
+ed.key3d(STAGE_KEY_BACKSPACE, 1, 0);
+check(ed.tool_typed == "-1." && math.abs(ty.x - 69.0) < 1e-9, "Backspace: one less (-1.)");
+ed.drag3d(tip + vec2f(90.0, 0.0), vec2f(70.0, 0.0), 0, 0);
+check(math.abs(ty.x - 69.0) < 1e-9, "the mouse moves on: the typed number stays");
+ed.button3d(tip + vec2f(90.0, 0.0), 0, false, 0);
+check(math.abs(ty.x - 69.0) < 1e-9 && ed.tool_axis < 0, "released: it stays at -1 m");
+ed.set_tool("turn");
+pump(ctx, 2);
+st = ed.tool_state();
+rg = ed.tool_ring(st, 2);
+ed.button3d(rg[6], 0, true, 0);
+for(k : [45, 57, 48])
+	ed.key3d(k, 1, 0);
+check(math.abs(ed.tool_value + 90.0) < 1e-9, "the z ring, typed -90: -90° (" + ed.tool_value + ")");
+ed.button3d(rg[6], 0, false, 0);
+d = ty.rz;
+for(d > 180.0)
+	d -= 360.0;
+check(math.abs(d + 90.0) < 1e-6, "turned by -90° (" + ty.rz + ")");
+ed.set_tool("select");
+ed.select_ids([ty.id], false, false);
+ed.remove_selected();
+
+// ---- a box selection (Ctrl+drag), plan views (#980) ----
+ba = ed.add_build("booth");
+ba.x = 80.0;
+ba.y = 80.0;
+bb = ed.add_build("booth");
+bb.x = 83.0;
+bb.y = 80.0;
+bc = ed.add_build("booth");
+bc.x = 90.0;
+bc.y = 80.0;
+ed.changed(true);
+check(wait_built([ba.id, bb.id, bc.id]), "three booths");
+ed.select_ids([], false, false);
+view.camera([target = [x = 83.0, y = 80.0, z = 0.5], yaw = 0.0, pitch = 0.6, distance = 14.0]);
+pump(ctx, 3);
+pa = ed.screen(stage_object_pivot(eng.stage, ba));
+pb = ed.screen(stage_object_pivot(eng.stage, bb));
+pc = ed.screen(stage_object_pivot(eng.stage, bc));
+from = vec2f(math.min(pa.x, pb.x) - 90.0, math.min(pa.y, pb.y) - 120.0);
+to = vec2f(math.max(pa.x, pb.x) + 90.0, math.max(pa.y, pb.y) + 60.0);
+check(pc.x > to.x, "the third booth outside the box");
+check(scene.stage_at(from) == "" || std.is_none(scene.stage_at(from)) || !scene.stage_at(from), "the box starts on the empty stage");
+//the mouse as in CAD programs: the left button selects and moves (a drag on the empty stage: a box), the right one turns
+//the view, the middle one moves it; a large object that fills the picture (a scan) is not moved by turning
+ed.button3d(from, 0, true, 0);
+ed.drag3d(to, to - from, 0, 0);
+ed.button3d(to, 0, false, 0);
+check(ed.selected.size() == 2 && ed.selected.has_value(ba.id) && ed.selected.has_value(bb.id) && math.abs(view.camera().yaw) < 1e-6, "a drag on the empty stage: a box selects the two in it, the view does not turn");
+ed.button3d(from, 0, true, 0);
+ed.button3d(from, 0, false, 0);
+check(ed.selected.size() == 0, "a click on the empty stage selects none");
+xa = ba.x;
+ya = ba.y;
+ed.button3d(pa, 1, true, 0);
+ed.drag3d(pa + vec2f(80.0, 0.0), vec2f(80.0, 0.0), 1, 0);
+ed.button3d(pa + vec2f(80.0, 0.0), 1, false, 0);
+check(math.abs(view.camera().yaw) > 0.1 && ba.x == xa && ba.y == ya && ed.selected.size() == 0, "a drag of the right button on a booth turns the view, the booth stays (" + view.camera().yaw + ")");
+yr = view.camera().yaw;
+tr = view.camera().target;
+ed.button3d(pa, 2, true, 0);
+ed.drag3d(pa + vec2f(0.0, 60.0), vec2f(0.0, 60.0), 2, 0);
+ed.button3d(pa + vec2f(0.0, 60.0), 2, false, 0);
+check(math.abs(view.camera().target.x - tr.x) + math.abs(view.camera().target.y - tr.y) > 0.1 && view.camera().yaw == yr && ba.x == xa && ba.y == ya, "a drag of the middle button moves the view, the booth stays");
+ed.select_ids([ba.id], false, false);
+ed.button3d(from, 1, true, 0);
+ed.button3d(from, 1, false, 0);
+check(ed.selected.size() == 1 && view.camera().yaw == yr, "a right click without moving: nothing changes");
+ed.select_ids([], false, false);
+view.camera([target = [x = 83.0, y = 80.0, z = 0.5], yaw = 0.0, pitch = 0.6, distance = 14.0]);
+pump(ctx, 3);
+ed.button3d(from, 0, true, STAGE_MOD_CTRL);
+ed.drag3d(to, to - from, 0, STAGE_MOD_CTRL);
+ed.button3d(to, 0, false, STAGE_MOD_CTRL);
+check(ed.selected.size() == 2 && ed.selected.has_value(ba.id) && ed.selected.has_value(bb.id) && math.abs(view.camera().yaw) < 1e-6, "Ctrl+drag: a box selects the two in it, the view does not turn");
+ed.set_view("top");
+check(view.camera().pitch > 1.4 && math.abs(view.camera().target.x - 81.5) < 0.6, "the top view of the selection (" + view.camera().pitch + ", " + view.camera().target.x + ")");
+ed.key3d(321, 1, 0);
+check(view.camera().pitch < 0.1 && math.abs(view.camera().yaw) < 1e-6, "numpad 1: from the front");
+ed.key3d(320, 1, 0);
+check(math.abs(view.camera().pitch - 0.5) < 1e-6, "numpad 0: 3D again");
+ed.select_ids([ba.id, bb.id, bc.id], false, false);
+ed.remove_selected();
+
+// ---- the tape measure, a plan without perspective, Save the plan (#980) ----
+mt = ed.add_build("truss", [length = 3.0]);
+mt.x = 100.0;
+mt.y = 100.0;
+mt.z = 2.0;
+ed.changed(true);
+check(wait_built([mt.id]), "a truss to measure");
+ed.select_ids([], false, false);
+view.camera([target = [x = 100.0, y = 100.0, z = 2.0], yaw = 0.3, pitch = 0.5, distance = 8.0, ortho = false]);
+pump(ctx, 3);
+ed.key3d(STAGE_KEY_M, 1, 0);
+check(ed.tool == "measure", "M: the tape measure");
+nd = stage_world_nodes(eng.stage, mt);
+e0 = ed.screen([x = nd[0][0], y = nd[0][1], z = nd[0][2]]) + vec2f(5.0, 4.0);
+e1 = ed.screen([x = nd[1][0], y = nd[1][1], z = nd[1][2]]) + vec2f(-4.0, 5.0);
+ed.button3d(e0, 0, true, 0);
+ed.button3d(e0, 0, false, 0);
+check(ed.measure_a && math.abs(ed.measure_a.x - nd[0][0]) < 1e-6, "the first click: snapped onto the truss end");
+ed.button3d(e1, 0, true, 0);
+ed.button3d(e1, 0, false, 0);
+mm = ed.measures.size() ? ed.measures[0] : None;
+check(mm && !ed.measure_a && ed.measure_text(mm[0], mm[1])[0] == "3.00 m" && ed.measure_text(mm[0], mm[1])[1].contains("Δx 3.00 m"), "the second: 3.00 m, Δx 3.00 m (" + (mm ? ed.measure_text(mm[0], mm[1])[0] : "-") + ")");
+fl = ed.screen([x = 105.0, y = 100.0, z = 0.0]);
+ed.button3d(fl, 0, true, 0);
+ed.button3d(fl, 0, false, 0);
+check(ed.measure_a && math.abs(ed.measure_a.z) < 0.01, "a click on the empty floor: a point of the floor");
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+check(!ed.measure_a && ed.measures.size() == 1, "Escape: the one being measured goes");
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+check(ed.measures.size() == 0 && ed.tool == "measure", "Escape again: all go");
+ed.button3d(fl, 0, true, 0);
+ed.drag3d(fl + vec2f(60.0, 0.0), vec2f(60.0, 0.0), 0, 0);
+ed.button3d(fl + vec2f(60.0, 0.0), 0, false, 0);
+check(!ed.measure_a && math.abs(view.camera().yaw - 0.3) < 1e-6, "a drag with the tape measure takes no point and does not turn the view (the right button does)");
+ed.key3d(STAGE_KEY_M, 1, 0);
+check(ed.tool == "select", "M again: back");
+//the plan: no perspective, the same size at any height, a scale
+ed.select_ids([mt.id], false, false);
+ed.set_view("top");
+cm = view.camera();
+k = view.focal() / cm.distance;
+qa = view.project([x = 100.0, y = 100.0, z = 0.0]);
+qb = view.project([x = 101.0, y = 100.0, z = 5.0]);
+check(cm.ortho && cm.pitch > 1.57 && math.abs((qb.x - qa.x) - k) < 0.5, "Top: a plan without perspective, from straight above (" + (qb.x - qa.x) + " / " + k + ")");
+ed.set_view("3d");
+check(!view.camera().ortho, "3D: with perspective again");
+ed.set_view("front");
+fp = ed.save_plan();
+for(i = 0; i < 300 && std.is_none(ed.plan_saved); i++)
+	pump(ctx, 1);
+check(ed.plan_saved && fileio.exists(fp) && !ed.plan_capture, "Save the plan: a PNG (" + fp + ", " + ed.plan_saved + ", " + ed.plan_error + ")");
+if(fileio.exists(fp))
+	fileio.remove(fp);
+ed.plan_saved = None;
+ed.set_view("3d");
+ed.select_ids([mt.id], false, false);
+ed.remove_selected();
+
+// ---- a new piece stands on what is there (#980) ----
+nd = ed.add_build("deck", [cols = 2, rows = 2, height = 0.6]);
+nd.x = 120.0;
+nd.y = 120.0;
+nd.z = 0.0;
+ed.changed(true);
+check(wait_built([nd.id]), "a deck");
+view.camera([target = [x = 120.0, y = 120.0, z = 0.5], yaw = 0.3, pitch = 0.5, distance = 8.0, ortho = false]);
+nb = ed.add_build("booth");
+check(math.abs(nb.z - 0.6) < 0.01, "Build over the decks: the booth on them, not in them (" + nb.z + ")");
+ed.select_ids([nd.id, nb.id], false, false);
+ed.remove_selected();
+
+// ---- lamps on the stage (#980): dragged under a truss they hang on it ----
+lt = ed.add_build("truss", [length = 4.0]);
+lt.x = 140.0;
+lt.y = 140.0;
+lt.z = 5.0;
+ld = ed.add_build("deck", [cols = 1, rows = 1, height = 1.0]);
+ld.x = 146.0;
+ld.y = 140.0;
+ld.z = 0.0;
+ed.changed(true);
+check(wait_built([lt.id, ld.id]), "a truss at 5 m and a deck");
+hl = [id = "lampH", name = "Wash", type = "", x = 137.0, y = 141.0, z = 4.0, mount = "hanging", rotation = 0.0];
+sl = [id = "lampS", name = "Bar", type = "", x = 146.0, y = 143.0, z = 0.0, mount = "floor", rotation = 0.0];
+eng.patch.fixtures.push_back(hl);
+eng.patch.fixtures.push_back(sl);
+view.camera([target = [x = 140.0, y = 140.0, z = 2.0], yaw = 0.0, pitch = 1.5707, distance = 14.0, ortho = true]);
+pump(ctx, 3);
+p0 = ed.screen([x = 137.0, y = 141.0, z = 4.0]);
+ed.start_lamp_drag("lampH", p0, false, false);
+check(ed.sel_lamps.size() == 1 && ed.selected.size() == 0 && ed.drag_mode == "lamp", "a lamp clicked: selected, the objects not");
+p1 = ed.screen([x = 139.0, y = 140.3, z = 4.0]);
+ed.drag_moved = true;
+ed.lamp_drag(p1);
+check(hl.hangs_on == lt.id && math.abs(hl.y - 140.0) < 1e-6 && math.abs(hl.z - 5.0) < 1e-6 && math.abs(hl.x - 139.0) < 0.06,
+	"a hanging lamp dragged under the truss: on its middle line, under it, hung on it (" + hl.x + ", " + hl.y + ", " + hl.z + ")");
+ed.drag_mode = "";
+stage_lamps_follow(eng.stage, eng.patch);
+lt.x = 141.0;
+lt.rz = 90.0;
+stage_lamps_follow(eng.stage, eng.patch);
+check(math.abs(hl.x - 141.0) < 0.06 && math.abs(hl.y - 139.0) < 0.06 && math.abs(hl.z - 5.0) < 1e-6, "the truss moved and turned: the lamp with it (" + hl.x + ", " + hl.y + ")");
+lt.x = 140.0;
+lt.rz = 0.0;
+stage_lamps_follow(eng.stage, eng.patch);
+p2 = ed.screen([x = hl.x, y = hl.y, z = hl.z]);
+ed.start_lamp_drag("lampH", p2, false, false);
+p3 = ed.screen([x = hl.x, y = hl.y + 4.0, z = hl.z]);
+ed.drag_moved = true;
+ed.lamp_drag(p3);
+check(hl.hangs_on == "" && math.abs(hl.y - 144.0) < 0.06, "dragged away from the truss: it hangs on nothing");
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+check(hl.hangs_on == lt.id && math.abs(hl.y - 140.0) < 0.06, "Escape: back under the truss, hung on it again");
+ed.drag_mode = "";
+//a standing lamp onto the deck
+q0 = ed.screen([x = 146.0, y = 143.0, z = 0.0]);
+ed.start_lamp_drag("lampS", q0, false, false);
+q1 = ed.screen([x = 146.0, y = 140.0, z = 0.0]);
+ed.drag_moved = true;
+ed.lamp_drag(q1);
+check(math.abs(sl.z - 1.0) < 1e-6 && (sl.hangs_on ?? "") == "", "a standing lamp dragged onto the deck: on it (" + sl.z + ")");
+ed.drag_mode = "";
+ed.build_inspector();
+check(ed.inspector.child_count() > 4, "the inspector of the lamp");
+ed.select_ids([], false, false);
+check(ed.sel_lamps.size() == 0, "nothing selected: no lamp either");
+eng.patch.fixtures = [];
+view.camera([ortho = false, pitch = 0.5]);
+ed.select_ids([lt.id, ld.id], false, false);
+ed.remove_selected();
+
+// ---- Add: what is added follows the mouse until a click puts it down (#980) ----
+pd = ed.add_build("deck", [cols = 2, rows = 2, height = 0.6]);
+pd.x = 160.0;
+pd.y = 160.0;
+pd.z = 0.0;
+ed.changed(true);
+check(wait_built([pd.id]), "a deck");
+view.camera([target = [x = 158.0, y = 160.0, z = 0.5], yaw = 0.0, pitch = 1.5707, distance = 12.0, ortho = true]);
+pump(ctx, 2);
+n0 = eng.stage.objects.size();
+pb = ed.add_build("booth", None, true);
+check(ed.placing == pb.id && wait_built([pb.id]), "Add a booth: it is being placed");
+ed.place_at(ed.screen([x = 160.0, y = 160.0, z = 0.0]));
+check(math.abs(pb.x - 160.0) < 0.06 && math.abs(pb.z - 0.6) < 0.01, "it follows the mouse onto the decks (" + pb.x + ", " + pb.z + ")");
+ed.place_at(ed.screen([x = 155.0, y = 160.0, z = 0.0]));
+check(math.abs(pb.x - 155.0) < 0.06 && math.abs(pb.z) < 0.01, "and off them onto the floor");
+cl = ed.screen([x = 160.0, y = 160.5, z = 0.0]);
+ed.button3d(cl, 0, true, 0);
+ed.button3d(cl, 0, false, 0);
+check(ed.placing == "" && math.abs(pb.y - 160.5) < 0.06 && math.abs(pb.z - 0.6) < 0.01 && eng.stage.objects.size() == n0 + 1, "a click puts it down there, nothing else happens");
+ed.sym_mode = "mirror";
+pc = ed.add_build("speaker", [pole = 0.0], true);
+check(stage_sym_members(eng.stage, pc.sym_group).size() == 2, "placing with mirror: two");
+ed.key3d(STAGE_KEY_ESCAPE, 1, 0);
+check(ed.placing == "" && !stage_find(eng.stage, pc.id) && eng.stage.objects.size() == n0 + 1, "Escape: it goes again, with its mirror");
+ed.sym_mode = "off";
+pe = ed.add_build("stand", None, true);
+yp = view.camera().yaw;
+ed.button3d(cl, 1, true, 0);
+ed.drag3d(cl + vec2f(60.0, 0.0), vec2f(60.0, 0.0), 1, 0);
+ed.button3d(cl + vec2f(60.0, 0.0), 1, false, 0);
+check(ed.placing == pe.id && stage_find(eng.stage, pe.id) && math.abs(view.camera().yaw - yp) > 0.1, "a drag of the right button while placing turns the view, it is still being placed");
+ed.button3d(cl, 1, true, 0);
+ed.button3d(cl, 1, false, 0);
+check(!stage_find(eng.stage, pe.id), "a right click without moving: it goes too");
+//the Row section is closed until it is asked for
+ed.select_ids([pb.id], false, false);
+ed.row_open = false;
+ed.build_inspector();
+c0 = ed.inspector.child_count();
+ed.row_open = true;
+ed.build_inspector();
+check(ed.inspector.child_count() > c0, "Copies in a row…: the Row section opens");
+ed.row_open = false;
+view.camera([ortho = false, pitch = 0.5]);
+ed.select_ids([pd.id, pb.id], false, false);
+ed.remove_selected();
+
+std.print(ok ? "ALL PASSED" : "FAILED");
+std.exitprocess(ok ? 0 : 1);

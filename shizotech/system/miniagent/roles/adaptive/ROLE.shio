@@ -80,6 +80,13 @@ format_task_hierachy(hierarchy)
 	return result;
 }
 
+// The report of a child whose run threw. The exception used to be dropped, and the
+// parent only learned that "the task did not emit a finalize() report".
+task_crash_report(crash)
+{
+	return "The task crashed and did not report: " + std.string(crash).strip() + "\nWhat it changed before the crash is unverified: check it before you build on it, then continue the task or start a new one.";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Batch tasks (see batch_spec.md)
 //
@@ -237,11 +244,14 @@ batch_run_child(agt, task)
 		return;
 	}
 
+	crash = "";
+
 	try {
 		res = executor.task(executor.env.batch_prompt);
 	}
 	catch(e) {
 		res = None;
+		crash = std.string(e);
 	}
 	
 	executor.env.batch_runs++;
@@ -263,12 +273,518 @@ batch_run_child(agt, task)
 		task.finished = true;
 		task.finish_reason = "failed";
 
-		if(!task.report)
-			task.report = "The batch child crashed or returned nothing before calling finalize().\nManual verification of this item is required.";
+		if(!task.report) {
+			if(crash)
+				task.report = task_crash_report(crash);
+			else
+				task.report = "The batch child returned nothing before calling finalize().\nManual verification of this item is required.";
+		}
 	}
 	
 	// Publish the terminal state to the scheduler.
 	task.batch_done = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Blind tests
+//
+// An agent that writes the tests for its own implementation tests what the code
+// does, not what it should do (and can make them pass either way). So the tests
+// of non-trivial work are written by a separate agent that never sees the
+// implementation: write_blind_tests hands the specification and the API
+// (signatures, no bodies) to an agent of the role util/blind_tester.
+//
+// "Blind" is enforced by the harness, not by the prompt - as long as the test
+// writer cannot run anything:
+//   * the file tools of the test writer work on an fs_path_guard (roles/SHARED.shio)
+//     instead of the workspace: it reads and writes test_path, reads
+//     reference_paths, and every other path is refused;
+//   * its role has no command, skill or share tools: nothing else reads files.
+//
+// With run_command it gets one more tool, run_tests, which runs exactly that
+// command - and with it the guarantee is gone, by nature: the tests it wrote are
+// code that runs with the access of the workspace. A test can open the
+// implementation and print it, copy it, change it; a traceback quotes it. What the
+// harness still does: a file a run created or changed inside test_path cannot be
+// read by the test writer (blind_mark_run_files: no "copy it over and read it") and
+// is named to the parent (files_changed_by_test_runs), and the output of a run is
+// cut to blind_run_output_bytes. What a test prints is seen. So run_command is
+// optional and off by default: without it the parent runs the tests itself and
+// sends the findings back (continue_task), which keeps the test writer blind.
+//
+// The report comes back in fields: the test files (looked up on disk, not taken
+// on trust), the test cases with the behaviour each checks, the ambiguities of
+// the spec, what is not covered. The test writer is recorded as a task of the
+// parent, so continue_task(task_id, feedback) reaches it later.
+// ─────────────────────────────────────────────────────────────────────────────
+
+blind_test_prompt = R"(
+BLIND TEST TASK
+
+Write tests for the unit described below. You have not seen its implementation and you cannot
+read it: your file tools reach only the paths named here.
+
+Specification (the only source of truth for the expected behaviour):
+[SPEC]
+
+API under test (everything you may assume about the implementation):
+[API]
+
+Test framework and conventions:
+[FRAMEWORK]
+
+Write the tests here (the only place where you may create or change files):
+[TEST_PATH]
+
+Reference files you may read:
+[REFERENCES]
+
+Running the tests:
+[RUN]
+
+Constraints:
+[CONSTRAINTS]
+)";
+
+blind_feedback_prompt = R"(
+FEEDBACK ON YOUR BLIND TESTS
+
+The agent that implements the unit ran your tests and says:
+
+[RESPONSE]
+
+Judge every point against the SPECIFICATION and the API description of your task, not against
+what the implementation does:
+- the test contradicts the specification, checks something it does not promise, or is broken
+  (setup, syntax, misuse of the framework): fix the test;
+- the test states what the specification demands: keep it unchanged and say so, with the
+  sentence of the specification it rests on;
+- the specification does not decide the point: report it as a spec ambiguity. If the feedback
+  settles it (a decision of the caller), follow that decision and say so.
+The rules of your role still hold. End with finalize() and the complete, updated report.
+
+Your task, unchanged (it is repeated because your earlier messages may have been compacted away):
+[BRIEF]
+)";
+
+// One run of run_command may take this long (seconds), unless the caller says otherwise.
+blind_run_timeout_s = 600;
+
+// The test writer may call run_tests this often.
+blind_max_runs = 20;
+
+// Output of one run_tests call: enough for the failures, small enough that a
+// runner that quotes source lines leaks little.
+blind_run_output_bytes = 16000;
+
+// A string or a list of strings as a list of the non-empty ones.
+blind_string_list(value)
+{
+	var list = [];
+
+	if(std.is_none(value))
+		return list;
+
+	if(std.is_string(value)) {
+		if(value.strip())
+			list.push_back(value.strip());
+		return list;
+	}
+
+	if(std.is_json(value)) {
+		for(var i = 0; i < value.size(); i++) {
+			var entry = std.string(value[i]).strip();
+			if(entry)
+				list.push_back(entry);
+		}
+	}
+
+	return list;
+}
+
+// The files below the test path with their size and time of the last write.
+blind_snapshot(guard)
+{
+	var snap = [];
+
+	for(var i = 0; i < guard.write_list.size(); i++) {
+		var root = guard.write_list[i];
+
+		if(!guard.base.exists(root))
+			continue;
+
+		if(!guard.base.is_directory(root)) {
+			var one = guard.base.file_info(root);
+			snap[root] = [size = one.size, time = one.last_write_time];
+			continue;
+		}
+
+		var names = guard.base.files(root, true);
+
+		for(var j = 0; j < names.size(); j++) {
+			var file = root + "/" + std.string(names[j]);
+			var info = guard.base.file_info(file);
+
+			if(std.is_json(info))
+				snap[file] = [size = info.size, time = info.last_write_time];
+		}
+	}
+
+	return snap;
+}
+
+// After a run: what it created or changed inside the test path is not the test
+// writer's own text any more (a run can copy the implementation there). Those files
+// become unreadable for the test writer and are remembered for the parent.
+// Returns their names.
+blind_mark_run_files(guard, blind, before)
+{
+	var after = blind_snapshot(guard);
+	var changed = [];
+
+	for(var i = 0; i < after.size(); i++) {
+		var file = after.key(i);
+		var now = after[i];
+
+		if(before.has(file) && before[file].size == now.size && before[file].time == now.time)
+			continue;
+
+		guard.set_foreign(file, "it was written by a run of the tests, not by you");
+		changed.push_back(file);
+		blind.run_files[file] = true;
+	}
+
+	return changed;
+}
+
+// The first `count` entries of a list.
+blind_first(list, count)
+{
+	var out = [];
+
+	for(var i = 0; i < list.size() && i < count; i++) {
+		out.push_back(list[i]);
+	}
+
+	return out;
+}
+
+// run_tests of the test writer: exactly the command of the caller, nothing else.
+blind_add_run_tool(tester, command, timeout_ms)
+{
+	tester.add_tool(
+		"run_tests",
+		"Run the tests with the command your caller configured (you cannot change it) and get the exit code and the output.\nCommand: " + command + "\nUse it to find mistakes in your TESTS: syntax, setup, misuse of the framework. A test that fails because the unit does not do what the specification says is a finding: keep it as it is. Never take expected values from this output.",
+		[],
+		[command, timeout_ms](agt, args)
+		{
+			var blind = agt.env.blind;
+
+			if(blind.runs >= blind_max_runs)
+				return agt_fail("run_tests was called " + std.string(blind.runs) + " times, that is the limit.", "Finish with what you have: report the state of the tests in finalize().");
+
+			blind.runs++;
+
+			var before = blind_snapshot(agt.env.fs_guard);
+
+			var result = cmd_run_to_end(agt, command, ".", timeout_ms, blind_run_output_bytes);
+
+			var run_files = blind_mark_run_files(agt.env.fs_guard, blind, before);
+
+			if(run_files.size()) {
+				result.files_changed_by_this_run = blind_first(run_files, 40);
+				result.files_changed_note = std.string(run_files.size()) + " file(s) in the test path were created or changed by this run, not by you: you cannot read them. Remove what should not stay (output of the tests, caches).";
+			}
+
+			blind.last_run = [
+				run = blind.runs,
+				state = std.string(result.state ?? "NOT STARTED"),
+				exit_code = result.has("exit_code") ? result.exit_code : None,
+			];
+			blind.last_run_writes = agt.env.fs_guard.writes;
+
+			result.command = command;
+			result.reminder = "Fix mistakes in your tests only. A test that states what the specification demands stays unchanged, also when it fails.";
+
+			return result;
+		}
+	);
+}
+
+// What write_blind_tests / continue_task hand to the parent: the report of the
+// test writer in fields, plus what the harness itself can see.
+blind_tests_result(task, tester, crash = "")
+{
+	var guard = tester.env.fs_guard;
+	var blind = tester.env.blind;
+
+	var out = [
+		ok = false,
+		task_id = task.id,
+		finish_reason = task.finish_reason,
+	];
+
+	var report = None;
+	if(std.is_json(tester.task_result))
+		report = tester.task_result.result;
+
+	// The test files as they are on disk, not as the report claims them: what was written
+	// through the restricted view and is still there, plus files the report names that
+	// exist inside the view (tests the writer kept as they were).
+	var files = [];
+	var listed = [];
+	var written = guard.touched_files();
+
+	for(var i = 0; i < written.size(); i++) {
+		listed[written[i]] = true;
+		files.push_back([
+			file = written[i],
+			bytes = guard.base.size(written[i]),
+		]);
+	}
+
+	if(std.is_json(report) && std.is_json(report.test_files)) {
+		for(var j = 0; j < report.test_files.size(); j++) {
+			var named = guard.tidy(report.test_files[j]);
+
+			if(listed.has(named) || guard.access_error(named, "read") != "")
+				continue;
+
+			if(guard.base.exists(named) && !guard.base.is_directory(named)) {
+				listed[named] = true;
+				files.push_back([
+					file = named,
+					bytes = guard.base.size(named),
+				]);
+			}
+		}
+	}
+
+	out.test_files = files;
+
+	if(std.is_json(report) && report.has("summary")) {
+		out.summary = report.summary;
+		out.test_cases = report.test_cases;
+		out.spec_ambiguities = report.spec_ambiguities;
+		out.not_covered = report.not_covered;
+
+		if(report.run_result ?? false)
+			out.run_result = report.run_result;
+	}
+	else {
+		out.report = crash ? task_crash_report(crash) : std.string(report ?? "");
+
+		if(!out.report)
+			out.report = "The test writer ended without a report: it may have crashed. Look at the test files that exist, then call write_blind_tests again.";
+	}
+
+	// what the harness saw of the last run_tests call (not what the test writer says about it)
+	if(std.is_json(blind.last_run)) {
+		out.last_test_run = blind.last_run.copy();
+		out.last_test_run.tests_changed_afterwards = (guard.writes != blind.last_run_writes) ? true : false;
+	}
+
+	// files a run left in the test path (the test writer could not read them; it may have
+	// removed or rewritten some since)
+	if(std.is_json(blind.run_files) && blind.run_files.size()) {
+		var left = [];
+
+		for(var r = 0; r < blind.run_files.size(); r++) {
+			var run_file = blind.run_files.key(r);
+
+			if(guard.base.exists(run_file) && guard.access_error(run_file, "content") != "")
+				left.push_back(run_file);
+		}
+
+		if(left.size()) {
+			out.files_changed_by_test_runs = blind_first(left, 60);
+			out.files_changed_by_test_runs_total = left.size();
+			out.files_changed_by_test_runs_note = "Runs of the tests created or changed these files inside the test path (caches and test output are normal). Look at anything else: a test that copies or prints the implementation is not a blind test.";
+		}
+	}
+
+	if(task.finish_reason == "finished" && files.size()) {
+		out.ok = true;
+		out.next_steps = "Run these tests against your implementation. A failing test means the implementation (or the specification) is wrong: fix the implementation. Do NOT edit, weaken, skip or delete the blind tests. A test you believe contradicts the specification goes back to the test writer: continue_task(task_id, <which test, why, the sentence of the specification>). Decide every entry of spec_ambiguities (or ask your parent) and send the decision with continue_task when tests have to change.";
+	}
+	else if(task.finish_reason == "question") {
+		out.next_steps = "The test writer needs an answer before it can write the tests: answer with continue_task(task_id, <answer>).";
+	}
+	else {
+		out.next_steps = "No usable tests came back. Read the reason, then fix the specification / API description or the paths and call write_blind_tests again, or answer with continue_task(task_id, ...).";
+	}
+
+	return out;
+}
+
+blind_tests_start(agt, args)
+{
+	var spec = (args.has("spec") && !std.is_none(args.spec)) ? std.string(args.spec).strip() : "";
+	var api = (args.has("api") && !std.is_none(args.api)) ? std.string(args.api).strip() : "";
+
+	if(!spec)
+		return agt_fail("Missing 'spec': no test writer was started.", "Give the behaviour to test: what every operation does for valid input, at the boundaries, for invalid input and on errors. The test writer knows nothing else.");
+
+	if(!api)
+		return agt_fail("Missing 'api': no test writer was started.", "Give the signatures / the interface exactly as the tests call it: names, parameters, results, errors, how to import or include the unit.");
+
+	var test_dir = agt_path_check(agt, args.test_path, "write", "test_path");
+	if(!test_dir.ok)
+		return test_dir;
+
+	var fs = agt.filesystem;
+
+	var references = [];
+	var wanted = blind_string_list(args.reference_paths);
+
+	for(var i = 0; i < wanted.size(); i++) {
+		var reference = agt_path_check(agt, wanted[i], "read", "reference_paths");
+		if(!reference.ok)
+			return reference;
+
+		if(!fs.exists(reference.path))
+			return agt_fail("The reference path '" + reference.path + "' does not exist: no test writer was started.", "List existing files or directories only, or leave reference_paths out.");
+
+		references.push_back(reference.path);
+	}
+
+	// The jail of the test writer. It refuses the working directory itself as a path:
+	// that would open everything.
+	var guard = None;
+
+	try {
+		guard = fs_path_guard(fs, [test_dir.path], references, "blind test writer",
+			"the implementation is off limits: tests are written from the specification and the API description only");
+	}
+	catch(e) {
+		return agt_fail("The restricted file view of the test writer could not be set up: " + std.string(e).strip(), "test_path and reference_paths have to be files or directories below the working directory, never the working directory itself.");
+	}
+
+	var run_command = (args.has("run_command") && !std.is_none(args.run_command)) ? std.string(args.run_command).strip() : "";
+
+	var run_timeout_s = blind_run_timeout_s;
+	if(args.run_timeout ?? false)
+		run_timeout_s = math.max(1, std.int(args.run_timeout));
+
+	var env = agt.env;
+
+	if(!env.tasks)
+		env.tasks = [];
+
+	var tasks = env.tasks;
+
+	var tester = agt.subagent("util/blind_tester");
+
+	tester.filesystem = guard;			// the jail
+	tester.env.fs_guard = guard;		// lets the file tools answer a refusal as a normal error
+	tester.env.blind = [
+		test_path = test_dir.path,
+		reference_paths = references,
+		run_command = run_command,
+		runs = 0,
+		last_run = None,
+		last_run_writes = -1,
+		run_files = std.json(),		// file -> true: created or changed by a run of the tests
+	];
+
+	if(run_command)
+		blind_add_run_tool(tester, run_command, run_timeout_s * 1000);
+
+	var parent_id = "";
+	if(agt.env.active_task ?? false)
+		parent_id = agt.env.active_task.id;
+
+	tasks.push_back([
+		agent = tester,
+		parent_id = parent_id,
+		kind = "blind_tests",
+
+		id = "task_" + std.random_hash(6),
+		name = "blind tests: " + test_dir.path,
+		goal = "Write blind tests into " + test_dir.path,
+		context = "",
+		contract = "",
+		constraints = "",
+
+		finished = false,
+		finish_reason = "",
+
+		report = "",
+	]);
+
+	var task = tasks[-1];
+
+	tester.env.active_task = task;
+
+	if(agt.on_action) {
+		tester.on_action = [agt](act) {
+			agt.on_action(act);
+		};
+	}
+
+	var framework = (args.has("framework") && !std.is_none(args.framework)) ? std.string(args.framework).strip() : "";
+	var constraints = (args.has("constraints") && !std.is_none(args.constraints)) ? std.string(args.constraints).strip() : "";
+
+	var run_text = "You cannot run the tests: there is no run_tests tool. Write them so that they are correct as they stand, and say in your report that they were not run.";
+	if(run_command)
+		run_text = "Call run_tests() to run: " + run_command + "\nYou cannot run anything else.";
+
+	var prompt = blind_test_prompt.replace([
+		"[SPEC]" = spec,
+		"[API]" = api,
+		"[FRAMEWORK]" = framework ? framework : "Not given: follow the tests and helpers that already exist in the test path and the reference files; if there are none, use the most common framework of the language and say which.",
+		"[TEST_PATH]" = test_dir.path,
+		"[REFERENCES]" = references.size() ? references.combine_string("\n").strip() : "None.",
+		"[RUN]" = run_text,
+		"[CONSTRAINTS]" = constraints ? constraints : "None.",
+	]);
+
+	// kept for continue_task: the feedback goes out with the task again (blind_feedback_prompt)
+	task.blind_brief = prompt;
+
+	managed _grd = agent_slot(tester, agt);
+
+	if(agt.should_stop()) {
+		tester.stop();
+		return [
+			task_id = task.id,
+			stopped = true,
+			finish_reason = task.finish_reason,
+			report = "The agent was stopped before the test writer started.\nDo not continue, end the turn with finalize().",
+		];
+	}
+
+	var crash = "";
+
+	try {
+		tester.task(prompt);
+	}
+	catch(e) {
+		crash = std.string(e);
+	}
+
+	if(std.is_json(tester.task_result)) {
+		task.finished = true;
+		task.finish_reason = std.string(tester.task_result.signal ?? "failed");
+		task.report = std.string(tester.task_result.result ?? "");
+	}
+	else if(crash) {
+		task.finished = true;
+		task.finish_reason = "failed";
+		task.report = task_crash_report(crash);
+	}
+
+	if(agt.should_stop()) {
+		tester.stop();
+		return [
+			task_id = task.id,
+			stopped = true,
+			finish_reason = task.finish_reason,
+			report = "The agent was stopped while the test writer was running.\nDo not continue, end the turn with finalize().",
+		];
+	}
+
+	return blind_tests_result(task, tester, crash);
 }
 
 add_tools(agt)
@@ -281,6 +797,10 @@ add_tools(agt)
 		],
 		[](agt, args)
 		{		
+			//No tasks: the old code returned an empty result list, which told the model nothing.
+			if(!std.is_list(args.tasks) || !args.tasks.size())
+				return agt_fail("Missing 'tasks': nothing was forked.", "Give a list with one message per sibling: what exactly that sibling has to do.");
+
 			fork_results = [];
 			
 			for(i = 0; i < args.tasks.size(); i++) {
@@ -324,8 +844,6 @@ add_tools(agt)
 					return;
 				}
 				
-				std.print("\n\n---NEW FORK---\n");
-				
 				try {
 					prompt = "You are forked sibling number " + task_index + ".\nFocus only on the following part of the task only, then immediately finish with finalize():\n\n" + task;
 					executor.task(prompt);
@@ -333,7 +851,7 @@ add_tools(agt)
 						fork_results[task_index].report = std.string(executor.task_result.result ?? "");
 				}
 				catch(e) {
-					fork_results[task_index].report = "This sibling died during execution.";
+					fork_results[task_index].report = "This sibling crashed and did not report: " + std.string(e).strip() + "\nWhat it changed before the crash is unverified.";
 				}
 				
 				//The parent was stopped while this sibling ran: it goes down with
@@ -356,8 +874,6 @@ add_tools(agt)
 				fork_threads[i].join();
 			}
 		
-			std.print("--- FORK finished ---");
-
 			if(agt.should_stop()) {
 				return [
 					stopped = true,
@@ -383,6 +899,10 @@ add_tools(agt)
 		],
 		[](agt, args)
 		{		
+			//A child without a goal has nothing to do; it used to be started anyway.
+			if(!args.has("goal") || std.is_none(args.goal) || std.string(args.goal).strip() == "")
+				return agt_fail("Missing 'goal': no task was started.", "Give name, goal, context, contract and effort. The child knows nothing but what these fields say.");
+
 			env = agt.env;
 			
 			if(!env.tasks)
@@ -391,7 +911,12 @@ add_tools(agt)
 			tasks = env.tasks;
 		
 			executor = agt.subagent("adaptive");
-			executor.set_reasoning_effort(args.effort);
+
+			//An effort the model API does not know would fail every request of the child:
+			//anything but the three known values leaves the child on its default.
+			effort = std.string(args.effort ?? "").strip().lowercase();
+			if(effort == "low" || effort == "medium" || effort == "high")
+				executor.set_reasoning_effort(effort);
 		
 			parent_id = "";
 			if(agt.env.active_task ?? false)
@@ -442,8 +967,6 @@ add_tools(agt)
 				];
 			}
 			
-			std.print("\n\n---NEW TASK---\n");
-			
 			prompt = agent_prompt.replace([
 				"[GOAL]" = args.goal,
 				"[CONTEXT]" = args.context,
@@ -452,31 +975,39 @@ add_tools(agt)
 				"[HIERACHY]" = hierarchy,
 			]);
 
-			try {
-			step_result = executor.task(prompt);
-		}
-		catch(e) {
+			crash = "";
 
-		}
-		
-		//The child's finalize() result is the task report now.
-		if(std.is_json(executor.task_result)) {
-			task.finished = true;
-			task.finish_reason = std.string(executor.task_result.signal ?? "failed");
-			task.report = std.string(executor.task_result.result ?? "");
-		}
-		
-		//Stopped while the child ran: the child goes down with its own tree and
-		//the parent gets a stop, not a report to continue from.
-		if(agt.should_stop()) {
-			executor.stop();
-			return [
-				task_id = task.id,
-				stopped = true,
-				finish_reason = task.finish_reason,
-				report = "The agent was stopped while this task was running.\nDo not continue, end the turn with finalize().",
-			];
-		}
+			try {
+				step_result = executor.task(prompt);
+			}
+			catch(e) {
+				crash = std.string(e);
+			}
+			
+			//The child's finalize() result is the task report now.
+			if(std.is_json(executor.task_result)) {
+				task.finished = true;
+				task.finish_reason = std.string(executor.task_result.signal ?? "failed");
+				task.report = std.string(executor.task_result.result ?? "");
+			}
+			else if(crash) {
+				//The run threw: the parent gets the reason, not just "no report".
+				task.finished = true;
+				task.finish_reason = "failed";
+				task.report = task_crash_report(crash);
+			}
+			
+			//Stopped while the child ran: the child goes down with its own tree and
+			//the parent gets a stop, not a report to continue from.
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped while this task was running.\nDo not continue, end the turn with finalize().",
+				];
+			}
 			
 			if(!task.report) {
 				return [
@@ -519,7 +1050,16 @@ add_tools(agt)
 			}
 		
 			if(!task) {
-				return "No task with the specified ID was found, cannot continue non existing task.";
+				known = [];
+				for(i = 0; i < tasks.size(); i++)
+					known.push_back(tasks[i].id + " (" + std.string(tasks[i].name) + ")");
+
+				return [
+					ok = false,
+					error = "No task with the id '" + std.string(args.task_id) + "' exists: nothing was continued.",
+					known_tasks = known,
+					hint = known.size() ? "Use a task_id of a task you started (start_task, file_task_batch and write_blind_tests return it)." : "You have not started any task yet: use start_task.",
+				];
 			}
 			
 			//A stop is checked before any task state is touched: a stopped agent
@@ -559,6 +1099,18 @@ add_tools(agt)
 				"[CONSTRAINTS]" = task.constraints,
 				"[HIERACHY]" = hierarchy,
 			]);
+
+			//A blind test writer gets the feedback with its rules and its task again: the
+			//continued turn may start on a cleared or compacted context (miniagent.task()
+			//clears a chat that is over half full), and "judge it against the specification"
+			//without the specification is a guess. It answers in the fields of its report.
+			is_blind = std.string(task.kind ?? "") == "blind_tests";
+
+			if(is_blind)
+				prompt = blind_feedback_prompt.replace([
+					"[RESPONSE]" = std.string(args.response ?? ""),
+					"[BRIEF]" = std.string(task.blind_brief ?? "").strip(),
+				]);
 			
 			managed _grd = agent_slot(executor, agt);
 			
@@ -572,30 +1124,41 @@ add_tools(agt)
 				];
 			}
 			
+			crash = "";
+
 			try {
-			step_result = executor.task(prompt);
-		}
-		catch(e) {
-			//Todo: add fail counter
-		}
-		
-		//The child's finalize() result is the task report now.
-		if(std.is_json(executor.task_result)) {
-			task.finished = true;
-			task.finish_reason = std.string(executor.task_result.signal ?? "failed");
-			task.report = std.string(executor.task_result.result ?? "");
-		}
-		
-		//Stopped while the child ran: the child goes down with its own tree.
-		if(agt.should_stop()) {
-			executor.stop();
-			return [
-				task_id = task.id,
-				stopped = true,
-				finish_reason = task.finish_reason,
-				report = "The agent was stopped while this task was running.\nDo not continue, end the turn with finalize().",
-			];
-		}
+				step_result = executor.task(prompt);
+			}
+			catch(e) {
+				//Todo: add fail counter
+				crash = std.string(e);
+			}
+			
+			//The child's finalize() result is the task report now.
+			if(std.is_json(executor.task_result)) {
+				task.finished = true;
+				task.finish_reason = std.string(executor.task_result.signal ?? "failed");
+				task.report = std.string(executor.task_result.result ?? "");
+			}
+			else if(crash) {
+				task.finished = true;
+				task.finish_reason = "failed";
+				task.report = task_crash_report(crash);
+			}
+			
+			//Stopped while the child ran: the child goes down with its own tree.
+			if(agt.should_stop()) {
+				executor.stop();
+				return [
+					task_id = task.id,
+					stopped = true,
+					finish_reason = task.finish_reason,
+					report = "The agent was stopped while this task was running.\nDo not continue, end the turn with finalize().",
+				];
+			}
+
+			if(is_blind)
+				return blind_tests_result(task, executor, crash);
 			
 			if(!task.report) {
 				return [
@@ -631,6 +1194,13 @@ add_tools(agt)
 				env.tasks = [];
 
 			tasks = env.tasks;
+
+			// A selector glob() does not take (absolute, "..", outside the working directory) is
+			// ignored there, and the batch came back as "matched no files": say what is wrong with it.
+			target_check = agt_path_check(agt, args.target, "read", "target");
+			if(!target_check.ok)
+				return target_check;
+
 			// ── Target resolution: exactly once, fixed snapshot for this batch ──
 			items = fileio.glob(args.target);
 
@@ -673,8 +1243,6 @@ add_tools(agt)
 			// Batch children use their own slot counter so that the internal
 			// helper subagents of a child can still use the model_config slots.
 			max_parallel = batch_max_parallel(agt);
-
-			std.print("\n\n---NEW BATCH--- ", batch_id, " (", children.size(), " items, max parallel: ", max_parallel, ")\n");
 
 			next_item = 0;
 			batch_running = 0;
@@ -795,6 +1363,25 @@ add_tools(agt)
 			}
 
 			return result;
+		}
+	);
+
+	agt.add_tool(
+		"write_blind_tests",
+		"Have the tests for your implementation written by a test writer that cannot see it: it gets 'spec' and 'api' only, its file tools reach 'test_path' (read and write) and 'reference_paths' (read) and nothing else, and it has no command tools.\nReturns the test files, the test cases with the behaviour each one checks, and the ambiguities it found in the specification. Then run the tests and fix the IMPLEMENTATION, not the tests; a test you believe is wrong goes back with continue_task(task_id, <which test and why>).\nBlocks until the test writer is done.",
+		[
+			spec = "&string(): The behaviour to test, complete and self-contained: what every operation does for valid input, at the boundaries, for invalid input and on errors. The task's demands, not a description of your code.",
+			api = "&string(): Signatures / interface exactly as the tests call it: names, parameters, results, errors, how to import or include the unit. No bodies.",
+			test_path = "&string(): File or directory (relative) the tests are written to. The test writer can read everything in it: where tests live next to the code, give the test file, not the directory.",
+			framework = "string(): OPTIONAL test framework and conventions: language, runner, file naming.",
+			reference_paths = "uarray(string): OPTIONAL files / directories the test writer may READ: public headers, interface docs, test helpers. Never the implementation.",
+			run_command = "string(): OPTIONAL command that runs the tests; the test writer may then run exactly this command. Leave it out to keep it blind: tests that run can print, copy or change your code, so with it the blindness rests on the test writer following its rules. Without it you run the tests yourself and send what failed with continue_task.",
+			run_timeout = "int(1): OPTIONAL seconds one run of run_command may take (default 600).",
+			constraints = "string(): OPTIONAL restrictions: what not to test, allowed dependencies.",
+		],
+		[](agt, args)
+		{
+			return blind_tests_start(agt, args);
 		}
 	);
 

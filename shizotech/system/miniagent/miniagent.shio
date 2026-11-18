@@ -16,6 +16,160 @@ stdbcol(col) {
 
 def create_miniagent(cfg, system_role);
 
+// ── helpers of miniagent.add_tool() (the bridge around every tool call) ──────
+
+// A tool result larger than this never reaches the model or the UI in full: the
+// tools bound their own results (roles/SHARED.shio), this is the backstop for the
+// ones that do not (skills, MCP tools, a report of a child).
+TOOL_RESULT_MAX_BYTES = 200000;
+
+// The required parameters of a tool (params: the spec given to add_tool) that a call left out.
+miniagent_missing_params(params, args)
+{
+	var missing = [];
+
+	if(!std.is_json(params))
+		return missing;
+
+	for(var i = 0; i < params.size(); i++) {
+		var name = params.key(i);
+		var spec = params[i];
+
+		// Only "&type(): ..." is named: the schema also marks an enum list as required, but the
+		// tools give those a default ("false", "end", "auto"), so a call without one is valid and
+		// an unrelated exception must not be blamed on it.
+		var required = std.is_string(spec) && spec.starts("&");
+
+		if(!required)
+			continue;
+
+		if(!std.is_json(args) || !args.has(name) || std.is_none(args[name]))
+			missing.push_back(name);
+	}
+
+	return missing;
+}
+
+// What the model (and the UI, through tool_end.result) gets when a tool threw:
+// the tool, the reason, and the parameters the call left out.
+miniagent_tool_exception(name, error, params, args)
+{
+	var reason = std.is_none(error) ? "" : std.string(error).strip();
+
+	if(!reason)
+		reason = "unknown error";
+
+	if(reason.size() > 2000)
+		reason = reason.substr(0, agt_utf8_floor(reason, 2000)) + "...";
+
+	var result = [
+		ok = false,
+		tool = name,
+		error = "The tool '" + name + "' failed with an exception: " + reason,
+	];
+
+	var missing = miniagent_missing_params(params, args);
+
+	if(missing.size()) {
+		result.missing_parameters = missing;
+		result.hint = "The call left out required parameters: " + missing.combine_string(", ").removesuffix(", ") + ". Call '" + name + "' again with all of them.";
+	}
+	else {
+		result.hint = "Check the arguments (names, types, values) and call the tool again. If the same call fails again, the fault is in the tool or its environment, not in the arguments: do not repeat it, work around it and name it in your report.";
+	}
+
+	return result;
+}
+
+// A copy of a JSON value whose long strings are cut to `limit` bytes each (head and tail,
+// with a note in between). Its structure and its short fields (ids, states, counts) stay.
+miniagent_shrink_strings(value, limit, what)
+{
+	if(std.is_string(value)) {
+		if(value.size() <= limit)
+			return value;
+
+		return agt_clip_middle(value, limit, what).out;
+	}
+
+	if(!std.is_json(value))
+		return value;
+
+	if(std.is_list(value)) {
+		var list = [];
+
+		for(var i = 0; i < value.size(); i++) {
+			list.push_back(miniagent_shrink_strings(value[i], limit, what));
+		}
+
+		return list;
+	}
+
+	var map = std.json();
+
+	for(var k = 0; k < value.size(); k++) {
+		map[value.key(k)] = miniagent_shrink_strings(value[k], limit, what);
+	}
+
+	return map;
+}
+
+// A result that is still too large is cut. A structured result (the reports of a batch,
+// a list of findings) keeps every entry with its short fields and loses the middle of its
+// long texts: an entry that vanished with its task id could not be continued. Only what is
+// still too large after that, and a plain text, is replaced by its head and its tail.
+miniagent_tool_cap(name, result)
+{
+	if(std.is_none(result))
+		return result;
+
+	var text = std.string(result);
+
+	if(text.size() <= TOOL_RESULT_MAX_BYTES)
+		return result;
+
+	if(std.is_json(result)) {
+		var limit = 16000;
+
+		for(limit >= 250) {
+			var smaller = miniagent_shrink_strings(result, limit, "this text of the result of " + name);
+
+			if(std.string(smaller).size() <= TOOL_RESULT_MAX_BYTES) {
+				if(!std.is_list(smaller) && !smaller.has("result_note"))
+					smaller.result_note = "The result of '" + name + "' had " + std.string(text.size()) + " bytes, too large to return in full: every entry is here, texts longer than " + std.string(limit) + " bytes were cut in the middle (marked where).";
+
+				return smaller;
+			}
+
+			limit = limit / 2;
+		}
+	}
+
+	var clipped = agt_clip_middle(text, TOOL_RESULT_MAX_BYTES, "result of " + name);
+
+	// no "ok" here: the tool ran, only its answer is cut (it is not known whether it succeeded)
+	return [
+		truncated = true,
+		warning = "The tool '" + name + "' ran, but its result has " + std.string(clipped.total_bytes) + " bytes, too large to return: its head and its tail follow, " + std.string(clipped.dropped_bytes) + " bytes in between were dropped.",
+		hint = "Do not repeat the same call. Ask for less (a smaller range, a filter), or let the tool write to a file and read that file in parts.",
+		result_head_and_tail = clipped.out,
+	];
+}
+
+// A failing event sink (the UI, a log) must not fail the tool call it reports.
+miniagent_tool_event(agt, action)
+{
+	if(agt.internal_run || !agt.on_action)
+		return;
+
+	try {
+		agt.on_action(action);
+	}
+	catch(e) {
+		std.error("[miniagent] on_action failed for a tool event: ", e);
+	}
+}
+
 class miniagent
 {	
 	//ModelConfig class
@@ -505,6 +659,14 @@ class miniagent
 		}
 		return "";
 	}
+	
+	//Convenience function
+	send_prompt(prompt) {
+		if(running)
+			task_update(prompt);
+		else
+			task(prompt);
+	}
 
 	//Stop this agent and, top-down, the whole agent tree below it.
 	//Every child created through subagent()/simple_agent() is registered in
@@ -684,43 +846,41 @@ class miniagent
 		callback,
 	)
 	{
-		//Bridge
-		llm_api.add_tool(name, description, params, [this, callback, name](agt, p) {
-			
-			toolid = std.random_hash();
-			
-			if(!this.internal_run && this.on_action) {
-				this.on_action([
-					tool_start=[
-						id=toolid,
-						args=p,
-						name=name,
-					]
-				]);		
-			}
-			
-			res = None;
-			
+		//Bridge: tool_start / tool_end around the call. An exception of the tool
+		//reaches the model and the UI with its reason and the name of the tool
+		//([ok = false, tool, error, hint]); it used to be swallowed into
+		//"The tool call caused an unexpected exception.", which told nobody what to fix.
+		llm_api.add_tool(name, description, params, [this, callback, name, params](agt, p) {
+
+			var toolid = std.random_hash();
+
+			miniagent_tool_event(this, [
+				tool_start=[
+					id=toolid,
+					args=p,
+					name=name,
+				]
+			]);
+
+			var res = None;
+
 			try {
 				res = callback(this, p);
 			}
-			catch(e) {	
-				res = [
-					ok = false,
-					error = "The tool call caused an unexpected exception.",
-				];
+			catch(e) {
+				res = miniagent_tool_exception(name, e, params, p);
 			}
-			
-			if(!this.internal_run && this.on_action) {
-				this.on_action([
-					tool_end=[
-						id=toolid,
-						result=res,
-						name=name,
-					]
-				]);		
-			}
-			
+
+			res = miniagent_tool_cap(name, res);
+
+			miniagent_tool_event(this, [
+				tool_end=[
+					id=toolid,
+					result=res,
+					name=name,
+				]
+			]);
+
 			return res;
 		});
 		

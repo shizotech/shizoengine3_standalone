@@ -1,0 +1,210 @@
+//The LEDs of the LEDMappers on the stage (#980): a group of a LEDMapper with a place on the stage (place3d of its group,
+//engine/patch/ledmap.shio) is a plane in the world of the stage. Its LEDs stand where they are on the picture: the middle
+//of the group's LEDs at the place, the picture standing upright facing the audience (its x to the right, its top up)
+//unless the place turns it, width metres for the width of the picture. The 3D views draw them as glowing points in the
+//colours the LEDMapper sends (stage3d_scene.sync_leds). A segment with a 3D path (path3d, an edge of a model) puts its
+//LEDs along that path instead, in the frame of the object the group hangs on. No UI; tested in _testing/stage_leds.shio.
+//
+//The registry is on the engine (a LEDMapper is an asset module of its own):
+//  holder.stage_leds          = [id (the registry id of the LEDMapper's AIInterface) -> [name, aspect (width / height
+//                               of its picture), shader (its LED shader: pixel_buffer() holds R, G, B per LED in the
+//                               order they are sent), groups = ledmap_stage_groups()]]
+//  holder.stage_leds_revision = goes up when one publishes or goes
+//
+//Needs engine/stage/stage.shio included before it.
+
+def stage_leds_remove(holder, id);
+
+//A LEDMapper tells which of its groups are on the stage (none: it goes from the registry)
+stage_leds_publish(holder, id, name, aspect, shader, groups) {
+	if(!groups.size()) {
+		stage_leds_remove(holder, id);
+		return;
+	}
+	holder.stage_leds[id] = [name = name, aspect = aspect > 0.0 ? aspect : 1.0, shader = shader, groups = groups];
+	holder.stage_leds_revision = holder.stage_leds_revision + 1;
+}
+
+stage_leds_remove(holder, id) {
+	if(!holder.stage_leds.has(id))
+		return;
+	holder.stage_leds.erase(id);
+	holder.stage_leds_revision = holder.stage_leds_revision + 1;
+}
+
+//The middle of a group's LEDs on the picture (u, v)
+stage_leds_center(leds) {
+	lo_u = 1e9;
+	lo_v = 1e9;
+	hi_u = -1e9;
+	hi_v = -1e9;
+	for(i = 0; i + 1 < leds.size(); i += 2) {
+		lo_u = math.min(lo_u, leds[i]);
+		hi_u = math.max(hi_u, leds[i]);
+		lo_v = math.min(lo_v, leds[i + 1]);
+		hi_v = math.max(hi_v, leds[i + 1]);
+	}
+	if(lo_u > hi_u)
+		return [u = 0.5, v = 0.5, w = 0.0, h = 0.0];
+	return [u = (lo_u + hi_u) / 2.0, v = (lo_v + hi_v) / 2.0, w = hi_u - lo_u, h = hi_v - lo_v];
+}
+
+//The frame of a group's place in the world: its own (moved, turned) in the frame of the object it hangs on
+stage_leds_matrix(s, place) {
+	o = [x = place.x, y = place.y, z = place.z, rx = place.rx, ry = place.ry, rz = place.rz, scale = 1.0];
+	m = stage_local_matrix(o);
+	q = place.hangs_on && s ? stage_find(s, place.hangs_on) : None;
+	if(q)
+		m = stage_mat_mul(stage_world_matrix(s, q), m);
+	return m;
+}
+
+//The LEDs of a group in the world: x, y, z, ... in the order they are sent
+stage_leds_points(s, group, aspect) {
+	c = stage_leds_center(group.leds);
+	w = math.max(0.001, std.float(group.place.width));
+	h = w / math.max(0.01, aspect);
+	m = stage_leds_matrix(s, group.place);
+	out = [];
+	leds = group.leds;
+	for(i = 0; i + 1 < leds.size(); i += 2) {
+		x = (leds[i] - c.u) * w;
+		z = (c.v - leds[i + 1]) * h;
+		out.push_back(m[0] * x + m[2] * z + m[3]);
+		out.push_back(m[4] * x + m[6] * z + m[7]);
+		out.push_back(m[8] * x + m[10] * z + m[11]);
+	}
+	//#980: segments along a 3D path (an edge of a model): their LEDs evenly along it, in the frame of the object the
+	//group hangs on (the world without one)
+	paths = group.paths ?? [];
+	if(paths.size()) {
+		q = group.place.hangs_on && s ? stage_find(s, group.place.hangs_on) : None;
+		f = q ? stage_world_matrix(s, q) : [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+		for(p : paths) {
+			pts = p.points;
+			n = pts.size();
+			closed = n >= 6 && math.abs(pts[0] - pts[n - 3]) < 1e-6 && math.abs(pts[1] - pts[n - 2]) < 1e-6 && math.abs(pts[2] - pts[n - 1]) < 1e-6;
+			total = stage_path_length(pts);
+			for(i = 0; i < p.count; i++) {
+				k = p.first + i;
+				if(k * 3 + 2 >= out.size())
+					break;
+				//(a ring: n LEDs n gaps apart; an open path: from end to end, half a gap in at each end)
+				t = closed ? (i + 0.5) / p.count : (p.count == 1 ? 0.5 : (i + 0.5) / p.count);
+				if(p.reversed)
+					t = 1.0 - t;
+				a = stage_path_point(pts, t, total);
+				out[k * 3] = f[0] * a.x + f[1] * a.y + f[2] * a.z + f[3];
+				out[k * 3 + 1] = f[4] * a.x + f[5] * a.y + f[6] * a.z + f[7];
+				out[k * 3 + 2] = f[8] * a.x + f[9] * a.y + f[10] * a.z + f[11];
+			}
+		}
+	}
+	return out;
+}
+
+//How big a group is on the stage: [width, height] in metres
+stage_leds_extent(group, aspect) {
+	c = stage_leds_center(group.leds);
+	w = math.max(0.001, std.float(group.place.width));
+	return [width = c.w * w, height = c.h * w / math.max(0.01, aspect)];
+}
+
+// =========================================================================
+// Colours from the place on the stage (#980): projection and the 3D effect of a LEDMapper
+// =========================================================================
+
+//The two axes of the world a projection takes ([u axis, v axis, v grows downwards]): front x / z (z up: the picture's
+//top up), above x / y (y towards the audience: the picture's bottom, as on the plan), side y / z
+stage_leds_axes(mode) {
+	if(mode == "top")
+		return [u = "x", v = "y", flip = false];
+	if(mode == "side")
+		return [u = "y", v = "z", flip = true];
+	return [u = "x", v = "z", flip = true];
+}
+
+//The colours of the placed groups of one LEDMapper (groups: ledmap_stage_groups(), aspect: of its picture), for its LED
+//shader:
+//  coords   = led index -> [u, v]: where a projected LED takes its colour on the picture (0..1, v down)
+//  pos      = x, y, z, mode per LED (total LEDs; mode 1: the 3D effect, 0: the picture), for the texture led_pos
+//  fx_lo, fx_hi = the box of the LEDs of the 3D effect (the effect runs over it)
+//A projection lays the picture over all the LEDs projected that way, keeping its proportions, centred
+stage_leds_colors(s, groups, aspect, total) {
+	pos = [];
+	for(i = 0; i < total * 4; i++)
+		pos.push_back(0.0);
+	coords = std.json();
+	lo = [x = 1e9, y = 1e9, z = 1e9];
+	hi = [x = -1e9, y = -1e9, z = -1e9];
+	by_mode = std.json(); //projection mode -> [[led index, x, y, z], ...]
+	for(g : groups) {
+		pts = stage_leds_points(s, g, aspect);
+		mode = g.color_source ?? "picture";
+		for(i = 0; i < g.count && i * 3 + 2 < pts.size(); i++) {
+			k = g.offset + i;
+			if(k >= total)
+				break;
+			p = [x = pts[i * 3], y = pts[i * 3 + 1], z = pts[i * 3 + 2]];
+			pos[k * 4] = p.x;
+			pos[k * 4 + 1] = p.y;
+			pos[k * 4 + 2] = p.z;
+			if(mode == "effect") {
+				pos[k * 4 + 3] = 1.0;
+				lo = [x = math.min(lo.x, p.x), y = math.min(lo.y, p.y), z = math.min(lo.z, p.z)];
+				hi = [x = math.max(hi.x, p.x), y = math.max(hi.y, p.y), z = math.max(hi.z, p.z)];
+			}
+			else if(mode == "front" || mode == "top" || mode == "side") {
+				if(!by_mode.has(mode))
+					by_mode[mode] = [];
+				by_mode[mode].push_back([k = k, p = p]);
+			}
+		}
+	}
+	for(m = 0; m < by_mode.size(); m++) {
+		ax = stage_leds_axes(by_mode.key(m));
+		list = by_mode[m];
+		u0 = 1e9;
+		u1 = -1e9;
+		v0 = 1e9;
+		v1 = -1e9;
+		for(e : list) {
+			u0 = math.min(u0, e.p[ax.u]);
+			u1 = math.max(u1, e.p[ax.u]);
+			v0 = math.min(v0, e.p[ax.v]);
+			v1 = math.max(v1, e.p[ax.v]);
+		}
+		//metres per picture width: the box fits, the picture keeps its proportions
+		w = math.max(u1 - u0, (v1 - v0) * aspect);
+		w = math.max(w, 0.001);
+		h = w / aspect;
+		cu = (u0 + u1) / 2.0;
+		cv = (v0 + v1) / 2.0;
+		for(e : list) {
+			u = 0.5 + (e.p[ax.u] - cu) / w;
+			v = 0.5 + (e.p[ax.v] - cv) / h;
+			coords[std.string(e.k)] = [u = u, v = ax.flip ? 1.0 - v : v];
+		}
+	}
+	if(lo.x > hi.x) {
+		lo = [x = 0.0, y = 0.0, z = 0.0];
+		hi = [x = 1.0, y = 1.0, z = 1.0];
+	}
+	return [coords = coords, pos = pos, fx_lo = lo, fx_hi = hi];
+}
+
+//The LEDMappers that take a strip along an edge (#980: their AIInterface has add_path_segment), in holder.ai_interfaces:
+//[[iface, name], ...]
+stage_leds_mappers(holder) {
+	out = [];
+	ifaces = holder.ai_interfaces;
+	for(i = 0; i < ifaces.size(); i++) {
+		f = ifaces[i];
+		try {
+			if(f.has_query("add_path_segment"))
+				out.push_back([iface = f, name = "LEDMapper " + (out.size() + 1)]);
+		}
+		catch(e) {}
+	}
+	return out;
+}

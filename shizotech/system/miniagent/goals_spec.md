@@ -25,7 +25,7 @@ GoalScheduler.tick()  ── windows, misfires, retries, stop policy, limits ─
 | `goal_tools.shio` | the agent operations: `get_goals`, `create_goal`, `update_goal`, `set_goal_status`, `run_goal_now` |
 | `goals.shio` | the CLI: `shz miniagent.goals ...` |
 | `agentspace_template/` | what `goals init` creates; a goal already in another status folder is not recreated as a proposed duplicate |
-| `goals_selftest.shio` | 192 checks, fake host + fake clock, no LLM |
+| `goals_selftest.shio` | 231 checks, fake host + fake clock, no LLM |
 
 ## The tree
 
@@ -107,7 +107,8 @@ a warning, not an error — **including keys inside `schedule:` / `policy:`**, s
 
 Every change is parsed and validated before it applies. An invalid edit is reported **once**
 (console, node notification → routers → Telegram) with the file and line, and the **last valid
-revision stays active**. `shz miniagent.goals validate` runs the same checks.
+revision stays active** — also after a restart (the ledger keeps its text).
+`shz miniagent.goals validate` runs the same checks.
 
 ### Revisions and edits
 
@@ -141,7 +142,8 @@ Daylight saving time:
 
 - a start inside the spring gap moves forward (02:30 → 03:30 CEST), it is never skipped;
 - a start inside the autumn overlap takes the first occurrence, it never runs twice;
-- a 22:00-06:00 window is 9 h on the fall-back night and 7 h on the spring-forward night.
+- a 22:00-06:00 window is 9 h on the fall-back night and 7 h on the spring-forward night;
+- a window inside the spring gap keeps its length (02:00-03:00 → 03:00-04:00 CEST).
 
 Time zones are POSIX rules: the system zoneinfo file's footer (Linux, macOS), else the built-in
 table in `goal_time.shio` (Windows), or a POSIX string given directly
@@ -153,7 +155,10 @@ scheduling a few weeks ahead needs.
 `GoalScheduler(space_or_path, host = None, opts = None)` is bound to one
 workspace's `.agentspace`; `opts` may contain `workspace_id`, `tick_ms` and `notify`.
 It exposes `root` and `workspace_id`. `start()` runs `tick()` every 15 s on its own
-thread, and `update()` is a synchronous alias for one `tick()`.
+thread, and `update()` is a synchronous alias for one `tick()`. Two things do not wait for
+the tick: a run requested in the scheduler's own process (`request_run`: "Run now" of the web
+interface, a tool of an agent) and the end of one of its runs (the finished listener) wake
+the loop, so a manual task starts and is settled within a moment, not within 15 s.
 
 1. **Rescan** the tree (definitions, status folders, preferences).
 2. **Settle runs**: terminal task events (`Workspace.add_task_finished_listener`) are
@@ -164,6 +169,8 @@ thread, and `update()` is a synchronous alias for one `tick()`.
    notifications. `finished` → success (and a verification run if `verify`);
    `question` → the window is `blocked` and the owner is asked; `failed` / `lost` → retry after
    `retry_backoff` while `max_attempts` allows; a stop the scheduler asked for is no failure.
+   Another run of a blocked / failed window (`max_parallel_workers` > 1) is still settled,
+   follows the stop policy and counts as background work.
    A running task with no agent action for `stall_timeout` (`Workspace` task `last_update_ms`)
    is stopped and counts as a failed attempt — a deterministic watchdog, no LLM check.
 3. **Window end**: no new runs; open runs follow the stop policy — `drain` lets them finish,
@@ -173,18 +180,26 @@ thread, and `update()` is a synchronous alias for one `tick()`.
 4. **Activate** due windows exactly once — the key is `goal id @ window start (UTC)`, stored
    before anything is dispatched, so restarts and repeated ticks never duplicate a window.
    A window that started while the scheduler was down follows `misfire`: `run_if_open` (start
-   late while it is still open), `skip` (record it as skipped), `catch_up` (missed windows run
-   once, now, for the original length). A window that ended unseen is recorded as `missed` and
-   reported. Windows before the goal became active are never "missed".
+   late while it is still open), `skip` (record it as skipped), `catch_up` (the latest missed
+   window runs once, now, for the original length; older ones are only recorded). A window that
+   ended unseen is recorded as `missed` and reported. Windows before the goal became active,
+   or before its schedule last changed (an edit of the times, a named window or the time zone
+   in the preferences), are never "missed". The ledger keeps 300 closed windows, and always
+   those the scheduler still looks back at (8 days; two intervals for a sub-day `every`).
 5. **Dispatch** runs within the limits: `max_background_tasks` (node), free workspace task
-   capacity minus `reserve_interactive_workers`, no new run within `yield_after_interactive` of
-   the owner's last request (`Workspace.background_capacity()`), per goal
-   `max_parallel_workers`. A run is
+capacity minus `reserve_interactive_workers`, no new run within `yield_after_interactive` of
+    the owner's last request (`Workspace.background_capacity()`; a manual run, `goals run` /
+    "Run now", is such a request itself and does not wait for it), per goal
+    `max_parallel_workers` (over all its windows: a manual run or a catch-up waits for the run
+    that is working). `Workspace.background_capacity()` reports the idle seconds since the
+    last interactive session prompt; a goal dispatch itself is created with `interactive=false`
+    and does not reset that idle time. A run is
    written to the ledger before `add_task` (outbox): after a crash it is found and settled as
    `interrupted`, then retried while its window is open. A dispatch the host **refuses** (no
    taskid) is a failed attempt: `dispatch_failed` in the ledger **and** a notification to the
-   owner naming the goal, the run and the time of the next attempt — the owner does not have to
-   wait for `max_attempts` to run out to learn that nothing can start on this node.
+   owner naming the goal, the run and the time of the next attempt (or that none is left) — the
+   owner does not have to wait for `max_attempts` to run out to learn that nothing can start
+   on this node.
 
 After every tick that changed something, `state/overview.md` is rewritten: every goal with
 its schedule, current or next window, last outcome and file (generated, never read back).
@@ -219,9 +234,9 @@ structured calls; code validates them.
 
 | Tool | Does |
 |---|---|
-| `get_goals()` | local time, time zone, named windows, defaults, precedence rules, the goals |
-| `create_goal(title, instructions, schedule_type, date?, days?, every?, window?, start?, end?, duration?, timezone?, ..., activate?)` | validated create; refuses the same id and near duplicates (`allow_duplicate=yes` overrides); `activate` missing → `proposed`; goals that allow merge/release/deploy/delete stay `proposed` |
-| `update_goal(id, revision, ...)` | changes only the given fields; refuses a stale revision |
+| `get_goals()` | local time, time zone, named windows, defaults, precedence rules, the goals (read from the files and the ledger when the scheduler object never ticks: a workspace worker) |
+| `create_goal(title, instructions, schedule_type, date?, days?, every?, window?, start?, end?, duration?, timezone?, ..., activate?)` | validated create; refuses the same id and near duplicates (`allow_duplicate=yes` overrides); `activate` missing → `active` (creating activates; `activate=no` keeps it `proposed`); goals that allow merge/release/deploy/delete stay `proposed` |
+| `update_goal(id, revision, ...)` | changes only the given fields; refuses a stale revision; a given field replaces the stored one it excludes (`start` ↔ `window`, `end` ↔ `duration`, `days` ↔ `every`, a sub-day `every` → window and times) |
 | `set_goal_status(id, status)` | the folder move |
 | `run_goal_now(id)` | queues a run (the tick thread starts it) |
 

@@ -1,0 +1,603 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  shared_tools_test.shio — the default tools of roles/SHARED.shio and the
+//  add_tool() bridge of miniagent.shio: errors the model can act on, bounded
+//  results, the path jail
+//
+//  Usage:  shz tests/shared_tools_test.shio     (from system/miniagent, no LLM)
+//
+//  The real tool callbacks of a real agent, bound to a temp folder below
+//  std.user_path() (removed at the end, nothing is written into the checkout).
+//
+//  Covered:
+//    * an exception inside a tool reaches the tool result (and tool_end) with its
+//      text and the tool name; a failing event sink does not fail the tool call;
+//      an over-large result is cut by the bridge
+//    * the path jail: "..", absolute, Windows and "~" paths, a link that leads out
+//    * read_file: line cap, byte cap, long single lines, binary files, ranges
+//    * list_dir: caps for plain and recursive listings, .git, missing paths
+//    * file_info / file_line_count on missing files
+//    * write_file, append_text, replace_string (diagnostics), mkdir, move, copy,
+//      rename, remove: what failed and why
+//    * finalize: unknown signals and empty reports do not end the turn
+//    * no std.print / std.cout in roles/SHARED.shio (the worker protocol is stdout)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+section(title) {
+	std.print("\n== ", title, " ==");
+}
+
+call(agt, name, args) {
+	return agt.llm_api.tools.tool_callbacks[name](args);
+}
+
+// a failure the model can act on: ok = false and an error that names the cause
+failed_with(res, text) {
+	return std.is_json(res) && res.has("ok") && !res.ok && std.string(res.error ?? "").contains(text);
+}
+
+short(res) {
+	text = std.string(res);
+	if(text.size() > 400)
+		return text.substr(0, 400) + "...";
+	return text;
+}
+
+std.print("shared_tools_test");
+
+BASE = fileio.absolute_path(std.user_path() + "/miniagent/shared_tools_test_" + std.random_hash(8));
+WORK = BASE + "/work";
+fileio.mkdir(WORK);
+
+put(rel, text) {
+	fileio.write_string(WORK + "/" + rel, text);
+}
+
+get(rel) {
+	return fileio.read_string(WORK + "/" + rel);
+}
+
+managed agent = miniagent(ModelConfig(), "adaptive");
+agent.filesystem = fileio.container(WORK);
+
+events = [];
+agent.on_action = [](action) {
+	events.push_back(action);
+};
+
+// ── 1. the bridge ────────────────────────────────────────────────────────────
+section("add_tool bridge: exceptions, event sink, result cap");
+
+agent.add_tool(
+	"boom",
+	"throws",
+	[
+		what = "&string(): anything",
+		mode = ["a", "b"],
+		extra = "string(): OPTIONAL",
+	],
+	[](agt, args) {
+		if(args.what == "ok")
+			return [ok = true, value = 7];
+		std.runtime_error("the flux capacitor is empty");
+		return "unreachable";
+	}
+);
+
+events = [];
+r = call(agent, "boom", [what = "x", mode = "a"]);
+check("an exception becomes [ok = false, error]", std.is_json(r) && r.has("ok") && !r.ok, short(r));
+check("the error carries the exception text", std.string(r.error).contains("the flux capacitor is empty"), short(r));
+check("the error names the tool", std.string(r.error).contains("boom") && r.tool == "boom", short(r));
+check("there is a hint", std.string(r.hint ?? "").size() > 10, short(r));
+check("no missing parameter is claimed when none is missing", !r.has("missing_parameters"), short(r));
+
+check("tool_start and tool_end are emitted", events.size() == 2 && std.is_json(events[0].tool_start) && std.is_json(events[1].tool_end), std.string(events.size()));
+check("tool_end carries the error text and the tool name",
+	events.size() == 2 && events[1].tool_end.name == "boom" && std.string(events[1].tool_end.result.error).contains("the flux capacitor is empty"), short(events));
+
+r = call(agent, "boom", [extra = "y"]);
+check("missing required parameters are listed", std.is_json(r.missing_parameters) && r.missing_parameters.size() == 1 &&
+	std.string(r.missing_parameters).contains("what") && !std.string(r.missing_parameters).contains("extra"), short(r));
+check("the hint names the missing parameters", std.string(r.hint).contains("what"), short(r));
+
+// an enum parameter has a default in the tools: leaving it out is no reason of a failure
+r = call(agent, "boom", [what = "x"]);
+check("a left-out enum parameter is not blamed for an exception", !r.has("missing_parameters") && std.string(r.error).contains("the flux capacitor is empty") &&
+	std.string(r.hint).contains("do not repeat it"), short(r));
+
+r = call(agent, "boom", [what = "ok", mode = "a"]);
+check("a tool that works is passed through unchanged", r.ok && r.value == 7, short(r));
+
+// a tool that gets no arguments at all answers, it does not throw
+r = call(agent, "read_file", []);
+check("read_file without a path names the parameter", failed_with(r, "Missing 'path'"), short(r));
+
+// a broken event sink
+agent.on_action = [](action) {
+	std.runtime_error("the sink is broken");
+};
+r = call(agent, "boom", [what = "ok", mode = "a"]);
+check("a failing on_action does not fail the tool call", std.is_json(r) && r.ok && r.value == 7, short(r));
+agent.on_action = None;
+
+// an over-large result
+agent.add_tool("flood", "returns far too much", [], [](agt, args) {
+	chunk = "";
+	for(i = 0; i < 100; i++)
+		chunk += "0123456789";
+	big = "HEAD-MARK ";
+	for(i = 0; i < 400; i++)
+		big += chunk;
+	return big + " TAIL-MARK";
+});
+r = call(agent, "flood", []);
+check("an over-large result is cut by the bridge", std.is_json(r) && r.truncated && std.string(r).size() < TOOL_RESULT_MAX_BYTES + 2000, std.string(std.string(r).size()));
+check("head and tail of it are kept", std.string(r.result_head_and_tail).contains("HEAD-MARK") && std.string(r.result_head_and_tail).contains("TAIL-MARK") &&
+	std.string(r.result_head_and_tail).contains("bytes dropped here"), "");
+check("the cut names the tool", std.string(r.warning).contains("flood"), short(r.warning));
+
+// a structured result that is too large keeps every entry (a batch: task ids and states)
+// and loses the middle of its long texts
+agent.add_tool("batch_like", "returns many reports", [], [](agt, args) {
+	line = "";
+	for(i = 0; i < 17; i++)
+		line += "report line with some words in it, number " + std.string(i) + " of the report. 0123456789 0123456789\n";
+	list = [];
+	for(i = 0; i < 150; i++)
+		list.push_back([task_id = "task_" + std.string(i), status = (i == 77) ? "question" : "finished", report = "R" + std.string(i) + " " + line + " END" + std.string(i)]);
+	return [ok = true, results = list];
+});
+r = call(agent, "batch_like", []);
+ids_ok = std.is_json(r) && std.is_json(r.results) && r.results.size() == 150;
+if(ids_ok) {
+	for(i = 0; i < 150; i++) {
+		if(r.results[i].task_id != "task_" + std.string(i))
+			ids_ok = false;
+	}
+}
+check("an over-large structured result keeps every entry with its id and state", ids_ok && r.ok && r.results[77].status == "question", short(r));
+check("... its long texts are cut in the middle and the result says so", std.string(r).size() <= TOOL_RESULT_MAX_BYTES + 400 && r.has("result_note") &&
+	std.string(r.results[3].report).starts("R3 ") && std.string(r.results[3].report).ends("END3") && std.string(r.results[3].report).contains("bytes dropped here"), short(r.results[3]));
+
+// ── 2. the path jail ─────────────────────────────────────────────────────────
+section("paths: nothing outside the working directory");
+
+put("a.txt", "alpha\nbeta");
+fileio.mkdir(WORK + "/sub");
+put("sub/inner.txt", "inner");
+fileio.write_string(BASE + "/outside.txt", "TOP SECRET");
+
+r = call(agent, "read_file", [path = "./a.txt"]);
+check("./x works", r.ok && r.content == "alpha\nbeta", short(r));
+r = call(agent, "read_file", [path = "a.txt"]);
+check("x works", r.ok && r.content == "alpha\nbeta", short(r));
+r = call(agent, "read_file", [path = "sub/../a.txt"]);
+check("a/../x inside the working directory works", r.ok && r.content == "alpha\nbeta", short(r));
+
+r = call(agent, "read_file", [path = "../outside.txt"]);
+check("../x is refused with a clear error", failed_with(r, "outside the working directory") && !std.string(r).contains("TOP SECRET"), short(r));
+r = call(agent, "read_file", [path = "sub/../../outside.txt"]);
+check("a/../../x is refused", failed_with(r, "outside the working directory") && !std.string(r).contains("TOP SECRET"), short(r));
+
+r = call(agent, "read_file", [path = "/etc/hostname"]);
+check("an absolute path is refused", failed_with(r, "Invalid path") && std.string(r.error).contains("absolute"), short(r));
+r = call(agent, "read_file", [path = WORK + "/a.txt"]);
+check("an absolute path inside the working directory gets its relative form", failed_with(r, "absolute") && std.string(r.hint).contains("./a.txt"), short(r));
+r = call(agent, "read_file", [path = "C:\\Users\\me\\secret.txt"]);
+check("a Windows drive path is refused", failed_with(r, "absolute"), short(r));
+r = call(agent, "read_file", [path = "c:/Users/me/secret.txt"]);
+check("a Windows drive path with / is refused", failed_with(r, "absolute"), short(r));
+r = call(agent, "read_file", [path = "\\\\server\\share\\x.txt"]);
+check("a UNC path is refused", failed_with(r, "absolute"), short(r));
+r = call(agent, "read_file", [path = "~/notes.txt"]);
+check("~ is refused", failed_with(r, "'~' is not expanded"), short(r));
+r = call(agent, "read_file", [path = "   "]);
+check("an empty path is refused", failed_with(r, "Missing 'path'"), short(r));
+
+r = call(agent, "write_file", [path = "../escape.txt", content = "x"]);
+check("write_file cannot leave the working directory", failed_with(r, "outside the working directory") && !fileio.exists(BASE + "/escape.txt"), short(r));
+r = call(agent, "append_text", [path = "../escape.txt", insert_at = "end", content = "x"]);
+check("append_text cannot leave the working directory", failed_with(r, "outside the working directory") && !fileio.exists(BASE + "/escape.txt"), short(r));
+r = call(agent, "replace_string", [path = "../outside.txt", target_text = "TOP", replacement_text = "x", replace_all = "false"]);
+check("replace_string cannot leave the working directory", failed_with(r, "outside the working directory") && fileio.read_string(BASE + "/outside.txt") == "TOP SECRET", short(r));
+r = call(agent, "list_dir", [path = "..", recursive = "false"]);
+check("list_dir cannot leave the working directory", failed_with(r, "outside the working directory") && !std.string(r).contains("outside.txt"), short(r));
+r = call(agent, "file_info", [path = "../outside.txt"]);
+check("file_info cannot leave the working directory", failed_with(r, "outside the working directory"), short(r));
+r = call(agent, "file_line_count", [path = "../outside.txt"]);
+check("file_line_count cannot leave the working directory", failed_with(r, "outside the working directory"), short(r));
+r = call(agent, "mkdir", [path = "../made"]);
+check("mkdir cannot leave the working directory", failed_with(r, "outside the working directory") && !fileio.exists(BASE + "/made"), short(r));
+r = call(agent, "move", [source = "a.txt", destination = "../moved.txt"]);
+check("move cannot leave the working directory", failed_with(r, "outside the working directory") && fileio.exists(WORK + "/a.txt") && !fileio.exists(BASE + "/moved.txt"), short(r));
+r = call(agent, "copy", [source = "../outside.txt", destination = "stolen.txt"]);
+check("copy cannot bring in a file from outside", failed_with(r, "outside the working directory") && !fileio.exists(WORK + "/stolen.txt"), short(r));
+r = call(agent, "rename", [source = "a.txt", destination = "/tmp/renamed.txt"]);
+check("rename refuses an absolute destination", failed_with(r, "absolute") && fileio.exists(WORK + "/a.txt"), short(r));
+call(agent, "remove", [path = "../outside.txt"]);
+r = call(agent, "remove", [path = "../outside.txt"]);
+check("remove cannot leave the working directory", failed_with(r, "outside the working directory") && fileio.exists(BASE + "/outside.txt"), short(r));
+
+if(subprocess.platform() != "windows") {
+	// a link inside the working directory that leads out of it
+	call(agent, "command_start", [command = "ln -s ../outside.txt link_out.txt", timeout = -1, cwd = WORK]);
+	if(fileio.exists(WORK + "/link_out.txt")) {
+		r = call(agent, "read_file", [path = "link_out.txt"]);
+		check("a link that leads out is refused", failed_with(r, "outside the working directory") && !std.string(r).contains("TOP SECRET"), short(r));
+		fileio.remove(WORK + "/link_out.txt");
+	}
+	else
+		std.print("  skip  link test (no ln)");
+}
+
+// ── 3. read_file ─────────────────────────────────────────────────────────────
+section("read_file: caps a model can continue from");
+
+text = "";
+for(i = 1; i <= 5000; i++)
+	text += "line " + i + "\n";
+put("long.txt", text);
+
+r = call(agent, "read_file", [path = "long.txt", include_line_numbers = "false"]);
+check("a long file comes back truncated, not as an error", r.ok && r.truncated, short(r));
+check("the line cap holds", r.start_line == 1 && r.end_line == READ_MAX_LINES && r.content.count("\n") == READ_MAX_LINES, std.string(r.end_line));
+check("the total and the next start line are named", r.total_lines == 5000 && r.next_start_line == READ_MAX_LINES + 1 &&
+	std.string(r.hint).contains("start_line = " + std.string(READ_MAX_LINES + 1)), short(r.hint));
+check("the content ends with the last shown line", r.content.ends("line " + std.string(READ_MAX_LINES) + "\n"), "");
+
+r2 = call(agent, "read_file", [path = "long.txt", include_line_numbers = "false", start_line = r.next_start_line]);
+check("reading on continues without a gap", r2.ok && r2.start_line == READ_MAX_LINES + 1 && r2.content.starts("line " + std.string(READ_MAX_LINES + 1) + "\n"), short(r2));
+r3 = call(agent, "read_file", [path = "long.txt", include_line_numbers = "false", start_line = 4001]);
+check("the last part is not marked truncated", r3.ok && !r3.has("truncated") && r3.end_line == 5000 && r3.content.ends("line 5000\n"), short(r3));
+
+r = call(agent, "read_file", [path = "long.txt", include_line_numbers = "true", start_line = 3, end_line = 4]);
+check("a line range with line numbers", r.ok && r.content == "3| line 3\n4| line 4\n" && r.start_line == 3 && r.end_line == 4 && !r.has("truncated"), short(r));
+r = call(agent, "read_file", [path = "long.txt", start_line = 6000]);
+check("a start line beyond the end names the line count", failed_with(r, "beyond the end") && r.total_lines == 5000, short(r));
+r = call(agent, "read_file", [path = "long.txt", start_line = 10, end_line = 5]);
+check("end_line before start_line is an error", failed_with(r, "before start_line"), short(r));
+
+// the byte cap: 1000 lines of 200 bytes
+wide = "";
+pad = "";
+for(i = 0; i < 19; i++)
+	pad += "0123456789";
+for(i = 1; i <= 1000; i++)
+	wide += "row " + i + " " + pad + "\n";
+put("wide.txt", wide);
+
+r = call(agent, "read_file", [path = "wide.txt", include_line_numbers = "false"]);
+check("the byte cap holds", r.ok && r.truncated && r.content.size() <= READ_MAX_BYTES && r.end_line < 1000 && r.end_line > 100,
+	"bytes=" + std.string(r.content.size()) + " end=" + std.string(r.end_line));
+check("a byte-capped read ends on a whole line", r.content.ends(pad + "\n") && r.next_start_line == r.end_line + 1, "");
+r2 = call(agent, "read_file", [path = "wide.txt", include_line_numbers = "false", start_line = r.next_start_line]);
+check("reading on after the byte cap continues without a gap", r2.ok && r2.content.starts("row " + std.string(r.next_start_line) + " "), short(r2));
+
+// one very long line (minified code)
+one = "";
+for(i = 0; i < 1500; i++)
+	one += pad;
+put("minified.js", one);
+r = call(agent, "read_file", [path = "minified.js"]);
+check("a very long single line is cut, not dumped", r.ok && r.long_lines_cut == 1 && r.content.size() < READ_MAX_LINE_BYTES + 200 && r.content.contains("[line cut:"),
+	"bytes=" + std.string(r.content.size()));
+check("the cut says how long the line is", r.content.contains(std.string(one.size()) + " bytes") && r.total_lines == 1, short(r.content.substr(r.content.size() - 80, 80)));
+
+// a long line of two-byte characters: the cut may not split one
+umlauts = "";
+for(i = 0; i < 9000; i++)
+	umlauts += "ä";
+put("umlauts.txt", umlauts + "\nend\n");
+r = call(agent, "read_file", [path = "umlauts.txt"]);
+cut_at = r.content.find(" ...[line cut:");
+check("a cut does not split a UTF-8 character", r.ok && cut_at > 0 && cut_at % 2 == 0 && r.content.substr(0, cut_at).char_length() == cut_at / 2,
+	"cut_at=" + std.string(cut_at));
+
+// binary
+zero = std.buffer();
+zero.push(0);
+put("blob.bin", "PK" + zero.string() + zero.string() + "binary" + zero.string() + "data");
+r = call(agent, "read_file", [path = "blob.bin"]);
+check("a binary file is named as binary, not dumped", failed_with(r, "binary") && r.binary && !r.has("content") && r.size_bytes == 15, short(r));
+r = call(agent, "file_line_count", [path = "blob.bin"]);
+check("file_line_count on a binary file", failed_with(r, "binary"), short(r));
+
+// line endings and the last line
+put("crlf.txt", "one\r\ntwo\r\n");
+r = call(agent, "read_file", [path = "crlf.txt"]);
+check("CRLF is read as line breaks", r.ok && r.content == "one\ntwo\n" && r.total_lines == 2, short(r));
+put("nobreak.txt", "one\ntwo");
+r = call(agent, "read_file", [path = "nobreak.txt"]);
+check("no line break is added to a last line without one", r.ok && r.content == "one\ntwo" && r.total_lines == 2, short(r));
+r = call(agent, "read_file", [path = "crlf.txt", include_line_numbers = "true"]);
+check("a final line break is no extra line", r.ok && r.content == "1| one\n2| two\n", short(r));
+
+put("empty.txt", "");
+r = call(agent, "read_file", [path = "empty.txt"]);
+check("an empty file", r.ok && r.status == "file is empty" && r.total_lines == 0, short(r));
+r = call(agent, "read_file", [path = "nope.txt"]);
+check("a missing file says so", failed_with(r, "does not exist") && std.string(r.hint ?? "").size() > 0, short(r));
+r = call(agent, "read_file", [path = "sub"]);
+check("a directory is not a file", failed_with(r, "is a directory"), short(r));
+
+// a file with the name of a member of the lock table
+put("current", "one\ntwo");
+put("ticketid", "three");
+r = call(agent, "read_file", [path = "./current"]);
+check("a file named 'current' is read (the lock table has a member of that name)", std.is_json(r) && r.ok && r.content == "one\ntwo", short(r));
+r = call(agent, "read_file", [path = "ticketid"]);
+check("a file named 'ticketid' is read", std.is_json(r) && r.ok && r.content == "three", short(r));
+fileio.remove(WORK + "/current");
+fileio.remove(WORK + "/ticketid");
+
+section("file_info / file_line_count");
+
+r = call(agent, "file_line_count", [path = "a.txt"]);
+check("file_line_count of a file", std.int(r) == 2, short(r));
+r = call(agent, "file_line_count", [path = "crlf.txt"]);
+check("file_line_count agrees with read_file", std.int(r) == 2, short(r));
+r = call(agent, "file_line_count", [path = "long.txt"]);
+check("file_line_count of a long file", std.int(r) == 5000, short(r));
+r = call(agent, "file_line_count", [path = "nope.txt"]);
+check("file_line_count of a missing file is an error", failed_with(r, "does not exist"), short(r));
+r = call(agent, "file_line_count", [path = "sub"]);
+check("file_line_count of a directory is an error", failed_with(r, "is a directory"), short(r));
+r = call(agent, "file_line_count", [path = "empty.txt"]);
+check("file_line_count of an empty file", std.is_json(r) && r.ok && r.lines == 0, short(r));
+
+r = call(agent, "file_info", [path = "nope.txt"]);
+check("file_info of a missing file is an error", failed_with(r, "does not exist"), short(r));
+r = call(agent, "file_info", [path = "a.txt"]);
+check("file_info of a file", std.is_json(r) && r.exists == 1 && r.type == "file" && r["path"] == "a.txt" && r["size"] == 10, short(r));
+r = call(agent, "file_info", [path = "sub"]);
+check("file_info of a directory", std.is_json(r) && r.type == "directory", short(r));
+
+// ── 4. list_dir ──────────────────────────────────────────────────────────────
+section("list_dir: caps with totals");
+
+fileio.mkdir(WORK + "/many");
+for(i = 0; i < LIST_MAX_ENTRIES + 50; i++)
+	put("many/f" + std.string(1000 + i) + ".txt", "x");
+
+r = call(agent, "list_dir", [path = "many", recursive = "false"]);
+check("a plain listing is capped", std.is_json(r) && r.truncated && r.files.size() == LIST_MAX_ENTRIES && r.shown_files == LIST_MAX_ENTRIES, short(r.hint));
+check("the totals are there", r.total_files == LIST_MAX_ENTRIES + 50 && r.total_dirs == 0 && r.has_files == "true", std.string(r.total_files));
+check("the listing is sorted, the cut drops the tail", r.files.has("f1000.txt") && !r.files.has("f" + std.string(1000 + LIST_MAX_ENTRIES + 49) + ".txt"), "");
+check("the hint says what to do", std.string(r.hint).contains("subdirectory"), short(r.hint));
+
+fileio.mkdir(WORK + "/tree/a/b");
+fileio.mkdir(WORK + "/tree/c");
+for(i = 0; i < LIST_MAX_ENTRIES_RECURSIVE + 30; i++)
+	put((i % 2 ? "tree/a/b/" : "tree/c/") + "g" + std.string(1000 + i) + ".txt", "xy");
+
+r = call(agent, "list_dir", [path = "tree", recursive = "true"]);
+check("a recursive listing is capped", std.is_json(r) && r.truncated && r.files.size() == LIST_MAX_ENTRIES_RECURSIVE && r.total_files == LIST_MAX_ENTRIES_RECURSIVE + 30,
+	std.string(r.total_files));
+check("its directories are listed", r.total_dirs == 3 && std.string(r.dirs).contains("a/b"), short(r.dirs));
+
+r = call(agent, "list_dir", [path = "sub", recursive = "false"]);
+check("a short listing is not marked truncated", std.is_json(r) && !r.has("truncated") && r.files.has("inner.txt") && r.files["inner.txt"]["size"] == 5, short(r));
+r = call(agent, "list_dir", [path = "", recursive = "false"]);
+check("an empty path lists the working directory", std.is_json(r) && r.files.has("a.txt") && std.string(r.dirs).contains("sub"), short(r));
+
+fileio.mkdir(WORK + "/repo/.git/objects");
+fileio.mkdir(WORK + "/repo/src");
+put("repo/.git/objects/pack", "x");
+put("repo/.git/HEAD", "x");
+put("repo/src/main.c", "x");
+r = call(agent, "list_dir", [path = "repo", recursive = "true"]);
+check("a recursive listing does not descend into .git", std.is_json(r) && r.files.has("src/main.c") && !std.string(r.files).contains(".git/") &&
+	!std.string(r.dirs).contains(".git/objects") && std.string(r.dirs).contains(".git") && std.string(r.note ?? "").contains(".git"), short(r));
+r = call(agent, "list_dir", [path = "repo", recursive = "false"]);
+check("a plain listing shows .git", std.string(r.dirs).contains(".git"), short(r));
+
+r = call(agent, "list_dir", [path = "nowhere", recursive = "false"]);
+check("a missing directory is an error", failed_with(r, "does not exist"), short(r));
+r = call(agent, "list_dir", [path = "a.txt", recursive = "false"]);
+check("a file is not a directory", failed_with(r, "is a file"), short(r));
+
+// ── 5. write tools ───────────────────────────────────────────────────────────
+section("write_file / append_text");
+
+r = call(agent, "write_file", [path = "deep/er/new.txt", content = "one\ntwo\nthree\n"]);
+check("write_file creates missing parent directories", r.ok && get("deep/er/new.txt") == "one\ntwo\nthree\n", short(r));
+check("write_file reports bytes and lines", r.bytes_written == 14 && r.lines_written == 3 && r["path"] == "deep/er/new.txt", short(r));
+r = call(agent, "write_file", [path = "deep/er/new.txt", content = "other"]);
+check("write_file refuses to overwrite a non-empty file", failed_with(r, "exists and is not empty") && std.string(r.next_steps).contains("replace_string") &&
+	get("deep/er/new.txt") == "one\ntwo\nthree\n", short(r));
+r = call(agent, "write_file", [path = "empty.txt", content = "filled"]);
+check("write_file fills an empty file", r.ok && get("empty.txt") == "filled", short(r));
+r = call(agent, "write_file", [path = "nocontent.txt"]);
+check("write_file without content", failed_with(r, "Missing 'content'") && !fileio.exists(WORK + "/nocontent.txt"), short(r));
+r = call(agent, "write_file", [path = "sub", content = "x"]);
+check("write_file onto a directory", failed_with(r, "is a directory"), short(r));
+r = call(agent, "write_file", [path = "a.txt/below.txt", content = "x"]);
+check("write_file below a file names the file in the way", failed_with(r, "'a.txt' is a file"), short(r));
+r = call(agent, "write_file", [path = "newdir/", content = "x"]);
+check("write_file to a path that names a directory", failed_with(r, "names a directory") && !fileio.exists(WORK + "/newdir"), short(r));
+r = call(agent, "write_file", [path = "blank.txt", content = ""]);
+check("write_file with empty content creates an empty file", r.ok && fileio.exists(WORK + "/blank.txt") && r.bytes_written == 0, short(r));
+
+r = call(agent, "append_text", [path = "fresh/log.txt", insert_at = "end", content = "abc"]);
+check("append_text creates a file with exactly the content", r.ok && r.created && get("fresh/log.txt") == "abc", "[" + get("fresh/log.txt") + "] " + short(r));
+r = call(agent, "append_text", [path = "fresh/log.txt", insert_at = "end", content = "def"]);
+check("append_text appends", r.ok && !r.created && get("fresh/log.txt") == "abcdef", short(r));
+r = call(agent, "append_text", [path = "fresh/log.txt", insert_at = "start", content = ">>"]);
+check("append_text inserts at the start", r.ok && get("fresh/log.txt") == ">>abcdef" && r.bytes_total == 8, short(r));
+r = call(agent, "append_text", [path = "fresh/log.txt", insert_at = "middle", content = "x"]);
+check("append_text with an unknown position", failed_with(r, "start") && get("fresh/log.txt") == ">>abcdef", short(r));
+
+section("replace_string: diagnostics");
+
+code = "int total(int a, int b)\n{\n\tint sum = a + b;\n\treturn sum;\n}\n\nint twice(int a)\n{\n\treturn total(a, a);\n}\n\nvoid log(int v) { print(v); }\nvoid log2(int v) { print( v ); }\nvoid log3(int v) { print(v); }\n";
+put("code.c", code);
+
+r = call(agent, "replace_string", [path = "nope.c", target_text = "x", replacement_text = "y", replace_all = "false"]);
+check("a missing file is told apart", failed_with(r, "does not exist"), short(r));
+r = call(agent, "replace_string", [path = "blank.txt", target_text = "x", replacement_text = "y", replace_all = "false"]);
+check("an empty file is told apart", failed_with(r, "File is empty"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "  ", replacement_text = "y", replace_all = "false"]);
+check("an empty target is told apart", failed_with(r, "Empty 'target_text'"), short(r));
+
+r = call(agent, "replace_string", [path = "code.c", target_text = "int sum = a+b;\n   return sum;", replacement_text = "return a + b;", replace_all = "false"]);
+check("whitespace-insensitive matching still works", r.ok && r.replacements == 1 && r.lines[0] == 3 && get("code.c").contains("{\n\treturn a + b;\n}"), short(r) + get("code.c"));
+
+before = get("code.c");
+r = call(agent, "replace_string", [path = "code.c", target_text = "print(v);", replacement_text = "emit(v);", replace_all = "false"]);
+check("several occurrences with replace_all=false: count and lines", failed_with(r, "occurs 3 times") && r.occurrences == 3 &&
+	r.lines.size() == 3 && r.lines[0] == 11 && r.lines[1] == 12 && r.lines[2] == 13, short(r));
+check("the whitespace variant counts as an occurrence, nothing was changed", get("code.c") == before, "");
+r = call(agent, "replace_string", [path = "code.c", target_text = "void log2(int v) { print( v ); }", replacement_text = "void log2(int v) { emit(v); }", replace_all = "false"]);
+check("more context makes it unique", r.ok && r.replacements == 1 && r.lines[0] == 12 && get("code.c").contains("void log2(int v) { emit(v); }"), short(r));
+// a model that sends a JSON false instead of the string "false" means false
+r = call(agent, "replace_string", [path = "code.c", target_text = "print(v);", replacement_text = "emit(v);", replace_all = json.bool(false)]);
+check("replace_all = false (a JSON boolean) is false, not the default", failed_with(r, "times") && get("code.c").contains("print(v);"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "print(v);", replacement_text = "emit(v);", replace_all = "true"]);
+check("replace_all=true changes every occurrence", r.ok && r.replacements == 2 && !get("code.c").contains("print(v)"), short(r));
+
+before = get("code.c");
+r = call(agent, "replace_string", [path = "code.c", target_text = "int twice(int a)\n{\n\treturn total(a, b);\n}", replacement_text = "x", replace_all = "false"]);
+check("not found: the first line is located", failed_with(r, "not found") && r.first_line_found_at[0] == 6, short(r));
+check("not found: the first difference is named", std.is_json(r.first_difference) && r.first_difference.target_text_line == 3 &&
+	r.first_difference.file_line == 8 && std.string(r.first_difference.found).contains("total(a, a)"), short(r.first_difference));
+check("not found: the text of the file is returned to copy from", std.string(r.file_text).contains("return total(a, a);") && r.file_text_lines.starts("6-"), short(r.file_text));
+check("not found: nothing was changed", get("code.c") == before, "");
+
+r = call(agent, "replace_string", [path = "code.c", target_text = "return total(a, b);", replacement_text = "x", replace_all = "false"]);
+check("not found: the closest line is named", failed_with(r, "not found") && std.is_json(r.closest_line) && r.closest_line.line == 8 &&
+	std.string(r.closest_line.text).contains("total(a, a)"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "int doubled(int a, int value)", replacement_text = "x", replace_all = "false"]);
+check("not found: a line that only shares a keyword is not offered", failed_with(r, "not found") && !r.has("closest_line"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "zzz qqq completely unrelated", replacement_text = "x", replace_all = "false"]);
+check("not found: nothing resembles it", failed_with(r, "not found") && !r.has("closest_line") && std.string(r.hint).contains("Read the file again"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "6| int twice(int a)\n7| {", replacement_text = "x", replace_all = "false"]);
+check("not found: line number prefixes are recognised", failed_with(r, "not found") && std.string(r.hint).contains("line number"), short(r));
+r = call(agent, "replace_string", [path = "code.c", target_text = "int twice(int a)", replacement_text = "int twice(int a)", replace_all = "false"]);
+check("a replacement that changes nothing is an error", failed_with(r, "unchanged"), short(r));
+
+put("win.txt", "first\r\nsecond\r\nthird\r\n");
+r = call(agent, "replace_string", [path = "win.txt", target_text = "second", replacement_text = "2a\n2b", replace_all = "false"]);
+check("the line endings of the file are kept", r.ok && get("win.txt") == "first\r\n2a\r\n2b\r\nthird\r\n", short(r));
+
+section("mkdir / move / copy / rename / remove: what failed and why");
+
+r = call(agent, "mkdir", [path = "made/deep/dir"]);
+check("mkdir creates nested directories", r.ok && fileio.is_directory(WORK + "/made/deep/dir"), short(r));
+r = call(agent, "mkdir", [path = "made/deep/dir"]);
+check("mkdir of an existing directory says so", r.ok && std.string(r.status).contains("already exists"), short(r));
+r = call(agent, "mkdir", [path = "a.txt"]);
+check("mkdir onto a file", failed_with(r, "is a file"), short(r));
+r = call(agent, "mkdir", [path = "a.txt/below"]);
+check("mkdir below a file", failed_with(r, "'a.txt' is a file"), short(r));
+
+put("m1.txt", "M1");
+put("m2.txt", "M2");
+r = call(agent, "move", [source = "ghost.txt", destination = "x.txt"]);
+check("move: a missing source", failed_with(r, "'ghost.txt' does not exist"), short(r));
+r = call(agent, "move", [source = "m1.txt", destination = "m2.txt"]);
+check("move: an existing destination is not replaced", failed_with(r, "already exists") && get("m1.txt") == "M1" && get("m2.txt") == "M2" &&
+	std.string(r.hint).contains("overwrite"), short(r));
+r = call(agent, "move", [source = "m1.txt", destination = "m2.txt", overwrite = "true"]);
+check("move: overwrite = true replaces it", r.ok && r.replaced_existing && !fileio.exists(WORK + "/m1.txt") && get("m2.txt") == "M1", short(r));
+r = call(agent, "move", [source = "m2.txt", destination = "made"]);
+check("move: a file into an existing directory", r.ok && r.destination == "made/m2.txt" && get("made/m2.txt") == "M1", short(r));
+r = call(agent, "move", [source = "made/m2.txt", destination = "new/place/m3.txt"]);
+check("move: missing parent directories are created", r.ok && get("new/place/m3.txt") == "M1", short(r));
+r = call(agent, "move", [source = "sub", destination = "made"]);
+check("move: a directory onto an existing directory", failed_with(r, "existing directory") && fileio.exists(WORK + "/sub/inner.txt"), short(r));
+r = call(agent, "move", [source = "a.txt", destination = "a.txt"]);
+check("move: source = destination", failed_with(r, "same path"), short(r));
+r = call(agent, "move", [source = "a.txt"]);
+check("move: a missing destination parameter", failed_with(r, "Missing 'destination'"), short(r));
+
+r = call(agent, "copy", [source = "ghost.txt", destination = "x.txt"]);
+check("copy: a missing source", failed_with(r, "does not exist"), short(r));
+r = call(agent, "copy", [source = "a.txt", destination = "copies/a2.txt"]);
+check("copy: to a new place", r.ok && get("copies/a2.txt") == "alpha\nbeta" && get("a.txt") == "alpha\nbeta", short(r));
+r = call(agent, "copy", [source = "crlf.txt", destination = "copies/a2.txt"]);
+check("copy: an existing destination is not replaced", failed_with(r, "already exists") && get("copies/a2.txt") == "alpha\nbeta", short(r));
+r = call(agent, "copy", [source = "sub", destination = "sub_copy"]);
+check("copy: a directory", r.ok && get("sub_copy/inner.txt") == "inner", short(r));
+
+r = call(agent, "rename", [source = "ghost.txt", destination = "x.txt"]);
+check("rename: a missing source", failed_with(r, "does not exist"), short(r));
+r = call(agent, "rename", [source = "copies/a2.txt", destination = "copies/a3.txt"]);
+check("rename: a new name", r.ok && get("copies/a3.txt") == "alpha\nbeta" && !fileio.exists(WORK + "/copies/a2.txt"), short(r));
+r = call(agent, "rename", [source = "copies/a3.txt", destination = "sub"]);
+check("rename: onto an existing directory", failed_with(r, "existing directory") && fileio.exists(WORK + "/copies/a3.txt"), short(r));
+r = call(agent, "rename", [source = "copies/a3.txt", destination = "a.txt"]);
+check("rename: an existing destination is not replaced", failed_with(r, "already exists") && get("a.txt") == "alpha\nbeta", short(r));
+
+r = call(agent, "remove", [path = "ghost.txt"]);
+check("remove: a missing path is not a success", failed_with(r, "does not exist"), short(r));
+r = call(agent, "remove", [path = "copies/a3.txt"]);
+check("remove: the first call only asks", std.is_json(r) && !r.ok && r.confirmation_required && fileio.exists(WORK + "/copies/a3.txt") &&
+	std.string(r.message).contains("10 bytes"), short(r));
+check("... and that is not an error (it would show as a failed tool call)", !r.has("error"), short(r));
+r = call(agent, "remove", [path = "copies/a3.txt"]);
+check("remove: the same call again removes", r.ok && !fileio.exists(WORK + "/copies/a3.txt"), short(r));
+r = call(agent, "remove", [path = "tree"]);
+check("remove: a directory says what is in it", !r.ok && r.confirmation_required && !r.has("error") && std.string(r.message).contains(std.string(LIST_MAX_ENTRIES_RECURSIVE + 30) + " files"), short(r));
+r = call(agent, "remove", [path = "sub_copy"]);
+check("remove: another path asks again", !r.ok && r.confirmation_required && fileio.exists(WORK + "/tree"), short(r));
+r = call(agent, "remove", [path = "sub_copy"]);
+check("remove: a directory is removed", r.ok && !fileio.exists(WORK + "/sub_copy") && fileio.exists(WORK + "/tree"), short(r));
+r = call(agent, "remove", [path = "."]);
+check("remove: the working directory itself is refused", failed_with(r, "cannot be removed") && fileio.exists(WORK), short(r));
+
+// ── 6. skills ────────────────────────────────────────────────────────────────
+section("skills");
+
+r = call(agent, "read_skill", [name = "no_such_skill_xyz"]);
+check("an unknown skill names the available ones", failed_with(r, "no_such_skill_xyz") && std.is_json(r.available_skills), short(r));
+
+// ── 7. finalize ──────────────────────────────────────────────────────────────
+section("finalize: only a valid signal with a report ends the turn");
+
+// finalize_run() stops the agent, so this comes last
+agent.task_result = None;
+r = call(agent, "finalize", [signal = "done", result = "report"]);
+check("an unknown signal is refused", failed_with(r, "Unknown signal") && std.string(r.valid_signals).contains("finished") && agent.task_result == None, short(r));
+r = call(agent, "finalize", [signal = "finished", result = "  "]);
+check("an empty report is refused", failed_with(r, "Missing 'result'") && agent.task_result == None, short(r));
+r = call(agent, "finalize", [signal = "FINISHED", result = "all done"]);
+check("a signal in another case is normalised", std.is_json(agent.task_result) && agent.task_result.signal == "finished" &&
+	agent.task_result.result == "all done" && agent.task_result.from_tool, short(agent.task_result));
+
+// ── 8. no prints in tool code ────────────────────────────────────────────────
+section("the worker protocol: tools do not print");
+
+source = fileio.read_string(__DIR__ + "/../roles/SHARED.shio");
+printing = [];
+source_lines = source.split("\n");
+for(i = 0; i < source_lines.size(); i++) {
+	line = source_lines[i].strip();
+	if(line.starts("//"))
+		continue;
+	if(line.contains("std.print(") || line.contains("std.cout("))
+		printing.push_back(i + 1);
+}
+check("roles/SHARED.shio has no std.print / std.cout", source.size() > 1000 && printing.size() == 0, "lines " + std.string(printing));
+
+fileio.remove(BASE);
+check("the temp folder is gone", !fileio.exists(BASE), BASE);
+
+std.print("\n", passed, " passed, ", failed, " failed");
+if(failed)
+	std.exitprocess(1);

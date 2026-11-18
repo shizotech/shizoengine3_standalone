@@ -1,12 +1,21 @@
-/* ── Workspace dashboard (issue #907) ──
- * Single-page UI: one sidebar with the recursive workspace tree and sessions;
- * chat, architecture and tasks tabs in
- * the main pane. API contract: ../workspace_spec.md.
+/* ── miniagent dashboard ──
+ * One page for every node of the network: the sidebar lists the nodes (this one and
+ * the others it sees on ShizoNet), their workspaces and sessions; the main pane has
+ * the chat of a session, the tasks and the architecture graph of a workspace.
+ *
+ * Talking to nodes: NodeApi.at(nodeId) (components/nodeapi.js). A call for another
+ * node goes to /api/nodes/<id>/api/... of this node, which asks that node over
+ * ShizoNet — the API is the same for every node (../workspace_spec.md).
+ *
+ * Staying current: one long-poll per node on /api/live (it answers when something the
+ * page shows has changed). What is drawn is patched in place (reconcile()), never
+ * rebuilt, so nothing flashes when an update arrives.
  * No CDN, no build step.
  */
 
 'use strict';
 
+/* ── helpers ── */
 const $ = (id) => document.getElementById(id);
 
 const arr = (x) => {
@@ -16,2690 +25,2082 @@ const arr = (x) => {
 };
 
 const esc = (s) => String(s == null ? '' : s)
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;');
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-const num = (x) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
-};
-
+const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0; };
 const fmtNum = (x) => num(x).toLocaleString();
+const enc = encodeURIComponent;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const truthy = (x) => x === true || x === 1 || x === '1' || x === 'true';
 
-const timeValue = (x) => {
-  if (typeof x === 'number') return x;
-  if (typeof x === 'string') {
-    const n = Date.parse(x);
-    return Number.isFinite(n) ? n : 0;
-  }
-  return 0;
+const fmtTokens = (x) => {
+  const n = num(x);
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + 'k';
+  return String(n);
 };
 
-const timeAgo = (x) => {
-  const t = timeValue(x);
-  if (!t) return 'just now';
-  const diff = Math.max(0, Date.now() - t);
-  const sec = Math.floor(diff / 1000);
-  if (sec < 60) return sec + 's ago';
+const timeAgo = (t) => {
+  t = num(t);
+  if (!t) return '';
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 60) return 'just now';
   const min = Math.floor(sec / 60);
-  if (min < 60) return min + 'm ago';
+  if (min < 60) return min + ' min ago';
   const hour = Math.floor(min / 60);
-  if (hour < 24) return hour + 'h ago';
-  return Math.floor(hour / 24) + 'd ago';
+  if (hour < 24) return hour + ' h ago';
+  return Math.floor(hour / 24) + ' d ago';
 };
 
-const statusLabel = (status) => {
-  const s = String(status || 'idle');
-  return s.charAt(0).toUpperCase() + s.slice(1);
-};
+const clip = (s, n) => { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+const oneLine = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
 
-const statusClass = (status) => {
-  const s = String(status || '').toLowerCase();
-  if (s === 'running' || s === 'starting' || s === 'waiting' || s === 'planned') return 'running';
-  if (s === 'done' || s === 'finished' || s === 'completed') return 'done';
-  if (s === 'question') return 'question';
-  if (s === 'failed' || s === 'error' || s === 'cancelled') return 'failed';
-  if (s === 'stopped' || s === 'paused' || s === 'archived') return 'stopped';
-  return 'idle';
-};
-
-const isRunningStatus = (status) => {
-  const s = String(status || '').toLowerCase();
-  return s === 'running' || s === 'starting' || s === 'waiting' || s === 'planned';
-};
-
-const isActiveTask = (task) => {
-  if (!task || typeof task !== 'object') return false;
-  if (task.active === true || task.active === 1) return true;
-  const status = String(task.state || task.status || '').toLowerCase();
-  return ['dispatching', 'running', 'starting', 'waiting', 'planned', 'checkpoint'].includes(status);
-};
-
-const isFinishedTask = (task) => {
-  const status = String(task && (task.state || task.status) || '').toLowerCase();
-  return ['done', 'finished', 'completed', 'question', 'failed', 'stopped', 'cancelled'].includes(status);
-};
-
-const isNeedsInputTask = (task) => {
-  const status = String(task && (task.state || task.status) || '').toLowerCase();
-  return status === 'question';
-};
-
-const goalStatus = (goal) => String(goal && goal.status || '').toLowerCase();
-const isGoalRunOpen = (goal) => ['dispatching', 'running', 'checkpoint'].includes(String(goal && goal.active_run_state || '').toLowerCase());
-const isGoalNeedsInput = (goal) => String(goal && goal.active_run_state || '').toLowerCase() === 'question';
-const goalHasOpenWindow = (goal) => Boolean(String(goal && goal.active_window || '').trim());
-const isGoalInvalid = (goal) => Boolean(goal && goal.invalid_edit === true) ||
-  (goal && Array.isArray(goal.errors) && goal.errors.length > 0) ||
-  goalStatus(goal) === 'invalid' || goalStatus(goal) === '?';
-const taskIdOf = (item) => String(item && (item.taskid || item.id) || '');
-const formatGoalErrors = (goal) => {
-  const errors = goal && Array.isArray(goal.errors) ? goal.errors : [];
-  return errors.map((error) => {
-    if (typeof error === 'string') return error;
-    if (error && typeof error === 'object') return error.message || error.error || error.reason || JSON.stringify(error);
-    return String(error);
-  }).join('; ');
-};
-const formatSchedule = (schedule) => {
-  if (!schedule) return '';
-  if (typeof schedule === 'string') return schedule;
-  if (typeof schedule !== 'object') return String(schedule);
-  const parts = [];
-  if (schedule.type) parts.push(String(schedule.type));
-  if (schedule.every) parts.push('every ' + String(schedule.every));
-  if (schedule.days) parts.push('days ' + (Array.isArray(schedule.days) ? schedule.days.join(', ') : String(schedule.days)));
-  if (schedule.date) parts.push('date ' + String(schedule.date));
-  if (schedule.window) parts.push('window ' + (Array.isArray(schedule.window) ? schedule.window.join('–') : String(schedule.window)));
-  if (schedule.start) parts.push('start ' + String(schedule.start));
-  if (schedule.end) parts.push('end ' + String(schedule.end));
-  if (schedule.duration) parts.push('duration ' + String(schedule.duration));
-  return parts.length ? parts.join(' · ') : JSON.stringify(schedule);
-};
-
-let markdownRenderer = null;
-
-function mdRender(text) {
-  if (!markdownRenderer) {
-    const factory = typeof window.markdownit === 'function' ? window.markdownit : null;
-    markdownRenderer = factory
-      ? factory({ breaks: true })
-      : { render: (s) => '<p>' + esc(s).replace(/\n/g, '<br>') + '</p>' };
-  }
-  try {
-    return markdownRenderer.render(String(text || ''));
-  } catch (e) {
-    return '<p>' + esc(text || '') + '</p>';
-  }
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
 }
 
-const state = {
-  workspaces: [],
-  byId: {},
-  selectedWorkspace: null,
-  selectedSession: null,
-  session: null,
-  sessions: [],
-  settings: { max_sessions: 2 },
-  stats: {},
-  notifications: [],
-  notificationSeen: 0,
-  view: 'workspace',
-  tab: 'chat',
-  architecture: null,
-  workspaceSessions: {},
-  expandedWorkspaces: new Set(),
-  workspaceSelectionGeneration: 0,
-  sessionCreationPending: false,
-  taskData: null,
-  taskRenderSignatures: {},
-  taskRequestGeneration: 0,
-  globalTaskRenderSignature: '',
-  globalTasksGeneration: 0,
-  globalTasksLoading: false,
-  stream: null,
-  streamSince: 0,
-  streamAbort: null,
-  currentAgentBubble: null,
-  currentAgentText: '',
-  currentReasoningBubble: null,
-  currentReasoningText: '',
-  pendingUser: null,
-  composerMode: 'normal',
-  composerEffort: 'medium',
-  renderingHistory: false
-};
+const icon = (name) => '<i class="fa-solid fa-' + name + '" aria-hidden="true"></i>';
 
-function applySettings(raw) {
-  const s = raw && raw.settings ? raw.settings : raw;
-  if (s && typeof s === 'object') state.settings = Object.assign({}, state.settings, s);
-  if (state.settings.max_sessions == null) state.settings.max_sessions = 2;
+function store(key, value) {
+  try {
+    if (value === undefined) return localStorage.getItem('miniagent_' + key);
+    if (value === null) localStorage.removeItem('miniagent_' + key);
+    else localStorage.setItem('miniagent_' + key, String(value));
+  } catch (e) { /* private mode */ }
+  return null;
+}
+
+/* Patch the children of `parent` to match `items`: an element is kept for a key that is
+ * still there (update() changes what differs), made for a new one, removed for one that
+ * went. Nothing is rebuilt, so an update never flashes and keeps scroll and focus. */
+function reconcile(parent, items, keyOf, create, update) {
+  const old = new Map();
+  Array.from(parent.children).forEach((c) => { if (c.dataset.key != null) old.set(c.dataset.key, c); else c.remove(); });
+  let prev = null;
+  items.forEach((item) => {
+    const key = String(keyOf(item));
+    let node = old.get(key);
+    if (node) old.delete(key);
+    else { node = create(item); node.dataset.key = key; }
+    update(node, item);
+    const want = prev ? prev.nextSibling : parent.firstChild;
+    if (node !== want) parent.insertBefore(node, want);
+    prev = node;
+  });
+  old.forEach((n) => n.remove());
+}
+
+/* set innerHTML only when it differs from what this element was last given */
+function setHtml(node, html) {
+  if (node._html !== html) { node.innerHTML = html; node._html = html; }
+}
+function setText(node, text) {
+  text = String(text == null ? '' : text);
+  if (node.textContent !== text) node.textContent = text;
+}
+function setClass(node, cls) {
+  if (node.className !== cls) node.className = cls;
+}
+
+let markdownRenderer = null;
+function mdRender(text) {
+  if (!markdownRenderer) {
+    markdownRenderer = typeof window.markdownit === 'function'
+      ? window.markdownit({ breaks: true })
+      : { render: (s) => '<p>' + esc(s).replace(/\n/g, '<br>') + '</p>' };
+  }
+  try { return markdownRenderer.render(String(text || '')); } catch (e) { return '<p>' + esc(text || '') + '</p>'; }
 }
 
 function toast(message, kind = 'info', timeout = 4200) {
   const box = $('toasts');
-  if (!box) return;
-  const el = document.createElement('div');
-  el.className = 'toast ' + kind;
-  el.textContent = String(message || '');
-  box.appendChild(el);
+  const t = el('div', 'toast ' + kind, String(message || ''));
+  box.appendChild(t);
   setTimeout(() => {
-    el.style.opacity = '0';
-    el.style.transform = 'translateX(18px)';
-    setTimeout(() => el.remove(), 240);
+    t.style.opacity = '0';
+    t.style.transform = 'translateX(18px)';
+    setTimeout(() => t.remove(), 240);
   }, timeout);
 }
 
-function makeEmpty(title, desc) {
-  const el = document.createElement('div');
-  el.className = 'empty-state';
-  el.innerHTML = '<i class="fa-solid fa-comments"></i><div>' + esc(title) + '</div>' +
-    (desc ? '<div class="empty-state-desc">' + esc(desc) + '</div>' : '');
-  return el;
-}
+/* ── status vocabulary ── */
+const statusClass = (status) => {
+  const s = String(status || '').toLowerCase();
+  if (s === 'queued') return 'queued';
+  if (['running', 'starting', 'waiting', 'planned', 'generating', 'dispatching', 'checkpoint'].includes(s)) return 'running';
+  if (['done', 'finished', 'completed'].includes(s)) return 'done';
+  if (s === 'question') return 'question';
+  if (['failed', 'error', 'cancelled', 'lost'].includes(s)) return 'failed';
+  return 'stopped';
+};
+const statusLabel = (status) => {
+  const s = String(status || 'idle').toLowerCase();
+  const map = { done: 'finished', waiting: 'ready', starting: 'starting', question: 'needs input', queued: 'queued' };
+  return map[s] || s;
+};
+const isActive = (status) => ['starting', 'running', 'waiting', 'queued'].includes(String(status || '').toLowerCase());
+const isGenerating = (status) => String(status || '').toLowerCase() === 'running';
+const isTerminal = (status) => ['done', 'failed', 'question', 'stopped'].includes(String(status || '').toLowerCase());
 
-function makeEmptyCompact(title, desc) {
-  const el = makeEmpty(title, desc);
-  el.classList.add('compact');
-  return el;
-}
+/* ── state ── */
+const state = {
+  nodes: [],                 // [{id, name, kind, local, online, model, description, ...}]
+  peersRev: -1,
+  nodeData: {},              // node id -> what is known of that node (nd())
+  openNodes: new Set(),
+  openWs: new Set(),         // "<node>/<workspace>"
+  sel: { node: null, ws: null, session: null },
+  view: 'welcome',           // welcome | workspace | globalTasks
+  tab: 'chat',
+  session: null,             // the open session (GET /api/sessions/<id>)
+  selGen: 0,                 // counts selections: an answer for an older one is dropped
+  stream: null,
+  streamSince: 0,
+  pendingUser: null,
+  composerMode: 'normal',
+  composerEffort: 'medium',
+  showDetails: true,
+  notifications: [],         // [{node, message, time}]
+  notifUnseen: 0,
+  taskSig: '',
+  dialogNode: null,          // the node of the settings dialog
+  newWs: null,               // {node, parent} of the workspace dialog
+};
 
-/* ── Settings ── */
-async function loadSettings() {
-  const data = await NodeApi.get('/api/settings');
-  applySettings(data);
-}
-
-function openSettings() {
-  $('maxSessionsInput').value = num(state.settings.max_sessions) || 2;
-  $('settingsDialog').classList.remove('hidden');
-  $('settingsDialog').hidden = false;
-}
-
-function closeSettings() {
-  $('settingsDialog').hidden = true;
-  $('settingsDialog').classList.add('hidden');
-}
-
-async function saveSettings() {
-  const value = Number($('maxSessionsInput').value);
-  if (!Number.isInteger(value) || value < 1 || value > 64) {
-    toast('Max sessions must be an integer from 1 to 64.', 'warn');
-    return;
+function nd(id) {
+  id = String(id);
+  if (!state.nodeData[id]) {
+    state.nodeData[id] = {
+      loaded: false, loading: false, error: '',
+      workspaces: [], byId: {}, general: null, projectsDir: '',
+      settings: { max_sessions: 2 }, stats: {}, sessions: [],
+      rev: 0, treeRev: -1, goalsRev: -1, notifCount: -1,
+      liveRunning: false, liveAbort: null, linkOk: true,
+    };
   }
+  return state.nodeData[id];
+}
+
+const nodeById = (id) => state.nodes.find((n) => n.id === id) || null;
+const api = (nodeId) => NodeApi.at(nodeId || 'local');
+const wsKey = (node, ws) => node + '/' + ws;
+const selApi = () => api(state.sel.node);
+
+function workspaceOf(node, ws) {
+  const d = nd(node);
+  if (ws === 'node') return d.general;
+  return d.byId[ws] || null;
+}
+function sessionsOf(node, ws) {
+  return nd(node).sessions.filter((s) => String(s.workspace_id) === String(ws))
+    .sort((a, b) => num(b.created) - num(a.created));
+}
+function childWorkspaces(node, parent) {
+  const d = nd(node);
+  const isRoot = !parent;
+  return d.workspaces.filter((w) => {
+    const p = String(w.parent || '');
+    if (isRoot) return !p || p === 'root' || !d.byId[p];
+    return p === String(parent);
+  }).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+}
+
+/* ── nodes ── */
+async function loadNodes() {
+  let data = null;
   try {
-    await NodeApi.put('/api/settings', { max_sessions: value });
-    state.settings.max_sessions = value;
-    closeSettings();
-    renderStats();
-    toast('Settings saved.', 'success');
+    data = await NodeApi.get('/api/nodes');
   } catch (e) {
-    toast('Could not save settings: ' + e.message, 'error');
+    // a node without the /api/nodes route (an older one): it is the only node
+    data = { nodes: [{ id: 'local', name: 'This node', kind: 'node', local: true, online: true }], rev: 0 };
   }
-}
+  state.nodes = arr(data.nodes).map((n) => Object.assign({}, n, {
+    id: String(n.id), local: truthy(n.local), online: truthy(n.online), api: n.api == null ? true : truthy(n.api),
+  }));
+  state.peersRev = num(data.rev);
 
-/* ── Workspace tree ── */
-function flattenWorkspaces(raw) {
-  let list = [];
-  if (Array.isArray(raw)) {
-    list = raw;
-  } else if (raw && typeof raw === 'object') {
-    if (Array.isArray(raw.workspaces)) list = raw.workspaces;
-    else if (Array.isArray(raw.tree)) list = raw.tree;
-    else if (raw.workspaces && typeof raw.workspaces === 'object') list = Object.values(raw.workspaces);
-    else if (raw.tree && typeof raw.tree === 'object') list = Object.values(raw.tree);
-    else list = Object.values(raw);
-  }
+  const local = nodeById('local');
+  if (local) $('brandSub').textContent = local.name || 'control console';
 
-  const out = [];
-  const seen = new Set();
-  const walk = (nodes, parentId) => {
-    arr(nodes).forEach((w) => {
-      if (!w || !w.id || seen.has(w.id)) return;
-      seen.add(w.id);
-      if (!w.parent && parentId) w.parent = parentId;
-      out.push(w);
-      if (w.children) walk(w.children, w.id);
-    });
-  };
-  walk(list, null);
-  return out;
-}
-
-function rootWorkspaces() {
-  // The store's root record is a filesystem anchor, not a visible workspace row.
-  return state.workspaces
-    .filter((w) => String(w.id) !== 'root' && (!w.parent || String(w.parent) === 'root' || !state.byId[w.parent]))
-    .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
-}
-
-function childrenOf(id) {
-  return state.workspaces
-    .filter((w) => w.parent != null && String(w.parent) === String(id))
-    .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
-}
-
-function expandWorkspacePath(id) {
-  const visited = new Set();
-  let workspace = state.byId[String(id)];
-  while (workspace && !visited.has(String(workspace.id))) {
-    const workspaceId = String(workspace.id);
-    visited.add(workspaceId);
-    state.expandedWorkspaces.add(workspaceId);
-    const parentId = String(workspace.parent || '');
-    if (!parentId || parentId === 'root') break;
-    workspace = state.byId[parentId];
-  }
-}
-
-function normalizeSessions(sessions) {
-  return arr(sessions).map((s) => {
-    if (!s || typeof s !== 'object') return null;
-    const sid = s.id || s.session_id || s.sessionId;
-    return Object.assign({}, s, { id: sid != null ? String(sid) : '' });
-  }).filter(Boolean);
-}
-
-function renderWorkspaceTree() {
-  const host = $('workspaceTree');
-  host.innerHTML = '';
-  host.setAttribute('role', 'group');
-  host.setAttribute('aria-label', 'Projects, subprojects, and sessions');
-  const roots = rootWorkspaces();
-
-  if (!roots.length) {
-    host.appendChild(makeEmpty('No projects yet.', 'Create one with the + button.'));
-    return;
-  }
-
-  const selectedId = state.selectedWorkspace ? String(state.selectedWorkspace.id) : '';
-  const expanded = state.expandedWorkspaces;
-  const built = new Set();
-
-  function renderNode(w, depth = 0) {
-    const id = String(w && w.id);
-    if (!w || !id || built.has(id)) return null;
-    built.add(id);
-
-    const selected = selectedId === id;
-    const isRoot = depth === 0;
-    const children = childrenOf(id);
-    const isExpanded = expanded.has(id);
-    const expandedChildren = isExpanded ? children : [];
-    const sessions = (isExpanded ? state.workspaceSessions[id] || [] : []).slice().sort((a, b) => {
-      return (timeValue(b.updated || b.created) || 0) - (timeValue(a.updated || a.created) || 0);
-    });
-    const item = document.createElement('div');
-    item.className = 'ws-item ' + (isRoot ? 'ws-root ws-project' : 'ws-subworkspace ws-project-child');
-    item.setAttribute('role', 'group');
-    item.setAttribute('aria-label', w.name || w.id);
-
-    const row = document.createElement('div');
-    row.className = 'ws-row ' + (isRoot ? 'ws-row-root' : 'ws-row-sub') + (selected ? ' selected' : '');
-
-    const link = document.createElement('button');
-    link.className = 'ws-link' + (selected ? ' active' : '');
-    link.dataset.wsId = id;
-    link.title = w.path || id;
-    link.setAttribute('aria-expanded', String(isExpanded));
-    link.innerHTML =
-      '<i class="fa-solid ' + (isExpanded ? 'fa-folder-open' : 'fa-folder') + ' ws-folder-icon" aria-hidden="true"></i>' +
-      '<span class="ws-name">' + esc(w.name || id) + '</span>' +
-      '<span class="ws-kind">' + (isRoot ? 'PROJECT' : 'SUBPROJECT') + '</span>';
-    row.appendChild(link);
-
-    const actions = document.createElement('span');
-    actions.className = 'ws-actions';
-    const addSession = document.createElement('button');
-    addSession.className = 'ws-action';
-    addSession.disabled = state.sessionCreationPending;
-    addSession.dataset.addSession = id;
-    addSession.title = 'New session in ' + (w.name || id);
-    addSession.setAttribute('aria-label', addSession.title);
-    addSession.innerHTML = '<i class="fa-solid fa-plus"></i>';
-    actions.appendChild(addSession);
-
-    const addChild = document.createElement('button');
-    addChild.className = 'ws-action';
-    addChild.dataset.addChild = id;
-    addChild.title = 'Add a sub-workspace under ' + (w.name || id);
-    addChild.setAttribute('aria-label', addChild.title);
-    addChild.innerHTML = '<i class="fa-solid fa-folder-plus ws-folder-icon"></i>';
-    actions.appendChild(addChild);
-
-    const deleteWorkspace = document.createElement('button');
-    deleteWorkspace.className = 'ws-action ws-action-danger';
-    deleteWorkspace.dataset.deleteWorkspace = id;
-    deleteWorkspace.disabled = children.length > 0;
-    deleteWorkspace.title = children.length
-      ? 'Delete sub-workspaces first'
-      : 'Remove ' + (w.name || id) + ' from Miniagent (sessions removed, files kept)';
-    deleteWorkspace.setAttribute('aria-label', deleteWorkspace.title);
-    deleteWorkspace.innerHTML = '<i class="fa-solid fa-trash"></i>';
-    actions.appendChild(deleteWorkspace);
-    row.appendChild(actions);
-    item.appendChild(row);
-
-    if (sessions.length || expandedChildren.length) {
-      const childBox = document.createElement('div');
-      childBox.className = 'ws-children';
-      childBox.setAttribute('role', 'group');
-      childBox.setAttribute('aria-label', 'Sessions and sub-workspaces for ' + (w.name || id));
-
-      sessions.forEach((s) => {
-        const sessionRow = document.createElement('div');
-        sessionRow.className = 'session-row';
-        const session = document.createElement('button');
-        const sessionStatuses = state.stats.session_status || {};
-        const sessionStatus = sessionStatuses[s.id] || s.status;
-        const generating = String(sessionStatus || '').toLowerCase() === 'running';
-        session.className = 'session-item' + (state.selectedSession === s.id ? ' active' : '');
-        session.dataset.sessionId = s.id;
-        session.dataset.workspaceId = id;
-        session.dataset.status = sessionStatus;
-        session.title = generating ? 'Agent is generating a reply' : statusLabel(sessionStatus);
-        session.innerHTML =
-          '<span class="status-dot ' + (generating ? 'generating' : statusClass(sessionStatus)) + '" aria-hidden="true"></span>' +
-          '<span class="session-name">' + esc(s.title || 'Session') + '</span>' +
-          (generating ? '<span class="session-activity">GENERATING</span>' : '') +
-          '<span class="session-tokens">' + fmtNum((state.stats.token_usage && Object.prototype.hasOwnProperty.call(state.stats.token_usage, s.id)) ? state.stats.token_usage[s.id] : s.token_usage) + ' tok</span>';
-        sessionRow.appendChild(session);
-
-        const deleteSession = document.createElement('button');
-        deleteSession.className = 'ws-action ws-action-danger session-delete';
-        deleteSession.dataset.deleteSession = s.id;
-        deleteSession.dataset.workspaceId = id;
-        deleteSession.title = 'Delete session';
-        deleteSession.setAttribute('aria-label', 'Delete session ' + (s.title || s.id));
-        deleteSession.innerHTML = '<i class="fa-solid fa-trash"></i>';
-        sessionRow.appendChild(deleteSession);
-        childBox.appendChild(sessionRow);
-      });
-
-      expandedChildren.forEach((childWorkspace) => {
-        const childNode = renderNode(childWorkspace, depth + 1);
-        if (childNode) childBox.appendChild(childNode);
-      });
-      item.appendChild(childBox);
-    }
-
-    return item;
-  }
-
-  roots.forEach((w) => {
-    const node = renderNode(w);
-    if (node) host.appendChild(node);
+  state.nodes.forEach((n) => {
+    if (n.kind === 'node' && n.online && (state.openNodes.has(n.id) || state.sel.node === n.id)) ensureNode(n.id);
   });
-}
-
-function openWorkspaceForm(parentId) {
-  state.newParent = parentId || '';
-  const parent = state.newParent ? state.byId[state.newParent] : null;
-  $('workspaceParentLabel').textContent = parent ? 'Subproject of ' + parent.name : 'Top-level project';
-  $('workspaceName').value = '';
-  $('workspacePath').value = '';
-  $('workspaceForm').classList.remove('hidden');
-  $('workspaceName').focus();
-}
-
-async function deleteWorkspace(id) {
-  const workspace = state.byId[String(id)];
-  if (!workspace || String(workspace.id) === 'root') return;
-  if (!window.confirm('Remove "' + (workspace.name || workspace.id) + '" from Miniagent? Its sessions will be stopped and removed automatically; its project files remain on disk. Delete sub-workspaces first.')) return;
-
-  try {
-    await NodeApi.del('/api/workspaces/' + encodeURIComponent(workspace.id));
-    const wasSelected = state.selectedWorkspace && String(state.selectedWorkspace.id) === String(workspace.id);
-    state.expandedWorkspaces.delete(String(workspace.id));
-    delete state.workspaceSessions[String(workspace.id)];
-    if (wasSelected) {
-      state.selectedWorkspace = null;
-      state.selectedSession = null;
-      state.session = null;
-      state.sessions = [];
-      state.taskData = null;
-      state.architecture = null;
-      delete state.taskRenderSignatures[String(workspace.id)];
-      localStorage.removeItem('miniagent_workspace_id');
-      closeStream();
-      setChatEmpty();
-      renderSessionHeader();
-    }
-    await loadWorkspaces(false);
-    try { await refreshStats(); } catch (e) { /* stats are optional */ }
-    renderHeader();
-    renderSessionHeader();
-    toast('Project removed from Miniagent. Sessions were deleted; files were kept.', 'success');
-  } catch (e) {
-    toast('Could not remove project: ' + e.message, 'error');
-  }
-}
-
-async function createWorkspace() {
-  const name = $('workspaceName').value.trim();
-  if (!name) {
-    toast('Project name is required.', 'warn');
-    return;
-  }
-  const path = $('workspacePath').value.trim();
-  const body = { name };
-  if (path) body.path = path;
-  if (state.newParent) body.parent = state.newParent;
-
-  try {
-    const data = await NodeApi.post('/api/workspaces', body);
-    const id = data && (data.id || data.workspace_id || data.workspaceId || (data.workspace && data.workspace.id));
-    $('workspaceForm').classList.add('hidden');
-    await loadWorkspaces();
-    if (id && state.byId[id]) await selectWorkspace(id);
-    toast('Project created.', 'success');
-  } catch (e) {
-    toast('Could not create project: ' + e.message, 'error');
-  }
-}
-
-/* ── Workspace data ── */
-async function loadWorkspaces(autoSelect = true) {
-  const data = await NodeApi.get('/api/workspaces');
-  state.workspaces = flattenWorkspaces(data);
-  state.byId = {};
-  state.workspaces.forEach((w) => { state.byId[w.id] = w; });
-  applySettings(data.settings);
-  state.stats = data.stats && typeof data.stats === 'object' ? data.stats : state.stats;
-
-  Object.keys(state.workspaceSessions).forEach((id) => {
-    if (!state.byId[id]) delete state.workspaceSessions[id];
-  });
-  state.expandedWorkspaces.forEach((id) => {
-    if (!state.byId[id]) state.expandedWorkspaces.delete(id);
-  });
-
-  if (state.selectedWorkspace) {
-    const selectedId = String(state.selectedWorkspace.id);
-    if (state.byId[selectedId]) {
-      state.selectedWorkspace = state.byId[selectedId];
-    } else {
-      state.selectedWorkspace = null;
-      state.selectedSession = null;
-      state.session = null;
-      state.sessions = [];
-    }
-  }
-
-  syncSessionTokens();
-  renderWorkspaceTree();
-  renderStats();
-
-  if (autoSelect && !state.selectedWorkspace) {
-    const saved = localStorage.getItem('miniagent_workspace_id');
-    const roots = rootWorkspaces();
-    const id = saved && saved !== 'root' && state.byId[saved]
-      ? saved
-      : (roots[0] && roots[0].id);
-    if (id) {
-      expandWorkspacePath(id);
-      await selectWorkspace(id);
-    }
-  }
-}
-
-async function selectWorkspace(id) {
-  const ws = state.byId[id];
-  if (!ws || String(ws.id) === 'root') return;
-
-  const generation = ++state.workspaceSelectionGeneration;
-  $('taskForm').classList.add('hidden');
-  $('taskForm').dataset.workspaceId = String(id);
-  state.selectedWorkspace = ws;
-  state.selectedSession = null;
-  state.session = null;
-  state.sessions = [];
-  state.workspaceSessions[String(id)] = [];
-  state.architecture = null;
-  state.taskData = null;
-  delete state.taskRenderSignatures[String(id)];
-  state.currentAgentBubble = null;
-  state.currentAgentText = '';
-  state.pendingUser = null;
-  state.streamSince = 0;
-  localStorage.setItem('miniagent_workspace_id', id);
-  closeStream();
-  if (state.tab === 'architecture') loadArchitecture(true);
-  if (state.tab === 'tasks') $('taskContent').innerHTML = '<div class="empty-state compact">Loading tasks...</div>';
-
-  showWorkspaceView();
-  renderWorkspaceTree();
-  renderSessionHeader();
-  setChatEmpty();
-
-  try {
-    await refreshWorkspace(id, generation);
-    if (generation === state.workspaceSelectionGeneration && state.tab === 'tasks') {
-      await loadTasks(id, generation);
-    }
-    if (generation === state.workspaceSelectionGeneration) {
-      await loadWorkspaceBranchSessions(id, generation);
-    }
-  } catch (e) {
-    if (generation === state.workspaceSelectionGeneration) {
-      toast('Could not load workspace: ' + e.message, 'error');
-    }
-  }
-}
-
-async function refreshWorkspace(id, generation = state.workspaceSelectionGeneration) {
-  const data = await NodeApi.get('/api/workspaces/' + encodeURIComponent(id));
-  if (generation !== state.workspaceSelectionGeneration || !state.selectedWorkspace || String(state.selectedWorkspace.id) !== String(id)) return;
-  const ws = data.workspace || data;
-
-  if (ws && ws.id) {
-    state.selectedWorkspace = ws;
-    state.byId[ws.id] = ws;
-    const idx = state.workspaces.findIndex((w) => w.id === ws.id);
-    if (idx >= 0) state.workspaces[idx] = Object.assign(state.workspaces[idx], ws);
-  }
-
-  applySettings(data.settings);
-  state.sessions = normalizeSessions(data.sessions);
-  state.workspaceSessions[String(id)] = state.sessions;
-  syncSessionTokens();
-
-  if (data.architecture) state.architecture = data.architecture;
-  if (data.goals) state.taskData = { goals: arr(data.goals), sessions: arr(data.tasks), templates: [] };
-
+  renderTree();
   renderHeader();
-  renderWorkspaceTree();
-  renderStats();
+}
 
-  if (state.selectedSession && state.sessions.some((s) => s.id === state.selectedSession)) {
-    await selectSession(state.selectedSession);
-  } else {
-    state.selectedSession = null;
-    state.session = null;
-    renderSessionHeader();
-    setChatEmpty();
+/* load a node's workspaces (once) and keep following it */
+function ensureNode(id) {
+  const d = nd(id);
+  if (!d.loaded && !d.loading) loadNode(id);
+  startLive(id);
+}
+
+async function loadNode(id) {
+  const d = nd(id);
+  d.loading = true;
+  d.error = '';
+  renderTree();
+  try {
+    const data = await api(id).get('/api/workspaces');
+    d.workspaces = arr(data.workspaces).filter((w) => w && w.id && String(w.id) !== 'root')
+      .map((w) => Object.assign({}, w, { id: String(w.id) }));
+    d.byId = {};
+    d.workspaces.forEach((w) => { d.byId[w.id] = w; });
+    d.general = data.general ? Object.assign({}, data.general, { id: 'node' }) : null;
+    d.projectsDir = String(data.projects_dir || '');
+    if (data.settings) d.settings = data.settings;
+    if (data.stats) d.stats = data.stats;
+    d.loaded = true;
+  } catch (e) {
+    d.error = e.message;
   }
+  d.loading = false;
+
+  // the selected workspace was removed on that node
+  if (state.sel.node === id && state.sel.ws && d.loaded && !workspaceOf(id, state.sel.ws)) {
+    clearSelection();
+  }
+  renderTree();
+  renderHeader();
 }
 
-/* ── Header / stats ── */
-function renderHeader() {
-  const globalBtn = $('btnGlobalTasks');
-  if (state.view === 'globalTasks') {
-    globalBtn.classList.add('active');
-    $('workspaceBreadcrumb').textContent = 'all workspaces';
-    $('workspaceTitle').textContent = 'Global tasks';
-    $('workspaceMeta').textContent = 'Tasks across ' + state.workspaces.length + ' workspace(s)';
-    return;
+/* ── the live feed of a node ── */
+function wantsLive(id) {
+  const n = nodeById(id);
+  if (!n || n.kind !== 'node' || !n.online) return false;
+  return id === 'local' || state.openNodes.has(id) || state.sel.node === id;
+}
+
+// the page holds a long-poll for its own node and for the node it works on; another
+// open node is asked every few seconds (a browser has only a few connections per host)
+const livePrimary = (id) => id === 'local' || state.sel.node === id;
+
+async function startLive(id) {
+  const d = nd(id);
+  if (d.liveRunning) return;
+  d.liveRunning = true;
+  let fails = 0;
+
+  while (wantsLive(id)) {
+    const long = livePrimary(id);
+    const ws = state.sel.node === id && state.sel.ws ? state.sel.ws : '';
+    const ctl = new AbortController();
+    d.liveAbort = ctl;
+    try {
+      const snap = await api(id).get('/api/live?since=' + d.rev + '&wait=' + (long ? 20000 : 0) +
+        (ws ? '&workspace=' + enc(ws) : ''), { signal: ctl.signal });
+      fails = 0;
+      if (!d.linkOk) { d.linkOk = true; }
+      applyLive(id, snap);
+      if (!long) await sleep(5000);
+    } catch (e) {
+      if (e.name === 'AbortError') continue;      // the selection changed: ask again with the new workspace
+      fails++;
+      d.linkOk = false;
+      updateLamps();
+      if (e.status === 404 && fails > 1) break;   // a node without the live feed
+      await sleep(Math.min(15000, 1500 * fails));
+    }
+  }
+  d.liveRunning = false;
+  d.liveAbort = null;
+}
+
+function restartLive(id) {
+  const d = state.nodeData[id];
+  if (d && d.liveAbort) d.liveAbort.abort();
+}
+
+function applyLive(id, snap) {
+  if (!snap || typeof snap !== 'object') return;
+  const d = nd(id);
+  d.rev = num(snap.rev);
+  d.sessions = arr(snap.sessions).map((s) => Object.assign({}, s, { id: String(s.id) }));
+  if (snap.stats) d.stats = snap.stats;
+  if (snap.settings) d.settings = snap.settings;
+
+  if (num(snap.tree_rev) !== d.treeRev) {
+    const first = d.treeRev < 0;
+    d.treeRev = num(snap.tree_rev);
+    if (!first || (!d.loaded && !d.loading)) loadNode(id);
   }
 
-  globalBtn.classList.remove('active');
+  if (id === 'local' && snap.peers_rev != null && num(snap.peers_rev) !== state.peersRev) loadNodes();
 
-  const ws = state.selectedWorkspace;
-  if (!ws) {
-    $('workspaceBreadcrumb').textContent = 'projects';
-    $('workspaceTitle').textContent = 'No project selected';
-    $('workspaceMeta').textContent = '';
-    return;
+  if (num(snap.notifications) !== d.notifCount) {
+    const first = d.notifCount < 0;
+    d.notifCount = num(snap.notifications);
+    loadNotifications(id, !first);
   }
 
-  const parent = ws.parent && String(ws.parent) !== 'root' ? state.byId[ws.parent] : null;
-  $('workspaceBreadcrumb').textContent = parent ? parent.name + ' / ' + (ws.name || ws.id) : (ws.name || ws.id);
-  $('workspaceTitle').textContent = ws.name || ws.id;
-  $('workspaceMeta').textContent =
-    (ws.path || '') + ' - ' + state.sessions.length + ' session' + (state.sessions.length === 1 ? '' : 's');
-}
-
-function sumTokens(x) {
-  if (Array.isArray(x)) return x.reduce((sum, item) => sum + sumTokens(item), 0);
-  if (x && typeof x === 'object') return Object.values(x).reduce((sum, item) => sum + sumTokens(item), 0);
-  return num(x);
-}
-
-function tokenMap() {
-  const map = state.stats && state.stats.token_usage;
-  return map && typeof map === 'object' && !Array.isArray(map) ? map : {};
-}
-
-function syncSessionTokens() {
-  const map = tokenMap();
-  const apply = (list) => {
-    if (!Array.isArray(list)) return;
-    list.forEach((session) => {
-      if (!session || session.id == null) return;
-      if (Object.prototype.hasOwnProperty.call(map, session.id)) {
-        session.token_usage = num(map[session.id]);
+  if (state.sel.node === id) {
+    // the open session: its status / title / tokens as the node has them
+    if (state.session) {
+      const live = d.sessions.find((s) => s.id === state.session.id);
+      if (!live) {
+        // deleted somewhere else
+        toast('The session was deleted.', 'warn');
+        state.sel.session = null;
+        state.session = null;
+        closeStream();
+        renderChatEmpty();
+      } else {
+        state.session.title = live.title;
+        state.session.token_usage = live.token_usage;
+        state.session.mode = live.mode;
+        // the stream owns the status while it is open; without one (a finished session
+        // that another page or a gateway continued) the feed brings it back to life
+        if (!state.stream && state.session.status !== live.status) {
+          state.session.status = live.status;
+          if (isActive(live.status)) reloadSession();
+        }
       }
-    });
-  };
-
-  Object.values(state.workspaceSessions).forEach(apply);
-  apply(state.sessions);
-  if (state.session && state.session.id != null && Object.prototype.hasOwnProperty.call(map, state.session.id)) {
-    state.session.token_usage = num(map[state.session.id]);
+    }
+    if (state.tab === 'tasks' && state.view === 'workspace') {
+      if (num(snap.goals_rev) !== d.goalsRev) d.goalsRev = num(snap.goals_rev);
+      scheduleTasks();
+    }
   }
+  if (state.view === 'globalTasks') scheduleGlobalTasks();
+
+  renderTree();
+  renderStats();
+  renderHeader();
+  renderSessionHeader();
 }
 
-function updateSessionTokenLabels() {
-  const map = tokenMap();
-  document.querySelectorAll('.session-item').forEach((item) => {
-    const sessionId = item.dataset.sessionId;
-    if (!sessionId || !Object.prototype.hasOwnProperty.call(map, sessionId)) return;
-    const chip = item.querySelector('.session-tokens');
-    if (chip) chip.textContent = fmtNum(map[sessionId]) + ' tok';
+/* ── the tree: nodes › workspaces › sessions ── */
+function renderTree() {
+  const host = $('nodeTree');
+  const online = state.nodes.filter((n) => n.online && n.kind === 'node').length;
+  setText($('nodeCount'), state.nodes.length ? online + ' online' : '');
+
+  reconcile(host, state.nodes, (n) => n.id, () => {
+    const box = el('div', 'tree-node');
+    box.innerHTML = '<div class="tree-row node-row"></div><div class="tree-children"></div>';
+    return box;
+  }, (box, n) => {
+    const d = nd(n.id);
+    const isNode = n.kind === 'node';
+    const open = isNode && state.openNodes.has(n.id);
+    const busy = d.sessions.some((s) => isGenerating(s.status)) || (!d.loaded && truthy(n.busy));
+    setClass(box, 'tree-node' + (open ? ' is-open' : '') + (n.online ? '' : ' offline'));
+    box.dataset.node = n.id;
+
+    const row = box.children[0];
+    const sub = !isNode ? 'gateway' : (n.model ? clip(n.model, 18) : '');
+    setHtml(row,
+      '<button class="tree-main" data-act="toggle-node" title="' + esc(nodeTitle(n)) + '">' +
+        '<i class="fa-solid fa-chevron-right tree-caret' + (isNode ? '' : ' leaf') + '"></i>' +
+        '<span class="node-dot' + (n.online ? (busy ? ' busy' : ' online') : '') + '"></span>' +
+        '<span class="tree-name">' + esc(n.name || n.id) + '</span>' +
+        (n.local ? '<span class="badge local">this node</span>' : '') +
+        (!isNode ? '<span class="badge gateway">gateway</span>' : '') +
+        (!n.online ? '<span class="badge off">offline</span>' : '') +
+        (isNode && n.online && !n.local && sub ? '<span class="tree-sub">' + esc(sub) + '</span>' : '') +
+      '</button>' +
+      (isNode && n.online ? '<span class="tree-actions">' +
+        '<button class="tree-action" data-act="add-ws" title="New workspace on ' + esc(n.name) + '">' + icon('folder-plus') + '</button>' +
+      '</span>' : ''));
+
+    const kids = box.children[1];
+    kids.hidden = !open;
+    if (!open) return;
+
+    if (!n.api && !n.local) { renderNote(kids, 'This node runs an older version: it has no API over ShizoNet.', true); return; }
+    if (d.error && !d.loaded) { renderNote(kids, 'Could not load: ' + d.error, true); return; }
+    if (!d.loaded) { renderNote(kids, 'Loading…'); return; }
+
+    const items = [];
+    if (d.general) items.push({ type: 'w', ws: d.general, general: true });
+    childWorkspaces(n.id, '').forEach((w) => items.push({ type: 'w', ws: w }));
+    renderWorkspaceList(kids, n.id, items);
+    if (!items.length) renderNote(kids, 'No workspaces yet. Add one with the folder button.');
+  });
+
+  if (!state.nodes.length) host.innerHTML = '<div class="tree-note">Looking for nodes…</div>';
+}
+
+function nodeTitle(n) {
+  const parts = [n.name || n.id];
+  if (n.description) parts.push(n.description);
+  if (n.model) parts.push('model: ' + n.model);
+  if (n.ip) parts.push(n.ip);
+  if (!n.online) parts.push('offline');
+  return parts.join('\n');
+}
+
+function renderNote(kids, text, error) {
+  let note = kids.querySelector(':scope > .tree-note');
+  Array.from(kids.children).forEach((c) => { if (c !== note) c.remove(); });
+  if (!note) { note = el('div', 'tree-note'); kids.appendChild(note); }
+  setClass(note, 'tree-note' + (error ? ' error' : ''));
+  setText(note, text);
+}
+
+// items: [{type:'w', ws, general}] or [{type:'s', s}] mixed, in the order they show
+function renderWorkspaceList(container, nodeId, items) {
+  reconcile(container, items, (it) => (it.type === 'w' ? 'w:' + it.ws.id : 's:' + it.s.id), (it) => {
+    if (it.type === 's') return el('div', 'tree-row session-row');
+    const box = el('div', 'tree-ws');
+    box.innerHTML = '<div class="tree-row ws-row"></div><div class="tree-children"></div>';
+    return box;
+  }, (node, it) => {
+    if (it.type === 's') { updateSessionRow(node, nodeId, it.s); return; }
+
+    const w = it.ws;
+    const key = wsKey(nodeId, w.id);
+    const open = state.openWs.has(key);
+    const selected = state.sel.node === nodeId && state.sel.ws === w.id;
+    const sessions = sessionsOf(nodeId, w.id);
+    const children = it.general ? [] : childWorkspaces(nodeId, w.id);
+    const running = sessions.filter((s) => isGenerating(s.status)).length;
+    const asking = sessions.filter((s) => String(s.status) === 'question').length;
+
+    setClass(node, 'tree-ws' + (open ? ' is-open' : ''));
+    const row = node.children[0];
+    setClass(row, 'tree-row ws-row' + (selected && !state.sel.session ? ' selected' : ''));
+    row.dataset.node = nodeId;
+    row.dataset.ws = w.id;
+    setHtml(row,
+      '<button class="tree-main" data-act="select-ws" title="' + esc((w.description ? w.description + '\n' : '') + (w.path || '')) + '">' +
+        '<i class="fa-solid fa-chevron-right tree-caret' + (sessions.length || children.length ? '' : ' leaf') + '"></i>' +
+        '<i class="fa-solid fa-' + (it.general ? 'home' : (open ? 'folder-open' : 'folder')) + ' tree-icon"></i>' +
+        '<span class="tree-name">' + esc(w.name || w.id) + '</span>' +
+        (running ? '<span class="status-dot running" title="' + running + ' running"></span>' : '') +
+        (asking ? '<span class="status-dot question" title="' + asking + ' need input"></span>' : '') +
+        (sessions.length ? '<span class="tree-sub">' + sessions.length + '</span>' : '') +
+      '</button>' +
+      '<span class="tree-actions">' +
+        '<button class="tree-action" data-act="add-session" title="New session in ' + esc(w.name) + '">' + icon('plus') + '</button>' +
+        (it.general ? '' : '<button class="tree-action" data-act="add-sub" title="New sub-workspace in ' + esc(w.name) + '">' + icon('folder-plus') + '</button>') +
+        (it.general ? '' : '<button class="tree-action danger" data-act="del-ws" title="' +
+          (children.length ? 'Remove its sub-workspaces first' : 'Remove ' + esc(w.name) + ' from this node (its files stay on disk)') + '"' +
+          (children.length ? ' disabled' : '') + '>' + icon('trash') + '</button>') +
+      '</span>');
+
+    const kids = node.children[1];
+    kids.hidden = !open;
+    if (!open) return;
+    const sub = sessions.map((s) => ({ type: 's', s })).concat(children.map((c) => ({ type: 'w', ws: c })));
+    renderWorkspaceList(kids, nodeId, sub);
   });
 }
 
-function updateConsoleLamps() {
-  const statuses = state.stats && state.stats.session_status && typeof state.stats.session_status === 'object'
-    ? state.stats.session_status
-    : {};
-  let active = 0;
-  let busy = 0;
-  let warn = 0;
+function updateSessionRow(row, nodeId, s) {
+  const selected = state.sel.node === nodeId && state.sel.session === s.id;
+  const gen = isGenerating(s.status);
+  setClass(row, 'tree-row session-row' + (selected ? ' selected' : ''));
+  row.dataset.node = nodeId;
+  row.dataset.ws = s.workspace_id;
+  row.dataset.session = s.id;
+  setHtml(row,
+    '<button class="tree-main" data-act="select-session" title="' + esc((s.title || 'Session') + '\n' + statusLabel(s.status) + (s.mode === 'goal' ? ' · loop' : '')) + '">' +
+      '<span class="status-dot ' + (gen ? 'running' : statusClass(s.status)) + '"></span>' +
+      '<span class="tree-name">' + esc(s.title || 'Session') + '</span>' +
+      '<span class="tree-sub">' + (num(s.token_usage) ? fmtTokens(s.token_usage) : '') + '</span>' +
+    '</button>' +
+    '<span class="tree-actions">' +
+      '<button class="tree-action danger" data-act="del-session" title="Delete this session and its chat">' + icon('trash') + '</button>' +
+    '</span>');
+}
 
-  Object.values(statuses).forEach((status) => {
-    const s = String(status || '').toLowerCase();
-    if (s === 'running' || s === 'generating' || s === 'starting' || s === 'waiting' || s === 'planned') busy++;
-    if (s === 'question' || s === 'failed' || s === 'error' || s === 'cancelled') warn++;
-    if (s === 'running' || s === 'generating' || s === 'question' || s === 'done' || s === 'failed') active++;
-  });
+/* ── selection ── */
+function saveSelection() {
+  store('sel', JSON.stringify(state.sel));
+  store('open_nodes', JSON.stringify(Array.from(state.openNodes)));
+  store('open_ws', JSON.stringify(Array.from(state.openWs)));
+}
 
-  if (!active) active = state.sessions.length;
-  const st = state.stats || {};
-  busy = Math.max(busy, num(st.running_processes ?? st.running ?? st.processes ?? 0));
+function clearSelection() {
+  const node = state.sel.node;
+  state.sel = { node: null, ws: null, session: null };
+  state.session = null;
+  state.selGen++;
+  closeStream();
+  showView('welcome');
+  saveSelection();
+  if (node) restartLive(node);
+}
 
-  [['lampPower', true], ['lampLink', active > 0], ['lampBusy', busy > 0], ['lampWarn', warn > 0]]
-    .forEach(([id, on]) => {
-      const lamp = $(id);
-      if (lamp) lamp.classList.toggle('on', on);
-    });
+async function selectWorkspace(nodeId, wsId, keepSession) {
+  const changedNode = state.sel.node !== nodeId;
+  const previous = state.sel.node;
+  state.sel = { node: nodeId, ws: wsId, session: keepSession || null };
+  state.selGen++;
+  state.openNodes.add(nodeId);
+  if (!keepSession) {
+    state.session = null;
+    closeStream();
+    renderChatEmpty();
+  }
+  state.taskSig = '';
+  saveSelection();
+  ensureNode(nodeId);
+  if (changedNode && previous) restartLive(previous);
+  restartLive(nodeId);
+  showView('workspace');
+  renderTree();
+  renderStats();
+  renderSessionHeader();
+  if (state.tab === 'tasks') loadTasks();
+  if (state.tab === 'architecture') loadArchitecture();
+}
+
+async function selectSession(nodeId, wsId, sessionId) {
+  if (state.sel.node !== nodeId || state.sel.ws !== wsId) await selectWorkspace(nodeId, wsId, sessionId);
+  state.sel.session = sessionId;
+  state.openWs.add(wsKey(nodeId, wsId));
+  saveSelection();
+  if (state.tab !== 'chat') showTab('chat');
+  renderTree();
+  await openSession(sessionId);
+}
+
+/* ── header / stats ── */
+function renderHeader() {
+  if (state.view === 'globalTasks') {
+    setText($('breadcrumb'), 'all nodes');
+    setText($('pageTitle'), 'All tasks');
+    setText($('pageMeta'), 'Scheduled goals and sessions of every workspace of every online node');
+    return;
+  }
+  const n = state.sel.node ? nodeById(state.sel.node) : null;
+  const w = n ? workspaceOf(n.id, state.sel.ws) : null;
+  if (!n || !w) {
+    setText($('breadcrumb'), 'nodes');
+    setText($('pageTitle'), 'miniagent');
+    const online = state.nodes.filter((x) => x.online && x.kind === 'node').length;
+    setText($('pageMeta'), state.nodes.length ? online + ' node' + (online === 1 ? '' : 's') + ' online' : '');
+    return;
+  }
+  const d = nd(n.id);
+  const parent = w.parent && String(w.parent) !== 'root' ? d.byId[w.parent] : null;
+  setText($('breadcrumb'), (n.name || n.id) + (parent ? ' / ' + parent.name : ''));
+  setText($('pageTitle'), w.name || w.id);
+  const count = sessionsOf(n.id, w.id).length;
+  setText($('pageMeta'), (w.path || '') + '  ·  ' + count + ' session' + (count === 1 ? '' : 's'));
+}
+
+function sumTokens(map) {
+  let t = 0;
+  if (map && typeof map === 'object') Object.values(map).forEach((v) => { t += num(v); });
+  return t;
 }
 
 function renderStats() {
-  const st = state.stats || {};
-  const sessionTokens = state.sessions.reduce((sum, s) => sum + num(s.token_usage), 0);
-  const tokens = sumTokens(st.token_usage ?? st.total_token_usage ?? st.total_tokens ?? st.tokens ?? sessionTokens);
-  const active = num(st.active_sessions ?? st.active ?? st.sessions_active ?? state.sessions.filter((s) => isRunningStatus(s.status)).length);
-  const running = num(st.running_processes ?? st.running ?? st.processes ?? 0);
-  const max = num(state.settings.max_sessions) || 0;
+  const id = state.sel.node || 'local';
+  const n = nodeById(id);
+  const d = nd(id);
+  const st = d.stats || {};
+  const tokens = sumTokens(st.token_usage);
+  const active = num(st.active_sessions);
+  const max = num(d.settings && d.settings.max_sessions) || num(st.max_sessions);
 
-  $('statsBody').innerHTML =
-    '<div class="stat-line"><span>Active sessions</span><b>' + active + '</b></div>' +
-    '<div class="stat-line"><span>Running processes</span><b>' + running + '</b></div>' +
-    '<div class="stat-line"><span>Token usage</span><b>' + fmtNum(tokens) + '</b></div>' +
-    '<div class="stat-line"><span>Max sessions</span><b>' + max + '</b></div>';
+  setHtml($('statsPanel'),
+    '<div class="stat-cell"><span>Node</span><b title="' + esc(n ? n.name : '') + '">' + esc(clip(n ? n.name : '—', 12)) + '</b></div>' +
+    '<div class="stat-cell"><span>Sessions</span><b>' + active + ' / ' + (max || '—') + '</b></div>' +
+    '<div class="stat-cell"><span>Processes</span><b>' + num(st.running_processes) + '</b></div>' +
+    '<div class="stat-cell"><span>Tokens</span><b>' + fmtTokens(tokens) + '</b></div>');
 
-  $('headerStats').innerHTML =
-    '<span class="stat-chip"><i class="fa-solid fa-bolt"></i> <b>' + fmtNum(tokens) + '</b> tok</span>' +
-    '<span class="stat-chip">active <b>' + active + '</b></span>' +
-    '<span class="stat-chip">running <b>' + running + '</b></span>' +
-    '<span class="stat-chip">max <b>' + max + '</b></span>';
-  updateConsoleLamps();
+  setHtml($('headerStats'),
+    '<span class="stat-chip">' + icon('bolt') + ' <b>' + fmtTokens(tokens) + '</b> tok</span>' +
+    '<span class="stat-chip">active <b>' + active + '</b> / ' + (max || '—') + '</span>');
+  updateLamps();
 }
 
-function updateSessionActivity() {
-  const statuses = state.stats.session_status || {};
-  document.querySelectorAll('.session-item').forEach((item) => {
-    const status = String(statuses[item.dataset.sessionId] || item.dataset.status || '').toLowerCase();
-    const generating = status === 'running';
-    item.dataset.status = status;
-    item.title = generating ? 'Agent is generating a reply' : statusLabel(status);
-    const dot = item.querySelector('.status-dot');
-    if (dot) dot.className = 'status-dot ' + (generating ? 'generating' : statusClass(status));
-    let activity = item.querySelector('.session-activity');
-    if (generating && !activity) {
-      activity = document.createElement('span');
-      activity.className = 'session-activity';
-      activity.textContent = 'GENERATING';
-      const tokens = item.querySelector('.session-tokens');
-      item.insertBefore(activity, tokens || null);
-    } else if (!generating && activity) {
-      activity.remove();
+function updateLamps() {
+  let busy = false;
+  let warn = false;
+  Object.keys(state.nodeData).forEach((id) => {
+    const d = state.nodeData[id];
+    if (!wantsLive(id)) return;
+    if (!d.linkOk) warn = true;
+    d.sessions.forEach((s) => {
+      if (isGenerating(s.status)) busy = true;
+      if (String(s.status) === 'question') warn = true;
+    });
+  });
+  $('lampLink').classList.toggle('on', nd('local').linkOk && state.nodes.length > 0);
+  $('lampBusy').classList.toggle('on', busy);
+  $('lampWarn').classList.toggle('on', warn);
+}
+
+/* ── views / tabs ── */
+function showView(view) {
+  state.view = view;
+  $('workspaceView').classList.toggle('hidden', view !== 'workspace');
+  $('globalTasksView').classList.toggle('hidden', view !== 'globalTasks');
+  $('welcomeView').classList.toggle('hidden', view !== 'welcome');
+  $('btnGlobalTasks').classList.toggle('active', view === 'globalTasks');
+  renderHeader();
+}
+
+function showTab(tab) {
+  state.tab = tab;
+  store('tab', tab);
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  $('tabChat').classList.toggle('hidden', tab !== 'chat');
+  $('tabTasks').classList.toggle('hidden', tab !== 'tasks');
+  $('tabArchitecture').classList.toggle('hidden', tab !== 'architecture');
+  if (tab === 'tasks') { state.taskSig = ''; loadTasks(); }
+  if (tab === 'architecture') loadArchitecture();
+  if (tab === 'chat') scrollChat(true);
+}
+
+/* ══ chat ══════════════════════════════════════════════════════════════════ */
+
+/* What is in the chat pane is a list of items, the same for a transcript that is read
+ * from chat.json, for the running turn the node hands over (session.turn) and for the
+ * events of the stream:
+ *   user | text | reasoning | tool | report | error | notice | milestone
+ * A reasoning item and a tool item are one line that opens: the preview stays small,
+ * the whole reasoning / every parameter and the result are one click away. */
+const chat = {
+  textEl: null, textRaw: '', textTimer: 0,
+  reasonEl: null,
+  tools: new Map(),          // tool id -> element
+  stick: true,
+  earlier: [],               // items of the transcript that are not drawn yet (older ones)
+};
+
+const SYSTEM_MARKS = ['<---SYTEM MESSAGE--->', '<!---SYTEM MESSAGE---!>'];
+const PAGE_ITEMS = 160;
+
+function chatBox() { return $('chatMessages'); }
+
+function chatReset() {
+  chatBox().innerHTML = '';
+  chat.textEl = null; chat.textRaw = '';
+  chat.reasonEl = null;
+  chat.tools = new Map();
+  chat.earlier = [];
+  chat.stick = true;
+  $('btnScrollDown').classList.add('hidden');
+}
+
+function renderChatEmpty() {
+  chatReset();
+  const w = state.sel.node ? workspaceOf(state.sel.node, state.sel.ws) : null;
+  const box = el('div', 'empty-state');
+  box.innerHTML = icon('comments') +
+    '<div class="empty-title">' + (w ? 'New session in ' + esc(w.name) : 'No workspace selected') + '</div>' +
+    '<div>' + (w ? 'Write a prompt below to start one, or pick a session in the sidebar.' : 'Pick a workspace in the sidebar.') + '</div>';
+  chatBox().appendChild(box);
+}
+
+function nearBottom() {
+  const b = chatBox();
+  return b.scrollHeight - b.scrollTop - b.clientHeight < 90;
+}
+function scrollChat(force) {
+  const b = chatBox();
+  if (force || chat.stick) { b.scrollTop = b.scrollHeight; chat.stick = true; $('btnScrollDown').classList.add('hidden'); }
+  else $('btnScrollDown').classList.remove('hidden');
+}
+
+function appendMsg(node, before) {
+  const empty = chatBox().querySelector(':scope > .empty-state');
+  if (empty) empty.remove();
+  if (before) chatBox().insertBefore(node, before);
+  else chatBox().appendChild(node);
+  return node;
+}
+
+function endRun() {           // what follows starts a new text / reasoning block
+  flushText();
+  chat.textEl = null; chat.textRaw = '';
+  if (chat.reasonEl) chat.reasonEl.classList.remove('live');
+  chat.reasonEl = null;
+}
+
+function addUser(text, before) {
+  if (!text) return null;
+  if (!before) endRun();
+  const m = el('div', 'msg user');
+  m.innerHTML = '<div class="msg-label"><span>You</span></div><div class="msg-body"></div>';
+  m.lastChild.textContent = text;
+  return appendMsg(m, before);
+}
+
+function makeText(text, before) {
+  const m = el('div', 'msg agent');
+  m.innerHTML = '<div class="msg-label"><span>Agent</span></div><div class="msg-body"></div>';
+  m.lastChild.innerHTML = mdRender(text);
+  return appendMsg(m, before);
+}
+
+function addTextDelta(text) {
+  if (!text) return;
+  if (chat.reasonEl) { chat.reasonEl.classList.remove('live'); chat.reasonEl = null; }
+  if (!chat.textEl) {
+    chat.textEl = makeText('');
+    chat.textRaw = '';
+  }
+  chat.textRaw += text;
+  // markdown of the whole block again per token is quadratic: draw at most every 70 ms
+  if (!chat.textTimer) chat.textTimer = setTimeout(flushText, 70);
+}
+
+function flushText() {
+  if (chat.textTimer) { clearTimeout(chat.textTimer); chat.textTimer = 0; }
+  if (chat.textEl) {
+    chat.textEl.lastChild.innerHTML = mdRender(chat.textRaw);
+    scrollChat();
+  }
+}
+
+/* the sentence that is being thought right now (the preview line of a reasoning block) */
+function lastSentence(text) {
+  const t = oneLine(text);
+  if (!t) return '';
+  const tail = t.length > 600 ? t.slice(-600) : t;
+  const parts = tail.split(/(?<=[.!?])\s+/);
+  let s = parts[parts.length - 1];
+  if (s.length < 24 && parts.length > 1) s = parts[parts.length - 2] + ' ' + s;
+  return clip(s, 220);
+}
+
+function makeReasoning(text, before, live) {
+  const m = el('div', 'msg reasoning' + (live ? ' live' : ''));
+  m.innerHTML =
+    '<button class="detail-head" data-act="toggle-detail" title="Show the whole reasoning">' +
+      '<i class="fa-solid fa-chevron-right detail-caret"></i>' +
+      '<span class="detail-kind">' + icon('brain') + ' Reasoning</span>' +
+      '<span class="detail-preview"></span>' +
+      '<span class="detail-meta"></span>' +
+      '<span class="detail-open" data-act="open-detail" title="Open in a window">' + icon('expand') + '</span>' +
+    '</button>' +
+    '<div class="detail-body"></div>';
+  m._kind = 'reasoning';
+  m._text = text || '';
+  paintReasoning(m);
+  return appendMsg(m, before);
+}
+
+function paintReasoning(m) {
+  m.querySelector('.detail-preview').textContent = lastSentence(m._text);
+  m.querySelector('.detail-meta').textContent = fmtNum(m._text.length) + ' chars';
+  if (m.classList.contains('open')) fillDetail(m);
+}
+
+function addReasoningDelta(text) {
+  if (!text) return;
+  flushText();
+  chat.textEl = null; chat.textRaw = '';
+  if (!chat.reasonEl) chat.reasonEl = makeReasoning('', null, true);
+  chat.reasonEl._text += text;
+  if (!chat.reasonEl._raf) {
+    const m = chat.reasonEl;
+    m._raf = requestAnimationFrame(() => { m._raf = 0; paintReasoning(m); scrollChat(); });
+  }
+}
+
+/* a tool call: {id, name, args, state: running|ok|failed, result, sub, elapsed} */
+const HIDDEN_ARGS = ['tool_call', 'tool_call_index'];
+
+function cleanArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return {};
+  const out = {};
+  Object.keys(args).forEach((k) => { if (!HIDDEN_ARGS.includes(k)) out[k] = args[k]; });
+  return out;
+}
+
+function argSummary(args) {
+  const keys = Object.keys(args);
+  if (!keys.length) return '';
+  const first = ['path', 'file', 'command', 'name', 'target', 'goal', 'query', 'url', 'node', 'workspace', 'taskid', 'signal', 'source'];
+  const ordered = keys.slice().sort((a, b) => {
+    const ia = first.indexOf(a); const ib = first.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  return ordered.slice(0, 3).map((k) => {
+    const v = args[k];
+    const s = typeof v === 'string' ? v : JSON.stringify(v);
+    return k + ': ' + clip(oneLine(s), 70);
+  }).join('   ');
+}
+
+function toolError(t) {
+  const r = t.result;
+  if (r && typeof r === 'object' && !Array.isArray(r)) {
+    if (r.error && (r.ok === false || r.ok === 0 || r.ok === undefined)) return String(r.error);
+  }
+  return '';
+}
+
+function makeTool(t, before) {
+  const m = el('div', 'msg tool');
+  m.innerHTML =
+    '<button class="detail-head" data-act="toggle-detail" title="Show the parameters and the result">' +
+      '<i class="fa-solid fa-chevron-right detail-caret"></i>' +
+      '<span class="detail-kind">' + icon('wrench') + '</span>' +
+      '<span class="tool-name"></span>' +
+      '<span class="detail-preview"></span>' +
+      '<span class="detail-meta"></span>' +
+      '<span class="tool-state"></span>' +
+      '<span class="detail-open" data-act="open-detail" title="Open in a window">' + icon('expand') + '</span>' +
+    '</button>' +
+    '<div class="detail-body"></div>';
+  m._kind = 'tool';
+  m._tool = Object.assign({ state: 'running' }, t, { args: cleanArgs(t.args) });
+  paintTool(m);
+  return appendMsg(m, before);
+}
+
+function paintTool(m) {
+  const t = m._tool;
+  const err = t.state === 'failed' ? toolError(t) : '';
+  setClass(m, 'msg tool' + (t.sub ? ' sub' : '') + (t.state === 'ok' ? ' ok' : '') + (t.state === 'failed' ? ' failed' : '') +
+    (m.classList.contains('open') ? ' open' : ''));
+  m.querySelector('.tool-name').textContent = (t.sub ? 'sub-agent · ' : '') + (t.name || 'tool');
+  m.querySelector('.detail-preview').textContent = err ? clip(oneLine(err), 160) : argSummary(t.args);
+  m.querySelector('.detail-preview').classList.toggle('tool-error', !!err);
+  m.querySelector('.detail-meta').textContent = t.elapsed || '';
+  m.querySelector('.tool-state').textContent = t.state === 'running' ? 'running' : (t.state === 'failed' ? 'failed' : 'done');
+  if (m.classList.contains('open')) fillDetail(m);
+}
+
+function toolStart(t, sub) {
+  endRun();
+  const m = makeTool({ id: String(t.id || ''), name: t.name, args: t.args, state: 'running', sub: !!sub });
+  if (t.id) chat.tools.set(String(t.id), m);
+  scrollChat();
+}
+
+function toolEnd(t) {
+  const id = String(t.id || '');
+  let m = chat.tools.get(id);
+  if (!m) {
+    // the start was before this page connected
+    m = makeTool({ id, name: t.name, args: {}, state: 'running' });
+  }
+  const res = t.result;
+  let failed = false;
+  if (res && typeof res === 'object' && !Array.isArray(res) && res.error && (res.ok === false || res.ok === 0)) failed = true;
+  m._tool.result = res;
+  m._tool.result_truncated = truthy(t.result_truncated);
+  m._tool.state = failed ? 'failed' : 'ok';
+  chat.tools.delete(id);
+  paintTool(m);
+}
+
+/* the body of an opened reasoning / tool item (made when it is opened, not before) */
+function valueText(v) {
+  if (typeof v === 'string') return v;
+  try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
+}
+
+function detailHtml(m) {
+  if (m._kind === 'reasoning') return '<pre class="reasoning-text">' + esc(m._text) + '</pre>';
+
+  const t = m._tool;
+  const keys = Object.keys(t.args || {});
+  let html = '<div class="kv-title">Parameters</div>';
+  if (!keys.length) html += '<div class="form-hint">none</div>';
+  else {
+    html += '<dl class="kv">';
+    keys.forEach((k) => {
+      const s = valueText(t.args[k]);
+      const long = s.length > 90 || s.includes('\n');
+      html += '<dt>' + esc(k) + '</dt><dd' + (long ? ' class="long"' : '') + '>' + esc(s) + '</dd>';
+    });
+    html += '</dl>';
+  }
+  if (t.state === 'running') {
+    html += '<div class="kv-title">Result</div><div class="form-hint">running…</div>';
+  } else if (t.result !== undefined && t.result !== null) {
+    html += '<div class="kv-title">Result' + (t.result_truncated ? ' (a long result: its head and tail)' : '') + '</div>' +
+      '<pre class="block' + (t.state === 'failed' ? ' tool-error' : '') + '">' + esc(valueText(t.result)) + '</pre>';
+  }
+  return html;
+}
+
+function fillDetail(m) {
+  const body = m.querySelector('.detail-body');
+  const html = detailHtml(m);
+  if (body._html !== html) {
+    const pre = body.querySelector('pre');
+    const atEnd = pre ? pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40 : true;
+    body.innerHTML = html;
+    body._html = html;
+    const now = body.querySelector('pre');
+    if (now && atEnd && m.classList.contains('live')) now.scrollTop = now.scrollHeight;
+  }
+}
+
+function detailPlain(m) {
+  if (m._kind === 'reasoning') return m._text;
+  const t = m._tool;
+  let out = (t.name || 'tool') + '\n\nParameters:\n' + valueText(t.args);
+  if (t.result !== undefined && t.result !== null) out += '\n\nResult:\n' + valueText(t.result);
+  return out;
+}
+
+function openDetailDialog(m) {
+  $('detailTitle').innerHTML = m._kind === 'reasoning'
+    ? icon('brain') + ' <span>Reasoning</span>'
+    : icon('wrench') + ' <span>' + esc((m._tool.sub ? 'sub-agent · ' : '') + (m._tool.name || 'tool')) + '</span>';
+  $('detailBody').innerHTML = detailHtml(m);
+  $('detailDialog')._plain = detailPlain(m);
+  openDialog('detailDialog');
+}
+
+function addReport(text, status, before) {
+  if (!text) return null;
+  if (!before) endRun();
+  const st = String(status || 'finished');
+  const cls = st === 'failed' ? ' failed' : st === 'question' ? ' question' : st === 'stopped' ? ' failed' : '';
+  const label = st === 'failed' ? 'Failed' : st === 'question' ? 'Question' : st === 'stopped' ? 'Stopped' : 'Report';
+  const m = el('div', 'msg report' + cls);
+  m.innerHTML = '<div class="msg-label"><span>' + label + '</span></div><div class="msg-body">' + mdRender(text) + '</div>';
+  return appendMsg(m, before);
+}
+
+function addError(text, before) {
+  if (!before) endRun();
+  const m = el('div', 'msg error');
+  m.innerHTML = '<div class="msg-label"><span>Error</span></div><div class="msg-body"></div>';
+  m.lastChild.textContent = text;
+  return appendMsg(m, before);
+}
+
+function addNotice(text, before) {
+  if (!text) return null;
+  if (!before) endRun();
+  return appendMsg(el('div', 'msg notice', text), before);
+}
+
+/* one item of a transcript (not streamed) */
+function drawItem(it, before) {
+  if (it.kind === 'user') return addUser(it.text, before);
+  if (it.kind === 'text') return it.text ? makeText(it.text, before) : null;
+  if (it.kind === 'reasoning') return it.text ? makeReasoning(it.text, before, false) : null;
+  if (it.kind === 'tool') return makeTool(it, before);
+  if (it.kind === 'report') return addReport(it.text, it.status, before);
+  if (it.kind === 'error') return addError(it.text, before);
+  if (it.kind === 'notice' || it.kind === 'milestone') return addNotice(it.text, before);
+  return null;
+}
+
+/* chat.json -> items */
+function contentText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter((p) => p && typeof p.text === 'string').map((p) => p.text).join('');
+}
+
+function userText(text) {
+  // the harness's own prompts are not the user's: a finalize reminder is dropped, a
+  // handover that was appended to the task is cut off
+  let t = String(text || '');
+  let cut = -1;
+  SYSTEM_MARKS.forEach((mark) => { const i = t.indexOf(mark); if (i >= 0 && (cut < 0 || i < cut)) cut = i; });
+  if (cut === 0) return '';
+  if (cut > 0) t = t.slice(0, cut);
+  return t.trim();
+}
+
+function parseArgs(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  try { const v = JSON.parse(String(raw || '{}')); return v && typeof v === 'object' ? v : { value: v }; } catch (e) { return { arguments: String(raw || '') }; }
+}
+
+// a tool message: "Time: ...\nTotal Elapsed Time: 2 Seconds\n\n<result>"
+function parseToolResult(content) {
+  let text = contentText(content);
+  let elapsed = '';
+  const m = text.match(/^Time: [^\n]*\nTotal Elapsed Time: ([^\n]*)\n\n?/);
+  if (m) { elapsed = m[1].replace(/ Seconds?/, ' s').replace(/ Minutes?/, ' min'); text = text.slice(m[0].length); }
+  let value = text;
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try { value = JSON.parse(trimmed); } catch (e) { value = text; }
+  }
+  return { value, elapsed };
+}
+
+function historyItems(messages) {
+  const items = [];
+  const byCall = {};
+  messages.forEach((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.role === 'user') {
+      const t = userText(contentText(msg.content));
+      if (t) items.push({ kind: 'user', text: t });
+    } else if (msg.role === 'assistant') {
+      if (msg.reasoning_content) items.push({ kind: 'reasoning', text: String(msg.reasoning_content) });
+      const t = contentText(msg.content);
+      if (t && t.trim()) items.push({ kind: 'text', text: t });
+      arr(msg.tool_calls).forEach((c) => {
+        const fn = (c && c.function) || {};
+        const it = { kind: 'tool', id: String(c.id || ''), name: fn.name || 'tool', args: parseArgs(fn.arguments), state: 'ok', result: undefined };
+        items.push(it);
+        if (c.id) byCall[String(c.id)] = it;
+      });
+    } else if (msg.role === 'tool') {
+      const it = byCall[String(msg.tool_call_id || '')];
+      const r = parseToolResult(msg.content);
+      if (it) {
+        it.result = r.value;
+        it.elapsed = r.elapsed;
+        const v = r.value;
+        if (v && typeof v === 'object' && !Array.isArray(v) && v.error && (v.ok === false || v.ok === 0)) it.state = 'failed';
+      }
     }
   });
-  updateConsoleLamps();
+  return items;
 }
 
-async function refreshStats() {
-  const data = await NodeApi.get('/api/stats');
-  state.stats = data && typeof data === 'object' ? data : {};
-  syncSessionTokens();
-  renderStats();
-  updateSessionActivity();
-  updateSessionTokenLabels();
+/* the whole session into the pane */
+function renderSession(session) {
+  chatReset();
+  const hist = Array.isArray(session.chat_history) ? session.chat_history : arr(session.chat_history);
+  const turn = arr(session.turn);
+  const cutAt = Math.min(hist.length, Math.max(0, num(session.chat_history_size_at_prompt)));
+  const terminal = isTerminal(session.status);
+  const saved = hist.slice(cutAt);
+
+  let items;
+  if (terminal && saved.length) {
+    // the turn has ended and chat.json has all of it
+    items = historyItems(hist);
+  } else if (turn.length) {
+    // the turn runs (or its end was not saved): the earlier turns from chat.json,
+    // this one as the node folded it from the stream
+    items = historyItems(hist.slice(0, cutAt)).concat(turn.map((t) => Object.assign({}, t, { sub: truthy(t.sub) })));
+  } else {
+    items = historyItems(hist);
+    if (session.prompt && !items.some((i) => i.kind === 'user' && i.text === userText(session.prompt)) && !saved.length) {
+      items.push({ kind: 'user', text: userText(session.prompt) });
+    }
+  }
+
+  if (terminal && session.report) items.push({ kind: 'report', text: session.report, status: session.status === 'done' ? 'finished' : session.status });
+  else if (terminal && session.error) items.push({ kind: 'error', text: session.error });
+
+  if (!items.length) { renderChatEmpty(); return; }
+
+  // a long transcript: the newest part now, the rest on request
+  chat.earlier = items.length > PAGE_ITEMS ? items.slice(0, items.length - PAGE_ITEMS) : [];
+  const shown = items.slice(chat.earlier.length);
+  drawEarlierButton();
+  shown.forEach((it) => drawItem(it));
+
+  // a tool of the running turn that has no result yet takes its tool_end from the stream;
+  // a running reasoning / text block at the end continues with the next delta
+  if (!terminal) {
+    Array.from(chatBox().querySelectorAll('.msg.tool')).forEach((m) => {
+      if (m._tool && m._tool.state === 'running' && m._tool.id) chat.tools.set(m._tool.id, m);
+    });
+    const last = chatBox().lastElementChild;
+    const lastItem = shown[shown.length - 1];
+    if (last && lastItem && lastItem.kind === 'reasoning') { chat.reasonEl = last; last.classList.add('live'); }
+    if (last && lastItem && lastItem.kind === 'text') { chat.textEl = last; chat.textRaw = lastItem.text; }
+  }
+  scrollChat(true);
+}
+
+function drawEarlierButton() {
+  const old = chatBox().querySelector(':scope > .earlier');
+  if (old) old.remove();
+  if (!chat.earlier.length) return;
+  const b = el('button', 'btn btn-small btn-ghost earlier', 'Show ' + Math.min(PAGE_ITEMS, chat.earlier.length) + ' earlier items (' + chat.earlier.length + ' more)');
+  b.dataset.act = 'earlier';
+  b.style.alignSelf = 'center';
+  chatBox().insertBefore(b, chatBox().firstChild);
+}
+
+function showEarlier() {
+  const box = chatBox();
+  const take = chat.earlier.splice(Math.max(0, chat.earlier.length - PAGE_ITEMS));
+  const btn = box.querySelector(':scope > .earlier');
+  const anchor = btn ? btn.nextSibling : box.firstChild;
+  const before = box.scrollHeight;
+  take.forEach((it) => drawItem(it, anchor));
+  drawEarlierButton();
+  box.scrollTop += box.scrollHeight - before;
+}
+
+/* ── a session: open, stream ── */
+async function openSession(sessionId) {
+  const gen = state.selGen;
+  const nodeId = state.sel.node;
+  closeStream();
+  state.session = null;
+  state.pendingUser = null;
+  chatReset();
+  chatBox().appendChild(el('div', 'empty-state compact', 'Loading the session…'));
   renderSessionHeader();
+
+  let s = null;
+  try {
+    s = await api(nodeId).get('/api/sessions/' + enc(sessionId));
+  } catch (e) {
+    if (gen !== state.selGen || state.sel.session !== sessionId) return;
+    chatReset();
+    chatBox().appendChild(el('div', 'empty-state compact', 'Could not load the session: ' + e.message));
+    return;
+  }
+  if (gen !== state.selGen || state.sel.session !== sessionId) return;
+
+  s.id = String(s.id || sessionId);
+  state.session = s;
+  state.composerEffort = String(s.reasoning_effort || state.composerEffort);
+  renderSession(s);
+  renderSessionHeader();
+  renderTree();
+
+  // the stream continues where the answer ended
+  state.streamSince = Math.max(num(s.turn_seq), num(s.seq));
+  if (!isTerminal(s.status)) openStream();
 }
 
-/* ── Sessions ── */
-function modeLabel(mode) {
-  return mode === 'goal' ? 'Loop' : 'Normal';
+async function reloadSession() {
+  if (state.sel.session) await openSession(state.sel.session);
 }
 
-function setChatEmpty() {
-  $('chatMessages').innerHTML =
-    '<div class="empty-state">' +
-      '<i class="fa-solid fa-comments"></i>' +
-      '<div>No messages yet.</div>' +
-      '<div class="empty-state-desc">Pick a session or create one with + in the sidebar.</div>' +
-    '</div>';
-  state.currentAgentBubble = null;
-  state.currentAgentText = '';
-  resetReasoningBubble();
+function closeStream() {
+  if (state.stream) {
+    try { state.stream.close(); } catch (e) {}
+    state.stream = null;
+  }
+}
+
+function openStream() {
+  closeStream();
+  if (!state.session) return;
+  const sessionId = state.session.id;
+  const gen = state.selGen;
+  const params = new URLSearchParams();
+  params.set('since', String(state.streamSince || 0));
+  const token = NodeApi.token();
+  if (token) params.set('token', token);
+  const es = new EventSource(selApi().url('/api/sessions/' + enc(sessionId) + '/stream?' + params.toString()));
+  state.stream = es;
+
+  const mine = () => state.stream === es && gen === state.selGen && state.sel.session === sessionId;
+  ['delta', 'user', 'status', 'done', 'error', 'stats', 'file', 'notify'].forEach((name) => {
+    es.addEventListener(name, (ev) => { if (mine() && ev.data) streamEvent(name, ev.data); });
+  });
+  es.onerror = () => {
+    if (!mine()) { es.close(); return; }
+    // the server closed the stream (the turn ended) or the connection broke. An
+    // EventSource would connect again by itself with the OLD position: do it by hand.
+    es.close();
+    state.stream = null;
+    if (state.session && !isTerminal(state.session.status)) {
+      setTimeout(() => { if (gen === state.selGen && state.sel.session === sessionId && !state.stream && state.session && !isTerminal(state.session.status)) openStream(); }, 1500);
+    }
+  };
+}
+
+function applyAction(action, sub) {
+  if (!action || typeof action !== 'object') return;
+  if (action.agent && typeof action.agent === 'object') { applyAction(action.agent.action, true); return; }
+  if (action.tool_start) { toolStart(action.tool_start, sub); return; }
+  if (action.tool_end) { toolEnd(action.tool_end); return; }
+  if (sub) return;                      // the text of sub-agents would interleave
+  if (action.reasoning != null) { addReasoningDelta(String(action.reasoning)); return; }
+  if (action.text != null) { addTextDelta(String(action.text)); return; }
+  if (action.milestone != null) addNotice(String(action.milestone));
+}
+
+function streamEvent(name, raw) {
+  let data = raw;
+  if (typeof raw === 'string') { try { data = JSON.parse(raw); } catch (e) { return; } }
+  if (!data || typeof data !== 'object') return;
+  if (data.seq != null) {
+    if (num(data.seq) <= state.streamSince) return;        // drawn already
+    state.streamSince = num(data.seq);
+  }
+  chat.stick = nearBottom();
+
+  if (name === 'delta') {
+    applyAction(data.action || data.delta);
+    setSessionStatus('running');
+  } else if (name === 'user') {
+    const text = String(data.text || '');
+    if (state.pendingUser && text === state.pendingUser) state.pendingUser = null;
+    else addUser(text);
+  } else if (name === 'status') {
+    const st = data.status;
+    if (data.reasoning_effort && state.session) state.session.reasoning_effort = String(data.reasoning_effort);
+    if (data.mode && state.session) state.session.mode = String(data.mode);
+    if (st && st !== 'connected') setSessionStatus(st);
+    else renderSessionHeader();
+  } else if (name === 'stats') {
+    if (state.session && data.token_usage != null) state.session.token_usage = num(data.token_usage);
+    renderSessionHeader();
+  } else if (name === 'file') {
+    addNotice('sent the file ' + (data.name || '') + (data.caption ? ': ' + data.caption : ''));
+  } else if (name === 'notify') {
+    addNotice('notification: ' + (data.message || ''));
+  } else if (name === 'error') {
+    addError(String(data.message || data.error || 'The agent reported an error'));
+  } else if (name === 'done') {
+    const st = data.status === 'finished' ? 'done' : String(data.status || 'done');
+    endRun();
+    if (data.report) addReport(data.report, data.status);
+    if (state.session) {
+      state.session.report = data.report || '';
+      if (data.token_usage != null) state.session.token_usage = num(data.token_usage);
+    }
+    setSessionStatus(st);
+    closeStream();
+    if (st === 'failed') toast('The session failed.', 'error');
+    else if (st === 'question') toast('The agent needs input.', 'warn');
+  }
+  scrollChat();
+}
+
+function setSessionStatus(status) {
+  if (!state.session) return;
+  const st = String(status || '').toLowerCase();
+  const mapped = st === 'finished' ? 'done' : st === 'error' ? 'failed' : st;
+  if (state.session.status === mapped) return;
+  state.session.status = mapped;
+  const d = nd(state.sel.node);
+  const live = d.sessions.find((s) => s.id === state.session.id);
+  if (live) live.status = mapped;
+  renderSessionHeader();
+  renderTree();
+  updateLamps();
 }
 
 function renderSessionHeader() {
   const s = state.session;
-  const titleEl = $('sessionTitleEl');
-  const metaEl = $('sessionMetaEl');
+  const hasWs = !!(state.sel.node && state.sel.ws);
   const modeButtons = document.querySelectorAll('#modeToggle button');
+  $('promptInput').disabled = !hasWs;
+  $('btnSendPrompt').disabled = !hasWs;
 
   if (!s) {
-    titleEl.textContent = 'No session selected';
-    metaEl.textContent = 'Select a session in the sidebar or create one with +.';
+    setText($('sessionTitleEl'), hasWs ? 'New session' : 'No workspace selected');
+    setHtml($('sessionMetaEl'), '');
+    modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === state.composerMode));
     $('reasoningEffort').value = state.composerEffort;
-    modeButtons.forEach((b) => {
-      b.classList.toggle('active', b.dataset.mode === state.composerMode);
-      b.disabled = false;
-    });
     $('btnStopSession').disabled = true;
-    $('btnSendPrompt').disabled = !state.selectedWorkspace || state.sessionCreationPending;
-    $('promptInput').disabled = !state.selectedWorkspace || state.sessionCreationPending;
-    $('composerHint').textContent = state.selectedWorkspace
-      ? 'Send a prompt to start a session, or use + to start an empty one.'
-      : 'Select a workspace first.';
+    setText($('composerHint'), hasWs ? 'Ctrl+Enter sends. The first prompt starts a session.' : '');
     return;
   }
 
-  titleEl.textContent = s.title || 'Session';
-  metaEl.textContent = statusLabel(s.status) + ' - ' + modeLabel(s.mode || 'normal') +
-    ' - ' + fmtNum(s.token_usage) + ' tokens';
-  const effort = String(s.reasoning_effort || state.composerEffort || 'medium').toLowerCase();
-  state.composerEffort = effort;
-  $('reasoningEffort').value = effort;
+  setText($('sessionTitleEl'), s.title || 'Session');
+  const cls = isGenerating(s.status) ? 'running' : statusClass(s.status);
+  setHtml($('sessionMetaEl'),
+    '<span class="chip ' + cls + '">' + esc(statusLabel(s.status)) + '</span>' +
+    (s.mode === 'goal' ? '<span class="chip">loop</span>' : '') +
+    '<span class="chip">' + icon('bolt') + ' ' + fmtNum(s.token_usage) + ' tokens</span>' +
+    (s.origin === 'net' ? '<span class="chip" title="Started by a gateway or another node">via network</span>' : '') +
+    (s.role && s.role !== 'adaptive' ? '<span class="chip">' + esc(s.role) + '</span>' : ''));
+  modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === (s.mode || 'normal')));
+  if (document.activeElement !== $('reasoningEffort')) $('reasoningEffort').value = String(s.reasoning_effort || 'medium');
+  $('btnStopSession').disabled = !isActive(s.status);
 
-  modeButtons.forEach((b) => {
-    b.classList.toggle('active', b.dataset.mode === (s.mode || 'normal'));
-    b.disabled = false;
-  });
-
-  $('btnStopSession').disabled = !isRunningStatus(s.status) && !['starting', 'waiting', 'running', 'planned'].includes(String(s.status));
-  $('btnSendPrompt').disabled = !state.selectedWorkspace || state.sessionCreationPending;
-  $('promptInput').disabled = !state.selectedWorkspace || state.sessionCreationPending;
-
-  if (isRunningStatus(s.status)) {
-    $('composerHint').textContent = 'Running - sending a new prompt interrupts the current turn.';
-  } else if (String(s.status || '').toLowerCase() === 'question') {
-    $('composerHint').textContent = 'The agent needs input - send a prompt to continue.';
-  } else if (s.mode === 'goal') {
-    $('composerHint').textContent = 'Loop mode continues the work until it is finished or fails.';
-  } else {
-    $('composerHint').textContent = 'Prompt starts a normal turn.';
-  }
+  if (isGenerating(s.status)) setText($('composerHint'), 'Running — a prompt you send now is handed to the agent in the middle of its turn.');
+  else if (String(s.status) === 'question') setText($('composerHint'), 'The agent asked a question — answer it to continue.');
+  else if (s.mode === 'goal') setText($('composerHint'), 'Loop: the agent keeps working until the goal is finished or failed.');
+  else setText($('composerHint'), 'Ctrl+Enter sends.');
 }
 
-async function loadWorkspaceBranchSessions(id, generation) {
-  const descendants = [];
-  const visited = new Set([String(id)]);
-
-  function collect(workspaceId) {
-    childrenOf(workspaceId).forEach((workspace) => {
-      const childId = String(workspace.id);
-      if (visited.has(childId)) return;
-      visited.add(childId);
-      descendants.push(workspace);
-      collect(childId);
-    });
-  }
-
-  collect(String(id));
-  const results = await Promise.all(descendants.map(async (workspace) => {
-    try {
-      const data = await NodeApi.get('/api/workspaces/' + encodeURIComponent(workspace.id) + '/sessions');
-      return { id: String(workspace.id), sessions: normalizeSessions(data) };
-    } catch (error) {
-      return { id: String(workspace.id), name: workspace.name || workspace.id, error };
-    }
-  }));
-
-  if (generation !== state.workspaceSelectionGeneration || !state.selectedWorkspace || String(state.selectedWorkspace.id) !== String(id)) return;
-
-  const failures = [];
-  results.forEach((result) => {
-    if (result.error) failures.push(result);
-    else state.workspaceSessions[result.id] = result.sessions;
-  });
-  syncSessionTokens();
-  renderWorkspaceTree();
-
-  if (failures.length) {
-    const first = failures[0];
-    toast('Could not load sessions for ' + failures.length + ' sub-workspace(s), including ' + first.name + ': ' + first.error.message, 'error');
-  }
-}
-
-async function selectSession(id) {
-  if (!id) return;
-  const sessionId = String(id);
-  const workspaceId = state.selectedWorkspace ? String(state.selectedWorkspace.id) : '';
-  const generation = state.workspaceSelectionGeneration;
-  const isCurrent = () => generation === state.workspaceSelectionGeneration &&
-    state.selectedWorkspace && String(state.selectedWorkspace.id) === workspaceId &&
-    state.selectedSession === sessionId;
-
-  state.selectedSession = sessionId;
-  state.session = null;
-  state.pendingUser = null;
-  state.streamSince = 0;
-  closeStream();
-  renderWorkspaceTree();
-  renderSessionHeader();
-  setChatEmpty();
-
-  try {
-    const data = await NodeApi.get('/api/sessions/' + encodeURIComponent(sessionId));
-    if (!isCurrent()) return;
-    const session = data.session || data;
-    state.session = session && (session.id || session.session_id || session.sessionId)
-      ? session
-      : { id: sessionId, title: 'Session', status: 'starting', mode: 'normal', events: [] };
-    state.session.id = String(state.session.id || sessionId);
-    state.selectedSession = state.session.id;
-    if (!state.session.events) state.session.events = [];
-    if (!Array.isArray(state.session.chat_history)) state.session.chat_history = [];
-    state.session.live_text = String(state.session.live_text || '');
-  } catch (e) {
-    if (!isCurrent()) return;
-    toast('Could not load session: ' + e.message, 'error');
-    state.session = null;
-    renderSessionHeader();
-    return;
-  }
-
-  syncSessionTokens();
-  renderSessionHeader();
-  renderWorkspaceTree();
-  renderSessionHistory(state.session.events, state.session.chat_history, state.session.live_text);
-
-  const st = String(state.session.status || '').toLowerCase();
-  if (!['done', 'failed', 'stopped'].includes(st)) openStream(sessionId);
-  if (state.tab === 'tasks') loadTasks(workspaceId, generation);
-}
-
-async function selectTreeSession(workspaceId, sessionId) {
-  const targetWorkspace = String(workspaceId || '');
-  if (!targetWorkspace || targetWorkspace === 'root') return;
-
-  showWorkspaceView();
-  if (!state.selectedWorkspace || String(state.selectedWorkspace.id) !== targetWorkspace) {
-    await selectWorkspace(targetWorkspace);
-    if (!state.selectedWorkspace || String(state.selectedWorkspace.id) !== targetWorkspace) return;
-  }
-
-  await selectSession(sessionId);
-}
-
-function renderSessionHistory(events, chatHistory, liveText) {
-  $('chatMessages').innerHTML = '';
-  state.currentAgentBubble = null;
-  state.currentAgentText = '';
-  resetReasoningBubble();
-
-  const list = arr(events);
-  let maxSeq = Math.max(
-    num(state.session && state.session.seq),
-    num(state.session && state.session.live_text_seq)
-  );
-  list.forEach((ev) => {
-    maxSeq = Math.max(maxSeq, num(ev.seq));
-  });
-  state.streamSince = maxSeq;
-
-  const status = String(state.session && state.session.status || '').toLowerCase();
-  const active = ['starting', 'running', 'waiting'].includes(status);
-  const hist = Array.isArray(chatHistory) ? chatHistory : [];
-  const live = String(liveText || '');
-  const prompt = String(state.session && state.session.prompt || '');
-  const promptHistorySize = num(state.session && state.session.chat_history_size_at_prompt);
-  const historySize = hist.length;
-
-  let reportRendered = false;
-  state.renderingHistory = true;
-
-  if (historySize) {
-    hist.forEach((message) => {
-      if (!message || typeof message !== 'object') return;
-      const role = String(message.role || '');
-      const text = chatContentText(message.content);
-      if (!text) return;
-      // Hide miniagent's synthetic "finalize()" reminder prompts; they are not user messages.
-      if (role === 'user' && text.startsWith('<---SYTEM MESSAGE--->')) return;
-      if (role === 'user') {
-        addUser(text);
-      } else if (role === 'assistant') {
-        resetAgentBubble();
-        addAgentText(text);
-      }
-    });
-
-    // The prompt was accepted before the disk snapshot grew: show it now.
-    if (prompt && historySize <= promptHistorySize) {
-      addUser(prompt);
-      resetAgentBubble();
-    }
-
-    // chat.json may only contain a partial current turn saved at a tool start.
-    const currentTurn = hist.slice(historySize > promptHistorySize ? promptHistorySize : historySize);
-    let savedAssistant = '';
-    currentTurn.forEach((message) => {
-      if (!message || typeof message !== 'object' || message.role !== 'assistant') return;
-      const text = chatContentText(message.content);
-      if (text) savedAssistant = text;
-    });
-
-    if (live || !savedAssistant) {
-      reportRendered = renderCurrentTurnEvents(list, Boolean(live));
-    }
-
-    if (live) {
-      if (savedAssistant && live.startsWith(savedAssistant)) {
-        state.currentAgentText = live;
-        if (state.currentAgentBubble) state.currentAgentBubble.innerHTML = mdRender(live);
-      } else if (savedAssistant && savedAssistant.startsWith(live)) {
-        // The saved snapshot is already at least as complete as the live text.
-      } else if (savedAssistant !== live) {
-        resetAgentBubble();
-        addAgentText(live);
-      }
-    }
-  } else {
-    // No chat.json yet: render the rolling event window, without duplicating the prompt.
-    const hasUser = list.some((ev) => ev && ev.type === 'user' &&
-      String(ev.text || ev.prompt || ev.message || '') === prompt);
-    if (prompt && !hasUser) addUser(prompt);
-    list.forEach((ev) => applySessionEvent(ev));
-    reportRendered = list.some((ev) => ev && ev.type === 'done' && ev.report);
-  }
-
-  // The terminal report is stored on the session; when the saved answer skipped
-  // the event render, the done-event report would otherwise vanish on reload.
-  const terminal = ['done', 'failed', 'question', 'stopped'].includes(status);
-  if (terminal && state.session && state.session.report && !reportRendered) {
-    addReport(state.session.report);
-  }
-
-  if (!historySize && !prompt && !live && !list.length) setChatEmpty();
-  state.renderingHistory = false;
-  scrollChat();
-}
-
-function renderCurrentTurnEvents(list, skipText = false) {
-  if (!Array.isArray(list) || !list.length) return false;
-
-  let start = -1;
-  for (let i = list.length - 1; i >= 0; i--) {
-    if (list[i] && list[i].type === 'user') { start = i; break; }
-  }
-  if (start < 0) {
-    for (let i = list.length - 1; i >= 0; i--) {
-      if (list[i] && list[i].type === 'done') { start = i; break; }
-    }
-  }
-
-  let reportRendered = false;
-
-  for (let i = start + 1; i < list.length; i++) {
-    const ev = list[i];
-    if (!ev) continue;
-    if (ev.type === 'delta') {
-      const action = ev.action || ev.delta || ev;
-      if (action.reasoning != null) addReasoning(String(action.reasoning));
-      else if (action.tool_start) addToolStart(action.tool_start);
-      else if (action.tool_end) addToolEnd(action.tool_end);
-      else if (action.milestone != null) addMilestone(String(action.milestone));
-      else if (action.text != null && !skipText) addAgentText(String(action.text));
-    } else if (ev.type === 'done' && ev.report) {
-      addReport(ev.report);
-      reportRendered = true;
-    } else if (ev.type === 'error') {
-      addError(ev.message || ev.error || 'Agent reported an error');
-    }
-  }
-
-  return reportRendered;
-}
-
-function chatContentText(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((part) => part && typeof part === 'object' && typeof part.text === 'string')
-    .map((part) => part.text)
-    .join('');
-}
-
-function applySessionEvent(ev) {
-  if (!ev || typeof ev !== 'object') return;
-  const type = ev.type || 'delta';
-  if (type === 'delta') {
-    handleStreamEvent('delta', ev.action || ev.delta || ev);
-  } else {
-    handleStreamEvent(type, ev);
-  }
-}
-
-/* ── Chat rendering ── */
-function scrollChat() {
-  const el = $('chatMessages');
-  el.scrollTop = el.scrollHeight;
-}
-
-function resetAgentBubble() {
-  state.currentAgentBubble = null;
-  state.currentAgentText = '';
-}
-
-function resetReasoningBubble() {
-  state.currentReasoningBubble = null;
-  state.currentReasoningText = '';
-}
-
-function reasoningSentence(text) {
-  const normalized = String(text).replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  let lastBoundary = -1;
-  let previousBoundary = -1;
-  for (let i = 0; i < normalized.length; i++) {
-    if (/[.!?]/.test(normalized[i]) && (i + 1 === normalized.length || /\s/.test(normalized[i + 1]))) {
-      previousBoundary = lastBoundary;
-      lastBoundary = i;
-    }
-  }
-  const start = lastBoundary === normalized.length - 1 ? previousBoundary + 1 : lastBoundary + 1;
-  const sentence = normalized.slice(start).trim() || normalized;
-  return sentence.length > 240 ? sentence.slice(0, 237) + '...' : sentence;
-}
-
-function addUser(text, local = false) {
-  if (!text) return;
-  const empty = $('chatMessages').querySelector('.empty-state');
-  if (empty) empty.remove();
-  const wrap = document.createElement('div');
-  wrap.className = 'msg user';
-  wrap.innerHTML =
-    '<div class="msg-label"><span>You</span><span>' + esc(timeAgo(Date.now())) + '</span></div>' +
-    '<div class="msg-body">' + esc(text) + '</div>';
-  $('chatMessages').appendChild(wrap);
-  resetAgentBubble();
-  resetReasoningBubble();
-  scrollChat();
-  if (local) {
-    state.pendingUser = String(text);
-    setTimeout(() => {
-      if (state.pendingUser === String(text)) state.pendingUser = null;
-    }, 8000);
-  }
-}
-
-function addAgentText(text) {
-  if (!text) return;
-  resetReasoningBubble();
-  if (!state.currentAgentBubble) {
-    const wrap = document.createElement('div');
-    wrap.className = 'msg agent';
-    wrap.innerHTML = '<div class="msg-label"><span>Agent</span></div><div class="msg-body"></div>';
-    $('chatMessages').appendChild(wrap);
-    state.currentAgentBubble = wrap.querySelector('.msg-body');
-    state.currentAgentText = '';
-  }
-  state.currentAgentText += String(text);
-  state.currentAgentBubble.innerHTML = mdRender(state.currentAgentText);
-  scrollChat();
-}
-
-function addReasoning(text) {
-  if (!text) return;
-  if (!state.currentReasoningBubble) {
-    resetAgentBubble();
-    const wrap = document.createElement('div');
-    wrap.className = 'msg reasoning';
-    wrap.innerHTML =
-      '<div class="msg-label"><span>Reasoning</span><span class="reasoning-latest">LATEST</span></div>' +
-      '<div class="msg-body"></div>';
-    state.currentReasoningBubble = wrap.querySelector('.msg-body');
-    state.currentReasoningText = '';
-    $('chatMessages').appendChild(wrap);
-  }
-  state.currentReasoningText = (state.currentReasoningText + String(text)).slice(-4096);
-  state.currentReasoningBubble.textContent = reasoningSentence(state.currentReasoningText);
-  scrollChat();
-}
-
-function toolArgumentsSummary(args) {
-  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
-  const keys = ['path', 'file', 'name', 'goal', 'query', 'url', 'command', 'workspace', 'repo', 'issue', 'task'];
-  return keys
-    .filter((key) => Object.prototype.hasOwnProperty.call(args, key) && (typeof args[key] === 'string' || typeof args[key] === 'number' || typeof args[key] === 'boolean'))
-    .slice(0, 2)
-    .map((key) => {
-      const value = String(args[key]).replace(/\s+/g, ' ').trim();
-      return key + ': ' + (value.length > 76 ? value.slice(0, 73) + '...' : value);
-    })
-    .join('  ·  ');
-}
-
-function toolFailureText(tool) {
-  const result = tool && tool.result;
-  let error = tool && tool.error;
-  if (!error && result && typeof result === 'object') {
-    error = result.error || (result.ok === false ? result.message || 'Tool failed' : '');
-  }
-  return error ? String(error).replace(/\s+/g, ' ').slice(0, 120) : '';
-}
-
-function addToolStart(tool) {
-  resetReasoningBubble();
-  const wrap = document.createElement('div');
-  wrap.className = 'msg tool';
-  wrap.dataset.toolId = tool && tool.id ? String(tool.id) : '';
-  const summary = toolArgumentsSummary(tool && tool.args);
-  wrap.innerHTML =
-    '<div class="tool-head"><i class="fa-solid fa-gear"></i>' +
-      '<span class="tool-name">' + esc(tool && tool.name ? tool.name : 'tool') + '</span>' +
-      '<span class="tool-state">RUNNING</span></div>' +
-    (summary ? '<div class="tool-args">' + esc(summary) + '</div>' : '');
-  $('chatMessages').appendChild(wrap);
-  scrollChat();
-}
-
-function addToolEnd(tool) {
-  resetReasoningBubble();
-  const id = tool && tool.id ? String(tool.id) : '';
-  const cards = Array.from($('chatMessages').querySelectorAll('.msg.tool'));
-  let card = null;
-  for (let i = cards.length - 1; i >= 0; i--) {
-    if (cards[i].dataset.toolId === id) { card = cards[i]; break; }
-  }
-  if (!card && cards.length) card = cards[cards.length - 1];
-
-  const error = toolFailureText(tool);
-  if (card) {
-    const status = card.querySelector('.tool-state');
-    if (status) status.textContent = error ? 'FAILED · ' + error : 'COMPLETE';
-    if (error) card.classList.add('failed');
-  } else {
-    const summary = toolArgumentsSummary(tool && tool.args);
-    const wrap = document.createElement('div');
-    wrap.className = 'msg tool' + (error ? ' failed' : '');
-    wrap.dataset.toolId = id;
-    wrap.innerHTML =
-      '<div class="tool-head"><i class="fa-solid fa-gear"></i>' +
-        '<span class="tool-name">' + esc(tool && tool.name ? tool.name : 'tool') + '</span>' +
-        '<span class="tool-state">' + esc(error ? 'FAILED · ' + error : 'COMPLETE') + '</span></div>' +
-      (summary ? '<div class="tool-args">' + esc(summary) + '</div>' : '');
-    $('chatMessages').appendChild(wrap);
-  }
-  scrollChat();
-}
-
-function addMilestone(text) {
-  if (!text) return;
-  resetReasoningBubble();
-  const wrap = document.createElement('div');
-  wrap.className = 'msg milestone';
-  wrap.innerHTML = '<i class="fa-solid fa-check-circle"></i> ' + esc(text);
-  $('chatMessages').appendChild(wrap);
-  scrollChat();
-}
-
-function addReport(text) {
-  if (!text) return;
-  resetReasoningBubble();
-  const wrap = document.createElement('div');
-  wrap.className = 'msg report';
-  wrap.innerHTML =
-    '<div class="msg-label"><span>Report</span></div>' +
-    '<div class="msg-body">' + mdRender(text) + '</div>';
-  $('chatMessages').appendChild(wrap);
-  scrollChat();
-}
-
-function addError(text) {
-  resetReasoningBubble();
-  const wrap = document.createElement('div');
-  wrap.className = 'msg error';
-  wrap.innerHTML =
-    '<div class="msg-label"><span>Error</span></div>' +
-    '<div class="msg-body">' + esc(text) + '</div>';
-  $('chatMessages').appendChild(wrap);
-  scrollChat();
-}
-
-/* ── Session state ── */
-function setSessionStatus(status) {
-  if (!state.session) return;
-  const raw = String(status || '').toLowerCase();
-  const mapped = raw === 'finished' ? 'done' : raw === 'error' ? 'failed' : raw;
-  state.session.status = mapped || 'running';
-  const s = state.sessions.find((x) => x.id === state.session.id);
-  if (s) s.status = mapped;
-  if (!state.stats.session_status) state.stats.session_status = {};
-  state.stats.session_status[state.session.id] = mapped;
-  renderSessionHeader();
-  renderWorkspaceTree();
-  updateConsoleLamps();
-}
-
-function updateTokenUsage(value) {
-  const n = num(value);
-  const sessionId = state.session && state.session.id;
-  if (state.session) state.session.token_usage = n;
-  const s = sessionId ? state.sessions.find((x) => x.id === sessionId) : null;
-  if (s) s.token_usage = n;
-  if (!state.stats || typeof state.stats !== 'object') state.stats = {};
-  if (!state.stats.token_usage || typeof state.stats.token_usage !== 'object' || Array.isArray(state.stats.token_usage)) {
-    state.stats.token_usage = {};
-  }
-  if (sessionId) state.stats.token_usage[sessionId] = n;
-  renderSessionHeader();
-  updateSessionTokenLabels();
-  renderStats();
-}
-
-/* ── SSE stream ── */
-function closeStream() {
-  // This only detaches the selected browser stream; SessionManager keeps the worker running.
-  if (state.stream) {
-    try { state.stream.close(); } catch (e) {}
-    state.stream = null;
-  }
-  if (state.streamAbort) {
-    state.streamAbort.abort();
-    state.streamAbort = null;
-  }
-}
-
-function streamUrl(id, since) {
-  const token = NodeApi.token();
-  const params = new URLSearchParams();
-  params.set('since', String(since || 0));
-  if (token) params.set('token', token);
-  return '/api/sessions/' + encodeURIComponent(id) + '/stream?' + params.toString();
-}
-
-function openStream(id) {
-  closeStream();
-  const since = state.streamSince || 0;
-  const generation = state.workspaceSelectionGeneration;
-  const sessionId = String(id);
-  const es = new EventSource(streamUrl(sessionId, since));
-  state.stream = es;
-  state.streamSince = since;
-
-  const isCurrent = () => state.stream === es && generation === state.workspaceSelectionGeneration &&
-    state.selectedSession === sessionId;
-  ['delta', 'user', 'status', 'done', 'error', 'stats'].forEach((name) => {
-    es.addEventListener(name, (ev) => {
-      if (isCurrent()) handleStreamEvent(name, ev.data);
-    });
-  });
-  es.onmessage = (ev) => {
-    if (isCurrent()) handleStreamEvent('message', ev.data);
-  };
-
-  es.onerror = () => {
-    if (!isCurrent()) return;
-    es.close();
-    state.stream = null;
-    fetchStream(sessionId, state.streamSince, generation);
-  };
-}
-
-function ensureStream(id) {
-  if (!state.stream && !state.streamAbort) openStream(id);
-}
-
-async function fetchStream(id, since, generation = state.workspaceSelectionGeneration) {
-  if (state.stream) {
-    try { state.stream.close(); } catch (e) {}
-    state.stream = null;
-  }
-  if (state.streamAbort) state.streamAbort.abort();
-  const controller = new AbortController();
-  state.streamAbort = controller;
-
-  try {
-    const res = await fetch(streamUrl(id, Math.max(num(since), state.streamSince)), {
-      headers: NodeApi.headers(),
-      signal: controller.signal
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('text/event-stream')) {
-      throw new Error('stream returned ' + contentType);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      buffer = buffer.replace(/\r\n/g, '\n');
-
-      let idx;
-      while ((idx = buffer.indexOf('\n\n')) >= 0) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        parseSseBlock(block, id, generation);
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) parseSseBlock(buffer, id, generation);
-  } catch (e) {
-    if (e.name !== 'AbortError' && generation === state.workspaceSelectionGeneration && state.selectedSession === String(id)) {
-      toast('Live stream failed: ' + e.message, 'error');
-    }
-  } finally {
-    if (state.streamAbort === controller) state.streamAbort = null;
-  }
-}
-
-function parseSseBlock(block, sessionId, generation) {
-  if (generation !== state.workspaceSelectionGeneration || !state.selectedWorkspace ||
-      String(state.selectedSession) !== String(sessionId) || String(state.selectedWorkspace.id) === '') return;
-  let event = 'message';
-  let data = '';
-  block.split('\n').forEach((line) => {
-    if (line.startsWith('event:')) event = line.slice(6).trim();
-    else if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).trimStart();
-  });
-  if (data) handleStreamEvent(event, data);
-}
-
-function handleStreamEvent(name, raw) {
-  let data = raw;
-  if (typeof raw === 'string') {
-    try { data = JSON.parse(raw); } catch (e) { data = raw; }
-  }
-  if (data && typeof data === 'object' && data.type) name = data.type;
-  if (data && typeof data === 'object' && data.seq != null) {
-    state.streamSince = Math.max(state.streamSince, num(data.seq));
-  }
-
-  if (name === 'delta') {
-    const action = (data && (data.action || data.delta)) || data;
-    if (!action || typeof action !== 'object') return;
-    if (action.text != null) addAgentText(String(action.text));
-    else if (action.reasoning != null) addReasoning(String(action.reasoning));
-    else if (action.tool_start) addToolStart(action.tool_start);
-    else if (action.tool_end) addToolEnd(action.tool_end);
-    else if (action.milestone != null) addMilestone(String(action.milestone));
-    return;
-  }
-
-  if (name === 'user') {
-    const text = data && (data.text || data.prompt || data.message);
-    if (state.pendingUser && String(text) === state.pendingUser) {
-      state.pendingUser = null;
-      return;
-    }
-    addUser(text);
-    return;
-  }
-
-  if (name === 'status') {
-    const status = data && (data.status || data.state || data.value);
-    if (data && data.reasoning_effort) {
-      const effort = String(data.reasoning_effort).toLowerCase();
-      if (['low', 'medium', 'high'].includes(effort) && state.session) {
-        state.session.reasoning_effort = effort;
-        state.composerEffort = effort;
-        $('reasoningEffort').value = effort;
-      }
-    }
-    if (status !== 'connected') setSessionStatus(status);
-    return;
-  }
-
-  if (name === 'stats') {
-    updateTokenUsage(data && (data.token_usage ?? data.tokens));
-    return;
-  }
-
-  if (name === 'done') {
-    const rawStatus = data && data.status;
-    const status = rawStatus === 'finished' ? 'done' : rawStatus === 'failed' ? 'failed' : (rawStatus || 'done');
-    setSessionStatus(status);
-    if (data && data.report) addReport(data.report);
-    if (data && data.token_usage != null) updateTokenUsage(data.token_usage);
-    closeStream();
-    if (!state.renderingHistory) {
-      if (status === 'failed') toast('Session failed.', 'error');
-      else if (status === 'question') toast('Agent needs input.', 'warn');
-      else toast('Session finished.', 'success');
-    }
-    return;
-  }
-
-  if (name === 'error') {
-    const msg = data && (data.message || data.error) || 'Agent reported an unspecified error';
-    addError(msg);
-    setSessionStatus('failed');
-    closeStream();
-    if (!state.renderingHistory) toast(msg, 'error');
-    return;
-  }
-
-  if (name === 'message') {
-    if (data && data.text != null) addAgentText(String(data.text));
-    else if (data && data.action) handleStreamEvent('delta', data);
-    return;
-  }
-
-  if (data && data.action) handleStreamEvent('delta', data);
-}
-
-/* ── Chat actions ── */
-function currentMode() {
-  return state.session ? (state.session.mode || state.composerMode) : state.composerMode;
-}
-
-async function setReasoningEffort(value) {
-  const effort = String(value || '').toLowerCase();
-  if (!['low', 'medium', 'high'].includes(effort)) return;
-
-  state.composerEffort = effort;
-  $('reasoningEffort').value = effort;
-
-  if (!state.session) {
-    toast('New sessions will use ' + effort + ' reasoning effort.', 'info');
-    return;
-  }
-
-  const previous = String(state.session.reasoning_effort || 'medium').toLowerCase();
-  const sessionId = state.session.id;
-  state.session.reasoning_effort = effort;
-  const listed = state.sessions.find((item) => String(item.id) === String(sessionId));
-  if (listed) listed.reasoning_effort = effort;
-
-  try {
-    const data = await NodeApi.post('/api/sessions/' + encodeURIComponent(sessionId) + '/effort', {
-      reasoning_effort: effort
-    });
-    if (data && data.reasoning_effort && state.session.reasoning_effort === effort) {
-      state.session.reasoning_effort = String(data.reasoning_effort).toLowerCase();
-    }
-    if (state.session.reasoning_effort === effort) toast('Reasoning effort set to ' + effort + '.', 'info');
-  } catch (e) {
-    if (state.session.reasoning_effort === effort) {
-      state.session.reasoning_effort = previous;
-      state.composerEffort = previous;
-      if (listed) listed.reasoning_effort = previous;
-      $('reasoningEffort').value = previous;
-      toast('Could not set reasoning effort: ' + e.message, 'error');
-    }
-  }
-}
-
+/* ── chat actions ── */
 async function sendPrompt() {
   const text = $('promptInput').value.trim();
-  const reasoningEffort = $('reasoningEffort').value;
-  if (!text || state.sessionCreationPending) return;
-  if (!state.selectedWorkspace) {
-    toast('Select a workspace first.', 'warn');
-    return;
-  }
+  if (!text || !state.sel.node || !state.sel.ws) return;
+  const effort = $('reasoningEffort').value;
+  const nodeId = state.sel.node;
+  const wsId = state.sel.ws;
+  const a = api(nodeId);
+  $('btnSendPrompt').disabled = true;
 
-  const ws = state.selectedWorkspace;
   try {
     if (!state.session) {
-      state.sessionCreationPending = true;
-      renderSessionHeader();
-      renderWorkspaceTree();
-      const data = await NodeApi.post('/api/workspaces/' + encodeURIComponent(ws.id) + '/sessions', {
-        mode: currentMode(),
-        prompt: text,
-        reasoning_effort: reasoningEffort
-      });
-      const id = data && (data.id || data.session_id || data.sessionId || (data.session && data.session.id));
-      if (!id) throw new Error('The server did not return the new session ID.');
+      const made = await a.post('/api/workspaces/' + enc(wsId) + '/sessions', { mode: state.composerMode, prompt: text, reasoning_effort: effort });
+      const id = made && String(made.id || '');
+      if (!id) throw new Error('The node did not return the new session.');
       $('promptInput').value = '';
-      if (state.selectedWorkspace && String(state.selectedWorkspace.id) === String(ws.id)) {
-        addUser(text, true);
-        state.selectedSession = String(id);
-        const generation = state.workspaceSelectionGeneration;
-        await refreshWorkspace(ws.id, generation);
-        if (generation === state.workspaceSelectionGeneration && state.selectedWorkspace && String(state.selectedWorkspace.id) === String(ws.id)) {
-          if (state.selectedSession !== String(id) || !state.session) {
-            state.selectedSession = String(id);
-            await selectSession(id);
-          }
-          const userMessages = Array.from($('chatMessages').querySelectorAll('.msg.user .msg-body'));
-          if (!userMessages.some((message) => message.textContent === text)) addUser(text, true);
-        }
-      }
-      toast('Session started.', 'success');
+      state.openWs.add(wsKey(nodeId, wsId));
+      // the feed brings the session into the tree; show it now
+      const d = nd(nodeId);
+      if (!d.sessions.some((s) => s.id === id)) d.sessions.push({ id, workspace_id: wsId, title: made.title, status: made.status, mode: made.mode, token_usage: 0, created: Date.now() });
+      await selectSession(nodeId, wsId, id);
       return;
     }
 
     const id = state.session.id;
-    const wasRunning = isRunningStatus(state.session.status);
-    state.pendingUser = String(text);
-    await NodeApi.post('/api/sessions/' + encodeURIComponent(id) + '/prompt', {
-      prompt: text,
-      reasoning_effort: reasoningEffort
-    });
-    addUser(text, true);
+    state.pendingUser = text;
+    await a.post('/api/sessions/' + enc(id) + '/prompt', { prompt: text, reasoning_effort: effort });
     $('promptInput').value = '';
+    chat.stick = true;
+    addUser(text);
+    scrollChat(true);
     setSessionStatus('running');
-    ensureStream(id);
-    toast(wasRunning ? 'Prompt sent - current turn interrupted.' : 'Prompt sent.', 'info');
+    if (!state.stream) openStream();
   } catch (e) {
     state.pendingUser = null;
-    toast('Prompt failed: ' + e.message, 'error');
+    toast('The prompt was not sent: ' + e.message, 'error');
   } finally {
-    if (state.sessionCreationPending) {
-      state.sessionCreationPending = false;
-      renderSessionHeader();
-      renderWorkspaceTree();
-    }
+    renderSessionHeader();
   }
 }
 
 async function setMode(mode) {
-  if (!state.session) {
-    state.composerMode = mode;
-    renderSessionHeader();
-    toast('New sessions will use ' + modeLabel(mode) + ' mode.', 'info');
-    return;
-  }
+  state.composerMode = mode;
+  if (!state.session) { renderSessionHeader(); return; }
   try {
-    await NodeApi.post('/api/sessions/' + encodeURIComponent(state.session.id) + '/mode', { mode });
+    await selApi().post('/api/sessions/' + enc(state.session.id) + '/mode', { mode });
     state.session.mode = mode;
     renderSessionHeader();
-    toast('Mode set to ' + modeLabel(mode) + '.', 'info');
   } catch (e) {
-    toast('Could not change mode: ' + e.message, 'error');
+    toast('Could not change the mode: ' + e.message, 'error');
   }
 }
 
-async function deleteSession(id, workspaceId) {
-  const sessionId = String(id || '');
-  if (!sessionId) return;
-  if (!window.confirm('Permanently delete this session and its chat history?')) return;
-
+async function setEffort(value) {
+  const effort = String(value || '').toLowerCase();
+  if (!['low', 'medium', 'high'].includes(effort)) return;
+  state.composerEffort = effort;
+  if (!state.session) return;
+  const before = state.session.reasoning_effort;
+  state.session.reasoning_effort = effort;
   try {
-    await NodeApi.del('/api/sessions/' + encodeURIComponent(sessionId));
-    const wasSelected = state.selectedSession === sessionId;
-    if (wasSelected) {
-      state.selectedSession = null;
-      state.session = null;
-      state.pendingUser = null;
-      state.streamSince = 0;
-      closeStream();
-      setChatEmpty();
-      renderSessionHeader();
-    }
-    state.sessions = state.sessions.filter((item) => item.id !== sessionId);
-    state.workspaceSessions[String(workspaceId)] = (state.workspaceSessions[String(workspaceId)] || [])
-      .filter((item) => item.id !== sessionId);
-    if (state.stats.session_status) delete state.stats.session_status[sessionId];
-    renderWorkspaceTree();
-    await refreshWorkspace(String(workspaceId));
-    await refreshStats();
-    toast('Session deleted.', 'success');
+    await selApi().post('/api/sessions/' + enc(state.session.id) + '/effort', { reasoning_effort: effort });
   } catch (e) {
-    toast('Could not delete session: ' + e.message, 'error');
+    state.session.reasoning_effort = before;
+    $('reasoningEffort').value = String(before || 'medium');
+    toast('Could not set the reasoning effort: ' + e.message, 'error');
   }
 }
 
 async function stopSession() {
   if (!state.session) return;
   try {
-    await NodeApi.post('/api/sessions/' + encodeURIComponent(state.session.id) + '/stop');
+    await selApi().post('/api/sessions/' + enc(state.session.id) + '/stop');
+    endRun();
+    addNotice('stopped');
     setSessionStatus('stopped');
     closeStream();
-    toast('Session stopped.', 'warn');
   } catch (e) {
-    toast('Could not stop session: ' + e.message, 'error');
+    toast('Could not stop the session: ' + e.message, 'error');
   }
 }
 
-async function newSession(workspaceId) {
-  if (!state.byId[workspaceId] || state.sessionCreationPending) return;
-  showWorkspaceView();
-  state.sessionCreationPending = true;
-  renderSessionHeader();
-  renderWorkspaceTree();
+async function newSession(nodeId, wsId) {
+  // a session starts with its first prompt: select the workspace and focus the composer
+  await selectWorkspace(nodeId, wsId);
+  state.openWs.add(wsKey(nodeId, wsId));
+  if (state.tab !== 'chat') showTab('chat');
+  renderTree();
+  $('promptInput').focus();
+}
 
+async function deleteSession(nodeId, wsId, sessionId) {
+  if (!window.confirm('Delete this session and its chat history?')) return;
   try {
-    if (!state.selectedWorkspace || String(state.selectedWorkspace.id) !== String(workspaceId)) {
-      await selectWorkspace(workspaceId);
+    await api(nodeId).del('/api/sessions/' + enc(sessionId));
+    const d = nd(nodeId);
+    d.sessions = d.sessions.filter((s) => s.id !== sessionId);
+    if (state.sel.node === nodeId && state.sel.session === sessionId) {
+      state.sel.session = null;
+      state.session = null;
+      closeStream();
+      renderChatEmpty();
+      renderSessionHeader();
+      saveSelection();
     }
-
-    const data = await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/sessions', {
-      mode: state.composerMode,
-      reasoning_effort: $('reasoningEffort').value
-    });
-    const id = data && (data.id || data.session_id || data.sessionId || (data.session && data.session.id));
-    if (!id) throw new Error('The server did not return the new session ID.');
-    state.selectedSession = String(id);
-    await refreshWorkspace(workspaceId);
-    toast('Session created.', 'success');
+    renderTree();
   } catch (e) {
-    toast('Could not create session: ' + e.message, 'error');
-  } finally {
-    state.sessionCreationPending = false;
-    renderSessionHeader();
-    renderWorkspaceTree();
+    toast('Could not delete the session: ' + e.message, 'error');
   }
 }
 
-/* ── Architecture ── */
-const KIND_COLORS = {
-  module: '#1f6f5c',
-  file: '#2b4f6b',
-  service: '#5b4b8a',
-  ui: '#7a5a2c',
-  data: '#3c6b74',
-  external: '#7b4d4d',
-  test: '#4b6b3c',
-  config: '#6a5c3b'
-};
-
-function kindColor(kind) {
-  return KIND_COLORS[kind] || '#1f6f5c';
+/* ── workspaces ── */
+function slug(name) {
+  const s = String(name || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '_').slice(0, 48);
+  return s || 'workspace';
 }
 
-function architectureSvg(nodes, edges) {
-  const NS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(NS, 'svg');
-  svg.classList.add('arch-svg');
+function openWorkspaceDialog(nodeId, parentId) {
+  const n = nodeById(nodeId);
+  const d = nd(nodeId);
+  const parent = parentId ? d.byId[parentId] : null;
+  state.newWs = { node: nodeId, parent: parentId || '' };
+  setText($('workspaceDialogTitle'), parent ? 'New sub-workspace' : 'New workspace');
+  setText($('workspaceWhere'), 'On ' + (n ? n.name : nodeId) + (parent ? ', inside ' + parent.name : ''));
+  $('workspaceName').value = '';
+  $('workspacePath').value = '';
+  $('workspaceDescription').value = '';
+  updateWorkspacePathHint();
+  openDialog('workspaceDialog');
+  $('workspaceName').focus();
+}
 
-  const defs = document.createElementNS(NS, 'defs');
-  const marker = document.createElementNS(NS, 'marker');
-  marker.setAttribute('id', 'archArrow');
-  marker.setAttribute('viewBox', '0 0 10 10');
-  marker.setAttribute('refX', '8');
-  marker.setAttribute('refY', '5');
-  marker.setAttribute('markerWidth', '6');
-  marker.setAttribute('markerHeight', '6');
-  marker.setAttribute('orient', 'auto');
-  const path = document.createElementNS(NS, 'path');
-  path.setAttribute('d', 'M0,0 L10,5 L0,10 z');
-  path.setAttribute('fill', '#8696a0');
-  marker.appendChild(path);
-  defs.appendChild(marker);
-  svg.appendChild(defs);
+function updateWorkspacePathHint() {
+  if (!state.newWs) return;
+  const d = nd(state.newWs.node);
+  const parent = state.newWs.parent ? d.byId[state.newWs.parent] : null;
+  const base = parent ? parent.path : d.projectsDir;
+  const name = $('workspaceName').value.trim();
+  const where = base ? base.replace(/[\\/]+$/, '') + '/' + slug(name || 'name') : '';
+  $('workspacePath').placeholder = where;
+  setText($('workspacePathHint'), $('workspacePath').value.trim()
+    ? 'An existing folder is registered as it is; a missing one is created.'
+    : 'Empty: a new folder ' + (where || 'below the node\'s working directory') + ' on that node.');
+}
 
-  const positions = new Map();
-  nodes.forEach((n, i) => {
-    let x = Number(n.x);
-    let y = Number(n.y);
-    if (!Number.isFinite(x)) x = 80 + (i % 4) * 180;
-    if (!Number.isFinite(y)) y = 70 + Math.floor(i / 4) * 110;
-    positions.set(n.id, { x, y, node: n });
+async function createWorkspace() {
+  if (!state.newWs) return;
+  const name = $('workspaceName').value.trim();
+  if (!name) { toast('The workspace needs a name.', 'warn'); return; }
+  const body = { name };
+  const path = $('workspacePath').value.trim();
+  const description = $('workspaceDescription').value.trim();
+  if (path) body.path = path;
+  if (description) body.description = description;
+  if (state.newWs.parent) body.parent = state.newWs.parent;
+  const nodeId = state.newWs.node;
+  try {
+    const made = await api(nodeId).post('/api/workspaces', body);
+    closeDialog('workspaceDialog');
+    await loadNode(nodeId);
+    if (state.newWs.parent) state.openWs.add(wsKey(nodeId, state.newWs.parent));
+    if (made && made.id) await selectWorkspace(nodeId, String(made.id));
+    toast('Workspace created: ' + (made && made.path ? made.path : name), 'success');
+  } catch (e) {
+    toast('Could not create the workspace: ' + e.message, 'error');
+  }
+}
+
+async function deleteWorkspace(nodeId, wsId) {
+  const w = workspaceOf(nodeId, wsId);
+  if (!w) return;
+  if (!window.confirm('Remove "' + (w.name || w.id) + '" from this node?\n\nIts sessions are stopped and deleted. The files in ' + (w.path || 'its folder') + ' stay on disk.')) return;
+  try {
+    await api(nodeId).del('/api/workspaces/' + enc(wsId));
+    state.openWs.delete(wsKey(nodeId, wsId));
+    if (state.sel.node === nodeId && state.sel.ws === wsId) clearSelection();
+    await loadNode(nodeId);
+    toast('Workspace removed. Its files were kept.', 'success');
+  } catch (e) {
+    toast('Could not remove the workspace: ' + e.message, 'error');
+  }
+}
+
+/* ── tasks ── */
+const goalStatus = (g) => String(g && g.status || '').toLowerCase();
+const goalRunOpen = (g) => ['dispatching', 'running', 'checkpoint'].includes(String(g && g.active_run_state || '').toLowerCase());
+const goalNeedsInput = (g) => String(g && g.active_run_state || '').toLowerCase() === 'question';
+const goalInvalid = (g) => truthy(g && g.invalid_edit) || (g && Array.isArray(g.errors) && g.errors.length > 0) || ['invalid', '?'].includes(goalStatus(g));
+const taskIdOf = (t) => String(t && (t.taskid || t.id) || '');
+
+function fmtSchedule(schedule) {
+  if (!schedule) return '';
+  if (typeof schedule === 'string') return schedule;
+  const parts = [];
+  if (schedule.type) parts.push(String(schedule.type));
+  if (schedule.every) parts.push('every ' + schedule.every);
+  if (schedule.days) parts.push(Array.isArray(schedule.days) ? schedule.days.join(', ') : String(schedule.days));
+  if (schedule.date) parts.push(String(schedule.date));
+  if (schedule.start) parts.push('from ' + schedule.start);
+  if (schedule.end) parts.push('to ' + schedule.end);
+  return parts.join(' · ') || JSON.stringify(schedule);
+}
+
+function goalErrors(g) {
+  return arr(g.errors).map((e) => (typeof e === 'string' ? e : (e && (e.message || e.error)) || JSON.stringify(e))).join('; ');
+}
+
+// -> {key, section, html}: the card of a goal
+function goalCard(g, nodeId, wsId) {
+  const st = goalStatus(g);
+  const running = goalRunOpen(g);
+  const asking = goalNeedsInput(g);
+  const invalid = goalInvalid(g);
+  const inWindow = !!String(g.active_window || '').trim();
+  const dry = truthy(g.dry_run);
+  const label = invalid ? 'invalid' : asking ? 'needs input' : running ? (String(g.active_run_state).toLowerCase() === 'checkpoint' ? 'checkpoint' : 'running')
+    : (inWindow && (st === 'active' || st === 'paused') ? 'window open' : (st || 'planned'));
+  const cls = label.replace(/[^a-z]/g, '');
+  let section = 'invalid';
+  if (invalid) section = 'invalid';
+  else if (asking) section = 'input';
+  else if (running || ((st === 'active' || st === 'paused') && inWindow)) section = 'running';
+  else if (st === 'proposed') section = 'proposed';
+  else if (st === 'active' || st === 'paused') section = 'scheduled';
+  else if (['completed', 'cancelled', 'archived'].includes(st)) section = 'finished';
+
+  const data = ' data-node="' + esc(nodeId) + '" data-ws="' + esc(wsId) + '" data-goal="' + esc(g.id) + '"';
+  let actions = '';
+  if (!invalid && st === 'proposed') actions += '<button class="btn btn-small btn-primary" data-act="goal-status" data-status="active"' + data + '>Activate</button>';
+  if (!invalid && st === 'active') {
+    if (!running) actions += '<button class="btn btn-small" data-act="goal-run"' + data + ' title="Start a run now">' + icon('play') + ' Run now</button>';
+    actions += '<button class="btn btn-small btn-ghost" data-act="goal-status" data-status="paused"' + data + '>Pause</button>';
+  }
+  if (!invalid && st === 'paused') actions += '<button class="btn btn-small btn-primary" data-act="goal-status" data-status="active"' + data + '>Resume</button>';
+  if (g.id != null) actions += '<button class="btn btn-small btn-danger" data-act="goal-delete"' + data + '>Delete</button>';
+
+  const html =
+    '<div class="task-top"><div class="task-name">' + esc(g.title || g.id || 'Goal') + '</div>' +
+      '<span class="task-state ' + esc(cls) + '">' + esc(label) + '</span></div>' +
+    (g.schedule ? '<div class="task-line">' + icon('clock') + ' ' + esc(fmtSchedule(g.schedule)) + '</div>' : '') +
+    (g.active_window ? '<div class="task-line"><b>Now:</b> ' + esc(g.active_window) + '</div>' : '') +
+    (!g.active_window && g.next_window ? '<div class="task-line"><b>Next:</b> ' + esc(g.next_window) + '</div>' : '') +
+    (dry ? '<div class="task-line">Dry run: the prompt is written to history.md, no worker starts. Activating clears it.</div>' : '') +
+    (g.last_outcome ? '<div class="task-line"><b>Last:</b> ' + esc(g.last_outcome) + '</div>' : '') +
+    (invalid && goalErrors(g) ? '<div class="task-report">' + esc(goalErrors(g)) + '</div>' : '') +
+    (running && g.active_taskid ? '<div class="task-line"><button class="btn btn-small btn-ghost" data-act="open-task" data-node="' + esc(nodeId) + '" data-ws="' + esc(wsId) + '" data-session="' + esc(g.active_taskid) + '">' + icon('comments') + ' Open its session</button></div>' : '') +
+    (actions ? '<div class="task-actions">' + actions + '</div>' : '');
+  return { key: 'g:' + nodeId + ':' + wsId + ':' + g.id, section, html, invalid };
+}
+
+function sessionCard(s, nodeId, wsId) {
+  const raw = String(s.state || s.status || 'planned').toLowerCase();
+  const active = truthy(s.active) || ['running', 'planned', 'starting', 'waiting', 'queued'].includes(raw);
+  const st = active && !['running', 'planned', 'queued'].includes(raw) ? 'running' : raw;
+  let section = 'finished';
+  if (raw === 'question') section = 'input';
+  else if (raw === 'queued') section = 'queued';
+  else if (active) section = 'running';
+  const id = taskIdOf(s);
+  const data = ' data-node="' + esc(nodeId) + '" data-ws="' + esc(wsId) + '" data-session="' + esc(id) + '"';
+  const html =
+    '<div class="task-top"><div class="task-name">' + esc(s.name || s.title || id || 'Session') + '</div>' +
+      '<span class="task-state ' + esc(st.replace(/[^a-z]/g, '')) + '">' + esc(raw === 'question' ? 'needs input' : st) + '</span></div>' +
+    '<div class="task-line">' + icon('bolt') + ' ' + fmtNum(s.token_usage) + ' tokens' + (s.origin === 'net' ? '  ·  via network' : '') +
+      (num(s.last_update_ms) ? '  ·  ' + esc(timeAgo(s.last_update_ms)) : '') + '</div>' +
+    (s.report || s.error ? '<div class="task-report">' + esc(clip(s.report || s.error, 900)) + '</div>' : '') +
+    '<div class="task-actions">' +
+      '<button class="btn btn-small btn-ghost" data-act="open-task"' + data + '>' + icon('comments') + ' Open</button>' +
+      (active ? '<button class="btn btn-small btn-danger" data-act="task-stop"' + data + '>' + icon('stop') + ' Stop</button>' : '') +
+    '</div>';
+  return { key: 's:' + nodeId + ':' + wsId + ':' + id, section, html };
+}
+
+const TASK_SECTIONS = [
+  ['running', 'Running now'],
+  ['queued', 'Queued — waiting for a free session'],
+  ['input', 'Needs input'],
+  ['scheduled', 'Scheduled'],
+  ['proposed', 'Proposed — waiting for your go'],
+  ['finished', 'Finished'],
+  ['invalid', 'Invalid goals'],
+];
+
+function taskCards(data, nodeId, wsId) {
+  const goals = arr(data && data.goals).filter((g) => g && typeof g === 'object');
+  const sessions = arr(data && data.sessions).filter((s) => s && typeof s === 'object');
+  const goalTasks = new Set(goals.map((g) => String(g.active_taskid || '')).filter(Boolean));
+  const cards = goals.map((g) => goalCard(g, nodeId, wsId));
+  sessions.forEach((s) => {
+    // the session of a running goal shows on the goal's card
+    if (goalTasks.has(taskIdOf(s)) && (truthy(s.active) || String(s.state) === 'question')) return;
+    cards.push(sessionCard(s, nodeId, wsId));
   });
+  return cards;
+}
 
-  const vals = Array.from(positions.values());
-  const minX = Math.min(...vals.map((p) => p.x), 0) - 70;
-  const maxX = Math.max(...vals.map((p) => p.x), 0) + 70;
-  const minY = Math.min(...vals.map((p) => p.y), 0) - 70;
-  const maxY = Math.max(...vals.map((p) => p.y), 0) + 70;
-  const width = Math.max(1, maxX - minX);
-  const height = Math.max(1, maxY - minY);
-  svg.setAttribute('viewBox', minX + ' ' + minY + ' ' + width + ' ' + height);
-  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-
-  edges.forEach((e) => {
-    const from = e.source || e.from;
-    const to = e.target || e.to;
-    const a = positions.get(from);
-    const b = positions.get(to);
-    if (!a || !b) return;
-
-    const line = document.createElementNS(NS, 'line');
-    line.setAttribute('x1', a.x);
-    line.setAttribute('y1', a.y);
-    line.setAttribute('x2', b.x);
-    line.setAttribute('y2', b.y);
-    line.setAttribute('class', 'arch-edge');
-    line.setAttribute('marker-end', 'url(#archArrow)');
-    svg.appendChild(line);
-
-    if (e.label) {
-      const label = document.createElementNS(NS, 'text');
-      label.setAttribute('x', (a.x + b.x) / 2);
-      label.setAttribute('y', (a.y + b.y) / 2 - 4);
-      label.setAttribute('class', 'arch-edge-label');
-      label.setAttribute('text-anchor', 'middle');
-      label.textContent = String(e.label);
-      svg.appendChild(label);
+/* draw cards into `host` in sections; nothing is rebuilt when nothing changed */
+function renderTaskSections(host, cards, emptyText) {
+  reconcile(host, TASK_SECTIONS.map(([id, title]) => ({ id, title })).concat([{ id: 'empty' }]), (s) => s.id, (s) => {
+    if (s.id === 'empty') return el('div', 'empty-state compact');
+    const sec = el('section', 'task-section');
+    sec.innerHTML = '<div class="task-section-head"><h3></h3><span></span></div><div class="task-grid"></div>';
+    return sec;
+  }, (sec, s) => {
+    if (s.id === 'empty') {
+      sec.hidden = cards.length > 0;
+      setHtml(sec, icon('tasks') + '<div class="empty-title">Nothing here yet</div><div>' + esc(emptyText || '') + '</div>');
+      return;
     }
-  });
-
-  nodes.forEach((n) => {
-    const p = positions.get(n.id);
-    const label = String(n.label || n.id || 'node');
-    const w = Math.min(250, Math.max(80, 55 + label.length * 7));
-    const h = 52;
-
-    const g = document.createElementNS(NS, 'g');
-    g.setAttribute('class', 'arch-node');
-
-    const rect = document.createElementNS(NS, 'rect');
-    rect.setAttribute('x', p.x - w / 2);
-    rect.setAttribute('y', p.y - h / 2);
-    rect.setAttribute('width', w);
-    rect.setAttribute('height', h);
-    rect.setAttribute('rx', '8');
-    rect.setAttribute('fill', kindColor(n.kind));
-    g.appendChild(rect);
-
-    const text = document.createElementNS(NS, 'text');
-    text.setAttribute('x', p.x);
-    text.setAttribute('y', p.y - 4);
-    text.textContent = label;
-    g.appendChild(text);
-
-    if (n.path) {
-      const sub = document.createElementNS(NS, 'text');
-      sub.setAttribute('x', p.x);
-      sub.setAttribute('y', p.y + 12);
-      sub.setAttribute('class', 'arch-path');
-      sub.textContent = String(n.path);
-      g.appendChild(sub);
-    }
-
-    const title = document.createElementNS(NS, 'title');
-    title.textContent = String(n.purpose || n.path || label);
-    g.appendChild(title);
-    svg.appendChild(g);
-  });
-
-  return svg;
-}
-
-function archButton(label, action, className = 'btn btn-small') {
-  const b = document.createElement('button');
-  b.className = className;
-  b.textContent = label;
-  b.addEventListener('click', () => architectureAction(action));
-  return b;
-}
-
-function renderArchitecture() {
-  const host = $('architectureView');
-  const raw = state.architecture || {};
-  const arch = raw.architecture || raw;
-  const nodes = arr(arch.nodes);
-  const edges = arr(arch.edges);
-  const pending = arr(arch.pending);
-  const plan = arch.plan || {};
-  const job = arch.job || {};
-
-  host.innerHTML = '';
-
-  const head = document.createElement('div');
-  head.className = 'arch-head';
-
-  const titleBlock = document.createElement('div');
-  titleBlock.className = 'arch-title-block';
-  titleBlock.innerHTML =
-    '<div><h2>' + esc(arch.project || (state.selectedWorkspace && state.selectedWorkspace.name) || 'Architecture') + '</h2>' +
-      '<div class="arch-summary">' + esc(arch.summary || '') + '</div></div>';
-  head.appendChild(titleBlock);
-
-  const actions = document.createElement('div');
-  actions.className = 'arch-actions';
-  actions.appendChild(archButton('Analyze', 'analyze'));
-  if (pending.length) {
-    actions.appendChild(archButton('Review plan', 'plan', 'btn btn-small btn-ghost'));
-    actions.appendChild(archButton('Apply', 'apply'));
-    actions.appendChild(archButton('Discard', 'discard', 'btn btn-small btn-ghost'));
-  }
-  head.appendChild(actions);
-  host.appendChild(head);
-
-  const cards = document.createElement('div');
-  cards.className = 'arch-cards';
-  const cardValues = [
-    ['Revision', arch.revision != null ? arch.revision : '-'],
-    ['Analyzed', arch.analyzed_at || 'never'],
-    ['Nodes', nodes.length],
-    ['Edges', edges.length],
-    ['Pending edits', pending.length]
-  ];
-  cardValues.forEach(([label, value]) => {
-    const card = document.createElement('div');
-    card.className = 'arch-card';
-    card.innerHTML = '<span>' + esc(label) + '</span><b>' + esc(value) + '</b>';
-    cards.appendChild(card);
-  });
-  host.appendChild(cards);
-
-  if (!nodes.length) {
-    host.appendChild(makeEmptyCompact('No architecture model.', 'Run Analyze to build the graph for this workspace.'));
-  } else {
-    host.appendChild(architectureSvg(nodes, edges));
-  }
-
-  const panel = document.createElement('div');
-  panel.className = 'arch-panel';
-
-  const pendingPane = document.createElement('div');
-  pendingPane.className = 'pane';
-  pendingPane.innerHTML = '<h3>Pending edits</h3>';
-  if (!pending.length) {
-    pendingPane.innerHTML += '<div class="pane-text">None.</div>';
-  } else {
-    const list = document.createElement('div');
-    list.className = 'pending-list';
-    pending.forEach((p) => {
-      const item = document.createElement('div');
-      item.className = 'pending-item';
-      item.innerHTML =
-        '<span class="op">' + esc(p.op || 'edit') + '</span>' +
-        '<span>' + esc(p.note || p.target || (p.node && p.node.label) || '') + '</span>';
-      list.appendChild(item);
+    const mine = cards.filter((c) => c.section === s.id);
+    setClass(sec, 'task-section' + (mine.length ? '' : ' is-empty'));
+    setText(sec.querySelector('h3'), s.title);
+    setText(sec.querySelector('.task-section-head span'), mine.length ? String(mine.length) : '');
+    reconcile(sec.querySelector('.task-grid'), mine, (c) => c.key, () => el('div', 'task-card'), (card, c) => {
+      setClass(card, 'task-card' + (c.invalid ? ' invalid' : ''));
+      setHtml(card, c.html);
     });
-    pendingPane.appendChild(list);
-  }
-  panel.appendChild(pendingPane);
-
-  const planPane = document.createElement('div');
-  planPane.className = 'pane';
-  planPane.innerHTML = '<h3>Plan</h3>';
-  if (plan && plan.text) {
-    planPane.innerHTML += '<div class="pane-text">' + mdRender(plan.text) + '</div>';
-  } else {
-    planPane.innerHTML += '<div class="pane-text">No plan yet.</div>';
-  }
-  panel.appendChild(planPane);
-
-  const jobPane = document.createElement('div');
-  jobPane.className = 'pane';
-  jobPane.innerHTML = '<h3>Job</h3>';
-  if (job && (job.taskid || job.state)) {
-    jobPane.innerHTML += '<div class="job-live">' +
-      ((job.state === 'implement' || job.state === 'research' || isRunningStatus(job.state)) ? '<span class="pulse-ring"></span>' : '') +
-      esc(job.state || 'unknown') + '</div>' +
-      '<div class="pane-text">' + esc(job.report || job.error || '') + '</div>';
-  } else {
-    jobPane.innerHTML += '<div class="pane-text">No job running.</div>';
-  }
-  panel.appendChild(jobPane);
-
-  host.appendChild(panel);
+  });
 }
 
-function loadArchitecture(forceReload = false) {
-  if (!state.selectedWorkspace) return;
-  const host = $('architectureView');
-  const workspaceId = String(state.selectedWorkspace.id);
-  let frame = host.querySelector('.architecture-frame');
-  if (frame && frame.dataset.workspaceId === workspaceId && !forceReload) return;
+let tasksTimer = 0;
+function scheduleTasks() {
+  if (tasksTimer) return;
+  tasksTimer = setTimeout(() => { tasksTimer = 0; loadTasks(); }, 250);
+}
 
+async function loadTasks() {
+  if (state.view !== 'workspace' || state.tab !== 'tasks' || !state.sel.node || !state.sel.ws) return;
+  const nodeId = state.sel.node;
+  const wsId = state.sel.ws;
+  const gen = state.selGen;
+  const w = workspaceOf(nodeId, wsId);
+  setText($('taskTitle'), 'Tasks — ' + (w ? w.name : ''));
+  let data = null;
+  try {
+    data = await api(nodeId).get('/api/workspaces/' + enc(wsId) + '/tasks');
+  } catch (e) {
+    if (gen !== state.selGen) return;
+    $('taskContent').innerHTML = '<div class="empty-state compact">Could not load the tasks: ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (gen !== state.selGen || state.tab !== 'tasks') return;
+  const cards = taskCards(data, nodeId, wsId);
+  renderTaskSections($('taskContent'), cards, 'Add a task above, or ask the agent in the chat to schedule one.');
+}
+
+async function submitTask(e) {
+  e.preventDefault();
+  const goal = $('taskGoal').value.trim();
+  if (!goal || !state.sel.node || !state.sel.ws) { toast('Describe what the task should do.', 'warn'); return; }
+  const title = $('taskTitleInput').value.trim() || clip(oneLine(goal), 48);
+  const a = selApi();
+  const ws = state.sel.ws;
+  try {
+    // the goal's id comes from its title: a second task with the same title gets a number
+    let made = null;
+    for (let n = 1; !made; n++) {
+      try {
+        made = await a.post('/api/workspaces/' + enc(ws) + '/goals',
+          { title: n > 1 ? title + ' (' + n + ')' : title, instructions: goal, schedule_type: 'manual', activate: 'yes' });
+      } catch (err) {
+        if (n >= 9 || !/exists already|already exists/.test(err.message)) throw err;
+      }
+    }
+    const id = made && (made.id || (made.goal && made.goal.id));
+    if (!id) throw new Error('The goal engine did not return the new task.');
+    await a.post('/api/workspaces/' + enc(ws) + '/goals/' + enc(id) + '/run', {});
+    $('taskForm').classList.add('hidden');
+    $('taskTitleInput').value = '';
+    $('taskGoal').value = '';
+    toast('The task is queued.', 'success');
+    loadTasks();
+  } catch (err) {
+    toast('Could not create the task: ' + err.message, 'error');
+  }
+}
+
+async function taskAction(btn) {
+  const act = btn.dataset.act;
+  const nodeId = btn.dataset.node;
+  const wsId = btn.dataset.ws;
+  const a = api(nodeId);
+  const again = () => { if (state.view === 'globalTasks') loadGlobalTasks(); else loadTasks(); };
+  try {
+    if (act === 'open-task') {
+      state.openWs.add(wsKey(nodeId, wsId));
+      await selectSession(nodeId, wsId, btn.dataset.session);
+      return;
+    }
+    btn.disabled = true;
+    if (act === 'goal-status') {
+      const body = { status: btn.dataset.status };
+      if (btn.dataset.status === 'active') body.clear_dry_run = 'yes';
+      await a.post('/api/workspaces/' + enc(wsId) + '/goals/' + enc(btn.dataset.goal) + '/status', body);
+    } else if (act === 'goal-run') {
+      await a.post('/api/workspaces/' + enc(wsId) + '/goals/' + enc(btn.dataset.goal) + '/run', {});
+      toast('The run is queued.', 'success');
+    } else if (act === 'goal-delete') {
+      if (!window.confirm('Delete the goal "' + btn.dataset.goal + '"? Its open runs are stopped; project files stay.')) { btn.disabled = false; return; }
+      await a.del('/api/workspaces/' + enc(wsId) + '/goals/' + enc(btn.dataset.goal));
+    } else if (act === 'task-stop') {
+      await a.del('/api/workspaces/' + enc(wsId) + '/tasks/' + enc(btn.dataset.session));
+    }
+    again();
+  } catch (e) {
+    btn.disabled = false;
+    toast('That did not work: ' + e.message, 'error');
+  }
+}
+
+/* ── all tasks (every online node) ── */
+let globalTimer = 0;
+function scheduleGlobalTasks() {
+  if (globalTimer) return;
+  globalTimer = setTimeout(() => { globalTimer = 0; loadGlobalTasks(); }, 600);
+}
+
+async function loadGlobalTasks() {
+  if (state.view !== 'globalTasks') return;
+  const host = $('globalTasksContent');
+  const nodes = state.nodes.filter((n) => n.kind === 'node' && n.online && n.api);
+  if (!host.children.length) host.innerHTML = '<div class="empty-state compact">Loading…</div>';
+
+  const results = await Promise.all(nodes.map(async (n) => {
+    try {
+      return { n, data: await api(n.id).get('/api/tasks/overview') };
+    } catch (e) {
+      return { n, error: e.message };
+    }
+  }));
+  if (state.view !== 'globalTasks') return;
+
+  const groups = [];
+  results.forEach(({ n, data, error }) => {
+    if (error) { groups.push({ key: n.id, n, error }); return; }
+    arr(data && data.workspaces).forEach((w) => {
+      const cards = taskCards(w, n.id, String(w.id));
+      if (cards.length) groups.push({ key: n.id + '/' + w.id, n, w, cards });
+    });
+  });
+
+  reconcile(host, groups.length ? groups : [{ key: 'empty' }], (g) => g.key, (g) => {
+    if (g.key === 'empty') return el('div', 'empty-state');
+    const box = el('div', 'global-group');
+    box.innerHTML = '<h3></h3><div class="global-body"></div>';
+    return box;
+  }, (box, g) => {
+    if (g.key === 'empty') {
+      setHtml(box, icon('tasks') + '<div class="empty-title">No tasks anywhere</div><div>Open a workspace and add a task, or ask an agent to schedule one.</div>');
+      return;
+    }
+    setHtml(box.children[0], icon(g.w ? (g.w.id === 'node' ? 'home' : 'folder') : 'server') + ' ' + esc(g.w ? g.w.name : g.n.name) +
+      ' <span class="tree-sub">' + esc(g.n.name) + '</span>');
+    if (g.error) { setHtml(box.children[1], '<div class="form-hint">Could not load: ' + esc(g.error) + '</div>'); return; }
+    box.children[1]._html = null;
+    renderTaskSections(box.children[1], g.cards, '');
+  });
+}
+
+/* ── architecture ── */
+function loadArchitecture() {
+  if (!state.sel.node || !state.sel.ws) return;
+  const host = $('architectureView');
+  const key = state.sel.node + '/' + state.sel.ws;
+  let frame = host.querySelector('.architecture-frame');
+  if (frame && frame.dataset.key === key) return;
   host.innerHTML = '';
-  frame = document.createElement('iframe');
-  frame.className = 'architecture-frame';
-  frame.title = 'Workspace architecture map and editor';
-  frame.dataset.workspaceId = workspaceId;
-  frame.src = 'architecture/index.html?workspace=' + encodeURIComponent(workspaceId);
+  frame = el('iframe', 'architecture-frame');
+  frame.title = 'Architecture graph of the workspace';
+  frame.dataset.key = key;
+  frame.src = 'architecture/index.html?workspace=' + enc(state.sel.ws) + (state.sel.node !== 'local' ? '&node=' + enc(state.sel.node) : '');
   host.appendChild(frame);
 }
 
-async function architectureAction(action) {
-  if (!state.selectedWorkspace) return;
-  const ws = state.selectedWorkspace;
-  try {
-    await NodeApi.post('/api/workspaces/' + encodeURIComponent(ws.id) + '/architecture/' + action);
-    toast('Architecture ' + action + ' started.', 'info');
-    loadArchitecture(true);
-    setTimeout(() => {
-      loadArchitecture(true);
-      refreshWorkspace(ws.id).catch(() => {});
-    }, 1200);
-  } catch (e) {
-    toast('Architecture action failed: ' + e.message, 'error');
-  }
-}
-
-/* ── Tasks ── */
-function taskStateClass(raw) {
-  const st = String(raw || 'planned').toLowerCase().replace(/[^a-z]/g, '') || 'planned';
-  return st;
-}
-
-function taskRenderSignature(data) {
-  const goals = arr(data && data.goals).map((g) => [
-    g.id, g.title, g.status, g.active_run_state, g.active_taskid,
-    g.active_window, g.next_window, g.last_outcome,
-    g.errors, g.invalid_edit, g.dry_run, g.schedule, g.revision
-  ]);
-  const sessions = arr(data && data.sessions).map((s) => [
-    s.taskid, s.id, s.name, s.title, s.state, s.status, s.active,
-    s.report, s.error, s.token_usage, s.last_update_ms
-  ]);
-  const templates = arr(data && data.templates).map((t) => t && (t.name || t));
-  return JSON.stringify([goals, sessions, templates]);
-}
-
-function goalCard(g, workspaceId) {
-  if (!g || typeof g !== 'object') return null;
-  const st = goalStatus(g);
-  const running = isGoalRunOpen(g);
-  const needsInput = isGoalNeedsInput(g);
-  const inWindow = goalHasOpenWindow(g);
-  const invalid = isGoalInvalid(g);
-  const displayState = invalid ? 'Invalid'
-    : needsInput ? 'Needs input'
-    : running ? (String(g.active_run_state || '').toLowerCase() === 'checkpoint' ? 'Checkpoint' : 'Running')
-    : (inWindow && (st === 'active' || st === 'paused') ? 'Window open' : statusLabel(st || 'planned'));
-  const stateClass = taskStateClass(invalid ? 'invalid' : needsInput ? 'question' : running ? 'running' : (inWindow ? 'active' : st));
-  const card = document.createElement('div');
-  card.className = 'task-card' + (invalid ? ' invalid' : '');
-
-  const top = document.createElement('div');
-  top.className = 'task-top';
-  top.innerHTML =
-    '<div class="task-name">' + esc(g.title || g.id || 'Task') + '</div>' +
-    '<span class="task-state ' + esc(stateClass) + '">' + esc(displayState) + '</span>';
-  card.appendChild(top);
-
-  const dryRun = Boolean(g.dry_run === true || g.dry_run === 1 ||
-    String(g.dry_run).toLowerCase() === 'true' || String(g.dry_run) === '1');
-  if (dryRun) {
-    const p = document.createElement('div');
-    p.className = 'task-report';
-    p.textContent = 'Dry run only: the scheduler writes the prompt to history.md and starts no worker.';
-    card.appendChild(p);
-  }
-
-  if (g.schedule) {
-    const p = document.createElement('div');
-    p.className = 'task-goal';
-    p.textContent = 'Schedule: ' + formatSchedule(g.schedule);
-    card.appendChild(p);
-  }
-  if (g.next_window) {
-    const p = document.createElement('div');
-    p.className = 'task-goal';
-    p.textContent = 'Next: ' + String(g.next_window);
-    card.appendChild(p);
-  }
-  if (g.active_window) {
-    const p = document.createElement('div');
-    p.className = 'task-goal';
-    p.textContent = 'Now: ' + String(g.active_window);
-    card.appendChild(p);
-  }
-  if (running && g.active_taskid) {
-    const p = document.createElement('div');
-    p.className = 'task-goal';
-    p.textContent = 'Running task ' + String(g.active_taskid);
-    card.appendChild(p);
-  }
-  if (g.last_outcome) {
-    const p = document.createElement('div');
-    p.className = 'task-report';
-    p.textContent = 'Last: ' + String(g.last_outcome);
-    card.appendChild(p);
-  }
-  if (invalid) {
-    const errorText = formatGoalErrors(g);
-    if (errorText) {
-      const p = document.createElement('div');
-      p.className = 'task-report';
-      p.textContent = 'Invalid: ' + errorText;
-      card.appendChild(p);
-    }
-  }
-
-  const actions = document.createElement('div');
-  actions.className = 'task-actions';
-
-  if (!invalid && st === 'proposed') {
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-small';
-    btn.textContent = dryRun ? 'Activate live' : 'Activate';
-    btn.title = dryRun ? 'Move to active and clear dry_run so the scheduler dispatches a worker' : 'Move to active';
-    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', dryRun));
-    actions.appendChild(btn);
-  } else if (!invalid && st === 'active') {
-    if (dryRun) {
-      const live = document.createElement('button');
-      live.className = 'btn btn-small';
-      live.textContent = 'Run live';
-      live.title = 'Clear dry_run; the scheduler dispatches the next window';
-      live.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', true));
-      actions.appendChild(live);
-    }
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-small btn-ghost';
-    btn.textContent = 'Pause';
-    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'paused'));
-    actions.appendChild(btn);
-  } else if (!invalid && st === 'paused') {
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-small';
-    btn.textContent = dryRun ? 'Resume live' : 'Resume';
-    btn.title = dryRun ? 'Resume and clear dry_run' : 'Resume';
-    btn.addEventListener('click', () => setGoalStatus(workspaceId, g.id, 'active', dryRun));
-    actions.appendChild(btn);
-  }
-
-  if (g.id != null) {
-    const del = document.createElement('button');
-    del.className = 'btn btn-small btn-danger';
-    del.textContent = 'Delete';
-    del.title = 'Delete this goal (stops open runs, keeps project files)';
-    del.addEventListener('click', () => deleteGoal(workspaceId, g.id));
-    actions.appendChild(del);
-  }
-
-  if (actions.childElementCount) card.appendChild(actions);
-  return card;
-}
-
-function sessionCard(s, workspaceId) {
-  if (!s || typeof s !== 'object') return null;
-  const reportedState = String(s.state || s.status || 'planned').toLowerCase();
-  const active = isActiveTask(s);
-  const st = active && !isRunningStatus(reportedState) ? 'running' : reportedState;
-  const card = document.createElement('div');
-  card.className = 'task-card';
-
-  const top = document.createElement('div');
-  top.className = 'task-top';
-  top.innerHTML =
-    '<div class="task-name">' + esc(s.name || s.title || s.taskid || 'Task') + '</div>' +
-    '<span class="task-state ' + esc(taskStateClass(st)) + '">' + esc(statusLabel(st)) + '</span>';
-  card.appendChild(top);
-
-  const meta = document.createElement('div');
-  meta.className = 'task-goal';
-  meta.textContent = 'Session ' + (s.taskid || s.id || '') + ' - ' + fmtNum(s.token_usage) + ' tokens';
-  card.appendChild(meta);
-
-  if (s.report || s.error) {
-    const report = document.createElement('div');
-    report.className = 'task-report';
-    report.textContent = s.report || s.error;
-    card.appendChild(report);
-  }
-
-  const actions = document.createElement('div');
-  actions.className = 'task-actions';
-  if (isRunningStatus(st) || st === 'planned' || st === 'running') {
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-small btn-danger';
-    btn.textContent = 'Stop';
-    btn.addEventListener('click', () => stopTask(workspaceId, s.taskid || s.id));
-    actions.appendChild(btn);
-  }
-  if (actions.childElementCount) card.appendChild(actions);
-  return card;
-}
-
-function taskSection(title, subtitle, cards, emptyText) {
-  const wrap = document.createElement('section');
-  wrap.className = 'task-section';
-  const head = document.createElement('div');
-  head.className = 'task-section-head';
-  head.innerHTML = '<h3>' + esc(title) + '</h3>' + (subtitle ? '<span>' + esc(subtitle) + '</span>' : '');
-  wrap.appendChild(head);
-
-  if (!cards.length) {
-    wrap.appendChild(makeEmptyCompact(emptyText, ''));
-    return wrap;
-  }
-
-  const grid = document.createElement('div');
-  grid.className = 'task-grid';
-  cards.forEach((c) => { if (c) grid.appendChild(c); });
-  wrap.appendChild(grid);
-  return wrap;
-}
-
-async function submitTaskForm(e) {
-  e.preventDefault();
-  const form = $('taskForm');
-  const workspaceId = form.dataset.workspaceId;
-  const goal = $('taskGoal').value.trim();
-  if (!workspaceId) {
-    toast('Select a workspace first.', 'warn');
-    return;
-  }
-  if (!goal) {
-    toast('Describe what the task should do.', 'warn');
-    return;
-  }
-  const title = $('taskTitle').value.trim() || goal.slice(0, 48);
-  try {
-    const created = await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals', {
-      title,
-      instructions: goal,
-      schedule_type: 'manual',
-      activate: 'yes'
-    });
-    const goalId = created && (created.id || (created.goal && created.goal.id));
-    if (!goalId) throw new Error('The goal engine did not return the new task ID.');
-    await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals/' + encodeURIComponent(goalId) + '/run', {});
-    form.classList.add('hidden');
-    $('taskTitle').value = '';
-    $('taskGoal').value = '';
-    state.taskRenderSignatures[String(workspaceId)] = '';
-    await reloadTaskView(workspaceId);
-    toast('Task queued by the goal engine.', 'success');
-  } catch (e) {
-    toast('Could not create or queue task: ' + e.message, 'error');
-  }
-}
-
-function renderTasks(data, workspaceName, workspaceId) {
-  const host = $('taskContent');
-  host.innerHTML = '';
-  $('taskForm').dataset.workspaceId = String(workspaceId);
-
-  const goals = arr(data && data.goals);
-  const sessions = arr(data && data.sessions);
-  const templates = arr(data && data.templates);
-
-  $('taskHeadline').innerHTML =
-    '<div class="task-headline"><div><h2>Tasks - ' + esc(workspaceName || 'workspace') + '</h2>' +
-      '<div class="form-hint">Running, scheduled, proposed, needs input, finished/archived and invalid goals of this workspace.</div></div>' +
-    '<button id="btnNewTask" class="btn btn-small">+ New task</button></div>';
-
-  const runningGoals = [];
-  const scheduledGoals = [];
-  const proposedGoals = [];
-  const finishedGoals = [];
-  const invalidGoals = [];
-  const needsInputGoals = [];
-
-  goals.forEach((g) => {
-    if (!g || typeof g !== 'object') return;
-    const st = goalStatus(g);
-    if (isGoalInvalid(g)) invalidGoals.push(g);
-    else if (isGoalNeedsInput(g)) needsInputGoals.push(g);
-    else if (isGoalRunOpen(g)) runningGoals.push(g);
-    else if ((st === 'active' || st === 'paused') && goalHasOpenWindow(g)) runningGoals.push(g);
-    else if (st === 'proposed') proposedGoals.push(g);
-    else if (st === 'active' || st === 'paused') scheduledGoals.push(g);
-    else if (['completed', 'cancelled', 'archived'].includes(st)) finishedGoals.push(g);
-    else invalidGoals.push(g);
+/* ── notifications ── */
+async function loadNotifications(nodeId, announce) {
+  let list = [];
+  try { list = arr(await api(nodeId).get('/api/notifications')); } catch (e) { return; }
+  const n = nodeById(nodeId);
+  const name = n ? n.name : nodeId;
+  const known = new Set(state.notifications.filter((x) => x.node === nodeId).map((x) => x.time + '|' + x.message));
+  const fresh = [];
+  list.forEach((x) => {
+    const item = { node: nodeId, nodeName: name, message: String(x.message || x.text || ''), time: num(x.time) };
+    if (!known.has(item.time + '|' + item.message)) { state.notifications.push(item); fresh.push(item); }
   });
-
-  const runningTaskIds = new Set(runningGoals.map((g) => String(g.active_taskid || '')).filter(Boolean));
-  const activeSessions = sessions.filter(isActiveTask).filter((s) => !runningTaskIds.has(taskIdOf(s)));
-  const runningCards = runningGoals.map((g) => goalCard(g, workspaceId))
-    .concat(activeSessions.map((s) => sessionCard(s, workspaceId)));
-
-  host.appendChild(taskSection(
-    'Running now',
-    runningCards.length ? runningCards.length + ' item(s)' : '',
-    runningCards,
-    'Nothing is running right now.'
-  ));
-
-  host.appendChild(taskSection(
-    'Scheduled but inactive',
-    scheduledGoals.length ? scheduledGoals.length + ' goal(s)' : '',
-    scheduledGoals.map((g) => goalCard(g, workspaceId)),
-    'No inactive scheduled goals.'
-  ));
-
-  host.appendChild(taskSection(
-    'Proposed tasks',
-    proposedGoals.length ? proposedGoals.length + ' waiting for activation' : '',
-    proposedGoals.map((g) => goalCard(g, workspaceId)),
-    'No proposed tasks. The agent can create one from chat.'
-  ));
-
-  const needsInputTaskIds = new Set(needsInputGoals.map((g) => String(g.active_taskid || '')).filter(Boolean));
-  const needsInputSessions = sessions.filter(isNeedsInputTask)
-    .filter((s) => !needsInputTaskIds.has(taskIdOf(s)));
-  const needsInputCards = needsInputGoals.map((g) => goalCard(g, workspaceId))
-    .concat(needsInputSessions.map((s) => sessionCard(s, workspaceId)));
-
-  host.appendChild(taskSection(
-    'Needs input',
-    needsInputCards.length ? needsInputCards.length + ' item(s)' : '',
-    needsInputCards,
-    'No session or goal is waiting for input.'
-  ));
-
-  const finishedSessions = sessions.filter((s) => isFinishedTask(s) && !isNeedsInputTask(s));
-  const finishedCards = finishedGoals.map((g) => goalCard(g, workspaceId))
-    .concat(finishedSessions.map((s) => sessionCard(s, workspaceId)));
-
-  host.appendChild(taskSection(
-    'Finished / archived',
-    finishedCards.length ? finishedCards.length + ' item(s)' : '',
-    finishedCards,
-    'Nothing finished yet.'
-  ));
-
-  host.appendChild(taskSection(
-    'Invalid goals',
-    invalidGoals.length ? invalidGoals.length + ' invalid' : '',
-    invalidGoals.map((g) => goalCard(g, workspaceId)),
-    'No invalid goals.'
-  ));
-
-  if (templates.length) {
-    const wrap = document.createElement('section');
-    wrap.className = 'task-section';
-    const headT = document.createElement('div');
-    headT.className = 'task-section-head';
-    headT.innerHTML = '<h3>Task templates</h3><span>Existing goal templates in .agentspace/templates</span>';
-    wrap.appendChild(headT);
-    const chips = document.createElement('div');
-    chips.className = 'template-chips';
-    templates.forEach((t) => {
-      const chip = document.createElement('div');
-      chip.className = 'template-chip';
-      chip.textContent = t.name || String(t);
-      chips.appendChild(chip);
-    });
-    wrap.appendChild(chips);
-    host.appendChild(wrap);
+  state.notifications.sort((a, b) => a.time - b.time);
+  if (state.notifications.length > 120) state.notifications = state.notifications.slice(-120);
+  if (announce && fresh.length) {
+    state.notifUnseen += fresh.length;
+    const last = fresh[fresh.length - 1];
+    toast(name + ': ' + clip(last.message, 300), 'info', 7000);
   }
+  renderNotificationBadge();
+  if (!$('notificationPanel').classList.contains('hidden')) renderNotifications();
 }
 
-async function loadTasks(workspaceId = state.selectedWorkspace && state.selectedWorkspace.id, generation = state.workspaceSelectionGeneration) {
-  if (!workspaceId) return;
-  const id = String(workspaceId);
-  const request = ++state.taskRequestGeneration;
-  const host = $('taskContent');
-  if (!state.taskData) host.innerHTML = '<div class="empty-state compact">Loading tasks...</div>';
-  try {
-    const data = await NodeApi.get('/api/workspaces/' + encodeURIComponent(id) + '/tasks');
-    if (request !== state.taskRequestGeneration || generation !== state.workspaceSelectionGeneration || !state.selectedWorkspace || String(state.selectedWorkspace.id) !== id) return;
-    state.taskData = data;
-    const signature = taskRenderSignature(data);
-    if (state.taskRenderSignatures[id] === signature) return;
-    state.taskRenderSignatures[id] = signature;
-    renderTasks(data, state.selectedWorkspace.name, id);
-  } catch (e) {
-    if (request !== state.taskRequestGeneration || generation !== state.workspaceSelectionGeneration || !state.selectedWorkspace || String(state.selectedWorkspace.id) !== id) return;
-    host.innerHTML = '<div class="empty-state compact">Could not load tasks: ' + esc(e.message) + '</div>';
-    toast('Tasks failed: ' + e.message, 'error');
-  }
-}
-
-async function reloadTaskView(workspaceId) {
-  const id = String(workspaceId || '');
-  if (!id) return;
-
-  if (state.view === 'globalTasks') {
-    state.globalTaskRenderSignature = '';
-    await showGlobalTasks(true);
-    return;
-  }
-
-  if (state.selectedWorkspace && String(state.selectedWorkspace.id) === id) {
-    state.taskRenderSignatures[id] = '';
-    await loadTasks(id);
-    await refreshWorkspace(id).catch(() => {});
-  }
-}
-
-async function setGoalStatus(workspaceId, goalId, status, clearDryRun = false) {
-  try {
-    const body = { status };
-    // Activating/resuming is meant to run live. Always clear dry_run, even if the
-    // card was rendered from stale data; the backend treats it as a no-op when
-    // the goal is not a dry run.
-    if (status === 'active' || clearDryRun) body.clear_dry_run = 'yes';
-    await NodeApi.post('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals/' + encodeURIComponent(goalId) + '/status', body);
-    toast(status === 'active' ? 'Goal active (dry_run cleared).' : 'Goal ' + status + '.', 'success');
-    await reloadTaskView(workspaceId);
-  } catch (e) {
-    toast('Goal update failed: ' + e.message, 'error');
-  }
-}
-
-async function deleteGoal(workspaceId, goalId) {
-  if (!workspaceId || goalId == null) return;
-  if (!window.confirm('Delete goal "' + goalId + '"? Open runs are stopped and the goal definition is removed. Project files stay on disk.')) return;
-
-  try {
-    const result = await NodeApi.del('/api/workspaces/' + encodeURIComponent(workspaceId) + '/goals/' + encodeURIComponent(goalId));
-    if (result && result.removed != null && String(result.removed) !== String(goalId)) {
-      throw new Error('The server removed a different goal.');
-    }
-    state.taskRenderSignatures[String(workspaceId)] = '';
-    state.globalTaskRenderSignature = '';
-    await reloadTaskView(workspaceId);
-    toast('Goal removed.', 'success');
-  } catch (e) {
-    toast('Could not delete goal: ' + e.message, 'error');
-  }
-}
-
-async function stopTask(workspaceId, taskid) {
-  try {
-    await NodeApi.del('/api/workspaces/' + encodeURIComponent(workspaceId) + '/tasks/' + encodeURIComponent(taskid));
-    toast('Task stopped.', 'warn');
-    await reloadTaskView(workspaceId);
-  } catch (e) {
-    toast('Could not stop task: ' + e.message, 'error');
-  }
-}
-
-/* ── Global tasks ── */
-async function showGlobalTasks(refreshOnly = false) {
-  if (!refreshOnly) {
-    state.view = 'globalTasks';
-    state.selectedSession = null;
-    state.session = null;
-    closeStream();
-    $('workspaceView').hidden = true;
-    $('globalTasksView').hidden = false;
-    $('workspaceView').classList.add('hidden');
-    $('globalTasksView').classList.remove('hidden');
-    renderHeader();
-    renderWorkspaceTree();
-    renderSessionHeader();
-  }
-  if (state.view !== 'globalTasks' || state.globalTasksLoading) return;
-  const generation = ++state.globalTasksGeneration;
-  state.globalTasksLoading = true;
-
-  const host = $('globalTasksContent');
-  const workspaces = state.workspaces.filter((ws) => String(ws.id) !== 'root');
-  if (!refreshOnly) {
-    host.innerHTML = '<h2>Global tasks</h2>' +
-      '<div class="global-tasks-sub">Tasks across ' + workspaces.length + ' workspace(s).</div>' +
-      '<div class="empty-state compact">Loading tasks...</div>';
-  }
-
-  const results = await Promise.all(workspaces.map(async (ws) => {
-    try {
-      const data = await NodeApi.get('/api/workspaces/' + encodeURIComponent(ws.id) + '/tasks');
-      return { ws, data };
-    } catch (e) {
-      return { ws, data: null, error: e.message };
-    }
-  }));
-
-  state.globalTasksLoading = false;
-  if (generation !== state.globalTasksGeneration || state.view !== 'globalTasks') return;
-
-  const groups = document.createElement('div');
-  groups.className = 'global-task-groups';
-  let total = 0;
-
-  const signature = JSON.stringify(results.map(({ ws, data, error }) => [
-    ws.id, error || '', data ? taskRenderSignature(data) : ''
-  ]));
-  if (refreshOnly && state.globalTaskRenderSignature === signature) return;
-  state.globalTaskRenderSignature = signature;
-  host.innerHTML = '<h2>Global tasks</h2>' +
-    '<div class="global-tasks-sub">Tasks across ' + workspaces.length + ' workspace(s).</div>';
-
-  results.forEach(({ ws, data, error }) => {
-    const goals = arr(data && data.goals);
-    const sessions = arr(data && data.sessions);
-    const goalTaskIds = new Set(goals.map((g) => String(g.active_taskid || '')).filter(Boolean));
-    const sessionCards = sessions
-      .filter((s) => isActiveTask(s) || isFinishedTask(s))
-      .filter((s) => !goalTaskIds.has(taskIdOf(s)))
-      .map((s) => sessionCard(s, ws.id));
-    const cards = goals.map((g) => goalCard(g, ws.id)).filter(Boolean).concat(sessionCards);
-
-    if (!cards.length && !error) return;
-    total += cards.length;
-
-    const group = document.createElement('div');
-    group.className = 'global-group';
-    group.innerHTML = '<h3><i class="fa-solid fa-grid-2"></i> ' + esc(ws.name || ws.id) + '</h3>';
-    if (error) {
-      group.innerHTML += '<div class="form-hint">Could not load: ' + esc(error) + '</div>';
-    }
-    if (cards.length) {
-      const grid = document.createElement('div');
-      grid.className = 'task-grid';
-      cards.forEach((c) => { if (c) grid.appendChild(c); });
-      group.appendChild(grid);
-    }
-    groups.appendChild(group);
-  });
-
-  if (!total && !results.some((r) => r.error)) {
-    host.appendChild(makeEmpty('No tasks anywhere.', 'Create goals in a workspace task scheduler.'));
-  } else {
-    host.appendChild(groups);
-  }
-}
-
-/* ── Notifications ── */
-async function refreshNotifications() {
-  try {
-    const data = await NodeApi.get('/api/notifications');
-    state.notifications = arr(data).slice(-30);
-    const badge = $('notificationBadge');
-    if (state.notifications.length) {
-      badge.textContent = String(state.notifications.length);
-      badge.classList.remove('hidden');
-    } else {
-      badge.classList.add('hidden');
-    }
-
-    const now = Date.now();
-    const fresh = state.notifications.filter((n) => timeValue(n.time || n.created || n.timestamp) > state.notificationSeen);
-    if (state.notificationSeen && fresh.length) {
-      const latest = fresh[fresh.length - 1];
-      toast(latest.message || latest.text || 'Notification', 'info');
-    }
-    state.notificationSeen = now;
-  } catch (e) {
-    // notifications are optional for the workspace dashboard
-  }
+function renderNotificationBadge() {
+  const b = $('notificationBadge');
+  b.textContent = String(state.notifUnseen);
+  b.classList.toggle('hidden', !state.notifUnseen);
 }
 
 function renderNotifications() {
   const panel = $('notificationPanel');
-  if (!state.notifications.length) {
-    panel.innerHTML = '<div class="empty-state compact">No notifications.</div>';
+  if (!state.notifications.length) { panel.innerHTML = '<div class="empty-state compact">No notifications.</div>'; return; }
+  panel.innerHTML = state.notifications.slice().reverse().map((n) =>
+    '<div class="notification-item">' + esc(n.message) +
+    '<div class="notification-meta">' + esc(n.nodeName) + (n.time ? '  ·  ' + esc(timeAgo(n.time)) : '') + '</div></div>').join('');
+}
+
+/* ── dialogs ── */
+function openDialog(id) { $(id).classList.remove('hidden'); }
+function closeDialog(id) {
+  $(id).classList.add('hidden');
+  if (id === 'settingsDialog') state.dialogNode = null;
+}
+
+/* settings: the sessions of a node and its Telegram gateway */
+async function openSettings() {
+  const sel = $('settingsNode');
+  const nodes = state.nodes.filter((n) => n.kind === 'node' && n.online && n.api);
+  sel.innerHTML = nodes.map((n) => '<option value="' + esc(n.id) + '">' + esc(n.name) + (n.local ? ' (this node)' : '') + '</option>').join('');
+  const want = state.sel.node && nodes.some((n) => n.id === state.sel.node) ? state.sel.node : 'local';
+  sel.value = want;
+  openDialog('settingsDialog');
+  await loadSettings(sel.value);
+}
+
+async function loadSettings(nodeId) {
+  state.dialogNode = nodeId;
+  $('gatewayToken').value = '';
+  setHtml($('gatewayStatus'), '<span class="form-hint">Loading…</span>');
+  try {
+    const s = await api(nodeId).get('/api/settings');
+    $('maxSessionsInput').value = num(s.max_sessions) || 2;
+  } catch (e) {
+    toast('Could not load the settings: ' + e.message, 'error');
+  }
+  await refreshGateway(true);
+}
+
+async function refreshGateway(fill) {
+  const nodeId = state.dialogNode;
+  if (!nodeId || $('settingsDialog').classList.contains('hidden')) return;
+  let g = null;
+  try {
+    g = await api(nodeId).get('/api/gateway');
+  } catch (e) {
+    if (state.dialogNode !== nodeId) return;
+    setHtml($('gatewayStatus'), '<span class="form-hint">' + (e.status === 404 ? 'This node has no gateway settings (an older version).' : 'Could not load: ' + esc(e.message)) + '</span>');
     return;
   }
-  panel.innerHTML = state.notifications.slice().reverse().map((n) => {
-    const msg = n.message || n.text || '';
-    const t = timeValue(n.time || n.created || n.timestamp);
-    return '<div class="notification-item"><div>' + esc(msg) + '</div>' +
-      '<div class="notification-time">' + esc(t ? timeAgo(t) : '') + '</div></div>';
-  }).join('');
+  if (state.dialogNode !== nodeId) return;
+  const s = g.settings || {};
+  const st = g.status || {};
+  if (fill) {
+    $('gatewayEnabled').checked = truthy(s.enabled);
+    $('gatewayName').value = s.name || '';
+    $('gatewayConfig').value = s.config || '';
+    $('gatewayToken').placeholder = truthy(s.token_set) ? 'saved (' + (s.token_hint || 'set') + ') — type a new one to replace it' : '123456:ABC-DEF…';
+  }
+  const running = truthy(st.running);
+  const log = arr(st.log).slice(-12).map((l) => (typeof l === 'string' ? l : String(l.text || ''))).join('\n');
+  setHtml($('gatewayStatus'),
+    '<span class="chip ' + (running ? 'done' : (truthy(st.wanted) ? 'running' : '')) + '">' + (running ? 'running' : (truthy(st.wanted) ? 'starting…' : 'not running')) + '</span>' +
+    (running && st.pid ? '<span class="form-hint">pid ' + esc(st.pid) + (num(st.restarts) ? ', restarted ' + num(st.restarts) + '×' : '') + '</span>' : '') +
+    (!truthy(g.managed) ? '<div class="form-hint" style="margin-top:6px">This node was started with --no-gateway: the settings are saved, the gateway is started with <code>shz miniagent --telegram-gateway</code>.</div>' : '') +
+    (st.last_exit && !running ? '<div class="form-hint" style="margin-top:6px">' + esc(st.last_exit) + '</div>' : '') +
+    (log ? '<div class="gateway-log">' + esc(log) + '</div>' : ''));
 }
 
-/* ── Navigation / events ── */
-function showWorkspaceView() {
-  state.view = 'workspace';
-  state.globalTasksGeneration++;
-  $('workspaceView').hidden = false;
-  $('globalTasksView').hidden = true;
-  $('workspaceView').classList.remove('hidden');
-  $('globalTasksView').classList.add('hidden');
-  renderHeader();
+async function saveSettings() {
+  const nodeId = state.dialogNode;
+  if (!nodeId) return;
+  const a = api(nodeId);
+  const max = Number($('maxSessionsInput').value);
+  if (!Number.isInteger(max) || max < 1 || max > 64) { toast('The session limit is a number from 1 to 64.', 'warn'); return; }
+  try {
+    await a.put('/api/settings', { max_sessions: max });
+    nd(nodeId).settings.max_sessions = max;
+    const body = { enabled: $('gatewayEnabled').checked ? 'true' : 'false', name: $('gatewayName').value.trim(), config: $('gatewayConfig').value.trim() };
+    const token = $('gatewayToken').value.trim();
+    if (token) body.bot_token = token;
+    try {
+      await a.put('/api/gateway', body);
+      $('gatewayToken').value = '';
+    } catch (e) {
+      if (e.status !== 404) throw e;      // a node without gateway settings: the rest was saved
+    }
+    toast('Settings saved.', 'success');
+    renderStats();
+    await refreshGateway(true);
+  } catch (e) {
+    toast('Could not save: ' + e.message, 'error');
+  }
 }
 
-function showTab(tab) {
-  state.tab = tab;
-  showWorkspaceView();
-  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll('.tab-panel').forEach((p) => p.classList.add('hidden'));
-  const panel = $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
-  if (panel) panel.classList.remove('hidden');
-  if (tab === 'architecture') loadArchitecture();
-  if (tab === 'tasks') loadTasks();
-}
-
+/* ── events ── */
 function toggleSidebar() {
-  const sidebar = $('sidebar');
-  const overlay = $('sidebarOverlay');
+  const sb = $('sidebar');
   if (window.innerWidth <= 900) {
-    sidebar.classList.remove('collapsed');
-    sidebar.classList.toggle('open');
-    overlay.hidden = !sidebar.classList.contains('open');
+    sb.classList.toggle('open');
+    $('sidebarOverlay').classList.toggle('hidden', !sb.classList.contains('open'));
   } else {
-    sidebar.classList.remove('open');
-    sidebar.classList.toggle('collapsed');
-    overlay.hidden = true;
+    sb.classList.toggle('collapsed');
+    store('sidebar', sb.classList.contains('collapsed') ? 'collapsed' : null);
+  }
+}
+
+function onTreeClick(e) {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const row = btn.closest('.tree-row');
+  const nodeBox = btn.closest('.tree-node');
+  const nodeId = (row && row.dataset.node) || (nodeBox && nodeBox.dataset.node);
+  const wsId = row && row.dataset.ws;
+  const act = btn.dataset.act;
+
+  if (act === 'toggle-node') {
+    const n = nodeById(nodeId);
+    if (!n || n.kind !== 'node') return;
+    if (state.openNodes.has(nodeId)) state.openNodes.delete(nodeId);
+    else { state.openNodes.add(nodeId); if (n.online) ensureNode(nodeId); }
+    saveSelection();
+    renderTree();
+  } else if (act === 'add-ws') {
+    openWorkspaceDialog(nodeId, '');
+  } else if (act === 'add-sub') {
+    openWorkspaceDialog(nodeId, wsId);
+  } else if (act === 'select-ws') {
+    const key = wsKey(nodeId, wsId);
+    const selected = state.sel.node === nodeId && state.sel.ws === wsId && !state.sel.session;
+    // a click on the selected workspace folds it; any other click opens and selects
+    if (selected && state.openWs.has(key)) state.openWs.delete(key);
+    else state.openWs.add(key);
+    selectWorkspace(nodeId, wsId);
+  } else if (act === 'add-session') {
+    newSession(nodeId, wsId);
+  } else if (act === 'del-ws') {
+    deleteWorkspace(nodeId, wsId);
+  } else if (act === 'select-session') {
+    selectSession(nodeId, wsId, row.dataset.session);
+  } else if (act === 'del-session') {
+    deleteSession(nodeId, wsId, row.dataset.session);
+  }
+  if (window.innerWidth <= 900 && (act === 'select-ws' || act === 'select-session')) {
+    $('sidebar').classList.remove('open');
+    $('sidebarOverlay').classList.add('hidden');
+  }
+}
+
+function onChatClick(e) {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  if (act === 'earlier') { showEarlier(); return; }
+  const m = btn.closest('.msg');
+  if (!m) return;
+  if (act === 'open-detail') { e.stopPropagation(); openDetailDialog(m); return; }
+  if (act === 'toggle-detail') {
+    m.classList.toggle('open');
+    if (m.classList.contains('open')) fillDetail(m);
   }
 }
 
 function bindEvents() {
-  $('btnNewWorkspace').addEventListener('click', () => openWorkspaceForm(''));
-  $('workspaceForm').addEventListener('submit', (e) => { e.preventDefault(); createWorkspace(); });
-  $('btnCancelWorkspace').addEventListener('click', () => $('workspaceForm').classList.add('hidden'));
-
-  $('workspaceTree').addEventListener('click', (e) => {
-    const deleteSessionBtn = e.target.closest('[data-delete-session]');
-    if (deleteSessionBtn) {
-      e.stopPropagation();
-      deleteSession(deleteSessionBtn.dataset.deleteSession, deleteSessionBtn.dataset.workspaceId);
-      return;
-    }
-
-    const deleteWorkspaceBtn = e.target.closest('[data-delete-workspace]');
-    if (deleteWorkspaceBtn) {
-      e.stopPropagation();
-      deleteWorkspace(deleteWorkspaceBtn.dataset.deleteWorkspace);
-      return;
-    }
-
-    const addSessionBtn = e.target.closest('[data-add-session]');
-    if (addSessionBtn) {
-      e.stopPropagation();
-      newSession(addSessionBtn.dataset.addSession);
-      return;
-    }
-
-    const addChild = e.target.closest('[data-add-child]');
-    if (addChild) {
-      e.stopPropagation();
-      openWorkspaceForm(addChild.dataset.addChild);
-      return;
-    }
-
-    const link = e.target.closest('[data-ws-id]');
-    if (link) {
-      const workspaceId = String(link.dataset.wsId);
-      showWorkspaceView();
-      if (state.expandedWorkspaces.has(workspaceId)) state.expandedWorkspaces.delete(workspaceId);
-      else state.expandedWorkspaces.add(workspaceId);
-      renderWorkspaceTree();
-      if (!state.selectedWorkspace || String(state.selectedWorkspace.id) !== workspaceId) {
-        selectWorkspace(workspaceId);
-      }
-      return;
-    }
-
-    const session = e.target.closest('[data-session-id]');
-    if (session) {
-      selectTreeSession(session.dataset.workspaceId, session.dataset.sessionId);
-    }
+  $('nodeTree').addEventListener('click', onTreeClick);
+  $('chatMessages').addEventListener('click', onChatClick);
+  $('chatMessages').addEventListener('scroll', () => {
+    chat.stick = nearBottom();
+    if (chat.stick) $('btnScrollDown').classList.add('hidden');
   });
-
-  $('btnGlobalTasks').addEventListener('click', showGlobalTasks);
-  $('btnSettings').addEventListener('click', openSettings);
-  $('btnSaveSettings').addEventListener('click', saveSettings);
-  $('btnCancelSettings').addEventListener('click', closeSettings);
-  $('btnCloseSettings').addEventListener('click', closeSettings);
-  $('settingsDialog').addEventListener('click', (e) => {
-    if (e.target === $('settingsDialog')) closeSettings();
-  });
-
-  $('modeToggle').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-mode]');
-    if (btn && !btn.disabled) setMode(btn.dataset.mode);
-  });
-
-  $('btnStopSession').addEventListener('click', stopSession);
-  $('btnSendPrompt').addEventListener('click', sendPrompt);
-  $('reasoningEffort').addEventListener('change', (e) => setReasoningEffort(e.target.value));
-  $('taskForm').addEventListener('submit', submitTaskForm);
-  $('taskView').addEventListener('click', (e) => {
-    if (e.target.closest('#btnNewTask')) {
-      $('taskForm').classList.remove('hidden');
-      $('taskTitle').focus();
-    }
-    if (e.target.closest('#btnCancelTask')) {
-      $('taskForm').classList.add('hidden');
-      loadTasks($('taskForm').dataset.workspaceId);
-    }
-  });
-  $('promptInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      sendPrompt();
-    }
-  });
-
-  $('tabbar').addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-tab]');
-    if (btn) showTab(btn.dataset.tab);
-  });
-
-  $('btnNotifications').addEventListener('click', () => {
-    const panel = $('notificationPanel');
-    panel.hidden = !panel.hidden;
-    if (!panel.hidden) renderNotifications();
-  });
+  $('btnScrollDown').addEventListener('click', () => scrollChat(true));
 
   $('btnToggleSidebar').addEventListener('click', toggleSidebar);
   $('btnMobileMenu').addEventListener('click', toggleSidebar);
-  $('sidebarOverlay').addEventListener('click', () => {
-    $('sidebar').classList.remove('open');
-    $('sidebarOverlay').hidden = true;
+  $('sidebarOverlay').addEventListener('click', toggleSidebar);
+
+  $('tabbar').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) showTab(b.dataset.tab); });
+  $('btnGlobalTasks').addEventListener('click', () => {
+    if (state.view === 'globalTasks') { showView(state.sel.ws ? 'workspace' : 'welcome'); return; }
+    showView('globalTasks');
+    $('globalTasksContent').innerHTML = '';
+    loadGlobalTasks();
+  });
+  $('btnSettings').addEventListener('click', openSettings);
+  $('settingsNode').addEventListener('change', (e) => loadSettings(e.target.value));
+  $('btnSaveSettings').addEventListener('click', saveSettings);
+
+  $('modeToggle').addEventListener('click', (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); });
+  $('reasoningEffort').addEventListener('change', (e) => setEffort(e.target.value));
+  $('btnStopSession').addEventListener('click', stopSession);
+  $('btnSendPrompt').addEventListener('click', sendPrompt);
+  $('promptInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendPrompt(); }
+  });
+  $('toggleDetails').addEventListener('change', (e) => {
+    state.showDetails = e.target.checked;
+    store('details', state.showDetails ? null : 'off');
+    $('chatMessages').classList.toggle('no-details', !state.showDetails);
+    scrollChat();
   });
 
+  $('btnNewTask').addEventListener('click', () => { $('taskForm').classList.remove('hidden'); $('taskGoal').focus(); });
+  $('btnCancelTask').addEventListener('click', () => $('taskForm').classList.add('hidden'));
+  $('taskForm').addEventListener('submit', submitTask);
+  const onTask = (e) => { const b = e.target.closest('[data-act]'); if (b && b.dataset.node) taskAction(b); };
+  $('taskContent').addEventListener('click', onTask);
+  $('globalTasksContent').addEventListener('click', onTask);
+
+  $('workspaceForm').addEventListener('submit', (e) => { e.preventDefault(); createWorkspace(); });
+  $('workspaceName').addEventListener('input', updateWorkspacePathHint);
+  $('workspacePath').addEventListener('input', updateWorkspacePathHint);
+
+  $('btnNotifications').addEventListener('click', () => {
+    const panel = $('notificationPanel');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) { state.notifUnseen = 0; renderNotificationBadge(); renderNotifications(); }
+  });
+  $('btnCopyDetail').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('detailDialog')._plain || ''); toast('Copied.', 'success', 1500); }
+    catch (e) { toast('The browser did not allow the copy.', 'warn'); }
+  });
+
+  document.addEventListener('click', (e) => {
+    const closer = e.target.closest('[data-close]');
+    if (closer) { closeDialog(closer.dataset.close); return; }
+    if (e.target.classList && e.target.classList.contains('dialog-backdrop')) closeDialog(e.target.id);
+    if (!e.target.closest('#notificationPanel') && !e.target.closest('#btnNotifications')) $('notificationPanel').classList.add('hidden');
+  });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('settingsDialog').hidden) closeSettings();
+    if (e.key !== 'Escape') return;
+    ['detailDialog', 'workspaceDialog', 'settingsDialog'].some((id) => {
+      if ($(id).classList.contains('hidden')) return false;
+      closeDialog(id);
+      return true;
+    });
   });
 }
 
-/* ── Boot ── */
+/* ── boot ── */
+function restoreState() {
+  try {
+    state.openNodes = new Set(JSON.parse(store('open_nodes') || '["local"]'));
+    state.openWs = new Set(JSON.parse(store('open_ws') || '[]'));
+  } catch (e) { state.openNodes = new Set(['local']); }
+  state.openNodes.add('local');
+  state.showDetails = store('details') !== 'off';
+  $('toggleDetails').checked = state.showDetails;
+  $('chatMessages').classList.toggle('no-details', !state.showDetails);
+  if (store('sidebar') === 'collapsed' && window.innerWidth > 900) $('sidebar').classList.add('collapsed');
+  const tab = store('tab');
+  if (tab && ['chat', 'tasks', 'architecture'].includes(tab)) state.tab = tab;
+}
+
+async function restoreSelection() {
+  let sel = null;
+  try { sel = JSON.parse(store('sel') || 'null'); } catch (e) { sel = null; }
+  if (!sel || !sel.node || !sel.ws) return;
+  const n = nodeById(sel.node);
+  if (!n || !n.online || n.kind !== 'node') return;
+  // wait for that node's workspaces
+  for (let i = 0; i < 40 && !nd(sel.node).loaded && !nd(sel.node).error; i++) {
+    ensureNode(sel.node);
+    await sleep(100);
+  }
+  if (!workspaceOf(sel.node, sel.ws)) return;
+  if (sel.session) {
+    // (the session list comes with the first answer of the live feed)
+    for (let i = 0; i < 30 && !nd(sel.node).rev; i++) await sleep(100);
+    if (nd(sel.node).sessions.some((s) => s.id === sel.session)) { await selectSession(sel.node, sel.ws, sel.session); return; }
+  }
+  await selectWorkspace(sel.node, sel.ws);
+}
+
 async function init() {
   bindEvents();
+  restoreState();
+  showTab(state.tab);
+  showView('welcome');
+  renderChatEmpty();
+  renderSessionHeader();
+  renderStats();
 
-  try {
-    await loadSettings();
-  } catch (e) {
-    toast('Could not load settings: ' + e.message, 'warn');
-  }
+  await loadNodes();
+  ensureNode('local');
+  await restoreSelection();
 
-  try {
-    await loadWorkspaces();
-  } catch (e) {
-    toast('Could not load workspaces: ' + e.message, 'error');
-  }
-
-  try {
-    await refreshStats();
-  } catch (e) {
-    // stats are optional at boot
-  }
-
-  try {
-    await refreshNotifications();
-  } catch (e) {
-    // notifications are optional
-  }
-
-  setInterval(() => refreshStats().catch(() => {}), 5000);
-  setInterval(() => refreshNotifications().catch(() => {}), 12000);
-  setInterval(() => {
-    if (state.view === 'globalTasks') showGlobalTasks(true);
-    else if (state.view === 'workspace' && state.tab === 'tasks') loadTasks();
-  }, 15000);
+  // the gateway status of an open settings dialog; the node list as a fallback for
+  // a node whose live feed does not tell (an older one)
+  setInterval(() => refreshGateway(false), 3000);
+  setInterval(() => { if (nd('local').treeRev < 0 || !nd('local').linkOk) loadNodes().catch(() => {}); }, 15000);
+  setInterval(() => { if (state.view === 'workspace' && state.tab === 'tasks') loadTasks(); else if (state.view === 'globalTasks') loadGlobalTasks(); }, 30000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

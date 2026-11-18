@@ -28,6 +28,7 @@ explains what you do with them.
 | [Python generators](Python-Generators.md) | A Python script as a generator: controls from `#@` comments, pictures in, values and a picture out |
 | [Video](Video.md) | Video clips: playback, speed, formats |
 | [Output and devices](Output-and-Devices.md) | Shader output, NDI, Spout, Art-Net, fixtures, mapping, Prolink |
+| [Stage](Stage.md) | The room, the set and the decoration in 3D: model files (STEP, 3MF, STL, OBJ, GLB) placed on the stage |
 | [Lighting desk](Lighting-Desk.md) | Programmer, palettes, cue stacks and executors for lamps and mapping, as on a lighting console |
 | [Settings](Settings.md) | Project, links, appearance, output, view scaling |
 | [Shortcuts and tips](Shortcuts-and-Tips.md) | Keys and gestures |

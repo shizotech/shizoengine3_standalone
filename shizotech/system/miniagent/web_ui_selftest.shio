@@ -3,12 +3,18 @@
 //
 //  Usage:  shz web_ui_selftest.shio      (from system/miniagent, no LLM)
 //
-//  web_ui_start() on a stub host whose receptionist turn takes 2 s, then what a
-//  browser does: the pages and their files, the polling of every page, a chat
+//  web_ui_start() on a stub host whose request turn takes 2 s, then what a
+//  browser does: the pages and their files, the polling of every page, a request
 //  turn with its /poll loop, many requests in a row and at the same time, a
 //  keep-alive connection that is reused (curl with several URLs). After every step the server must still answer
 //  quickly (shizotech/shizoscript3 PR #9: "after the first request the webserver
-//  hangs"). Exits with code 0 when every check passes.
+//  hangs").
+//  Then the parts of issue #1015: the live feed (GET /api/live answers at once
+//  when the page is behind and holds the answer while nothing changes), the node
+//  list, the gateway settings, and the API of ANOTHER node through this one: a
+//  second stub node on ShizoNet with a route table, asked through
+//  /api/nodes/<id>/api/... (JSON and the session stream), no HTTP between them.
+//  Exits with code 0 when every check passes.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "web_ui"
@@ -45,6 +51,10 @@ class StubHost {
 	tasks_failed = [];
 	listeners = [];
 	turns = 0;
+	peers = None;		// NodePeers: the other nodes (set below)
+	gateway = None;
+	name = "StubNode";
+	description = "the node of the self-test";
 
 	on_notify(cb) {}
 	on_task_finished(cb) {}
@@ -115,7 +125,9 @@ if(fileio.exists(ROOT)) {
 
 host = StubHost();
 cfg = [url = "http://127.0.0.1:9", name = "stub-model", token = "", max_tokens = 8000, max_running_agents = 0];
-ui = web_ui_start(host, cfg, [port = TEST_PORT, api_token = ""]);
+// the workspaces of the test live in its own folder, not in the user's storage
+registry = WorkspaceRegistry("", "", ROOT + "/workspaces", ROOT + "/projects");
+ui = web_ui_start(host, cfg, [port = TEST_PORT, api_token = ""], registry);
 
 if(!ui) {
 	std.print("FAIL: the web interface did not start");
@@ -125,7 +137,7 @@ check(!std.is_none(ui.runtime) && !std.is_none(ui.runtime.store) && !std.is_none
 std.sleep(300);
 
 std.print("\n── the pages and their files ──");
-for(p : ["/", "/dashboard.js", "/components/nodeapi.js", "/components/icons.css", "/components/industrial.css",
+for(p : ["/", "/dashboard.js", "/dashboard.css", "/components/nodeapi.js", "/components/minimd.js", "/components/icons.css", "/components/theme.css",
 	"/architecture/index.html", "/architecture/graph.js", "/architecture/style.css"]) {
 	r = http("GET", p);
 	check("GET " + p, r.http_code == 200 && std.string(r.body).length() > 50, std.string(r.http_code));
@@ -153,20 +165,25 @@ for(i = 0; i < 30; i++) {
 check("150 polls answered", bad == 0 && slow == 0, std.string(bad) + " failed, " + std.string(slow) + " slow");
 alive("after the polling");
 
-std.print("\n── a chat turn (2 s) while the pages poll ──");
-r = http("POST", "/api/adminagent", [prompt = "hello"]);
-sid = std.json(std.string(r.body), true).session_id;
-check("the chat turn starts", r.http_code == 200 && sid, std.string(r.body));
+std.print("\n── a request turn (2 s) while the pages poll ──");
+r = http("POST", "/api/request", [prompt = "hello"]);
+rid = std.string(std.json(std.string(r.body), true).data.request_id ?? "");
+check("the request turn starts", r.http_code == 200 && rid, std.string(r.body));
 text = "";
+tools = 0;
 state = "";
 during = [n = 0, slow = 0];
 t0 = std.millis();
 for(std.millis() - t0 < 6000) {
-	p = http("POST", "/api/adminagent/poll", [session_id = sid]);
-	j = std.json(std.string(p.body), true);
+	p = http("POST", "/api/request/poll", [request_id = rid]);
+	j = std.json(std.string(p.body), true).data;
 	state = std.string(j.status);
-	if(j.has("delta"))
-		text += std.string(j.delta.text);
+	if(j.has("delta")) {
+		if(j.delta.has("text"))
+			text += std.string(j.delta.text);
+		if(j.delta.has("tool_start"))
+			tools++;
+	}
 	q = http("GET", "/api/status");
 	during.n++;
 	if(q.http_code != 200 || q.ms > 1000)
@@ -177,23 +194,23 @@ for(std.millis() - t0 < 6000) {
 }
 check("the turn ends with done", state == "done", state);
 check("the answer arrived", text.contains("thinking about hello") && text.contains("done"), text);
-check("a tool call is shown once", text.split("[TOOL] start_task").size() == 2, text);
+check("the tool call arrived once", tools == 1, std.string(tools));
 check("the other pages were answered during the turn", during.n > 5 && during.slow == 0, std.string(during));
-alive("after the chat turn");
+alive("after the request turn");
 
-std.print("\n── a second and third chat turn ──");
+std.print("\n── a second and third turn ──");
 for(k = 0; k < 2; k++) {
-	r = http("POST", "/api/adminagent", [prompt = "again " + std.string(k)]);
-	sid = std.json(std.string(r.body), true).session_id;
+	r = http("POST", "/api/request", [prompt = "again " + std.string(k)]);
+	rid = std.string(std.json(std.string(r.body), true).data.request_id ?? "");
 	state = "";
 	t0 = std.millis();
 	for(std.millis() - t0 < 6000 && state != "done") {
-		state = std.string(std.json(std.string(http("POST", "/api/adminagent/poll", [session_id = sid]).body), true).status);
+		state = std.string(std.json(std.string(http("POST", "/api/request/poll", [request_id = rid]).body), true).data.status);
 		std.sleep(100);
 	}
 	check("turn " + std.string(k + 2) + " ends", state == "done", state);
 }
-check("three receptionist turns ran", host.turns == 3, std.string(host.turns));
+check("three turns ran", host.turns == 3, std.string(host.turns));
 alive("after three turns");
 
 std.print("\n── 20 requests at the same time ──");
@@ -235,7 +252,164 @@ else {
 }
 alive("with keep-alive connections open");
 
+std.print("\n── the live feed (GET /api/live) ──");
+r = http("GET", "/api/live?since=0&wait=5000");
+live = std.json(std.string(r.body), true).data;
+check("a page that is behind is answered at once", r.http_code == 200 && r.ms < 1500 && std.int(live.rev) > 0, std.string(r.ms) + " ms " + std.string(r.body).substr(0, 200));
+check("the live answer carries what the sidebar shows", live.has("sessions") && live.has("stats") && live.has("settings") && live.has("tree_rev"), std.string(live));
+rev = std.int(live.rev);
+r = http("GET", "/api/live?since=" + std.string(rev) + "&wait=1200");
+check("nothing changed: the answer is held for the wait", r.http_code == 200 && r.ms >= 1000 && r.ms < 3000 && std.int(std.json(std.string(r.body), true).data.rev) == rev, std.string(r.ms) + " ms");
+// a change while a page waits ends the wait
+res_live = [ms = -1, rev = 0];
+std.thread([res_live, rev]() {
+	q = http("GET", "/api/live?since=" + std.string(rev) + "&wait=8000", "", 12000);
+	res_live.rev = std.int(std.json(std.string(q.body), true).data.rev);
+	res_live.ms = q.ms;
+}).run();
+std.sleep(400);
+r = http("PUT", "/api/settings", [max_sessions = 7]);
+check("settings saved", r.http_code == 200, std.string(r.body));
+t0 = std.millis();
+for(res_live.ms < 0 && std.millis() - t0 < 9000)
+	std.sleep(20);
+check("a change ends the wait early", res_live.ms >= 0 && res_live.ms < 4000 && res_live.rev > rev, std.string(res_live));
+r = http("POST", "/api/workspaces", [name = "Live Probe"]);
+made = std.json(std.string(r.body), true).data;
+check("a workspace without a path goes below the projects folder", r.http_code == 200 && std.string(made.path) == fileio.absolute_path(ROOT + "/projects/live_probe"), std.string(r.body));
+r = http("GET", "/api/live?since=" + std.string(res_live.rev) + "&wait=3000");
+live2 = std.json(std.string(r.body), true).data;
+check("a new workspace moves tree_rev", std.int(live2.tree_rev) > std.int(live.tree_rev) && r.ms < 2500, std.string(live2.tree_rev) + " after " + std.string(live.tree_rev));
+
+// the tasks of all workspaces in one answer (the "All tasks" view)
+r = http("GET", "/api/tasks/overview");
+ov = std.json(std.string(r.body), true);
+ov_probe = None;
+if(ov.ok) {
+	for(w : ov.data.workspaces) {
+		if(std.string(w.id) == std.string(made.id))
+			ov_probe = w;
+	}
+}
+check("GET /api/tasks/overview lists every workspace with its goals and sessions", r.http_code == 200 && ov.ok && !std.is_none(ov_probe) && ov_probe.name == "Live Probe" && ov_probe.has("goals") && ov_probe.has("sessions"), std.string(r.body).substr(0, 300));
+alive("after the live feed");
+
+std.print("\n── the node list, the gateway settings ──");
+r = http("GET", "/api/nodes");
+nodes = std.json(std.string(r.body), true).data.nodes;
+check("the node itself is listed", r.http_code == 200 && nodes.size() == 1 && nodes[0].id == "local" && nodes[0].name == "StubNode", std.string(r.body));
+r = http("GET", "/api/nodes/nobody/api/workspaces");
+check("no ShizoNet: a call for another node is refused with a reason", r.http_code == 503 && std.string(r.body).contains("ShizoNet"), std.string(r.http_code) + " " + std.string(r.body));
+r = http("GET", "/api/gateway");
+gw = std.json(std.string(r.body), true).data;
+check("the gateway settings are served without the token", r.http_code == 200 && gw.has("settings") && !gw.settings.has("bot_token") && gw.settings.has("token_set"), std.string(r.body));
+
+std.print("\n── another node through this one (ShizoNet, no HTTP) ──");
+// node B: a stub host with a route table, on ShizoNet as an AI node
+class RemoteHost {
+	running = true;
+	name = "RemoteBox";
+	api_table = None;
+	api_token = "";
+	polls = 0;
+
+	get_overview() { return [tasks = [], tasks_scheduled = [], tasks_finished = [], tasks_failed = []]; }
+	add_notify_listener(cb) {}
+	add_file_listener(cb) {}
+	add_task_finished_listener(cb) {}
+	workspaces_summary(limit = 64) { return [[id = "w1", name = "Remote Project", description = "", path = "/remote/w1", parent = ""]]; }
+}
+
+remote = RemoteHost();
+table = ApiRouter();
+table.route("GET", "^/api/workspaces$", [](req, writer) {
+	return node_api_ok([where = "remote", since = node_api_get(req.query_params, "since", "none"), token = node_api_get(req.query_params, "token", "none")]);
+});
+table.route("POST", "^/api/workspaces$", [](req, writer) {
+	b = node_api_body(req);
+	return node_api_ok([created = node_api_get(b, "name")]);
+});
+table.route("DELETE", "^/api/workspaces/([0-9a-zA-Z_-]+)$", [](req, writer) {
+	return node_api_err("workspace has children: " + std.string(req.matches[0]), 409);
+});
+// a session with three events, the last one ends it
+table.route("GET", "^/api/sessions/([0-9a-zA-Z_-]+)/events$", [remote](req, writer) {
+	remote.polls++;
+	since = node_api_int(req.query_params, "since", 0);
+	if(std.string(req.matches[0]) != "s1")
+		return node_api_err("unknown session", 404);
+	all = [
+		[seq = 1, type = "user", text = "hi"],
+		[seq = 2, type = "delta", action = [text = "hello from far away"]],
+		[seq = 3, type = "done", ok = json.bool(true), status = "finished", report = "all good"],
+	];
+	out = [];
+	for(e : all) {
+		// one event per poll: the stream has to ask again
+		if(e.seq > since && !out.size())
+			out.push_back(e);
+	}
+	last = out.size() ? out[0].seq : since;
+	return node_api_ok([session_id = "s1", status = last >= 3 ? "done" : "running", seq = last, terminal = json.bool(last >= 3), events = out]);
+});
+remote.api_table = table;
+
+net_a = shizonet.server("StubNode");
+net_b = shizonet.server("RemoteBox");
+svc_b = ai_node_attach(net_b, remote, [name = "RemoteBox", description = "far away", model = "big"]);
+host.peers = NodePeers(net_a, "StubNode");
+
+found = "";
+t0 = std.millis();
+for(std.millis() - t0 < 15000 && !found) {
+	for(p : host.peers.list()) {
+		if(p.name == "RemoteBox" && p.online && p.api)
+			found = std.string(p.id);
+	}
+	std.sleep(100);
+}
+check("the other node is found on ShizoNet", found, std.string(host.peers.list()));
+
+r = http("GET", "/api/nodes");
+nodes = std.json(std.string(r.body), true).data.nodes;
+// (another node of some other test on this machine may be in the list as well)
+remote_rec = None;
+for(n : nodes) {
+	if(n.name == "RemoteBox")
+		remote_rec = n;
+}
+check("the node list has this node first and the other node", nodes.size() >= 2 && nodes[0].id == "local" && !std.is_none(remote_rec) && remote_rec.kind == "node" && remote_rec.model == "big" && remote_rec.workspaces == 1, std.string(r.body));
+
+r = http("GET", "/api/nodes/" + found + "/api/workspaces?since=7&token=secret");
+j = std.json(std.string(r.body), true);
+check("GET reaches the other node's API", r.http_code == 200 && j.ok && j.data.where == "remote" && j.data.since == "7", std.string(r.body));
+check("the token of this node is not passed on", j.data.token == "none", std.string(r.body));
+r = http("POST", "/api/nodes/" + found + "/api/workspaces", [name = "Far Project"]);
+j = std.json(std.string(r.body), true);
+check("POST with a body reaches it", r.http_code == 200 && j.data.created == "Far Project", std.string(r.body));
+r = http("DELETE", "/api/nodes/" + found + "/api/workspaces/w9");
+j = std.json(std.string(r.body), true);
+check("an error of the other node comes back with its status and text", r.http_code == 409 && !j.ok && std.string(j.error).contains("w9"), std.string(r.http_code) + " " + std.string(r.body));
+r = http("GET", "/api/nodes/" + found + "/api/nothing/here");
+check("an unknown route of the other node is a 404", r.http_code == 404, std.string(r.http_code) + " " + std.string(r.body));
+r = http("GET", "/api/nodes/who-0000/api/workspaces");
+check("an unknown node is a 404 with a reason", r.http_code == 404 && std.string(r.body).contains("unknown node"), std.string(r.http_code) + " " + std.string(r.body));
+
+// the session stream of the other node as server sent events
+r = http("GET", "/api/nodes/" + found + "/api/sessions/s1/stream?since=0", "", 20000);
+sse = std.string(r.body);
+check("the stream of a remote session arrives as events", r.http_code == 200 && sse.contains("event: user") && sse.contains("hello from far away") && sse.contains("event: done") && sse.contains("all good"), sse);
+check("the stream asked the node once per event", remote.polls == 3, std.string(remote.polls));
+check("the stream ends with the session", r.ms < 10000, std.string(r.ms));
+r = http("GET", "/api/nodes/" + found + "/api/sessions/gone/stream?since=0", "", 20000);
+check("a session that does not exist ends the stream with an error event", std.string(r.body).contains("event: error"), std.string(r.body));
+alive("after the remote calls");
+
+host.peers.stop();
+svc_b.stop();
+
 ui.server.stop();
+registry.stop();
 if(fileio.exists(ROOT)) {
 	for(f : fileio.files(ROOT, true))
 		try { fileio.remove(ROOT + "/" + f); } catch(e) {}

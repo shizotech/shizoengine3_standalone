@@ -1,0 +1,319 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  node_peers.shio — the other AI nodes a node sees on the ShizoNet network
+//
+//      #include "node_peers"
+//
+//      peers = NodePeers(server, "ThisNode");     // server: the node's shizonet.server
+//      peers.list();                              // [[id, name, kind, online, ip, info]]
+//      r = peers.call(id, "GET", "/api/workspaces");
+//      // -> [ok, status_code, body (JSON text)]: the peer's own JSON API, asked over
+//      //    ShizoNet (ai_api in shizonet_ai.shio). No HTTP between the nodes.
+//      peers.stop();
+//
+//  One thread finds the devices that announce themselves as an AI node (the
+//  AINode prop) or as a gateway / router (AIRouter) and keeps their info current.
+//  The web interface of a node lists them and works on them through call(): the
+//  page talks to its own node only, the node talks to the others.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "shizonet_ai"
+
+PEERS_REFRESH_MS = 3000;        // discovery / info period
+PEERS_RECHECK_MS = 30000;       // a device that was no AI node is asked again after this
+PEERS_MAX = 64;
+
+peers_slug(text) {
+    out = "";
+
+    for(c : std.string(text ?? "").strip()) {
+        if((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_" || c == "-")
+            out += c;
+        else
+            out += "_";
+    }
+
+    if(out.length() > 32)
+        out = out.substr(0, 32);
+
+    return out;
+}
+
+// the id of a peer in URLs: its name and its mac (two nodes may share a name)
+peers_id(name, mac) {
+    m = "";
+
+    for(c : std.string(mac ?? "").lowercase()) {
+        if((c >= "a" && c <= "f") || (c >= "0" && c <= "9"))
+            m += c;
+    }
+
+    slug = peers_slug(name);
+
+    if(!slug)
+        slug = "node";
+
+    return slug + "-" + m;
+}
+
+class NodePeers {
+    server = None;
+    self_name = "";
+    table = [];             // key (mac:name) -> record
+    running = true;
+    thread = None;
+    rev = 0;                // counts up when list() would answer differently
+    list_sig = "";
+
+    __init__(_server, _self_name = "") {
+        server = _server;
+        self_name = std.string(_self_name ?? "");
+        table = [];
+        running = true;
+        rev = 0;
+        list_sig = "";
+
+        t = std.thread([this]() { this.loop(); });
+        t.run();
+        thread = t;
+    }
+
+    stop() {
+        running = false;
+
+        if(thread) {
+            try {
+                thread.join();
+            } catch(e) {}
+            thread = None;
+        }
+
+        return true;
+    }
+
+    loop() {
+        for(this.running) {
+            try {
+                refresh();
+            } catch(e) {
+                std.error("[peers] refresh failed: ", e);
+            }
+
+            // wake up early when the node stops
+            waited = 0;
+
+            for(this.running && waited < PEERS_REFRESH_MS) {
+                std.sleep(100);
+                waited += 100;
+            }
+        }
+    }
+
+    // One discovery pass. Every call into a device blocks, so this runs on the
+    // peers thread only.
+    refresh() {
+        if(!server)
+            return 0;
+
+        all = server.all_devices();
+        now = std.millis_steady();
+
+        for(dev : all) {
+            name = ai_name(dev.name(), "");
+            mac = ai_str(dev.mac());
+            key = mac + ":" + name;
+            online = dev.online() ? true : false;
+
+            if(!table.has(key)) {
+                if(table.size() >= PEERS_MAX)
+                    continue;
+
+                table[key] = [
+                    id = peers_id(name, mac),
+                    wire_name = name,
+                    name = name,
+                    mac = mac,
+                    ip = ai_str(dev.ip()),
+                    kind = "",          // "" unknown, "node", "gateway", "other"
+                    online = online,
+                    info = [],
+                    checked = 0,
+                    seen = 0,
+                    dev = dev,
+                ];
+            }
+
+            rec = table[key];
+            rec.dev = dev;
+            rec.online = online;
+            rec.ip = ai_str(dev.ip());
+
+            if(!online)
+                continue;
+
+            rec.seen = std.millis();
+
+            // what is it? asked once, and again after a while for a device that
+            // was no AI node (it may have been restarted as one)
+            if(!rec.kind || (rec.kind == "other" && now - std.int(rec.checked) > PEERS_RECHECK_MS)) {
+                rec.checked = now;
+                rec.kind = "other";
+
+                ver = None;
+                try {
+                    ver = dev.get_prop(AI_PROP_NODE, AI_TIMEOUT_POLL);
+                } catch(e) {
+                    ver = None;
+                }
+
+                if(ver) {
+                    rec.kind = "node";
+                } else {
+                    rv = None;
+                    try {
+                        rv = dev.get_prop(AI_PROP_ROUTER, AI_TIMEOUT_POLL);
+                    } catch(e) {
+                        rv = None;
+                    }
+
+                    if(rv)
+                        rec.kind = "gateway";
+                }
+            }
+
+            if(rec.kind == "node" || rec.kind == "gateway") {
+                info = None;
+                try {
+                    info = dev.get_prop(rec.kind == "node" ? AI_PROP_NODE_INFO : AI_PROP_ROUTER_INFO, AI_TIMEOUT_POLL);
+                } catch(e) {
+                    info = None;
+                }
+
+                if(std.is_json(info)) {
+                    rec.info = info;
+
+                    if(info.has("name") && info.name)
+                        rec.name = ai_name(info.name, rec.name);
+                }
+            }
+        }
+
+        // what the list shows, without the fields that move all the time
+        sig = "";
+
+        for(k, rec : table) {
+            if(rec.kind != "node" && rec.kind != "gateway")
+                continue;
+
+            sig += rec.id + "|" + rec.name + "|" + rec.kind + "|" + std.string(rec.online ? 1 : 0) + "|" +
+                ai_field(rec.info, "model") + "|" + ai_field(rec.info, "description") + "|" +
+                ai_field(rec.info, "tasks_running") + "|" + std.string(ai_opt_list(rec.info, "workspaces").size()) + ";";
+        }
+
+        if(sig != list_sig) {
+            list_sig = sig;
+            rev++;
+        }
+
+        return table.size();
+    }
+
+    summary(rec) {
+        info = std.is_json(rec.info) ? rec.info : [];
+
+        return [
+            id = rec.id,
+            name = rec.name,
+            kind = rec.kind,
+            local = json.bool(false),
+            online = json.bool(rec.online ? true : false),
+            ip = rec.ip,
+            description = ai_field(info, "description"),
+            model = ai_field(info, "model"),
+            busy = json.bool(ai_opt(info, "busy", false) ? true : false),
+            tasks_running = std.int(ai_opt(info, "tasks_running", 0)),
+            goals = json.bool(ai_opt(info, "goals", false) ? true : false),
+            api = json.bool(ai_opt(info, "api", false) ? true : false),
+            workspaces = ai_opt_list(info, "workspaces").size(),
+            last_seen = rec.seen,
+            order = (rec.online ? "0" : "1") + std.string(rec.name).lowercase(),
+        ];
+    }
+
+    // the AI nodes and gateways, online first, by name
+    list() {
+        out = [];
+
+        for(k, rec : table) {
+            if(rec.kind == "node" || rec.kind == "gateway")
+                out.push_back(summary(rec));
+        }
+
+        // (json.sort takes no comparator: sort by a key that puts online nodes first)
+        out.sort_by("order");
+
+        return out;
+    }
+
+    find(id) {
+        want = std.string(id ?? "");
+
+        for(k, rec : table) {
+            if(rec.id == want)
+                return rec;
+        }
+
+        return None;
+    }
+
+    // One call of a peer's JSON API over ShizoNet.
+    // -> [ok (the call reached the peer), status_code, body (JSON text of the peer)]
+    call(id, method, path, body = None, query = None, timeout = 0) {
+        rec = find(id);
+
+        if(!rec)
+            return fail(404, "unknown node: " + std.string(id));
+
+        if(rec.kind != "node")
+            return fail(400, std.string(rec.name) + " is not an AI node");
+
+        dev = rec.dev;
+
+        if(!dev || !dev.online())
+            return fail(503, "node " + std.string(rec.name) + " is offline");
+
+        payload = [method = std.string(method ?? "GET"), path = std.string(path ?? "")];
+
+        if(!std.is_none(body))
+            payload.body = body;
+
+        if(std.is_json(query) && query.size())
+            payload.query = query;
+
+        if(timeout <= 0)
+            timeout = AI_TIMEOUT_API;
+
+        reply = None;
+
+        try {
+            reply = dev.get(AI_CMD_API, payload, timeout);
+        } catch(e) {
+            return fail(502, "node " + std.string(rec.name) + " did not answer: " + std.string(e));
+        }
+
+        if(!std.is_json(reply))
+            return fail(504, "node " + std.string(rec.name) + " did not answer in time");
+
+        if(!reply.ok)
+            return fail(std.int(reply.status_code ?? 502), ai_field(reply, "error", "the node refused the call"));
+
+        return [ok = true, status_code = std.int(reply.status_code ?? 200), body = ai_str(reply.body)];
+    }
+
+    fail(code, message) {
+        return [
+            ok = false,
+            status_code = code,
+            body = std.string([ok = json.bool(false), error = std.string(message)]),
+        ];
+    }
+}

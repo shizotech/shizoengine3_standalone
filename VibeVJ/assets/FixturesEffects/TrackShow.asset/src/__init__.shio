@@ -1,0 +1,561 @@
+//Track show (#719): the shows per track of the lighting desk (engine.desk.shows, engine/patch/desk_show_runtime.shio).
+//No AI needed: the desk runs it with DJ Link (a ProlinkBridge or ProlinkDecks generator in the project).
+//
+//- Top: the deck (the master deck or deck 1-4), its track and where it plays (bar.beat). The cues of its track: each
+//  starts at a beat and lasts some bars; its Action runs when the deck plays through its first beat, its End action
+//  when the playhead leaves it after it started. Add cue here (at the playhead, on the beat), Import memory / hot cues
+//  (the cues the DJ stored in rekordbox, with their names). A show is found again by the track's signature on any USB
+//  stick. Runs on: Master deck / On air / Any deck / Never; Lock phrases: the track's cues lock out phrase triggers.
+//- Below, the rules that need no show per track: Cue names (a rekordbox cue named DROP or with the word @strobe runs
+//  an action), Phrase triggers (filters, weight, solo / blend), Look-ahead (beats before a drop, a phrase, a cue),
+//  Limits (max on-time, min gap, duty cycle of a stack, specials disarmed), Settings (crews of the cue call, back-off,
+//  stop) and the Log (what ran or was held back, and why).
+//- Actions are typed like the command line: go Main, goto 3 Main, off Main, clip 1 2, column 3, desk <command>,
+//  midi 90 3C 7F @ <device>, song <name>, loop start|stop <name>. Each change is a step of the undo history.
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/fx"
+#include "engine/patch/desk"
+#include "engine/patch/desk_show"
+#include "engine/patch/palette"
+
+def build_sheet();
+def build_rules();
+
+TS_ROW = 28;
+TS_GAP = 4;
+TS_DECKS = ["master", "1", "2", "3", "4"];
+TS_DECK_LABELS = ["Master deck", "Deck 1", "Deck 2", "Deck 3", "Deck 4"];
+TS_PAGES = ["name_rules", "phrase_rules", "lookahead", "limits", "settings", "log"];
+TS_PAGE_LABELS = ["Cue names", "Phrase triggers", "Look-ahead", "Limits", "Settings", "Log"];
+TS_ACTION_TIP = "What runs, typed like the command line: go Main, goto 3 Main, off Main (a cue stack), clip 1 2 (row, column of the Clipview), column 3, desk <command line>, midi 90 3C 7F @ <MIDI device>, song <name>, loop start|stop <name>. Empty: nothing";
+
+engine = None;
+desk = None;
+deck_ref = "master";
+page = "name_rules";
+managed head_label = None;
+managed pos_label = None;
+managed scope_combo = None;
+managed lock_btn = None;
+managed status_label = None;
+managed sheet_content = None;
+managed rules_content = None;
+sheet_key = "x";
+rules_key = "x";
+seen_revision = -1;
+seen_log = -1;
+filling = false;      //the fields are being filled (their callbacks are not the user)
+status_text = "";
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+set_status(text) {
+	status_text = std.string(text);
+	if(status_label)
+		status_label.caption(status_text);
+}
+
+//The show of the track on the picked deck (None: no track or no show yet)
+deck_info() {
+	return desk.shows.deck_view(deck_ref);
+}
+
+//A change of the track show of the deck (made when make), as one step of the undo history
+edit_entry(name, make, change) {
+	n = desk.shows.deck_number(deck_ref);
+	me = desk.shows;
+	return desk.shows.edit(name, [me, n, make, change](sh) {
+		ent = me.entry_for(n, make);
+		return ent ? change(ent) : None;
+	});
+}
+
+//A change of one element (by id) of a list of the show (rules, limits)
+edit_rule(list_key, id, change, name = "Edit rule") {
+	desk.shows.edit(name, [list_key, id, change](sh) {
+		r = desk_show_by_id(sh[list_key], id);
+		if(r)
+			change(r);
+		return None;
+	});
+}
+
+//A text field for an action: parsed when it is left / Enter; a wrong one says why in the status
+action_field(row, w, action, set_fn) {
+	box = row.textbox(desk_action_text(desk.data, action)).editable(true).alignment("left").fixed_width(w).fixed_height(TS_ROW);
+	box.placeholder("go Main · off Main · clip 1 2 …").tooltip(TS_ACTION_TIP);
+	box.on_change([set_fn](text) {
+		if(filling)
+			return;
+		r = desk_action_parse(desk.data, text);
+		if(!r.ok) {
+			set_status("Action: " + r.error);
+			return;
+		}
+		set_status("");
+		set_fn(r.action);
+	});
+	return box;
+}
+
+float_field(row, w, v, tip, set_fn, lo = 0.0, hi = 100000.0) {
+	box = row.floatbox().value(std.float(v)).alignment("right").fixed_width(w).fixed_height(TS_ROW);
+	box.min_value(lo).max_value(hi).tooltip(tip);
+	box.value_callback([set_fn](x) {
+		if(!filling)
+			set_fn(x);
+	});
+	return box;
+}
+
+text_field(row, w, v, tip, set_fn) {
+	box = row.textbox(std.string(v ?? "")).editable(true).alignment("left").fixed_width(w).fixed_height(TS_ROW).tooltip(tip);
+	box.on_change([set_fn](text) {
+		if(!filling)
+			set_fn(text);
+	});
+	return box;
+}
+
+combo_field(row, w, values, labels, v, tip, set_fn) {
+	box = row.combobox().items(labels).fixed_width(w).fixed_height(TS_ROW).tooltip(tip);
+	box.selected(math.max(0, patch_index_of(values, v)));
+	box.on_change([values, set_fn](index, text) {
+		if(!filling && index >= 0 && index < values.size())
+			set_fn(values[index]);
+	});
+	return box;
+}
+
+toggle_field(row, w, caption, v, tip, set_fn) {
+	btn = row.pushbutton(caption).fixed_width(w).fixed_height(TS_ROW).tooltip(tip);
+	btn.pushed(v ? true : false);
+	btn.on_change([set_fn](x) {
+		if(!filling)
+			set_fn(x ? true : false);
+	});
+	return btn;
+}
+
+delete_button(row, tip, fn) {
+	del = row.button("").icon(nanogui.icon("times")).danger("hover").transparent(true).fixed_width(28).fixed_height(TS_ROW).tooltip(tip);
+	del.on_click(fn);
+	return del;
+}
+
+head_row(parent, cols) {
+	head = parent.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+	for(c : cols)
+		head.label(c[0]).fixed_width(c[1]).fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+}
+
+crews() {
+	return desk.data.show.crews;
+}
+
+// =========================================================================
+// The cues of the track on the deck
+// =========================================================================
+
+build_sheet() {
+	filling = true;
+	sheet_content.clear_children();
+	v = deck_info();
+	ent = v ? v.show : None;
+	if(!v)
+		sheet_content.label("No deck: add a ProlinkBridge or ProlinkDecks generator (DJ Link) and play a track").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+	else if(!ent)
+		sheet_content.label("This track has no show yet: Add cue here or Import its memory / hot cues").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+	else {
+		head_row(sheet_content, [["Name", 170], ["Starts", 80], ["Beat", 70], ["Bars", 60], ["Crew", 100], ["Action", 200], ["End action", 200], ["", 56], ["", 28]]);
+		for(c : ent.cues) {
+			cid = c.id;
+			row = sheet_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			text_field(row, 170, c.name, "The name of the cue (the cue call shows it)", [cid](text) {
+				edit_entry("Rename track cue", false, [cid, text](e) { c = desk_show_by_id(e.cues, cid); if(c) c.name = text; return None; });
+			});
+			row.label(desk_show_bar_text(c.beat)).fixed_width(80).fixed_height(TS_ROW).text_color(PAL_TEXT_2).tooltip("Bar and beat in it, as the DJ counts");
+			float_field(row, 70, c.beat, "The beat it starts at (beat 1: the first beat of the track)", [cid](x) {
+				edit_entry("Move track cue", false, [cid, x](e) {
+					c = desk_show_by_id(e.cues, cid);
+					if(!c)
+						return None;
+					length = std.float(c.end_beat) - std.float(c.beat);
+					desk_show_remove_id(e.cues, cid);
+					c.beat = math.max(1.0, x);
+					c.end_beat = c.beat + math.max(0.25, length);
+					desk_show_cue_insert(e, c);
+					return None;
+				});
+			}, 1.0);
+			float_field(row, 60, (std.float(c.end_beat) - std.float(c.beat)) / 4.0, "How long it lasts in bars: its End action runs when the playhead leaves it", [cid](x) {
+				edit_entry("Track cue length", false, [cid, x](e) { c = desk_show_by_id(e.cues, cid); if(c) c.end_beat = std.float(c.beat) + math.max(0.0625, x) * 4.0; return None; });
+			}, 0.0625);
+			combo_field(row, 100, crews(), crews(), c.crew ?? "Lighting", "The crew whose cue call counts down to it", [cid](x) {
+				edit_entry("Track cue crew", false, [cid, x](e) { c = desk_show_by_id(e.cues, cid); if(c) c.crew = x; return None; });
+			});
+			action_field(row, 200, c.action ?? None, [cid](a) {
+				edit_entry("Track cue action", false, [cid, a](e) { c = desk_show_by_id(e.cues, cid); if(c) c.action = a; return None; });
+			});
+			action_field(row, 200, c.end_action ?? None, [cid](a) {
+				edit_entry("Track cue end action", false, [cid, a](e) { c = desk_show_by_id(e.cues, cid); if(c) c.end_action = a; return None; });
+			});
+			toggle_field(row, 56, "Late", c.late ?? false, "Also starts when the deck starts playing inside the cue (not only when it plays through its first beat)", [cid](x) {
+				edit_entry("Track cue late", false, [cid, x](e) { c = desk_show_by_id(e.cues, cid); if(c) c.late = x; return None; });
+			});
+			delete_button(row, "Deletes this cue", [cid]() {
+				edit_entry("Delete track cue", false, [cid](e) { desk_show_remove_id(e.cues, cid); return None; });
+			});
+		}
+	}
+	sheet_content.parent().refresh_layout();
+	filling = false;
+}
+
+//What the sheet is built from: when it changes, it is built again
+sheet_key_now() {
+	v = deck_info();
+	if(!v)
+		return "none";
+	return std.string(v.n) + "|" + (v.show ? v.show.compact_string() : "-") + "|" + crews().compact_string() + "|" + desk.data.stacks.size();
+}
+
+// =========================================================================
+// The rules
+// =========================================================================
+
+stack_values() {
+	out = [""];
+	for(s : desk.data.stacks)
+		out.push_back(s.id);
+	return out;
+}
+stack_labels() {
+	out = ["Pick…"];
+	for(s : desk.data.stacks)
+		out.push_back(s.name);
+	return out;
+}
+
+add_rule_button(kind, caption) {
+	btn = rules_content.button(caption).icon(nanogui.icon("plus")).fixed_width(200).fixed_height(TS_ROW);
+	btn.on_click([kind]() {
+		desk.shows.edit("Add rule", [kind](sh) {
+			r = desk_show_rule_new(kind);
+			if(kind == "limits" && desk.data.stacks.size())
+				r.stack = desk.data.stacks[0].id;
+			sh[kind].push_back(r);
+			return None;
+		});
+	});
+}
+
+rule_on(row, list_key, r) {
+	rid = r.id;
+	toggle_field(row, 44, "On", r.on ??? true, "Off: the rule does nothing", [list_key, rid](x) {
+		edit_rule(list_key, rid, [x](rule) { rule.on = x; });
+	});
+}
+
+build_rules() {
+	filling = true;
+	rules_content.clear_children();
+	sh = desk.data.show;
+	if(page == "name_rules") {
+		rules_content.label("A rekordbox cue whose name (or a word of it) matches runs the action when the deck plays through it: DROP, @strobe, build*").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+		head_row(rules_content, [["", 44], ["Name", 150], ["Cues", 150], ["Deck", 110], ["Crew", 100], ["Action", 240], ["", 28]]);
+		for(r : sh.name_rules) {
+			rid = r.id;
+			row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			rule_on(row, "name_rules", r);
+			text_field(row, 150, r.pattern, "The name of the cue: * any characters, ? one; case does not count", [rid](t) { edit_rule("name_rules", rid, [t](x) { x.pattern = t; }); });
+			combo_field(row, 150, DESK_SHOW_KINDS, DESK_SHOW_KIND_LABELS, r.kinds ?? "all", "Which cues of rekordbox", [rid](t) { edit_rule("name_rules", rid, [t](x) { x.kinds = t; }); });
+			combo_field(row, 110, DESK_SHOW_SCOPES, DESK_SHOW_SCOPE_LABELS, r.players ?? "master", "Which deck: the tempo master, a deck on air (needs a DJM), any deck", [rid](t) { edit_rule("name_rules", rid, [t](x) { x.players = t; }); });
+			combo_field(row, 100, crews(), crews(), r.crew ?? "Lighting", "The crew of the cue call", [rid](t) { edit_rule("name_rules", rid, [t](x) { x.crew = t; }); });
+			action_field(row, 240, r.action ?? None, [rid](a) { edit_rule("name_rules", rid, [a](x) { x.action = a; }); });
+			delete_button(row, "Deletes this rule", [rid]() { desk.shows.edit("Delete rule", [rid](s) { desk_show_remove_id(s.name_rules, rid); return None; }); });
+		}
+		add_rule_button("name_rules", "Add a cue name");
+	}
+	else if(page == "phrase_rules") {
+		rules_content.label("At a new phrase one trigger that fits is picked by weight; Solo runs alone, Blend with every other blend one that fits. A track with cues of its own runs none (Lock phrases)").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+		head_row(rules_content, [["", 44], ["Name", 120], ["Phrase", 96], ["Deck", 104], ["Mood", 90], ["Bars ≥", 56], ["Bars ≤", 56], ["BPM ≥", 56], ["BPM ≤", 56], ["Weight", 60], ["", 60], ["Crew", 90], ["Action", 190], ["", 28]]);
+		for(r : sh.phrase_rules) {
+			rid = r.id;
+			row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			rule_on(row, "phrase_rules", r);
+			text_field(row, 120, r.name, "Its name (the log shows it)", [rid](t) { edit_rule("phrase_rules", rid, [t](x) { x.name = t; }); });
+			combo_field(row, 96, DESK_SHOW_PHRASES, DESK_SHOW_PHRASE_LABELS, r.phrase ?? "", "Which phrase of rekordbox", [rid](t) { edit_rule("phrase_rules", rid, [t](x) { x.phrase = t; }); });
+			combo_field(row, 104, DESK_SHOW_SCOPES, DESK_SHOW_SCOPE_LABELS, r.players ?? "master", "Which deck", [rid](t) { edit_rule("phrase_rules", rid, [t](x) { x.players = t; }); });
+			combo_field(row, 90, DESK_SHOW_MOODS, DESK_SHOW_MOOD_LABELS, r.mood ?? "", "The mood rekordbox found for the track", [rid](t) { edit_rule("phrase_rules", rid, [t](x) { x.mood = t; }); });
+			for(f : [["bars_min", "Shortest phrase in bars (0: any)"], ["bars_max", "Longest phrase in bars (0: any)"], ["bpm_min", "Lowest BPM of the deck (0: any)"], ["bpm_max", "Highest BPM of the deck (0: any)"]]) {
+				key = f[0];
+				float_field(row, 56, r[key] ?? 0.0, f[1], [rid, key](x) { edit_rule("phrase_rules", rid, [key, x](y) { y[key] = x; }); });
+			}
+			float_field(row, 60, r.weight ?? 100.0, "How likely it is picked among those that fit (1-1000)", [rid](x) { edit_rule("phrase_rules", rid, [x](y) { y.weight = math.clamp(x, 1.0, 1000.0); }); }, 1.0, 1000.0);
+			toggle_field(row, 60, "Solo", r.solo ??? true, "Solo: runs alone when it is picked. Off (blend): runs with the other blend triggers that fit", [rid](x) { edit_rule("phrase_rules", rid, [x](y) { y.solo = x; }); });
+			combo_field(row, 90, crews(), crews(), r.crew ?? "Lighting", "The crew of the cue call", [rid](t) { edit_rule("phrase_rules", rid, [t](x) { x.crew = t; }); });
+			action_field(row, 190, r.action ?? None, [rid](a) { edit_rule("phrase_rules", rid, [a](x) { x.action = a; }); });
+			delete_button(row, "Deletes this trigger", [rid]() { desk.shows.edit("Delete rule", [rid](s) { desk_show_remove_id(s.phrase_rules, rid); return None; }); });
+		}
+		add_rule_button("phrase_rules", "Add a phrase trigger");
+	}
+	else if(page == "lookahead") {
+		rules_content.label("An action some beats before each drop, buildup, break, new phrase, memory cue or track cue: fog 16 beats before the drop, a blackout 1 beat before").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+		head_row(rules_content, [["", 44], ["Name", 150], ["Before", 130], ["Beats", 70], ["Deck", 110], ["Crew", 100], ["Action", 240], ["", 28]]);
+		for(r : sh.lookahead) {
+			rid = r.id;
+			row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			rule_on(row, "lookahead", r);
+			text_field(row, 150, r.name, "Its name (the cue call and the log show it)", [rid](t) { edit_rule("lookahead", rid, [t](x) { x.name = t; }); });
+			combo_field(row, 130, DESK_SHOW_TARGETS, DESK_SHOW_TARGET_LABELS, r.target ?? "drop", "What it is ahead of", [rid](t) { edit_rule("lookahead", rid, [t](x) { x.target = t; }); });
+			float_field(row, 70, r.beats ?? 16.0, "How many beats before", [rid](v) { edit_rule("lookahead", rid, [v](x) { x.beats = v; }); });
+			combo_field(row, 110, DESK_SHOW_SCOPES, DESK_SHOW_SCOPE_LABELS, r.players ?? "master", "Which deck", [rid](t) { edit_rule("lookahead", rid, [t](x) { x.players = t; }); });
+			combo_field(row, 100, crews(), crews(), r.crew ?? "Lighting", "The crew of the cue call", [rid](t) { edit_rule("lookahead", rid, [t](x) { x.crew = t; }); });
+			action_field(row, 240, r.action ?? None, [rid](a) { edit_rule("lookahead", rid, [a](x) { x.action = a; }); });
+			delete_button(row, "Deletes this action", [rid]() { desk.shows.edit("Delete rule", [rid](s) { desk_show_remove_id(s.lookahead, rid); return None; }); });
+		}
+		add_rule_button("lookahead", "Add a look-ahead");
+	}
+	else if(page == "limits") {
+		rules_content.label("Strobes, blinders, specials. Max on-time and duty cycle also stop a Go by hand; min gap and arming only hold back the automation. Specials stay disarmed until armed (also after a load)").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+		head_row(rules_content, [["Stack", 160], ["Max on s", 76], ["Min gap s", 76], ["Duty %", 64], ["Window s", 72], ["", 76], ["", 76], ["On now", 110], ["", 28]]);
+		info = desk.shows.describe();
+		for(r : sh.limits) {
+			rid = r.id;
+			row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			combo_field(row, 160, stack_values(), stack_labels(), r.stack ?? "", "The cue stack it limits", [rid](t) { edit_rule("limits", rid, [t](x) { x.stack = t; }); });
+			float_field(row, 76, r.max_on ?? 0.0, "The longest it may stay on, seconds (0: no limit)", [rid](v) { edit_rule("limits", rid, [v](x) { x.max_on = v; }); });
+			float_field(row, 76, r.min_gap ?? 0.0, "The automation starts it again only after this many seconds off", [rid](v) { edit_rule("limits", rid, [v](x) { x.min_gap = v; }); });
+			float_field(row, 64, std.float(r.duty ?? 0.0) * 100.0, "At most this part of the window on (0: no limit)", [rid](v) { edit_rule("limits", rid, [v](x) { x.duty = math.clamp(v / 100.0, 0.0, 1.0); }); }, 0.0, 100.0);
+			float_field(row, 72, r.window ?? 60.0, "The window of the duty cycle, seconds", [rid](v) { edit_rule("limits", rid, [v](x) { x.window = math.max(1.0, v); }); }, 1.0);
+			toggle_field(row, 76, "Special", r.special ?? false, "A special (CO2, pyro, ...): the automation never starts it until it is armed", [rid](x) { edit_rule("limits", rid, [x](y) { y.special = x; }); });
+			armed_now = false;
+			on_now = 0.0;
+			for(e : info.limits) {
+				if(e.id == rid) {
+					armed_now = e.armed;
+					on_now = e.on_seconds;
+				}
+			}
+			arm = row.pushbutton("Armed").fixed_width(76).fixed_height(TS_ROW).tooltip("The automation may start this special now (not saved: disarmed after a load)");
+			arm.pushed(armed_now ? true : false);
+			arm.on_change([rid](x) {
+				if(!filling)
+					desk.shows.arm(rid, x);
+			});
+			row.label(desk_num_text(on_now) + " s of window").fixed_width(110).fixed_height(TS_ROW).text_color(PAL_TEXT_2);
+			delete_button(row, "Deletes this limit", [rid]() { desk.shows.edit("Delete limit", [rid](s) { desk_show_remove_id(s.limits, rid); return None; }); });
+		}
+		add_rule_button("limits", "Add a limit");
+	}
+	else if(page == "settings") {
+		row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+		row.label("Crews of the cue call").fixed_width(220).fixed_height(TS_ROW).text_color(PAL_TEXT_2);
+		text_field(row, 360, desk_join(sh.crews, ", "), "The crews the cue call counts down for, separated by commas", [](t) {
+			list = [];
+			for(w : t.split(",")) {
+				if(w.trim())
+					list.push_back(w.trim());
+			}
+			if(list.size())
+				desk.shows.edit("Crews", [list](s) { s.crews = list; return None; });
+		});
+		for(f : [["backoff_bars", "Back-off after a touch, bars", "The automation leaves a stack alone this many bars after the operator touched it (Go, Back, Off, Flash, its master)"],
+			["stop_after", "Stop when no deck plays, s", "Seconds without a playing deck before the automation stops what it started (0: never)"],
+			["standby_beats", "Standby before, beats", "How many beats before an item the cue call says standby"]]) {
+			key = f[0];
+			row = rules_content.widget().fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+			row.label(f[1]).fixed_width(220).fixed_height(TS_ROW).text_color(PAL_TEXT_2);
+			float_field(row, 100, sh[key], f[2], [key](v) { desk.shows.edit("Show settings", [key, v](s) { s[key] = math.max(0.0, v); return None; }); });
+		}
+	}
+	else {
+		st = desk.shows.describe();
+		if(!st.log.size())
+			rules_content.label("Nothing ran yet").fixed_height(TS_ROW).text_color(PAL_TEXT_3);
+		for(i = st.log.size() - 1; i >= 0 && i >= st.log.size() - 40; i--) {
+			e = st.log[i];
+			text = std.string(e.kind) + " · " + std.string(e.what) + (e.action ? " · " + std.string(e.action) : "") + (e.why ? " · " + std.string(e.why) : "") + (e.deck ? " · deck " + std.string(e.deck) : "");
+			rules_content.label(text).fixed_height(22).text_color(e.ok ? PAL_TEXT_2 : PAL_DANGER);
+		}
+	}
+	rules_content.parent().refresh_layout();
+	filling = false;
+}
+
+rules_key_now() {
+	sh = desk.data.show;
+	if(page == "log")
+		return "log" + desk.shows.log_count;
+	if(page == "settings")
+		return "settings" + sh.crews.compact_string() + sh.backoff_bars + "/" + sh.stop_after + "/" + sh.standby_beats;
+	key = page + sh[page].compact_string() + crews().compact_string();
+	if(page == "limits") {
+		key += stack_labels().compact_string() + desk.shows.armed.compact_string();
+	}
+	return key;
+}
+
+// =========================================================================
+// Every frame
+// =========================================================================
+
+//Twice a second: the deck may have got another track (the desk's revision does not change then)
+last_tick_ms = 0;
+shown_text = "";
+frame_tick() {
+	now = std.millis();
+	if(now - last_tick_ms < 500)
+		return false;
+	last_tick_ms = now;
+	return true;
+}
+
+update(generator, tl_pos, pos_delta) {
+	if(!engine || !desk || !sheet_content)
+		return;
+	//where the deck is: every frame, without building anything again
+	v = deck_info();
+	text = "";
+	if(!v)
+		text = "No deck";
+	else {
+		text = (v.title ? v.title : "(no title yet)") + (v.artist ? " · " + v.artist : "") + "   " + (v.bar ? v.bar : "-") + (v.playing ? " ▶" : " ‖");
+		text += v.master ? " · master" : "";
+		text += v.on_air ? " · on air" : "";
+		text += v.signature ? " · " + std.string(v.signature).substr(0, 8) : "";
+	}
+	if(text != shown_text) {
+		shown_text = text;
+		pos_label.caption(text);
+	}
+	if(desk.revision != seen_revision || desk.shows.log_count != seen_log || frame_tick()) {
+		seen_revision = desk.revision;
+		seen_log = desk.shows.log_count;
+		key = sheet_key_now();
+		if(key != sheet_key) {
+			sheet_key = key;
+			build_sheet();
+			ent = v ? v.show : None;
+			filling = true;
+			if(ent) {
+				scope_combo.selected(math.max(0, patch_index_of(DESK_SHOW_SCOPES, ent.enabled ?? "master")));
+				lock_btn.pushed((ent.lock_phrases ??? true) ? true : false);
+			}
+			filling = false;
+		}
+		key = rules_key_now();
+		if(key != rules_key) {
+			rules_key = key;
+			build_rules();
+		}
+	}
+}
+
+dispatcher(generator, cmd, value) {
+	return None;
+}
+
+entry(generator, area) {
+	engine = generator.engine;
+	desk = engine.desk;
+	generator.window.fixed_size(vec2f(1180, 720));
+	area.layout(None);
+
+	top = area.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+	deck_combo = top.combobox().items(TS_DECK_LABELS).fixed_width(130).fixed_height(TS_ROW);
+	deck_combo.selected(math.max(0, patch_index_of(TS_DECKS, deck_ref)));
+	deck_combo.tooltip("The deck whose track this shows: the tempo master deck, or a deck by its number (DJ Link)\n[[wiki:Lighting-Desk#shows-per-track]]");
+	deck_combo.on_change([](index, text) {
+		if(index >= 0 && index < TS_DECKS.size()) {
+			deck_ref = TS_DECKS[index];
+			sheet_key = "x";
+			seen_revision = -1;
+		}
+	});
+	pos_label = top.label("No deck").fixed_width(420).fixed_height(TS_ROW).text_color(PAL_TEXT);
+	pos_label.tooltip("The track on the deck, where it plays (bar.beat), and the start of its signature (it finds the show again on any USB stick)");
+	add_btn = top.button("Add cue here").icon(nanogui.icon("plus")).fixed_width(140).fixed_height(TS_ROW);
+	add_btn.tooltip("A cue of 4 bars at the beat of the playhead of the deck (the show of the track is made when it has none)");
+	add_btn.on_click([]() {
+		r = desk.shows.add_cue_here(deck_ref);
+		set_status(r.ok ? "Cue added at " + desk_show_bar_text(r.cue.beat) : r.error);
+	});
+	mem_btn = top.button("Import memory cues").fixed_width(160).fixed_height(TS_ROW);
+	mem_btn.tooltip("The memory cues (and memory loops) the DJ stored in rekordbox become cues of this track, with their names");
+	mem_btn.on_click([]() {
+		r = desk.shows.import_cues(deck_ref, "memory");
+		set_status(r.ok ? r.added + " cues imported" : r.error);
+	});
+	hot_btn = top.button("Import hot cues").fixed_width(140).fixed_height(TS_ROW);
+	hot_btn.tooltip("The hot cues of rekordbox become cues of this track, with their names");
+	hot_btn.on_click([]() {
+		r = desk.shows.import_cues(deck_ref, "hot");
+		set_status(r.ok ? r.added + " cues imported" : r.error);
+	});
+
+	opts = area.widget().anchor_left(0).anchor_right(0).anchor_top(TS_ROW + TS_GAP).fixed_height(TS_ROW).layout(nanogui.layout_horizontal().spacing(TS_GAP));
+	opts.label("Runs on").fixed_width(70).fixed_height(TS_ROW).text_color(PAL_TEXT_2);
+	scope_combo = opts.combobox().items(DESK_SHOW_SCOPE_LABELS).fixed_width(130).fixed_height(TS_ROW);
+	scope_combo.tooltip("When the cues of this track run: while its deck is the tempo master, while it is on air (needs a DJM), on any deck, never");
+	scope_combo.on_change([](index, text) {
+		if(filling || index < 0 || index >= DESK_SHOW_SCOPES.size())
+			return;
+		scope = DESK_SHOW_SCOPES[index];
+		edit_entry("Track show runs on", false, [scope](e) { e.enabled = scope; return None; });
+	});
+	lock_btn = opts.pushbutton("Lock phrases").fixed_width(130).fixed_height(TS_ROW);
+	lock_btn.tooltip("The cues of this track lock out the phrase triggers and the look-ahead on phrases (and the phrases of the stacks) while it plays");
+	lock_btn.on_change([](x) {
+		if(!filling)
+			edit_entry("Track show lock phrases", false, [x](e) { e.lock_phrases = x ? true : false; return None; });
+	});
+	del_show = opts.button("Delete show").danger("hover").fixed_width(120).fixed_height(TS_ROW);
+	del_show.tooltip("Deletes the show of this track (all its cues)");
+	del_show.on_click([]() {
+		v = deck_info();
+		if(!v || !v.show)
+			return;
+		sid = v.show.id;
+		desk.shows.edit("Delete track show", [sid](sh) { desk_show_remove_id(sh.tracks, sid); return None; });
+	});
+	status_label = opts.label("").fixed_width(640).fixed_height(TS_ROW).text_color(PAL_CUE);
+
+	sheet_top = 2 * (TS_ROW + TS_GAP);
+	sheet_content = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(sheet_top).fixed_height(300).content().layout(nanogui.layout_vertical().spacing(2));
+
+	rules_top = sheet_top + 300 + 8;
+	tabs = area.combobox().items(TS_PAGE_LABELS).segmented(true).anchor_left(0).anchor_right(0).anchor_top(rules_top).fixed_height(TS_ROW);
+	tabs.selected(math.max(0, patch_index_of(TS_PAGES, page)));
+	tabs.tooltip("Rules that need no show per track, the limits of stacks, the settings and what ran\n[[wiki:Lighting-Desk#shows-per-track]]");
+	tabs.on_change([](index, text) {
+		if(index >= 0 && index < TS_PAGES.size()) {
+			page = TS_PAGES[index];
+			rules_key = "x";
+			seen_revision = -1;
+		}
+	});
+	rules_content = area.vscroll().anchor_left(0).anchor_right(0).anchor_top(rules_top + TS_ROW + TS_GAP).anchor_bottom(0).content().layout(nanogui.layout_vertical().spacing(2));
+	seen_revision = -1;
+}
+
+save_state() {
+	return [deck = deck_ref, page = page];
+}
+
+load_state(state) {
+	deck_ref = std.string(state.deck ?? "master");
+	page = std.string(state.page ?? "name_rules");
+	sheet_key = "x";
+	rules_key = "x";
+	seen_revision = -1;
+}

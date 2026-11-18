@@ -320,13 +320,44 @@ if(!cfg.load(config_path, false)) {
     ], true, true);
 
     manager = SessionManager(store, config_path);
+    check(manager.capacity().interactive_idle_secs >= 600, "workspace capacity is idle before any interactive request");
     recovered = manager.get_session(recovery_id);
     check(recovered.status == "done" && recovered.report == "Completed before restart." && recovered.error == "", "restart recovers a durable worker completion instead of reporting an interruption");
-    mres = manager.create_session(proto.workspace.id, "manager-test", "normal", "", "adaptive", "high");
+    mres = manager.create_session(proto.workspace.id, "manager-test", "normal", "", "adaptive", "high", "web");
+    check(manager.capacity().interactive_idle_secs < 600, "workspace capacity yields after a recent owner request");
 
     check(mres.ok, "session manager create");
     check(mres.ok && mres.session.reasoning_effort == "high", "session reasoning effort is persisted and returned");
     check(!manager.create_session(proto.workspace.id, "invalid-effort", "normal", "", "adaptive", "extreme").ok, "invalid reasoning effort is refused");
+
+    // the running turn as items: what a page that opens the session in the middle of
+    // a turn draws (GET /api/sessions/<id> answers it as `turn`)
+    tl = mres.session.id;
+    manager.turn_log_reset(tl, "do the thing");
+    manager.turn_log_add(tl, [reasoning = "First. "]);
+    manager.turn_log_add(tl, [reasoning = "Second."]);
+    manager.turn_log_add(tl, [text = "Looking."]);
+    manager.turn_log_add(tl, [tool_start = [id = "c1", name = "read_file", args = [path = "a.txt", tool_call = "x", tool_call_index = 0]]]);
+    manager.turn_log_add(tl, [agent = [id = "sub1", action = [text = "the text of a sub-agent is not shown"]]]);
+    manager.turn_log_add(tl, [agent = [id = "sub1", action = [tool_start = [id = "c2", name = "list_dir", args = [path = "."]]]]]);
+    manager.turn_log_add(tl, [tool_end = [id = "c1", name = "read_file", result = [ok = false, error = "no such file"]]]);
+    manager.turn_log_add(tl, [tool_end = [id = "c2", name = "list_dir", result = "a.txt"]]);
+    manager.turn_log_add(tl, [reasoning = "Third."]);
+    turn_items = manager.turn_log(tl);
+    turn_kinds = "";
+    for(it : turn_items)
+        turn_kinds = turn_kinds + it.kind + " ";
+    check(turn_kinds == "user reasoning text tool tool reasoning ", "the turn log folds the stream into items (" + turn_kinds + ")");
+    check(turn_items[1].text == "First. Second.", "the reasoning deltas of one block are one item");
+    check(turn_items[3].name == "read_file" && turn_items[3].state == "failed" && turn_items[3].args.path == "a.txt" && !turn_items[3].args.has("tool_call") && turn_items[3].result.error == "no such file", "a tool item has every parameter (without the harness fields), its state and its result");
+    check(turn_items[4].name == "list_dir" && (turn_items[4].sub ? 1 : 0) == 1 && turn_items[4].state == "ok", "the tool call of a sub-agent is in the log and marked");
+    for(i = 0; i < WS_TURN_ITEMS_MAX + 20; i++)
+        manager.turn_log_push(tl, [kind = "notice", text = "n" + std.string(i)]);
+    turn_items = manager.turn_log(tl);
+    check(turn_items.size() == WS_TURN_ITEMS_MAX && turn_items[0].kind == "user", "a very long turn keeps the prompt and its newest items");
+    manager.turn_log_reset(tl, "next");
+    check(manager.turn_log(tl).size() == 1 && manager.turn_log(tl)[0].text == "next", "a new prompt starts a new turn log");
+    manager.turn_log_reset(tl, "");
 
     active_task_id = "active-task-selftest";
     manager.sessions[active_task_id] = [
@@ -372,7 +403,7 @@ if(!cfg.load(config_path, false)) {
 
     store.set_settings(1);
     second = manager.create_session(proto.workspace.id, "second", "normal", "", "adaptive");
-    check(!second.ok, "max_sessions enforced");
+    check(second.ok && second.session.status == "queued", "max_sessions accepts the next task as queued");
     store.set_settings(3);
 
     notify_count = 0;
@@ -386,6 +417,23 @@ if(!cfg.load(config_path, false)) {
     stopped = manager.get_session(sid);
     check(!std.is_none(stopped) && stopped.status == "stopped", "session stopped");
     check(notify_count == 1, "stopped session reports exactly one terminal event");
+
+    second_started = false;
+    for(i = 0; i < 100; i++) {
+        s2 = manager.get_session(second.session.id);
+
+        if(s2 && (s2.status == "waiting" || s2.status == "running")) {
+            second_started = true;
+            break;
+        }
+
+        std.sleep(100);
+    }
+    check(second_started, "a queued session starts when a slot frees");
+
+    // clean up the worker started by the queue check
+    manager.stop_session(second.session.id);
+
     loaded_session = SessionManager(store, config_path).get_session(sid);
     check(!std.is_none(loaded_session) && loaded_session.status == "stopped", "saved session loaded from .megamind");
     check(!std.is_none(loaded_session) && loaded_session.reasoning_effort == "high", "session reasoning effort survives manager reload");

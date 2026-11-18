@@ -1,0 +1,1707 @@
+//The stage of a project (#980): the 3D models of the room, the set and the decoration, where they stand and what hangs
+//on what. Pure data and logic, no UI: the Stage menu (engine/menus/stage) edits it, the 3D views draw it
+//(engine/patch/stage3d_scene.shio), saved as projects/<name>/stage.json; _testing/stage.shio checks it.
+//
+//  stage = [
+//    version = 1,
+//    objects = [[id, name, kind ("model", "screen", "splat", "build"), source (path of the model file, "/"), parent (id, "" = on the stage),
+//                x, y, z (metres), rx, ry, rz (degrees: turned around x, then y, then z), scale,
+//                unit (metres per unit of an STL / OBJ file, 0 = the default of the format), up ("" / "z" / "y": the
+//                same for the up axis), visible (1 / 0), materials (part name -> [preset, transmission, diffusion]:
+//                a translucent body the LEDs on the stage shine through, #980), screen (kind "screen": an LED wall or a
+//                screen, stage_screen_defaults), splat (kind "splat": a scan of the venue, stage_splat_defaults),
+//                build (kind "build": a truss, deck, stairs, ... made from its measures, stage_builds.shio),
+//                folder (id of the folder it is in, "" = none), sym_group, sym_mode, sym_index (symmetry: the
+//                pieces of a group follow each other, stage_sym_*)], ...],
+//    folders = [[id, name, folder (the folder it is in, "" = none), visible (1 / 0: off hides all in it), open (1 / 0:
+//                its contents shown in the list of the Stage menu)], ...],
+//    simulation = 1 / 0 (the light of the LEDs and, later, through the materials; off for the show),
+//  ]
+//
+//- The world is that of the fixture setup (engine/patch/stage3d.shio): x to the right, y towards the audience, z up,
+//  metres. A model is placed with its own origin at (x, y, z).
+//- parent: an object moves, turns and scales with its parent (a decoration on a truss; later the LEDs of a part,
+//  #980). Its x, y, z, rx, ry, rz, scale are in the frame of the parent.
+//- folder: only for order and showing / hiding (a folder off hides everything in it, at any depth; an object's own
+//  visible stays as it is). It moves nothing: hanging on another object is parent.
+//- The models themselves (engine/stage/stage_models.shio) are read by stage_model_get(): once per file, unit and up
+//  axis, on a thread; never while drawing.
+
+#include "../patch/xml"
+#include "../patch/gdtf_mesh"
+#include "stage_models"
+
+STAGE_VERSION = 1;
+
+def stage_object_defaults(o);
+def stage_screen_defaults(o);
+def stage_splat_defaults(o);
+def stage_world_matrix(s, o);
+def stage_point(m, p);
+def stage_model_store();
+def stage_model_key(o);
+def stage_world_to_local(s, o, d);
+def stage_free_name(s, base);
+def stage_find(s, id);
+def stage_children(s, id);
+def stage_mat_mul(a, b);
+def stage_object_pivot(s, o);
+def stage_model_get(o, key);
+def stage_world_box(m, b);
+def stage_moves_with(s, o, ids);
+def stage_folder_defaults(f);
+def stage_find_folder(s, id);
+
+#include "stage_builds"
+
+stage_new() {
+	return [version = STAGE_VERSION, objects = [], folders = [], simulation = 0];
+}
+
+//Missing keys of an older or hand-written object
+stage_object_defaults(o) {
+	if(!o.has("id") || !o.id)
+		o.id = std.random_hash();
+	if(!o.has("name") || std.is_none(o.name))
+		o.name = "Object";
+	if(!o.has("kind") || !o.kind)
+		o.kind = "model";
+	if(!o.has("source") || std.is_none(o.source))
+		o.source = "";
+	if(!o.has("parent") || std.is_none(o.parent))
+		o.parent = "";
+	for(k : ["x", "y", "z", "rx", "ry", "rz", "unit"]) {
+		if(!o.has(k) || std.is_none(o[k]))
+			o[k] = 0.0;
+	}
+	if(!o.has("scale") || std.is_none(o.scale) || o.scale <= 0.0)
+		o.scale = 1.0;
+	if(!o.has("up") || std.is_none(o.up))
+		o.up = "";
+	if(!o.has("visible") || std.is_none(o.visible))
+		o.visible = 1;
+	if(!o.has("folder") || std.is_none(o.folder))
+		o.folder = "";
+	if(!o.has("sym_group") || std.is_none(o.sym_group))
+		o.sym_group = "";
+	if(!o.has("sym_mode") || std.is_none(o.sym_mode))
+		o.sym_mode = "";
+	if(!o.has("sym_index") || std.is_none(o.sym_index))
+		o.sym_index = 0;
+	//#980: the material of each body (part name -> [preset, transmission, diffusion]); a body not named is solid
+	if(!o.has("materials") || std.type(o.materials) != "json" || std.is_list(o.materials))
+		o.materials = std.json();
+	if(o.kind == "screen")
+		stage_screen_defaults(o);
+	if(o.kind == "splat")
+		stage_splat_defaults(o);
+	if(o.kind == "build")
+		stage_build_defaults(o);
+	return o;
+}
+
+// =========================================================================
+// Scans of the venue (#980): Gaussian splats
+// =========================================================================
+
+//An object of kind "splat" is a scan of the room (a .ply of the 3D Gaussian splatting tools or a .splat file): the floor
+//and what stands on it, as the base the stage is built on. A scan comes in a frame of its own (its up axis, its unit, a
+//floor anywhere): align is the matrix that puts its floor at z = 0 in metres (made with stage_splat_floor and
+//stage_splat_scale), applied before the object's own place, turn and scale.
+//  o.splat = [align (12 numbers, 3 x 4 rows), height (metres above its floor shown; 0: all, the ceiling too),
+//             quality ("low" / "medium" / "high": how many splats are drawn at most)]
+STAGE_SPLAT_QUALITY = [low = 300000, medium = 1000000, high = 4000000];
+STAGE_SPLAT_IDENTITY = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+stage_splat_defaults(o) {
+	if(!o.has("splat") || std.type(o.splat) != "json" || std.is_list(o.splat))
+		o.splat = std.json();
+	c = o.splat;
+	if(!c.has("align") || !std.is_list(c.align) || c.align.size() != 12)
+		c.align = STAGE_SPLAT_IDENTITY.copy();
+	if(!c.has("height") || std.is_none(c.height))
+		c.height = 0.0;
+	c.height = math.max(0.0, std.float(c.height));
+	if(!c.has("quality") || !STAGE_SPLAT_QUALITY.has(c.quality))
+		c.quality = "medium";
+	return o;
+}
+
+//The inverse of a 3 x 4 frame (rotation, uniform or not, and a move)
+stage_mat_inverse(m) {
+	a = m[0]; b = m[1]; c = m[2];
+	d = m[4]; e = m[5]; f = m[6];
+	g = m[8]; h = m[9]; i = m[10];
+	det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+	if(math.abs(det) < 1e-12)
+		return STAGE_SPLAT_IDENTITY.copy();
+	k = 1.0 / det;
+	r = [(e * i - f * h) * k, (c * h - b * i) * k, (b * f - c * e) * k, 0.0,
+		(f * g - d * i) * k, (a * i - c * g) * k, (c * d - a * f) * k, 0.0,
+		(d * h - e * g) * k, (b * g - a * h) * k, (a * e - b * d) * k, 0.0];
+	for(row = 0; row < 3; row++)
+		r[row * 4 + 3] = -(r[row * 4] * m[3] + r[row * 4 + 1] * m[7] + r[row * 4 + 2] * m[11]);
+	return r;
+}
+
+//The frame a scan's aligned coordinates are in, in the world (its parents and its own place, without its align)
+stage_splat_frame(s, o) {
+	keep = o.splat.align;
+	o.splat.align = STAGE_SPLAT_IDENTITY.copy();
+	m = stage_world_matrix(s, o);
+	o.splat.align = keep;
+	return m;
+}
+
+//Puts the floor of a scan at z = 0: three points of the world on its floor (clicked in the 3D view) and where the
+//camera was (the side the floor is seen from is up). Changes o.splat.align; returns the floor's normal before (in the
+//scan's aligned frame) or None when the points are on one line
+stage_splat_floor(s, o, pts, eye) {
+	inv = stage_mat_inverse(stage_splat_frame(s, o));
+	q = [];
+	for(p : pts)
+		q.push_back(stage_point(inv, p));
+	u = [x = q[1].x - q[0].x, y = q[1].y - q[0].y, z = q[1].z - q[0].z];
+	v = [x = q[2].x - q[0].x, y = q[2].y - q[0].y, z = q[2].z - q[0].z];
+	n = [x = u.y * v.z - u.z * v.y, y = u.z * v.x - u.x * v.z, z = u.x * v.y - u.y * v.x];
+	l = math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+	if(l < 1e-9)
+		return None;
+	n = [x = n.x / l, y = n.y / l, z = n.z / l];
+	e = stage_point(inv, eye);
+	if(n.x * (e.x - q[0].x) + n.y * (e.y - q[0].y) + n.z * (e.z - q[0].z) < 0.0)
+		n = [x = -n.x, y = -n.y, z = -n.z];
+	//the turn that takes n to +z (Rodrigues: around n x z by the angle between them)
+	ax = [x = n.y, y = -n.x, z = 0.0];
+	sn = math.sqrt(ax.x * ax.x + ax.y * ax.y);
+	cs = n.z;
+	r = STAGE_SPLAT_IDENTITY.copy();
+	if(sn > 1e-9) {
+		kx = ax.x / sn;
+		ky = ax.y / sn;
+		kz = 0.0;
+		t = 1.0 - cs;
+		r = [t * kx * kx + cs, t * kx * ky - sn * kz, t * kx * kz + sn * ky, 0.0,
+			t * kx * ky + sn * kz, t * ky * ky + cs, t * ky * kz - sn * kx, 0.0,
+			t * kx * kz - sn * ky, t * ky * kz + sn * kx, t * kz * kz + cs, 0.0];
+	}
+	else if(cs < 0.0)
+		r = [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0];
+	//and down (or up) to z = 0
+	z0 = stage_point(r, q[0]).z;
+	r[11] = -z0;
+	o.splat.align = stage_mat_mul(r, o.splat.align);
+	return n;
+}
+
+//Scales a scan (its align) so that two points of the world that are measured apart are real metres apart. Returns the
+//factor, 0 when the points are the same
+stage_splat_scale(s, o, a, b, real) {
+	d = math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z));
+	if(d < 1e-9 || real <= 0.0)
+		return 0.0;
+	f = real / d;
+	sm = [f, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, f, 0.0];
+	o.splat.align = stage_mat_mul(sm, o.splat.align);
+	return f;
+}
+
+//The splats of a scan (a nanogui.splats3d), None while they are read or without the loader
+stage_splats_get(o) {
+	if(o.kind != "splat")
+		return None;
+	e = stage_model_store()[stage_model_key(o)] ?? None;
+	return e ? (e.splats ?? None) : None;
+}
+
+//The box in the world around a scan as it stands (its splat centres aligned and placed: the box of its file turned is
+//much bigger), from a sample of them; None while they are read
+stage_splat_world_box(s, o) {
+	sp = stage_splats_get(o);
+	if(!sp)
+		return None;
+	v = sp.sample(4000);
+	if(v.size() < 3)
+		return None;
+	m = stage_world_matrix(s, o);
+	lo = [x = 1e30, y = 1e30, z = 1e30];
+	hi = [x = -1e30, y = -1e30, z = -1e30];
+	for(i = 0; i + 2 < v.size(); i += 3) {
+		p = stage_point(m, [x = v[i], y = v[i + 1], z = v[i + 2]]);
+		lo = [x = math.min(lo.x, p.x), y = math.min(lo.y, p.y), z = math.min(lo.z, p.z)];
+		hi = [x = math.max(hi.x, p.x), y = math.max(hi.y, p.y), z = math.max(hi.z, p.z)];
+	}
+	return [min = lo, max = hi];
+}
+
+//The splats of a scan are read by nanogui.splats3d, which the app gives (std.global("stage_splat_loader"): a function
+//that makes one; engine/patch/stage3d_scene.shio sets it): this file stays without a module (the tests)
+stage_splat_loader() {
+	return std.global("stage_splat_loader").get();
+}
+
+// =========================================================================
+// Screens and LED walls (#980): a picture of VibeVJ on the stage
+// =========================================================================
+
+//An object of kind "screen" has no model file: a rectangle that shows a picture, on a body behind it, upright and
+//facing the audience (+y), the middle of its bottom edge at its place (x, y, z). The picture is that of a video router
+//(source: its name, as the input lists of the shaders and the LEDMapper show them): what goes to the real wall.
+//  o.screen = [type ("led": an LED wall of panels, "screen": a projection screen, a monitor),
+//              cols, rows (panels), panel_w, panel_h (metres a panel), panel_px, panel_py (pixels of a panel),
+//              width, height (metres, type "screen"), depth (metres of the body),
+//              source (video router name, "": none), brightness (0..2: how bright the picture is drawn)]
+STAGE_SCREEN_TYPES = ["led", "screen"];
+STAGE_SCREEN_TYPE_LABELS = ["LED wall (panels)", "Screen / monitor"];
+
+stage_screen_defaults(o) {
+	if(!o.has("screen") || std.type(o.screen) != "json" || std.is_list(o.screen))
+		o.screen = std.json();
+	c = o.screen;
+	defaults = [type = "led", cols = 6, rows = 3, panel_w = 0.5, panel_h = 0.5, panel_px = 128, panel_py = 128,
+		width = 3.0, height = 2.0, depth = 0.08, source = "", brightness = 1.0];
+	for(i = 0; i < defaults.size(); i++) {
+		k = defaults.key(i);
+		if(!c.has(k) || std.is_none(c[k]))
+			c[k] = defaults[i];
+	}
+	if(!STAGE_SCREEN_TYPES.has_value(c.type))
+		c.type = "led";
+	c.cols = math.clamp(std.int(c.cols), 1, 1000);
+	c.rows = math.clamp(std.int(c.rows), 1, 1000);
+	c.panel_px = math.clamp(std.int(c.panel_px), 1, 8192);
+	c.panel_py = math.clamp(std.int(c.panel_py), 1, 8192);
+	for(k : ["panel_w", "panel_h", "width", "height"])
+		c[k] = math.max(0.01, std.float(c[k]));
+	c.depth = math.clamp(std.float(c.depth), 0.0, 2.0);
+	c.brightness = math.clamp(std.float(c.brightness), 0.0, 2.0);
+	return o;
+}
+
+//How big a screen is: [width, height] metres, [px, py] its pixels (an LED wall: its panels; a screen: 0, 0)
+stage_screen_size(o) {
+	c = o.screen;
+	if(c.type == "led")
+		return [width = c.cols * c.panel_w, height = c.rows * c.panel_h, px = c.cols * c.panel_px, py = c.rows * c.panel_py];
+	return [width = c.width, height = c.height, px = 0, py = 0];
+}
+
+//A screen or LED wall onto the stage (type "led" / "screen"), the middle of its bottom edge at (x, y, z)
+stage_add_screen(s, type = "led", x = 0.0, y = 0.0, z = 0.0) {
+	o = stage_object_defaults([name = stage_free_name(s, type == "led" ? "LED wall" : "Screen"), kind = "screen", x = x, y = y, z = z,
+		screen = [type = type, depth = type == "led" ? 0.08 : 0.03]]);
+	s.objects.push_back(o);
+	return o;
+}
+
+//The model of a screen (as stage_models.shio makes them): the body ("Body") and the picture ("Display", with texture
+//coordinates uv: u left to right, v bottom (0) to top (1): pictures are in GL orientation, row 0 at the bottom)
+stage_screen_model(o) {
+	z = stage_screen_size(o);
+	w = z.width / 2.0;
+	h = z.height;
+	d = math.max(0.002, o.screen.depth);
+	m = stage_model_new("screen");
+	body = stage_part_new("Body", [0.06, 0.06, 0.07]);
+	body.v = [-w, -d, 0.0, w, -d, 0.0, w, 0.0, 0.0, -w, 0.0, 0.0, -w, -d, h, w, -d, h, w, 0.0, h, -w, 0.0, h];
+	body.t = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0];
+	m.parts.push_back(body);
+	//(a little in front of the body: no fighting over the depth)
+	f = 0.002;
+	disp = stage_part_new("Display", [0.02, 0.02, 0.025]);
+	disp.v = [-w, f, h, w, f, h, w, f, 0.0, -w, f, 0.0];
+	disp.t = [0, 3, 2, 0, 2, 1];
+	disp.uv = [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+	m.parts.push_back(disp);
+	stage_model_finish(m);
+	m.ok = true;
+	return m;
+}
+
+//The pictures a screen can show: the video routers that are on, [[name, picture], ...] (a router whose generator went
+//away is left out)
+stage_picture_sources() {
+	out = [];
+	try {
+		list = std.global("videorouter").instances;
+		for(i = 0; list && i < list.size(); i++) {
+			r = list[i];
+			try {
+				if(r && r.name && r.output_ctrl)
+					out.push_back([name = r.name, picture = r.output_ctrl.value()]);
+			}
+			catch(e) {}
+		}
+	}
+	catch(e) {}
+	return out;
+}
+
+//The picture of a video router by its name, or None
+stage_picture(name) {
+	if(!name)
+		return None;
+	for(e : stage_picture_sources()) {
+		if(e.name == name)
+			return e.picture;
+	}
+	return None;
+}
+
+//The materials a body can be (#980): [id, label, transmission (how much of the LED light comes through), diffusion
+//(how much wider the spot of an LED gets per metre between it and the surface)]. Starting values: no measurements yet,
+//the inspector changes them per body
+STAGE_MATERIALS = [
+	["solid", "Solid", 0.0, 0.0],
+	["petg", "PETG, printed (white)", 0.55, 0.9],
+	["spandex", "Spandex", 0.6, 1.4],
+	["acrylic_opal", "Acrylic, opal", 0.5, 1.0],
+	["acrylic_clear", "Acrylic, clear", 0.9, 0.04],
+	["glass_clear", "Glass, clear", 0.92, 0.02],
+	["glass_frosted", "Glass, frosted", 0.7, 0.45],
+];
+
+//#980: measured materials (Stage › Materials › Measure with a camera) are presets of their own, one JSON file each in
+//assets/Stage/Materials ([name, transmission, diffusion, note, points]): copied to another computer, they come along.
+//Their id is "user:<file name without .json>"
+STAGE_MATERIAL_DIR = "assets/Stage/Materials";
+
+//The measured presets read last (stage_materials_load): [[id, label, transmission, diffusion, note], ...]
+stage_materials_user() {
+	v = std.global("stage_user_materials").get();
+	return std.is_none(v) ? [] : v;
+}
+
+//Every preset: the built-in ones, then the measured ones
+stage_materials_all() {
+	all = [];
+	for(m : STAGE_MATERIALS)
+		all.push_back(m);
+	for(m : stage_materials_user())
+		all.push_back(m);
+	return all;
+}
+
+//Reads the measured presets of dir (not while drawing: it asks the file system). Returns how many
+stage_materials_load(dir = STAGE_MATERIAL_DIR) {
+	list = [];
+	try {
+		if(fileio.exists(dir)) {
+			for(f : fileio.files(dir, false)) {
+				path = std.string(f);
+				if(!path.lowercase().ends(".json"))
+					continue;
+				try {
+					j = fileio.read_json(path.contains("/") ? path : dir + "/" + path);
+					if(j && j.has("name"))
+						list.push_back(["user:" + fileio.pure_name(path), std.string(j.name) + " (measured)",
+							math.clamp(std.float(j.transmission ?? 0.5), 0.0, 1.0), math.max(0.0, std.float(j.diffusion ?? 1.0)), std.string(j.note ?? "")]);
+				}
+				catch(e) {}
+			}
+		}
+	}
+	catch(e) {}
+	std.global("stage_user_materials").set(list);
+	return list.size();
+}
+
+//Saves a measured material as a preset (a file name from its name). Returns its id
+stage_material_save(name, transmission, diffusion, note = "", points = [], dir = STAGE_MATERIAL_DIR) {
+	stem = "";
+	for(i = 0; i < std.string(name).size(); i++) {
+		c = std.string(name).substr(i, 1);
+		stem += "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".contains(c) ? c : "_";
+	}
+	if(!stem)
+		stem = "material";
+	if(!fileio.exists(dir))
+		fileio.mkdir(dir);
+	fileio.write_json(dir + "/" + stem + ".json", [name = name, transmission = transmission, diffusion = diffusion, note = note, points = points]);
+	stage_materials_load(dir);
+	return "user:" + stem;
+}
+
+stage_material_preset(id) {
+	for(m : stage_materials_all()) {
+		if(m[0] == id)
+			return m;
+	}
+	return STAGE_MATERIALS[0];
+}
+
+//The material values from what a camera measured (#980): points = [[distance (metres from the LED to the surface),
+//sigma (metres: how wide its spot is on the surface), flux (the light of the spot)], ...]; bare = the flux of the LED
+//seen without the material (None: no transmission measured). The spot of the simulation is 0.003 + diffusion *
+//distance wide (view3d): diffusion by least squares through that; transmission = the flux through / bare.
+//Returns [diffusion, transmission (or None), fit (metres: how far the points are from the line, root mean square)]
+//or None without a point at a distance above 0
+stage_material_fit(points, bare = None) {
+	sh = 0.0;
+	shh = 0.0;
+	n = 0;
+	for(p : points) {
+		if(p[0] <= 0.0)
+			continue;
+		sh += p[0] * (p[1] - 0.003);
+		shh += p[0] * p[0];
+		n++;
+	}
+	if(!n || shh <= 0.0)
+		return None;
+	d = math.max(0.0, sh / shh);
+	err = 0.0;
+	for(p : points) {
+		if(p[0] > 0.0)
+			err += (0.003 + d * p[0] - p[1]) * (0.003 + d * p[0] - p[1]);
+	}
+	t = None;
+	if(!std.is_none(bare) && bare > 0.0) {
+		sum = 0.0;
+		for(p : points)
+			sum += p[2] / bare;
+		t = math.clamp(sum / points.size(), 0.0, 1.0);
+	}
+	return [diffusion = d, transmission = t, fit = math.sqrt(err / n)];
+}
+
+//The material of a body of an object: [preset, transmission, diffusion]; preset "solid" when it has none
+stage_part_material(o, part_name) {
+	m = o.materials[part_name] ?? None;
+	if(!m || std.type(m) != "json" || !m.has("preset") || m.preset == "solid")
+		return [preset = "solid", transmission = 0.0, diffusion = 0.0];
+	p = stage_material_preset(m.preset);
+	return [preset = m.preset, transmission = std.float(m.transmission ?? p[2]), diffusion = std.float(m.diffusion ?? p[3])];
+}
+
+//Sets the material of a body: a preset with its values (transmission / diffusion None: those of the preset)
+stage_set_part_material(o, part_name, preset, transmission = None, diffusion = None) {
+	if(preset == "solid") {
+		if(o.materials.has(part_name))
+			o.materials.erase(part_name);
+		return;
+	}
+	p = stage_material_preset(preset);
+	o.materials[part_name] = [preset = p[0], transmission = std.is_none(transmission) ? p[2] : std.float(transmission),
+		diffusion = std.is_none(diffusion) ? p[3] : std.float(diffusion)];
+}
+
+//Missing lists of an empty or hand-written stage; a parent that is gone (or a loop) puts its children on the stage
+stage_normalize(s) {
+	if(std.is_none(s) || std.type(s) != "json")
+		s = stage_new();
+	if(!s.has("version"))
+		s.version = STAGE_VERSION;
+	if(!s.has("objects") || std.type(s.objects) != "json")
+		s.objects = [];
+	if(!s.has("simulation") || std.is_none(s.simulation))
+		s.simulation = 0;
+	//#980: the folders: defaults, a folder that is not there, a loop
+	if(!s.has("folders") || std.type(s.folders) != "json" || !std.is_list(s.folders))
+		s.folders = [];
+	fids = std.json();
+	for(f : s.folders) {
+		stage_folder_defaults(f);
+		fids[f.id] = true;
+	}
+	for(f : s.folders) {
+		if(f.folder && (!fids.has(f.folder) || f.folder == f.id))
+			f.folder = "";
+	}
+	for(f : s.folders) {
+		seen = std.json();
+		p = f.folder;
+		for(p) {
+			if(seen.has(p) || p == f.id) {
+				f.folder = "";
+				break;
+			}
+			seen[p] = true;
+			q = stage_find_folder(s, p);
+			p = q ? q.folder : "";
+		}
+	}
+	ids = std.json();
+	groups = std.json();
+	for(o : s.objects) {
+		stage_object_defaults(o);
+		ids[o.id] = true;
+		if(o.folder && !fids.has(o.folder))
+			o.folder = "";
+		if(o.sym_group)
+			groups[o.sym_group] = (groups[o.sym_group] ?? 0) + 1;
+	}
+	//#980: a symmetry group of one is none
+	for(o : s.objects) {
+		if(o.sym_group && (groups[o.sym_group] ?? 0) < 2) {
+			o.sym_group = "";
+			o.sym_mode = "";
+			o.sym_index = 0;
+		}
+	}
+	for(o : s.objects) {
+		if(o.parent && (!ids.has(o.parent) || o.parent == o.id))
+			o.parent = "";
+	}
+	for(o : s.objects) {
+		//a loop (a -> b -> a): the first one met goes on the stage
+		seen = std.json();
+		p = o.parent;
+		for(p) {
+			if(seen.has(p) || p == o.id) {
+				o.parent = "";
+				break;
+			}
+			seen[p] = true;
+			q = stage_find(s, p);
+			p = q ? q.parent : "";
+		}
+	}
+	return s;
+}
+
+stage_find(s, id) {
+	for(o : s.objects) {
+		if(o.id == id)
+			return o;
+	}
+	return None;
+}
+
+stage_index(s, id) {
+	for(i = 0; i < s.objects.size(); i++) {
+		if(s.objects[i].id == id)
+			return i;
+	}
+	return -1;
+}
+
+//The objects whose parent is id ("" : those on the stage)
+stage_children(s, id) {
+	out = [];
+	for(o : s.objects) {
+		if(o.parent == id)
+			out.push_back(o);
+	}
+	return out;
+}
+
+//A name that is not taken yet: "Truss", "Truss 2", ...
+stage_free_name(s, base) {
+	taken = std.json();
+	for(o : s.objects)
+		taken[o.name] = true;
+	if(!taken.has(base))
+		return base;
+	for(i = 2; i < 10000; i++) {
+		n = base + " " + i;
+		if(!taken.has(n))
+			return n;
+	}
+	return base;
+}
+
+//A model file onto the stage at (x, y, z). Returns the new object
+stage_add_model(s, path, x = 0.0, y = 0.0, z = 0.0) {
+	src = std.string(path).replace("\\", "/");
+	kind = stage_model_format(src) == "splat" ? "splat" : "model";
+	o = stage_object_defaults([name = stage_free_name(s, fileio.pure_name(src)), kind = kind, source = src, x = x, y = y, z = z]);
+	s.objects.push_back(o);
+	return o;
+}
+
+//Removes the objects (ids) and what hangs on them
+stage_remove(s, ids) {
+	gone = std.json();
+	for(id : ids)
+		gone[id] = true;
+	//(what hangs on a removed object goes too, at any depth)
+	more = true;
+	for(more) {
+		more = false;
+		for(o : s.objects) {
+			if(!gone.has(o.id) && o.parent && gone.has(o.parent)) {
+				gone[o.id] = true;
+				more = true;
+			}
+		}
+	}
+	keep = [];
+	for(o : s.objects) {
+		if(!gone.has(o.id))
+			keep.push_back(o);
+	}
+	s.objects = keep;
+	return gone.size();
+}
+
+//Copies of the objects (ids), a little to the right, with their own ids; what hangs on them is copied too. Returns the
+//copies of the objects named (not of their children)
+stage_duplicate(s, ids, dx = 0.5) {
+	out = [];
+	for(id : ids) {
+		o = stage_find(s, id);
+		if(!o)
+			continue;
+		map = std.json(); //old id -> new id
+		list = [o];
+		for(i = 0; i < list.size(); i++) {
+			for(c : stage_children(s, list[i].id))
+				list.push_back(c);
+		}
+		first = None;
+		for(src : list) {
+			c = src.copy();
+			c.id = std.random_hash();
+			//(a copy is in no symmetry group)
+			c.sym_group = "";
+			c.sym_mode = "";
+			c.sym_index = 0;
+			map[src.id] = c.id;
+			if(src.id == o.id) {
+				c.name = stage_free_name(s, o.name);
+				c.x = o.x + dx;
+				first = c;
+			}
+			else
+				c.parent = map[src.parent] ?? c.parent;
+			s.objects.push_back(c);
+			if(src.id == o.id)
+				first = s.objects[-1];
+		}
+		if(first)
+			out.push_back(first);
+	}
+	return out;
+}
+
+// =========================================================================
+// Undo (#980): snapshots of the stage for the undo history of VibeVJ (the Stage menu records the steps)
+// =========================================================================
+
+//What a step brings back: the objects, the folders, the simulation
+stage_undo_snapshot(s) {
+	return [objects = s.objects.copy(), folders = (s.folders ?? []).copy(), simulation = s.simulation];
+}
+
+//Back to a snapshot (undo / redo) on the stage of the engine; the views and the Stage menu follow its revision
+stage_undo_apply(engine, snap) {
+	s = engine.stage;
+	if(!s)
+		return;
+	s.objects = snap.objects.copy();
+	s.folders = snap.folders.copy();
+	s.simulation = snap.simulation;
+	engine.stage_changed();
+	std.global("stage_undo_revision").set(engine.stage_revision);
+}
+
+//Whether the last change of the stage was an undo / redo (stage_undo_apply): no new step for it
+stage_undo_restored(engine) {
+	r = std.global("stage_undo_revision").get();
+	return engine && !std.is_none(r) && r == engine.stage_revision;
+}
+
+// =========================================================================
+// Folders (#980): order in the list, shown or hidden together
+// =========================================================================
+
+stage_folder_defaults(f) {
+	if(!f.has("id") || !f.id)
+		f.id = std.random_hash();
+	if(!f.has("name") || std.is_none(f.name) || !f.name)
+		f.name = "Folder";
+	if(!f.has("folder") || std.is_none(f.folder))
+		f.folder = "";
+	for(k : ["visible", "open"]) {
+		if(!f.has(k) || std.is_none(f[k]))
+			f[k] = 1;
+	}
+	return f;
+}
+
+stage_find_folder(s, id) {
+	for(f : s.folders ?? []) {
+		if(f.id == id)
+			return f;
+	}
+	return None;
+}
+
+//A free name for a folder ("Folder", "Folder 2", ...)
+stage_free_folder_name(s, base) {
+	taken = std.json();
+	for(f : s.folders)
+		taken[f.name] = true;
+	if(!taken.has(base))
+		return base;
+	for(i = 2; i < 10000; i++) {
+		if(!taken.has(base + " " + i))
+			return base + " " + i;
+	}
+	return base;
+}
+
+//A new folder in folder ("" : at the top) with the objects ids in it. Returns it
+stage_add_folder(s, name = "", ids = [], folder = "") {
+	if(!s.has("folders"))
+		s.folders = [];
+	f = stage_folder_defaults([name = name ? name : stage_free_folder_name(s, "Folder"), folder = stage_find_folder(s, folder) ? folder : ""]);
+	s.folders.push_back(f);
+	for(id : ids) {
+		o = stage_find(s, id);
+		if(o)
+			o.folder = f.id;
+	}
+	return f;
+}
+
+//The folders in folder fid ("" : at the top), in their order
+stage_subfolders(s, fid) {
+	out = [];
+	for(f : s.folders ?? []) {
+		if(f.folder == fid)
+			out.push_back(f);
+	}
+	return out;
+}
+
+//Everything in folder fid, at any depth: [objects, folders]
+stage_folder_contents(s, fid) {
+	fs = [];
+	todo = [fid];
+	seen = std.json();
+	for(i = 0; i < todo.size(); i++) {
+		for(f : stage_subfolders(s, todo[i])) {
+			if(seen.has(f.id))
+				continue;
+			seen[f.id] = true;
+			fs.push_back(f);
+			todo.push_back(f.id);
+		}
+	}
+	inside = std.json();
+	inside[fid] = true;
+	for(f : fs)
+		inside[f.id] = true;
+	os = [];
+	for(o : s.objects) {
+		if(o.folder && inside.has(o.folder))
+			os.push_back(o);
+	}
+	return [objects = os, folders = fs];
+}
+
+//Whether a folder is shown: it and every folder it is in on
+stage_folder_shown(s, fid) {
+	p = fid;
+	for(n = 0; p && n < 64; n++) {
+		f = stage_find_folder(s, p);
+		if(!f)
+			return true;
+		if(!f.visible)
+			return false;
+		p = f.folder;
+	}
+	return true;
+}
+
+//Whether an object is drawn: its own visible and all its folders
+stage_object_shown(s, o) {
+	return o.visible && stage_folder_shown(s, o.folder ?? "");
+}
+
+//Puts folder id into folder ("" : the top). Refused (false) when folder is in id: a loop
+stage_move_folder(s, id, folder) {
+	f = stage_find_folder(s, id);
+	if(!f)
+		return false;
+	p = folder;
+	for(p) {
+		if(p == id)
+			return false;
+		q = stage_find_folder(s, p);
+		if(!q)
+			return false;
+		p = q.folder;
+	}
+	f.folder = folder;
+	return true;
+}
+
+//Puts object id into folder ("" : none). False when the folder is not there
+stage_set_folder(s, id, folder) {
+	o = stage_find(s, id);
+	if(!o || (folder && !stage_find_folder(s, folder)))
+		return false;
+	o.folder = folder;
+	return true;
+}
+
+//Removes a folder: what is in it goes to the folder it was in (with_objects: the objects in it go too, with what
+//hangs on them). Returns how many objects went
+stage_remove_folder(s, id, with_objects = false) {
+	f = stage_find_folder(s, id);
+	if(!f)
+		return 0;
+	n = 0;
+	if(with_objects) {
+		c = stage_folder_contents(s, id);
+		ids = [];
+		for(o : c.objects)
+			ids.push_back(o.id);
+		n = stage_remove(s, ids);
+		gone = std.json();
+		gone[id] = true;
+		for(g : c.folders)
+			gone[g.id] = true;
+		keep = [];
+		for(g : s.folders) {
+			if(!gone.has(g.id))
+				keep.push_back(g);
+		}
+		s.folders = keep;
+		return n;
+	}
+	for(o : s.objects) {
+		if(o.folder == id)
+			o.folder = f.folder;
+	}
+	for(g : s.folders) {
+		if(g.folder == id)
+			g.folder = f.folder;
+	}
+	keep = [];
+	for(g : s.folders) {
+		if(g.id != id)
+			keep.push_back(g);
+	}
+	s.folders = keep;
+	return 0;
+}
+
+//"Stage / Rig / Front": the folders a folder is in and its name
+stage_folder_path(s, fid) {
+	path = "";
+	p = fid;
+	for(n = 0; p && n < 64; n++) {
+		f = stage_find_folder(s, p);
+		if(!f)
+			break;
+		path = f.name + (path ? " / " + path : "");
+		p = f.folder;
+	}
+	return path;
+}
+
+//Hangs id on parent ("" : on the stage). Refused (false) when parent hangs on id: a loop
+stage_set_parent(s, id, parent) {
+	o = stage_find(s, id);
+	if(!o)
+		return false;
+	p = parent;
+	for(p) {
+		if(p == id)
+			return false;
+		q = stage_find(s, p);
+		if(!q)
+			return false;
+		p = q.parent;
+	}
+	o.parent = parent;
+	return true;
+}
+
+// =========================================================================
+// Where an object is: 3 x 4 matrices (rows: [m0 m1 m2 m3, m4 m5 m6 m7, m8 m9 m10 m11], the last row 0 0 0 1), as the
+// view3d takes them
+// =========================================================================
+
+stage_mat_mul(a, b) {
+	c = [];
+	for(r = 0; r < 3; r++) {
+		for(k = 0; k < 4; k++) {
+			v = a[r * 4] * b[k] + a[r * 4 + 1] * b[4 + k] + a[r * 4 + 2] * b[8 + k];
+			if(k == 3)
+				v += a[r * 4 + 3];
+			c.push_back(v);
+		}
+	}
+	return c;
+}
+
+//The frame of an object in its parent: moved to (x, y, z), turned around x, y, z (in that order) and scaled
+stage_local_matrix(o) {
+	d = math.PI / 180.0;
+	cx = math.cos(o.rx * d);
+	sx = math.sin(o.rx * d);
+	cy = math.cos(o.ry * d);
+	sy = math.sin(o.ry * d);
+	cz = math.cos(o.rz * d);
+	sz = math.sin(o.rz * d);
+	s = o.scale;
+	//Rz * Ry * Rx
+	m = [
+		cz * cy * s, (cz * sy * sx - sz * cx) * s, (cz * sy * cx + sz * sx) * s, o.x,
+		sz * cy * s, (sz * sy * sx + cz * cx) * s, (sz * sy * cx - cz * sx) * s, o.y,
+		-sy * s, cy * sx * s, cy * cx * s, o.z,
+	];
+	//#980: a scan: its floor at z = 0 first (align)
+	if(o.kind == "splat" && o.has("splat"))
+		m = stage_mat_mul(m, o.splat.align);
+	return m;
+}
+
+// =========================================================================
+// Move and turn tools (#980, the Stage menu's 2 and 3): along / around an axis of the world or of the object
+// =========================================================================
+
+//The frame of an object in its parent without the align of a scan: its place, turn and scale only
+stage_base_local(o) {
+	if(o.kind != "splat" || !o.has("splat"))
+		return stage_local_matrix(o);
+	keep = o.splat.align;
+	o.splat.align = STAGE_SPLAT_IDENTITY.copy();
+	m = stage_local_matrix(o);
+	o.splat.align = keep;
+	return m;
+}
+
+//The frame of the object an object hangs on (the world when it hangs on nothing)
+stage_parent_world(s, o) {
+	q = o.parent ? stage_find(s, o.parent) : None;
+	return q ? stage_world_matrix(s, q) : STAGE_SPLAT_IDENTITY.copy();
+}
+
+//A turn by deg degrees around the axis a ([x, y, z], a unit vector) through (0, 0, 0)
+stage_mat_axis_angle(a, deg) {
+	t = deg * math.PI / 180.0;
+	c = math.cos(t);
+	n = math.sin(t);
+	k = 1.0 - c;
+	return [k * a.x * a.x + c, k * a.x * a.y - n * a.z, k * a.x * a.z + n * a.y, 0.0,
+		k * a.x * a.y + n * a.z, k * a.y * a.y + c, k * a.y * a.z - n * a.x, 0.0,
+		k * a.x * a.z - n * a.y, k * a.y * a.z + n * a.x, k * a.z * a.z + c, 0.0];
+}
+
+//The turns rx, ry, rz (degrees; z of y of x, as stage_local_matrix) of the turn of a frame (its scale taken out)
+stage_mat_to_euler(m) {
+	sc = math.sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+	if(sc <= 0.0)
+		sc = 1.0;
+	r00 = m[0] / sc;
+	r01 = m[1] / sc;
+	r02 = m[2] / sc;
+	r10 = m[4] / sc;
+	r11 = m[5] / sc;
+	r20 = m[8] / sc;
+	r21 = m[9] / sc;
+	r22 = m[10] / sc;
+	d = 180.0 / math.PI;
+	sy = math.clamp(0.0 - r20, -1.0, 1.0);
+	ry = math.asin(sy);
+	if(math.abs(sy) < 0.999999)
+		return [rx = math.atan2(r21, r22) * d, ry = ry * d, rz = math.atan2(r10, r00) * d];
+	//straight up or down: the turns around x and z are one, all of it on x
+	if(sy > 0.0)
+		return [rx = math.atan2(r01, r02) * d, ry = 90.0, rz = 0.0];
+	return [rx = math.atan2(0.0 - r01, 0.0 - r02) * d, ry = -90.0, rz = 0.0];
+}
+
+//The three axes the tools work along: the world's, or the object's own (local: as it is turned, its parents too)
+stage_object_axes(s, o, local) {
+	if(!local)
+		return [[x = 1.0, y = 0.0, z = 0.0], [x = 0.0, y = 1.0, z = 0.0], [x = 0.0, y = 0.0, z = 1.0]];
+	w = stage_mat_mul(stage_parent_world(s, o), stage_base_local(o));
+	out = [];
+	for(c = 0; c < 3; c++) {
+		v = [x = w[c], y = w[4 + c], z = w[8 + c]];
+		l = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+		out.push_back(l > 0.0 ? [x = v.x / l, y = v.y / l, z = v.z / l] : [x = c == 0 ? 1.0 : 0.0, y = c == 1 ? 1.0 : 0.0, z = c == 2 ? 1.0 : 0.0]);
+	}
+	return out;
+}
+
+//Moves an object by d ([x, y, z] metres of the world), whatever it hangs on
+stage_move_object(s, o, d) {
+	l = stage_world_to_local(s, o, d);
+	o.x = o.x + l.x;
+	o.y = o.y + l.y;
+	o.z = o.z + l.z;
+}
+
+//Turns an object by deg degrees around the axis a of the world (a unit vector) through the point pivot of the world:
+//its place and its turns rx, ry, rz in the frame of what it hangs on afterwards
+stage_rotate_object(s, o, a, deg, pivot) {
+	r = stage_mat_axis_angle(a, deg);
+	q = stage_point(r, pivot);
+	r[3] = pivot.x - q.x;
+	r[7] = pivot.y - q.y;
+	r[11] = pivot.z - q.z;
+	pw = stage_parent_world(s, o);
+	w = stage_mat_mul(r, stage_mat_mul(pw, stage_base_local(o)));
+	b = stage_mat_mul(stage_mat_inverse(pw), w);
+	o.x = b[3];
+	o.y = b[7];
+	o.z = b[11];
+	e = stage_mat_to_euler(b);
+	o.rx = e.rx;
+	o.ry = e.ry;
+	o.rz = e.rz;
+}
+
+//The frame of an object in the world (its parents' frames applied)
+stage_world_matrix(s, o) {
+	m = stage_local_matrix(o);
+	p = o.parent;
+	depth = 0;
+	for(p && depth < 64) {
+		q = stage_find(s, p);
+		if(!q)
+			break;
+		m = stage_mat_mul(stage_local_matrix(q), m);
+		p = q.parent;
+		depth++;
+	}
+	return m;
+}
+
+//A point [x, y, z] through a matrix
+stage_point(m, p) {
+	return [x = m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3], y = m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7],
+		z = m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]];
+}
+
+// =========================================================================
+// Symmetry (#980): a piece with its counterparts, mirrored at the middle of the stage (x = 0) or turned around it
+// (around the z axis through x = 0, y = 0), as in a rocket workshop. A change of one is made to the others
+// =========================================================================
+
+STAGE_SYM_MODES = ["off", "mirror", "radial2", "radial3", "radial4", "radial6", "radial8"];
+STAGE_SYM_TEXT = ["off", "Mirror", "×2", "×3", "×4", "×6", "×8"];
+
+//How many pieces a mode makes: 1 (off), 2 (mirror), n (radial n)
+stage_sym_count(mode) {
+	if(mode == "mirror")
+		return 2;
+	if(std.string(mode).substr(0, 6) == "radial")
+		return math.max(1, std.int(std.string(mode).removeprefix("radial")));
+	return 1;
+}
+
+//The pieces of a symmetry group, in their order
+stage_sym_members(s, gid) {
+	out = [];
+	if(!gid)
+		return out;
+	for(o : s.objects) {
+		if(o.sym_group == gid)
+			out.push_back(o);
+	}
+	return out;
+}
+
+//m placed as the counterpart of lead, in the frame of what they hang on (the stage: its middle; a truss: its middle
+//and its own axes; a truss circle: its centre): mirrored at x = 0 of that frame (x and the turns around y and z the
+//other way) or turned around its z axis by m's place in the group. Pieces that hang on different objects stay
+stage_sym_pose(s, lead, m) {
+	if(lead.parent != m.parent || m.id == lead.id)
+		return;
+	for(k : ["x", "y", "z", "rx", "ry", "rz", "scale"])
+		m[k] = lead[k];
+	if(lead.sym_mode == "mirror") {
+		if(m.sym_index != lead.sym_index) {
+			m.x = 0.0 - lead.x;
+			m.ry = 0.0 - lead.ry;
+			m.rz = 0.0 - lead.rz;
+		}
+		return;
+	}
+	n = stage_sym_count(lead.sym_mode);
+	deg = (m.sym_index - lead.sym_index) * 360.0 / n;
+	if(math.abs(deg) < 1e-9)
+		return;
+	b = stage_mat_mul(stage_mat_axis_angle([x = 0.0, y = 0.0, z = 1.0], deg), stage_base_local(m));
+	m.x = b[3];
+	m.y = b[7];
+	m.z = b[11];
+	e = stage_mat_to_euler(b);
+	m.rx = e.rx;
+	m.ry = e.ry;
+	m.rz = e.rz;
+}
+
+//The others of lead's group follow it: place, turns, scale and the measures of a build / screen
+stage_sym_sync(s, lead) {
+	if(!lead || !lead.sym_group)
+		return 0;
+	n = 0;
+	for(m : stage_sym_members(s, lead.sym_group)) {
+		if(m.id == lead.id)
+			continue;
+		stage_sym_pose(s, lead, m);
+		if(lead.kind == "build" && m.kind == "build")
+			m.build = lead.build.copy();
+		if(lead.kind == "screen" && m.kind == "screen")
+			m.screen = lead.screen.copy();
+		m.materials = lead.materials.copy();
+		n++;
+	}
+	return n;
+}
+
+//Makes o the first of a new group of mode ("mirror", "radial4", ...): its counterparts as copies (with what hangs on
+//it), hanging on what o hangs on. Returns all the pieces (o first); off: [o]
+stage_sym_create(s, o, mode) {
+	n = stage_sym_count(mode);
+	if(n < 2 || !STAGE_SYM_MODES.has_value(mode))
+		return [o];
+	gid = std.random_hash();
+	o.sym_group = gid;
+	o.sym_mode = mode;
+	o.sym_index = 0;
+	out = [o];
+	for(k = 1; k < n; k++) {
+		c = stage_duplicate(s, [o.id], 0.0)[0];
+		c.sym_group = gid;
+		c.sym_mode = mode;
+		c.sym_index = k;
+		stage_sym_pose(s, o, c);
+		out.push_back(c);
+	}
+	return out;
+}
+
+//Takes o out of its group (a group of one left is none)
+stage_sym_detach(s, o) {
+	gid = o.sym_group;
+	o.sym_group = "";
+	o.sym_mode = "";
+	o.sym_index = 0;
+	rest = stage_sym_members(s, gid);
+	if(rest.size() == 1) {
+		rest[0].sym_group = "";
+		rest[0].sym_mode = "";
+		rest[0].sym_index = 0;
+	}
+}
+
+//"Mirror (2)", "×4 radial (4)": what a group is, "" for none
+stage_sym_text(s, o) {
+	if(!o.sym_group)
+		return "";
+	n = stage_sym_members(s, o.sym_group).size();
+	return (o.sym_mode == "mirror" ? "Mirror" : "×" + stage_sym_count(o.sym_mode) + " radial") + " (" + n + " pieces)";
+}
+
+// =========================================================================
+// Lamps on the stage (#980): a lamp of the fixture setup that hangs on an object of the stage (a truss) moves and turns
+// with it. Its x, y, z and rotation stay in the world (the effects, the beams, the plan read them); f.hangs_on is the
+// object's id and f.hang its place in the object's frame:
+//   f.hang = [x, y, z (metres in the frame of the object), rot (degrees on the plan, from the object's own turn),
+//             wx, wy, wz, wrot (where it was put in the world the last time: a lamp moved since was moved by hand)]
+// =========================================================================
+
+//How far an object is turned on the plan (degrees, its own x axis from the world's x towards y)
+stage_plan_turn(w) {
+	return math.atan2(w[4], w[0]) * 180.0 / math.PI;
+}
+
+//Degrees into -180 .. 180
+stage_deg(a) {
+	for(a > 180.0)
+		a -= 360.0;
+	for(a <= -180.0)
+		a += 360.0;
+	return a;
+}
+
+//Takes the place of lamp f on its object as it is now (after it was moved by hand, or when it is hung on it)
+stage_lamp_rehang(s, f) {
+	o = stage_find(s, f.hangs_on ?? "");
+	if(!o) {
+		f.hang = None;
+		return false;
+	}
+	w = stage_world_matrix(s, o);
+	l = stage_point(stage_mat_inverse(w), [x = f.x, y = f.y, z = f.z ?? 0.0]);
+	f.hang = [x = l.x, y = l.y, z = l.z, rot = stage_deg((f.rotation ?? 0.0) - stage_plan_turn(w)), wx = f.x, wy = f.y,
+		wz = f.z ?? 0.0, wrot = f.rotation ?? 0.0];
+	return true;
+}
+
+//Hangs lamp f on the object id ("" : on nothing) where it is now
+stage_lamp_hang(s, f, id) {
+	f.hangs_on = id && stage_find(s, id) ? id : "";
+	if(!f.hangs_on) {
+		f.hang = None;
+		return false;
+	}
+	return stage_lamp_rehang(s, f);
+}
+
+//The lamps (patch p) that hang on objects of stage s follow them: a lamp moved by hand since keeps where it is now (its
+//place on the object is taken again), else it goes where its place on the object is now. Call after a change of the
+//stage or the patch. True when a lamp moved
+stage_lamps_follow(s, p) {
+	if(!s || !p)
+		return false;
+	moved = false;
+	for(f : p.fixtures ?? []) {
+		if(!(f.hangs_on ?? ""))
+			continue;
+		o = stage_find(s, f.hangs_on);
+		//(an object that is not there: perhaps the stage is not loaded yet; the lamp stays where it is)
+		if(!o)
+			continue;
+		h = f.hang ?? None;
+		z = f.z ?? 0.0;
+		r = f.rotation ?? 0.0;
+		if(!h || math.abs(f.x - h.wx) > 1e-6 || math.abs(f.y - h.wy) > 1e-6 || math.abs(z - h.wz) > 1e-6 || math.abs(stage_deg(r - h.wrot)) > 1e-6) {
+			stage_lamp_rehang(s, f);
+			continue;
+		}
+		w = stage_world_matrix(s, o);
+		q = stage_point(w, [x = h.x, y = h.y, z = h.z]);
+		nr = stage_deg(h.rot + stage_plan_turn(w));
+		if(math.abs(q.x - f.x) > 1e-6 || math.abs(q.y - f.y) > 1e-6 || math.abs(q.z - z) > 1e-6 || math.abs(stage_deg(nr - r)) > 1e-6) {
+			f.x = q.x;
+			f.y = q.y;
+			f.z = q.z;
+			f.rotation = nr;
+			moved = true;
+		}
+		h.wx = f.x;
+		h.wy = f.y;
+		h.wz = f.z;
+		h.wrot = f.rotation;
+	}
+	return moved;
+}
+
+// =========================================================================
+// Standing on things (#980): a dragged object that stood on the floor or on something goes up onto what it is moved
+// over (a DJ booth onto the decks, a top onto a sub)
+// =========================================================================
+
+STAGE_GROUND_TYPES = ["deck", "booth", "speaker"]; //builds that can carry something (not trusses, stairs, stands, ...)
+
+//The lowest point of o in the world (the box of its model), None while the model is read
+stage_bottom(s, o) {
+	m = stage_model_get(o);
+	if(!m || !m.ok || !m.bounds)
+		return None;
+	return stage_world_box(stage_world_matrix(s, o), m.bounds).min.z;
+}
+
+//The height of what stands under the point (x, y) of the world: the highest top of the shown objects that stand on the
+//floor (model files, decks, booths, speakers) and are under it; 0: the floor. skip: objects that do not count (a json
+//set; what hangs on them neither)
+stage_ground_at(s, x, y, skip = None) {
+	g = 0.0;
+	for(o : s.objects) {
+		if(!stage_object_shown(s, o) || (skip && stage_moves_with(s, o, skip)))
+			continue;
+		if(o.kind == "screen" || o.kind == "splat" || (o.kind == "build" && !STAGE_GROUND_TYPES.has_value(o.build.type)))
+			continue;
+		m = stage_model_get(o);
+		if(!m || !m.ok || !m.bounds)
+			continue;
+		b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+		if(b.min.z > 0.05 || x < b.min.x || x > b.max.x || y < b.min.y || y > b.max.y)
+			continue;
+		g = math.max(g, b.max.z);
+	}
+	return g;
+}
+
+//The objects that are no ground for o: skip and o itself (what hangs on it too)
+stage_ground_skip(o, skip) {
+	out = std.json();
+	if(skip) {
+		for(i = 0; i < skip.size(); i++)
+			out[skip.key(i)] = true;
+	}
+	out[o.id] = true;
+	return out;
+}
+
+//o put onto what stands under its middle (stage_ground_at): moved up or down. False while its model is read
+stage_put_on_ground(s, o, skip = None) {
+	bottom = stage_bottom(s, o);
+	if(std.is_none(bottom))
+		return false;
+	p = stage_object_pivot(s, o);
+	dz = stage_ground_at(s, p.x, p.y, stage_ground_skip(o, skip)) - bottom;
+	if(math.abs(dz) > 1e-9)
+		stage_move_object(s, o, [x = 0.0, y = 0.0, z = dz]);
+	return true;
+}
+
+//Whether o stands on the floor or on something (its bottom within 3 cm of what is under it)
+stage_on_ground(s, o, skip = None) {
+	bottom = stage_bottom(s, o);
+	if(std.is_none(bottom))
+		return false;
+	p = stage_object_pivot(s, o);
+	return math.abs(bottom - stage_ground_at(s, p.x, p.y, stage_ground_skip(o, skip))) < 0.03;
+}
+
+// =========================================================================
+// Rows and spacing (#980): copies in a row, objects spaced evenly
+// =========================================================================
+
+//o's own axis k (0 x, 1 y, 2 z) in the frame of what it hangs on: a unit vector [x, y, z]
+stage_own_axis(o, k) {
+	b = stage_base_local(o);
+	v = [x = b[k], y = b[4 + k], z = b[8 + k]];
+	l = math.max(1e-9, math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+	return [x = v.x / l, y = v.y / l, z = v.z / l];
+}
+
+//How big o is along its own axis k (its model, scaled): the step of a row whose pieces touch; None while it is read
+stage_own_size(o, k) {
+	m = stage_model_get(o);
+	if(!m || !m.ok || !m.bounds)
+		return None;
+	lo = [m.bounds.min.x, m.bounds.min.y, m.bounds.min.z];
+	hi = [m.bounds.max.x, m.bounds.max.y, m.bounds.max.z];
+	return (hi[k] - lo[k]) * o.scale;
+}
+
+//count - 1 copies of o (with what hangs on it) after it in a row along its own axis k, step metres apart. Returns the
+//copies
+stage_row(s, o, count, step, k = 0) {
+	a = stage_own_axis(o, k);
+	out = [];
+	for(i = 1; i < count; i++) {
+		c = stage_duplicate(s, [o.id], 0.0)[0];
+		c.x = o.x + a.x * step * i;
+		c.y = o.y + a.y * step * i;
+		c.z = o.z + a.z * step * i;
+		out.push_back(c);
+	}
+	return out;
+}
+
+//The objects (in this order) spaced evenly between the first and the last, which stay: their middles (the boxes of
+//their models) on the line between those two. False with fewer than three or a model not read yet
+stage_distribute(s, list) {
+	n = list.size();
+	if(n < 3)
+		return false;
+	a = stage_object_pivot(s, list[0]);
+	b = stage_object_pivot(s, list[n - 1]);
+	for(i = 1; i < n - 1; i++) {
+		f = i / std.float(n - 1);
+		p = stage_object_pivot(s, list[i]);
+		stage_move_object(s, list[i], [x = a.x + (b.x - a.x) * f - p.x, y = a.y + (b.y - a.y) * f - p.y, z = a.z + (b.z - a.z) * f - p.z]);
+	}
+	return true;
+}
+
+// =========================================================================
+// Joining pieces (#980): the nodes of trusses and towers snap together
+// =========================================================================
+
+STAGE_NODE_ALIGN = -0.7; //two truss ends join when they point at each other (the cosine of their directions below this)
+
+//The nodes of an object in the world (stage_build_nodes): [[x, y, z, dx, dy, dz, kind ("end": a truss end, "top": the
+//top of a tower), lift (an end: metres from the bottom of the truss up to it)], ...]
+stage_world_nodes(s, o) {
+	if(o.kind != "build")
+		return [];
+	w = stage_world_matrix(s, o);
+	out = [];
+	for(n : stage_build_nodes(o)) {
+		p = stage_point(w, [x = n[0], y = n[1], z = n[2]]);
+		dx = w[0] * n[3] + w[1] * n[4] + w[2] * n[5];
+		dy = w[4] * n[3] + w[5] * n[4] + w[6] * n[5];
+		dz = w[8] * n[3] + w[9] * n[4] + w[10] * n[5];
+		l = math.max(1e-9, math.sqrt(dx * dx + dy * dy + dz * dz));
+		top = o.build.type == "tower";
+		out.push_back([p.x, p.y, p.z, dx / l, dy / l, dz / l, top ? "top" : "end", top ? 0.0 : n[2] * o.scale]);
+	}
+	return out;
+}
+
+//Whether o is one of ids (a json set) or hangs on one of them (it moves with them)
+stage_moves_with(s, o, ids) {
+	p = o.id;
+	for(n = 0; p && n < 64; n++) {
+		if(ids.has(p))
+			return true;
+		q = stage_find(s, p);
+		p = q ? q.parent : "";
+	}
+	return false;
+}
+
+//The best join of the objects that move (ids: a json set; what hangs on them moves too) onto the others that are
+//shown: a truss end onto a free end pointing at it, a truss end onto the top of a tower (the truss lying on it), a
+//tower's top under a truss end. [delta = [x, y, z] (the move in the world that joins them), at = [x, y, z] (where),
+//dist] for the nearest within max_dist metres, else None
+stage_snap(s, ids, max_dist, skip = None) {
+	movers = [];
+	targets = [];
+	for(o : s.objects) {
+		//(skip: neither moving nor a target, e.g. the counterparts of a symmetry group)
+		if(!stage_object_shown(s, o) || (skip && stage_moves_with(s, o, skip)))
+			continue;
+		ns = stage_world_nodes(s, o);
+		if(!ns.size())
+			continue;
+		if(stage_moves_with(s, o, ids)) {
+			for(n : ns)
+				movers.push_back(n);
+		}
+		else {
+			for(n : ns)
+				targets.push_back(n);
+		}
+	}
+	best = None;
+	for(m : movers) {
+		for(t : targets) {
+			gx = t[0];
+			gy = t[1];
+			gz = t[2];
+			if(m[6] == "end" && t[6] == "end") {
+				if(m[3] * t[3] + m[4] * t[4] + m[5] * t[5] > STAGE_NODE_ALIGN)
+					continue;
+			}
+			else if(m[6] == "end" && t[6] == "top")
+				gz += m[7];
+			else if(m[6] == "top" && t[6] == "end")
+				gz -= t[7];
+			else
+				continue;
+			d = [x = gx - m[0], y = gy - m[1], z = gz - m[2]];
+			dist = math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+			if(dist <= max_dist && (!best || dist < best.dist))
+				best = [delta = d, at = [x = t[0], y = t[1], z = t[2]], dist = dist];
+		}
+	}
+	return best;
+}
+
+//The free nodes of the objects that do not move (ids), in the world: where something could join, shown while dragging
+stage_free_nodes(s, ids) {
+	out = [];
+	for(o : s.objects) {
+		if(stage_object_shown(s, o) && !stage_moves_with(s, o, ids)) {
+			for(n : stage_world_nodes(s, o))
+				out.push_back(n);
+		}
+	}
+	return out;
+}
+
+//A move in the world (d = [x, y, z]) as a move of o in the frame of its parent: what to add to its x, y, z
+stage_world_to_local(s, o, d) {
+	q = o.parent ? stage_find(s, o.parent) : None;
+	if(!q)
+		return d;
+	m = stage_world_matrix(s, q);
+	//(the rotation of a frame is orthogonal and scaled the same on every axis: its inverse is its transpose / scale²)
+	k = m[0] * m[0] + m[4] * m[4] + m[8] * m[8];
+	if(k <= 0.0)
+		return d;
+	return [x = (m[0] * d.x + m[4] * d.y + m[8] * d.z) / k, y = (m[1] * d.x + m[5] * d.y + m[9] * d.z) / k,
+		z = (m[2] * d.x + m[6] * d.y + m[10] * d.z) / k];
+}
+
+//The box in the world around the eight corners of a box of a model ([min, max] of [x, y, z]) placed by m
+stage_world_box(m, b) {
+	lo = [x = 1e30, y = 1e30, z = 1e30];
+	hi = [x = -1e30, y = -1e30, z = -1e30];
+	for(i = 0; i < 8; i++) {
+		c = [x = i % 2 ? b.max.x : b.min.x, y = std.int(i / 2) % 2 ? b.max.y : b.min.y, z = std.int(i / 4) ? b.max.z : b.min.z];
+		w = stage_point(m, c);
+		lo = [x = math.min(lo.x, w.x), y = math.min(lo.y, w.y), z = math.min(lo.z, w.z)];
+		hi = [x = math.max(hi.x, w.x), y = math.max(hi.y, w.y), z = math.max(hi.z, w.z)];
+	}
+	return [min = lo, max = hi];
+}
+
+// =========================================================================
+// The models, read once (a thread), by file, unit and up axis
+// =========================================================================
+
+stage_model_store() {
+	g = std.global("stage_model_cache");
+	cache = g.get();
+	if(std.is_none(cache)) {
+		g.set(std.json());
+		cache = g.get();
+	}
+	return cache;
+}
+
+//What a model of an object is read with: [path, unit, up] (the defaults of its format where it says 0 / "")
+stage_model_opts(o) {
+	d = stage_model_defaults(o.source);
+	return [path = o.source, unit = o.unit > 0.0 ? o.unit : d.unit, up = o.up ? o.up : d.up];
+}
+
+//How often the model files were found changed (stage_models_reload): part of every key, so the views build them again
+stage_model_generation() {
+	v = std.global("stage_model_generation").get();
+	return std.is_none(v) ? 0 : v;
+}
+
+//The key of the model of an object: the file, the unit, the up axis and the generation. No file system call: the 3D
+//views ask for it while they draw (a fileio call there would suspend their callback, #980)
+stage_model_key(o) {
+	//#980: a scan: its file (the splats do not depend on its unit or up axis: align)
+	if(o.kind == "splat")
+		return "splat|" + o.source + "|" + stage_model_generation();
+	//#980: a screen is made from its sizes, no file
+	if(o.kind == "screen") {
+		z = stage_screen_size(o);
+		return "screen|" + z.width + "|" + z.height + "|" + o.screen.depth;
+	}
+	if(o.kind == "build")
+		return stage_build_key(o);
+	opts = stage_model_opts(o);
+	return opts.path + "|" + opts.unit + "|" + opts.up + "|" + stage_model_generation();
+}
+
+//When a file was last written (ms), 0 when it is not there
+stage_file_time(path) {
+	try {
+		info = fileio.file_info(path);
+		return info.exists ? info.last_write_time : 0;
+	}
+	catch(e) {
+		return 0;
+	}
+}
+
+//Every model is read again (the next generation): a file next to a model changed (the .stagemesh of a STEP file)
+stage_models_refresh() {
+	std.global("stage_model_generation").set(stage_model_generation() + 1);
+	std.global("stage_model_cache").set(std.json());
+}
+
+//Model files that changed since they were read are read again (the next generation). Not while drawing: it asks the
+//file system. Returns true when one had changed
+stage_models_reload() {
+	cache = stage_model_store();
+	stale = false;
+	for(i = 0; i < cache.size() && !stale; i++) {
+		e = cache[i];
+		if(e.model && e.has("path") && stage_file_time(e.path) != e.time)
+			stale = true;
+	}
+	if(!stale)
+		return false;
+	stage_models_refresh();
+	return true;
+}
+
+//The model of an object (stage_models.shio), None while it is read; [ok = false, error] when it cannot be. The first
+//call starts the reading on a thread; the next frames get it
+stage_model_get(o, key = "") {
+	cache = stage_model_store();
+	k = key ? key : stage_model_key(o);
+	//#980: a screen: made here, at once (two boxes)
+	if(o.kind == "screen") {
+		if(!cache.has(k))
+			cache[k] = [model = stage_screen_model(o), path = "", time = 0];
+		return cache[k].model;
+	}
+	//#980: a truss, a deck, ...: made here from its measures
+	if(o.kind == "build") {
+		if(!cache.has(k))
+			cache[k] = [model = stage_build_model(o), path = "", time = 0];
+		return cache[k].model;
+	}
+	if(!o.source)
+		return None;
+	e = cache[k] ?? None;
+	if(e)
+		return e.model;
+	//#980: a scan: read by nanogui.splats3d on a thread (the app gives the loader); its model has no parts, its box is
+	//that of the splat centres, the splats themselves in cache[k].splats (stage_splats_get)
+	if(o.kind == "splat") {
+		loader = stage_splat_loader();
+		if(std.is_none(loader))
+			return None;
+		cache[k] = [model = None, splats = None, path = o.source, time = 0];
+		path = o.source;
+		worker = std.thread([cache, k, loader, path]() {
+			m = None;
+			try {
+				cache[k].time = stage_file_time(path);
+				sp = loader();
+				r = sp.load(path);
+				if(r.ok) {
+					b = sp.bounds();
+					m = [ok = true, error = "", format = "splat", parts = [], triangles = 0, splats = r.count, bounds = b, needs_convert = false, stale = false];
+					cache[k].splats = sp;
+				}
+				else
+					m = [ok = false, error = r.error, format = "splat", parts = [], triangles = 0, bounds = None, needs_convert = false, stale = false];
+			}
+			catch(err) {
+				m = [ok = false, error = "Cannot read " + path + ": " + err, format = "splat", parts = [], triangles = 0, bounds = None, needs_convert = false, stale = false];
+			}
+			cache[k].model = m;
+		});
+		worker.run();
+		return None;
+	}
+	cache[k] = [model = None, path = o.source, time = 0];
+	opts = stage_model_opts(o);
+	worker = std.thread([cache, k, opts]() {
+		m = None;
+		try {
+			cache[k].time = stage_file_time(opts.path);
+			m = stage_model_read(opts.path, opts);
+		}
+		catch(err) {
+			m = [ok = false, error = "Cannot read " + opts.path + ": " + err, parts = [], triangles = 0, bounds = None];
+		}
+		cache[k].model = m;
+	});
+	worker.run();
+	return None;
+}
+
+//The edges of the model of an object (#980, stage_model_edges: chains in the frame of the model), worked out on a
+//thread once per model; None until they are there (or while the model is read)
+stage_model_edges_get(o) {
+	m = stage_model_get(o);
+	if(std.is_none(m) || !m.ok)
+		return None;
+	cache = stage_model_store();
+	k = stage_model_key(o) + "|edges";
+	e = cache[k] ?? None;
+	if(e)
+		return e.model;
+	cache[k] = [model = None];
+	worker = std.thread([cache, k, m]() {
+		chains = [];
+		try {
+			chains = stage_model_edges(m);
+		}
+		catch(err) {
+			chains = [];
+		}
+		cache[k].model = chains;
+	});
+	worker.run();
+	return None;
+}
+
+//The point a tool works at: the middle of the box of its model in the world, else its place
+stage_object_pivot(s, o) {
+	w = stage_world_matrix(s, o);
+	m = stage_model_get(o);
+	if(m && m.ok && m.bounds) {
+		b = m.bounds;
+		return stage_point(w, [x = (b.min.x + b.max.x) / 2.0, y = (b.min.y + b.max.y) / 2.0, z = (b.min.z + b.max.z) / 2.0]);
+	}
+	return [x = w[3], y = w[7], z = w[11]];
+}

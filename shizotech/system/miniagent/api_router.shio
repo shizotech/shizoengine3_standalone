@@ -1,0 +1,325 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  api_router.shio — one route table for the node API, two transports
+//
+//      #include "api_router"
+//
+//      api = ApiRouter(webserver.http_server(port));   // HTTP + the table
+//      api = ApiRouter();                               // the table only (a node without --web)
+//      api.route("GET", "^/api/workspaces/([0-9a-zA-Z_-]+)$", [](req, writer) { ... });
+//      api.start();  api.stop();                        // forwarded to the HTTP server
+//
+//      res = api.dispatch("GET", "/api/workspaces/abc", None, [since = "3"]);
+//      // -> [status_code, body (the answer text), json (the parsed answer), ok]
+//
+//  The route handlers are the ones the HTTP server calls: (req, writer) ->
+//  [status_code, headers, body]. dispatch() calls the same handler with a request
+//  built from its arguments, so every JSON route also works without HTTP: that is
+//  how another node reaches this API over ShizoNet (the ai_api command, see
+//  shizonet_ai.shio) and how the web interface of one node shows the others.
+//
+//  A route that streams (it writes to `writer`: server sent events) is registered
+//  with stream = true; dispatch() answers 501 for it, a remote caller polls the
+//  JSON twin of that route instead.
+// ═════════════════════════════════════════════════════════════════════════════
+
+API_ROUTER_CAPTURE = "([0-9a-zA-Z_-]+)";
+
+// "/a/b?x=1&y=2" -> [path = "/a/b", query = [x = "1", y = "2"]]
+// The values are taken as written (no %XX decoding): a caller with a value that
+// needs escaping passes it in the `query` argument of dispatch() instead.
+api_router_split_query(target) {
+    t = std.string(target ?? "");
+    q = std.json();
+
+    pos = t.find("?");
+
+    if(pos < 0)
+        return [path = t, query = q];
+
+    path = t.substr(0, pos);
+    rest = t.substr(pos + 1);
+
+    for(part : rest.split("&")) {
+        if(!part)
+            continue;
+
+        eq = part.find("=");
+
+        if(eq < 0)
+            q[part] = "";
+        else
+            q[part.substr(0, eq)] = part.substr(eq + 1);
+    }
+
+    return [path = path, query = q];
+}
+
+class ApiRouter {
+    server = None;       // webserver.http_server, None for a table without HTTP
+    routes = [];         // [method, pattern, handler, stream, parts (simple patterns) | None]
+    running = false;
+
+    __init__(_server = None) {
+        server = _server;
+        routes = [];
+        running = false;
+    }
+
+    // A pattern of plain path segments and API_ROUTER_CAPTURE groups is matched
+    // by hand (no regex call per route and request). Anything else falls back to
+    // the regex functions of the string.
+    compile(pattern) {
+        p = std.string(pattern);
+
+        if(!p.starts("^") || !p.ends("$"))
+            return None;
+
+        p = p.substr(1, p.length() - 2);
+        optional_slash = false;
+
+        if(p.ends("/?")) {
+            optional_slash = true;
+            p = p.substr(0, p.length() - 2);
+        }
+
+        if(!p.starts("/"))
+            return None;
+
+        parts = [];
+
+        for(seg : p.substr(1).split("/")) {
+            if(seg == API_ROUTER_CAPTURE) {
+                parts.push_back([capture = true, text = ""]);
+                continue;
+            }
+
+            for(c : seg) {
+                plain = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_" || c == "-" || c == ".";
+
+                if(!plain)
+                    return None;
+            }
+
+            parts.push_back([capture = false, text = seg]);
+        }
+
+        return [parts = parts, optional_slash = optional_slash];
+    }
+
+    route(method, pattern, handler, stream = false) {
+        routes.push_back([
+            method = std.string(method),
+            pattern = std.string(pattern),
+            handler = handler,
+            stream = stream ? true : false,
+            compiled = compile(pattern),
+        ]);
+
+        if(server)
+            server.route(method, pattern, handler);
+
+        return true;
+    }
+
+    static(prefix, root, protect = None) {
+        if(!server)
+            return false;
+
+        if(protect)
+            server.static(prefix, root, protect);
+        else
+            server.static(prefix, root);
+
+        return true;
+    }
+
+    start() {
+        if(!server) {
+            running = true;
+            return true;
+        }
+
+        running = server.start() ? true : false;
+        return running;
+    }
+
+    stop() {
+        running = false;
+
+        if(server) {
+            try {
+                server.stop();
+            } catch(e) {}
+        }
+
+        return true;
+    }
+
+    // -> the captures of the route for this path, None when it does not match
+    match(r, path) {
+        c = r.compiled;
+
+        if(std.is_json(c)) {
+            p = path;
+
+            if(c.optional_slash && p.ends("/") && p.length() > 1)
+                p = p.substr(0, p.length() - 1);
+
+            if(!p.starts("/"))
+                return None;
+
+            segs = p.substr(1).split("/");
+
+            if(segs.size() != c.parts.size())
+                return None;
+
+            caps = [];
+
+            for(i = 0; i < segs.size(); i++) {
+                part = c.parts[i];
+                seg = segs[i];
+
+                if(!part.capture) {
+                    if(seg != part.text)
+                        return None;
+                    continue;
+                }
+
+                if(!seg)
+                    return None;
+
+                for(ch : seg) {
+                    ok = (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch == "_" || ch == "-";
+
+                    if(!ok)
+                        return None;
+                }
+
+                caps.push_back(seg);
+            }
+
+            return caps;
+        }
+
+        // a pattern this class cannot match by hand: the regex of the string
+        if(!path.regex_match(r.pattern))
+            return None;
+
+        caps = [];
+        joined = path.regex_replace(r.pattern, "$1\n$2\n$3\n$4");
+
+        for(v : joined.split("\n")) {
+            if(v)
+                caps.push_back(v);
+        }
+
+        return caps;
+    }
+
+    // One API call without HTTP.
+    //   method, target ("/api/x" or "/api/x?a=1"), body (json | text | None),
+    //   query (json, merged over the query of target), headers (json)
+    // -> [ok, status_code, body (text), json (parsed body, None when it is no JSON)]
+    dispatch(method, target, body = None, query = None, headers = None) {
+        method = std.string(method ?? "GET").uppercase();
+        split = api_router_split_query(target);
+        path = std.string(split.path);
+        q = split.query;
+
+        if(std.is_json(query)) {
+            for(k, v : query)
+                q[std.string(k)] = std.string(v);
+        }
+
+        raw = "";
+
+        if(std.is_json(body))
+            raw = body.compact_string();
+        else if(!std.is_none(body))
+            raw = std.string(body);
+
+        hdr = std.json();
+
+        if(std.is_json(headers)) {
+            for(k, v : headers)
+                hdr[std.string(k).lowercase()] = std.string(v);
+        }
+
+        found_path = false;
+
+        for(r : routes) {
+            caps = match(r, path);
+
+            if(std.is_none(caps))
+                continue;
+
+            if(r.method != "*" && r.method != method) {
+                // the CORS preflight route matches every path: it does not make
+                // an unknown path a known one
+                if(r.method != "OPTIONS")
+                    found_path = true;
+                continue;
+            }
+
+            if(r.stream)
+                return make_reply(501, std.string([ok = json.bool(false), error = "This route streams; it is not available without HTTP."]));
+
+            req = [
+                method = method,
+                path = path,
+                body = raw,
+                client_ip = "shizonet",
+                headers = hdr,
+                query_params = q,
+                matches = caps,
+            ];
+
+            res = None;
+
+            try {
+                res = r.handler(req, None);
+            } catch(e) {
+                return make_reply(500, std.string([ok = json.bool(false), error = "API route failed: " + std.string(e)]));
+            }
+
+            if(!std.is_json(res))
+                return make_reply(500, std.string([ok = json.bool(false), error = "API route returned nothing."]));
+
+            return make_reply(std.int(res.status_code ?? 200), std.string(res.body ?? ""));
+        }
+
+        if(found_path)
+            return make_reply(405, std.string([ok = json.bool(false), error = "Method not allowed: " + method + " " + path]));
+
+        return make_reply(404, std.string([ok = json.bool(false), error = "Unknown API route: " + method + " " + path]));
+    }
+
+    make_reply(code, text) {
+        parsed = None;
+
+        try {
+            parsed = std.json(text, true);
+        } catch(e) {
+            parsed = None;
+        }
+
+        if(!std.is_json(parsed))
+            parsed = None;
+
+        return [
+            ok = json.bool(code >= 200 && code < 300),
+            status_code = code,
+            body = text,
+            json = parsed,
+        ];
+    }
+}
+
+// Register a streaming route (server sent events) on an ApiRouter or on a plain
+// webserver object (a test server, an older host): the plain one has no flag.
+api_route_stream(server, method, pattern, handler) {
+    if(std.is_class(server, ApiRouter))
+        return server.route(method, pattern, handler, true);
+
+    return server.route(method, pattern, handler);
+}

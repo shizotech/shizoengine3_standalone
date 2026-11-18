@@ -1,0 +1,732 @@
+//The stage for AI agents (#980): queries for the in-app Chat and MCP clients to list the model files, put models on the
+//stage, place, turn, scale, hang and remove them, and convert STEP files. No UI; tested headless in _testing/stage_ai.shio.
+//
+//Needs engine/interfaces/aiinterface.shio, engine/stage/stage.shio and engine/stage/stage_step.shio included before it.
+//
+//The engine owns one interface (engine.stage_ai, made by stage_ai_create()), live_path "stage":
+//  - MCP: each query is a tool of its own (list_stage, add_stage_object, ...) with the live_path "stage"
+//  - Chat: the tool vibevj_stage(action, args) of the vibevj skill
+//
+//holder: the engine (a stand-in in tests) with stage and stage_changed(). Objects are named by their id or by their
+//name (when only one has it). Positions in metres (x to the right, y towards the audience, z up: the world of the fixture
+//setup), turns in degrees. Argument names are never names of JSON methods (filter, remove, map, any, all, ...): a JSON
+//literal drops such keys (so "hangs_on", not "parent"; "dimensions", not "size"). A true / false argument is "any()": the
+//typed specs of AIInterface have no bool.
+
+#include "stage_leds"
+
+STAGE_AI_LIVE_PATH = "stage";
+STAGE_AI_DIR = "assets/Stage";
+STAGE_AI_UNITS = [mm = 0.001, cm = 0.01, m = 1.0, "in" = 0.0254];
+
+class stage_ai_target {
+	get_live_path() {
+		return "stage";
+	}
+	get_relative_path() {
+		return "engine/menus/stage/stage.menu";
+	}
+}
+
+//An object by id or name (runtime error when there is none, or more than one of that name)
+stage_ai_object(s, key) {
+	key = std.string(key);
+	o = stage_find(s, key);
+	if(o)
+		return o;
+	found = None;
+	count = 0;
+	want = key.lowercase();
+	for(q : s.objects) {
+		if(std.string(q.name).lowercase() == want) {
+			found = q;
+			count++;
+		}
+	}
+	if(count == 1)
+		return found;
+	if(count > 1)
+		std.runtime_error("More than one object is called '" + key + "', use its id (list_stage).");
+	std.runtime_error("No object '" + key + "' on the stage (list_stage lists them).");
+	return None;
+}
+
+//#980: a folder by id, name or path ("Rig / Front")
+stage_ai_folder(s, key) {
+	key = std.string(key);
+	f = stage_find_folder(s, key);
+	if(f)
+		return f;
+	want = key.lowercase();
+	found = None;
+	count = 0;
+	for(g : s.folders) {
+		if(std.string(g.name).lowercase() == want || stage_folder_path(s, g.id).lowercase() == want) {
+			found = g;
+			count++;
+		}
+	}
+	if(count == 1)
+		return found;
+	if(count > 1)
+		std.runtime_error("More than one folder is called '" + key + "', use its id or path (list_stage: folders).");
+	std.runtime_error("No folder '" + key + "' (list_stage: folders).");
+	return None;
+}
+
+//A folder as the queries give it
+stage_ai_folder_describe(s, f) {
+	c = stage_folder_contents(s, f.id);
+	ids = [];
+	for(o : c.objects) {
+		if(o.folder == f.id)
+			ids.push_back(o.id);
+	}
+	return [id = f.id, name = f.name, path = stage_folder_path(s, f.id), in_folder = f.folder ? stage_folder_path(s, f.folder) : "",
+		visible = f.visible ? true : false, shown = stage_folder_shown(s, f.id), objects = ids, all_objects = c.objects.size()];
+}
+
+stage_ai_float(args, name, fallback) {
+	return args.has(name) && !std.is_none(args[name]) ? std.float(args[name]) : fallback;
+}
+
+//The model of an object, waiting up to wait_ms for it to be read (a query runs on a thread of its own)
+stage_ai_model(o, wait_ms = 0) {
+	m = stage_model_get(o);
+	for(i = 0; std.is_none(m) && i < wait_ms / 20; i++) {
+		std.sleep(20);
+		m = stage_model_get(o);
+	}
+	return m;
+}
+
+stage_ai_round(v) {
+	return math.round(v * 1000.0) / 1000.0;
+}
+
+//What an agent sees of an object
+stage_ai_describe(s, o, wait_ms = 0) {
+	m = stage_ai_model(o, wait_ms);
+	parent = o.parent ? stage_find(s, o.parent) : None;
+	unit = o.unit;
+	unit_name = "";
+	for(i = 0; i < STAGE_AI_UNITS.size(); i++) {
+		if(unit > 0.0 && math.abs(STAGE_AI_UNITS[i] - unit) < 1e-9)
+			unit_name = STAGE_AI_UNITS.key(i);
+	}
+	d = [id = o.id, name = o.name, file = o.source, format = stage_model_format(o.source), hangs_on = parent ? parent.name : "",
+		x = o.x, y = o.y, z = o.z, rx = o.rx, ry = o.ry, rz = o.rz, scale = o.scale, unit = unit_name,
+		up = o.up ? o.up : stage_model_defaults(o.source).up, visible = o.visible ? true : false, materials = o.materials,
+		folder = o.folder ? stage_folder_path(s, o.folder) : "", shown = stage_object_shown(s, o) ? true : false];
+	//#980: its symmetry group: the mode and the others (they follow a change of it)
+	if(o.sym_group) {
+		others = [];
+		for(m : stage_sym_members(s, o.sym_group)) {
+			if(m.id != o.id)
+				others.push_back(m.id);
+		}
+		d.symmetry = [mode = o.sym_mode, index = o.sym_index, others = others];
+	}
+	//#980: a scan of the venue (Gaussian splats): its settings
+	if(o.kind == "splat") {
+		d.kind = "splat";
+		d.splat = [quality = o.splat.quality, height = o.splat.height, align = o.splat.align, splats = m && m.ok ? (m.splats ?? 0) : 0];
+	}
+	//#980: a truss, deck, stairs, ...: its type and measures, what it is, where others join it
+	if(o.kind == "build") {
+		d.kind = "build";
+		d.format = "";
+		d.build = o.build.copy();
+		d.text = stage_build_text(o);
+		nodes = [];
+		w = stage_world_matrix(s, o);
+		for(n : stage_build_nodes(o)) {
+			q = stage_point(w, [x = n[0], y = n[1], z = n[2]]);
+			nodes.push_back([x = stage_ai_round(q.x), y = stage_ai_round(q.y), z = stage_ai_round(q.z)]);
+		}
+		d.nodes = nodes;
+	}
+	//#980: a screen or LED wall: its settings, its size and pixels
+	if(o.kind == "screen") {
+		d.kind = "screen";
+		d.format = "";
+		d.screen = o.screen.copy();
+		z = stage_screen_size(o);
+		d.screen.size = [width = stage_ai_round(z.width), height = stage_ai_round(z.height), px = z.px, py = z.py];
+	}
+	if(std.is_none(m))
+		d.model = [state = "reading"];
+	else if(m.needs_convert)
+		d.model = [state = "not_converted", error = m.error];
+	else if(!m.ok)
+		d.model = [state = "error", error = m.error];
+	else {
+		names = [];
+		for(p : m.parts) {
+			if(names.size() < 20)
+				names.push_back(p.name);
+		}
+		b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+		//(a scan: the box of its splats as they stand)
+		if(o.kind == "splat")
+			b = stage_splat_world_box(s, o) ?? b;
+		d.model = [state = m.stale ? "stale" : "ready", triangles = m.triangles, parts = names, part_count = m.parts.size(),
+			dimensions = [x = stage_ai_round((m.bounds.max.x - m.bounds.min.x) * o.scale), y = stage_ai_round((m.bounds.max.y - m.bounds.min.y) * o.scale),
+				z = stage_ai_round((m.bounds.max.z - m.bounds.min.z) * o.scale)],
+			world_box = [min = [x = stage_ai_round(b.min.x), y = stage_ai_round(b.min.y), z = stage_ai_round(b.min.z)],
+				max = [x = stage_ai_round(b.max.x), y = stage_ai_round(b.max.y), z = stage_ai_round(b.max.z)]]];
+		if(o.kind == "splat")
+			d.model.dimensions = [x = stage_ai_round(b.max.x - b.min.x), y = stage_ai_round(b.max.y - b.min.y), z = stage_ai_round(b.max.z - b.min.z)];
+	}
+	if(d.format == "step") {
+		job = stage_step_job(o.source);
+		if(job)
+			d.step = [state = job.state, status = job.status, error = job.error];
+	}
+	return d;
+}
+
+//A model file for the stage: in assets/Stage already, or copied there (an OBJ with its .mtl, a STEP file with its
+//.stagemesh). Returns its path relative to the app
+stage_ai_file(path) {
+	path = std.string(path).trim().replace("\\", "/");
+	if(!stage_model_format(path))
+		std.runtime_error("Not a model file VibeVJ reads (STEP, 3MF, STL, OBJ, GLB): " + path);
+	if(fileio.is_file(path)) {
+		rel = std.string(fileio.relative_path_cwd(path)).replace("\\", "/");
+		if(rel.starts(STAGE_AI_DIR + "/"))
+			return rel;
+		dest = STAGE_AI_DIR + "/" + fileio.file_name(path);
+		if(!fileio.exists(STAGE_AI_DIR))
+			fileio.mkdir(STAGE_AI_DIR);
+		fileio.copy(path, dest);
+		fmt = stage_model_format(path);
+		if(fmt == "obj") {
+			mtl = fileio.file_dir(path) + "/" + fileio.pure_name(path) + ".mtl";
+			if(fileio.is_file(mtl))
+				fileio.copy(mtl, STAGE_AI_DIR + "/" + fileio.file_name(mtl));
+		}
+		if(fmt == "step" && fileio.is_file(stage_step_mesh_path(path)))
+			fileio.copy(stage_step_mesh_path(path), stage_step_mesh_path(dest));
+		return dest;
+	}
+	//a file of assets/Stage by its name
+	inside = STAGE_AI_DIR + "/" + path;
+	if(fileio.is_file(inside))
+		return inside;
+	std.runtime_error("No model file " + path + " (list_stage_files lists those of assets/Stage).");
+	return "";
+}
+
+//Puts the lowest point of an object at height z (its model read first)
+stage_ai_on_floor(s, o, z = 0.0) {
+	m = stage_ai_model(o, 20000);
+	if(!m || !m.ok || !m.bounds)
+		return false;
+	b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+	d = stage_world_to_local(s, o, [x = 0.0, y = 0.0, z = z - b.min.z]);
+	o.x += d.x;
+	o.y += d.y;
+	o.z += d.z;
+	return true;
+}
+
+def stage_ai_build_keys(type);
+
+//The measures of a piece (#980) from a query: build = {length, height, ...} (STAGE_BUILD_PARAMS of its type)
+stage_ai_build(o, cfg) {
+	if(o.kind != "build" || std.is_none(cfg) || std.type(cfg) != "json")
+		return;
+	if(cfg.has("type") && cfg.type != o.build.type) {
+		if(!STAGE_BUILD_TYPES.has_value(cfg.type))
+			std.runtime_error("No build type '" + cfg.type + "'. Types: " + STAGE_BUILD_TYPES.combine_string(", ").removesuffix(", "));
+		o.build = [type = cfg.type];
+	}
+	for(i = 0; i < cfg.size(); i++) {
+		k = cfg.key(i);
+		if(k == "type")
+			continue;
+		if(std.is_none(stage_build_param(o.build.type, k)))
+			std.runtime_error("A " + o.build.type + " has no measure '" + k + "' (" + stage_ai_build_keys(o.build.type) + ")");
+		o.build[k] = cfg[i];
+	}
+	stage_build_defaults(o);
+}
+
+//"length, width, ..." of a type, for messages and the query descriptions
+stage_ai_build_keys(type) {
+	keys = [];
+	for(p : STAGE_BUILD_PARAMS[type])
+		keys.push_back(p.k + (p.kind == "choice" ? " (" + p.values.combine_string(" / ").removesuffix(" / ") + ")" : ""));
+	return keys.combine_string(", ").removesuffix(", ");
+}
+
+//#980: symmetry = "mirror" / "radial2" .. "radial8" of an add: its counterparts (after its place is set). Returns how
+//many pieces there are
+stage_ai_symmetry(s, o, args) {
+	if(!args.has("symmetry") || !args.symmetry || args.symmetry == "off")
+		return 1;
+	mode = std.string(args.symmetry).lowercase().replace(" ", "");
+	if(!STAGE_SYM_MODES.has_value(mode))
+		std.runtime_error("symmetry is one of " + STAGE_SYM_MODES.combine_string(", ").removesuffix(", "));
+	return stage_sym_create(s, o, mode).size();
+}
+
+//Sets the fields of args on o (shared by add_stage_object and set_stage_object)
+//The settings of a screen (#980) from a query: screen = {type, cols, rows, panel_w, ...}
+stage_ai_screen(o, cfg) {
+	if(o.kind != "screen" || std.is_none(cfg) || std.type(cfg) != "json")
+		return;
+	for(i = 0; i < cfg.size(); i++) {
+		k = cfg.key(i);
+		if(["type", "cols", "rows", "panel_w", "panel_h", "panel_px", "panel_py", "width", "height", "depth", "source", "brightness"].has_value(k))
+			o.screen[k] = cfg[i];
+	}
+	if(o.screen.source && std.is_none(stage_picture(o.screen.source))) {
+		names = [];
+		for(e : stage_picture_sources())
+			names.push_back(e.name);
+		std.runtime_error("No video router '" + o.screen.source + "'. The ones that are on: " + (names.size() ? names.combine_string(", ").removesuffix(", ") : "none (VideoRouter › Enable Router of a shader, video or output)"));
+	}
+	stage_screen_defaults(o);
+}
+
+stage_ai_apply(s, o, args) {
+	if(args.has("name") && args.name)
+		o.name = std.string(args.name);
+	for(k : ["x", "y", "z", "rx", "ry", "rz"]) {
+		if(args.has(k))
+			o[k] = stage_ai_float(args, k, o[k]);
+	}
+	if(args.has("scale")) {
+		v = stage_ai_float(args, "scale", 1.0);
+		if(v <= 0.0)
+			std.runtime_error("scale must be more than 0");
+		o.scale = v;
+	}
+	if(args.has("unit")) {
+		u = std.string(args.unit).lowercase().trim();
+		if(STAGE_AI_UNITS.has(u))
+			o.unit = STAGE_AI_UNITS[u];
+		else if(u == "" || u == "default")
+			o.unit = 0.0;
+		else
+			std.runtime_error("unit is mm, cm, m or in");
+	}
+	if(args.has("up")) {
+		u = std.string(args.up).lowercase().trim();
+		if(u != "z" && u != "y" && u != "")
+			std.runtime_error("up is z or y");
+		o.up = u;
+	}
+	if(args.has("folder")) {
+		target = args.folder ? stage_ai_folder(s, args.folder).id : "";
+		stage_set_folder(s, o.id, target);
+	}
+	if(args.has("hangs_on")) {
+		target = args.hangs_on ? stage_ai_object(s, args.hangs_on).id : "";
+		if(!stage_set_parent(s, o.id, target))
+			std.runtime_error("'" + o.name + "' cannot hang on what hangs on it");
+	}
+	if(args.has("visible"))
+		o.visible = args.visible ? 1 : 0;
+	//#980: [body name -> preset (STAGE_MATERIALS) or [preset, transmission, diffusion]]
+	if(args.has("materials") && std.type(args.materials) == "json") {
+		for(i = 0; i < args.materials.size(); i++) {
+			part = std.string(args.materials.key(i));
+			v = args.materials[i];
+			preset = std.is_string(v) ? v : (v.preset ?? "solid");
+			if(stage_material_preset(preset)[0] != preset)
+				std.runtime_error("material " + preset + ": one of solid, petg, spandex, acrylic_opal, acrylic_clear, glass_clear, glass_frosted");
+			if(std.is_string(v))
+				stage_set_part_material(o, part, preset);
+			else
+				stage_set_part_material(o, part, preset, v.transmission ?? None, v.diffusion ?? None);
+		}
+	}
+}
+
+stage_ai_register(iface, holder) {
+	iface.register("list_stage", [
+		search = "string(): Only objects whose name or file contains this text (case-insensitive)",
+	], [holder](args) {
+		s = holder.stage;
+		needle = args.has("search") && args.search ? std.string(args.search).lowercase() : "";
+		list = [];
+		for(o : s.objects) {
+			if(needle && !(o.name + " " + o.source).lowercase().contains(needle))
+				continue;
+			list.push_back(stage_ai_describe(s, o));
+		}
+		folders = [];
+		for(f : s.folders)
+			folders.push_back(stage_ai_folder_describe(s, f));
+		return [objects = list, count = list.size(), total = s.objects.size(), folders = folders];
+	}, "Stage: every object (a 3D model of the room, the set, the decoration) with id, name, model file, what it hangs on, position in metres (x to the right, y towards the audience, z up, the world of the fixture setup), turn in degrees around x, y, z, scale, unit and up axis of an STL / OBJ / STEP file, visible (its own eye), folder (path) and shown (visible and all its folders on), and its model: state (ready, reading, not_converted (a STEP file), stale, error), triangles, its parts (bodies), dimensions (metres, scaled) and box in the world.");
+
+	iface.register("list_stage_files", [], [holder](args) {
+		files = [];
+		if(fileio.exists(STAGE_AI_DIR)) {
+			for(f : fileio.glob(STAGE_AI_DIR + "/**/*")) {
+				p = std.string(f).replace("\\", "/");
+				fmt = stage_model_format(p);
+				if(!fmt || !fileio.is_file(p))
+					continue;
+				e = [path = std.string(fileio.relative_path_cwd(p)).replace("\\", "/"), format = fmt];
+				if(fmt == "step")
+					e.converted = fileio.is_file(stage_step_mesh_path(p));
+				files.push_back(e);
+			}
+		}
+		return [files = files, folder = STAGE_AI_DIR, step_converter_installed = stage_step_env_ready()];
+	}, "Stage: the model files in assets/Stage that add_stage_object takes (STEP, 3MF, STL, OBJ, GLB); for a STEP file whether it is converted already, and whether the STEP converter (OpenCASCADE) is installed.");
+
+	iface.register("add_stage_object", [
+		path = "&string(): The model file: a path in assets/Stage (list_stage_files), its name there, or a path anywhere on this computer (copied into assets/Stage)",
+		name = "string(): Name (default: the file name)",
+		x = "float(): Position in metres (x to the right)",
+		y = "float(): Position in metres (towards the audience)",
+		z = "float(): Height in metres; with on_floor the height of its lowest point",
+		rx = "float(): Turn around x in degrees",
+		ry = "float(): Turn around y in degrees",
+		rz = "float(): Turn around the vertical in degrees",
+		scale = "float(): Scale (1: as the file says)",
+		unit = "string(): STL / OBJ only: mm (default), cm, m or in",
+		up = "string(): STL / OBJ / STEP: z or y, the axis of the file that points up (OBJ default y, the others z)",
+		hangs_on = "string(): An object (id or name) it hangs on: it moves with it, its position is then in that object's frame",
+		folder = "string(): The folder it goes into (id, name or path)",
+		symmetry = "string(): mirror (a second one mirrored at the middle: x = 0 of the stage, or of what it hangs on) or radial2 .. radial8 (around the middle / the centre of what it hangs on, a truss circle). The others follow later changes of any one of them",
+		on_floor = "any(): true / false. Default true: its lowest point at height z (CAD models often have their origin elsewhere)",
+	], [holder](args) {
+		s = holder.stage;
+		src = stage_ai_file(args.path);
+		o = stage_add_model(s, src);
+		stage_ai_apply(s, o, args);
+		floor = !args.has("on_floor") || args.on_floor;
+		placed = floor ? stage_ai_on_floor(s, o, o.z) : false;
+		stage_ai_symmetry(s, o, args);
+		holder.stage_changed();
+		d = stage_ai_describe(s, o, 20000);
+		d.on_floor = placed;
+		return d;
+	}, "Stage: puts a model file on the stage. Waits until its model is read (up to 20 s) and returns the object with its dimensions and box in the world. A STEP file that is not converted yet shows nothing until convert_step.");
+
+	//#980: screens and LED walls
+	iface.register("add_stage_screen", [
+		type = "string(): led (an LED wall of panels, default) or screen (a projection screen, a monitor: width, height)",
+		name = "string(): Name (default: LED wall / Screen)",
+		x = "float(): Position of the middle of its bottom edge in metres (x to the right)",
+		y = "float(): Position in metres (towards the audience)",
+		z = "float(): Height of its bottom edge in metres",
+		rz = "float(): Turn around the vertical in degrees (0: facing the audience)",
+		screen = "any(): {cols, rows (panels), panel_w, panel_h (metres a panel, 0.5), panel_px, panel_py (pixels a panel, 128), width, height (metres, type screen), depth, source (name of a video router: list_picture_sources), brightness}",
+		hangs_on = "string(): An object (id or name) it hangs on (a truss)",
+		folder = "string(): The folder it goes into (id, name or path)",
+		symmetry = "string(): mirror (a second one mirrored at the middle: x = 0 of the stage, or of what it hangs on) or radial2 .. radial8 (around the middle / the centre of what it hangs on, a truss circle). The others follow later changes of any one of them",
+	], [holder](args) {
+		s = holder.stage;
+		o = stage_add_screen(s, (args.type ?? "led") == "screen" ? "screen" : "led");
+		stage_ai_screen(o, args.screen ?? None);
+		stage_ai_apply(s, o, args);
+		stage_ai_symmetry(s, o, args);
+		holder.stage_changed();
+		return stage_ai_describe(s, o, 2000);
+	}, "Stage: an LED wall or screen showing a picture of VibeVJ (the picture of a video router, drawn with the Stage simulation on). Returns it with its size, pixels and box.");
+
+	types = "";
+	for(t : STAGE_BUILD_TYPES)
+		types += t + ": " + stage_ai_build_keys(t) + "; ";
+	iface.register("add_stage_build", [
+		type = "&string(): truss, deck (stage decks), stairs, tower (ground support), stand (crank stand), speaker, barrier (front barrier), curtain, booth (DJ booth)",
+		build = "any(): Its measures (metres) where they differ from the defaults: " + types.removesuffix("; ") +
+			". Common: truss square 290 mm {length 1..4} or a circle {path: arc, radius 2}; decks of 2 × 1 m {cols, rows, height 0.2..1.0}; stairs {height} = the deck's",
+		name = "string(): Name (default: Truss, Stage, Stairs, ...)",
+		x = "float(): Position of the middle of its bottom in metres (x to the right)",
+		y = "float(): Position in metres (towards the audience)",
+		z = "float(): Height of its bottom in metres (a truss hung at 5 m: z 5)",
+		rz = "float(): Turn around the vertical in degrees (a straight truss lies along x; 90: along y)",
+		hangs_on = "string(): An object (id or name) it hangs on",
+		folder = "string(): The folder it goes into (id, name or path)",
+		symmetry = "string(): mirror (a second one mirrored at the middle: x = 0 of the stage, or of what it hangs on) or radial2 .. radial8 (around the middle / the centre of what it hangs on, a truss circle). The others follow later changes of any one of them",
+	], [holder](args) {
+		s = holder.stage;
+		t = std.string(args.type ?? "");
+		if(!STAGE_BUILD_TYPES.has_value(t))
+			std.runtime_error("No build type '" + t + "'. Types: " + STAGE_BUILD_TYPES.combine_string(", ").removesuffix(", "));
+		o = stage_add_build(s, t);
+		stage_ai_build(o, args.build ?? None);
+		if(o.build.type == "truss" && o.build.path == "arc" && !(args.has("name") && args.name))
+			o.name = stage_free_name(s, "Truss circle");
+		stage_ai_apply(s, o, args);
+		stage_ai_symmetry(s, o, args);
+		holder.stage_changed();
+		return stage_ai_describe(s, o, 2000);
+	}, "Stage: a truss, stage decks, stairs, ground support, a crank stand, a speaker, a front barrier, a curtain or a DJ booth, made from its measures (no model file). Returns it with its box and nodes (the ends of a truss, the top of a tower: where the next piece joins).");
+
+	//#980: folders: order in the list, shown or hidden together
+	iface.register("add_stage_folder", [
+		name = "string(): Its name (default: Folder, Folder 2, ...)",
+		objects = "array(string): Objects (ids or names) that go into it",
+		in_folder = "string(): The folder it is in (id, name or path); empty: at the top",
+	], [holder](args) {
+		s = holder.stage;
+		into = args.has("in_folder") && args.in_folder ? stage_ai_folder(s, args.in_folder).id : "";
+		ids = [];
+		for(k : args.objects ?? [])
+			ids.push_back(stage_ai_object(s, k).id);
+		f = stage_add_folder(s, args.has("name") && args.name ? std.string(args.name) : "", ids, into);
+		holder.stage_changed();
+		return stage_ai_folder_describe(s, f);
+	}, "Stage: a folder for objects (order in the Stage menu's list; a folder hidden hides everything in it, at any depth). Objects go in with set_stage_object folder too.");
+
+	iface.register("set_stage_folder", [
+		folder = "&string(): The folder: id, name or path",
+		name = "string(): New name",
+		visible = "any(): true / false: show or hide everything in it (the objects keep their own visible)",
+		in_folder = "string(): Put it into this folder (id, name or path); empty: at the top",
+	], [holder](args) {
+		s = holder.stage;
+		f = stage_ai_folder(s, args.folder);
+		if(args.has("name") && args.name)
+			f.name = std.string(args.name);
+		if(args.has("visible"))
+			f.visible = args.visible ? 1 : 0;
+		if(args.has("in_folder")) {
+			into = args.in_folder ? stage_ai_folder(s, args.in_folder).id : "";
+			if(!stage_move_folder(s, f.id, into))
+				std.runtime_error("A folder cannot go into itself or into a folder that is in it.");
+		}
+		holder.stage_changed();
+		return stage_ai_folder_describe(s, f);
+	}, "Stage: renames a folder, shows or hides all in it, puts it into another folder.");
+
+	iface.register("remove_stage_folder", [
+		folder = "&string(): The folder: id, name or path",
+		with_objects = "any(): true: the objects in it (at any depth) go too. Default false: they stay, in the folder it was in",
+	], [holder](args) {
+		s = holder.stage;
+		f = stage_ai_folder(s, args.folder);
+		n = stage_remove_folder(s, f.id, args.has("with_objects") && args.with_objects ? true : false);
+		holder.stage_changed();
+		return [removed_objects = n, folders = s.folders.size()];
+	}, "Stage: removes a folder; what is in it stays (in the folder it was in) unless with_objects.");
+
+	iface.register("align_stage_scan", [
+		object = "&string(): The scan (a .ply / .splat object): id or name",
+		floor = "any(): Three points of the world on its floor [[x, y, z], [x, y, z], [x, y, z]] (e.g. picked in the 3D view): it is turned and moved so that its floor is level at height 0",
+		eye = "any(): [x, y, z]: a point above the floor (the side it is seen from; default 3 m above the middle of the three points along the world's z)",
+		measure = "any(): Two points of the world [[x, y, z], [x, y, z]] whose real distance is real",
+		real = "float(): The real distance of the two measure points in metres: the scan is scaled to it",
+		reset = "any(): true: the scan as its file has it again (before floor / measure)",
+	], [holder](args) {
+		s = holder.stage;
+		o = stage_ai_object(s, args.object);
+		if(o.kind != "splat")
+			std.runtime_error(o.name + " is no scan (a .ply or .splat file)");
+		pt = [](v) { return std.is_list(v) ? [x = std.float(v[0]), y = std.float(v[1]), z = std.float(v[2])] : [x = std.float(v.x), y = std.float(v.y), z = std.float(v.z)]; };
+		out = std.json();
+		if(args.has("reset") && args.reset)
+			o.splat.align = STAGE_SPLAT_IDENTITY.copy();
+		if(args.has("floor") && !std.is_none(args.floor)) {
+			if(args.floor.size() != 3)
+				std.runtime_error("floor: three points");
+			pts = [pt(args.floor[0]), pt(args.floor[1]), pt(args.floor[2])];
+			eye = args.has("eye") && !std.is_none(args.eye) ? pt(args.eye) :
+				[x = (pts[0].x + pts[1].x + pts[2].x) / 3.0, y = (pts[0].y + pts[1].y + pts[2].y) / 3.0, z = (pts[0].z + pts[1].z + pts[2].z) / 3.0 + 3.0];
+			n = stage_splat_floor(s, o, pts, eye);
+			if(std.is_none(n))
+				std.runtime_error("floor: the three points are on one line");
+			out.floor = true;
+		}
+		if(args.has("measure") && !std.is_none(args.measure)) {
+			if(args.measure.size() != 2 || !args.has("real"))
+				std.runtime_error("measure: two points and real (metres)");
+			f = stage_splat_scale(s, o, pt(args.measure[0]), pt(args.measure[1]), stage_ai_float(args, "real", 0.0));
+			if(f <= 0.0)
+				std.runtime_error("measure: the two points are the same (or real is not above 0)");
+			out.scaled_by = stage_ai_round(f);
+		}
+		holder.stage_changed();
+		d = stage_ai_describe(s, o, 2000);
+		d.aligned = out;
+		return d;
+	}, "Stage: puts a scan of the venue (Gaussian splats) on the stage's floor: three points of its floor make it level at height 0, two measured points and their real distance give it its real size. Points of the world: from vibevj_capture of the Stage view, or the world_box of a scan.");
+
+	iface.register("list_picture_sources", [], [holder](args) {
+		names = [];
+		for(e : stage_picture_sources()) {
+			if(!names.has_value(e.name))
+				names.push_back(e.name);
+		}
+		return [sources = names];
+	}, "Stage: the pictures a screen can show: the video routers that are on (VideoRouter › Enable Router of a shader, video or output).");
+
+	iface.register("set_stage_object", [
+		object = "&string(): The object: id or name",
+		name = "string(): New name",
+		x = "float(): Position in metres",
+		y = "float(): Position in metres",
+		z = "float(): Height in metres",
+		rx = "float(): Turn around x in degrees",
+		ry = "float(): Turn around y in degrees",
+		rz = "float(): Turn around the vertical in degrees",
+		scale = "float(): Scale",
+		unit = "string(): STL / OBJ: mm, cm, m or in",
+		up = "string(): z or y",
+		hangs_on = "string(): Object it hangs on (id or name); empty: on the stage",
+		folder = "string(): The folder it is in (id, name or path \"Rig / Front\"); empty: none. Folders are for order and showing / hiding, they move nothing",
+		visible = "any(): true / false. Shown in the 3D views (and all its folders on)",
+		materials = "any(): The material of bodies (model.parts): {\"Diffuser\": \"acrylic_opal\"} or {\"Diffuser\": {\"preset\": \"petg\", \"transmission\": 0.5, \"diffusion\": 1.2}}; presets solid, petg, spandex, acrylic_opal, acrylic_clear, glass_clear, glass_frosted. Translucent bodies let the LEDs on the stage near them shine through (Stage simulation on)",
+		on_floor = "any(): true / false. true: its lowest point at height 0 (after the other changes)",
+		screen = "any(): A screen / LED wall only: {type, cols, rows, panel_w, panel_h, panel_px, panel_py, width, height, depth, source, brightness} (add_stage_screen)",
+		build = "any(): A build (truss, deck, ...) only: its measures, e.g. {length: 3} or {height: 0.8}; type too (starts from its defaults). See add_stage_build",
+		splat = "any(): A scan only: {quality (low / medium / high: 300 000 / 1 000 000 / 4 000 000 splats drawn at most), height (metres above its floor shown, 0: all)}",
+	], [holder](args) {
+		s = holder.stage;
+		o = stage_ai_object(s, args.object);
+		stage_ai_screen(o, args.screen ?? None);
+		stage_ai_build(o, args.build ?? None);
+		if(o.kind == "splat" && args.has("splat") && std.type(args.splat) == "json") {
+			if(args.splat.has("quality"))
+				o.splat.quality = std.string(args.splat.quality);
+			if(args.splat.has("height"))
+				o.splat.height = std.float(args.splat.height);
+			stage_splat_defaults(o);
+		}
+		stage_ai_apply(s, o, args);
+		if(args.has("on_floor") && args.on_floor)
+			stage_ai_on_floor(s, o, 0.0);
+		//#980: its symmetry group follows it
+		stage_sym_sync(s, o);
+		holder.stage_changed();
+		return stage_ai_describe(s, o, 20000);
+	}, "Stage: changes one object (name, position, turn, scale, unit, up axis, what it hangs on, visible). Returns it with its box in the world.");
+
+	iface.register("remove_stage_objects", [
+		objects = "&array(string): The objects: ids or names (what hangs on them goes too)",
+	], [holder](args) {
+		s = holder.stage;
+		ids = [];
+		for(k : args.objects)
+			ids.push_back(stage_ai_object(s, k).id);
+		n = stage_remove(s, ids);
+		holder.stage_changed();
+		return [removed = n, left = s.objects.size()];
+	}, "Stage: removes objects and what hangs on them. The model files stay.");
+
+	iface.register("duplicate_stage_objects", [
+		objects = "&array(string): The objects: ids or names (what hangs on them is copied too)",
+		dx = "float(): How far the copies move in x (metres, default 0.5)",
+	], [holder](args) {
+		s = holder.stage;
+		ids = [];
+		for(k : args.objects)
+			ids.push_back(stage_ai_object(s, k).id);
+		copies = stage_duplicate(s, ids, stage_ai_float(args, "dx", 0.5));
+		holder.stage_changed();
+		list = [];
+		for(c : copies)
+			list.push_back(stage_ai_describe(s, c));
+		return [copies = list];
+	}, "Stage: copies objects with what hangs on them; the copies get new ids and names.");
+
+	iface.register("list_stage_edges", [
+		object = "&string(): The object: id or name",
+	], [holder](args) {
+		s = holder.stage;
+		o = stage_ai_object(s, args.object);
+		chains = None;
+		for(i = 0; i < 1000 && std.is_none(chains); i++) {
+			chains = stage_model_edges_get(o);
+			if(std.is_none(chains))
+				std.sleep(20);
+		}
+		if(std.is_none(chains))
+			std.runtime_error("The model of '" + o.name + "' could not be read");
+		m = stage_world_matrix(s, o);
+		list = [];
+		for(i = 0; i < chains.size(); i++) {
+			c = chains[i];
+			a = stage_point(m, [x = c.points[0], y = c.points[1], z = c.points[2]]);
+			n = c.points.size();
+			b = stage_point(m, [x = c.points[n - 3], y = c.points[n - 2], z = c.points[n - 1]]);
+			list.push_back([edge = i, part = c.part, closed = c.closed, length = stage_ai_round(stage_path_length(c.points)),
+				start = [x = stage_ai_round(a.x), y = stage_ai_round(a.y), z = stage_ai_round(a.z)],
+				end = [x = stage_ai_round(b.x), y = stage_ai_round(b.y), z = stage_ai_round(b.z)]]);
+		}
+		return [object = o.name, edges = list, count = list.size()];
+	}, "Stage: the edges of a model (where its faces meet at a sharp angle, where it ends), each with its start and end in the world and its length; add_leds_along_edge takes their numbers.");
+
+	iface.register("add_leds_along_edge", [
+		object = "&string(): The object: id or name",
+		edge = "&int(): The edge (list_stage_edges)",
+		outline = "any(): true (default): the whole outline it belongs to (it goes on at each corner in the same plane), false: only that edge",
+		leds_per_m = "float(): LEDs a metre (default 60)",
+		ledmapper = "int(): Which LEDMapper (1, 2, ... in the order they were opened; default 1)",
+	], [holder](args) {
+		s = holder.stage;
+		o = stage_ai_object(s, args.object);
+		chains = stage_model_edges_get(o);
+		for(i = 0; i < 1000 && std.is_none(chains); i++) {
+			std.sleep(20);
+			chains = stage_model_edges_get(o);
+		}
+		k = std.int(args.edge);
+		if(std.is_none(chains) || k < 0 || k >= chains.size())
+			std.runtime_error("No edge " + k + " (list_stage_edges)");
+		whole = !args.has("outline") || args.outline;
+		path = whole ? stage_edge_loop(chains, k) : [closed = chains[k].closed, points = chains[k].points];
+		mappers = stage_leds_mappers(holder);
+		if(!mappers.size())
+			std.runtime_error("No LEDMapper is open: put one into a view (vibevj_set_area_view assets/Mapping/LEDMapper.asset)");
+		mi = math.clamp((args.has("ledmapper") ? std.int(args.ledmapper) : 1) - 1, 0, mappers.size() - 1);
+		r = mappers[mi].iface.query("add_path_segment", [points = path.points, hangs_on = o.id,
+			leds_per_m = args.has("leds_per_m") ? std.float(args.leds_per_m) : 60.0, group_name = "Edges of " + o.name], "stage");
+		if(!r.ok)
+			std.runtime_error(r.error);
+		r.value.closed = path.closed;
+		return r.value;
+	}, "Stage: a strip of LEDs along an edge of a model (by default its whole outline) into a LEDMapper: a group 'Edges of <object>' that hangs on the object, so the LEDs move with it; colours as every group on the stage (set_stage_place color_source).");
+
+	iface.register("convert_step", [
+		path = "&string(): The STEP file (in assets/Stage, or an object on the stage by id or name)",
+		detail = "string(): coarse (1 mm), normal (0.3 mm, default) or fine (0.1 mm): how close the triangles follow curved surfaces",
+		install = "any(): true / false. The first conversion installs OpenCASCADE (about 170 MB download, 1.2 GB on disk): ask the user first, then call again with install = true",
+	], [holder](args) {
+		s = holder.stage;
+		path = std.string(args.path);
+		if(!fileio.is_file(path)) {
+			o = stage_ai_object(s, path);
+			path = o.source;
+		}
+		if(stage_model_format(path) != "step")
+			std.runtime_error(path + " is no STEP file");
+		if(!stage_step_env_ready() && !(args.has("install") && args.install))
+			return [ok = false, needs_install = true, error = "OpenCASCADE is not installed (" + STAGE_STEP_SIZE + "). Ask the user, then call convert_step again with install = true."];
+		d = std.string(args.detail ?? "normal").lowercase();
+		tol = d == "coarse" ? 1.0 : (d == "fine" ? 0.1 : 0.3);
+		job = stage_step_convert(path, tol);
+		return [ok = true, path = path, state = job.state, status = job.status,
+			note = "Runs in the background; list_stage or get_step_status shows when it is done."];
+	}, "Stage: converts a STEP file into triangles (once; a .stagemesh next to it). The first time it installs OpenCASCADE: only with install = true after the user agreed.");
+
+	iface.register("get_step_status", [
+		path = "&string(): The STEP file (or an object on the stage by id or name)",
+	], [holder](args) {
+		path = std.string(args.path);
+		if(!fileio.is_file(path))
+			path = stage_ai_object(holder.stage, path).source;
+		job = stage_step_job(path);
+		if(!job)
+			return [path = path, state = fileio.is_file(stage_step_mesh_path(path)) ? "converted" : "not_converted"];
+		return [path = path, state = job.state, status = job.status, progress = job.progress, error = job.error];
+	}, "Stage: how the conversion of a STEP file goes: env (OpenCASCADE is installed), converting, done, error.");
+}
+
+//The interface of the stage: in holder.ai_interfaces (when it is the engine), live_path "stage"
+stage_ai_create(holder) {
+	iface = AIInterface(stage_ai_target(), None, "engine/menus/stage/stage.menu");
+	iface.add_capability("stage");
+	stage_ai_register(iface, holder);
+	return iface;
+}

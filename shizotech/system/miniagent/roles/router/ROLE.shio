@@ -2,22 +2,23 @@
 // ═════════════════════════════════════════════════════════════════════════════
 //  Role: Router  (router_api.md §"Router role surface")
 //
-//  A thin, non-blocking receptionist for a FLEET of remote AI nodes. Exactly the
-//  ten coordination tools of the role surface exist on this role. Deliberately
-//  NOT registered: file, write, command, skill, search, taskroute, worker or
-//  task-execution tools. The router cannot investigate, plan or execute — the
-//  boundary is enforced by the runtime, not by prompt wording.
+//  The router agent of a gateway: for each message it decides which node and
+//  which workspace own it, starts the work there as a worker session
+//  (start_task) or passes the message into the session of an existing task
+//  (update_task — a task is a thread, a finished one can be continued), and
+//  reports what it did. Deliberately NOT registered: file, write, command, skill,
+//  search or task-execution tools. The router cannot investigate, plan or
+//  execute — the boundary is enforced by the runtime, not by prompt wording.
 //
-//  Difference from the receptionist role: the receptionist delegates to local
-//  Minds on ONE machine (agt.env.mind); the router delegates to remote
-//  receptionists on OTHER servers, reached over ShizoNet (agt.env.router). Every
-//  task goes to exactly one node, picked from the node table. Node events
-//  (task_finished / notify / node_state) arrive later as system events and are
-//  forwarded to the owner by the host — nothing here polls, waits or blocks.
+//  There is no agent on the node between the router and the worker any more
+//  (the node's receptionist is gone): the request reaches the worker in the
+//  user's own words (Router.turn_text), not as the paraphrase of a paraphrase.
 //
 //  Every tool call goes through the contracted Router methods only
 //  (nodes_summary, node_overview, tasks_summary, add_task, update_task, stop_task,
-//  inspect_task, notify_user) and returns immediately.
+//  inspect_task, notify_user) and returns immediately. Node events (task
+//  finished / failed / question, notify, file) arrive later and are forwarded
+//  to the owner by the host — nothing here polls, waits or blocks.
 // ═════════════════════════════════════════════════════════════════════════════
 
 ROUTER_NO_ROUTER = "No Router instance is attached to this agent (agt.env.router is empty).\nNothing can be routed. This is a host setup error: report it to the user and finish the turn.";
@@ -115,6 +116,63 @@ router_add_task_error(router) {
 	return why;
 }
 
+// the user's own words of the current turn (Router.turn_text), "" when the host set none
+router_turn_text(router) {
+	txt = "";
+
+	if(!router) {
+		return txt;
+	}
+
+	try {
+		txt = std.string(router.turn_text ?? "").strip();
+	}
+	catch(e) {
+		txt = "";
+	}
+
+	return txt;
+}
+
+// the reason of the last Router.update_task() failure ("" when the host has none)
+router_update_task_error(router) {
+	why = "";
+
+	if(!router) {
+		return why;
+	}
+
+	try {
+		why = std.string(router.update_task_error() ?? "").strip();
+	}
+	catch(e) {
+		why = "";
+	}
+
+	return why;
+}
+
+// "name (id), name (id)": the workspaces a node published, "" when it published none
+router_workspace_hint(router, node) {
+	out = "";
+
+	try {
+		for(n : router.nodes_summary()) {
+			if(std.string(n.name) != std.string(node) || !std.is_json(n.workspaces)) {
+				continue;
+			}
+			for(w : n.workspaces) {
+				out += (out ? ", " : "") + std.string(w.name ? w.name : w.id);
+			}
+		}
+	}
+	catch(e) {
+		out = "";
+	}
+
+	return out;
+}
+
 // Does the node run a goal scheduler? true / false / None (None = the node did not
 // report the field: an older node, so nothing is claimed about it).
 router_node_goals(router, node) {
@@ -148,7 +206,7 @@ add_tools(agt)
 {
 	agt.add_tool(
 		"get_nodes",
-		"Inspect the routing table: every online AI node with name, description, capabilities, tags, model, load, open tasks and 'goals' (does this node run a goal scheduler, i.e. can it do work at set times?).\nRead-only. Use it to pick the node for a task and to check which nodes exist at all.\nThis call never wakes, invokes or runs a node, and it does not start anything.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
+		"The routing table: every online AI node with name, description, model, load, open tasks, 'goals' (does this node run a goal scheduler, i.e. can it do work at set times?) and its 'workspaces' (id, name, description) - the places work can go to.\nRead-only. Use it to pick the node AND the workspace for new work.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
 		None,
 		[](agt, args)
 		{
@@ -204,9 +262,9 @@ add_tools(agt)
 
 	agt.add_tool(
 		"get_tasks",
-		"List the routed tasks of the WHOLE fleet from the router's own task mirror: taskid, node, name, state, goal, report, updates, times.\nRead-only. Use it to answer 'what is running?' across all nodes and to find the taskid of a task the user refers to (inspect_task / update_task / stop_task need that taskid).\n'state' filters: open (queued + running), finished, failed, stopped, lost, all (default). 'node' restricts the list to one node name from get_nodes.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
+		"List the routed tasks (threads) of the WHOLE fleet from the router's own task mirror: thread, taskid, node, workspace, name, state, turn, goal, last message, report, times.\nRead-only. Use it to answer 'what is running?' across all nodes and to find the task a message belongs to (inspect_task / update_task / stop_task take its thread label or taskid).\n'state' filters: open (queued + running), finished, failed, stopped, lost, question, all (default). 'node' restricts the list to one node name from get_nodes.\nDo not call it repeatedly to watch progress: node events arrive later as system events.",
 		[
-			state = "string(): OPTIONAL state filter: open | finished | failed | stopped | lost | all.",
+			state = "string(): OPTIONAL state filter: open | finished | failed | stopped | lost | question | all.",
 			node = "string(): OPTIONAL node name, exactly as listed by get_nodes.",
 		],
 		[](agt, args)
@@ -233,7 +291,7 @@ add_tools(agt)
 
 	agt.add_tool(
 		"get_goals",
-		"The scheduled goals (autonomous work at set times) of every node, or of one node: id, title, status, schedule, next window, last outcome.\nRead-only. Requests that create or change a schedule are routed with start_task to the node that should do the work; its receptionist owns the goal.",
+		"The scheduled goals (autonomous work at set times) of every node, or of one node: id, title, status, schedule, next window, last outcome.\nRead-only. Requests that create or change a schedule are routed with start_task to the node and workspace that should do the work; the worker there creates the goal.",
 		[
 			node = "string(): OPTIONAL node name from get_nodes (all nodes otherwise)",
 		],
@@ -265,12 +323,13 @@ add_tools(agt)
 
 	agt.add_tool(
 		"start_task",
-		"Route a task to exactly ONE node. Forward the user's intent as given: do NOT pre-validate feasibility, do NOT research the task, do NOT inspect anything first. The node's receptionist investigates, plans, executes and reports.\n'node' must be a name from get_nodes — never invent one.\nReturns promptly with the taskid, the task name and the node. The goal is NOT executed by this call and you must not wait for it: completion arrives later as a system event.\nScheduled work ('tonight', 'every Sunday', 'from 05:00 to 10:00') needs a node with goals=true. A node with goals=false has no goal system: route the request anyway, but tell the user in finish(report) that this node cannot schedule it - do NOT silently present the job as a scheduled goal and do NOT quietly turn it into normal work.\nWhen the node refuses the task, this answer carries the concrete reason: relay that reason verbatim in finish(report).",
+		"Start NEW work: a worker session in one workspace of one node. Use it only for work that does not belong to an existing task (a follow-up, a correction or an answer goes to update_task).\n'node' and 'workspace' must be names from get_nodes / the context - never invent one. Work that belongs to no project goes to the workspace 'General' (also when 'workspace' is left out). If you cannot tell which workspace is meant, do NOT call this tool: ask the user with finish(report).\nThe worker gets the user's message verbatim (with attached files) unless 'task' is given: pass 'task' only when the message mixes several things, then pass exactly the part for this task, in the user's words.\nReturns promptly with the thread label, the task name, the node and the workspace. The work is NOT done when the call returns and you must not wait for it: completion arrives later as an event.\nScheduled work ('tonight', 'every Sunday') needs a node with goals=true.\nWhen the node refuses, this answer carries the concrete reason: relay that reason verbatim in finish(report).",
 		[
 			node = "&string(): Target node name, exactly as listed by get_nodes.",
-			name = "&string(): Funny short task name for the task like 'Sexy-Sushi'.",
-			task = "&string(): Repeat the user's intention word-by-word.",
-			summary = "&string(): Short summary of the task.",
+			name = "&string(): Short task name, two or three words (like 'Login-Button').",
+			workspace = "string(): OPTIONAL workspace name or id on that node, as listed by get_nodes. Left out: the node's 'General' workspace.",
+			task = "string(): OPTIONAL the text for the worker. Left out: the user's message, verbatim.",
+			summary = "string(): OPTIONAL one line about the task for the action log.",
 		],
 		[](agt, args)
 		{
@@ -286,11 +345,22 @@ add_tools(agt)
 
 			actions = router_actions(agt);
 
+			task_text = std.string(args.task ?? "").strip();
+
+			if(!task_text) {
+				task_text = router_turn_text(agt.env.router);
+			}
+
+			if(!task_text) {
+				return "No task text: pass 'task' with the user's request. No task was routed.";
+			}
+
+			workspace = std.string(args.workspace ?? "").strip();
 			taskname = std.string(args.name).strip() + "-" + std.random_hash(6);
 
 			taskid = None;
 			try {
-				taskid = agt.env.router.add_task(taskname, args.task, node);
+				taskid = agt.env.router.add_task(taskname, task_text, node, "worker", workspace);
 			}
 			catch(e) {
 				taskid = None;
@@ -300,38 +370,52 @@ add_tools(agt)
 				why = router_add_task_error(agt.env.router);
 
 				if(why) {
-					return "The node '" + node + "' did not accept the task. Reason: " + why + "\nNo task was created. Put that reason into finish(report) so the user knows why; do not claim the task is running.";
+					return "The task was NOT started. Reason: " + why + "\nPut that reason into finish(report) so the user knows why; do not claim the task is running.";
 				}
 
 				return "The node '" + node + "' did not accept the task (offline, unreachable or it refused).\nNo task was created. Report that to the user; do not claim the task is running.";
 			}
 
+			// what the mirror made of it: the thread label and the workspace name
+			thread = "";
+			where = workspace;
+			try {
+				info = agt.env.router.inspect_task(std.string(taskid));
+				if(std.is_json(info)) {
+					thread = std.string(info.thread ?? "");
+					where = std.string(info.workspace_name ?? info.workspace ?? workspace);
+				}
+			}
+			catch(e) {}
+
 			//upside down for easier handling
 			actions.insert(0, [
 				action="start_task",
 				node=node,
+				workspace=where,
+				thread=thread,
 				name=taskname,
-				summary=args.summary,
+				summary=std.string(args.summary ?? ""),
 				taskid=std.string(taskid),
 			]);
 
-			suggestion = "Tell the user the task name and the node it runs on, keep the taskid private.";
+			suggestion = "Tell the user the thread label, the workspace and the node; the result arrives later as its own message.";
 			goals = router_node_goals(agt.env.router, node);
 
 			if(goals === false) {
-				suggestion += " This node has no goal system (goals=false): if the user asked for work at set times, say in finish(report) that this node cannot schedule it (it needs an .agentspace).";
+				suggestion += " This node has no goal system (goals=false): if the user asked for work at set times, say in finish(report) that this node cannot schedule it.";
 			}
 
-			return [taskid=std.string(taskid), name=taskname, node=node, suggestion=suggestion];
+			return [thread=thread, taskid=std.string(taskid), name=taskname, node=node, workspace=where, suggestion=suggestion];
 		}
 	);
 
 	agt.add_tool(
 		"update_task",
-		"Forward a follow-up instruction, clarification or answer to an existing routed task on its node.\n'taskid' is the taskid from start_task (private, never shown to the user).\nReturns promptly; the node processes the message in its own time.",
+		"Send a message into an EXISTING task: a follow-up, a correction, an addition, the answer to a question the task asked. The worker of that task has the whole conversation, so the message needs no explanation.\nWorks while the task runs (the message is injected into its turn) and after it has finished, failed, stopped or asked a question (the same session starts a new turn).\n'task' is the thread label (like T12) from the context / get_tasks, or a taskid.\nThe worker gets the user's message verbatim unless 'message' is given.\nReturns promptly; the result of the turn arrives later as an event. When the node refuses, the answer carries the reason: relay it.",
 		[
-			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
-		message = "&string(): The instruction or answer to forward, phrased for the node that owns the goal.",
+			taskid = "&string(): The task: its thread label (T12) or taskid, from the context or get_tasks.",
+			message = "string(): OPTIONAL the text for the worker. Left out: the user's message, verbatim.",
 		],
 		[](agt, args)
 		{
@@ -341,26 +425,42 @@ add_tools(agt)
 
 			actions = router_actions(agt);
 
+			msg = std.string(args.message ?? "").strip();
+
+			if(!msg) {
+				msg = router_turn_text(agt.env.router);
+			}
+
+			if(!msg) {
+				return "No message text: pass 'message' with the user's words.";
+			}
+
 			ok = false;
 			try {
-				ok = agt.env.router.update_task(args.taskid, args.message);
+				ok = agt.env.router.update_task(args.taskid, msg);
 			}
 			catch(e) {
 				ok = false;
 			}
 
 			if(!ok) {
-				return "The task does not exist, has already finished, or its node is offline / has no update channel for it.\nCan only send task updates to tasks that are queued or running on an online node.\nMust create a new task.";
+				why = router_update_task_error(agt.env.router);
+
+				if(why) {
+					return "The message was NOT delivered. Reason: " + why + "\nIf the task cannot be continued, start new work with start_task and say so; otherwise put the reason into finish(report).";
+				}
+
+				return "The task does not exist, or its node is offline / has no update channel for it.\nThe message was not delivered. If the work should go on, start a new task.";
 			}
 
 			//upside down for easier handling
 			actions.insert(0, [
 				action="update_task",
-				message=args.message,
+				message=msg.length() > 300 ? msg.substr(0, 300) + "..." : msg,
 				taskid=std.string(args.taskid),
 			]);
 
-			return "OK";
+			return "OK - the message is in the task's conversation. Tell the user which task took it.";
 		}
 	);
 
@@ -368,7 +468,7 @@ add_tools(agt)
 		"stop_task",
 		"Requests that a routed task on its node stops its work.\nReports only what the node confirmed: a confirmed stop is not the same as a stop request.",
 		[
-			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
+			taskid = "&string(): The task: its thread label (T12) or taskid, from the context or get_tasks.",
 		reason = "string(): OPTIONAL short reason, kept in the router's task record.",
 		],
 		[](agt, args)
@@ -404,9 +504,9 @@ add_tools(agt)
 
 	agt.add_tool(
 		"inspect_task",
-		"Inspect one routed task: its mirrored state on the router plus, when its node answers, the live remote task record.\nRead-only. Never call it repeatedly to watch progress: node events arrive later as system events.",
+		"Inspect one routed task: its mirrored state on the router (state, report, the turns of its thread) plus, when its node answers, the live remote task record.\nRead-only. Never call it repeatedly to watch progress: node events arrive later as system events.",
 		[
-			taskid = "&string(): The routed task's taskid, taken from the current context or from get_tasks.",
+			taskid = "&string(): The task: its thread label (T12) or taskid, from the context or get_tasks.",
 		],
 		[](agt, args)
 		{

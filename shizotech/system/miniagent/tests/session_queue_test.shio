@@ -1,0 +1,352 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  session_queue_test.shio — session slot queue checks
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Tests are written from the specification and the public API only.
+// A fake spawn subclass simulates a worker start by setting the session status.
+// No model/API calls are made.
+
+#include "workspaces"
+
+passed = 0;
+failed = 0;
+
+check(cond, label) {
+    if(cond) {
+        passed++;
+        std.print("ok " + label);
+    } else {
+        failed++;
+        std.print("FAIL " + label);
+    }
+}
+
+class FakeSessionManager : SessionManager {
+    spawn_status = "waiting";
+    spawn_count = 0;
+
+    spawn(sid) {
+        spawn_count++;
+        sessions[sid].status = spawn_status;
+        return true;
+    }
+}
+
+is_active_status(status) {
+    return status == "starting" || status == "running" || status == "waiting";
+}
+
+make_context(max_sessions, name) {
+    root = std.user_path() + "/miniagent/session_queue_test_" + std.random_hash(10);
+    root = fileio.absolute_path(root);
+
+    if(fileio.exists(root))
+        fileio.remove(root);
+
+    store = WorkspaceStore(root);
+    store.set_settings(max_sessions);
+
+    ws = store.create(name, "", "");
+    config_path = ws.workspace.path + "/config.json";
+    fileio.write_json(config_path, [
+        url = "",
+        token = "",
+        name = "",
+        max_tokens = 128000,
+        max_running_agents = 0,
+    ], true, true);
+
+    manager = FakeSessionManager(store, config_path);
+    return [root = root, store = store, workspace = ws.workspace, manager = manager];
+}
+
+cleanup(ctx) {
+    if(fileio.exists(ctx.root))
+        fileio.remove(ctx.root);
+}
+
+// ── 1. create_session below capacity ───────────────────────────────────────
+ctx = make_context(2, "active-under-capacity");
+res = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "hello", "adaptive", "medium", "web");
+check(res.ok && !std.is_none(res.session) && res.session.id != "", "create_session accepts a task below capacity");
+s1 = ctx.manager.get_session(res.session.id);
+check(!std.is_none(s1) && is_active_status(s1.status), "active session has an occupying status");
+check(ctx.manager.spawn_count == 1, "active session worker is spawned once");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0 && st.total_sessions == 1, "stats count one active session and no queued session");
+cleanup(ctx);
+
+// ── 2. create_session when the pool is full ───────────────────────────────
+ctx = make_context(1, "full-pool-single");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "first prompt", "adaptive", "medium", "web");
+check(first.ok && is_active_status(ctx.manager.get_session(first.session.id).status), "first session occupies the only slot");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "second prompt", "adaptive", "medium", "web");
+check(second.ok, "full pool accepts the second task instead of refusing it");
+check(second.session.status == "queued", "second task is created with status queued");
+check(ctx.manager.spawn_count == 1, "queued task does not spawn a worker");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1 && st.total_sessions == 2, "stats count the active and queued sessions");
+cleanup(ctx);
+
+// ── 3. a full pool accepts more than one queued task ──────────────────────
+ctx = make_context(1, "full-pool-multiple");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+check(second.ok && third.ok, "a full pool accepts a second and a third task");
+check(second.session.status == "queued" && third.session.status == "queued", "both accepted tasks are queued");
+check(second.session.id != third.session.id && second.session.id != first.session.id && third.session.id != first.session.id, "each accepted task has a distinct session id");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 2 && st.total_sessions == 3, "stats show one active and two queued sessions");
+cleanup(ctx);
+
+// ── 4. dispatch_queue with an empty queue ────────────────────────────────
+ctx = make_context(2, "empty-queue");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+started = ctx.manager.dispatch_queue();
+check(started == 0, "dispatch_queue starts zero sessions when the queue is empty");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0, "empty dispatch leaves the active session unchanged");
+cleanup(ctx);
+
+// ── 5. stop_session of an active session dispatches oldest queued ─────────
+ctx = make_context(1, "stop-active-fifo");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+stopped_active = ctx.manager.stop_session(first.session.id);
+check(stopped_active, "stop_session of an active session returns true");
+check(ctx.manager.get_session(first.session.id).status == "stopped", "stopped active session is marked stopped");
+check(is_active_status(ctx.manager.get_session(second.session.id).status), "oldest queued session starts when a slot frees");
+check(ctx.manager.get_session(third.session.id).status == "queued", "newer queued session remains queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session remain after the stop");
+cleanup(ctx);
+
+// ── 6. dispatch_queue starts only free slots, FIFO after max raised ──────
+ctx = make_context(1, "raise-max-dispatch");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+fourth = ctx.manager.create_session(ctx.workspace.id, "fourth", "normal", "p4", "adaptive", "medium", "web");
+ctx.store.set_settings(3);
+check(ctx.manager.max_sessions() == 3, "raising max_sessions is visible to the manager");
+started_count = ctx.manager.dispatch_queue();
+check(started_count == 2, "dispatch_queue starts exactly the two free slots, not more");
+check(is_active_status(ctx.manager.get_session(second.session.id).status) && is_active_status(ctx.manager.get_session(third.session.id).status), "the two oldest queued sessions start FIFO");
+check(ctx.manager.get_session(fourth.session.id).status == "queued", "the fourth queued session remains queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 3 && st.queued_sessions == 1 && st.total_sessions == 4 && st.max_sessions == 3, "stats reflect three active, one queued, and max_sessions 3");
+cleanup(ctx);
+
+// ── 7. stop_session of a queued session ─────────────────────────────────
+ctx = make_context(1, "stop-queued");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+stopped_queued = ctx.manager.stop_session(second.session.id);
+check(stopped_queued, "stop_session of a queued session returns true");
+check(ctx.manager.get_session(second.session.id).status == "stopped", "queued session is marked stopped");
+insp = ctx.manager.inspect_task(second.session.id);
+check(insp.ok && insp.state == "stopped" && !insp.active, "inspect_task reports the stopped queued session as stopped and inactive");
+check(ctx.manager.get_session(third.session.id).status == "queued", "the queue entry is removed without starting another session while the pool is full");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session remain");
+cleanup(ctx);
+
+// ── 8. delete_session of an active session dispatches the next queued ───
+ctx = make_context(1, "delete-active");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+deleted = ctx.manager.delete_session(first.session.id);
+check(deleted.ok, "delete_session of an active session succeeds");
+check(std.is_none(ctx.manager.get_session(first.session.id)), "deleted active session is gone");
+check(is_active_status(ctx.manager.get_session(second.session.id).status), "queued session starts after the active session is deleted");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0, "one active session and no queued session remain");
+cleanup(ctx);
+
+// ── 9. delete_session of a queued session removes files and queue entry ─
+ctx = make_context(1, "delete-queued");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+second_dir = ctx.workspace.path + "/.megamind/sessions/" + second.session.id;
+deleted_queued = ctx.manager.delete_session(second.session.id);
+check(deleted_queued.ok, "delete_session of a queued session succeeds");
+check(std.is_none(ctx.manager.get_session(second.session.id)), "get_session returns None after deleting a queued session");
+check(!fileio.exists(second_dir), "deleted queued session files are removed");
+check(ctx.manager.get_session(third.session.id).status == "queued", "deleted queued session's queue entry is removed and the next entry remains queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1 && st.total_sessions == 2, "stats show the deleted session is no longer present");
+ctx.manager.stop_session(first.session.id);
+check(is_active_status(ctx.manager.get_session(third.session.id).status), "the deleted queued session is not started; the next queued session is");
+cleanup(ctx);
+
+// ── 10. send_prompt on a running session ────────────────────────────────
+ctx = make_context(1, "prompt-running");
+ctx.manager.spawn_status = "running";
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+res = ctx.manager.send_prompt(first.session.id, "next prompt", "high", true);
+check(res.ok && res.session.status == "running", "send_prompt on a running session returns ok and keeps it running");
+check(ctx.manager.get_session(first.session.id).status == "running", "running session still has status running after the prompt");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0, "running prompt does not add a queued session");
+cleanup(ctx);
+
+// ── 11. send_prompt on a queued session appends the follow-up ────────────
+ctx = make_context(1, "prompt-queued");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "initial prompt", "adaptive", "medium", "web");
+spawns_before = ctx.manager.spawn_count;
+res = ctx.manager.send_prompt(second.session.id, "follow-up");
+check(res.ok, "send_prompt on a queued session is accepted");
+check(res.session.status == "queued", "queued session stays queued after the prompt");
+check(res.session.prompt == "initial prompt\n\nfollow-up", "follow-up is appended with the newline pair separator");
+check(ctx.manager.spawn_count == spawns_before, "queued prompt does not spawn a worker");
+check(ctx.manager.get_session(second.session.id).prompt == "initial prompt\n\nfollow-up", "the queued task's stored prompt is the appended prompt");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1 && st.total_sessions == 2, "the follow-up is not a separate session");
+cleanup(ctx);
+
+// ── 12. send_prompt on a stopped session while the pool is full ──────────
+ctx = make_context(1, "prompt-stopped-full");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+ctx.manager.stop_session(second.session.id);
+res = ctx.manager.send_prompt(second.session.id, "resume");
+check(res.ok, "stopped session accepts a prompt while the pool is full");
+check(res.session.status == "queued", "accepted stopped-session prompt becomes queued instead of refused");
+check(ctx.manager.get_session(second.session.id).status == "queued", "stored stopped session is queued after the prompt");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session after the accepted prompt");
+cleanup(ctx);
+
+// ── 13. send_prompt on a finished session while the pool is full ─────────
+ctx = make_context(1, "prompt-finished-full");
+ctx.manager.spawn_status = "done";
+finished = ctx.manager.create_session(ctx.workspace.id, "finished", "normal", "old prompt", "adaptive", "medium", "web");
+check(ctx.manager.get_session(finished.session.id).status == "done", "session was simulated as finished");
+ctx.manager.spawn_status = "waiting";
+active = ctx.manager.create_session(ctx.workspace.id, "active", "normal", "active prompt", "adaptive", "medium", "web");
+check(is_active_status(ctx.manager.get_session(active.session.id).status), "pool is full with an active session");
+res = ctx.manager.send_prompt(finished.session.id, "new prompt");
+check(res.ok, "finished session accepts a prompt while the pool is full");
+check(res.session.status == "queued", "accepted finished-session prompt becomes queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session after the accepted prompt");
+cleanup(ctx);
+
+// ── 14. send_prompt on a failed session while the pool is full ───────────
+ctx = make_context(1, "prompt-failed-full");
+ctx.manager.spawn_status = "failed";
+failed_session = ctx.manager.create_session(ctx.workspace.id, "failed", "normal", "old prompt", "adaptive", "medium", "web");
+check(ctx.manager.get_session(failed_session.session.id).status == "failed", "session was simulated as failed");
+ctx.manager.spawn_status = "waiting";
+active = ctx.manager.create_session(ctx.workspace.id, "active", "normal", "active prompt", "adaptive", "medium", "web");
+check(is_active_status(ctx.manager.get_session(active.session.id).status), "pool is full with an active session");
+res = ctx.manager.send_prompt(failed_session.session.id, "new prompt");
+check(res.ok, "failed session accepts a prompt while the pool is full");
+check(res.session.status == "queued", "accepted failed-session prompt becomes queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session after the accepted prompt");
+cleanup(ctx);
+
+// ── 15. send_prompt on a question session while the pool is full ─────────
+ctx = make_context(1, "prompt-question-full");
+ctx.manager.spawn_status = "question";
+question_session = ctx.manager.create_session(ctx.workspace.id, "question", "normal", "old prompt", "adaptive", "medium", "web");
+check(ctx.manager.get_session(question_session.session.id).status == "question", "session was simulated as question");
+ctx.manager.spawn_status = "waiting";
+active = ctx.manager.create_session(ctx.workspace.id, "active", "normal", "active prompt", "adaptive", "medium", "web");
+check(is_active_status(ctx.manager.get_session(active.session.id).status), "pool is full with an active session");
+res = ctx.manager.send_prompt(question_session.session.id, "new prompt");
+check(res.ok, "question session accepts a prompt while the pool is full");
+check(res.session.status == "queued", "accepted question-session prompt becomes queued");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 1, "one active and one queued session after the accepted prompt");
+cleanup(ctx);
+
+// ── 16. send_prompt on a finished session with a free slot ───────────────
+ctx = make_context(1, "prompt-finished-free");
+ctx.manager.spawn_status = "done";
+finished = ctx.manager.create_session(ctx.workspace.id, "finished", "normal", "old prompt", "adaptive", "medium", "web");
+check(ctx.manager.get_session(finished.session.id).status == "done", "session was simulated as finished");
+ctx.manager.spawn_status = "running";
+res = ctx.manager.send_prompt(finished.session.id, "new turn");
+check(res.ok, "finished session accepts a prompt when a slot is free");
+s_after = ctx.manager.get_session(finished.session.id);
+check(s_after.status == "running" || s_after.status == "starting", "finished session starts a new turn with status running or starting");
+check(s_after.status != "queued", "new turn is not queued when a slot is free");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0, "one active and no queued session after a free-slot prompt");
+cleanup(ctx);
+
+// ── 17. inspect_task for a queued session ────────────────────────────────
+ctx = make_context(1, "inspect-queued");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+insp = ctx.manager.inspect_task(second.session.id);
+check(insp.ok && insp.state == "queued" && !insp.active, "inspect_task reports a queued session as state queued and active false");
+cleanup(ctx);
+
+// ── 18. stats active/queued/total/max_sessions ───────────────────────────
+ctx = make_context(2, "stats-counts");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+second = ctx.manager.create_session(ctx.workspace.id, "second", "normal", "p2", "adaptive", "medium", "web");
+third = ctx.manager.create_session(ctx.workspace.id, "third", "normal", "p3", "adaptive", "medium", "web");
+check(ctx.manager.max_sessions() == 2, "manager reports max_sessions 2");
+st = ctx.manager.stats();
+check(st.active_sessions == 2 && st.queued_sessions == 1 && st.total_sessions == 3 && st.max_sessions == 2, "stats count only active statuses, count queued, include both, and report max_sessions");
+cleanup(ctx);
+
+// ── 19. invalid reasoning effort is refused even when the pool is full ───
+ctx = make_context(1, "invalid-effort");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+bad = ctx.manager.create_session(ctx.workspace.id, "bad-effort", "normal", "p2", "adaptive", "extreme", "web");
+check(!bad.ok, "invalid reasoning effort is refused even with a full pool");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0 && st.total_sessions == 1, "invalid effort does not create a queued session");
+cleanup(ctx);
+
+// ── 20. empty prompt is refused ──────────────────────────────────────────
+ctx = make_context(1, "empty-prompt");
+ctx.manager.spawn_status = "running";
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+res = ctx.manager.send_prompt(first.session.id, "");
+check(!res.ok, "send_prompt with an empty prompt is refused");
+check(ctx.manager.get_session(first.session.id).status == "running", "running session state is unchanged by the refused empty prompt");
+cleanup(ctx);
+
+// ── 21. stop_session of an unknown session ──────────────────────────────
+ctx = make_context(1, "unknown-stop");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+unknown_stop = ctx.manager.stop_session("does-not-exist");
+check(!unknown_stop, "stop_session of an unknown session returns false");
+st = ctx.manager.stats();
+check(st.active_sessions == 1 && st.queued_sessions == 0, "unknown stop does not change the active session");
+cleanup(ctx);
+
+// ── 22. inspect_task of an unknown id ───────────────────────────────────
+ctx = make_context(1, "unknown-inspect");
+first = ctx.manager.create_session(ctx.workspace.id, "first", "normal", "p1", "adaptive", "medium", "web");
+missing = ctx.manager.inspect_task("missing-task");
+check(!missing.ok && missing.state == "lost" && missing.error == "not found", "inspect_task of an unknown id returns ok false, state lost, error not found");
+cleanup(ctx);
+
+// ── 23. max_sessions boundary of 1 ──────────────────────────────────────
+ctx = make_context(1, "max-one");
+set_res = ctx.store.set_settings(1);
+check(set_res.ok && ctx.store.settings().max_sessions == 1, "max_sessions 1 is accepted");
+check(ctx.manager.max_sessions() == 1 && ctx.manager.stats().max_sessions == 1, "manager and stats report max_sessions 1");
+cleanup(ctx);
+
+std.print("session_queue_test: " + std.string(passed) + " passed, " + std.string(failed) + " failed");
+
+if(failed) {
+    std.print("FAIL");
+    std.exitprocess(1);
+}
+
+std.print("PASSED");
+std.exitprocess(0);

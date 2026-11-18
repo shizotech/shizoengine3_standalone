@@ -206,7 +206,9 @@ universes or patch layers in between.
 
 ![The fixture setup: fixture types and lamps on the left, the stage plan in the middle, the lamp settings on the right, the universe map below](media/fixture-setup.png)
 
-1. In the tab *Devices*, open *Fixtures* and click *Fixture setup*. The fixture setup opens in a new tab.
+1. Click the toolbox button at the right end of the top bar and choose *Fixture setup* (or, in the tab *Devices*, open
+   *Fixtures* and click *Fixture setup*). The fixture setup opens in a new tab. Closing the tab hides it; it opens
+   again as you left it ([Tools](The-Screen.md#tools)).
 2. Your Art-Net nodes are listed on the right under *Nodes* as soon as they answer. A node that does not answer
    ArtPoll (or is not on the network yet): *Add node by IP*, with its IP address and a name.
 3. In *Fixture types* on the left, click a type, set *Count* and click *Add lamps*. Or drag the type onto the plan.
@@ -286,11 +288,14 @@ it is sent and turned by its pan and tilt, so you see what the [Phaser](#effects
 - The beams stop at the floor and light it where they land, weaker the farther they reach. Its colour wheel and gobo
   wheel show too: the beam has the colour of the slot the wheel is on (with only a dimmer and a colour wheel), and the
   light on the floor the shape of the gobo it is on (open: round).
+- The models of the [stage](Stage.md) (trusses, the set, the decoration) stand in it too, where they were put in the
+  Stage menu. They cannot be clicked here: clicks go to the lamps.
 - The selected lamps glow at their edges in the accent colour, a lamp with a problem in red.
 - How far a moving head turns and how wide its beam is comes from the fixture file (*Pan °*, *Tilt °*, *Beam °* in the
   [fixture editor](#make-a-fixture-file)).
-- Drag the empty stage to turn it, drag with the right or the middle mouse button to move it, scroll to zoom. *Fit*
-  shows all lamps.
+- As in the [Stage](Stage.md) menu and CAD programs: drag with the right mouse button to turn the view, with the
+  middle one to move it, scroll to zoom. The left button only selects and moves lamps (a click on the empty stage
+  selects none). *Fit* shows all lamps.
 - Click a lamp to select it (Shift+click for more), drag it to move it at its height. Shift+drag it to move it up and
   down, with the selected lamps (the top left shows its height). R, Page Up / Page Down and the arrow keys work as on
   the plan. *3D* again goes back to the plan.
@@ -316,7 +321,8 @@ To program the lamps as on a lighting console (select, palettes, cues, faders), 
 
 ### Make a fixture file
 
-*Fixture editor*, next to *Fixture setup* in the tab *Devices*, opens the fixture editor.
+*Fixture editor* in the Tools button of the top bar (or next to *Fixture setup* in the tab *Devices*) opens the fixture
+editor.
 
 1. Click *Create new fixture*. Double-click its name to rename it (lamps of that type follow the new name).
 2. Click the fixture, then *Add Channel* for each channel, in the order of the DMX chart of the lamp.
@@ -573,6 +579,9 @@ gets (its segments one after the other), a **scene** is a set of groups with a m
    group follow one after the other.
 5. Switch on *Test*: the selected segment, group or scene is white on the real LEDs and everything else black, to find
    a strip in the rig.
+6. *On the stage* in the settings of a group puts its LEDs into the 3D views of the [stage](Stage.md#leds-on-the-stage)
+   and the fixture setup, where they show the colours they are sent. There the group can also take its colours from
+   the picture projected onto where its LEDs stand, or from a 3D effect ([Colours](Stage.md#colours-of-the-leds-on-the-stage)).
 
 | On the picture | What it does |
 |---|---|
@@ -623,6 +632,32 @@ selected group; one is made when there is none), × deletes it. Presets can also
 | *LED Smoothing* | Changes fade over a few frames. |
 | *Analog Mode* | Smoothing like a light bulb: up quickly, down slowly. |
 | *Width*, *Height* | Size of the picture the segments are drawn on. |
+
+#### Camera scan
+
+![The LEDMapper after a camera scan: a segment of 40 LEDs along the curvy path the camera saw, its shape Scanned; on the left Camera scan with "40 LEDs: 40 seen"](media/ledmapper-scan.png)
+
+A strip laid by hand (on a printed object, through a decoration, around a sculpture) does not run in straight lines.
+The **Camera scan** puts each of its LEDs where a camera sees it: one LED after the other lights up, everything else
+stays dark, and the bright spot in the camera's picture is its place.
+
+1. Add a camera: *Generators* › *Input* › *Camera* in a view, and pick the device there. Point it at the LEDs from
+   where the audience looks at them. An NDI receiver (a phone with an NDI camera app) or a capture card works too.
+2. Set up the segments as usual: the right *LEDs*, *Node*, *Universe*, *Address*. Check with *Test* that the LEDs light.
+3. Darken the room. In the left column under *Camera scan*, pick the camera.
+4. Select a segment (or a group: all its segments), click *Scan the selection*. It takes *Wait* per LED (300 ms: a
+   minute for 200 LEDs); *Stop the scan* stops it and changes nothing.
+
+When it is done, each scanned segment has the *Shape* *Scanned*: its LEDs stand where the camera saw them, in the
+order they are sent. A LED the camera did not see (hidden, too dim) is put between the ones beside it on the strip; the
+text under the button says how many. *Fit into the picture* (on) makes the places fill the picture, keeping their
+proportions; off they stay where they were in the camera's picture. A scanned segment can be moved, turned with its
+group and duplicated like any other; *Shape* *Line* or *Curve* makes it a drawn strip again.
+
+- LEDs found one place too late (in the place of the one before): *Wait* longer. A camera has a delay of its own, a USB
+  webcam often 100-200 ms.
+- Reflections on a shiny floor or wall: the brightest spot counts, a reflection only when it is brighter than the LED.
+- On the [stage](Stage.md#leds-on-the-stage) a scanned group stands as its picture: upright, at its place.
 
 ### Drawing a mask (MaskDraw)
 
@@ -1152,23 +1187,42 @@ normals, the trail or the chemicals, the agents and the mask. The lighting costs
 Two generators in `Generators` › `Network` read the CDJs through **DJ Watch**, a small ESP32 box in the DJ network
 (`dj-watch.local`; it was called prolink-bridge before). Both use the same connection.
 
-- **Prolink Bridge** (*ProlinkBridge*) gives the values of the tempo master deck: BPM, beat and bar, beat and downbeat
-  pulses, beats to the next cue, cue ramp, drop pulse, progress, playing, on air, master deck, and *Low* / *Mid* /
-  *High* from the waveform.
-  - *Sync timeline* (on at the start) makes the [timeline](Timeline.md#sync-the-timeline-from-audio) follow the master
-    deck while it plays.
+- **Prolink Bridge** (*ProlinkBridge*) gives the values of the deck that gives the tempo (the tempo master deck):
+  BPM, beat and bar, beat and downbeat pulses, beats to the next cue, cue ramp, drop pulse, progress, playing, on air,
+  master deck, and *Low* / *Mid* / *High* from the waveform.
+  - *Sync timeline* (on at the start) makes the [timeline](Timeline.md#sync-the-timeline-from-audio) follow that deck
+    while it plays.
+  - *Tempo from* (section *Settings*): which deck. *Auto* takes the master deck, else the deck on air and playing, else
+    a playing one; or a fixed deck 1-6 ([which deck](Lighting-Desk.md#which-deck-gives-the-tempo)). The timeline passes
+    its tempo on to lighting desks and Ableton Link ([Timeline](Timeline.md#tempo-to-lighting-desks-and-ableton-link)).
   - *Bar lock* (on at the start) also puts the bar on its downbeat.
   - *Phase offset* moves the beat earlier or later; *Pulse length* sets how long the pulses last (10 to 1000 ms).
+  - The section *Mixer* has the *Crossfader* and, for channels 1 to 4 of the DJ mixer, *Ch n fader*, *Ch n VU*,
+    *Ch n EQ low* / *mid* / *high*; the section *Deck* has *Fader* and *VU* of the channel of the deck it follows. See
+    [Mixer data](#mixer-data).
+  - *Now playing* (section *Deck*) is the number of the deck whose track the audience hears, with its title in the
+    line below ([History and playlist](#history-and-playlist)).
 - With either of them, the [lighting desk](Lighting-Desk.md#dj-link-phrases) plays cues on the phrases of the master
   deck (Intro, Buildup, Drop, ...) and on its memory cues.
-- **Prolink Decks** (*ProlinkDecks*) draws the decks with their waveforms, cues and phrases as a video output (*Out*).
-  - Each section *Deck 1* … *Deck 4* has *BPM*, *Beat*, *Low*, *Mid*, *High*, *Progress*, *Cue ramp*, *Playing*,
-    *On air*, *Phrase ramp*, *Buildup* and *Drop*. These are [pure outputs](Linking.md#pure-outputs): link from them,
-    not into them.
-  - The section *History* lists the tracks that were played, with *Save CSV*, *Save TXT* and *Clear*.
+- With either of them, VibeVJ makes SMPTE timecode per track from the decks (Art-Net, MTC, LTC) and sends the decks
+  over TCNet: [Timecode from the decks](Timeline.md#timecode-from-the-decks), [TCNet](Timeline.md#tcnet).
+- **Prolink Decks** (*ProlinkDecks*) draws up to six decks with their artwork, waveforms, cues and phrases as a video
+  output (*Out*). *Decks* *Auto* shows every player that is there; with five or six the deck panels sit in two rows.
+  - Each section *Deck 1* … *Deck 6* has *BPM*, *Beat*, *Low*, *Mid*, *High*, *Progress*, *Cue ramp*, *Playing*,
+    *On air*, *Phrase ramp*, *Buildup*, *Drop*, and from the mixer *Fader*, *VU*, *EQ low*, *EQ mid* and
+    *EQ high*. These are [pure outputs](Linking.md#pure-outputs): link from them, not into them.
+  - When the mixer sends its faders, a thin bar at the left of each lane shows the channel fader (green while the deck
+    is on air).
+  - The section *History* lists the tracks that were played, with *Save CSV*, *Save TXT* and *Clear*, and how a
+    track counts: *History rule*, *Now playing*, *Write playlist* ([History and playlist](#history-and-playlist)).
   - *Time display* (section *Settings*) shows the *Remaining* time of each track (default) or the *Elapsed* time.
-  - Next to the BPM of each deck the words *On air* (green, needs a mixer on the network), *Master* and *Sync*; a green
-    ▶ before the time while a deck plays.
+  - The deck you hear is framed in green with a *Live* badge, like a playing clip. With a DJM on the network that is
+    every deck whose channel is open; without a mixer it is the tempo master while it plays, or the only deck that
+    plays.
+  - Each deck shows its player number, the player model, the artwork, title and artist, the key (*Key 8A*), the BPM in
+    a box (filled light on the tempo master), the tempo in %, *Master*, *Sync* and *MT* (key lock, where the player
+    reports it: Denon), and the time with its tenths smaller; a green ▶ before the time while a deck plays. What has
+    already played is drawn darker.
   - *Style* changes the colours of the waveforms (*CDJ* or *VibeVJ*); the background, texts and badges look like the
     rest of VibeVJ in both.
   - Keys on its picture: H shows the history, + and - zoom, 0 resets the zoom.
@@ -1255,7 +1309,9 @@ What comes in:
   with their names and colours, saved loops and artwork. VibeVJ reads from the library on the player only what a track
   needs (a few KB), right after the track is loaded. Tracks have to be analysed in Engine DJ. A player that cannot
   hand out parts of a file gets its whole library copied once instead; *Prolink Decks* and the DJ Watch program then
-  show the progress ("library USB 1: 40 %").
+  show the progress ("library USB 1: 40 %"). Covers and waveforms that Engine 5 keeps as files next to the library
+  are read too.
+- When you change the beat grid or a hot cue on the player, the deck shows the change by itself.
 
 | | Denon players | CDJs |
 |---|---|---|
@@ -1263,11 +1319,101 @@ What comes in:
 | Waveform | Coarse: Engine keeps one overview of the whole track, the scrolling waveform is stretched from it. *Low* / *Mid* / *High* work the same. | Detail from the player. |
 | Parts (intro, break, drop) | Found in the waveform (bass or no bass), like for tracks without rekordbox phrases. | rekordbox phrases. |
 | Cue countdown, drop pulse | To the next **hot cue** (Engine has no memory cues). | To the next memory cue. |
-| On air | Prime 4 / Prime Go / SC Live: their channel faders. SC players with an X1800 / X1850: the faders the mixer reports. Another mixer: a playing deck counts as on air. | From the DJM. |
+| On air | Prime 4 / Prime Go / SC Live: their channel faders. SC players with an X1800 / X1850: the fader of the channel the mixer says the deck plays on. Another mixer: a playing deck counts as on air. | From the DJM. |
 | *Listen only* | Only the list of devices (StageLinQ sends nothing without a connection). | Tempo and beats. |
 
 Not tried on a real Denon player yet (October 2026): the connection follows the open StageLinQ programs and is tested
 against a simulated SC6000. If something is missing or wrong, the messages of the DJ Watch program (*Devices*) help.
+
+### Mixer data
+
+Besides *On air*, VibeVJ can read the DJ mixer itself: the channel faders, the EQ knobs, trim, Color FX, the
+crossfader and the level meters (VU). Use them like any value: link *Ch 2 EQ low* to a bass effect, *Fader* to the
+brightness of a layer, *VU* to a pulse.
+
+| Mixer | What comes | How |
+|---|---|---|
+| Pioneer DJM (900NXS2, A9, V10 ...) | Faders, trim, EQ (V10: four bands), Color FX knob, crossfader assign, crossfader, master, VU of each channel | Source *Network card* and *Mixer data (DJM)* on (in *Settings*) |
+| Pioneer DJM without *Mixer data* | *On air* of each channel | Any source |
+| Denon X1800 / X1850, Prime 4, Prime Go, SC Live | Channel faders, crossfader, which deck plays on which channel | Source *Network card*, nothing to switch on |
+
+With *Mixer data (DJM)* on, this computer also announces itself to the mixer as a *PRO DJ LINK Bridge* (the Pioneer
+program for lighting desks); only then does a DJM send its faders and meters. A DJM decides on the first announcement it
+sees and keeps to that. VibeVJ listens to the network for 3 seconds first, then announces. If the mixer still sends
+nothing, the line at the top of *Prolink Decks* says so: switch the mixer off and on while *Mixer data (DJM)* is on (in a
+break, not in the middle of a set). *Listen only* never sends anything, so it has no mixer data.
+
+**Which deck on which channel.** VibeVJ takes player 1 on channel 1, player 2 on channel 2 and so on, like the CDJs do
+for their on-air ring. Denon mixers say themselves which deck is on which channel. When a deck plays with its channel
+closed while another channel is open with no playing deck on it, the deck shows "Channel 3?" in *Prolink Decks* and the
+line at the top explains it. In the DJ Watch program you set the channel of each player in the tab *Mixer*.
+
+**Enhanced on air.** *Enhanced on air* (in *Settings*, off at the start) keeps *On air* at 1 while a deck that was on
+air keeps playing, through a short fader dip or a sing-along with the fader down. *Hold* is how long (10 s at the start;
+0 = as long as the deck plays).
+
+Values a mixer does not send stay at 0 in the outputs (in the DJ Watch program: "—").
+
+Not tried on a real mixer yet (November 2026): the mixer data is tested against a simulated DJM and a simulated Denon
+player.
+
+### History and playlist
+
+VibeVJ works out which track the audience hears (*now playing*), like the playlist tools for streams do:
+
+- A track is *now playing* at once when it is the first one heard, or when the track before it was cued, ended or
+  unloaded. During a mix the new track counts after 128 beats (two phrases) in a row. This is the mode *Smart*.
+- *Waits for silence*: the new track counts only once nothing else is heard. *Follows master*: the deck that becomes
+  tempo master counts.
+- *Heard* means the channel is open on the DJM (with *Enhanced on air*: also through a short fader dip, see
+  [Mixer data](#mixer-data)); without a mixer in the network every playing deck. A short cut of the
+  fader or a pause (less than 8 beats) is no stop; cue, end of the track or loading another one is.
+- After 30 s with nothing heard the set ended; the next track starts a new set.
+
+The *History* (in *Prolink Decks* and in the DJ Watch program) lists each play with its start, stop and play time, the
+deck, where the track came from (player and slot: USB, SD), title, artist, BPM and key. Plays shorter than *Min play*
+(10 s, DJ Watch) are left out. *History rule* *Audible 30 s* is the old rule: a track counts once it was heard for 30 s.
+
+*Write playlist* writes the plays of the set while they happen to `Documents/prolink-history/set-<date>-<time>.csv`
+(start, stop, play time, player, source player and slot, title, artist, BPM, key, genre). After 30 minutes with nothing
+heard (*New file after* in DJ Watch) the next track starts a new file. *Save CSV* / *Save TXT* write the whole history
+once.
+
+Tested against recorded status lines of players and a mixer, not with real CDJs and a DJM yet (November 2026).
+
+### DJ MIDI out
+
+The generator **DJ MIDI Out** (*DJMidiOut*, `Generators` › `Network`) sends what the DJ does as MIDI to a lighting
+program, a small DMX controller that reacts to notes, or SoundSwitch. It reads the decks of a *Prolink Bridge* or
+*Prolink Decks* generator, so one of them has to run.
+
+1. Choose the *MIDI output*: a port of the computer, or a virtual port (loopMIDI on Windows, IAC on macOS) that the
+   other program reads.
+2. *Deck*: *Auto* follows the tempo master (else the deck on air and playing), or a fixed deck.
+3. Each line can be switched off; *Ch* (1-16) and the note or controller number can be changed. *Send* sends that line
+   once, to map it in the other program.
+
+| Notes (a short pulse) | Default |
+|---|---|
+| Beat, Downbeat, Phrase change | 36, 37, 38 |
+| Phrase kind: the note + the code of the phrase (Intro 0, Verse 1-6, Bridge 7, Drop 8, Buildup 9, Down 10, Outro 11) | 40-51 |
+| Drop, Buildup, Track load, Cue reached (a memory cue) | 52, 53, 54, 55 |
+
+| Controllers (CC, sent when they change, at most 60 times a second) | Default |
+|---|---|
+| BPM coarse (BPM - 50), BPM fine (hundredths), Pitch (64 = 0 %, a step 0.25 %) | 1, 2, 3 |
+| Bar phase, Beat phase, Playing, Master deck | 4, 5, 6, 7 |
+| Phrase kind (code x 10), Phrase progress, Beats left in the phrase | 20, 21, 22 |
+| Low / Mid / High of decks 1-6 (the number + deck - 1) | 30, 36, 42 |
+
+*SoundSwitch*: switch it on and SoundSwitch gets one bank select (channel 16, notes 60-63 for bank 1-4) and one
+AutoLoop pulse (channel 13-16, notes 64-95 for AutoLoop 1-32) per phrase. Set which AutoLoop each kind of phrase
+starts (*Bank*, *AutoLoop*); in SoundSwitch press *Map* on an AutoLoop, then *Send* on the line here. SoundSwitch takes
+the tempo from Ableton Link: switch on *Ableton Link* under [Tempo to lighting desks](Timeline.md#tempo-to-lighting-desks-and-ableton-link).
+
+The notes go out with the frames of VibeVJ, within half a frame of the beat (about ±8 ms at 60 frames a second). For
+a tight tempo use Ableton Link, which runs on a thread of its own. Not tried with SoundSwitch or a hardware MIDI
+controller yet (November 2026): tested with a virtual MIDI device in VibeVJ.
 
 ## ShizoNet
 

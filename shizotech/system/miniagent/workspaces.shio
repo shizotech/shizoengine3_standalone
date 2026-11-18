@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════
+﻿// ═══════════════════════════════════════════════════════════════════════════
 //  workspaces.shio — workspace tree, sessions and per-workspace mind state
 //  issue #907: every workspace owns its own .megamind, sessions, architecture
 //  and goals below std.user_path()/miniagent/workspaces.
@@ -28,6 +28,15 @@ WS_EVENT_KEPT = 300;
 WS_NOTIFY_KEPT = 100;
 WS_STREAM_POLL_MS = 100;
 WS_STREAM_PING_MS = 15000;
+WS_LIVE_TICK_MS = 250;          // how often the live feed looks for a change
+WS_LIVE_GOALS_MS = 1000;        // ... and at the goals of a watched workspace
+WS_LIVE_WATCH_MS = 30000;       // a workspace stays watched this long after its last request
+WS_LIVE_WAIT_MAX_MS = 25000;    // longest long-poll (a ShizoNet get has to outlast it)
+WS_EVENTS_WAIT_MAX_MS = 10000;
+WS_SAVE_DELTA_MS = 1000;        // session.json is rewritten at most this often while tokens stream
+WS_EVENT_RESULT_MAX = 16000;    // characters of a tool result kept in an event (chat.json has all of it)
+WS_TURN_ITEMS_MAX = 600;        // items of the running turn kept for a page that opens the session
+WS_TURN_TEXT_MAX = 400000;      // characters of one text / reasoning item of the running turn
 
 // ── small helpers ──────────────────────────────────────────────────────────
 ws_str(v, def = "") {
@@ -151,6 +160,36 @@ ws_chat_from_events(events) {
     return chat;
 }
 
+// A tool result in the event window is for the eyes of the owner: a huge one (a
+// whole file, a long command output) is cut to its head and tail there. The
+// agent's own copy in chat.json is not touched.
+ws_clip_event_action(action) {
+    if(!std.is_json(action) || !action.has("tool_end") || !std.is_json(action.tool_end))
+        return action;
+
+    te = action.tool_end;
+
+    if(!te.has("result") || std.is_none(te.result))
+        return action;
+
+    text = std.is_json(te.result) ? te.result.compact_string() : std.string(te.result);
+    n = text.length();
+
+    if(n <= WS_EVENT_RESULT_MAX)
+        return action;
+
+    head = WS_EVENT_RESULT_MAX * 3 / 4;
+    tail = WS_EVENT_RESULT_MAX - head;
+
+    out = action.copy();
+    out.tool_end = te.copy();
+    out.tool_end.result = text.substr(0, head) + "\n… [" + std.string(n - head - tail) + " characters left out] …\n" + text.substr(n - tail);
+    out.tool_end.result_truncated = json.bool(true);
+    out.tool_end.result_chars = n;
+
+    return out;
+}
+
 // A short project-agent note for every real workspace. Generic and never
 // overwrites an existing file: a project's own AGENTS.md is the authority.
 ensure_agents_md(path) {
@@ -181,9 +220,10 @@ class WorkspaceStore {
     root = "";
     registry_path = "";
     settings_path = "";
+    projects_dir = "";      // where a workspace created without a path gets its folder
     items = [];
 
-    __init__(_root = "") {
+    __init__(_root = "", _projects_dir = "") {
         base = ws_str(_root);
 
         if(base) {
@@ -197,8 +237,29 @@ class WorkspaceStore {
         registry_path = root + "/" + WS_REGISTRY_FILE;
         settings_path = root + "/" + WS_SETTINGS_FILE;
         items = [];
+        set_projects_dir(_projects_dir);
 
         load();
+    }
+
+    // New projects without a path are created below this folder:
+    // <the directory the node was started in>/workspaces/<name>, so a project can
+    // be started from the web interface or a chat without typing a path. A store
+    // made with its own root (a test, an isolated client) keeps them in that root.
+    set_projects_dir(dir) {
+        d = ws_str(dir).strip();
+
+        if(d) {
+            projects_dir = fileio.absolute_path(d);
+            return projects_dir;
+        }
+
+        if(root == fileio.absolute_path(miniagent_workspaces_root()))
+            projects_dir = fileio.absolute_path(ws_str(std.wd(), ".") + "/workspaces");
+        else
+            projects_dir = root;
+
+        return projects_dir;
     }
 
     root_workspace() {
@@ -437,10 +498,16 @@ class WorkspaceStore {
 
         phys = "";
 
-        if(path)
+        if(path) {
             phys = fileio.absolute_path(path);
-        else
+        } else if(parent == "root") {
+            // no path: a new project folder below the node's working directory
+            fileio.mkdir(projects_dir);
+            phys = fileio.absolute_path(projects_dir + "/" + ws_slug(name));
+        } else {
+            // a sub-workspace without a path lives inside its parent
             phys = fileio.absolute_path(base + "/" + ws_slug(name));
+        }
 
         if(fileio.exists(phys) && !fileio.is_directory(phys)) {
             cs.release();
@@ -574,6 +641,7 @@ class SessionManager {
     cfg_spec = "";
     token = "";
     sessions = [];
+    queue = [];             // session ids accepted while every slot is busy, FIFO
     live_texts = [];
     live_text_seqs = [];
     procs = [];
@@ -587,12 +655,18 @@ class SessionManager {
     workspace_paths = [];
     stop_requested = [];
     terminal_reported = [];
+// Last owner request (std.millis). The goal scheduler yields to it through
+    // background_capacity(); a goal dispatch itself must not count as interactive.
+    last_interactive_ms = 0;
+    saved_at = [];          // session id -> std.millis_steady() of the last session.json write
+    turn_logs = [];         // session id -> the running turn as items (see turn_log_add)
 
     __init__(_store, _cfg_spec, _token = "") {
         store = _store;
         cfg_spec = ws_config_spec_absolute(_cfg_spec);
         token = ws_str(_token);
         sessions = [];
+        queue = [];
         live_texts = [];
         live_text_seqs = [];
         procs = [];
@@ -606,7 +680,15 @@ class SessionManager {
         workspace_paths = [];
         stop_requested = [];
         terminal_reported = [];
+// Last owner request (std.millis). The goal scheduler yields to it through
+        // background_capacity(); a goal dispatch itself must not count as interactive.
+        last_interactive_ms = 0;
+        saved_at = [];
+        turn_logs = [];
         load_sessions();
+
+        // sessions accepted before the restart and still queued run again
+        dispatch_queue();
     }
 
     // A Workspace registers its physical directory before any session is created.
@@ -676,6 +758,7 @@ class SessionManager {
             s.title = ws_str(s.title, "Session");
             s.mode = ws_str(s.mode, "normal");
             s.role = ws_str(s.role, "adaptive");
+            s.origin = ws_str(s.origin);
             s.reasoning_effort = ws_str(s.reasoning_effort, "medium");
             if(!ws_valid_reasoning_effort(s.reasoning_effort))
                 s.reasoning_effort = "medium";
@@ -699,7 +782,7 @@ class SessionManager {
             s.chat_history_size_at_prompt = std.int(s.chat_history_size_at_prompt);
             restarted = false;
 
-            if(s.status == "starting" || s.status == "running" || s.status == "waiting") {
+            if(s.status == "queued" || s.status == "starting" || s.status == "running" || s.status == "waiting") {
                 recovered = recovered_turn(dir + "/" + sid, s);
 
                 if(std.is_json(recovered)) {
@@ -734,6 +817,9 @@ class SessionManager {
             sessions[s.id] = s;
             loaded++;
 
+            if(s.status == "queued" && !queue_contains(s.id))
+                queue.push_back(s.id);
+
             if(restarted)
                 save_session(sid);
         }
@@ -749,15 +835,59 @@ class SessionManager {
         n = 0;
 
         for(k, s : sessions) {
-            if(s.status == "starting" || s.status == "running" || s.status == "waiting")
+            if(s && (s.status == "starting" || s.status == "running" || s.status == "waiting"))
                 n++;
         }
 
         return n;
     }
 
-    session_dir(sid) {
-        s = sessions[sid];
+    queued_count() {
+        n = 0;
+
+        for(k, s : sessions) {
+            if(s && s.status == "queued")
+                n++;
+        }
+
+        return n;
+    }
+
+    session_record(sid) {
+        sid = ws_str(sid);
+
+        // sessions[sid] on a missing key creates a null entry; use has() so a
+        // deleted session really leaves the map (and stats).
+        if(!sessions.has(sid))
+            return None;
+
+        return sessions[sid];
+    }
+
+    dequeue(sid) {
+        sid = ws_str(sid);
+
+        for(i = 0; i < queue.size(); i++) {
+            if(ws_str(queue[i]) == sid) {
+                queue.erase(i);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    queue_contains(sid) {
+        sid = ws_str(sid);
+
+        for(q : queue) {
+            if(ws_str(q) == sid)
+                return true;
+        }
+
+        return false;
+    }    session_dir(sid) {
+        s = session_record(sid);
 
         if(!s)
             return "";
@@ -817,14 +947,177 @@ class SessionManager {
         ];
     }
 
+    // ── the running turn, for a page that opens the session in the middle of it ──
+    //
+    // The event window holds the last WS_EVENT_KEPT events, which is a few seconds of
+    // streamed tokens, and chat.json is only written at a tool call and at the end of
+    // a turn. So a page that opened a running session saw the reasoning and the tool
+    // calls of the turn only from the moment it connected. The turn log is the same
+    // stream folded into items as it arrives:
+    //     [kind = "user", text]                 the prompt (also one sent while it runs)
+    //     [kind = "reasoning", text]            consecutive reasoning deltas, joined
+    //     [kind = "text", text]                 consecutive text deltas, joined
+    //     [kind = "tool", id, name, args, state = running|ok|failed, result, sub]
+    //     [kind = "milestone" | "notice" | "error", text]
+    // GET /api/sessions/<id> answers it as `turn` together with `turn_seq`, the seq of
+    // the last event that is in it: the page draws the items and takes the stream from
+    // there. It is memory only; a finished turn is read from chat.json.
+    turn_log_reset(sid, prompt = "") {
+        items = [];
+
+        if(ws_str(prompt))
+            items.push_back([kind = "user", text = ws_str(prompt)]);
+
+        turn_logs[sid] = items;
+    }
+
+    turn_log(sid) {
+        if(!turn_logs.has(sid))
+            return [];
+
+        return turn_logs[sid].copy();
+    }
+
+    turn_log_push(sid, item) {
+        if(!turn_logs.has(sid))
+            turn_logs[sid] = [];
+
+        items = turn_logs[sid];
+        items.push_back(item);
+
+        // too many: the oldest go (the prompt at the front stays)
+        for(items.size() > WS_TURN_ITEMS_MAX)
+            items.erase(items[0].kind == "user" ? 1 : 0);
+    }
+
+    turn_log_text(sid, kind, text) {
+        text = ws_str(text);
+
+        if(!text)
+            return;
+
+        if(turn_logs.has(sid) && turn_logs[sid].size()) {
+            items = turn_logs[sid];
+            last = items[items.size() - 1];
+
+            if(last.kind == kind) {
+                last.text = ws_str(last.text) + text;
+
+                if(last.text.length() > WS_TURN_TEXT_MAX)
+                    last.text = "…" + last.text.substr(last.text.length() - WS_TURN_TEXT_MAX + 1000);
+
+                return;
+            }
+        }
+
+        turn_log_push(sid, [kind = kind, text = text]);
+    }
+
+    // one streamed action of the session's agent (sub = it came from a sub-agent)
+    turn_log_add(sid, action, sub = false) {
+        if(!std.is_json(action))
+            return;
+
+        // the actions of a sub-agent arrive wrapped: [agent = [id, action]]
+        if(action.has("agent") && std.is_json(action.agent)) {
+            if(std.is_json(action.agent.action))
+                turn_log_add(sid, action.agent.action, true);
+            return;
+        }
+
+        if(action.has("tool_start") && std.is_json(action.tool_start)) {
+            t = action.tool_start;
+            args = std.json();
+
+            if(std.is_json(t.args)) {
+                for(k, v : t.args) {
+                    // what the harness adds to the arguments is not a parameter
+                    if(std.string(k) != "tool_call" && std.string(k) != "tool_call_index")
+                        args[std.string(k)] = v;
+                }
+            }
+
+            turn_log_push(sid, [
+                kind = "tool",
+                id = ws_str(t.id),
+                name = ws_str(t.name, "tool"),
+                args = args,
+                state = "running",
+                result = None,
+                sub = json.bool(sub),
+            ]);
+            return;
+        }
+
+        if(action.has("tool_end") && std.is_json(action.tool_end)) {
+            t = action.tool_end;
+            id = ws_str(t.id);
+
+            if(!turn_logs.has(sid))
+                return;
+
+            items = turn_logs[sid];
+
+            for(i = items.size() - 1; i >= 0; i--) {
+                if(items[i].kind == "tool" && ws_str(items[i].id) == id) {
+                    res = t.result;
+                    failed = false;
+
+                    if(std.is_json(res) && res.has("ok") && !res.ok && res.has("error"))
+                        failed = true;
+
+                    items[i].state = failed ? "failed" : "ok";
+                    items[i].result = res;
+
+                    if(t.has("result_truncated"))
+                        items[i].result_truncated = json.bool(true);
+                    break;
+                }
+            }
+            return;
+        }
+
+        // the text and the reasoning of sub-agents would interleave: only their tools show
+        if(sub)
+            return;
+
+        if(action.has("reasoning") && !std.is_none(action.reasoning)) {
+            turn_log_text(sid, "reasoning", action.reasoning);
+            return;
+        }
+
+        if(action.has("text") && !std.is_none(action.text)) {
+            turn_log_text(sid, "text", action.text);
+            return;
+        }
+
+        if(action.has("milestone") && !std.is_none(action.milestone))
+            turn_log_push(sid, [kind = "milestone", text = ws_str(action.milestone)]);
+    }
+
+    // While tokens stream, an event arrives every few milliseconds; writing the whole
+    // session.json for each of them made the disk the slowest part of a turn. A
+    // streamed delta is saved at most every WS_SAVE_DELTA_MS, everything else (a tool
+    // call, a status, the end of the turn) at once.
+    save_session_lazy(sid) {
+        now = std.millis_steady();
+
+        if(saved_at.has(sid) && now - std.int(saved_at[sid]) < WS_SAVE_DELTA_MS)
+            return false;
+
+        return save_session(sid);
+    }
+
     save_session(sid) {
         path = session_path(sid);
 
         if(!path)
             return false;
 
+        saved_at[sid] = std.millis_steady();
+
         cs = std.critical_section_named("workspace_session_save:" + path);
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s) {
             cs.release();
@@ -845,6 +1138,7 @@ class SessionManager {
             created = s.created,
             updated = s.updated,
             role = s.role,
+            origin = ws_str(s.origin),
             report = s.report,
             error = s.error,
             seq = s.seq,
@@ -869,6 +1163,8 @@ class SessionManager {
     }
 
     host_state(status) {
+        if(status == "queued")
+            return "queued";
         if(status == "done")
             return "finished";
         if(status == "failed")
@@ -885,7 +1181,7 @@ class SessionManager {
     }
 
     session_view(sid) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return None;
@@ -904,7 +1200,7 @@ class SessionManager {
 
     delete_session(sid) {
         sid = ws_str(sid);
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return [ok = false, error = "unknown session"];
@@ -917,7 +1213,7 @@ class SessionManager {
         deleting_sessions[sid] = true;
         guard.release();
 
-        if(s.status == "starting" || s.status == "running" || s.status == "waiting")
+        if(s.status == "queued" || s.status == "starting" || s.status == "running" || s.status == "waiting")
             stop_session(sid);
 
         dir = session_dir(sid);
@@ -940,6 +1236,8 @@ class SessionManager {
         stop_requested.erase(sid);
         terminal_reported.erase(sid);
         deleting_sessions.erase(sid);
+        saved_at.erase(sid);
+        turn_logs.erase(sid);
         guard.release();
         save_lock.release();
 
@@ -991,7 +1289,7 @@ class SessionManager {
     }
 
     session_events(sid) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return [];
@@ -1000,7 +1298,7 @@ class SessionManager {
     }
 
     inspect_task(taskid) {
-        s = sessions[taskid];
+        s = session_record(taskid);
 
         if(!s) {
             return [
@@ -1023,6 +1321,7 @@ class SessionManager {
             name = s.title,
             role = s.role,
             mode = s.mode,
+            origin = ws_str(s.origin),
             state = host_state(s.status),
             active = json.bool(s.status == "starting" || s.status == "running" || s.status == "waiting"),
             report = s.report,
@@ -1044,7 +1343,7 @@ class SessionManager {
     }
 
     spawn(sid) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return false;
@@ -1109,6 +1408,90 @@ class SessionManager {
         return true;
     }
 
+    // FIFO dispatcher: a queued session consumes the next free slot. Called after
+    // every terminal/stopped/deleted session and after max_sessions is raised.
+    dispatch_queue() {
+        started = 0;
+
+        for(1) {
+            cs = std.critical_section_named("workspace_sessions");
+
+            if(active_count() >= max_sessions()) {
+                cs.release();
+                break;
+            }
+
+            sid = "";
+
+            for(q : queue) {
+                s = session_record(q);
+
+                if(s && s.status == "queued") {
+                    sid = ws_str(q);
+                    break;
+                }
+            }
+
+            if(!sid) {
+                // stopped or deleted ids are stale, not queue entries
+                for(i = queue.size() - 1; i >= 0; i--) {
+                    s = session_record(queue[i]);
+
+                    if(!s || s.status != "queued")
+                        queue.erase(i);
+                }
+
+                cs.release();
+                break;
+            }
+
+            dequeue(sid);
+            s = session_record(sid);
+            s.status = "starting";
+            s.attempts = 0;
+            s.report = "";
+            s.error = "";
+            s.updated = std.millis();
+            cs.release();
+
+            if(!spawn(sid)) {
+                s = session_record(sid);
+
+                if(s) {
+                    s.status = "failed";
+                    s.error = s.error ? s.error : "the session could not be started";
+                    s.report = s.error;
+                    finish_terminal(s, "failed", s.report, s.error, false);
+                }
+
+                started++;
+                continue;
+            }
+
+            if(ws_str(s.prompt)) {
+                send_json(sid, [type = "prompt", text = s.prompt, reasoning_effort = s.reasoning_effort]);
+                if(s.status == "starting")
+                    s.status = "running";
+                turn_log_reset(sid, s.prompt);
+                push_event(s, "status", [status = s.status]);
+            } else {
+                turn_log_reset(sid, "");
+            }
+
+            s.updated = std.millis();
+            save_session(sid);
+            pump_active[sid] = true;
+
+            std.thread([this, sid]() {
+                this.pump(sid);
+            }).run();
+
+            started++;
+        }
+
+        return started;
+    }
+
     send_json(sid, obj) {
         p = procs[sid];
 
@@ -1118,7 +1501,11 @@ class SessionManager {
         return p.write_line(obj.compact_string());
     }
 
-    create_session(workspace_id, title = "", mode = "normal", prompt = "", role = "adaptive", reasoning_effort = "medium") {
+// origin: who started the session ("web" the web interface, "net" another node or a
+    // gateway over ShizoNet, "goal" a scheduled goal, "" unknown). It travels with the
+    // task-finished event, so a chat gateway can stay quiet about turns the owner is
+    // watching in the web interface.
+    create_session(workspace_id, title = "", mode = "normal", prompt = "", role = "adaptive", reasoning_effort = "medium", origin = "") {
         path = workspace_path(workspace_id);
 
         if(!path)
@@ -1152,12 +1539,16 @@ class SessionManager {
             }
         }
 
+        // a session a person asked for (the web interface, a gateway) is interactive use
+        origin = ws_str(origin);
+        if(origin == "web" || origin == "net")
+            last_interactive_ms = std.millis();
+
         cs = std.critical_section_named("workspace_sessions");
 
-        if(active_count() >= max_sessions()) {
-            cs.release();
-            return [ok = false, error = "max_sessions reached"];
-        }
+        // Every task is accepted. When every slot is busy it becomes a queued
+        // session; dispatch_queue() starts it as soon as a slot frees.
+        full = active_count() >= max_sessions();
 
         sid = std.random_hash(16);
 
@@ -1167,7 +1558,7 @@ class SessionManager {
             title = title,
             mode = mode,
             reasoning_effort = reasoning_effort,
-            status = "starting",
+            status = full ? "queued" : "starting",
             prompt = prompt,
             events = [],
             chat_history_size_at_prompt = 0,
@@ -1175,6 +1566,7 @@ class SessionManager {
             created = std.millis(),
             updated = std.millis(),
             role = role,
+            origin = ws_str(origin),
             report = "",
             error = "",
             seq = 0,
@@ -1182,6 +1574,8 @@ class SessionManager {
         ];
 
         sessions[sid] = s;
+        if(full)
+            queue.push_back(sid);
         live_texts[sid] = "";
         live_text_seqs[sid] = 0;
         stop_requested[sid] = false;
@@ -1192,16 +1586,32 @@ class SessionManager {
         fileio.mkdir(dir);
         save_session(sid);
 
+        if(full) {
+            if(prompt) {
+                turn_log_reset(sid, prompt);
+                push_event(s, "user", [text = prompt]);
+                push_event(s, "status", [status = "queued"]);
+                save_session(sid);
+            }
+
+            dispatch_queue();
+            return [ok = true, session = session_view(sid)];
+        }
+
         if(!spawn(sid)) {
             sessions.erase(sid);
+            dequeue(sid);
             return [ok = false, error = s.error];
         }
 
         if(prompt) {
             send_json(sid, [type = "prompt", text = prompt, reasoning_effort = s.reasoning_effort]);
-            s.status = "running";
+            // a spawn hook may already have set the status (a test fake); do not overwrite it
+            if(s.status == "starting")
+                s.status = "running";
+            turn_log_reset(sid, prompt);
             push_event(s, "user", [text = prompt]);
-            push_event(s, "status", [status = "running"]);
+            push_event(s, "status", [status = s.status]);
         }
 
         s.updated = std.millis();
@@ -1216,11 +1626,16 @@ class SessionManager {
         return [ok = true, session = session_view(sid)];
     }
 
-    send_prompt(sid, prompt, reasoning_effort = None) {
-        s = sessions[sid];
+// interactive = false: the prompt comes from the node itself (a goal run that is
+    // told to wrap up, an architecture job), not from a person
+    send_prompt(sid, prompt, reasoning_effort = None, interactive = true) {
+        s = session_record(sid);
 
         if(!s)
             return [ok = false, error = "unknown session"];
+
+        if(interactive)
+            last_interactive_ms = std.millis();
 
         if(deleting_sessions[sid])
             return [ok = false, error = "session deletion is in progress"];
@@ -1250,27 +1665,88 @@ class SessionManager {
 
         p = procs[sid];
 
-        if(!p || !p.running()) {
-            s.status = "starting";
+        // A prompt while the subprocess is generating updates its running task
+        // (miniagent.task_update); an interrupt would stop that task instead.
+        if(p && p.running()) {
+            send_json(sid, [type = "prompt", text = prompt, reasoning_effort = s.reasoning_effort]);
+
+            s.prompt = prompt;
+            live_texts[sid] = "";
+            live_text_seqs[sid] = s.seq;
+            s.chat_history_size_at_prompt = history.size();
+            s.status = "running";
+            s.updated = std.millis();
+            if(interactive)
+                last_interactive_ms = std.millis();
+            turn_log_reset(sid, prompt);
+            push_event(s, "user", [text = prompt]);
+            push_event(s, "status", [status = "running"]);
+            save_session(sid);
+
+            return [ok = true, session = session_view(sid)];
+        }
+
+        // The session is accepted but not started yet: the follow-up is part of the
+        // same task and is appended to the prompt that will run when a slot frees.
+        if(s.status == "queued") {
+            s.prompt = ws_str(s.prompt) ? ws_str(s.prompt) + "\n\n" + prompt : prompt;
+            s.chat_history_size_at_prompt = history.size();
+            s.updated = std.millis();
+            if(!queue_contains(sid))
+                queue.push_back(sid);
+
+            turn_log_reset(sid, s.prompt);
+            push_event(s, "user", [text = prompt]);
+            push_event(s, "status", [status = "queued"]);
+            save_session(sid);
+
+            dispatch_queue();
+            return [ok = true, session = session_view(sid)];
+        }
+
+        cs = std.critical_section_named("workspace_sessions");
+
+        if(active_count() >= max_sessions()) {
+            s.status = "queued";
+            s.prompt = prompt;
             s.attempts = 0;
             s.report = "";
             s.error = "";
+            s.chat_history_size_at_prompt = history.size();
+            s.updated = std.millis();
+            if(!queue_contains(sid))
+                queue.push_back(sid);
+            cs.release();
 
-            if(!spawn(sid)) {
+            turn_log_reset(sid, prompt);
+            push_event(s, "user", [text = prompt]);
+            push_event(s, "status", [status = "queued"]);
+            save_session(sid);
+
+            dispatch_queue();
+            return [ok = true, session = session_view(sid)];
+        }
+
+        cs.release();
+
+        s.status = "starting";
+        s.attempts = 0;
+        s.report = "";
+        s.error = "";
+
+        if(!spawn(sid)) {
             sessions.erase(sid);
+            dequeue(sid);
             return [ok = false, error = s.error];
         }
 
-            if(!pump_active[sid]) {
-                pump_active[sid] = true;
-                std.thread([this, sid]() {
-                    this.pump(sid);
-                }).run();
-            }
+        if(!pump_active[sid]) {
+            pump_active[sid] = true;
+            std.thread([this, sid]() {
+                this.pump(sid);
+            }).run();
         }
 
-        // A prompt while the subprocess is generating updates its running task
-        // (miniagent.task_update); an interrupt would stop that task instead.
         send_json(sid, [type = "prompt", text = prompt, reasoning_effort = s.reasoning_effort]);
 
         s.prompt = prompt;
@@ -1279,6 +1755,9 @@ class SessionManager {
         s.chat_history_size_at_prompt = history.size();
         s.status = "running";
         s.updated = std.millis();
+        if(interactive)
+            last_interactive_ms = std.millis();
+        turn_log_reset(sid, prompt);
         push_event(s, "user", [text = prompt]);
         push_event(s, "status", [status = "running"]);
         save_session(sid);
@@ -1287,7 +1766,7 @@ class SessionManager {
     }
 
     set_mode(sid, mode) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return [ok = false, error = "unknown session"];
@@ -1310,7 +1789,7 @@ class SessionManager {
     }
 
     set_reasoning_effort(sid, effort) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return [ok = false, error = "unknown session"];
@@ -1332,10 +1811,12 @@ class SessionManager {
     }
 
     stop_session(sid) {
-        s = sessions[sid];
+        s = session_record(sid);
 
         if(!s)
             return false;
+
+        dequeue(sid);
 
         if(s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped") {
             stop_requested[sid] = true;
@@ -1368,12 +1849,15 @@ class SessionManager {
                 p.kill();
         }
 
+        // the stopped session frees its slot: a queued task can start now
+        dispatch_queue();
+
         return true;
     }
 
     pump(sid) {
         for(1) {
-            s = sessions[sid];
+            s = session_record(sid);
 
             if(!s)
                 break;
@@ -1463,12 +1947,20 @@ class SessionManager {
 
                 s.status = "running";
                 s.updated = std.millis();
-                e = push_event(s, "delta", [action = action]);
+                clipped = ws_clip_event_action(action);
+                e = push_event(s, "delta", [action = clipped]);
+                turn_log_add(sid, clipped);
+                streamed = !std.is_none(action.text) || !std.is_none(action.reasoning);
+
                 if(!std.is_none(action.text)) {
                     live_texts[sid] = ws_str(live_texts[sid]) + ws_str(action.text);
                     live_text_seqs[sid] = e.seq;
                 }
-                save_session(sid);
+
+                if(streamed)
+                    save_session_lazy(sid);
+                else
+                    save_session(sid);
             }
             else if(type == "stats") {
                 s.token_usage = std.int(data.token_usage);
@@ -1487,7 +1979,9 @@ class SessionManager {
                 ];
 
                 s.updated = std.millis();
-                push_event(s, "file", f.copy());
+                // (the event says that a file went out, not the file: the data is megabytes)
+                push_event(s, "file", [name = f.name, bytes = f.bytes, caption = f.caption]);
+                turn_log_push(sid, [kind = "notice", text = "sent the file " + f.name + " (" + std.string(f.bytes) + " bytes)" + (f.caption ? ": " + f.caption : "")]);
                 save_session(sid);
                 file_event(f);
             }
@@ -1496,6 +1990,7 @@ class SessionManager {
 
                 s.updated = std.millis();
                 push_event(s, "notify", [message = msg]);
+                turn_log_push(sid, [kind = "notice", text = "notification: " + msg]);
                 save_session(sid);
                 notify_user(msg);
             }
@@ -1627,7 +2122,7 @@ class SessionManager {
 
             if(state == "running")
                 active_tasks.push_back(info);
-            else if(state == "planned")
+            else if(state == "planned" || state == "queued")
                 tasks_scheduled.push_back(info);
             else if(state == "finished")
                 tasks_finished.push_back(info);
@@ -1667,7 +2162,7 @@ class SessionManager {
             if(s.workspace_id != workspace_id)
                 continue;
 
-            if(s.status == "starting" || s.status == "running" || s.status == "waiting") {
+            if(s.status == "queued" || s.status == "starting" || s.status == "running" || s.status == "waiting") {
                 try {
                     if(stop_session(k))
                         stopped++;
@@ -1719,7 +2214,7 @@ class SessionManager {
 
     // One terminal event per task turn. The durable result is written first,
     // the SSE `done` event follows, and listeners are notified at most once.
-    finish_terminal(s, status, report, error = "") {
+    finish_terminal(s, status, report, error = "", dispatch_next = true) {
         if(terminal_reported[s.id])
             return false;
 
@@ -1738,6 +2233,10 @@ class SessionManager {
         save_session(s.id);
         emit_finished_task(s);
 
+        // A terminal turn frees its slot: the next accepted task starts now.
+        if(dispatch_next)
+            dispatch_queue();
+
         return true;
     }
 
@@ -1749,7 +2248,9 @@ class SessionManager {
 
         task = [
             taskid = s.id,
+            workspace_id = s.workspace_id,
             name = s.title,
+            origin = ws_str(s.origin),
             state = host_state(s.status),
             report = s.report,
             error = s.error,
@@ -1770,21 +2271,37 @@ class SessionManager {
         }
     }
 
+    // What the goal scheduler asks before it starts background work.
+    // interactive_idle_secs: seconds since a person last asked for something, a huge
+    // number when nobody has since the node started. (It was a constant 0, which the
+    // scheduler read as "someone is typing right now": with the template's
+    // yield_after_interactive = 10m no scheduled goal ever started, only urgent ones.)
     capacity() {
+        idle = 1000000000;
+
+        if(last_interactive_ms)
+            idle = math.max(0, std.int((std.millis() - last_interactive_ms) / 1000));
+
         return [
             workers = max_sessions(),
             busy = active_count(),
-            interactive_idle_secs = 0,
+            queued = queued_count(),
+            interactive_idle_secs = idle,
         ];
     }
 
     stats() {
         active = 0;
         running = 0;
+        total = 0;
         tokens = [];
         session_status = std.json();
 
         for(k, s : sessions) {
+            if(!s)
+                continue;
+
+            total++;
             session_status[k] = s.status;
             if(s.status == "starting" || s.status == "running" || s.status == "waiting")
                 active++;
@@ -1799,7 +2316,8 @@ class SessionManager {
 
         return [
             active_sessions = active,
-            total_sessions = sessions.size(),
+            queued_sessions = queued_count(),
+            total_sessions = total,
             running_processes = running,
             token_usage = tokens,
             session_status = session_status,
@@ -1862,12 +2380,12 @@ class Workspace {
         }
     }
 
-    add_task(name, goal, role = "adaptive") {
+    add_task(name, goal, role = "adaptive", origin = "") {
         role = ws_str(role, "adaptive");
         if(!role)
             role = "adaptive";
 
-        res = manager.create_session(id, ws_str(name), "normal", ws_str(goal), role, "medium");
+res = manager.create_session(id, ws_str(name), "normal", ws_str(goal), role, "medium", ws_str(origin));
 
         if(res.ok && std.is_json(res.session))
             return ws_str(res.session.id);
@@ -1875,8 +2393,10 @@ class Workspace {
         return "";
     }
 
+    // (the workspace's own callers: its goal scheduler and architecture board;
+    // a person's follow-up goes through SessionManager.send_prompt directly)
     update_task(taskid, message) {
-        res = manager.send_prompt(ws_str(taskid), ws_str(message));
+        res = manager.send_prompt(ws_str(taskid), ws_str(message), None, false);
         return res.ok ? true : false;
     }
 
@@ -1976,6 +2496,243 @@ class Workspace {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  LiveFeed — one change counter for the web interface (GET /api/live)
+//
+//  The dashboard used to ask for the stats, the notifications and the task list
+//  on timers and to rebuild what it showed. Now it holds one long-poll per node:
+//  the feed looks at the state every WS_LIVE_TICK_MS and counts `rev` up when
+//  something the dashboard shows has changed (a session's status / title /
+//  tokens, the workspace list, the settings, a notification, the goals of a
+//  workspace that is being watched). The request returns as soon as `rev` differs
+//  from the one the page has, so the page redraws only then, and only what
+//  changed. It works the same through the ShizoNet tunnel (ai_api), which is how
+//  the dashboard of one node follows the others.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class LiveFeed {
+    registry = None;
+    running = true;
+    thread = None;
+    rev = 1;
+    base_sig = "";
+    tree_rev = 1;
+    tree_sig = "";
+    notify_count = 0;
+    goals = [];         // workspace id -> [rev, sig, seen, checked]
+    extra = None;       // a function -> json merged into every answer (Node: the peers)
+    extra_sig = "";
+
+    __init__(_registry) {
+        registry = _registry;
+        running = true;
+        rev = 1;
+        base_sig = "";
+        tree_rev = 1;
+        tree_sig = "";
+        notify_count = 0;
+        goals = [];
+        extra = None;
+        extra_sig = "";
+
+        // the first look is not a change: the state at the start is rev 1
+        try {
+            tick();
+        } catch(e) {}
+        rev = 1;
+
+        t = std.thread([this]() { this.loop(); });
+        t.run();
+        thread = t;
+    }
+
+    stop() {
+        running = false;
+
+        if(thread) {
+            try {
+                thread.join();
+            } catch(e) {}
+            thread = None;
+        }
+
+        return true;
+    }
+
+    // what the sidebar shows of a session; `updated` is left out on purpose (it
+    // moves with every streamed token)
+    sessions() {
+        out = [];
+
+        for(k, s : registry.manager.sessions) {
+            out.push_back([
+                id = s.id,
+                workspace_id = s.workspace_id,
+                title = s.title,
+                status = s.status,
+                mode = s.mode,
+                token_usage = s.token_usage,
+                created = s.created,
+            ]);
+        }
+
+        return out;
+    }
+
+    watch(workspace_id) {
+        id = ws_str(workspace_id);
+
+        if(!id)
+            return 0;
+
+        if(!goals.has(id))
+            goals[id] = [rev = 1, sig = "", seen = std.millis_steady(), checked = 0];
+
+        goals[id].seen = std.millis_steady();
+
+        if(!goals[id].checked)
+            check_goals(id);
+
+        return std.int(goals[id].rev);
+    }
+
+    check_goals(id) {
+        g = goals[id];
+        g.checked = std.millis_steady();
+        sig = "";
+
+        try {
+            sch = registry.scheduler(id);
+
+            if(sch)
+                sig = std.string(sch.overview());
+        } catch(e) {
+            sig = "error: " + ws_str(e);
+        }
+
+        if(sig != g.sig) {
+            g.sig = sig;
+            g.rev = std.int(g.rev) + 1;
+            return true;
+        }
+
+        return false;
+    }
+
+    tick() {
+        changed = false;
+
+        // the workspace list: its own counter, the page reloads the tree on it
+        tsig = std.string(registry.store.list());
+
+        if(tsig != tree_sig) {
+            tree_sig = tsig;
+            tree_rev++;
+            changed = true;
+        }
+
+        sig = std.string(sessions()) + std.string(registry.store.settings()) + std.string(registry.manager.notifications.size());
+
+        if(extra) {
+            try {
+                sig += std.string(extra());
+            } catch(e) {}
+        }
+
+        if(sig != base_sig) {
+            base_sig = sig;
+            changed = true;
+        }
+
+        now = std.millis_steady();
+        drop = [];
+
+        for(id, g : goals) {
+            if(now - std.int(g.seen) > WS_LIVE_WATCH_MS) {
+                drop.push_back(id);
+                continue;
+            }
+
+            if(now - std.int(g.checked) >= WS_LIVE_GOALS_MS) {
+                if(check_goals(id))
+                    changed = true;
+            }
+        }
+
+        for(id : drop)
+            goals.erase(id);
+
+        if(changed)
+            rev++;
+
+        return changed;
+    }
+
+    loop() {
+        for(this.running) {
+            try {
+                tick();
+            } catch(e) {
+                std.error("[workspaces] live feed failed: ", e);
+            }
+
+            std.sleep(WS_LIVE_TICK_MS);
+        }
+    }
+
+    snapshot(workspace_id = "") {
+        out = [
+            rev = rev,
+            tree_rev = tree_rev,
+            sessions = sessions(),
+            stats = registry.manager.stats(),
+            settings = registry.store.settings(),
+            notifications = registry.manager.notifications.size(),
+            goals_rev = 0,
+        ];
+
+        id = ws_str(workspace_id);
+
+        if(id && goals.has(id))
+            out.goals_rev = std.int(goals[id].rev);
+
+        if(extra) {
+            try {
+                add = extra();
+
+                if(std.is_json(add)) {
+                    for(k, v : add)
+                        out[k] = v;
+                }
+            } catch(e) {}
+        }
+
+        return out;
+    }
+
+    // Blocks until the state differs from `since` (or wait_ms passed).
+    wait(since, wait_ms, workspace_id = "", alive = None) {
+        since = std.int(since);
+        wait_ms = std.int(wait_ms);
+
+        if(wait_ms > WS_LIVE_WAIT_MAX_MS)
+            wait_ms = WS_LIVE_WAIT_MAX_MS;
+
+        watch(workspace_id);
+        deadline = std.millis_steady() + wait_ms;
+
+        for(this.running && rev == since && std.millis_steady() < deadline) {
+            if(alive && !alive())
+                break;
+
+            std.sleep(50);
+        }
+
+        watch(workspace_id);
+        return snapshot(workspace_id);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  WorkspaceRegistry — all workspaces, one SessionManager, one store
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1985,14 +2742,18 @@ class WorkspaceRegistry {
     workspaces = [];
     cfg_spec = "";
     token = "";
+    live = None;        // LiveFeed, made by the first /api/live request
+    adopted = [];       // id -> record of a workspace outside the store (the node's own)
 
-    __init__(_cfg_spec, _token = "") {
+    __init__(_cfg_spec, _token = "", _root = "", _projects_dir = "") {
         cfg_spec = ws_config_spec_absolute(_cfg_spec);
         token = ws_str(_token);
 
-        store = WorkspaceStore();
+        store = WorkspaceStore(_root, _projects_dir);
         manager = SessionManager(store, cfg_spec, token);
         workspaces = [];
+        live = None;
+        adopted = [];
 
         for(rec : store.list())
             ensure(rec);
@@ -2014,6 +2775,34 @@ class WorkspaceRegistry {
         workspaces[id] = w;
 
         return w;
+    }
+
+    // A workspace that is not in the store (the node's own one, id "node"): it gets
+    // sessions, goals, an architecture board and every API route like the others,
+    // but it is not part of the project tree and cannot be removed.
+    adopt(record) {
+        rec = std.is_json(record) ? record.copy() : [];
+        id = ws_str(rec.id);
+
+        if(!id || !ws_str(rec.path))
+            return None;
+
+        adopted[id] = rec;
+        return ensure(rec);
+    }
+
+    // the record of a workspace by id: a project of the store or an adopted one
+    record(id) {
+        id = ws_str(id);
+        rec = store.get(id);
+
+        if(rec)
+            return rec;
+
+        if(adopted.has(id))
+            return adopted[id].copy();
+
+        return None;
     }
 
     get(id) {
@@ -2052,6 +2841,9 @@ class WorkspaceRegistry {
 
         if(id == "root")
             return [ok = false, error = "the root workspace cannot be deleted", code = 409];
+
+        if(adopted.has(id))
+            return [ok = false, error = "the node's own workspace cannot be removed", code = 409];
 
         w = get(id);
 
@@ -2138,8 +2930,22 @@ class WorkspaceRegistry {
         return started;
     }
 
+    live_feed() {
+        if(!live)
+            live = LiveFeed(this);
+
+        return live;
+    }
+
     stop() {
         stopped = 0;
+
+        if(live) {
+            try {
+                live.stop();
+            } catch(e) {}
+            live = None;
+        }
 
         for(k, w : workspaces)
             stopped += w.stop();
@@ -2289,7 +3095,56 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
             workspaces = ctx.store.list(),
             settings = ctx.store.settings(),
             stats = ctx.manager.stats(),
+            projects_dir = ctx.store.projects_dir,
+            general = ctx.record("node"),
         ]);
+    });
+
+    // GET /api/tasks/overview: the goals and the sessions of every workspace of this
+    // node in one answer (the "All tasks" view; one call per node instead of one per
+    // workspace, which matters when the node is asked over ShizoNet).
+    server.route("GET", "^/api/tasks/overview$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        out = [];
+
+        for(w : ctx.list()) {
+            if(w.id == "root")
+                continue;
+
+            goals = [];
+
+            if(w.scheduler) {
+                try {
+                    goals = w.scheduler.overview();
+                } catch(e) {
+                    std.error("[workspaces] goals overview failed: ", e);
+                }
+            }
+
+            out.push_back([
+                id = w.id,
+                name = w.name,
+                goals = goals,
+                sessions = ctx.manager.host_tasks(w.id),
+            ]);
+        }
+
+        return node_api_ok([workspaces = out]);
+    });
+
+    // GET /api/live?since=<rev>&wait=<ms>&workspace=<id>: the change feed (LiveFeed).
+    // Answers at once when the page is behind, otherwise when something changes.
+    server.route("GET", "^/api/live$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        since = node_api_int(req.query_params, "since", 0);
+        wait_ms = node_api_int(req.query_params, "wait", 0);
+        workspace_id = node_api_get(req.query_params, "workspace");
+
+        return node_api_ok(ctx.live_feed().wait(since, wait_ms, workspace_id));
     });
 
     server.route("POST", "^/api/workspaces$", [ctx, token](req, writer) {
@@ -2363,7 +3218,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
             return node_api_err("Unauthorized", 401);
 
         workspace_id = std.string(req.matches[0]);
-        w = ctx.store.get(workspace_id);
+        w = ctx.record(workspace_id);
 
         if(!w)
             return node_api_err("unknown workspace", 404);
@@ -2422,7 +3277,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
 
         workspace_id = std.string(req.matches[0]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         return node_api_ok(ctx.manager.list_sessions(workspace_id));
@@ -2434,7 +3289,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
 
         workspace_id = std.string(req.matches[0]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         body = node_api_body(req);
@@ -2451,7 +3306,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         if(!workspaces_get_scheduler(ctx, workspace_id))
             return node_api_err("workspace goal scheduler unavailable", 409);
 
-        res = ctx.manager.create_session(workspace_id, title, mode, prompt, role, reasoning_effort);
+        res = ctx.manager.create_session(workspace_id, title, mode, prompt, role, reasoning_effort, "web");
 
         if(!res.ok)
             return node_api_err(res.error, 409);
@@ -2591,7 +3446,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
 
         workspace_id = std.string(req.matches[0]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         scheduler = workspaces_get_scheduler(ctx, workspace_id);
@@ -2633,7 +3488,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
 
         workspace_id = std.string(req.matches[0]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         body = node_api_body(req);
@@ -2656,7 +3511,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         if(!workspaces_get_scheduler(ctx, workspace_id))
             return node_api_err("workspace goal scheduler unavailable", 409);
 
-        res = ctx.manager.create_session(workspace_id, name, mode, goal, role);
+        res = ctx.manager.create_session(workspace_id, name, mode, goal, role, "medium", "web");
 
         if(!res.ok)
             return node_api_err(res.error, 409);
@@ -2675,7 +3530,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
 
         workspace_id = std.string(req.matches[0]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         scheduler = workspaces_get_scheduler(ctx, workspace_id);
@@ -2710,7 +3565,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         workspace_id = std.string(req.matches[0]);
         goal_id = std.string(req.matches[1]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         scheduler = workspaces_get_scheduler(ctx, workspace_id);
@@ -2732,7 +3587,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         workspace_id = std.string(req.matches[0]);
         goal_id = std.string(req.matches[1]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         body = node_api_body(req);
@@ -2759,7 +3614,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         workspace_id = std.string(req.matches[0]);
         goal_id = std.string(req.matches[1]);
 
-        if(!ctx.store.get(workspace_id))
+        if(!ctx.record(workspace_id))
             return node_api_err("unknown workspace", 404);
 
         res = workspaces_delete_goal(ctx, workspace_id, goal_id);
@@ -2863,10 +3718,15 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
             history = [];
         }
 
+        // after the file read (it suspends): the turn log and the seq of one moment
         live = ctx.manager.session_live_state(sid);
+        now_s = ctx.manager.get_session(sid);
         s.chat_history = history;
         s.live_text = live.text;
         s.live_text_seq = live.seq;
+        s.turn = ctx.manager.turn_log(sid);
+        s.turn_seq = now_s ? now_s.seq : s.seq;
+        s.status = now_s ? now_s.status : s.status;
         return node_api_ok(s);
     });
 
@@ -2946,7 +3806,53 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
         return node_api_ok([session_id = sid, status = "stopped"]);
     });
 
-    server.route("GET", "^/api/sessions/([0-9a-zA-Z_-]+)/stream$", [ctx, token](req, writer) {
+    // GET /api/sessions/<id>/events?since=<seq>&wait=<ms>: the events after `since` as
+    // JSON. The twin of /stream for a caller without a streaming connection: the
+    // dashboard of another node asks through ShizoNet. With `wait` the answer is held
+    // back until there is an event or the session ends.
+    server.route("GET", "^/api/sessions/([0-9a-zA-Z_-]+)/events$", [ctx, token](req, writer) {
+        if(!node_api_authorized(req, token))
+            return node_api_err("Unauthorized", 401);
+
+        sid = std.string(req.matches[0]);
+        since = node_api_int(req.query_params, "since", 0);
+        wait_ms = node_api_int(req.query_params, "wait", 0);
+
+        if(wait_ms > WS_EVENTS_WAIT_MAX_MS)
+            wait_ms = WS_EVENTS_WAIT_MAX_MS;
+
+        deadline = std.millis_steady() + wait_ms;
+
+        for(1) {
+            s = ctx.manager.get_session(sid);
+
+            if(!s)
+                return node_api_err("unknown session", 404);
+
+            out = [];
+
+            for(e : ctx.manager.session_events(sid)) {
+                if(e.seq > since)
+                    out.push_back(e);
+            }
+
+            terminal = s.status == "done" || s.status == "failed" || s.status == "question" || s.status == "stopped";
+
+            if(out.size() || terminal || std.millis_steady() >= deadline) {
+                return node_api_ok([
+                    session_id = sid,
+                    status = s.status,
+                    seq = s.seq,
+                    terminal = json.bool(terminal),
+                    events = out,
+                ]);
+            }
+
+            std.sleep(WS_STREAM_POLL_MS);
+        }
+    });
+
+    api_route_stream(server, "GET", "^/api/sessions/([0-9a-zA-Z_-]+)/stream$", [ctx, token](req, writer) {
         if(!node_api_authorized(req, token)) {
             writer.write_header(401, "application/json; charset=utf-8", node_api_headers());
             writer.write(std.string([ok = json.bool(false), error = "Unauthorized"]));
@@ -2994,7 +3900,7 @@ workspaces_api_register(server, cfg, api_token, registry = None) {
                     last_seq = e.seq;
                     payload = e.copy();
                     payload.erase("type");
-                    writer.write_sse(std.string(payload), std.string(e.type));
+                    writer.write_sse(payload.compact_string(), std.string(e.type));
                     sent = true;
                 }
             }

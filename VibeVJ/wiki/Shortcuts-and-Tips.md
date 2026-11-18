@@ -193,6 +193,21 @@ More in [Clipview](Clipview.md) and [CueList](CueList.md).
 
 More in [Timeline](Timeline.md).
 
+## 3D views
+
+The [Stage](Stage.md) menu, the 3D view of the [fixture setup](Output-and-Devices.md#the-stage-in-3d) and the 3D plan
+of the Phaser: the mouse as in Fusion and other CAD programs.
+
+| Gesture | Does |
+|---|---|
+| Right mouse button drag | Turns the view. |
+| Middle mouse button drag | Moves the view. |
+| Mouse wheel | Zooms. |
+| Click / drag an object or a lamp (left button) | Selects it / moves it at its height. Shift + drag: up and down. |
+| Drag on the empty stage (left button) | Stage menu: a box that selects what is in it (Shift: adds). A click there selects none. |
+| Right click without moving | As before: takes away what is being placed (Stage menu), goes back to the start (Phaser). |
+| F | Shows the selection (or everything). |
+
 ## Help window
 
 | Gesture | Does |

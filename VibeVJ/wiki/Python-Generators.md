@@ -30,6 +30,7 @@ They are in the *Assets* tab under `Generators` › `Python`. Drag one into a Pa
 | *LFO* | A wave in Python: *Shape* (Sine, Triangle, Saw, Square, Noise), *Rate* per beat, *Depth*, *Free* (its own time instead of the beat), *Reset*. Sends *Value* and *Circle* (a point that goes round). |
 | *AverageColour* | Link a picture into *In*: sends its average *Colour*, its *Brightness* and the *Spread* (the share brighter than the average). *Follow* below 1 smooths them. |
 | *Threshold* | Link a picture into *In*: *Out* is the picture where it is brighter than *Threshold*, in *Colour*, with a soft edge (*Softness*); *Invert* turns it round. *Coverage* is the share that is on. |
+| *CrowdMotion* | Link a camera on the crowd into *In*: *Motion* is how much it moves now, *Activity* over the last *Slow* seconds, *Burst* flashes when the movement jumps (hands up on a drop). Light of the show does not count (*Light compensation*). *Area* picks the part of the picture with the crowd, *Out* shows the moving pixels. Link *Motion* into *Crowd* of the [Director](Assets.md#director). Uses numpy. |
 | *Edges* | Link a picture into *In*: *Out* shows its outlines in *Colour* (*Gain*, *Threshold*; *Underlay* puts the picture under them). *Amount* is the share that is an edge. Uses numpy: the first time it installs it (see [Dependencies](#dependencies)). |
 
 Open the files (`src/__init__.py` inside the asset) to see how they are written.

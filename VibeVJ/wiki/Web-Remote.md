@@ -156,6 +156,13 @@ without waiting for it, and turned into a JPEG on a thread of its own, so the fr
 phone. The preview settings belong to this computer, not to the project. The picture is about 5 to 30 KB; at 5
 pictures a second that is less than 150 KB a second of the Wi-Fi.
 
+## Cue call for the crews
+
+The address of the remote with `/cuecall` at the end (for example `http://192.168.1.20:13350/cuecall`) is the
+[cue call](Lighting-Desk.md#cue-call) of the lighting desk: per crew (Lighting, Video, SFX, Laser) the next cue of the
+master deck in bars.beats, *STANDBY*, 3, 2, 1 and a green *GO* on the beat. Pair the phone on the remote first (the
+page uses its token); pick a crew at the top to see it big. The page only reads, it changes nothing.
+
 ## How the changes count
 
 The remote sets values as a MIDI controller does:
@@ -177,7 +184,9 @@ The remote sets values as a MIDI controller does:
 - The remote uses plain HTTP, like most stage equipment. Anyone who can read the traffic of the Wi-Fi can read the
   pairing of a phone. For shows where that matters, use a network of your own (a small router for VibeVJ and the
   phones), not the Wi-Fi of the venue.
-- Reaching the remote from outside the local network (over the internet, through a server) is not part of it yet.
+- The remote is for the local network only (decided 2026-11-04, #359). Reaching it from outside works only through your
+  own port forwarding, VPN or proxy, which VibeVJ does not set up or support. A ShizoScript relay server for remote access
+  may come later.
 
 ## When it does not work
 

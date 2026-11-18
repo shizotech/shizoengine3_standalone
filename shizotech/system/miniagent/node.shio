@@ -1,34 +1,34 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  node.shio — the Node runtime: workspaces, task routing, ShizoNet/API host
+//  node.shio — the command line of a Node (the class is in node_lib.shio)
 //
-//  Usage:   shz node.shio                       interactive (shizonet is on too)
-//           shz node.shio --interactive --config gpu
-//           shz node.shio --name Box --description "GPU box"   headless AI node
-//           shz node.shio --webserver --port 13337             + JSON web API
-//           shz node.shio --web [--port 13337]                 + the web interface
-//           shz node.shio --port 13337 --api-token secret
-//           shz node.shio --agentspace .agentspace             scheduled goals
-//           shz node.shio --init                               register cwd workspace
+//  Usage:   shz miniagent --node                       a node on ShizoNet (headless)
+//           shz miniagent --node --web [--port 13337]  ... with the web interface
+//           shz miniagent --node --webserver --port N  ... with the JSON API only
+//           shz miniagent --node --interactive         ... with a console
+//           shz miniagent --init [<dir>] [--name X]    register a directory as a
+//                                                      workspace, then return
+//           (shz miniagent.node ... is the same without the --node flag)
 //
-//  The Node owns all Workspace objects through a WorkspaceRegistry, the node's
-//  own root Workspace, the receptionist connector, the ShizoNet AI service and
-//  the optional web UI / JSON API. Workspace subprocesses get a config spec,
-//  never a saved endpoint/token file.
+//  Options: --name <node name>  --description <text>
+//           --config <name|path[#profile]>   the model of the workers
+//           --workspace <dir>                register <dir> as a workspace at start
+//                                            (may be given several times)
+//           --api-token <t>                  token of the HTTP API / the web pages
+//           --agentspace <dir> | --no-goals  the node's own scheduled goals
+//           --data-dir <dir>                 storage root instead of
+//                                            std.user_path()/miniagent
+//           --no-gateway                     do not start the Telegram gateway
+//                                            that is set up in the web interface
+//           and the model config flags: --list-configs, --new-config,
+//           --save-config, --config-url / -token / -model ...
 //
-//  Model configs:
-//           --config <name|path[#profile]>
-//           --receptionist-config <name|path[#profile]>
-//           --worker-config <name|path[#profile]>
-//           and the --new-* / --save-* variants
+//  A node uses the workspaces that are registered on this machine
+//  (std.user_path()/miniagent/workspaces): --init, --workspace or the web
+//  interface add one. A workspace created without a path gets a new folder
+//  ./workspaces/<name> below the directory the node was started in.
 // ═════════════════════════════════════════════════════════════════════════════
 
-#include "miniagent"
-#include "workspaces"
-#include "mcp/mcp_server"
-#include "web_ui"
-#include "shizonet_ai"
-#include "model_config_cli"
-#include "goal_engine"
+#include "node_lib"
 
 node_flag_present(flag) {
     for(_i = 1; _i < std.argc(); _i++) {
@@ -41,42 +41,39 @@ node_flag_present(flag) {
     return false;
 }
 
-// shz miniagent --init / shz miniagent.node --init: register the current
-// directory as a real workspace under the registry root and initialize it.
-// It does not load a model config, start ShizoNet, goals, the web UI or workers.
-node_init_workspace() {
-    cwd = fileio.absolute_path(std.string(std.wd() ?? ""));
+// every value of a flag that may be given several times (--workspace a --workspace=b)
+node_flag_values(flag) {
+    out = [];
 
-    if(!cwd) {
-        std.error("[miniagent] --init: could not resolve the current directory");
-        return false;
+    for(_i = 1; _i < std.argc(); _i++) {
+        a = std.string(std.argv(_i) ?? "");
+
+        if(a.starts(flag + "=")) {
+            out.push_back(a.substr(flag.length() + 1));
+        } else if(a == flag && _i + 1 < std.argc()) {
+            v = std.string(std.argv(_i + 1) ?? "");
+
+            if(v && !v.starts("--"))
+                out.push_back(v);
+        }
     }
 
-    name = fileio.file_name(cwd);
+    return out;
+}
 
-    if(!name)
-        name = "Workspace";
+// --init, --init <dir>, --init=<dir>: the directory ("" = the current one)
+node_init_dir() {
+    v = node_flag_values("--init");
+    return v.size() ? std.string(v[0]) : "";
+}
 
-    store = WorkspaceStore();
-    res = store.create(name, cwd, "root", "Initialized by shz miniagent --init");
-
-    if(!res.ok) {
-        std.error("[miniagent] --init failed: ", res.error);
-        return false;
-    }
-
+node_print_registered(res, how) {
     w = res.workspace;
 
     if(res.reused)
-        std.print("Workspace already registered: " + std.string(w.id) + " (" + std.string(w.path) + ")");
+        std.print("Workspace already registered: " + std.string(w.name) + " [" + std.string(w.id) + "] " + std.string(w.path));
     else
-        std.print("Workspace registered: " + std.string(w.id) + " (" + std.string(w.path) + ")");
-
-    if(fileio.exists(w.path + "/AGENTS.md"))
-        std.print("Initialized .megamind and .agentspace; AGENTS.md is present.");
-    else
-        std.print("Initialized .megamind and .agentspace; AGENTS.md was not created.");
-    return true;
+        std.print("Workspace registered" + how + ": " + std.string(w.name) + " [" + std.string(w.id) + "] " + std.string(w.path));
 }
 
 node_value_flags() {
@@ -88,6 +85,9 @@ node_value_flags() {
         "--max-workers",
         "--workers",
         "--agentspace",
+        "--workspace",
+        "--data-dir",
+        "--init",
     ];
 }
 
@@ -103,69 +103,20 @@ node_get_int_option(flag_a, flag_b = None, def = 0) {
     return def;
 }
 
-node_has_headless_identity() {
-    name_opt = std.argvoption("--name");
-    desc_opt = std.argvoption("--description");
-
-    if(name_opt)
-        return true;
-    if(desc_opt)
-        return true;
-
-    return false;
-}
-
 // --web: the web interface (web_ui.shio), the JSON API is part of it
 node_is_web_ui_mode() {
     return web_ui_parse(web_ui_args()).web;
 }
 
-node_is_web_mode() {
+// --webserver / --port without --web: the JSON API only
+node_is_api_mode() {
     if(node_is_web_ui_mode())
-        return true;
+        return false;
 
     if(model_config_cli_has_flag("--webserver"))
         return true;
 
-    port_opt = std.argvoption("--port");
-
-    if(port_opt)
-        return true;
-
-    return false;
-}
-
-node_is_interactive_mode() {
-    if(model_config_cli_has_flag("--interactive"))
-        return true;
-
-    if(std.argc() == 1)
-        return true;
-
-    if(node_is_web_mode())
-        return false;
-
-    if(node_has_headless_identity())
-        return false;
-
-    prompt = model_config_cli_positional_prompt(node_value_flags());
-
-    if(prompt)
-        return false;
-
-    return true;
-}
-
-node_same_spec(a, b) {
-    sa = "";
-    sb = "";
-
-    if(a)
-        sa = std.string(a);
-    if(b)
-        sb = std.string(b);
-
-    return sa == sb;
+    return std.argvoption("--port") ? true : false;
 }
 
 // Resolve a CLI config spec to an absolute file path plus its #profile.
@@ -186,7 +137,7 @@ node_config_spec(spec) {
 
 last_state = "";
 
-mind_host_print(action) {
+node_console_print(action) {
     if(action.text) {
         if(last_state != "text")
             last_state = "text";
@@ -204,6 +155,7 @@ mind_host_print(action) {
     }
 
     if(action.tool_start) {
+        last_state = "tool";
         stdfcol("yellow");
         std.cout("\n\n[TOOL] ", action.tool_start.name, "\n");
         stdfcol("white");
@@ -225,7 +177,7 @@ node_goals_root() {
 
 node_print_goals(sch) {
     if(!sch) {
-        std.cout("Goals are off. Create them with: shz miniagent.goals init (then restart the node)\n");
+        std.cout("Goals are off (--no-goals).\n");
         return;
     }
 
@@ -252,770 +204,167 @@ node_print_goals(sch) {
     }
 }
 
-node_host_help() {
+node_print_workspaces(node, current) {
+    for(w : node.workspaces_summary()) {
+        mark = (w.id == current) ? " *" : "  ";
+        std.cout(mark + " " + std.string(w.name) + "  [" + std.string(w.id) + "]  " + std.string(w.path) + "\n");
+    }
+}
+
+node_print_peers(node) {
+    if(!node.peers) {
+        std.cout("Not on ShizoNet.\n");
+        return;
+    }
+
+    list = node.peers.list();
+
+    if(!list.size()) {
+        std.cout("No other AI node or gateway on the network right now.\n");
+        return;
+    }
+
+    for(p : list)
+        std.cout("  " + (p.online ? "online " : "offline") + "  " + std.string(p.kind) + "  " + std.string(p.name) + "  " + std.string(p.ip) + "  " + std.string(p.model) + "\n");
+}
+
+node_console_help() {
     std.cout(
-        "\n/config                show receptionist + worker config paths\n" +
-        "/goals                scheduled goals\n" +
-        "/configs               list model configs\n" +
-        "/overview              all workspace tasks\n" +
-        "/status                workspace statistics\n" +
-        "/clear                 clear the receptionist transcript\n" +
+        "\n/workspaces            the workspaces of this node (* = the current one)\n" +
+        "/use <id|name>         the workspace plain text goes to (default: General)\n" +
+        "/overview              the tasks of every workspace\n" +
+        "/status                session statistics\n" +
+        "/goals                 the node's scheduled goals\n" +
+        "/nodes                 the other AI nodes and gateways on ShizoNet\n" +
+        "/config  /configs      the model config, the configs there are\n" +
         "/exit                  quit\n\n" +
-        "plain text is a request to the receptionist\n"
+        "plain text is a task for a worker in the current workspace\n"
     );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Receptionist — connector agent turn on the Node
-// ─────────────────────────────────────────────────────────────────────────────
-
-agent_task_result(agt) {
-    if(agt && std.is_json(agt.task_result))
-        return agt.task_result;
-
-    return None;
-}
-
-// Normalize one receptionist turn into the owner-facing envelope.
-node_turn_result(agent, res, crash = "", execution_time_ms = -1) {
-    out = res;
-
-    if(!std.is_json(out))
-        out = [ok = false, reports = []];
-
-    if(!std.is_json(out.reports))
-        out.reports = [];
-
-    if(execution_time_ms >= 0 && !out.has("execution_time_ms"))
-        out.execution_time_ms = execution_time_ms;
-
-    tr = agent_task_result(agent);
-
-    signal = "";
-    from_tool = true;
-    text = "";
-
-    if(tr) {
-        signal = std.string(tr.signal ?? "");
-        from_tool = tr.from_tool ? true : false;
-        if(tr.has("result"))
-            text = std.string(tr.result ?? "");
-    } else if(std.is_json(out)) {
-        signal = std.string(out.signal ?? "");
-        from_tool = out.has("from_tool") ? (out.from_tool ? true : false) : true;
-        if(out.has("result"))
-            text = std.string(out.result ?? "");
-    }
-
-    if(signal == "failed" && !from_tool)
-        out.stopped = true;
-
-    if(crash) {
-        out.ok = false;
-        out.error = crash;
-        out.reports = [[
-            report = "The node's receptionist crashed: " + crash,
-            time = std.millis(),
-            time_str = std.timestamp(),
-        ]];
-        return out;
-    }
-
-    if(text) {
-        out.ok = !(signal == "failed");
-        out.error = out.ok ? "" : text;
-        out.reports = [[
-            report = text,
-            time = std.millis(),
-            time_str = std.timestamp(),
-        ]];
-        return out;
-    }
-
-    if(agent && std.is_json(agent.env) && agent.env.has("reports") && std.is_json(agent.env.reports) && agent.env.reports.size()) {
-        out.ok = true;
-        out.reports = agent.env.reports.copy();
-        out.error = "";
-        return out;
-    }
-
-    if(!out.reports.size()) {
-        if(out.stopped)
-            out.reports = [[
-                report = "The receptionist turn was stopped.",
-                time = std.millis(),
-                time_str = std.timestamp(),
-            ]];
-        else
-            out.reports = [[
-                report = "The node's receptionist turn ended without a report: " + (out.error ?? ""),
-                time = std.millis(),
-                time_str = std.timestamp(),
-            ]];
-    }
-
-    return out;
-}
-
-class Receptionist {
-    model_config = None;
-    agent = None;
-    owner = None;
-    queue = [];
-    _active = false;
-    last_interactive_ms = 0;
-    updates = [];
-    running = true;
-    thread = None;
-
-    __init__(cfg, _owner = None) {
-        model_config = cfg;
-        owner = _owner;
-        queue = [];
-        _active = false;
-        last_interactive_ms = 0;
-        updates = [];
-        running = true;
-        thread = None;
-
-        agent = miniagent(cfg, "receptionist");
-         agent.set_reasoning_effort("low");
-         agent.env.mind = _owner;
-
-         // Read-only workspace questions: the receptionist reads the node's own
-         // workspace root, never the directory the node was launched from.
-         node_root = miniagent_node_root();
-         if(node_root && fileio.is_directory(node_root))
-             agent.filesystem = fileio.container(node_root);
-
-        rt = std.thread(this.loop);
-        rt.run();
-        thread = rt;
-    }
-
-    __deinit__() {
-        stop();
-    }
-
-    stop() {
-        running = false;
-
-        try {
-            agent.stop();
-        } catch(e) {}
-
-        if(thread) {
-            try {
-                thread.join();
-            } catch(e) {}
-        }
-
-        queue = [];
-        updates = [];
-        _active = false;
-
-        if(owner) {
-            owner._receptionist_active = false;
-            owner.request_queue = queue;
-        }
-
-        return true;
-    }
-
-    task_update(message) {
-        if(agent && agent.running)
-            agent.task_update(std.string(message));
-    }
-
-    update(message) {
-        if(!_active)
-            return false;
-
-        updates.push_back(std.string(message));
-
-        try {
-            agent.stop();
-        } catch(e) {}
-
-        return true;
-    }
-
-    request(prompt, on_finish = None, on_action = None, interactive = true) {
-        if(interactive)
-            last_interactive_ms = std.millis();
-
-        req = [
-            id = std.random_hash(),
-            prompt = std.string(prompt),
-            finished = false,
-            result = None,
-            on_finish_cb = on_finish,
-            on_action_cb = on_action,
-        ];
-
-        queue.push_back(req);
-
-        for(!req.finished)
-            std.sleep(100);
-
-        return req.result;
-    }
-
-    loop() {
-        for(this.running) {
-            if(!queue.size()) {
-                std.sleep(100);
-                continue;
-            }
-
-            req = queue[0];
-
-            try {
-                run_request(req);
-            } catch(e) {
-                std.error("[node] receptionist request failed: ", e);
-                req.result = [ok = false, error = std.string(e), reports = [[
-                    report = "The node's receptionist crashed: " + std.string(e),
-                    time = std.millis(),
-                    time_str = std.timestamp(),
-                ]]];
-            }
-
-            req.finished = true;
-            queue.erase(0);
-            std.sleep(10);
-        }
-    }
-
-    run_request(req) {
-        result = None;
-        crash = "";
-        start_ms = std.millis();
-
-        updates = [];
-        _active = true;
-
-        if(owner)
-            owner._receptionist_active = true;
-
-        try {
-            agent.on_action = req.on_action_cb;
-            agent.clear_chat();
-            result = agent.task(req.prompt);
-
-            for(updates.size() && this.running) {
-                msg = "";
-                for(i = 0; i < updates.size(); i++)
-                    msg += updates[i] + "\n\n";
-                updates = [];
-                result = agent.task("# Follow-up from the user\n" + msg.strip(), true);
-            }
-        } catch(e) {
-            crash = std.string(e);
-            std.error("[node] receptionist turn crashed: ", e);
-        }
-
-        updates = [];
-        _active = false;
-
-        if(owner)
-            owner._receptionist_active = false;
-
-        result = node_turn_result(agent, result, crash, std.millis() - start_ms);
-
-        if(req.on_finish_cb) {
-            try {
-                req.on_finish_cb(result);
-            } catch(e) {
-                std.error("[node] receptionist finish callback failed: ", e);
-            }
-        }
-
-        req.result = result;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Node — owns every Workspace, routes tasks, hosts ShizoNet and HTTP
-// ─────────────────────────────────────────────────────────────────────────────
-
-class Node {
-    cfg = None;
-    worker_cfg_spec = "";
-    max_workers = 1;
-    name = "";
-    description = "";
-    ai = None;
-    registry = None;
-    node_workspace = None;
-    receptionist = None;
-    web = None;
-    api = None;
-    goals = None;
-    running = true;
-
-    // compatibility fields for the old ShizoNet / node_api host shape
-    request_queue = [];
-    _receptionist_active = false;
-    worker_threads = [];
-
-    __init__(cfg, worker_cfg_spec, max_workers = 1, name = "", description = "") {
-        this.cfg = cfg;
-        this.worker_cfg_spec = std.string(worker_cfg_spec ?? "");
-        this.max_workers = std.int(max_workers);
-
-        if(this.max_workers <= 0)
-            this.max_workers = 1;
-
-        this.name = std.string(name ?? "");
-        this.description = std.string(description ?? "");
-
-        this.ai = None;
-        this.registry = None;
-        this.node_workspace = None;
-        this.web = None;
-        this.api = None;
-        this.goals = None;
-        this.running = true;
-        this.request_queue = [];
-        this._receptionist_active = false;
-        this.worker_threads = [];
-
-        this.receptionist = Receptionist(this.cfg, this);
-        this.request_queue = this.receptionist.queue;
-    }
-
-    ensure_workspace_registry() {
-        if(this.registry)
-            return this.registry;
-
-        this.registry = WorkspaceRegistry(this.worker_cfg_spec, "");
-
-        // The node's own Workspace lives at std.user_path()/miniagent/node, outside
-        // the userspace registry. It is the default target for node-level tasks and
-        // owns the node's .agentspace and .megamind/architecture.
-        node_record = [
-            id = "node",
-            name = this.name ? this.name : "Node",
-            path = miniagent_node_root(),
-            parent = "",
-            created = std.millis(),
-            description = this.description,
-        ];
-
-        this.node_workspace = Workspace(node_record, this.registry.manager, this.registry.cfg_spec, "");
-
-         if(this.node_workspace && this.node_workspace.path && this.receptionist && this.receptionist.agent)
-             this.receptionist.agent.filesystem = fileio.container(std.string(this.node_workspace.path));
-
-        if(this.node_workspace)
-            this.goals = this.node_workspace.scheduler;
-
-        return this.registry;
-    }
-
-    resolve_workspace(workspace_id) {
-        this.ensure_workspace_registry();
-
-        id = std.string(workspace_id ?? "");
-
-        if(!id || id == "node")
-            return this.node_workspace;
-
-        return this.registry.get(id);
-    }
-
-    add_task(name, goal, role = "adaptive", workspace_id = "") {
-        w = resolve_workspace(workspace_id);
-
-        if(!w)
-            return "";
-
-        return w.add_task(name, goal, role);
-    }
-
-    inspect_task(taskid) {
-        taskid = std.string(taskid ?? "");
-
-        if(this.node_workspace) {
-            info = this.node_workspace.inspect_task(taskid);
-
-            if(std.is_json(info) && info.ok) {
-                info.workspace_id = this.node_workspace.id;
-                return info;
-            }
-        }
-
-        registry = this.ensure_workspace_registry();
-
-        for(k, w : registry.list()) {
-            info = w.inspect_task(taskid);
-
-            if(std.is_json(info) && info.ok) {
-                info.workspace_id = w.id;
-                return info;
-            }
-        }
-
-        return "Not found.";
-    }
-
-    update_task(taskid, message) {
-        taskid = std.string(taskid ?? "");
-
-        if(this.node_workspace && this.node_workspace.update_task(taskid, message))
-            return true;
-
-        registry = this.ensure_workspace_registry();
-
-        for(k, w : registry.list()) {
-            if(w.update_task(taskid, message))
-                return true;
-        }
-
-        return false;
-    }
-
-    stop_task(taskid) {
-        taskid = std.string(taskid ?? "");
-
-        if(this.node_workspace && this.node_workspace.stop_task(taskid))
-            return true;
-
-        registry = this.ensure_workspace_registry();
-
-        for(k, w : registry.list()) {
-            if(w.stop_task(taskid))
-                return true;
-        }
-
-        return false;
-    }
-
-    get_overview() {
-        registry = this.ensure_workspace_registry();
-        all = [];
-
-        if(this.node_workspace)
-            all.push_back(this.node_workspace);
-
-        for(k, w : registry.list())
-            all.push_back(w);
-
-        active_tasks = [];
-        tasks_scheduled = [];
-        tasks_finished = [];
-        tasks_failed = [];
-
-        for(w : all) {
-            ov = w.get_overview();
-
-            for(t : ov.tasks) {
-                t.workspace_id = w.id;
-                active_tasks.push_back(t);
-            }
-
-            for(t : ov.tasks_scheduled) {
-                t.workspace_id = w.id;
-                tasks_scheduled.push_back(t);
-            }
-
-            for(t : ov.tasks_finished) {
-                t.workspace_id = w.id;
-                tasks_finished.push_back(t);
-            }
-
-            for(t : ov.tasks_failed) {
-                t.workspace_id = w.id;
-                tasks_failed.push_back(t);
-            }
-        }
-
-        return [
-            tasks = active_tasks,
-            tasks_scheduled = tasks_scheduled,
-            tasks_finished = tasks_finished,
-            tasks_failed = tasks_failed,
-        ];
-    }
-
-    tasks() {
-        ov = get_overview();
-        out = [];
-
-        for(t : ov.tasks)
-            out.push_back(t);
-        for(t : ov.tasks_scheduled)
-            out.push_back(t);
-        for(t : ov.tasks_finished)
-            out.push_back(t);
-        for(t : ov.tasks_failed)
-            out.push_back(t);
-
-        return out;
-    }
-
-    request(prompt, on_finish = None, on_action = None) {
-        return receptionist.request(prompt, on_finish, on_action, true);
-    }
-
-    update_receptionist(message) {
-        if(!receptionist)
-            return false;
-
-        return receptionist.update(message);
-    }
-
-    notify_user(msg) {
-        registry = this.ensure_workspace_registry();
-
-        if(!registry || !registry.manager)
-            return [ok = false, error = "no workspace manager"];
-
-        return registry.manager.notify_user(msg);
-    }
-
-    add_notify_listener(cb) {
-        registry = this.ensure_workspace_registry();
-
-        if(registry && registry.manager)
-            registry.manager.add_notify_listener(cb);
-    }
-
-    add_file_listener(cb) {
-        registry = this.ensure_workspace_registry();
-
-        if(registry && registry.manager)
-            registry.manager.add_file_listener(cb);
-    }
-
-    add_task_finished_listener(cb, owner = "") {
-        registry = this.ensure_workspace_registry();
-
-        if(registry && registry.manager)
-            registry.manager.add_task_finished_listener(cb, owner);
-    }
-
-    remove_task_finished_listener(owner) {
-        registry = this.ensure_workspace_registry();
-
-        if(registry && registry.manager)
-            return registry.manager.remove_task_finished_listener(owner);
-
-        return false;
-    }
-
-    share_file(path, caption = "") {
-        registry = this.ensure_workspace_registry();
-
-        if(!registry || !registry.manager)
-            return [ok = false, error = "no workspace manager"];
-
-        return registry.manager.share_file(path, caption);
-    }
-
-    start_shizonet() {
-        if(this.ai)
-            return this.ai;
-
-        server = shizonet.server(this.name);
-        this.ai = ai_node_attach(server, this, [
-            name = this.name,
-            description = this.description,
-            model = this.cfg.name,
-        ]);
-
-        std.print("Shizonet AI node online: " + this.ai.node_name());
-        return this.ai;
-    }
-
-    start_node_goals(root) {
-        root = std.string(root ?? "");
-
-        if(!root)
-            return None;
-
-        this.ensure_workspace_registry();
-
-        space = GoalSpace(root);
-
-        if(!space.exists()) {
-            created = space.init(__DIR__ + "/agentspace_template");
-            std.print("Created " + root + "/ (" + created.size() + " files) from the template.");
-        }
-
-        if(this.node_workspace && this.node_workspace.scheduler) {
-            try {
-                this.node_workspace.scheduler.stop();
-            } catch(e) {}
-        }
-
-        sch = GoalScheduler(space, this.node_workspace, [workspace_id = "node"]);
-        sch.start();
-
-        this.node_workspace.scheduler = sch;
-        this.goals = sch;
-
-        std.print("Goal scheduler on " + root + "/ - shz miniagent.goals list");
-        return sch;
-    }
-
-    disable_node_goals() {
-        if(this.node_workspace && this.node_workspace.scheduler) {
-            try {
-                this.node_workspace.scheduler.stop();
-            } catch(e) {}
-            this.node_workspace.scheduler = None;
-        }
-
-        this.goals = None;
-        return true;
-    }
-
-    start_web(opts) {
-        registry = this.ensure_workspace_registry();
-
-        ui = web_ui_start(this, this.cfg, opts, registry);
-
-        if(!ui)
-            return None;
-
-        this.web = ui.server;
-        this.api = ui.server;
-
-        return ui;
-    }
-
-    start_api(port, token) {
-        this.api = node_api_start(this, this.cfg, port, token);
-        return this.api;
-    }
-
-    stop() {
-        this.running = false;
-
-        if(this.receptionist) {
-            try {
-                this.receptionist.stop();
-            } catch(e) {}
-            this.receptionist = None;
-        }
-
-        if(this.registry) {
-            try {
-                this.registry.stop();
-            } catch(e) {}
-            this.registry = None;
-        }
-
-        if(this.ai) {
-            try {
-                this.ai.stop();
-            } catch(e) {}
-            this.ai = None;
-        }
-
-        web_server = this.web;
-        api_server = this.api;
-
-        if(web_server) {
-            try { web_server.stop(); } catch(e) {}
-        }
-
-        if(api_server && api_server !== web_server) {
-            try { api_server.stop(); } catch(e) {}
-        }
-
-        this.web = None;
-        this.api = None;
-        this.goals = None;
-        this.node_workspace = None;
-        this.request_queue = [];
-        this._receptionist_active = false;
-
-        return true;
-    }
-}
-
+//  shz miniagent --init [<dir>] [--name X]
 // ─────────────────────────────────────────────────────────────────────────────
 
 if(node_flag_present("--init")) {
-    if(!node_init_workspace())
+    res = node_register_workspace(node_init_dir(), std.string(std.argvoption("--name") ?? ""));
+
+    if(!res.ok) {
+        std.error("[miniagent] --init failed: ", res.error);
         std.exitprocess(1);
+    }
+
+    node_print_registered(res, "");
+    w = res.workspace;
+
+    if(fileio.exists(w.path + "/AGENTS.md"))
+        std.print("Initialized .megamind and .agentspace; AGENTS.md is present.");
+    else
+        std.print("Initialized .megamind and .agentspace; AGENTS.md was not created.");
+
+    std.print("Start the node with: shz miniagent --node [--web]");
     return;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  the model of the workers
+// ─────────────────────────────────────────────────────────────────────────────
 
 cfg = ModelConfig();
 
 if(model_config_cli_handle_config_commands(
     MODEL_CONFIG_PACKAGE,
     MODEL_CONFIG_DEFAULT_KEY,
-    ["receptionist-", "worker-"]
+    ["worker-"]
 ))
     return;
 
-main_spec = std.argvoption("--config");
-rec_spec = std.argvoption("--receptionist-config");
+// --config is the model of the node's workers; --worker-config is its old name
+cfg_spec = std.argvoption("--config");
 worker_spec = std.argvoption("--worker-config");
 
-if(!rec_spec)
-    rec_spec = main_spec;
+if(worker_spec)
+    cfg_spec = worker_spec;
 
-if(!worker_spec)
-    worker_spec = main_spec;
-
-if(!model_config_cli_get(cfg, rec_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, true, true, "Receptionist", "receptionist-"))
-    return;
-
-worker_cfg = ModelConfig();
+if(std.argvoption("--receptionist-config"))
+    std.warn("--receptionist-config is ignored: a node has no receptionist agent any more, --config is the model of its workers.");
 
 if(model_config_cli_has_endpoint_args("worker-")) {
-    if(!model_config_cli_make(worker_cfg, worker_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, "worker-", false, false))
+    if(!model_config_cli_make(cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, "worker-", false, false))
         return;
-} else if(!node_same_spec(worker_spec, rec_spec)) {
-    if(!model_config_cli_get(worker_cfg, worker_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, true, true, "Worker", "worker-"))
-        return;
-} else {
-    worker_cfg.copy_from(cfg);
+} else if(!model_config_cli_get(cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, true, true, "Node", "config-")) {
+    return;
 }
 
-save_main = std.argvoption("--save-config");
+save_spec = std.argvoption("--save-config");
 
-if(save_main)
-    model_config_save_spec(cfg, save_main, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
+if(!save_spec)
+    save_spec = std.argvoption("--save-worker-config");
 
-save_rec = std.argvoption("--save-receptionist-config");
+if(save_spec)
+    model_config_save_spec(cfg, save_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
 
-if(save_rec)
-    model_config_save_spec(cfg, save_rec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
-
-save_worker = std.argvoption("--save-worker-config");
-
-if(save_worker) {
-    worker_cfg = ModelConfig();
-    model_config_cli_get(worker_cfg, worker_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY, false, false, "Worker", "worker-");
-    model_config_save_spec(worker_cfg, save_worker, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
-}
-
-model_config_cli_print_loaded("Receptionist config", cfg, rec_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
-model_config_cli_print_loaded("Worker config", worker_cfg, worker_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
+model_config_cli_print_loaded("Model config", cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
 
 max_workers = node_get_int_option("--max-workers", "--workers", 1);
 
 if(max_workers <= 0)
     max_workers = 1;
 
-worker_cfg_spec = node_config_spec(worker_spec);
+worker_cfg_spec = node_config_spec(cfg_spec);
 
 node = Node(cfg, worker_cfg_spec, max_workers, std.argvoption("--name"), std.argvoption("--description"));
 
-// ── the workspace registry and node's own root workspace ─────────────────────
+// ── the workspaces of this machine + the node's own one ──────────────────────
 node.ensure_workspace_registry();
 
-// ── shizonet AI node service: always on, the de-facto transport ──────────────
+for(dir : node_flag_values("--workspace")) {
+    res = node_register_workspace(dir, "", node.registry.store);
+
+    if(!res.ok) {
+        std.error("[miniagent] --workspace " + dir + ": ", res.error);
+        continue;
+    }
+
+    node.registry.ensure(res.workspace);
+    node_print_registered(res, " (--workspace)");
+}
+
+// ── HTTP: the web interface or the JSON API alone ───────────────────────────
+web_ui_mode = node_is_web_ui_mode();
+api_mode = node_is_api_mode();
+http_failed = false;
+
+if(web_ui_mode) {
+    opts = web_ui_parse(web_ui_args());
+    ui = node.start_web(opts);
+
+    if(ui)
+        std.print("Web interface: http://127.0.0.1:" + opts.port + "/");
+    else
+        http_failed = true;
+} else if(api_mode) {
+    api_port = std.int(std.argvoption("--port"));
+
+    if(api_port <= 0)
+        api_port = 13337;
+
+    if(node.start_api(api_port, std.string(std.argvoption("--api-token") ?? "")))
+        std.print("Node JSON API: http://localhost:" + api_port + "/api/health");
+    else
+        http_failed = true;
+}
+
+if(http_failed) {
+    std.error("Could not start the HTTP server (the port is in use?).");
+    node.stop();
+    std.exitprocess(1);
+}
+
+// ── ShizoNet: the AI node service, the peers, the API for the other nodes ───
 node.start_shizonet();
 
-// ── scheduled goals (.agentspace) ────────────────────────────────────────────
+// ── scheduled goals of the node (its own workspace) ─────────────────────────
 goals_root = node_goals_root();
 
 if(goals_root)
@@ -1025,25 +374,29 @@ else
 
 scheduler_count = 0;
 
-for(k, w : node.registry.list()) {
+for(w : node.registry.list()) {
     if(w.scheduler)
         scheduler_count++;
 }
 
-std.print("Workspace goal schedulers running: " + std.string(scheduler_count));
+std.print("Workspaces: " + std.string(node.workspaces_summary().size()) + "  goal schedulers running: " + std.string(scheduler_count));
+std.print("New workspaces without a path go to " + node.registry.store.projects_dir);
 
-interactive_mode = node_is_interactive_mode();
-web_mode = node_is_web_mode();
-prompt = model_config_cli_positional_prompt(node_value_flags());
+// ── the Telegram gateway that was set up in the web interface ───────────────
+gateway = GatewayRunner(cfg_spec ? std.string(cfg_spec) : "");
+node.gateway = gateway;
 
-// ── interactive mode ─────────────────────────────────────────────────────────
+if(!model_config_cli_has_flag("--no-gateway"))
+    gateway.autostart();
 
-if(interactive_mode) {
-    node_host_help();
+// ── console / headless ──────────────────────────────────────────────────────
+if(model_config_cli_has_flag("--interactive")) {
+    node_console_help();
+    current = "node";
 
     for(1) {
         std.color("green");
-        std.cout("\n>>> (user) ");
+        std.cout("\n>>> (" + current + ") ");
 
         cmd = std.input().strip();
 
@@ -1055,9 +408,29 @@ if(interactive_mode) {
             continue;
         }
 
+        if(cmd == "/help") {
+            node_console_help();
+            continue;
+        }
+
+        if(cmd == "/workspaces") {
+            node_print_workspaces(node, current);
+            continue;
+        }
+
+        if(cmd.starts("/use")) {
+            want = cmd.removeprefix("/use").strip();
+            w = node.resolve_workspace(want);
+
+            if(!w)
+                std.cout("No workspace '" + want + "'. /workspaces lists them.\n");
+            else
+                current = std.string(w.id);
+            continue;
+        }
+
         if(cmd == "/config") {
-            model_config_cli_print_loaded("Receptionist config", cfg, rec_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
-model_config_cli_print_loaded("Worker config", worker_cfg, worker_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
+            model_config_cli_print_loaded("Model config", cfg, cfg_spec, MODEL_CONFIG_PACKAGE, MODEL_CONFIG_DEFAULT_KEY);
             std.print("Worker config spec: ", node.worker_cfg_spec, "\n");
             continue;
         }
@@ -1067,13 +440,13 @@ model_config_cli_print_loaded("Worker config", worker_cfg, worker_spec, MODEL_CO
             continue;
         }
 
-        if(cmd == "/help") {
-            node_host_help();
+        if(cmd == "/goals") {
+            node_print_goals(node.goals);
             continue;
         }
 
-        if(cmd == "/goals") {
-            node_print_goals(node.goals);
+        if(cmd == "/nodes") {
+            node_print_peers(node);
             continue;
         }
 
@@ -1093,72 +466,20 @@ model_config_cli_print_loaded("Worker config", worker_cfg, worker_spec, MODEL_CO
         }
 
         try {
-            node.request(cmd);
+            res = node.request(cmd, None, node_console_print, current);
+            stdfcol("white");
+            std.cout("\n\n" + std.string(res.reports[0].report) + "\n");
         } catch(e) {
-            std.error("receptionist run failed: ", e);
+            std.error("the request failed: ", e);
         }
     }
+} else {
+    std.print("AI node '" + node.node_name() + "' is running. Ctrl+C to stop.\n");
+
+    for(node.running)
+        std.sleep(250);
 }
 
-// ── optional JSON web API, alongside shizonet ────────────────────────────────
-else if(web_mode) {
-    port_opt = std.argvoption("--port");
-    token_opt = std.argvoption("--api-token");
-
-    api_port = std.int(port_opt);
-    api_token = "";
-
-    if(api_port <= 0)
-        api_port = 13337;
-
-    if(token_opt)
-        api_token = std.string(token_opt);
-
-    if(node_is_web_ui_mode()) {
-        opts = web_ui_parse(web_ui_args());
-        std.print("Starting the web interface at " + opts.port);
-
-        ui = node.start_web(opts);
-
-        if(ui) {
-            std.print("Web interface: http://127.0.0.1:" + opts.port + "/  (architecture: " + ui.board.path + ")\n");
-        } else
-            api_port = opts.port;
-    } else {
-        std.print("Starting API server at " + api_port);
-
-        api = node.start_api(api_port, api_token);
-
-        if(api)
-            std.print("Node JSON API: http://localhost:" + api_port + "/api/health\n");
-    }
-
-    if(!node.web && !node.api) {
-        std.error("Could not start the API server on port ", api_port, ".");
-    } else {
-        for(node.running)
-            std.sleep(250);
-    }
-}
-
-// ── single-shot request ──────────────────────────────────────────────────────
-else if(prompt) {
-    std.cout("\n>>> (user) ", prompt, "\n");
-
-    try {
-        node.request(prompt);
-    } catch(e) {
-        std.error("receptionist run failed: ", e);
-    }
-
-    node.running = false;
-}
-
-// ── headless AI node ─────────────────────────────────────────────────────────
-else {
-    std.print("Headless AI node. Ctrl+C to stop.\n");
-    std.sleep(-1);
-}
-
+gateway.stop();
 node.stop();
-std.cout("\nHost stopped.\n");
+std.cout("\nNode stopped.\n");

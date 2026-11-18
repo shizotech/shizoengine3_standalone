@@ -14,6 +14,8 @@ cue and the same fader move the light and the projection together.
 | *Executors* (`FixturesEffects`) | Faders and buttons that play cue stacks and are the masters of groups |
 | *LampValues* (`FixturesEffects`) | The channels of one lamp as outputs: a shader follows a lamp |
 | *CueTrigger* (`FixturesEffects`) | Starts a cue when a clip starts: the video show runs the light |
+| *Track show* (`FixturesEffects`) | Cues at beats of the DJ's tracks, rules on rekordbox cue names and phrases, look-ahead, limits ([Shows per track](#shows-per-track)) |
+| *Cue call* (`FixturesEffects`) | Counts down per crew to the next cue of the master deck, standby / 3 / 2 / 1 / GO ([Cue call](#cue-call)) |
 | *ProjectionZone* (`Fixtures` › `Virtual`) | The lamp of a MapLab slice: dimmer, colour, pan, tilt, zoom, rotate, strobe |
 | *Look* (`Fixtures` › `Virtual`) | A lamp for a shader: dimmer, colour, speed, size and four FX |
 | *Masters* (Devices › Fixtures) | Four Speed masters; per group its Group master and inputs to link into (Colour, Dimmer, Pan, Tilt) |
@@ -223,6 +225,65 @@ the master deck and reacts to each new one by itself. No AI is needed: the rules
 A whole set: name the cues of a stack Intro, Buildup, Drop, Break, Outro, set *On a DJ phrase* to *Cue of its name*, Go
 once. The [Chat](The-Screen.md#chat-tab) can build such a stack too, and the same rules play it.
 
+A track that has a [show of its own](#shows-per-track) (cues) locks out the phrases while it plays, unless its *Lock
+phrases* is off.
+
+## Shows per track
+
+The generator **Track show** (*FixturesEffects*) programs light for the tracks of the DJ, with
+[DJ Link](Output-and-Devices.md#prolink-cdjs) (a ProlinkBridge or ProlinkDecks generator in the project). No AI and no
+person on Go: the desk runs it every frame.
+
+- **Cues of a track:** pick the deck at the top (the master deck or deck 1-4). Its track, where it plays (bar.beat) and
+  the start of its signature are shown. *Add cue here* puts a cue of 4 bars on the beat of the playhead; *Import memory
+  cues* / *Import hot cues* make cues of the cues the DJ stored in rekordbox, with their names. Each cue has a start
+  beat, a length in bars, a crew (for the [cue call](#cue-call)), an *Action* and an *End action*.
+- **When a cue runs:** its *Action* when the deck plays through its first beat, its *End action* when the playhead
+  leaves it after it started (the end, a jump out of it, another track). A jump back plays the cues after it again; a
+  jump forward starts none of the cues it skips; a paused or cued deck starts none (*Late*: it also starts when the deck
+  starts playing inside it). *Runs on*: while the deck is the master deck (default: the tempo master, and without one the
+  deck that plays on air, the same deck whose tempo goes out), while its channel is on air (needs a DJM), on any deck,
+  or never. The [cue call](#cue-call) follows the master deck too.
+- **The same track on another USB stick** finds its show again: the signature of a track is worked out from its title,
+  artist, duration, waveform and beat grid. A track without one yet (still loading) is found by title, artist and
+  duration.
+- **Actions** are typed like the [command line](#the-command-line): `go Main`, `goto 3 Main`, `off Main` (a cue stack),
+  `clip 1 2` (row, column of the Clipview), `column 3`, `desk all at color red`, `midi 90 3C 7F @ <MIDI device>`,
+  `osc 192.168.1.20:7000 /composition/layers/1/clips/2/connect 1` (an OSC message, port 8000 when none is given),
+  `song <name>`, `loop start <name>`. A stack starts at once (no quantize: the cue is on the beat already).
+
+Below, the rules that need no show per track:
+
+- **Cue names:** a rekordbox cue whose name, or a word of it, matches runs an action when the deck plays through it:
+  a memory cue *DROP* → `go Drop`, a hot cue `@strobe` → `go Strobe`. `*` and `?` are wildcards, case does not count.
+- **Phrase triggers:** at each new phrase of a deck, the triggers that fit (phrase, deck, mood of the track, length in
+  bars, BPM) are candidates and one is picked at random by its weight. A *Solo* trigger runs alone; a blend one (Solo
+  off) runs together with every other blend trigger that fits. A track with cues of its own runs none (*Lock phrases*).
+- **Look-ahead:** an action a number of beats before each drop, buildup, break, new phrase, memory cue or track cue:
+  fog 16 beats before the drop, a blackout 1 beat before it.
+- **Limits** of a stack, for strobes, blinders and specials: *Max on* (seconds), *Min gap* (seconds between two starts
+  by the automation), *Duty* (at most this part of the *Window* on). Max on and the duty cycle also stop a Go by hand.
+  A *Special* (CO2, pyro) is never started by the automation until it is *Armed*; arming is not saved, after a load it
+  is disarmed.
+- **Settings:** the crews of the cue call; *Back-off*: when the operator touches a stack (Go, Back, Off, Flash, its
+  master), the automation leaves it alone for this many bars; *Stop when no deck plays*: what the automation started
+  goes off this many seconds after no deck plays (3 s by default).
+- **Log:** what ran, what was held back and why (back-off, a limit, a disarmed special).
+
+The shows, rules and limits are saved with the project (desk.json) and every change is a step of the undo history.
+Agents reach them over MCP (`get_track_show`, `add_track_cue`, `import_track_cues`, `set_track_show`, `set_show_rules`,
+`arm_special`, `get_cue_call`).
+
+## Cue call
+
+The generator **Cue call** (*FixturesEffects*) counts down what comes next on the master deck, per crew (Lighting,
+Video, SFX, Laser: set the crews in *Track show* › *Settings*): the next track cue, named rekordbox cue, look-ahead or
+phrase trigger of that crew, in bars.beats (`2.3`: 2 bars and 3 beats). Within 16 beats it says *STANDBY*, the last
+three beats count 3, 2, 1, and the beat itself is a green *GO*. The last tile is the next phrase.
+
+On phones: the page `/cuecall` of the [web remote](Web-Remote.md) shows the same (pair the phone on the remote first);
+each crew member picks a crew and gets it big, with a short buzz on GO where the phone can. There is no spoken call.
+
 ## Groups as link targets
 
 ![Devices › Fixtures › Masters › Groups with the inputs of the group Back (blue); a ColorSelector whose first row colours the group Front](media/lighting-desk-groups.png)
@@ -332,13 +393,96 @@ Now palettes, cues, executors, the Phaser and the Art-Net mapping of a console m
 - *Trigger* does it by hand; link a beat or a button into it, or map it.
 - Not when a project loads.
 
+## Tempo to lighting desks
+
+VibeVJ's own desk follows the timeline anyway. A lighting desk of its own (grandMA, Daslight, ChamSys, a Wolfmix) or a
+program like Resolume gets the tempo and the beats of the timeline from *TC* › *Tempo to lighting desks and Ableton
+Link* ([Timeline](Timeline.md#tempo-to-lighting-desks-and-ableton-link)); the DJ Watch program sends those of a deck
+(tab *Send BPM*). The timeline follows the DJ ([ProlinkBridge](Output-and-Devices.md#prolink-cdjs), the audio
+analysis), so the light runs at the tempo of the music, on the beat.
+
+Pick the target, enter the address of the desk, turn on *Send*, press *Send test* and look at the desk.
+
+A show programmed on timecode (a cue list per track) gets SMPTE timecode from the decks instead: an offset per track
+plus where the deck is in it, as Art-Net timecode, MTC or LTC, and the decks as TCNet layers
+([Timecode from the decks](Timeline.md#timecode-from-the-decks), [TCNet](Timeline.md#tcnet); DJ Watch: tab *Timecode*).
+
+### Ableton Link (Resolume, Ableton Live, Daslight, Traktor)
+
+The simplest way where the other program speaks Link: no address, no mapping. Turn on *Ableton Link* (*Bar* on: the
+others play their bars with the timeline). In Resolume: *Preferences* › *Ableton Link* on; Ableton Live: *Link* in the
+bar; Daslight 5: Ableton Link in its tempo settings. All Link programs in the network then run at the tempo of
+VibeVJ. The computer and the other program must be in the same network (Link uses UDP multicast on port 20808; allow it
+in the firewall).
+
+### grandMA3 and grandMA3 onPC
+
+1. On the desk: *Menu* › *In & Out* › *OSC*: a line with *Receive* and *Receive Command* on, its port (8000 here).
+2. In VibeVJ: *grandMA3 / onPC*, the IP address of the desk (or onPC), port 8000.
+3. The command `Master 3.1 At BPM {bpm}` sets the first speed master; `{bpm}` is the tempo with one decimal. Change
+   it to the master you use.
+
+### grandMA2 and grandMA2 onPC
+
+The grandMA2 has no OSC input for commands; VibeVJ uses its remote command line over Telnet.
+
+1. On the desk: *Setup* › *Console* › *Global Settings* › *Telnet*: *Login Enabled*.
+2. In VibeVJ: *grandMA2 / onPC*, the IP address (*Search* finds desks on this computer and in the local networks),
+   port 30000, a user of the show and its password (every show has *administrator* / *admin*; case sensitive).
+3. The command `SpecialMaster 3.16 At {bpm}` sets speed master 16; the grandMA2 takes whole numbers only, so the tempo
+   goes out rounded. It is sent when it changes and every 15 s.
+
+The line under the fields says *logged in*, or why not: Telnet off on the desk ("remote command line … switched off"), a
+wrong password, or the error the desk answered ("Error #… " – give the user more rights).
+
+### Daslight
+
+Daslight reads a button from the value of an OSC message: VibeVJ sends 255 and 30 ms later 0 on every beat. Turn on
+OSC input in Daslight, map its tap (BPM tap) to an OSC address, enter that address (several, separated by commas) and
+the port. Daslight 5 also takes Ableton Link, which needs no mapping.
+
+### ChamSys MagicQ
+
+MagicQ maps an OSC message without a value to *Tap to time*: VibeVJ sends one on every beat to each address of the
+list. Turn on OSC in MagicQ (*Setup* › *View Settings* › *Network*: the OSC receive port) and map the addresses you
+enter to the tap of the speed master.
+
+### Wolfmix and OS2L
+
+The Wolfmix has no network: its computer software WTOOLS takes OS2L, the protocol of VirtualDJ. Run WTOOLS on the same
+computer as VibeVJ with OS2L on, choose *OS2L*, address 127.0.0.1, port 5000. A beat message goes out on every beat
+(its number counts so that a bar starts on a multiple of 4); a start, a jump or a new tempo is flagged, so WTOOLS takes
+the phase again.
+
+### OSC tempo (QLC+ and others)
+
+*OSC tempo* sends the tempo as a float to an address (default `/bpm`) when it changes and every 2 s. For Resolume,
+Ableton Link is the better way.
+
+### Which deck gives the tempo
+
+The timeline follows one deck: *Tempo from* in the settings of the generator
+[ProlinkBridge](Output-and-Devices.md#prolink-cdjs). *Auto* takes the tempo master deck, else the deck that is on air
+and playing, else a playing one; with CDJs and Denon players together the master that is also live wins. Or a fixed
+deck 1-6. The deck that gives the tempo shows a green *Send BPM* chip in the deck view (Prolink Decks, DJ Watch).
+*Auto* changes the deck only when the other one has been the better one for a second: when the DJ hands the master to
+the next player, both claim it for a moment, and that does not make the tempo jump back and forth.
+
+**Tested how:** OSC, grandMA2 Telnet (login, the greeting with Telnet off, an error answer), OS2L (the beat times: about
+1 ms from the beat) and the taps are tested against stand-ins on the computer, not against real desks yet: check the
+mapping on the desk with *Send test* before a show. The Ableton Link part is tested against Ableton's own Link library
+(tempo, bar phase, joining a session, following).
+
 ## What is saved
 
 The palettes and the cue stacks are saved with the project (`desk.json`, with the effect timelines of the cues, with *Go starts* and *On a DJ phrase* of each
-stack, and which inputs of the groups sent), the executors, LampValues, CueTrigger and the *Lamps* of a ColorSelector
-with their view. The programmer is not saved.
+stack, which inputs of the groups sent, and the shows per track with their rules and limits), the executors,
+LampValues, CueTrigger, Track show, Cue call and the *Lamps* of a ColorSelector with their view. The programmer is not saved.
 
 ## See also
+
+- [Timeline](Timeline.md#tempo-to-lighting-desks-and-ableton-link): the tempo to lighting desks and Ableton Link, and
+  the timeline following a Link session
 
 - [Output and devices](Output-and-Devices.md): the fixture setup, the Phaser, MapLab, Art-Net
 - [Clipview](Clipview.md) and [CueList](CueList.md)

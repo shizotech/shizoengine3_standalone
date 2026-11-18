@@ -1,0 +1,665 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  blind_tests_test.shio — write_blind_tests of the adaptive role: the test
+//  writer cannot read the implementation, and its report comes back in fields
+//
+//  Usage:  shz tests/blind_tests_test.shio     (from system/miniagent, no LLM)
+//
+//  Three layers, all in a temp folder below std.user_path() (removed at the end):
+//
+//    1. fs_path_guard (roles/SHARED.shio) on its own: what the allow-list lets
+//       through, what it refuses ("..", links, look-alike directory names).
+//    2. A real agent of the role util/blind_tester behind that guard, called
+//       through its real tool callbacks: every read / write of a path that is not
+//       listed is refused with a clear error, and the role has no tool that
+//       reaches files any other way (no command, skill, share or task tools).
+//    3. The real write_blind_tests / continue_task tools of an adaptive agent.
+//       The model of the test writer is a script that calls the test writer's
+//       tools (it first tries to read the implementation), so the whole path
+//       runs: guard, prompt, run_tests, finalize, the result of the parent,
+//       feedback, the agent slot.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#include "../miniagent"
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+	if(cond) {
+		passed++;
+		std.print("  PASS  ", name);
+	}
+	else {
+		failed++;
+		std.print("  FAIL  ", name, "  -> ", info);
+	}
+}
+
+section(title) {
+	std.print("\n== ", title, " ==");
+}
+
+call(agt, name, args) {
+	if(!agt.llm_api.tools.tool_callbacks.has(name))
+		return [ok = false, error = "tool_not_registered", tool = name];
+	return agt.llm_api.tools.tool_callbacks[name](args);
+}
+
+short(res) {
+	text = std.string(res);
+	if(text.size() > 500)
+		return text.substr(0, 500) + "...";
+	return text;
+}
+
+// refused by the restricted view: an error that says so, and nothing of the secret
+refused(res) {
+	return std.is_json(res) && res.has("ok") && !res.ok && std.string(res.error ?? "").contains("blind test writer") &&
+		std.string(res.error).contains("not allowed") && !std.string(res).contains("SECRET");
+}
+
+// true when calling fn() raises an error that names the guard
+raises(fn) {
+	hit = false;
+	try {
+		fn();
+	}
+	catch(e) {
+		hit = std.string(e).contains("blind test writer") && std.string(e).contains("not allowed");
+	}
+	return hit;
+}
+
+tool_names(agt) {
+	names = [];
+	tools = agt.llm_api.tools.tools;
+	for(i = 0; i < tools.size(); i++)
+		names.push_back(tools[i].function.name);
+	return names;
+}
+
+has_name(names, name) {
+	for(i = 0; i < names.size(); i++)
+		if(names[i] == name)
+			return true;
+	return false;
+}
+
+std.print("blind_tests_test");
+
+BASE = fileio.absolute_path(std.user_path() + "/miniagent/blind_tests_test_" + std.random_hash(8));
+WORK = BASE + "/work";
+
+put(rel, text) {
+	fileio.write_string(WORK + "/" + rel, text);
+}
+
+get(rel) {
+	return fileio.read_string(WORK + "/" + rel);
+}
+
+fileio.mkdir(WORK + "/src");
+fileio.mkdir(WORK + "/include");
+fileio.mkdir(WORK + "/tests/unit");
+fileio.mkdir(WORK + "/tests/unit_secret");
+fileio.mkdir(WORK + "/tests/blind");
+
+IMPL = "# SECRET IMPLEMENTATION\ndef add(a, b):\n    return a + b + 0  # SECRET\n";
+put("src/calc.py", IMPL);
+put("include/calc_api.md", "add(a, b) -> number\ndiv(a, b) -> number, raises ZeroDivisionError\n");
+put("tests/unit/helpers.py", "def approx(a, b):\n    return abs(a - b) < 1e-9\n");
+put("tests/unit_secret/notes.txt", "SECRET notes next to the tests");
+put("README.md", "SECRET readme of the project");
+fileio.write_string(BASE + "/outside.txt", "SECRET outside the workspace");
+
+REASON = "the implementation is off limits";
+
+// ── 1. the guard on its own ──────────────────────────────────────────────────
+section("fs_path_guard: the allow-list");
+
+guard = fs_path_guard(fileio.container(WORK), ["tests/unit"], ["include/calc_api.md"], "blind test writer", REASON);
+
+check("a listed directory is readable and writable", guard.access_error("tests/unit/test_x.py", "read") == "" && guard.access_error("tests/unit/test_x.py", "write") == "" &&
+	guard.access_error("tests/unit", "read") == "");
+check("a listed reference file is readable, not writable", guard.access_error("include/calc_api.md", "read") == "" && guard.access_error("include/calc_api.md", "write") != "");
+check("./ and inner .. do not confuse it", guard.access_error("./tests/unit/./sub/../test_x.py", "write") == "");
+
+err = guard.access_error("src/calc.py", "read");
+check("the implementation is refused with a clear message", err.contains("blind test writer") && err.contains("reading 'src/calc.py' is not allowed") && err.contains(REASON), err);
+check("the refusal names what is allowed", err.contains("tests/unit") && err.contains("include/calc_api.md"), err);
+check("writing it is refused as writing", guard.access_error("src/calc.py", "write").contains("writing 'src/calc.py' is not allowed"));
+check("a .. out of the listed directory is refused", guard.access_error("tests/unit/../../src/calc.py", "read") != "" && guard.access_error("tests/unit/../unit_secret/notes.txt", "read") != "");
+check("a directory that only starts like a listed one is refused", guard.access_error("tests/unit_secret/notes.txt", "read") != "" && guard.access_error("tests/unit_secret", "read") != "");
+check("the sibling of a listed file is refused", guard.access_error("include/other.h", "read") != "" && guard.access_error("include", "read") != "");
+check("the working directory itself is refused", guard.access_error(".", "read") != "" && guard.access_error("README.md", "read") != "");
+check("a path outside the working directory is refused", guard.access_error("../outside.txt", "read") != "" && guard.access_error("", "read") != "");
+check("the way to a listed path may be looked at, not read", guard.access_error("tests", "stat") == "" && guard.access_error("tests", "read") != "" &&
+	guard.access_error("src", "stat") != "");
+
+check("read_text of the implementation raises", raises([]() { return guard.read_text("src/calc.py"); }));
+check("read_file / read_string / read_json raise", raises([]() { return guard.read_file("src/calc.py"); }) && raises([]() { return guard.read_string("src/calc.py"); }) &&
+	raises([]() { return guard.read_json("src/calc.py"); }));
+check("exists / size / file_info / hash raise", raises([]() { return guard.exists("src/calc.py"); }) && raises([]() { return guard.size("src/calc.py"); }) &&
+	raises([]() { return guard.file_info("src/calc.py"); }) && raises([]() { return guard.hash("src/calc.py"); }));
+check("listing a directory that is not listed raises", raises([]() { return guard.files("src", false); }) && raises([]() { return guard.dirs(".", true); }) &&
+	raises([]() { return guard.files("tests", true); }));
+check("write / mkdir / remove outside raise", raises([]() { return guard.write_text("src/new.py", "x"); }) && raises([]() { return guard.mkdir("src/dir"); }) &&
+	raises([]() { return guard.remove("src/calc.py"); }) && raises([]() { return guard.write_text("include/calc_api.md", "x"); }));
+check("copy cannot bring the implementation in", raises([]() { return guard.copy("src/calc.py", "tests/unit/stolen.py"); }) && !fileio.exists(WORK + "/tests/unit/stolen.py"));
+check("move / rename cannot take it or put files elsewhere", raises([]() { return guard.move("src/calc.py", "tests/unit/stolen.py"); }) &&
+	raises([]() { return guard.rename("tests/unit/helpers.py", "src/helpers.py"); }) && fileio.exists(WORK + "/src/calc.py") && fileio.exists(WORK + "/tests/unit/helpers.py"));
+check("nothing was changed outside", get("src/calc.py") == IMPL && get("include/calc_api.md").starts("add(a, b)") && !fileio.exists(WORK + "/src/new.py"));
+
+check("reading inside works", guard.read_text("tests/unit/helpers.py").contains("approx") && guard.read_text("include/calc_api.md").contains("div(a, b)") &&
+	guard.exists("tests") && guard.is_directory("tests/unit") && guard.files("tests/unit", false).size() == 1);
+check("writing inside works and is recorded", guard.write_text("tests/unit/test_a.py", "assert True\n") && get("tests/unit/test_a.py") == "assert True\n" &&
+	guard.touched_files().size() == 1 && guard.touched_files()[0] == "tests/unit/test_a.py" && guard.writes == 1, std.string(guard.touched_files()));
+check("a removed file is no longer recorded", guard.remove("tests/unit/test_a.py") && guard.touched_files().size() == 0 && guard.writes == 2);
+
+if(subprocess.platform() != "windows") {
+	std.system("ln -s ../../src/calc.py '" + WORK + "/tests/unit/link.py'");
+	if(fileio.exists(WORK + "/tests/unit/link.py")) {
+		check("a link inside the listed directory that leads to the implementation is refused", guard.access_error("tests/unit/link.py", "read") != "" &&
+			raises([]() { return guard.read_text("tests/unit/link.py"); }));
+		fileio.remove(WORK + "/tests/unit/link.py");
+	}
+	else
+		std.print("  skip  link test (no ln)");
+}
+
+made = false;
+try { bad = fs_path_guard(fileio.container(WORK), ["."], [], "blind test writer", REASON); made = true; } catch(e) { }
+check("the working directory itself cannot be listed", !made);
+made = false;
+try { bad = fs_path_guard(fileio.container(WORK), ["tests/unit"], ["../outside.txt"], "blind test writer", REASON); made = true; } catch(e) { }
+check("a path outside the working directory cannot be listed", !made);
+
+// ── 2. the role behind the guard, through its real tools ────────────────────
+if(subprocess.platform() != "windows") {
+	// '\\' is a character of a name here: this is ONE file in the working directory
+	check("a name with '\\' that only looks like a path below the test path is refused",
+		guard.access_error("tests\\unit\\..\\..\\evil.py", "write") != "" && guard.access_error("tests\\unit\\x.py", "write") != "" &&
+		guard.access_error("tests\\unit\\..\\..\\src\\calc.py", "read") != "", "");
+}
+
+section("util/blind_tester: every tool is bound to the restricted view");
+
+cfg = ModelConfig();
+managed owner = miniagent(cfg, "adaptive");
+owner.filesystem = fileio.container(WORK);
+
+tester = owner.subagent("util/blind_tester");
+guard2 = fs_path_guard(owner.filesystem, ["tests/blind"], ["include/calc_api.md", "tests/unit"], "blind test writer", REASON);
+tester.filesystem = guard2;
+tester.env.fs_guard = guard2;
+
+names = tool_names(tester);
+check("the read and write tools and finalize are there", has_name(names, "read_file") && has_name(names, "list_dir") && has_name(names, "file_info") &&
+	has_name(names, "file_line_count") && has_name(names, "write_file") && has_name(names, "replace_string") && has_name(names, "finalize"), std.string(names));
+
+forbidden = [
+	"command_start", "command_read", "command_wait", "command_input", "command_kill", "command_list_sessions",
+	"list_skills", "read_skill", "send_file",
+	"fork", "start_task", "continue_task", "file_task_batch", "write_blind_tests",
+	"search_in_file", "resolve_symbol", "read_source_map", "run_tests",
+];
+leaks = "";
+for(i = 0; i < forbidden.size(); i++)
+	if(has_name(names, forbidden[i]))
+		leaks += forbidden[i] + " ";
+check("no command, skill, share or task tool (each would get around the view)", leaks.empty(), "leaked: " + leaks);
+check("the role ends with finalize", tester.use_finalize == true);
+
+r = call(tester, "read_file", [path = "src/calc.py"]);
+check("read_file of the implementation is refused", refused(r) && std.string(r.error).contains(REASON), short(r));
+r = call(tester, "read_file", [path = "./src/calc.py", include_line_numbers = "true", start_line = 1, end_line = 2]);
+check("read_file with a range is refused too", refused(r), short(r));
+r = call(tester, "read_file", [path = "tests/blind/../../src/calc.py"]);
+check("read_file through .. is refused", refused(r), short(r));
+r = call(tester, "read_file", [path = "README.md"]);
+check("read_file of any other project file is refused", refused(r), short(r));
+r = call(tester, "read_file", [path = "tests/unit_secret/notes.txt"]);
+check("read_file next to a listed directory is refused", refused(r), short(r));
+r = call(tester, "read_file", [path = "../outside.txt"]);
+check("read_file outside the working directory is refused", std.is_json(r) && !r.ok && !std.string(r).contains("SECRET"), short(r));
+r = call(tester, "file_line_count", [path = "src/calc.py"]);
+check("file_line_count is refused", refused(r), short(r));
+r = call(tester, "file_info", [path = "src/calc.py"]);
+check("file_info is refused", refused(r), short(r));
+r = call(tester, "list_dir", [path = "src", recursive = "false"]);
+check("list_dir of the implementation directory is refused", refused(r) && !std.string(r).contains("calc.py"), short(r));
+r = call(tester, "list_dir", [path = ".", recursive = "true"]);
+check("list_dir of the working directory is refused and names what is allowed", refused(r) && !std.string(r).contains("calc.py") && std.string(r.error).contains("tests/blind"), short(r));
+
+r = call(tester, "read_file", [path = "include/calc_api.md"]);
+check("a reference file is readable", r.ok && std.string(r.content).contains("div(a, b)"), short(r));
+r = call(tester, "read_file", [path = "tests/unit/helpers.py"]);
+check("a reference directory is readable", r.ok && std.string(r.content).contains("approx"), short(r));
+r = call(tester, "list_dir", [path = "tests/unit", recursive = "false"]);
+check("a reference directory can be listed", std.is_json(r) && r.files.has("helpers.py"), short(r));
+
+r = call(tester, "write_file", [path = "tests/blind/test_calc.py", content = "from calc import add\n\ndef test_add_returns_sum():\n    assert add(2, 3) == 5\n"]);
+check("the test path is writable", r.ok && get("tests/blind/test_calc.py").contains("test_add_returns_sum"), short(r));
+r = call(tester, "replace_string", [path = "tests/blind/test_calc.py", target_text = "add(2, 3) == 5", replacement_text = "add(2, 3) == 5  # spec: the sum", replace_all = "false"]);
+check("the test file can be edited", r.ok && get("tests/blind/test_calc.py").contains("# spec: the sum"), short(r));
+
+r = call(tester, "write_file", [path = "src/calc.py", content = "overwritten"]);
+check("write_file onto the implementation is refused", refused(r) && get("src/calc.py") == IMPL, short(r));
+r = call(tester, "write_file", [path = "src/extra.py", content = "x"]);
+check("write_file next to the implementation is refused", refused(r) && !fileio.exists(WORK + "/src/extra.py"), short(r));
+r = call(tester, "write_file", [path = "tests/unit/helpers2.py", content = "x"]);
+check("a reference directory is read-only", refused(r) && std.string(r.error).contains("writing") && !fileio.exists(WORK + "/tests/unit/helpers2.py"), short(r));
+r = call(tester, "append_text", [path = "src/calc.py", insert_at = "end", content = "x"]);
+check("append_text is refused", refused(r) && get("src/calc.py") == IMPL, short(r));
+r = call(tester, "replace_string", [path = "src/calc.py", target_text = "return a + b", replacement_text = "return 0", replace_all = "true"]);
+check("replace_string is refused (and tells nothing about the content)", refused(r) && get("src/calc.py") == IMPL && !r.has("file_text") && !r.has("closest_line"), short(r));
+r = call(tester, "copy", [source = "src/calc.py", destination = "tests/blind/peek.py"]);
+check("copy cannot bring the implementation into the test path", refused(r) && !fileio.exists(WORK + "/tests/blind/peek.py"), short(r));
+r = call(tester, "move", [source = "src/calc.py", destination = "tests/blind/peek.py"]);
+check("move is refused", refused(r) && fileio.exists(WORK + "/src/calc.py") && !fileio.exists(WORK + "/tests/blind/peek.py"), short(r));
+r = call(tester, "rename", [source = "src/calc.py", destination = "src/calc2.py"]);
+check("rename is refused", refused(r) && fileio.exists(WORK + "/src/calc.py"), short(r));
+r = call(tester, "mkdir", [path = "src/sub"]);
+check("mkdir is refused", refused(r) && !fileio.exists(WORK + "/src/sub"), short(r));
+call(tester, "remove", [path = "src/calc.py"]);
+r = call(tester, "remove", [path = "src/calc.py"]);
+check("remove is refused", refused(r) && fileio.exists(WORK + "/src/calc.py"), short(r));
+
+// The view alone is the jail. agt.env.fs_guard only lets the tools answer nicely: a
+// test writer that has just the filesystem (no env entry) is refused all the same,
+// by the exception of the view, which the add_tool bridge turns into the tool result.
+bare = owner.subagent("util/blind_tester");
+bare.filesystem = guard2;
+r = call(bare, "read_file", [path = "src/calc.py"]);
+check("the view alone refuses a read (as a tool error with the reason)", refused(r) && std.string(r.error).contains("read_file"), short(r));
+r = call(bare, "list_dir", [path = "src", recursive = "true"]);
+check("the view alone refuses a listing", refused(r), short(r));
+r = call(bare, "write_file", [path = "src/extra.py", content = "x"]);
+check("the view alone refuses a write", refused(r) && !fileio.exists(WORK + "/src/extra.py"), short(r));
+r = call(bare, "copy", [source = "src/calc.py", destination = "tests/blind/peek.py"]);
+check("the view alone refuses a copy", refused(r) && !fileio.exists(WORK + "/tests/blind/peek.py"), short(r));
+r = call(bare, "read_file", [path = "include/calc_api.md"]);
+check("the view alone still lets the listed paths through", r.ok && std.string(r.content).contains("div(a, b)"), short(r));
+
+// the finalize of the role: the report shape is checked before the run may end
+tester.task_result = None;
+r = call(tester, "finalize", [signal = "finished", summary = "done", test_files = [], test_cases = ["a: b"]]);
+check("finalize: a finished run needs test files", std.is_json(r) && !r.ok && std.string(r.error).contains("test_files") && tester.task_result == None, short(r));
+r = call(tester, "finalize", [signal = "finished", summary = "done", test_files = ["src/calc.py"], test_cases = ["a: b"]]);
+check("finalize: a file outside the test path is no test file", std.is_json(r) && !r.ok && std.string(r.error).contains("src/calc.py") && tester.task_result == None, short(r));
+r = call(tester, "finalize", [signal = "finished", summary = "done", test_files = ["tests/blind/missing.py"], test_cases = ["a: b"]]);
+check("finalize: a test file that does not exist", std.is_json(r) && !r.ok && std.string(r.error).contains("does not exist") && tester.task_result == None, short(r));
+r = call(tester, "finalize", [signal = "finished", summary = "done", test_files = ["tests/blind/test_calc.py"]]);
+check("finalize: a finished run needs test cases", std.is_json(r) && !r.ok && std.string(r.error).contains("test_cases") && tester.task_result == None, short(r));
+r = call(tester, "finalize", [signal = "finished", test_files = ["tests/blind/test_calc.py"], test_cases = ["a: b"]]);
+check("finalize: a summary is needed", std.is_json(r) && !r.ok && std.string(r.error).contains("summary") && tester.task_result == None, short(r));
+r = call(tester, "finalize", [signal = "passed", summary = "x"]);
+check("finalize: an unknown signal", std.is_json(r) && !r.ok && std.string(r.error).contains("Unknown signal") && tester.task_result == None, short(r));
+
+r = call(tester, "finalize", [
+	signal = "finished",
+	summary = "One test for add.",
+	test_files = ["tests/blind/test_calc.py"],
+	test_cases = ["test_add_returns_sum: add(2, 3) is 5"],
+	spec_ambiguities = ["add with strings: the spec does not say"],
+]);
+res = tester.task_result;
+check("finalize: the report is the task result, in fields", std.is_json(res) && res.signal == "finished" && std.is_json(res.result) &&
+	res.result.summary == "One test for add." && res.result.test_files[0] == "tests/blind/test_calc.py" &&
+	res.result.test_cases.size() == 1 && res.result.spec_ambiguities.size() == 1 && std.is_list(res.result.not_covered), short(res));
+
+fileio.remove(WORK + "/tests/blind/test_calc.py");
+
+// ── 3. write_blind_tests end to end ──────────────────────────────────────────
+section("write_blind_tests: the tool of the adaptive role");
+
+// What generic_agent.context has to offer miniagent.task().
+class script_context {
+	body = [messages = []];
+	token_count_prompt(prompt) { return 0; }
+}
+
+// The model of the test writer as a script. add_tool() keeps the bridge callbacks
+// of miniagent.add_tool(), so the script calls the real tools of the agent.
+class script_api {
+	owner = None;
+	plan = None;			// plan(api, prompt): what the "model" does in one run
+	bridge = [];			// tool name -> bridge callback(agt, args)
+	prompts = [];
+	context = script_context();
+
+	__init__(_owner, _plan) {
+		owner = _owner;
+		plan = _plan;
+		bridge = [];
+		prompts = [];
+	}
+
+	stop() { }
+	set_reasoning_effort(effort) { }
+	set_model(model) { }
+
+	add_tool(name, description, params, cb) {
+		bridge[name] = cb;
+	}
+
+	has_tool(name) {
+		return bridge.has(name);
+	}
+
+	use(name, args) {
+		if(!bridge.has(name))
+			return [ok = false, error = "tool_not_registered", tool = name];
+		return bridge[name](None, args);
+	}
+
+	task(prompt) {
+		prompts.push_back(prompt);
+		plan(this, prompt);
+		return "";
+	}
+}
+
+seen = [];
+testers = [];
+plan_mode = "write";
+
+TEST_V1 = "from calc import add, div\nimport pytest\n\ndef test_add_returns_sum():\n    assert add(2, 3) == 5\n\ndef test_div_by_zero_raises():\n    with pytest.raises(ZeroDivisionError):\n        div(1, 0)\n\ndef test_div_returns_quotient():\n    assert div(6, 3) == 3\n";
+
+tester_plan = [](api, prompt) {
+	// the harness asks again when a run ends without finalize: nothing more to do then
+	if(prompt.contains("without calling 'finalize()'") || prompt.contains("Write a handover"))
+		return;
+
+	seen.prompt = prompt;
+	seen.slots_in_use = agent_slots_in_use();
+
+	if(plan_mode == "crash")
+		std.runtime_error("the model endpoint is unreachable");
+
+	if(plan_mode == "keep") {
+		// the tests that are there already cover it: nothing is written, the files are named
+		seen.fin = api.use("finalize", [
+			signal = "finished",
+			summary = "The existing tests cover the specification; nothing was changed.",
+			test_files = ["./tests/blind/test_calc.py", "src/calc.py"],
+			test_cases = ["test_add_returns_sum: add(2, 3) is 5"],
+		]);
+		if(!std.is_string(seen.fin)) {
+			// the implementation is no test file: named without it, the report is accepted
+			seen.fin_refused = seen.fin;
+			seen.fin = api.use("finalize", [
+				signal = "finished",
+				summary = "The existing tests cover the specification; nothing was changed.",
+				test_files = ["./tests/blind/test_calc.py"],
+				test_cases = ["test_add_returns_sum: add(2, 3) is 5"],
+			]);
+		}
+		return;
+	}
+
+	if(plan_mode == "question") {
+		seen.fin = api.use("finalize", [signal = "question", summary = "Does div round or truncate for integers?"]);
+		return;
+	}
+
+	if(plan_mode == "leak") {
+		// a test writer whose "test run" copies the implementation into the test path
+		seen.write = api.use("write_file", [path = "tests/blind/test_calc.py", content = TEST_V1]);
+		seen.run = api.use("run_tests", []);
+		seen.leak_read = api.use("read_file", [path = "tests/blind/peek.txt"]);
+		seen.leak_alias = api.use("read_file", [path = "tests/blind/../blind/peek.txt"]);
+		seen.leak_lines = api.use("file_line_count", [path = "tests/blind/peek.txt"]);
+		seen.leak_edit = api.use("replace_string", [path = "tests/blind/peek.txt", target_text = "def add", replacement_text = "def add2", replace_all = "false"]);
+		seen.leak_copy = api.use("copy", [source = "tests/blind/peek.txt", destination = "tests/blind/peek2.txt"]);
+		seen.leak_list = api.use("list_dir", [path = "tests/blind", recursive = "false"]);
+		seen.own_read = api.use("read_file", [path = "tests/blind/test_calc.py"]);
+		// it may remove the file and write one of its own under that name
+		api.use("remove", [path = "tests/blind/peek.txt"]);
+		seen.leak_remove = api.use("remove", [path = "tests/blind/peek.txt"]);
+		seen.rewrite = api.use("write_file", [path = "tests/blind/peek.txt", content = "my own notes"]);
+		seen.reread = api.use("read_file", [path = "tests/blind/peek.txt"]);
+		seen.fin = api.use("finalize", [
+			signal = "finished",
+			summary = "Three tests.",
+			test_files = ["tests/blind/test_calc.py"],
+			test_cases = ["test_add_returns_sum: add(2, 3) is 5"],
+			run_result = "copied",
+		]);
+		return;
+	}
+
+	if(plan_mode == "feedback") {
+		seen.edit = api.use("replace_string", [path = "tests/blind/test_calc.py", target_text = "assert div(6, 3) == 3", replacement_text = "assert div(6, 3) == 2", replace_all = "false"]);
+		seen.fin = api.use("finalize", [
+			signal = "finished",
+			summary = "test_div_returns_quotient fixed (the spec says 6 / 3 is 2); the other tests stand.",
+			test_files = ["tests/blind/test_calc.py"],
+			test_cases = ["test_add_returns_sum: add(2, 3) is 5", "test_div_by_zero_raises: div(1, 0) raises ZeroDivisionError", "test_div_returns_quotient: div(6, 3) is 2"],
+		]);
+		return;
+	}
+
+	// a model that tries to look at the implementation first
+	seen.peek = api.use("read_file", [path = "src/calc.py"]);
+	seen.peek_list = api.use("list_dir", [path = ".", recursive = "true"]);
+	seen.peek_copy = api.use("copy", [source = "src/calc.py", destination = "tests/blind/impl_copy.py"]);
+
+	seen.reference = api.use("read_file", [path = "include/calc_api.md"]);
+	seen.write = api.use("write_file", [path = "tests/blind/test_calc.py", content = TEST_V1]);
+
+	seen.has_run_tool = api.has_tool("run_tests");
+	if(seen.has_run_tool) {
+		// arguments do not change what runs
+		seen.run = api.use("run_tests", [command = "cat src/calc.py"]);
+	}
+
+	seen.fin = api.use("finalize", [
+		signal = "finished",
+		summary = "Three tests for add and div.",
+		test_files = ["tests/blind/test_calc.py"],
+		test_cases = ["test_add_returns_sum: add(2, 3) is 5", "test_div_by_zero_raises: div(1, 0) raises ZeroDivisionError", "test_div_returns_quotient: div(6, 3) is 3"],
+		spec_ambiguities = ["div of two integers: the spec does not say whether the result is an integer or a float; the tests accept both"],
+		not_covered = ["overflow: the spec names no limits"],
+		run_result = seen.has_run_tool ? "2 passed, 1 failed (test_div_returns_quotient)" : "",
+	]);
+};
+
+// The test writers of this parent get the script as their model. The tools of the
+// role are registered once more, this time into the script.
+class blind_parent : miniagent {
+	subagent(system_role, log_actions = true, copy_config = false) {
+		c = super.subagent(system_role, log_actions, copy_config);
+
+		if(system_role == "util/blind_tester") {
+			c.llm_api = script_api(c, tester_plan);
+			c.skills["role"].module.call("add_tools", c);
+			testers.push_back(c);
+		}
+
+		return c;
+	}
+}
+
+LIMIT = 1;
+cfg2 = ModelConfig();
+cfg2.max_running_agents = LIMIT;
+
+managed parent = blind_parent(cfg2, "adaptive");
+parent.filesystem = fileio.container(WORK);
+
+check("write_blind_tests is a tool of the adaptive role", has_name(tool_names(parent), "write_blind_tests"));
+
+// like a worker: the parent holds the only slot
+parent_slot = agent_slot(parent, None);
+
+SPEC = "add(a, b) returns the sum of two numbers. div(a, b) returns a divided by b; b == 0 raises ZeroDivisionError.";
+API = "from calc import add, div\nadd(a: float, b: float) -> float\ndiv(a: float, b: float) -> float";
+
+// arguments that cannot work: an error, and no test writer is started
+r = call(parent, "write_blind_tests", [api = API, test_path = "tests/blind"]);
+check("a missing spec is an error", std.is_json(r) && !r.ok && std.string(r.error).contains("Missing 'spec'"), short(r));
+r = call(parent, "write_blind_tests", [spec = SPEC, test_path = "tests/blind"]);
+check("a missing api is an error", std.is_json(r) && !r.ok && std.string(r.error).contains("Missing 'api'"), short(r));
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "."]);
+check("the working directory as test path is refused (it would open everything)", std.is_json(r) && !r.ok && std.string(r.error).contains("restricted file view"), short(r));
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "../tests"]);
+check("a test path outside the working directory is refused", std.is_json(r) && !r.ok && std.string(r.error).contains("outside the working directory"), short(r));
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "tests/blind", reference_paths = ["include/nope.h"]]);
+check("a reference path that does not exist is an error", std.is_json(r) && !r.ok && std.string(r.error).contains("include/nope.h"), short(r));
+check("no test writer was started for any of them", testers.size() == 0 && parent._child_agents.size() == 0, std.string(testers.size()));
+
+// the normal case, fully blind (no run_command)
+plan_mode = "write";
+r = call(parent, "write_blind_tests", [
+	spec = SPEC,
+	api = API,
+	test_path = "tests/blind",
+	framework = "pytest, files named test_*.py",
+	reference_paths = ["include/calc_api.md", "tests/unit"],
+	constraints = "no network",
+]);
+
+check("the test writer ran once", testers.size() == 1 && testers[0].llm_api.prompts.size() == 1, std.string(testers.size()));
+check("its prompt carries the spec, the api, the paths and the framework", std.string(seen.prompt).contains(SPEC) && std.string(seen.prompt).contains("add(a: float, b: float) -> float") &&
+	std.string(seen.prompt).contains("tests/blind") && std.string(seen.prompt).contains("include/calc_api.md") && std.string(seen.prompt).contains("pytest") &&
+	std.string(seen.prompt).contains("no network"), short(seen.prompt));
+check("its prompt says that it cannot run the tests", std.string(seen.prompt).contains("You cannot run the tests") && seen.has_run_tool == false, "");
+check("the prompt does not contain the implementation", !std.string(seen.prompt).contains("SECRET"), "");
+
+check("its read of the implementation was refused", refused(seen.peek), short(seen.peek));
+check("its listing of the working directory was refused", refused(seen.peek_list), short(seen.peek_list));
+check("its copy of the implementation was refused", refused(seen.peek_copy) && !fileio.exists(WORK + "/tests/blind/impl_copy.py"), short(seen.peek_copy));
+check("it could read the reference file", seen.reference.ok && std.string(seen.reference.content).contains("div(a, b)"), short(seen.reference));
+check("it wrote the tests into the test path", seen.write.ok && get("tests/blind/test_calc.py") == TEST_V1, short(seen.write));
+
+check("the result of the parent: ok, task id, finish reason", std.is_json(r) && r.ok && std.string(r.task_id).starts("task_") && r.finish_reason == "finished", short(r));
+check("the test files are the ones on disk", r.test_files.size() == 1 && r.test_files[0].file == "tests/blind/test_calc.py" && r.test_files[0].bytes == TEST_V1.size(), short(r.test_files));
+check("the test cases with what each one checks", r.test_cases.size() == 3 && std.string(r.test_cases[1]).contains("test_div_by_zero_raises") &&
+	std.string(r.test_cases[1]).contains("ZeroDivisionError"), short(r.test_cases));
+check("the ambiguities of the spec come back", r.spec_ambiguities.size() == 1 && std.string(r.spec_ambiguities[0]).contains("integer or a float"), short(r.spec_ambiguities));
+check("what is not covered comes back", r.not_covered.size() == 1 && std.string(r.not_covered[0]).contains("overflow"), short(r.not_covered));
+check("the summary comes back", r.summary == "Three tests for add and div.", short(r.summary));
+check("without a run there is no run result", !r.has("run_result") && !r.has("last_test_run"), short(r));
+check("the next steps: fix the implementation, feedback goes through continue_task", std.string(r.next_steps).contains("fix the implementation") &&
+	std.string(r.next_steps).contains("continue_task") && std.string(r.next_steps).contains("Do NOT edit"), short(r.next_steps));
+check("the implementation is untouched", get("src/calc.py") == IMPL, "");
+
+check("the test writer ran on the slot the waiting parent lent it", seen.slots_in_use == LIMIT, std.string(seen.slots_in_use));
+check("the slot is back with the parent", agent_slots_in_use() == LIMIT && parent._slot_held && !parent._slot_lent, std.string(agent_slots_in_use()));
+check("the test writer is a registered child (a stop reaches it)", parent._child_agents.size() == 1 && testers[0]._parent == parent, "");
+check("the test writer is a task of the parent", parent.env.tasks.size() == 1 && parent.env.tasks[0].id == r.task_id && parent.env.tasks[0].kind == "blind_tests", "");
+
+first_task_id = r.task_id;
+
+// feedback: the parent believes a test is wrong
+plan_mode = "feedback";
+r2 = call(parent, "continue_task", [task_id = first_task_id, response = "test_div_returns_quotient expects 3, the spec example says div(6, 3) is 2."]);
+check("continue_task reaches the same test writer", testers.size() == 1 && testers[0].llm_api.prompts.size() == 2, std.string(testers[0].llm_api.prompts.size()));
+check("the feedback prompt carries the feedback and the rules", std.string(seen.prompt).contains("FEEDBACK ON YOUR BLIND TESTS") &&
+	std.string(seen.prompt).contains("div(6, 3) is 2") && std.string(seen.prompt).contains("SPECIFICATION"), short(seen.prompt));
+// the continued turn may start on a compacted context: the task comes again with the feedback
+check("the feedback comes with the task again (spec, API, test path)", std.string(seen.prompt).contains("Your task, unchanged") &&
+	std.string(seen.prompt).contains(SPEC.strip()) && std.string(seen.prompt).contains(API.strip()) && std.string(seen.prompt).contains("tests/blind"), short(seen.prompt));
+check("the test writer is still behind its view", testers[0].filesystem.access_error("src/calc.py", "read") != "" &&
+	testers[0].env.fs_guard.access_error("src/calc.py", "read") != "", "");
+check("the answer comes back in the same fields", std.is_json(r2) && r2.ok && r2.task_id == first_task_id && r2.finish_reason == "finished" &&
+	r2.test_cases.size() == 3 && std.string(r2.test_cases[2]).contains("is 2") && r2.test_files[0].file == "tests/blind/test_calc.py", short(r2));
+check("the test was changed by the test writer", get("tests/blind/test_calc.py").contains("assert div(6, 3) == 2"), "");
+
+// with a run command: one more tool, exactly that command
+plan_mode = "write";
+fileio.remove(WORK + "/tests/blind/test_calc.py");
+r = call(parent, "write_blind_tests", [
+	spec = SPEC,
+	api = API,
+	test_path = "tests/blind",
+	run_command = "echo '2 passed'\necho '1 failed: test_div_returns_quotient'\nexit 1",
+	run_timeout = 30,
+]);
+check("with run_command the test writer has run_tests", seen.has_run_tool == true && std.string(seen.prompt).contains("Call run_tests()"), short(seen.prompt));
+check("run_tests ran the configured command, whatever was passed", std.is_json(seen.run) && seen.run.state == "EXITED" && seen.run.exit_code == 1 &&
+	std.string(seen.run.output).contains("1 failed: test_div_returns_quotient") && !std.string(seen.run).contains("SECRET"), short(seen.run));
+check("run_tests reminds what a failure means", std.string(seen.run.reminder).contains("stays unchanged"), short(seen.run.reminder));
+check("the result has what the test writer says about the run", r.ok && std.string(r.run_result).contains("1 failed"), short(r.run_result));
+check("the result has what the harness saw of the run", std.is_json(r.last_test_run) && r.last_test_run.exit_code == 1 && r.last_test_run.run == 1 &&
+	r.last_test_run.tests_changed_afterwards == false, short(r.last_test_run));
+check("another test writer, another task", testers.size() == 2 && r.task_id != first_task_id, "");
+
+// A run is code with the access of the workspace: it can copy the implementation into the
+// test path. The test writer cannot read what a run left there, and the parent is told.
+plan_mode = "leak";
+fileio.remove(WORK + "/tests/blind/test_calc.py");
+r = call(parent, "write_blind_tests", [
+	spec = SPEC,
+	api = API,
+	test_path = "tests/blind",
+	run_command = "cp '" + WORK + "/src/calc.py' '" + WORK + "/tests/blind/peek.txt'\necho copied",
+	run_timeout = 30,
+]);
+check("the run did copy the implementation into the test path", seen.run.exit_code == 0 && std.string(seen.run.output).contains("copied"), short(seen.run));
+check("run_tests names the files the run left", std.is_json(seen.run.files_changed_by_this_run) && std.string(seen.run.files_changed_by_this_run).contains("tests/blind/peek.txt") &&
+	!std.string(seen.run.files_changed_by_this_run).contains("test_calc.py"), short(seen.run));
+check("the test writer cannot read a file a run left", std.is_json(seen.leak_read) && !seen.leak_read.ok && std.string(seen.leak_read.error).contains("written by a run") &&
+	!std.string(seen.leak_read).contains("SECRET"), short(seen.leak_read));
+check("... not under another spelling of the path", !std.string(seen.leak_alias).contains("SECRET") && std.is_json(seen.leak_alias) && !seen.leak_alias.ok, short(seen.leak_alias));
+check("... not through file_line_count, replace_string or copy", !std.string(seen.leak_lines).contains("SECRET") && std.is_json(seen.leak_lines) && !seen.leak_lines.ok &&
+	std.is_json(seen.leak_edit) && !seen.leak_edit.ok && !std.string(seen.leak_edit).contains("SECRET") &&
+	std.is_json(seen.leak_copy) && !seen.leak_copy.ok && !fileio.exists(WORK + "/tests/blind/peek2.txt"), short(seen.leak_edit) + short(seen.leak_copy));
+check("it still sees that the file is there, and reads its own files", std.string(seen.leak_list).contains("peek.txt") && std.is_json(seen.own_read) && seen.own_read.ok, short(seen.leak_list));
+check("it can remove the file and write its own under that name", std.is_json(seen.leak_remove) && seen.leak_remove.ok && std.is_json(seen.reread) && seen.reread.ok &&
+	seen.reread.content == "my own notes", short(seen.reread));
+check("the parent is not told about a file the test writer replaced", !r.has("files_changed_by_test_runs"), short(r));
+
+plan_mode = "write";
+fileio.remove(WORK + "/tests/blind/test_calc.py");
+fileio.remove(WORK + "/tests/blind/peek.txt");
+r = call(parent, "write_blind_tests", [
+	spec = SPEC,
+	api = API,
+	test_path = "tests/blind",
+	run_command = "cp '" + WORK + "/src/calc.py' '" + WORK + "/tests/blind/peek.txt'\necho copied",
+	run_timeout = 30,
+]);
+check("the parent is told which files the runs left in the test path", r.ok && std.is_json(r.files_changed_by_test_runs) &&
+	std.string(r.files_changed_by_test_runs).contains("tests/blind/peek.txt") && r.files_changed_by_test_runs_total == 1 &&
+	std.string(r.files_changed_by_test_runs_note).contains("not a blind test"), short(r));
+fileio.remove(WORK + "/tests/blind/peek.txt");
+
+// a test writer that keeps the tests that are there
+plan_mode = "keep";
+seen.fin_refused = None;
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "tests/blind"]);
+check("a report cannot name the implementation as a test file", std.is_json(seen.fin_refused) && !seen.fin_refused.ok && std.string(seen.fin_refused.error).contains("src/calc.py"), short(seen.fin_refused));
+check("test files the writer kept are found on disk", std.is_json(r) && r.ok && r.test_files.size() == 1 && r.test_files[0].file == "tests/blind/test_calc.py" &&
+	r.test_files[0].bytes == TEST_V1.size(), short(r));
+
+// a question instead of tests
+plan_mode = "question";
+r = call(parent, "write_blind_tests", [spec = "div divides.", api = API, test_path = "tests/blind/more"]);
+check("a question of the test writer comes back as a question", std.is_json(r) && !r.ok && r.finish_reason == "question" &&
+	std.string(r.summary).contains("round or truncate") && std.string(r.next_steps).contains("continue_task"), short(r));
+
+// a test writer that dies
+plan_mode = "crash";
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "tests/blind/more"]);
+check("a crashed test writer: failed, with the reason", std.is_json(r) && !r.ok && r.finish_reason == "failed" &&
+	std.string(r.report).contains("the model endpoint is unreachable"), short(r));
+check("the slot of a crashed test writer is back", agent_slots_in_use() == LIMIT && !parent._slot_lent, std.string(agent_slots_in_use()));
+
+// a stopped parent starts nothing
+plan_mode = "write";
+runs_before = testers.size();
+parent.stop();
+r = call(parent, "write_blind_tests", [spec = SPEC, api = API, test_path = "tests/blind/more"]);
+check("a stopped parent does not run a test writer", std.is_json(r) && r.stopped && testers[-1].llm_api.prompts.size() == 0, short(r));
+
+parent_slot.release();
+check("all slots released", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));
+
+fileio.remove(BASE);
+check("the temp folder is gone", !fileio.exists(BASE), BASE);
+
+std.print("\n", passed, " passed, ", failed, " failed");
+if(failed)
+	std.exitprocess(1);

@@ -574,7 +574,9 @@ reductions), like the JIT. `std.kernel_jit("off")` turns ahead of time code off 
   declaration or a `launch` statement is the compile error "Kernels are not available on this build
   (microcontroller).", `std.kernel_compile(...)` and the other `std.kernel_*` functions do not exist.
   `std.buffer.read` / `write` stay. Defining `SHZ_FEAT_KERNELS` there brings them back (the code is portable).
-- Emscripten runs kernels on the launching thread (`launch_async` runs at once). Same results, same API.
+  The decision of #222 wants kernels on the ESP32. Whether they come back within the 5 MB slot is asked there.
+- Emscripten runs kernels on the launching thread (`launch_async` runs at once). Same results, same API. The
+  Emscripten build is no longer maintained (decided 2026-11-04, #222): this is what the code does, nobody tests it.
 - No compiler specific code is required: computed goto falls back to a switch, `__restrict` and the
   `optimize("O3")` attribute of the batch loop are only used where the compiler has them, 64x64 bit high
   multiplication has a portable fallback.

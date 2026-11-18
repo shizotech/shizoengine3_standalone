@@ -35,6 +35,9 @@ using nanogui;
 #include "engine/patch/dmx"
 #include "engine/patch/palette"
 #include "engine/patch/channelmap"
+#include "engine/stage/stage"
+#include "engine/stage/stage_leds"
+#include "engine/patch/ledscan"
 
 LM_ROW = 26;
 LM_LEFT_W = 250;
@@ -94,6 +97,70 @@ uniform sampler2D input;
 uniform sampler2D led_coords;
 uniform sampler2D gains;
 uniform sampler2D feedback;
+uniform sampler2D led_pos; // #980: x, y, z on the stage (metres), w 1: the 3D effect colours this LED
+
+// The 3D effect (#980): over the box of its LEDs (fx_lo .. fx_hi), fx_time in cycles (speed applied)
+uniform int fx_type;      // 0 plane sweep, 1 sphere pulse, 2 noise, 3 rainbow
+uniform int fx_axis;      // 0 x, 1 y, 2 z
+uniform float fx_time;
+uniform float fx_size;    // 0..1 of the box
+uniform float fx_hue_a;
+uniform float fx_hue_b;
+uniform vec3 fx_lo;
+uniform vec3 fx_hi;
+
+vec3 hue_rgb(float h)
+{
+    vec3 k = clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    return k;
+}
+
+float fx_hash(vec3 p)
+{
+    p = fract(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float fx_noise(vec3 x)
+{
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(fx_hash(i), fx_hash(i + vec3(1, 0, 0)), f.x), mix(fx_hash(i + vec3(0, 1, 0)), fx_hash(i + vec3(1, 1, 0)), f.x), f.y),
+               mix(mix(fx_hash(i + vec3(0, 0, 1)), fx_hash(i + vec3(1, 0, 1)), f.x), mix(fx_hash(i + vec3(0, 1, 1)), fx_hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+vec3 effect3d(vec3 p)
+{
+    vec3 span = max(fx_hi - fx_lo, vec3(0.001));
+    vec3 q = (p - fx_lo) / span;                       // 0..1 in the box
+    float along = fx_axis == 0 ? q.x : (fx_axis == 1 ? q.y : 1.0 - q.z);
+    float size = max(fx_size, 0.01);
+    vec3 a = hue_rgb(fx_hue_a);
+    vec3 b = hue_rgb(fx_hue_b);
+    if (fx_type == 0)
+    {
+        // a plane of colour a sweeping through, b elsewhere
+        float d = abs(fract(along - fx_time + 0.5) - 0.5);
+        return mix(b, a, 1.0 - smoothstep(size * 0.5, size * 0.5 + 0.05, d));
+    }
+    if (fx_type == 1)
+    {
+        // rings from the middle of the box outwards
+        float r = length((p - (fx_lo + fx_hi) * 0.5) / max(max(span.x, span.y), span.z));
+        float w = fract(r / size - fx_time);
+        return mix(b, a, smoothstep(0.0, 0.15, w) * (1.0 - smoothstep(0.35, 0.6, w)));
+    }
+    if (fx_type == 2)
+    {
+        // 3D noise drifting through
+        float n = fx_noise(q / size * 2.0 + vec3(0.0, 0.0, fx_time * 2.0));
+        return mix(b, a, smoothstep(0.35, 0.65, n));
+    }
+    // a rainbow along the axis
+    return hue_rgb(fx_hue_a + along / size - fx_time);
+}
 
 uniform int analog_mode;
 uniform int led_radius;
@@ -132,6 +199,10 @@ void main()
         }
         current_color = color_sum / float(sample_count);
     }
+    // #980: an LED of the 3D effect takes the effect's colour at its place on the stage
+    vec4 lpos = texelFetch(led_pos, ivec2(int(gl_FragCoord.x), 0), 0);
+    if (lpos.w > 0.5)
+        current_color = vec4(effect3d(lpos.xyz), 1.0);
     current_color *= gain.r;
 
     vec4 feedbackColor = max(texture(feedback, v_uv) - 0.0025, 0.0);
@@ -220,7 +291,34 @@ class led_mapper {
 	managed coords_image = None;
 	managed gains_image = None;
 	coords_tex = None;
+	managed pos_image = None; //#980: the place of each LED on the stage, for the 3D effect
+	pos_tex = None;
+	seen_stage_rev = -1;      //the stage it placed the LEDs by (an object they hang on moves: again)
+	fx_clock = 0.0;           //cycles of the 3D effect so far
+	fx_last = 0;              //std.millis() of the last frame
+	managed fx_type = None;   //the controls of the 3D effect
+	managed fx_speed = None;
+	managed fx_size = None;
+	managed fx_axis = None;
+	managed fx_hue_a = None;
+	managed fx_hue_b = None;
 	gains_tex = None;
+
+	//#980: the camera scan of the LEDs' places (engine/patch/ledscan.shio)
+	scan = None;              //LedScan of the last scan (running or done)
+	scan_gpu = None;          //LedScanGpu while one runs
+	scan_slots = [];          //the segments scanned: [id, offset, count] (offset into scan.leds)
+	scan_buffer = None;       //what is sent while scanning: the one LED lit
+	scan_lit = -1;            //the LED lit in scan_buffer
+	scan_camera = "";         //live_path of the Camera generator
+	scan_cam_paths = [];      //of the camera list
+	scan_fit = true;          //the places fitted into the picture
+	scan_result = "";         //what the last scan found
+	scan_shown = "";          //the status text shown
+	managed scan_btn = None;
+	managed scan_info = None;
+	managed scan_wait_box = None;
+	managed scan_cam_combo = None;
 
 	managed in_ctrl = None;
 	managed out_ctrl = None;
@@ -378,9 +476,9 @@ class led_mapper {
 			copy = ledmap_new_ids(seg.copy());
 			copy.name = seg.name + " copy";
 			//a little lower, so it is seen
-			copy.start_pos.y = math.min(1.0, copy.start_pos.y + 0.05);
-			copy.end_pos.y = math.min(1.0, copy.end_pos.y + 0.05);
-			copy.control.y = math.min(1.0, copy.control.y + 0.05);
+			moved = ledmap_segment_movable(copy);
+			for(i = 0; i < moved.size(); i++)
+				moved[i].y = math.min(1.0, moved[i].y + 0.05);
 			g.segments.insert(sel_segment + 1, copy);
 			select(sel_scene, sel_group, sel_segment + 1);
 		}
@@ -498,7 +596,7 @@ class led_mapper {
 			return;
 		data = item.copy();
 		data.type = kind;
-		fileio.write_json(LM_PRESET_DIR + kind + "s/" + name + ".json", data);
+		fileio.write_json(LM_PRESET_DIR + kind + "s/" + name + ".json", data, true);
 		build_library();
 	}
 
@@ -920,6 +1018,8 @@ class led_mapper {
 			this.changed(false, true);
 		});
 
+		build_stage_place(box, g);
+
 		row = box.widget().fixed_height(LM_ROW + 2);
 		dup = row.button("Duplicate").icon(nanogui.icon("copy")).anchor_left(0).fixed_width(126).fixed_height(LM_ROW);
 		dup.on_click([this]() { this.duplicate_selected(); });
@@ -928,6 +1028,90 @@ class led_mapper {
 		save_btn.on_click([this, g]() { this.save_preset("group", g); });
 		rem = box.button("Remove group").icon(nanogui.icon("trash")).fixed_height(LM_ROW).danger(true);
 		rem.on_click([this]() { this.remove_selected(); });
+	}
+
+	//Where the group is on the stage (#980, place3d): its LEDs in the 3D views of the Stage menu and the fixture setup
+	build_stage_place(box, g) {
+		title(box, "On the stage");
+		pl = g.place3d;
+		on = box.pushbutton(pl.on ? "Shown on the stage" : "Not on the stage").icon(nanogui.icon(pl.on ? "eye" : "eye_slash"))
+			.fixed_height(LM_ROW).pushed(pl.on ? true : false);
+		on.tooltip("Places the LEDs of this group in 3D: the Stage menu (Tools) and the 3D view of the fixture setup show them in the colours they are sent\n[[wiki:Stage#leds-on-the-stage]]");
+		on.on_change([this, g](v) {
+			g.place3d.on = v ? 1 : 0;
+			this.changed(false, true);
+		});
+		if(!pl.on)
+			return;
+		hint(box, "The middle of the group's LEDs stands at Position, the picture upright facing the audience (its x to the right, its top up) unless turned. Width: how wide the whole picture is on the stage.");
+		src_index = LEDMAP_COLOR_SOURCES.has_value(g.color_source) ? patch_index_of(LEDMAP_COLOR_SOURCES, g.color_source) : 0;
+		cs = field(box, "Colours").combobox().items(LEDMAP_COLOR_SOURCE_LABELS).selected(src_index).anchor(0);
+		cs.tooltip("Picture: where the LEDs are drawn. Projected: the picture laid over every group projected the same way, by where its LEDs stand on the stage (a video shines through the whole arrangement). 3D effect: the effect on the left (3D effect)\n[[wiki:Stage#colours-of-the-leds-on-the-stage]]");
+		cs.on_change([this, g](i, text) {
+			if(i >= 0 && i < LEDMAP_COLOR_SOURCES.size()) {
+				g.color_source = LEDMAP_COLOR_SOURCES[i];
+				this.changed(false);
+			}
+		});
+		w3 = (LM_RIGHT_W - 12 - 100) / 3.0;
+		rows = [["Position m", ["x", "y", "z"], 0.05], ["Turn °", ["rx", "ry", "rz"], 5.0]];
+		for(r : rows) {
+			row = box.widget().fixed_height(LM_ROW + 2);
+			row.label(r[0]).anchor_left(0).fixed_width(100).fixed_height(LM_ROW).text_color(PAL_TEXT_2);
+			for(i = 0; i < 3; i++) {
+				k = r[1][i];
+				fb = row.floatbox().anchor_left(100 + i * w3).fixed_width(w3 - 4).fixed_height(LM_ROW).value(pl[k]);
+				fb.step(r[2]);
+				fb.value_callback([this, g, k](v) {
+					g.place3d[k] = v;
+					this.changed(false);
+				});
+			}
+		}
+		wb = field(box, "Width m").floatbox().anchor(0).min_value(0.01).max_value(1000.0).value(pl.width);
+		wb.step(0.1);
+		wb.tooltip("How wide the whole picture of this LEDMapper is on the stage (metres); the height follows its aspect. The group's own size is below");
+		wb.value_callback([this, g](v) {
+			if(v > 0.0) {
+				g.place3d.width = v;
+				this.changed(false);
+				this.update_info();
+			}
+		});
+		//an object of the stage it hangs on: it moves with it
+		names = ["The stage"];
+		ids = [""];
+		at = 0;
+		st = engine.stage;
+		if(st) {
+			for(o : st.objects) {
+				if(o.id == pl.hangs_on)
+					at = ids.size();
+				names.push_back(o.name);
+				ids.push_back(o.id);
+			}
+		}
+		hc = field(box, "Hangs on").combobox().items(names).selected(at).anchor(0);
+		hc.tooltip("An object of the stage (a panel, a truss) the LEDs move with: Position and Turn are then from that object");
+		hc.on_change([this, g, ids](i, text) {
+			if(i >= 0 && i < ids.size()) {
+				g.place3d.hangs_on = ids[i];
+				this.changed(false);
+			}
+		});
+		//its size on the stage, from the LEDs as they are now
+		leds = [];
+		if(build_data) {
+			for(sg : ledmap_stage_groups(scenes, build_data)) {
+				if(sg.id == g.id)
+					leds = sg.leds;
+			}
+		}
+		if(leds.size()) {
+			aspect = size_x.value() / math.max(1.0, std.float(size_y.value()));
+			ext = stage_leds_extent([leds = leds, place = pl], aspect);
+			hint(box, "On the stage: " + (math.round(ext.width * 100.0) / 100.0) + " × " + (math.round(ext.height * 100.0) / 100.0) + " m");
+		}
 	}
 
 	build_segment_inspector(box, seg, g) {
@@ -946,14 +1130,26 @@ class led_mapper {
 			seg.height = v;
 			this.changed(true);
 		});
-		shape = field(box, "Shape").combobox().items(LM_SHAPES).selected(seg.shape == "curve" ? 1 : 0).anchor(0);
+		//#980: a scanned segment (shape "points") has as many LEDs as the camera found places, one row; Line or Curve
+		//makes it a straight strip again (its points are gone)
+		scanned = seg.shape == "points";
+		if(scanned) {
+			leds.enabled(false);
+			rows.enabled(false);
+			leds.tooltip("Scanned: one LED per place the camera scan found (Camera scan on the left)");
+		}
+		shape = field(box, "Shape").combobox().items(scanned ? [LM_SHAPES[0], LM_SHAPES[1], "Scanned"] : LM_SHAPES).selected(scanned ? 2 : (seg.shape == "curve" ? 1 : 0)).anchor(0);
 		shape.on_change([this, seg](index, text) {
+			if(index == 2)
+				return;
+			was_scanned = seg.shape == "points";
 			if(index == 1 && seg.shape != "curve") {
 				d = ledmap_vec(seg.end_pos) - ledmap_vec(seg.start_pos);
 				seg.control = [x = (seg.start_pos.x + seg.end_pos.x) / 2.0 + d.y * 0.25, y = (seg.start_pos.y + seg.end_pos.y) / 2.0 - d.x * 0.25];
 			}
 			seg.shape = index == 1 ? "curve" : "line";
-			this.changed(false);
+			seg.points = [];
+			this.changed(false, was_scanned);
 		});
 
 		row = box.widget().fixed_height(LM_ROW + 2);
@@ -1040,7 +1236,7 @@ class led_mapper {
 	mirror(g, along_x) {
 		for(i = 0; i < g.segments.size(); i++) {
 			seg = g.segments[i];
-			pts = [seg.start_pos, seg.end_pos, seg.control];
+			pts = ledmap_segment_movable(seg);
 			for(j = 0; j < pts.size(); j++) {
 				if(along_x)
 					pts[j].x = 1.0 - pts[j].x;
@@ -1077,9 +1273,12 @@ class led_mapper {
 		//what is sent now, for the fixture setup and the other LEDMappers
 		dmx_publish(engine, gen.ai_interface.registry_id, "LEDMapper", ledmap_dmx_ranges(scenes, build_data),
 			gen.ai_interface.registry_id, gen);
+		//the groups with a place on the stage (#980): the 3D views draw their LEDs in the colours sent
+		publish_stage();
 		check_conflicts(false);
 
 		total = math.max(1, build_data.total);
+		apply_stage_colors();
 		coords = build_data.coords;
 		if(!build_data.total)
 			coords = [0.0, 0.0, 1.0, 0.0];
@@ -1162,6 +1361,13 @@ class led_mapper {
 			seen_patch_rev = engine.patch_revision;
 			build_dirty = true;
 		}
+		//#980: an object of the stage that LEDs hang on moved: their places, the projections, the 3D effect again
+		if(engine.stage_revision != seen_stage_rev) {
+			seen_stage_rev = engine.stage_revision;
+			if(engine.stage_leds.has(gen.ai_interface.registry_id))
+				build_dirty = true;
+		}
+		tick_effect();
 		if(build_dirty) {
 			rebuild();
 			return;
@@ -1174,6 +1380,9 @@ class led_mapper {
 			upload_gains();
 
 		buffer = led_shader.pixel_buffer();
+		//#980: while a camera scan runs only the LED it lights
+		if(scan && scan.running())
+			buffer = scan_frame();
 		if(!buffer || !build_data)
 			return;
 		for(i = 0; i < build_data.runs.size(); i++) {
@@ -1255,7 +1464,7 @@ class led_mapper {
 
 	//Distance in pixels from pos to the path of a segment
 	seg_distance(g, seg, pos) {
-		steps = seg.shape == "curve" ? 16 : 1;
+		steps = ledmap_path_steps(seg);
 		best = 1000000.0;
 		prev = to_px(ledmap_transform(g, ledmap_path_point(seg, 0.0)));
 		for(i = 1; i <= steps; i++) {
@@ -1339,7 +1548,8 @@ class led_mapper {
 			//Select: handles of the selected segment first
 			seg = cur_segment();
 			if(seg) {
-				handles = [["start", seg.start_pos], ["end", seg.end_pos]];
+				//(a scanned segment, shape "points": its points come from the camera, it is only moved as a whole)
+				handles = seg.shape == "points" ? [] : [["start", seg.start_pos], ["end", seg.end_pos]];
 				if(seg.shape == "curve")
 					handles.push_back(["control", seg.control]);
 				for(i = 0; i < handles.size(); i++) {
@@ -1438,7 +1648,7 @@ class led_mapper {
 			before = untransform(g, snap_uv(to_uv(drag.last)));
 			d = now - before;
 			if(d.x != 0.0 || d.y != 0.0) {
-				pts = [seg.start_pos, seg.end_pos, seg.control];
+				pts = ledmap_segment_movable(seg);
 				for(i = 0; i < pts.size(); i++) {
 					pts[i].x = pts[i].x + d.x;
 					pts[i].y = pts[i].y + d.y;
@@ -1510,7 +1720,7 @@ class led_mapper {
 			//in the coordinates of the segment (before the transform of its group)
 			o = untransform(g, vec2f(0.5, 0.5));
 			m = untransform(g, vec2f(0.5 + d.x, 0.5 + d.y)) - o;
-			pts = [seg.start_pos, seg.end_pos, seg.control];
+			pts = ledmap_segment_movable(seg);
 			for(i = 0; i < pts.size(); i++) {
 				pts[i].x = pts[i].x + m.x;
 				pts[i].y = pts[i].y + m.y;
@@ -1720,7 +1930,7 @@ class led_mapper {
 					seg = g.segments[k];
 					nvgBeginPath();
 					nvgMoveTo(seg_px(g, ledmap_path_point(seg, 0.0)));
-					steps = seg.shape == "curve" ? 16 : 1;
+					steps = ledmap_path_steps(seg);
 					for(t = 1; t <= steps; t++)
 						nvgLineTo(seg_px(g, ledmap_path_point(seg, t / std.float(steps))));
 					nvgStrokeColor(PAL_LINE_STRONG);
@@ -1810,6 +2020,51 @@ class led_mapper {
 		analog.tooltip("Smoothing like a light bulb: up quickly, down slowly");
 		analog.callback([this](v) { this.led_shader.uniform("analog_mode", v); });
 
+		//#980: the 3D effect of the groups on the stage whose Colours are "3D effect" (the box of their LEDs)
+		title(left_content, "3D effect");
+		fx_type = left_content.controlcombo("Effect", "effect3d").caption("Effect").items(["Plane sweep", "Sphere pulse", "Noise", "Rainbow"]).fixed_height(LM_ROW);
+		fx_type.tooltip("For the groups on the stage whose Colours are 3D effect: a plane sweeping through them, rings from their middle, 3D noise, a rainbow along an axis\n[[wiki:Stage#colours-of-the-leds-on-the-stage]]");
+		fx_type.callback([this](v) { this.led_shader.uniform("fx_type", std.int(v)); });
+		fx_axis = left_content.controlcombo("Direction", "effect3d").caption("Direction").items(["Left to right", "Back to front", "Top to bottom"]).fixed_height(LM_ROW);
+		fx_axis.callback([this](v) { this.led_shader.uniform("fx_axis", std.int(v)); });
+		fx_speed = left_content.controlslider("Speed", "effect3d").fixed_height(LM_ROW).value(0.25);
+		fx_speed.tooltip("How fast it moves: 0 stands still, 1 two passes a second");
+		fx_size = left_content.controlslider("Size", "effect3d").fixed_height(LM_ROW).value(0.3);
+		fx_size.tooltip("How wide the plane, the rings, the noise or the rainbow are, from a thin line to the whole arrangement");
+		fx_size.callback([this](v) { this.led_shader.uniform("fx_size", v); });
+		fx_hue_a = left_content.controlslider("Colour A", "effect3d").fixed_height(LM_ROW).value(0.6);
+		fx_hue_a.tooltip("The colour of the plane, the rings, the bright noise (a hue: 0 red, 0.33 green, 0.66 blue)");
+		fx_hue_a.callback([this](v) { this.led_shader.uniform("fx_hue_a", v); });
+		fx_hue_b = left_content.controlslider("Colour B", "effect3d").fixed_height(LM_ROW).value(0.0);
+		fx_hue_b.tooltip("The colour around them");
+		fx_hue_b.callback([this](v) { this.led_shader.uniform("fx_hue_b", v); });
+
+		//#980: the camera scan: one LED after the other lit, its place where a camera sees it
+		title(left_content, "Camera scan");
+		scan_cam_combo = left_content.combobox().items(["Pick a camera…"]).fixed_height(LM_ROW);
+		scan_cam_combo.tooltip("A Camera generator (Generators › Input › Camera) that sees the LEDs from where the audience looks at them\n[[wiki:Output-and-Devices#camera-scan]]");
+		scan_cam_combo.on_open([this]() { this.fill_scan_cameras(); });
+		scan_cam_combo.on_change([this](index, text) {
+			this.scan_camera = index > 0 && index - 1 < this.scan_cam_paths.size() ? this.scan_cam_paths[index - 1] : "";
+		});
+		scan_wait_box = field(left_content, "Wait (ms)").intbox().anchor(0).min_value(30).max_value(5000).value(LEDSCAN_WAIT_MS);
+		scan_wait_box.tooltip("How long each LED is lit before the camera's picture counts: Art-Net, the camera and its buffer. More when LEDs are found in the wrong place (the one before)");
+		fit_btn = left_content.pushbutton("Fit into the picture").fixed_height(LM_ROW).pushed(true);
+		fit_btn.tooltip("On: the places found fill the picture (their proportions kept). Off: where they are in the camera's picture");
+		fit_btn.on_change([this](v) { this.scan_fit = v ? true : false; });
+		scan_btn = left_content.button("Scan the selection").fixed_height(LM_ROW);
+		scan_btn.tooltip("Lights the LEDs of the selected segment (or of all segments of the selected group) one after the other and puts each where the camera sees it. Darken the room first");
+		scan_btn.on_click([this]() {
+			if(this.scan && this.scan.running())
+				this.stop_scan();
+			else {
+				r = this.start_scan();
+				if(!r.ok)
+					this.show_scan_info(r.error);
+			}
+		});
+		scan_info = left_content.label("").wrap(true).fixed_width(LM_LEFT_W - 16).text_color(PAL_TEXT_2);
+
 		title(left_content, "Layout");
 		outliner_holder = left_content.widget().layout(nanogui.layout_vertical());
 		title(left_content, "Library");
@@ -1864,6 +2119,10 @@ class led_mapper {
 		gains_tex = gains_image.texture();
 		gains_tex.pixel_format("rgba").component_format("float32").size(vec2i(1, 1));
 		gains_tex.upload_data([1.0, 0.0, 0.0, 0.0]);
+		pos_image = area.image().visible(false);
+		pos_tex = pos_image.texture();
+		pos_tex.pixel_format("rgba").component_format("float32").size(vec2i(1, 1));
+		pos_tex.upload_data([0.0, 0.0, 0.0, 0.0]);
 
 		led_shader = center.shader().anchor_left(0).anchor_right(0).anchor_top(LM_TOOLBAR_H).fixed_height(LM_STRIP_H);
 		led_shader.tooltip("What is sent: one pixel per LED, in the order of the data");
@@ -1876,6 +2135,16 @@ class led_mapper {
 		led_shader.input("feedback", led_shader);
 		led_shader.input("led_coords", coords_image);
 		led_shader.input("gains", gains_image);
+		led_shader.input("led_pos", pos_image);
+		//the 3D effect (#980) as its controls start (they set it again when they change or a project loads them)
+		led_shader.uniform("fx_type", std.int(fx_type.value()));
+		led_shader.uniform("fx_axis", std.int(fx_axis.value()));
+		led_shader.uniform("fx_size", fx_size.value());
+		led_shader.uniform("fx_hue_a", fx_hue_a.value());
+		led_shader.uniform("fx_hue_b", fx_hue_b.value());
+		led_shader.uniform("fx_time", 0.0);
+		led_shader.uniform("fx_lo", vec3f(0.0, 0.0, 0.0));
+		led_shader.uniform("fx_hi", vec3f(1.0, 1.0, 1.0));
 
 		canvas_scroll = center.scrollarea().anchor_left(0).anchor_right(0).anchor_top(LM_TOOLBAR_H + LM_STRIP_H + 2).anchor_bottom(LM_MASTERS_H).fit_content();
 		canvas_view = canvas_scroll.content();
@@ -1965,9 +2234,60 @@ class led_mapper {
 		detach();
 	}
 
+	//#980: the colours of the groups on the stage: a projected LED samples the picture where the projection puts it
+	//(build_data.coords), an LED of the 3D effect gets its place in led_pos (engine/stage/stage_leds.shio)
+	apply_stage_colors() {
+		total = math.max(1, build_data.total);
+		groups = ledmap_stage_groups(scenes, build_data);
+		aspect = size_x.value() / math.max(1.0, std.float(size_y.value()));
+		c = stage_leds_colors(engine.stage, groups, aspect, total);
+		for(i = 0; i < c.coords.size(); i++) {
+			k = std.int(c.coords.key(i));
+			if(k * 4 + 1 < build_data.coords.size()) {
+				build_data.coords[k * 4] = c.coords[i].u;
+				build_data.coords[k * 4 + 1] = c.coords[i].v;
+			}
+		}
+		pos_tex.size(vec2i(total, 1));
+		pos_tex.upload_data(c.pos);
+		led_shader.uniform("fx_lo", vec3f(c.fx_lo.x, c.fx_lo.y, c.fx_lo.z));
+		led_shader.uniform("fx_hi", vec3f(c.fx_hi.x, c.fx_hi.y, c.fx_hi.z));
+	}
+
+	//The 3D effect moves on by its speed (cycles a second) each frame
+	tick_effect() {
+		now = std.millis();
+		dt = fx_last ? math.min(0.25, (now - fx_last) / 1000.0) : 0.0;
+		fx_last = now;
+		if(!fx_speed)
+			return;
+		fx_clock += dt * fx_speed.value() * 2.0;
+		if(fx_clock > 10000.0)
+			fx_clock -= 10000.0;
+		led_shader.uniform("fx_time", fx_clock);
+	}
+
+	//The groups that are on the stage, for the 3D views (engine/stage/stage_leds.shio): their LEDs and this shader, whose
+	//read-back has their colours
+	publish_stage() {
+		if(!build_data || !gen || !gen.ai_interface)
+			return;
+		aspect = size_x && size_y ? size_x.value() / math.max(1.0, std.float(size_y.value())) : 16.0 / 9.0;
+		try {
+			stage_leds_publish(engine, gen.ai_interface.registry_id, "LEDMapper", aspect, led_shader, ledmap_stage_groups(scenes, build_data));
+		}
+		catch(e) {}
+	}
+
 	detach() noexcept {
+		try {
+			if(gen && gen.ai_interface)
+				stage_leds_remove(engine, gen.ai_interface.registry_id);
+		}
+		catch(e) {}
 		if(chmap)
 			chmap.detach();
+		free_scan_gpu();
 		if(canvas) {
 			canvas.on_draw(None);
 			canvas.on_mouse_button(None);
@@ -2077,10 +2397,12 @@ class led_mapper {
 				problem = false, tip = ""]);
 		}
 		//other LEDMappers (this one draws its own segments)
-		key = node + "|" + std.string(universe) + "|" + std.string(engine.patch_revision) + "|" + seen_dmx_state;
-		if(!map_cells || key != map_cells_key) {
+		//Not a local called `key`: that is the method key() of this class and stays it (the cells were computed once
+		//and never again: another universe, node or patch change kept the cells of the first one)
+		cells_key = node + "|" + std.string(universe) + "|" + std.string(engine.patch_revision) + "|" + seen_dmx_state;
+		if(!map_cells || cells_key != map_cells_key) {
 			map_cells = dmx_universe_cells(engine, p, node, universe, gen.ai_interface.registry_id);
-			map_cells_key = key;
+			map_cells_key = cells_key;
 		}
 		data.cells = map_cells;
 		data.title = patch_node_name(engine.net, p, node) + " · Universe " + std.string(universe) + " · " + std.string(used) +
@@ -2171,6 +2493,215 @@ class led_mapper {
 			selection = [scene = sel_scene, group = sel_group, segment = sel_segment], test = test_on];
 	}
 
+	// =========================================================================
+	// Camera scan (#980, engine/patch/ledscan.shio)
+	// =========================================================================
+
+	//The Camera generators: their live_paths in the combobox
+	fill_scan_cameras() {
+		scan_cam_paths = [];
+		items = ["Pick a camera…"];
+		sel = 0;
+		for(c : ledscan_cameras(engine)) {
+			scan_cam_paths.push_back(c.live_path);
+			items.push_back(c.name);
+			if(c.live_path == scan_camera)
+				sel = items.size() - 1;
+		}
+		scan_cam_combo.items(items);
+		scan_cam_combo.selected(sel);
+	}
+
+	//The camera's picture: of the generator picked (a Camera: its video; any other, an NDI receiver of a phone's camera, a
+	//capture card: the picture of its default output), else of the only Camera generator
+	scan_picture() {
+		return ledscan_picture(engine, scan_camera);
+	}
+
+	//The slots to scan: the selected segment, else every segment of the selected group
+	scan_targets() {
+		list = [];
+		if(!build_data)
+			return list;
+		for(slot : build_data.slots) {
+			if(slot.scene != sel_scene || slot.group != sel_group)
+				continue;
+			if(sel_segment >= 0 && slot.segment != sel_segment)
+				continue;
+			list.push_back(slot);
+		}
+		return list;
+	}
+
+	show_scan_info(text) {
+		if(text != scan_shown && scan_info) {
+			scan_shown = text;
+			scan_info.caption(text);
+		}
+	}
+
+	free_scan_gpu() noexcept {
+		if(scan_gpu) {
+			try {
+				std.free(scan_gpu.host);
+			}
+			catch(e) {}
+		}
+		scan_gpu = None;
+	}
+
+	//Starts a scan of the selection: [ok] or [ok = false, error]
+	start_scan(camera = None, wait = None, fit = None) {
+		if(scan && scan.running())
+			return [ok = false, error = "A scan is running"];
+		if(camera)
+			scan_camera = camera;
+		if(!std.is_none(fit))
+			scan_fit = fit ? true : false;
+		if(!std.is_none(wait))
+			scan_wait_box.value(math.clamp(std.int(wait), 30, 5000));
+		if(build_dirty)
+			rebuild();
+		slots = scan_targets();
+		if(!slots.size())
+			return [ok = false, error = "Select a segment or a group with segments first"];
+		pic = None;
+		try {
+			pic = scan_picture();
+		}
+		catch(e) {
+			return [ok = false, error = std.string(e)];
+		}
+		leds = [];
+		scan_slots = [];
+		for(slot : slots) {
+			scan_slots.push_back([id = slot.id, offset = leds.size(), count = slot.count]);
+			for(i = 0; i < slot.count; i++)
+				leds.push_back(slot.offset + i);
+		}
+		free_scan_gpu();
+		scan_gpu = LedScanGpu(center_holder);
+		scan_gpu.source(pic);
+		scan_buffer = std.buffer();
+		scan_buffer.resize(math.max(1, build_data.total) * 3, 0);
+		scan_lit = -1;
+		scan = LedScan();
+		scan.start(leds, std.millis(), scan_wait_box.value());
+		scan_result = "";
+		scan_btn.caption("Stop the scan");
+		show_scan_info("Taking the dark picture…");
+		return [ok = true, leds = leds.size(), seconds = math.round(leds.size() * scan.wait_ms / 100.0) / 10.0];
+	}
+
+	stop_scan() {
+		if(scan && scan.running()) {
+			scan.stop();
+			end_scan("Stopped: nothing changed");
+		}
+	}
+
+	//One frame of the scan (render thread, from update()): the measure, the next step, the buffer that is sent
+	scan_frame() {
+		a = scan.tick(std.millis(), scan_gpu ? scan_gpu.spot() : None);
+		if(a.lit != scan_lit) {
+			if(scan_lit >= 0 && scan_lit * 3 + 2 < scan_buffer.size()) {
+				for(c = 0; c < 3; c++)
+					scan_buffer[scan_lit * 3 + c] = 0;
+			}
+			if(a.lit >= 0 && a.lit * 3 + 2 < scan_buffer.size()) {
+				for(c = 0; c < 3; c++)
+					scan_buffer[a.lit * 3 + c] = LEDSCAN_LEVEL;
+			}
+			scan_lit = a.lit;
+		}
+		if(scan_gpu)
+			scan_gpu.frame(a.capture);
+		if(scan.state == "done")
+			finish_scan();
+		else if(scan.running())
+			show_scan_info(scan.state == "dark" ? "Taking the dark picture…" : "LED " + (scan.index + 1) + " of " + scan.leds.size() + " · " + scan.seen() + " seen");
+		return scan_buffer;
+	}
+
+	end_scan(text) {
+		free_scan_gpu();
+		scan_lit = -1;
+		scan_result = text;
+		scan_btn.caption("Scan the selection");
+		show_scan_info(text);
+	}
+
+	//The places found into the segments scanned (shape "points"), in the coordinates of their groups
+	finish_scan() {
+		pic = None;
+		cam_aspect = 16.0 / 9.0;
+		try {
+			pic = scan_picture();
+			cam_aspect = ledscan_picture_aspect(pic);
+		}
+		catch(e) {}
+		results = [];
+		lists = [];
+		missing = 0;
+		failed = [];
+		for(e : scan_slots) {
+			found = [];
+			for(i = 0; i < e.count; i++)
+				found.push_back(scan.found[e.offset + i]);
+			r = ledscan_points(found);
+			if(!r) {
+				failed.push_back(e.id);
+				continue;
+			}
+			missing += r.missing;
+			results.push_back([id = e.id, points = r.points]);
+			lists.push_back(r.points);
+		}
+		if(scan_fit && lists.size())
+			ledscan_fit(lists, cam_aspect, size_x.value() / math.max(1.0, std.float(size_y.value())));
+		placed = 0;
+		for(k = 0; k < results.size(); k++) {
+			hit = find_segment(results[k].id);
+			if(!hit)
+				continue;
+			pts = [];
+			for(p : lists[k])
+				pts.push_back(untransform(hit.group, vec2f(p.x, p.y)));
+			//in the order the LEDs are sent: a reversed segment keeps its points the other way round
+			if(hit.segment.reversed) {
+				back = [];
+				for(i = pts.size() - 1; i >= 0; i--)
+					back.push_back(pts[i]);
+				pts = back;
+			}
+			ledmap_set_points(hit.segment, pts);
+			placed += pts.size();
+		}
+		text = scan.leds.size() + " LEDs: " + scan.seen() + " seen";
+		if(missing)
+			text += ", " + missing + " placed between the ones beside them";
+		if(failed.size())
+			text += ", " + failed.size() + (failed.size() == 1 ? " segment" : " segments") + " not seen (fewer than 2 LEDs): left as they were";
+		if(!placed)
+			text = "No LED was seen: is the camera looking at them, the room dark, Art-Net reaching the LEDs?";
+		end_scan(text);
+		if(placed)
+			changed(true, true);
+	}
+
+	//[scene, group, segment] of a segment id (the layout can change during a scan)
+	find_segment(id) {
+		for(sc : scenes) {
+			for(g : sc.groups) {
+				for(seg : g.segments) {
+					if(seg.id == id)
+						return [group = g, segment = seg];
+				}
+			}
+		}
+		return None;
+	}
+
 	register_queries() {
 		gen.register("get_layout", [], [this](args) {
 			if(this.build_dirty)
@@ -2216,6 +2747,137 @@ class led_mapper {
 			return [ok = true];
 		}, "Changes the selected group");
 
+		//#980: where the selected group is on the stage (engine/stage/stage_leds.shio)
+		gen.register("set_stage_place", [
+			on = "int(): 1: its LEDs on the stage (the Stage menu, the 3D view of the fixture setup), 0: not",
+			x = "float(): Where the middle of its LEDs is, metres (x to the right, y towards the audience, z up)",
+			y = "float(): metres", z = "float(): metres (height)",
+			rx = "float(): Turn around x in degrees", ry = "float(): Turn around y in degrees",
+			rz = "float(): Turn around the vertical in degrees (0: the picture faces the audience)",
+			width = "float(): How wide the whole picture is on the stage, metres (the height follows its aspect)",
+			hangs_on = "string(): An object of the stage (id or name, list_stage) its LEDs move with; empty: none",
+			color_source = "string(): Where its colours come from: picture (as drawn), front, top, side (the picture projected by where the LEDs stand), effect (the 3D effect, set_effect3d)",
+		], [this](args) {
+			g = this.cur_group();
+			if(!g)
+				return [ok = false, error = "No group selected (select)"];
+			pl = g.place3d;
+			pl.on = args.has("on") ? (std.int(args.on) ? 1 : 0) : 1;
+			for(k : ["x", "y", "z", "rx", "ry", "rz"]) {
+				if(args.has(k))
+					pl[k] = std.float(args[k]);
+			}
+			if(args.has("width") && std.float(args.width) > 0.0)
+				pl.width = std.float(args.width);
+			if(args.has("hangs_on")) {
+				pl.hangs_on = "";
+				want = std.string(args.hangs_on);
+				st = this.engine.stage;
+				for(o : st ? st.objects : []) {
+					if(o.id == want || std.string(o.name).lowercase() == want.lowercase())
+						pl.hangs_on = o.id;
+				}
+				if(want && !pl.hangs_on)
+					return [ok = false, error = "No object '" + want + "' on the stage (list_stage of the live_path stage)"];
+			}
+			if(args.has("color_source")) {
+				if(!LEDMAP_COLOR_SOURCES.has_value(args.color_source))
+					return [ok = false, error = "color_source is one of " + LEDMAP_COLOR_SOURCES.combine_string(", ")];
+				g.color_source = args.color_source;
+			}
+			this.changed(false, true);
+			return [ok = true, value = [place = pl, color_source = g.color_source]];
+		}, "Places the selected group on the stage (#980): its LEDs in 3D in the colours they are sent; the default is on");
+
+		gen.register("add_group", [name = "string(): Name (default: Group n)"], [this](args) {
+			g = this.add_group(args.has("name") ? std.string(args.name) : "");
+			this.build_inspector();
+			return [ok = true, value = this.describe().selection];
+		}, "Adds a group to the selected scene (a scene is made when there is none) and selects it: add_segment draws into it");
+
+		//#980: a strip along an edge of a model of the stage (the Stage menu, an agent): a segment whose LEDs follow a
+		//3D path, in a group that hangs on that object
+		gen.register("add_path_segment", [
+			points = "&array(float): The path: x, y, z, ... in metres, in the frame of the object (as stage_model_edges gives them)",
+			hangs_on = "string(): The object of the stage (id) the path belongs to; empty: the points are in the world",
+			leds = "int(): How many LEDs (default: leds_per_m times its length)",
+			leds_per_m = "float(): LEDs a metre (default 60)",
+			group_name = "string(): The group it goes into (made when there is none of that name; default: Edges)",
+		], [this](args) {
+			pts = [];
+			for(v : args.points)
+				pts.push_back(std.float(v));
+			if(pts.size() < 6 || pts.size() % 3 != 0)
+				return [ok = false, error = "points: at least two points, x, y, z each"];
+			n = args.has("leds") && args.leds ? std.int(args.leds) : 0;
+			if(n <= 0)
+				n = math.max(1, std.int(math.round(stage_path_length(pts) * (args.has("leds_per_m") && args.leds_per_m ? std.float(args.leds_per_m) : 60.0))));
+			gname = args.has("group_name") && args.group_name ? std.string(args.group_name) : "Edges";
+			//the group of that name in the selected scene, else a new one
+			found = -1;
+			sc = this.cur_scene();
+			if(sc) {
+				for(i = 0; i < sc.groups.size(); i++) {
+					if(sc.groups[i].name == gname)
+						found = i;
+				}
+			}
+			if(found >= 0)
+				this.select(this.sel_scene, found, -1);
+			else
+				this.add_group(gname);
+			g = this.cur_group();
+			g.place3d.on = 1;
+			g.place3d.hangs_on = args.has("hangs_on") ? std.string(args.hangs_on) : "";
+			//on the picture: a line of its own under the ones before (where it samples the picture)
+			row = g.segments.size();
+			yy = 0.06 + (row % 16) * 0.055;
+			seg = this.add_segment(vec2f(0.08, yy), vec2f(0.92, yy), "line");
+			seg.width = n;
+			seg.height = 1;
+			seg.path3d = pts;
+			seg.name = "Edge " + (row + 1);
+			this.changed(true, true);
+			return [ok = true, value = [group = g.name, segment = seg.name, leds = n, length = stage_path_length(pts)]];
+		}, "Adds a strip of LEDs along a 3D path (an edge of a model of the stage) into a group that hangs on that object; on the picture it is a line of its own");
+
+		gen.register("set_effect3d", [
+			effect = "string(): plane, sphere, noise or rainbow",
+			direction = "string(): x (left to right), y (back to front) or z (top to bottom)",
+			speed = "float(): 0..1 (1: two passes a second)", size = "float(): 0..1 of the arrangement",
+			hue_a = "float(): Colour A as a hue 0..1 (0 red, 0.33 green, 0.66 blue)", hue_b = "float(): Colour B, the same",
+		], [this](args) {
+			names = ["plane", "sphere", "noise", "rainbow"];
+			axes = ["x", "y", "z"];
+			if(args.has("effect")) {
+				if(!names.has_value(args.effect))
+					return [ok = false, error = "effect is plane, sphere, noise or rainbow"];
+				this.fx_type.value(patch_index_of(names, args.effect));
+				this.led_shader.uniform("fx_type", patch_index_of(names, args.effect));
+			}
+			if(args.has("direction")) {
+				if(!axes.has_value(args.direction))
+					return [ok = false, error = "direction is x, y or z"];
+				this.fx_axis.value(patch_index_of(axes, args.direction));
+				this.led_shader.uniform("fx_axis", patch_index_of(axes, args.direction));
+			}
+			if(args.has("speed"))
+				this.fx_speed.value(math.clamp(std.float(args.speed), 0.0, 1.0));
+			if(args.has("size")) {
+				this.fx_size.value(math.clamp(std.float(args.size), 0.0, 1.0));
+				this.led_shader.uniform("fx_size", this.fx_size.value());
+			}
+			if(args.has("hue_a")) {
+				this.fx_hue_a.value(math.clamp(std.float(args.hue_a), 0.0, 1.0));
+				this.led_shader.uniform("fx_hue_a", this.fx_hue_a.value());
+			}
+			if(args.has("hue_b")) {
+				this.fx_hue_b.value(math.clamp(std.float(args.hue_b), 0.0, 1.0));
+				this.led_shader.uniform("fx_hue_b", this.fx_hue_b.value());
+			}
+			return [ok = true];
+		}, "The 3D effect of this LEDMapper (#980) for its groups on the stage whose colour_source is effect");
+
 		gen.register("select", [scene = "&int(): Scene index", group = "int(): Group index (-1: the scene)", segment = "int(): Segment index (-1: the group)"], [this](args) {
 			//(not ??: it takes 0 as missing)
 			this.select(std.int(args.scene), args.has("group") ? std.int(args.group) : -1, args.has("segment") ? std.int(args.segment) : -1);
@@ -2228,6 +2890,28 @@ class led_mapper {
 			this.gains_dirty = true;
 			return [ok = true];
 		}, "Test mode: the selection white on the LEDs, everything else black");
+
+		//#980: the camera scan
+		gen.register("scan_leds", [
+			camera = "string(): live_path of a Camera generator, or of another one whose picture is a camera (an NDI receiver) (default: the one picked, else the only Camera)",
+			wait_ms = "int(): ms each LED is lit before the camera counts (default 300)",
+			fit = "any(): true (default): the places found fill the picture; false: where they are in the camera's picture",
+		], [this](args) {
+			r = this.start_scan(args.camera ?? None, args.wait_ms ?? None, args.has("fit") ? args.fit : None);
+			return r.ok ? [ok = true, value = r] : r;
+		}, "Camera scan of the selected segment (or every segment of the selected group): one LED after the other lit, each put where the camera sees it (shape points). Runs over frames: get_scan_status");
+
+		gen.register("get_scan_status", [], [this](args) {
+			s = this.scan;
+			if(!s)
+				return [ok = true, value = [state = "idle"]];
+			return [ok = true, value = [state = s.state, leds = s.leds.size(), done = s.found.size(), seen = s.seen(), result = this.scan_result]];
+		}, "The camera scan: state (dark, led, done, stopped), LEDs, done, seen, and what it found");
+
+		gen.register("stop_scan", [], [this](args) {
+			this.stop_scan();
+			return [ok = true];
+		}, "Stops a camera scan: the segments stay as they were");
 
 		gen.register("add_lamps", [target = "&string(): group:<id> or type:<path> of the fixture setup"], [this](args) {
 			g = this.add_lamps(args.target);

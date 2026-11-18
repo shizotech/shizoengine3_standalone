@@ -13,9 +13,11 @@
 //  online / goals travel as 1/0 (shizoscript has no bool type), so the receiver
 //  tests them for truthiness and never compares them to a JSON literal true.
 //
-//  on_get handlers run on the ShizoNet script thread: they only touch the
-//  request table and return. They never block and never call device.get().
-//  All blocking work (host.request) runs on the service worker thread.
+//  on_get handlers never call device.get(). The request handlers only touch the
+//  request table and return; all blocking work (host.request) runs on the service
+//  worker thread. The one handler that may wait is ai_api (a long-poll route of
+//  the API): every GET is answered by a task of its own, so it holds back only
+//  its own answer.
 //  ai_request_update is recorded in the update queue and applied by the
 //  refresh thread (the worker thread is blocked inside host.request while the
 //  request it runs is the one a follow-up has to reach).
@@ -34,7 +36,7 @@ AI_CMD_INFO = "ai_info";
 AI_CMD_REQUEST = "ai_request";
 AI_CMD_REQUEST_POLL = "ai_request_poll";
 AI_CMD_REQUEST_STOP = "ai_request_stop";
-AI_CMD_REQUEST_UPDATE = "ai_request_update";	// follow-up into a delegated receptionist turn
+AI_CMD_REQUEST_UPDATE = "ai_request_update";	// follow-up into a running request turn
 AI_CMD_OVERVIEW = "ai_overview";
 AI_CMD_TASKS = "ai_tasks";
 AI_CMD_TASK = "ai_task";
@@ -42,13 +44,16 @@ AI_CMD_TASK_ADD = "ai_task_add";
 AI_CMD_TASK_UPDATE = "ai_task_update";
 AI_CMD_TASK_STOP = "ai_task_stop";
 AI_CMD_GOALS = "ai_goals";					// scheduled goals: list / pause / resume / cancel / run
+AI_CMD_API = "ai_api";						// the node's JSON API (node_api.md, workspace_spec.md) without HTTP
 
 // node pushes to routers (broadcast, fire and forget)
 AI_CMD_EVENT = "ai_event";
 
 AI_TIMEOUT_CONTROL = 5000;
 AI_TIMEOUT_POLL = 2000;
+AI_TIMEOUT_API = 15000;			// one ai_api call (creating a workspace, deleting a session take a moment)
 AI_MAX_KEPT = 200;
+AI_INFO_MAX_WORKSPACES = 64;	// workspaces listed in AINodeInfo (the routing table of a gateway)
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Service tuning (not part of the wire contract)
@@ -122,6 +127,36 @@ ai_field(data, key, def = "") {
 		return def;
 
 	return ai_str(data.geti(key), def);
+}
+
+// A value as it can travel over ShizoNet. A JSON boolean (json.bool, what the HTTP
+// API answers with) is an object the receiver cannot read: the whole payload is
+// dropped there ("invalid json payload"). Every reply and event of this service
+// goes through here, so `active: true` of a task record arrives as 1.
+// (Found with a real node behind a gateway: every ai_task poll of a worker session
+// was lost, a finished task was only seen through its task_finished push.)
+ai_wire(value) {
+	if(std.type(value) == "json.bool")
+		return value ? 1 : 0;
+
+	if(!std.is_json(value))
+		return value;
+
+	if(std.is_list(value)) {
+		out = [];
+
+		for(item : value)
+			out.push_back(ai_wire(item));
+
+		return out;
+	}
+
+	out = std.json();
+
+	for(k, item : value)
+		out[std.string(k)] = ai_wire(item);
+
+	return out;
 }
 
 ai_trim(list, max_keep) {
@@ -258,37 +293,51 @@ ai_node_info(host, opts = None) {
 		}
 	}
 
+	// Open direct requests (Node.request: one worker turn each). A host of the old
+	// shape (a stub, an older node with a receptionist agent) is read the old way.
 	queued = 0;
-
-	try {
-		if(host.receptionist)
-			queued = host.receptionist.queue.size();
-		else
-			queued = host.request_queue.size();
-	}
-	catch(e) {
-		try {
-			queued = host.request_queue.size();
-		}
-		catch(e2) {
-			queued = 0;
-		}
-	}
-
 	active = false;
+	counted = false;
 
 	try {
-		if(host.receptionist)
-			active = host.receptionist._active ? true : false;
-		else
-			active = host._receptionist_active ? true : false;
+		if(std.is_function(host.requests_active)) {
+			active = host.requests_active() > 0;
+			counted = true;
+		}
 	}
 	catch(e) {
+		counted = false;
+	}
+
+	if(!counted) {
 		try {
-			active = host._receptionist_active ? true : false;
+			if(host.receptionist)
+				queued = host.receptionist.queue.size();
+			else
+				queued = host.request_queue.size();
 		}
-		catch(e2) {
-			active = false;
+		catch(e) {
+			try {
+				queued = host.request_queue.size();
+			}
+			catch(e2) {
+				queued = 0;
+			}
+		}
+
+		try {
+			if(host.receptionist)
+				active = host.receptionist._active ? true : false;
+			else
+				active = host._receptionist_active ? true : false;
+		}
+		catch(e) {
+			try {
+				active = host._receptionist_active ? true : false;
+			}
+			catch(e2) {
+				active = false;
+			}
 		}
 	}
 
@@ -323,6 +372,31 @@ ai_node_info(host, opts = None) {
 	running = ov.tasks.size();
 	planned = ov.tasks_scheduled.size();
 
+	// The workspaces of the node: a gateway routes a request to a node AND a
+	// workspace, so the routing table carries them (id, name, description, path).
+	workspaces = [];
+
+	try {
+		if(std.is_function(host.workspaces_summary))
+			workspaces = host.workspaces_summary(AI_INFO_MAX_WORKSPACES);
+	}
+	catch(e) {
+		workspaces = [];
+	}
+
+	if(!std.is_json(workspaces))
+		workspaces = [];
+
+	// ai_api: the node serves its JSON API over ShizoNet (a Node does, a stub host does not)
+	has_api = false;
+
+	try {
+		has_api = !std.is_none(host["api_table"]) ? true : false;
+	}
+	catch(e) {
+		has_api = false;
+	}
+
 	return [
 		name = name,
 		version = AI_NET_VERSION,
@@ -336,6 +410,8 @@ ai_node_info(host, opts = None) {
 		tasks_running = running,
 		tasks_planned = planned,
 		goals = has_goals ? 1 : 0,
+		api = has_api ? 1 : 0,
+		workspaces = workspaces,
 		uptime_ms = std.millis() - AI_STARTED_AT,
 	];
 }
@@ -495,20 +571,21 @@ class AiService {
 
 	register_node() {
 		server.set_prop(AI_PROP_NODE, AI_NET_VERSION);
-		server.set_prop(AI_PROP_NODE_INFO, info());
+		server.set_prop(AI_PROP_NODE_INFO, ai_wire(info()));
 
-		server.on_get(AI_CMD_INFO, [this](dev, data) { return handle_info(dev, data); });
-		server.on_get(AI_CMD_REQUEST, [this](dev, data) { return handle_request(dev, data); });
-		server.on_get(AI_CMD_REQUEST_POLL, [this](dev, data) { return handle_poll(dev, data); });
-		server.on_get(AI_CMD_REQUEST_STOP, [this](dev, data) { return handle_request_stop(dev, data); });
-		server.on_get(AI_CMD_REQUEST_UPDATE, [this](dev, data) { return handle_request_update(dev, data); });
-		server.on_get(AI_CMD_OVERVIEW, [this](dev, data) { return handle_overview(dev, data); });
-		server.on_get(AI_CMD_TASKS, [this](dev, data) { return handle_tasks(dev, data); });
-		server.on_get(AI_CMD_TASK, [this](dev, data) { return handle_task(dev, data); });
-		server.on_get(AI_CMD_TASK_ADD, [this](dev, data) { return handle_task_add(dev, data); });
-		server.on_get(AI_CMD_TASK_UPDATE, [this](dev, data) { return handle_task_update(dev, data); });
-		server.on_get(AI_CMD_TASK_STOP, [this](dev, data) { return handle_task_stop(dev, data); });
-		server.on_get(AI_CMD_GOALS, [this](dev, data) { return handle_goals(dev, data); });
+		server.on_get(AI_CMD_INFO, [this](dev, data) { return ai_wire(handle_info(dev, data)); });
+		server.on_get(AI_CMD_REQUEST, [this](dev, data) { return ai_wire(handle_request(dev, data)); });
+		server.on_get(AI_CMD_REQUEST_POLL, [this](dev, data) { return ai_wire(handle_poll(dev, data)); });
+		server.on_get(AI_CMD_REQUEST_STOP, [this](dev, data) { return ai_wire(handle_request_stop(dev, data)); });
+		server.on_get(AI_CMD_REQUEST_UPDATE, [this](dev, data) { return ai_wire(handle_request_update(dev, data)); });
+		server.on_get(AI_CMD_OVERVIEW, [this](dev, data) { return ai_wire(handle_overview(dev, data)); });
+		server.on_get(AI_CMD_TASKS, [this](dev, data) { return ai_wire(handle_tasks(dev, data)); });
+		server.on_get(AI_CMD_TASK, [this](dev, data) { return ai_wire(handle_task(dev, data)); });
+		server.on_get(AI_CMD_TASK_ADD, [this](dev, data) { return ai_wire(handle_task_add(dev, data)); });
+		server.on_get(AI_CMD_TASK_UPDATE, [this](dev, data) { return ai_wire(handle_task_update(dev, data)); });
+		server.on_get(AI_CMD_TASK_STOP, [this](dev, data) { return ai_wire(handle_task_stop(dev, data)); });
+		server.on_get(AI_CMD_GOALS, [this](dev, data) { return ai_wire(handle_goals(dev, data)); });
+		server.on_get(AI_CMD_API, [this](dev, data) { return ai_wire(handle_api(dev, data)); });
 
 		server.on_connect([this](dev) { node_connected(dev); });
 
@@ -596,6 +673,9 @@ class AiService {
 				name = ai_str(task.name),
 				state = ai_str(task.state),
 				report = ai_str(task.report),
+				error = ai_field(task, "error"),
+				workspace_id = ai_field(task, "workspace_id"),
+				origin = ai_field(task, "origin"),
 			]);
 		};
 
@@ -657,7 +737,7 @@ class AiService {
 		accepted = 0;
 
 		try {
-			accepted = server.broadcast(AI_CMD_EVENT, payload);
+			accepted = server.broadcast(AI_CMD_EVENT, ai_wire(payload));
 		}
 		catch(err) {
 			accepted = 0;
@@ -673,7 +753,7 @@ class AiService {
 	update_props() {
 		try {
 			if(kind == "node")
-				server.set_prop(AI_PROP_NODE_INFO, info());
+				server.set_prop(AI_PROP_NODE_INFO, ai_wire(info()));
 			else
 				server.set_prop(AI_PROP_ROUTER_INFO, ai_router_info(server, router, opts));
 		}
@@ -742,11 +822,23 @@ class AiService {
 			if(status != "generating")
 				continue;
 
-			// A Node continues the running turn with the message on its own
-			// receptionist thread (Node.update_receptionist). Calling
-			// receptionist.task_update() from here also updates the running
-			// task, but must check `running` first: no task means nothing to update.
+			// A Node hands the message to the worker session that runs the request
+			// (Node.update_request). Hosts of the old shape continue their
+			// receptionist turn (update_receptionist / receptionist.task_update).
 			handled = false;
+			try {
+				if(std.is_function(host.update_request)) {
+					host.update_request(message);
+					handled = true;
+				}
+			}
+			catch(e) {
+				handled = false;
+			}
+
+			if(handled)
+				continue;
+
 			try {
 				if(std.is_function(host.update_receptionist)) {
 					host.update_receptionist(message);
@@ -803,7 +895,8 @@ class AiService {
 		}
 	}
 
-	// One request at a time: the receptionist is a single serial queue.
+	// One request at a time, in the order they came (ai_request is the blocking
+	// "run this and give me the answer" path; ai_task_add starts work in parallel).
 	worker_loop() {
 		for(running) {
 			if(!pending.size()) {
@@ -822,6 +915,7 @@ class AiService {
 
 			requests[rid].status = "generating";
 			prompt = std.string(requests[rid].prompt);
+			workspace = ai_str(requests[rid].workspace);
 
 			on_action = [this, rid](action) {
 				if(!requests.has(rid))
@@ -841,7 +935,13 @@ class AiService {
 			};
 
 			try {
-				result = host.request(prompt, on_finish, on_action);
+				result = None;
+
+				// a host that takes no workspace (a stub, an older node) gets the plain call
+				if(workspace)
+					result = host.request(prompt, on_finish, on_action, workspace);
+				else
+					result = host.request(prompt, on_finish, on_action);
 
 				if(requests.has(rid)) {
 					requests[rid].result = result;
@@ -975,13 +1075,27 @@ class AiService {
 			execution_time_ms = std.millis() - req.created,
 		];
 
-		// best effort: ask the receptionist to abort the running turn
+		// best effort: stop the worker turn of the request (Node.stop_request);
+		// a host of the old shape stops its receptionist agent
+		asked = false;
 		try {
-			if(std.is_function(host.receptionist.stop))
-				host.receptionist.stop();
+			if(std.is_function(host.stop_request)) {
+				host.stop_request();
+				asked = true;
+			}
 		}
 		catch(e) {
-			// the host has no receptionist handle, the request stays marked stopped
+			asked = false;
+		}
+
+		if(!asked) {
+			try {
+				if(std.is_function(host.receptionist.stop))
+					host.receptionist.stop();
+			}
+			catch(e) {
+				// the host has no receptionist handle, the request stays marked stopped
+			}
 		}
 
 		return [ok = true, request_id = request_id, status = "stopped"];
@@ -1076,6 +1190,66 @@ class AiService {
 		return [ok = true, tasks = ai_host_tasks(host)];
 	}
 
+	// The node's JSON API over ShizoNet: [method, path, body?, query?] is one call of
+	// the route table the HTTP server uses (api_router.shio), the answer is its
+	// status code and its body text (JSON, as the HTTP route would send it; text and
+	// not a json value, so `true` stays `true` on the way). This is how the web
+	// interface of one node works with every other node on the network.
+	// A request runs as its own task: a long-poll route (/api/live, .../events)
+	// holds only its own answer back.
+	handle_api(dev, data) {
+		table = None;
+
+		try {
+			table = host["api_table"];
+		}
+		catch(e) {
+			table = None;
+		}
+
+		if(std.is_none(table))
+			return [ok = false, status_code = 501, error = "this node does not serve its API over ShizoNet"];
+
+		method = ai_field(data, "method", "GET");
+		path = ai_field(data, "path");
+
+		if(path.empty())
+			return [ok = false, status_code = 400, error = "missing 'path'"];
+
+		body = None;
+		query = None;
+
+		if(std.is_json(data)) {
+			if(data.has("body") && !std.is_none(data.body))
+				body = data.body;
+
+			if(data.has("query") && std.is_json(data.query))
+				query = data.query;
+		}
+
+		// the caller is on the ShizoNet network: it gets what the node's own pages get
+		headers = [];
+
+		try {
+			tok = ai_str(host["api_token"]);
+
+			if(tok)
+				headers["x-api-token"] = tok;
+		}
+		catch(e) {}
+
+		res = None;
+
+		try {
+			res = table.dispatch(method, path, body, query, headers);
+		}
+		catch(e) {
+			return [ok = false, status_code = 500, error = "API call failed: " + ai_str(e)];
+		}
+
+		return [ok = true, status_code = std.int(res.status_code), body = ai_str(res.body)];
+	}
+
 	handle_task(dev, data) {
 		taskid = ai_field(data, "taskid");
 
@@ -1124,20 +1298,36 @@ class AiService {
 		workspace = workspace.strip();
 
 		taskid = None;
+		why = "";
 
+		// A Node takes the origin of a task ("net": it came over ShizoNet); a host
+		// with the shorter add_task (a stub, an older node) gets the call it knows.
 		try {
-			if(workspace.empty())
-				taskid = host.add_task(name, goal);
-			else
-				taskid = host.add_task(name, goal, "adaptive", workspace);
+			taskid = host.add_task(name, goal, "adaptive", workspace, "net");
 		}
 		catch(e) {
 			taskid = None;
+			why = ai_str(e);
+		}
+
+		if(std.is_none(taskid) && why.contains("argument count")) {
+			why = "";
+
+			try {
+				if(workspace.empty())
+					taskid = host.add_task(name, goal);
+				else
+					taskid = host.add_task(name, goal, "adaptive", workspace);
+			}
+			catch(e) {
+				taskid = None;
+				why = ai_str(e);
+			}
 		}
 
 		// A refused dispatch is an error, not a task with an empty id.
 		if(std.is_none(taskid))
-			return [ok = false, error = "add_task failed"];
+			return [ok = false, error = why ? "add_task failed: " + why : "add_task failed"];
 
 		if(std.is_json(taskid)) {
 			if(!taskid.ok)

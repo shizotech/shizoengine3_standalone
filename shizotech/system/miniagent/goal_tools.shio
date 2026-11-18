@@ -5,7 +5,7 @@
 //      goal_tools_add(agt)              registers the tools on a miniagent
 //      goal_tool_create(sch, args) ...  the same operations without an agent
 //
-//  The model interprets "tonight, work on X" and proposes a structured goal;
+//  The model interprets "tonight, work on X" and creates/activates a structured goal;
 //  this code validates it, refuses duplicates and stale edits, and writes the
 //  Markdown file. The model never writes goal files and never decides when
 //  work runs. The scheduler comes from agt.env.mind.goals (Megamind.goals).
@@ -67,11 +67,44 @@ goal_tool_context(sch) {
 	];
 }
 
+// The goals with their runtime state. A scheduler that ticks has them in memory.
+// One that never ticks (the tool scheduler of a workspace worker process,
+// workspace_agent.shio) has no definitions at all: there the list comes from the
+// goal files, and the runtime state from the ledger the node's scheduler writes
+// (read only; this process never writes it).
+goal_tool_overview(sch) {
+	if(sch.last_scan || sch.running)
+		return sch.overview();
+
+	try {
+		disk = std.json(goal_read(sch.ledger.path));
+		if(gj_is_map(disk) && disk.has("goals") && disk.has("activations")) {
+			if(!disk.has("events"))
+				disk.events = [];
+			if(!disk.has("seq"))
+				disk.seq = 0;
+			sch.ledger.data = disk;
+		}
+	}
+	catch(e) {}
+
+	out = [];
+	prefs = sch.space.preferences();
+	for(f : sch.space.folders()) {
+		r = sch.space.load(f, prefs);
+		if(r.ok)
+			out.push_back(sch.goal_summary(f.id, r.def));
+		else
+			out.push_back([id = f.id, title = "(invalid)", status = f.status, errors = r.errors, invalid_edit = true]);
+	}
+	return out;
+}
+
 goal_tool_list(sch) {
 	ctx = goal_tool_context(sch);
 	goals = [];
 	try {
-		goals = sch.overview();
+		goals = goal_tool_overview(sch);
 	}
 	catch(e) {}
 	ctx.goals = goals;
@@ -179,7 +212,7 @@ goal_tool_create(sch, args) {
 		}
 	}
 
-	status = goal_arg_yes(args, "activate") ? "active" : "proposed";
+	status = goal_arg_yes(args, "activate", true) ? "active" : "proposed";
 	needs_owner = false;
 
 	pol = gj(data, "policy", std.json());
@@ -192,18 +225,28 @@ goal_tool_create(sch, args) {
 
 	res = sch.space.write_goal(id, data, body, status);
 
-	if(!res.ok)
-		return [ok = false, errors = res.errors, error = "the goal is invalid, nothing was written: " + gfm_join(res.errors, "; ")];
+    if(!res.ok)
+        return [ok = false, errors = res.errors, error = "the goal is invalid, nothing was written: " + gfm_join(res.errors, "; ")];
 
-	out = goal_tool_summary(sch, res.def, res.path, status);
+    try { sch.rescan(); } catch(e) {}
+
+    out = goal_tool_summary(sch, res.def, res.path, status);
 	out.ok = true;
 	out.warnings = gj(res, "warnings", []);
 	if(needs_owner)
 		out.note = "The goal allows high impact actions, so it stays in goals/proposed/ until the owner activates it (set_goal_status active after an explicit yes).";
 	else if(status == "proposed")
 		out.note = "Saved as PROPOSED: nothing runs until it is activated. Show the user the schedule and ask for a yes.";
+	else if(res.def.schedule.type == "manual")
+		out.note = "Active, manual: it has no schedule and runs only when it is started (run_goal_now).";
 	else
 		out.note = "Active: the scheduler starts it in its next window. Tell the user the window and the time zone so they can correct it.";
+
+	// a once goal with a date in the past, an end_date that is over: no "next window"
+	if(res.def.schedule.type != "manual" && !out.next_windows.size()) {
+		no_window = "The schedule has no window ahead (is the date in the past?): nothing will run until it is corrected with update_goal.";
+		out.note = status == "active" ? no_window : no_window + " " + out.note;
+	}
 	return out;
 }
 
@@ -266,6 +309,17 @@ goal_tool_update(sch, args) {
 	}
 	if(goal_arg(args, "duration") && sch_new.has("end") && !goal_arg(args, "end"))
 		sch_new.remove("end");
+	if(goal_arg(args, "end") && sch_new.has("duration") && !goal_arg(args, "duration"))
+		sch_new.remove("duration");
+	// a sub-day interval is continuous: it replaces the stored window and times
+	// (they cannot be cleared through this tool, and both together are refused)
+	every_secs = gt_parse_duration(goal_arg(args, "every"));
+	if(!std.is_none(every_secs) && every_secs < GT_DAY) {
+		for(k : ["window", "start", "end", "duration"]) {
+			if(!goal_arg(args, k) && sch_new.has(k))
+				sch_new.remove(k);
+		}
+	}
 	// days and every are alternatives: the one given in this call wins
 	if(goal_arg(args, "every") && sch_new.has("days"))
 		sch_new.remove("days");
@@ -290,11 +344,13 @@ goal_tool_update(sch, args) {
 		return [ok = false, conflict = gj(res, "conflict", false), error = gfm_join(res.errors, "; ")];
 
 	try {
-		sch.ledger.goal(id).pending_actor = "agent";
-	}
-	catch(e) {}
+        sch.ledger.goal(id).pending_actor = "agent";
+    }
+    catch(e) {}
 
-	out = goal_tool_summary(sch, res.def, res.path, f.status);
+    try { sch.rescan(); } catch(e) {}
+
+    out = goal_tool_summary(sch, res.def, res.path, f.status);
 	out.ok = true;
 	out.note = "Saved. A run that is working right now keeps its revision; the change applies from the next run.";
 	return out;
@@ -316,10 +372,12 @@ goal_tool_set_status(sch, args) {
 		to = "archived";
 
 	res = sch.space.move(id, to);
-	if(!res.ok)
-		return [ok = false, error = res.error];
+    if(!res.ok)
+        return [ok = false, error = res.error];
 
-	what = [
+    try { sch.rescan(); } catch(e) {}
+
+    what = [
 		active = "it runs in its next window",
 		paused = "no new windows; a run working right now finishes",
 		cancelled = "no new windows; a running task is stopped",
@@ -373,7 +431,7 @@ goal_tools_add(agt) {
 		verify = "string(): OPTIONAL yes = a verification run checks the acceptance criteria",
 		dry_run = "string(): OPTIONAL yes = only write the prompt to history.md, dispatch nothing",
 		allow = "string(): OPTIONAL comma separated allowed actions (e.g. 'edit,test,commit,push_branch')",
-		activate = "string(): yes = active now (only when the user asked for it clearly), otherwise it is saved as proposed",
+		activate = "string(): yes = active now (the default: creating a goal activates it); no = saved as proposed",
 		allow_duplicate = "string(): OPTIONAL yes = create it even though a similar goal exists",
 	];
 	for(k, v : GOAL_TOOL_SCHEDULE_PARAMS) {
@@ -383,7 +441,7 @@ goal_tools_add(agt) {
 
 	agt.add_tool(
 		"create_goal",
-		"Create a scheduled work item in the goal engine. A 'goal' is the engine's unit of work, not only an abstract objective: recurring tasks are goals with schedule_type=recurring. For any task the user wants repeated, use the dedicated create_recurring_goal tool when available; otherwise create_goal(schedule_type=recurring) with days or every. Do not turn recurring work into a one-off/manual task. Use get_goals() first to resolve the local time zone and named windows. New goals stay proposed unless the user explicitly asks to activate them; report the resulting schedule and time zone.",
+		"Create a scheduled work item in the goal engine. A 'goal' is the engine's unit of work, not only an abstract objective: recurring tasks are goals with schedule_type=recurring. For any task the user wants repeated, use the dedicated create_recurring_goal tool when available; otherwise create_goal(schedule_type=recurring) with days or every. Do not turn recurring work into a one-off/manual task. Use get_goals() first to resolve the local time zone and named windows. Creating a goal activates it by default (activate=yes); pass activate=no only when the user asks to propose it. Goals that allow merge, release, deploy, delete, force_push, publish or payment stay proposed until the owner approves. Report the resulting schedule and time zone.",
 		create_params,
 		[](agt, args) {
 			sch = goal_tool_scheduler(agt);
@@ -397,7 +455,7 @@ goal_tools_add(agt) {
 	// user (receptionist, workspace agent, future agents) has the same tool.
 	agt.add_tool(
 		"create_recurring_goal",
-		"Create a recurring Goal (the goal engine's unit of scheduled work) for this node/workspace. Use this for every request to repeat work; a recurring task is a recurring Goal, not a one-off task. Choose days (daily, weekdays, weekends, or comma-separated weekdays) OR every (5m, 30m, 2h, 2d). Sub-day intervals run continuously from activation and need no window. It stays proposed unless the user explicitly asks to activate it now.",
+		"Create a recurring Goal (the goal engine's unit of scheduled work) for this node/workspace. Use this for every request to repeat work; a recurring task is a recurring Goal, not a one-off task. Choose days (daily, weekdays, weekends, or comma-separated weekdays) OR every (5m, 30m, 2h, 2d). Sub-day intervals run continuously from activation and need no window. Creating it activates it by default (activate=yes); pass activate=no only when the user asks to propose the schedule without starting it.",
 		[
 			title = "&string(): Short title for the recurring goal",
 			instructions = "&string(): What the worker should do on each recurrence, with scope and acceptance criteria",
@@ -408,7 +466,7 @@ goal_tools_add(agt) {
 			end = "string(): OPTIONAL local HH:MM end time",
 			duration = "string(): OPTIONAL duration such as 2h, used instead of end",
 			timezone = "string(): OPTIONAL IANA time zone, default from get_goals",
-			activate = "string(): OPTIONAL yes only when the user explicitly asks to activate the recurring work now",
+			activate = "string(): yes = activate it now (default); no = save it as proposed",
 		],
 		[](agt, args) {
 			sch = goal_tool_scheduler(agt);
@@ -443,7 +501,7 @@ goal_tools_add(agt) {
 
 	agt.add_tool(
 		"set_goal_status",
-		"Activate, pause, resume, cancel, complete or archive a goal. Activating a proposed goal needs the user's explicit yes.",
+		"Activate, pause, resume, cancel, complete or archive a goal. Activating an existing proposed goal still needs the user's explicit yes.",
 		[
 			id = "&string(): The goal id",
 			status = "&string(): active | paused | cancelled | completed | archived | proposed",

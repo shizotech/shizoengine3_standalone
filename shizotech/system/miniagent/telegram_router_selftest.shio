@@ -307,10 +307,25 @@ class tg_stub_host {
         ];
     }
 
-    add_task(name, goal) {
+    published = [];     // the workspaces this node publishes ([] = an older node)
+    workspaces_summary(limit = 64) { return published; }
+
+    add_task(name, goal, role = "adaptive", workspace = "", origin = "") {
         taskid = std.random_hash(16);
-        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned"]);
+        tasks_scheduled.push_back([name = name, task = goal, taskid = taskid, state = "planned", workspace_id = workspace, origin = origin]);
         return taskid;
+    }
+
+    find_task(taskid) {
+        for(t : tasks_scheduled) {
+            if(t.taskid == taskid)
+                return t;
+        }
+        for(t : tasks_finished) {
+            if(t.taskid == taskid)
+                return t;
+        }
+        return None;
     }
 
     stop_task(taskid) {
@@ -414,8 +429,18 @@ class tg_stub_agent {
         return false;
     }
 
+    raw_prompts = [];   // the prompts as the gateway sent them (with the <context> block)
+
     task(prompt) {
         turns++;
+        raw_prompts.push_back(std.string(prompt));
+
+        // the gateway puts the tasks of the chat and the nodes in front of the
+        // message; the decisions of this stub read the message itself
+        cut = std.string(prompt).find("</context>");
+        if(cut >= 0)
+            prompt = std.string(prompt).substr(cut + 10).strip();
+
         prompts.push_back(std.string(prompt));
 
         // miniagent resets task_result at the start of every turn
@@ -457,10 +482,10 @@ class tg_stub_agent {
             return this.report("no node picked for this");
         }
 
+        // no 'task': the worker gets the user's own words (Router.turn_text)
         res = callbacks["start_task"]([
             node = node,
             name = "AgentPick",
-            task = std.string(prompt),
             summary = "stub agent turn",
         ]);
 
@@ -528,6 +553,7 @@ rtr = tg_fragile_router(
         role = "receptionist",
         description = "telegram selftest front",
         trusted_chats = TRUSTED_FILE,
+        threads_path = "-",
         poll_ms = 100,
         draft_ms = 0,
     ]
@@ -794,14 +820,22 @@ file_prompt = stub_agent.prompts[stub_agent.prompts.size() - 1];
 check("the caption is the instruction", file_prompt.starts("implement this plan for the http site"), file_prompt);
 check("the agent sees the file content", file_prompt.contains("Attached file 'plan.md'") && file_prompt.contains("- step one: the http status page"), file_prompt);
 tg_file_delivered(host) {
-    for(r : host.requests) {
+    for(t : host.tasks_scheduled) {
+        r = std.string(t.task);
         if(r.contains("Files the user attached") && r.contains("- step one: the http status page"))
             return true;
     }
     return false;
 }
 delivered = wait_for([hostB]() { return tg_file_delivered(hostB); }, 8000);
-check("the node receives the file verbatim with the delegated goal", delivered, std.string(hostB.requests.size()));
+check("the worker receives the file verbatim with the task", delivered, std.string(hostB.tasks_scheduled));
+file_task = "";
+for(t : hostB.tasks_scheduled) {
+    if(std.string(t.task).contains("- step one: the http status page"))
+        file_task = std.string(t.task);
+}
+check("the worker gets the caption in the user's words, not a paraphrase", file_task.starts("implement this plan for the http site"), file_task);
+check("the agent got the tasks of the chat and the nodes as context", stub_agent.raw_prompts[stub_agent.raw_prompts.size() - 1].starts("<context>") && stub_agent.raw_prompts[stub_agent.raw_prompts.size() - 1].contains(WEB_NAME), stub_agent.raw_prompts[stub_agent.raw_prompts.size() - 1]);
 check("the file is kept in telegram_inbox/", fileio.files(rtr.tg_inbox, false).size() >= 1, rtr.tg_inbox);
 check("the attachments end with the turn", wait_for([rtr]() { return rtr.turn_attachments.size() == 0 && rtr.tg_active == None; }, 8000), "");
 
@@ -840,12 +874,13 @@ if(std.is_json(wrec))
 check("the node accepted the task", hostA.finish_task(rtid, "finished", "the telegram report text"), rtid);
 
 notified = wait_for([bot]() {
-        return bot.has_for(CHAT_A, "[done] " + GPU_NAME + ": task TGJob") && bot.has_for(CHAT_B, "[done] " + GPU_NAME + ": task TGJob");
+        return bot.has_for(CHAT_A, GPU_NAME + ": task TGJob finished") && bot.has_for(CHAT_B, GPU_NAME + ": task TGJob finished");
     }, 8000);
 
 check("a finished task notifies every trusted chat", notified, std.string(bot.sent));
 check("the notification carries the report", bot.has_for(CHAT_A, "the telegram report text"), bot.last_for(CHAT_A));
-check("the finish is announced exactly once per chat", bot.count_with("[done] " + GPU_NAME + ": task TGJob") == 2, std.string(bot.count_with("[done] " + GPU_NAME + ": task TGJob")));
+check("the finish is announced exactly once per chat", bot.count_with(GPU_NAME + ": task TGJob finished") == 2, std.string(bot.count_with(GPU_NAME + ": task TGJob finished")));
+check("the message names the thread of the task", bot.has_for(CHAT_A, "[done] " + std.string(wrec.thread) + " · " + GPU_NAME + ": task TGJob finished"), bot.last_for(CHAT_A));
 
 // node -> router notify
 hostA.notify_user("telegram ping from the gpu box");
@@ -944,7 +979,7 @@ check("the stall tells the owner what to do", bot.has_for(CHAT_A, "Ask it for st
 
 // a node that ASKS: task_finished in state question -> [question]
 rtr.handle_event([kind = "task_finished", node = "GhostBox", taskid = "q1", name = "AskJob", state = "question", report = "which branch shall I push?"]);
-ask_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[question] GhostBox: task AskJob question"); }, 6000);
+ask_seen = wait_for([bot]() { return bot.has_for(CHAT_A, "[question] ") && bot.has_for(CHAT_A, "GhostBox: task AskJob question"); }, 6000);
 check("a question task_finished renders [question]", ask_seen, bot.last_for(CHAT_A));
 check("the node's question is in the message", bot.has_for(CHAT_A, "which branch shall I push?"), bot.last_for(CHAT_A));
 
@@ -1023,6 +1058,7 @@ rtr2 = TelegramRouter(
         role = "receptionist",
         description = "telegram selftest reload",
         trusted_chats = TRUSTED_FILE,
+        threads_path = "-",
         poll_ms = 100,
     ]
 );

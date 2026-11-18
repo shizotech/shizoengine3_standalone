@@ -142,6 +142,38 @@ git checkout claude/adoring-tesla-ygcafo
 - [ ] Save and load with group inputs sending: they send again after the load; *Release* then gives the lamps back
       what they had before (not the colour of the input).
 
+## Phase 9: shows per track and cue call (branch `show-cues`, 2026-11-13)
+
+**C++ changed** (the prolink module: `track(id).signature`, cue `beat` / `endBeat`): rebuild the module. Tested on
+Linux only against the demo set of the ProlinkBridge (cut with a jump back and forward, smoke phase `deskshow`) and
+script tests (`_testing/desk_show.shio`, `modules/shzmodule_prolink/test/run.sh`); no real CDJs, DJM, USB sticks or
+phones were used.
+
+- [ ] **Signature on real sticks**: the same track exported to two USB sticks (or two computers), loaded on two
+      CDJs: *Track show* shows the same first 8 digits of the signature on both decks; a cue made on one stick runs from
+      the other. A track analysed again (other beat grid) is still found by title, artist and duration.
+- [ ] **Track cues with CDJs**: *Add cue here* on the beat while the master deck plays; *Action* `go <stack>`,
+      *End action* `off <stack>`. Play through: Go on the beat, Off when the playhead leaves it. Jump back (hot cue
+      before it, or a loop): Off, then Go again when played through. Needle-search forward over a cue: it does not run.
+      Pause inside it, play again: nothing (with *Late*: it starts).
+- [ ] *Runs on* *On air* with a DJM: the cues run only while the channel fader of the deck is open. *Master deck*:
+      only while the deck is the tempo master.
+- [ ] **Import memory / hot cues** of a track with named cues: the names come along, the beats sit on the cue points.
+- [ ] **Cue names**: a memory cue named `DROP` (rule `drop` → `go Drop`) and a hot cue with the word `@strobe`: they
+      run when played through, on every track, without a show.
+- [ ] **Phrase triggers** (rekordbox phrases): two triggers *Drop* (one Solo, one blend weight 300): over several drops
+      both come up; a track with cues of its own runs none (*Lock phrases*), with it off they come again.
+- [ ] **Look-ahead**: fog 16 beats before the drop and a blackout 1 beat before: they come at the right beat with real
+      CDJs (latency of DJ Link and of the DMX output: is the blackout before the drop, not on it?).
+- [ ] **Limits**: a strobe stack with *Max on* 2 s: a Go by hand goes off after 2 s; *Min gap* holds back a second start
+      of the automation; a *Special* never starts until *Armed*, and is disarmed after a load.
+- [ ] **Back-off**: touch a stack (Go / Off / its fader) while the automation drives it: the log says *held … back-off*
+      for the next bars, then it runs again. Stop all decks: what the automation started goes off after 3 s.
+- [ ] **Cue call** generator: the tiles count down in bars.beats, STANDBY, 3, 2, 1, GO on the beat with the music.
+- [ ] **Phones**: the web remote on, a phone paired, `http://<computer>:13350/cuecall`: the same countdown, a crew picked
+      big, a buzz on GO (Android); iPhone Safari shows it too (no buzz).
+- [ ] Windows paths and HiDPI: the Track show sheet and the Cue call tiles are readable on a Retina / 4K screen.
+
 ## Results
 
 ### Windows (date)

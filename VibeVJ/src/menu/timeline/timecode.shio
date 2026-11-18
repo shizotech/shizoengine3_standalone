@@ -21,6 +21,18 @@
 //(mididevice.send_sync) runs on a thread of its own and is told every frame where the timeline is (after_move). The
 //timecode it sends is offset + cursor * 60 / BPM. To the virtual MIDI device it comes in as its input (and goes to its
 //port of the system on Linux and macOS).
+//- Ableton Link: the timeline follows the tempo and the bar of a Link session (Ableton Live, Resolume, Traktor ...;
+//  the Link peer of the prolink module, tempo_panel.shio). Bars stay bars: the cursor keeps its bar and takes the beat
+//  in the bar of the session (quantum 4). With start / stop sync in the session it plays and stops with it, else it
+//  plays while a Link session is there.
+//Tempo to lighting desks and Ableton Link (tempo_panel.shio, loaded at run time): the tempo and the beats of the
+//timeline go to Ableton Link, OSC, grandMA2 / grandMA3, Daslight, ChamSys and OS2L. The sender of the prolink module
+//(prolink.tempo_out) runs on a thread of its own and is told every frame where the timeline is (after_move), like
+//MIDI clock.
+//Timecode from the decks and TCNet (deck_timecode_panel.shio, loaded at run time): SMPTE timecode from the position of a
+//deck of the DJ connection (the ProlinkBridge / ProlinkDecks generator: std.global("prolink_sources")) with an offset per
+//track, out as Art-Net, LTC and MTC, and the decks as TCNet layers (VibeVJ as the TCNet master node). The sender of the
+//prolink module (prolink.timecode_out) reads the decks on a thread of its own; it has nothing to do with the timeline.
 //Test sources: VibeVJ plays MTC into its virtual MIDI device (Shizo Virtual MIDI) and MIDI clock into a second one
 //(Shizo Test Clock), for show prep without a master and for the tests (MCP send_test_timecode, send_test_clock).
 
@@ -28,10 +40,46 @@ TC_JUMP_SECONDS = 0.25;  //further off than this the cursor jumps; closer, it ca
 TC_STEP_MAX = 3.0;       //a step of the cursor at most 3 times the step of a frame at the tempo
 TC_TEST_DEVICE = "Shizo Virtual MIDI";
 TC_TEST_CLOCK_DEVICE = "Shizo Test Clock";
-TC_SOURCES = ["mtc", "clock", "ltc"];
-TC_SOURCE_NAMES = ["MIDI Time Code", "MIDI clock", "LTC (audio input)"];
+TC_SOURCES = ["mtc", "clock", "ltc", "link"];
+TC_SOURCE_NAMES = ["MIDI Time Code", "MIDI clock", "LTC (audio input)", "Ableton Link"];
 TC_RATES = ["24", "25", "29.97df", "30"];
 TC_LTC_STALE = 0.3;      //seconds without an LTC message while it ran: stopped (the analysis went away)
+TC_TEMPO_PANEL_FILE = "src/menu/timeline/tempo_panel.shio";
+TC_DECK_PANEL_FILE = "src/menu/timeline/deck_timecode_panel.shio";
+TC_MEASURED_MS = 1500;   //a tempo set by a measuring source (CDJs, the audio analysis) this recently: the desks get it steadied
+
+//A panel file loaded at run time (tempo_panel.shio, deck_timecode_panel.shio): its module, or None when this build cannot
+//compile it (a prolink module without tempo_out / timecode_out, or none at all)
+tc_load_panel(path, name) {
+	try {
+		mod = std.module();
+		if(mod.load_file(path) && mod.has(name))
+			return mod;
+	}
+	catch(e) {}
+	return None;
+}
+
+tc_load_tempo_panel(path) {
+	return tc_load_panel(path, "tempo_panel");
+}
+
+//The device of a ProlinkBridge / ProlinkDecks generator (std.global("prolink_sources")), a connected one first
+tc_prolink_device() {
+	sources = std.global("prolink_sources").get();
+	if(!sources)
+		return None;
+	found = None;
+	for(key, device : sources) {
+		if(!device)
+			continue;
+		if(device.connected())
+			return device;
+		if(!found)
+			found = device;
+	}
+	return found;
+}
 
 //Frames per second of a rate name of MTC
 tc_fps(rate) {
@@ -144,7 +192,7 @@ class timecode_sender
 	speed = 1.0;        //1: real time; a little more or less: a master that runs fast or slow
 	playing = false;
 	base = 0.0;         //seconds of the timecode where it started
-	started = 0;        //std.millis() at the start
+	started = 0;        //std.millis_steady() at the start
 	sent = 0;           //quarter frames sent since the start
 	first_frame = 0;    //the frame number of the start (even: a sequence of eight quarter frames is two frames)
 
@@ -168,7 +216,7 @@ class timecode_sender
 		frame = std.int(math.floor(seconds * tc_fps(rate) + 0.0001));
 		first_frame = frame - frame % 2;
 		base = first_frame / tc_fps(rate);
-		started = std.millis();
+		started = std.millis_steady();
 		sent = 0;
 		playing = true;
 	}
@@ -183,7 +231,7 @@ class timecode_sender
 	now() {
 		if(!playing)
 			return base;
-		return base + (std.millis() - started) / 1000.0 * speed;
+		return base + (std.millis_steady() - started) / 1000.0 * speed;
 	}
 
 	//Every frame: the quarter frames that are due (four per frame of the timecode)
@@ -209,17 +257,17 @@ class timecode_sender
 class ltc_input
 {
 	msg = None;
-	at = 0;           //std.millis() of the last message
+	at = 0;           //std.millis_steady() of the last message
 	messages = 0;
 
 	message(m) {
 		msg = m;
-		at = std.millis();
+		at = std.millis_steady();
 		messages++;
 	}
 
 	age() {
-		return (std.millis() - at) / 1000.0;
+		return (std.millis_steady() - at) / 1000.0;
 	}
 
 	//None before any. While it runs the time goes on from the last frame (at most 0.15 s), backwards too
@@ -251,7 +299,7 @@ class ltc_test_source
 	now() {
 		if(!playing)
 			return base;
-		return math.max(0.0, base + (reverse ? -1.0 : 1.0) * (std.millis() - started) / 1000.0);
+		return math.max(0.0, base + (reverse ? -1.0 : 1.0) * (std.millis_steady() - started) / 1000.0);
 	}
 
 	set(at, rate_name, play, backwards) {
@@ -261,7 +309,7 @@ class ltc_test_source
 		rate = rate_name;
 		reverse = backwards ? true : false;
 		playing = play ? true : false;
-		started = std.millis();
+		started = std.millis_steady();
 	}
 
 	message() {
@@ -283,7 +331,7 @@ class timecode_chase
 	locates = -1;
 	last_target = -1.0;
 	error = 0.0;            //seconds the cursor is off the master after the step of this frame (+: behind)
-	tick_at = 0;            //std.millis() of the last tick: the cursor was moved then, a target read later is further on
+	tick_at = 0;            //std.millis_steady() of the last tick: the cursor was moved then, a target read later is further on
 	sender = None;          //test timecode
 	ltc = None;             //LTC from the audio analysis
 	ltc_test = None;        //test LTC (send_test_ltc)
@@ -294,6 +342,12 @@ class timecode_chase
 	out_rate = "25";        //the frame rate of the MTC sent
 	out_dev = None;         //the device object of out_device
 	out_sent = None;        //what send_sync returned last
+	tempo_mod = None;       //the module of tempo_panel.shio
+	tempo = None;           //the tempo panel: tempo to lighting desks and Ableton Link, None when not available
+	tempo_saved = None;     //its settings from the project while it is not available (kept for the next save)
+	deck_mod = None;        //the module of deck_timecode_panel.shio
+	deck_tc = None;         //timecode from the decks and TCNet, None when not available
+	deck_tc_saved = None;   //its settings from the project while it is not available
 	managed btn = None;
 	managed chase_btn = None;
 	managed kind_box = None;
@@ -318,6 +372,19 @@ class timecode_chase
 		btn.autoclose(true);
 		pop = btn.popup().content().layout(nanogui.layout_vertical());
 		pop.fixed_width(330);
+		//Timecode from the decks and TCNet (deck_timecode_panel.shio): popups of their own to the right, this one stays
+		//short. At the top: a popup to the right opens downwards from its button, from further down it ran off the screen
+		row = pop.widget().anchor_left(0).anchor_right(0).fixed_height(26).layout(nanogui.layout_horizontal());
+		deck_btn = row.button_popup("Decks to timecode").side("right").fixed_width(165)
+			.tooltip("SMPTE timecode from the position of a deck (DJ connection: a Prolink generator), an offset per track, as Art-Net, LTC and MTC: the light and video show runs with the track that plays\n[[wiki:Timeline#timecode-from-the-decks]]");
+		deck_btn.autoclose(true);
+		tcnet_btn = row.button_popup("TCNet").side("right").fixed_width(165)
+			.tooltip("VibeVJ as the TCNet master node (like ShowKontrol / the PRO DJ LINK Bridge): the decks as layers for Resolume, ChamSys MagicQ, grandMA3\n[[wiki:Timeline#tcnet]]");
+		tcnet_btn.autoclose(true);
+		deck_pop = deck_btn.popup().content().layout(nanogui.layout_vertical());
+		deck_pop.fixed_width(330);
+		tcnet_pop = tcnet_btn.popup().content().layout(nanogui.layout_vertical());
+		tcnet_pop.fixed_width(330);
 		chase_btn = pop.controlbutton("CHASE").caption("Chase").push(true).anchor_left(0).anchor_right(0).fixed_height(28);
 		chase_btn.get_button().tooltip("On: the timeline plays, stops and jumps with the source below (MIDI clock: its tempo too). MIDI-mappable.");
 		chase_btn.undoable(false);
@@ -386,6 +453,32 @@ class timecode_chase
 		});
 		out_label = pop.label("").font_size(13).fixed_height(20);
 		out_rate_box.selected(tc_index(TC_RATES, out_rate));
+
+		//Tempo and beats to lighting desks and Ableton Link (tempo_panel.shio)
+		pop.label("Tempo to lighting desks and Ableton Link").font_size(13).fixed_height(22);
+		tempo_mod = tc_load_tempo_panel(TC_TEMPO_PANEL_FILE);
+		if(tempo_mod) {
+			panel_class = tempo_mod.get("tempo_panel");
+			tempo = panel_class(pop, 320);
+			tempo.on_change = [this](){
+				this.update_badge();
+			};
+		}
+		else
+			pop.label("Needs a newer prolink module (tempo out)").font_size(13).fixed_height(20);
+
+		deck_mod = tc_load_panel(TC_DECK_PANEL_FILE, "deck_timecode_panel");
+		if(deck_mod) {
+			deck_class = deck_mod.get("deck_timecode_panel");
+			deck_tc = deck_class(deck_pop, tcnet_pop, 320, "VibeVJ");
+			deck_tc.on_change = [this](){
+				this.update_badge();
+			};
+		}
+		else {
+			deck_pop.label("Needs a newer prolink module (timecode out)").font_size(13).fixed_height(20);
+			tcnet_pop.label("Needs a newer prolink module (timecode out)").font_size(13).fixed_height(20);
+		}
 		fill_sources();
 		fill_outputs();
 		show_output();
@@ -405,9 +498,21 @@ class timecode_chase
 		locates = -1;
 		last_target = -1.0;
 		error = 0.0;
-		btn.badge(v ? "on" : (out_device != "" && (out_clock || out_mtc) ? "out" : ""));
+		update_badge();
+		tempo_follow();
 		if(!v)
 			timeline.window_caption_tc("");
+	}
+
+	//The badge of the button TC: "on" while it chases, "out" while it sends (MIDI, lighting desks, Link)
+	update_badge() {
+		btn.badge(on ? "on" : (sending() || (tempo && tempo.any_on()) || (deck_tc && deck_tc.any_on()) ? "out" : ""));
+	}
+
+	//The Link peer follows the session while the timeline chases it, else it leads (when Link is on)
+	tempo_follow() {
+		if(tempo)
+			tempo.set_link_follow(on && source == "link");
 	}
 
 	set_source(kind) {
@@ -420,6 +525,7 @@ class timecode_chase
 		was_running = false;
 		locates = -1;
 		last_target = -1.0;
+		tempo_follow();
 		return true;
 	}
 
@@ -521,7 +627,7 @@ class timecode_chase
 		if(out_rate_box.selected() != tc_index(TC_RATES, out_rate))
 			out_rate_box.selected(tc_index(TC_RATES, out_rate));
 		fill_outputs();
-		btn.badge(on ? "on" : (out_device != "" && (out_clock || out_mtc) ? "out" : ""));
+		update_badge();
 		show_output();
 		return true;
 	}
@@ -532,6 +638,19 @@ class timecode_chase
 
 	//Every frame after the engine moved the cursor (__init__.shio): where the timeline is now, for the sender's thread
 	after_move() {
+		if(deck_tc) {
+			//The decks of the DJ connection (again every 2 s: a generator came or went, or opened another source)
+			if(ticks % 120 == 0)
+				deck_tc.follow(tc_prolink_device());
+			deck_tc.tick();
+		}
+		if(tempo) {
+			//The desks get the tempo steadied while a measuring source sets it (CDJs, the audio analysis, MIDI clock)
+			measured = (on && source == "clock") || std.millis_steady() - timeline.bpm_measured_ms < TC_MEASURED_MS;
+			tempo.update([playing = timeline.play_btn.value() ? 1 : 0, bpm = math.max(1.0, timeline.bpm_ctrl.value()),
+				beat = timeline.cursor_pos.value(), exact = measured ? 0 : 1]);
+			tempo.tick();
+		}
 		if(!sending())
 			return;
 		if(!out_dev || ticks % 30 == 0) {
@@ -566,6 +685,22 @@ class timecode_chase
 		return [device = out_device, clock = out_clock ? true : false, mtc = out_mtc ? true : false, rate = out_rate, sent = out_sent];
 	}
 
+	//Timecode from the decks and TCNet: its settings, what it sends, the track offsets
+	deck_timecode_json() {
+		if(!deck_tc)
+			return [ok = false, available = false, error = "This build has no timecode out (prolink module without timecode_out)."];
+		j = deck_tc.state_json();
+		j.status.mtc = [on = deck_tc.cfg.mtc.on ? true : false, device = deck_tc.cfg.mtc.device, text = deck_tc.mtc_label.caption(), sent = deck_tc.mtc_sent];
+		return j;
+	}
+
+	//The tempo to lighting desks and Link: its settings and what it sends
+	tempo_json() {
+		if(!tempo)
+			return [ok = false, available = false, error = "This build has no tempo out (prolink module without tempo_out)."];
+		return [ok = true, available = true, settings = tempo.save_state(), status = tempo.status(), link = tempo.link()];
+	}
+
 	// =========================================================================
 	// Chasing
 	// =========================================================================
@@ -577,6 +712,19 @@ class timecode_chase
 	//What the source says: [running, target (the beat the cursor goes to), locates, ...], None before anything came
 	read_source() {
 		name = device == "" ? None : device;
+		//Ableton Link: the cursor keeps its bar and takes the beat in the bar of the session (quantum 4)
+		if(source == "link") {
+			if(!tempo)
+				return None;
+			l = tempo.link();
+			if(!l || !l.running || l.peers < 1)
+				return None;
+			cur = timeline.cursor_pos.value();
+			d = l.beat - cur;
+			d = d - math.floor(d / 4.0 + 0.5) * 4.0;
+			run = l.startStop ? (l.playing ? true : false) : true;
+			return [running = run, target = run ? cur + d : cur, locates = 0, link = l];
+		}
 		if(source == "clock") {
 			c = nanogui.midi_clock(name);
 			if(!c)
@@ -593,7 +741,7 @@ class timecode_chase
 
 	//Every frame, before the engine moves the cursor (__init__.shio)
 	tick() {
-		tick_at = std.millis();
+		tick_at = std.millis_steady();
 		if(sender)
 			sender.tick();
 		if(ltc_test && (ltc_test.playing || ticks % 10 == 0))
@@ -615,6 +763,9 @@ class timecode_chase
 			show_status(src, true);
 		if(!src)
 			return;
+		//Ableton Link: the tempo of the timeline is the tempo of the session
+		if(src.has("link") && src.link.bpm > 0.0 && math.abs(timeline.bpm_ctrl.value() - src.link.bpm) >= 0.0005)
+			timeline.bpm_ctrl.value(src.link.bpm);
 		//MIDI clock: the tempo of the timeline is the tempo of the clock
 		if(src.has("clock") && src.clock.clock && src.clock.bpm > 0.0) {
 			b = math.round(src.clock.bpm * 100.0) / 100.0;
@@ -676,11 +827,19 @@ class timecode_chase
 		text = "";
 		caption = "";
 		if(!src) {
-			if(source == "ltc")
+			if(source == "link")
+				text = tempo ? "No other Link program in the network yet" : "Ableton Link needs a newer prolink module";
+			else if(source == "ltc")
 				text = "No LTC yet (an Audio Input Analysis generator reads it)";
 			else
 				text = "No " + (source == "clock" ? "MIDI clock" : "timecode") + " yet" + (device != "" ? " from " + device : "");
-			caption = source == "clock" ? "Clock: none" : "TC: no timecode";
+			caption = source == "link" ? "Link: no session" : (source == "clock" ? "Clock: none" : "TC: no timecode");
+		}
+		else if(src.has("link")) {
+			l = src.link;
+			text = "Link  ·  " + tc_num(l.bpm, 2) + " BPM  ·  " + std.string(l.peers) + (l.peers == 1 ? " peer" : " peers") + "  ·  "
+				+ (src.running ? "running" : "stopped") + (chasing && src.running ? "  ·  off by " + std.int(math.round(error * 1000.0)) + " ms" : "");
+			caption = "Link " + tc_num(l.bpm) + " BPM";
 		}
 		else if(src.has("clock")) {
 			c = src.clock;
@@ -703,7 +862,8 @@ class timecode_chase
 		src = read_source();
 		st = [ok = true, on = on, source = source, device = device, offset = offset_text, position = timeline.cursor_pos.value(),
 			playing = timeline.play_btn.value() ? true : false, bpm = timeline.bpm_ctrl.value(), output = output_json(),
-			frame_age_seconds = (std.millis() - tick_at) / 1000.0, fps = std.global("engine").ctx.real_fps()];
+			frame_age_seconds = (std.millis_steady() - tick_at) / 1000.0, fps = std.global("engine").ctx.real_fps()];
+		st.link = tempo ? tempo.link() : None;
 		st.timecode = source == "clock" ? None : (src ? src.tc : None);
 		st.clock = nanogui.midi_clock(device == "" ? None : device);
 		st.ltc = ltc.state();
@@ -725,7 +885,8 @@ class timecode_chase
 
 	save_state() {
 		return [device = device, offset = offset_text, source = source, out_device = out_device, out_clock = out_clock ? 1 : 0,
-			out_mtc = out_mtc ? 1 : 0, out_rate = out_rate];
+			out_mtc = out_mtc ? 1 : 0, out_rate = out_rate, tempo = tempo ? tempo.save_state() : tempo_saved,
+			deck_timecode = deck_tc ? deck_tc.save_state() : deck_tc_saved];
 	}
 
 	load_state(states) {
@@ -736,22 +897,171 @@ class timecode_chase
 			states && states.has("out_clock") ? std.int(states.out_clock) != 0 : false,
 			states && states.has("out_mtc") ? std.int(states.out_mtc) != 0 : false,
 			states && states.has("out_rate") ? states.out_rate : "25");
+		tempo_saved = states && states.has("tempo") ? states.tempo : None;
+		if(tempo)
+			tempo.load_state(tempo_saved);
+		deck_tc_saved = states && states.has("deck_timecode") ? states.deck_timecode : None;
+		if(deck_tc) {
+			deck_tc.load_state(deck_tc_saved);
+			deck_tc.follow(tc_prolink_device());
+		}
+		update_badge();
+		tempo_follow();
 	}
 
 	// For AI agents (the live_path timeline)
 	register_queries(ai) {
+		ai.register("get_tempo_output", [], [this](args){
+			return this.tempo_json();
+		}, "Tempo to lighting desks and Ableton Link (the part of the TC popup under Tempo to lighting desks): available (this build has the tempo out of the prolink module), settings (per target link, osc, ma3, ma2, daslight, chamsys, os2l: on, ip, port, address / command, user, password; link: phase, start_stop), status (playing, bpm, sentBpm = the steadied tempo the desks get, beat, beats, targets = per target on, ok, text, sent; link; scan = the grandMA2 search), link (the Ableton Link session: running, peers, bpm, beat, phase, playing).", "read");
+
+		ai.register("set_tempo_output", [
+			target = "enum(link,osc,ma3,ma2,daslight,chamsys,os2l): The target to set.",
+			on = "int(0,1): Send to it.",
+			ip = "string(): IPv4 address of the desk or program (not for link).",
+			port = "int(1,65535): Its port (OSC UDP; grandMA2 and OS2L TCP).",
+			address = "string(): osc: the OSC address of the tempo; daslight / chamsys: the OSC addresses of the tap, separated by commas.",
+			command = "string(): ma3 / ma2: the command line, {bpm} = the tempo (ma2: whole numbers).",
+			user = "string(): ma2: the user to log in as.",
+			password = "string(): ma2: its password.",
+			phase = "int(0,1): link: lead the bar phase too.",
+			start_stop = "int(0,1): link: Play and Stop to the Link session.",
+		], [this](args){
+			if(!this.tempo)
+				return this.tempo_json();
+			fields = std.json();
+			for(k, v : args) {
+				if(k != "target")
+					fields[k] = v;
+			}
+			if(!this.tempo.set_target(std.string(args.target ?? ""), fields))
+				return [ok = false, error = "target must be link, osc, ma3, ma2, daslight, chamsys or os2l."];
+			this.update_badge();
+			return this.tempo_json();
+		}, "Sets a target of the tempo to lighting desks and Ableton Link (the timeline's tempo and beats; the values left out stay). The status comes every 100 ms: read it with get_tempo_output a moment later.");
+
+		ai.register("send_tempo_test", [
+			target = "enum(osc,ma3,ma2,daslight,chamsys,os2l): The target (it must be on).",
+		], [this](args){
+			if(!this.tempo)
+				return this.tempo_json();
+			return [ok = this.tempo.test_target(std.string(args.target ?? "")) ? true : false];
+		}, "Sends a test to a target of the tempo out: osc / ma3 / ma2 the tempo once (120 BPM when there is none), daslight / chamsys / os2l eight beats at 120 BPM.");
+
+		ai.register("search_grandma2", [], [this](args){
+			if(!this.tempo)
+				return this.tempo_json();
+			this.tempo.search();
+			return [ok = true, note = "The search takes a few seconds: get_tempo_output status.scan has the result."];
+		}, "Looks for grandMA2 desks (Telnet port 30000) on this computer and in the /24 networks of its cards.");
+
+		ai.register("get_deck_timecode", [], [this](args){
+			return this.deck_timecode_json();
+		}, "Timecode from the decks and TCNet (the parts of the TC popup under Timecode from the decks and TCNet; not the timeline): available, settings (source onair / master / deck, deck, rate, latency_ms, hold, artnet = [on, ip, port], ltc = [on, device, level_db], mtc = [on, device], tcnet = [on, iface, name, layers, timecode]), status (valid, text, time, rate, running, held, deck, title, artist, offset, listed (own offset or the unlisted one), from, following (a DJ connection is there), artnet / ltc / mtc / tcnet: on, ok, text, sent; tcnet: node_id, receivers, masters), tracks (unlisted, current, entries = [title, artist, duration, offset, has_offset, seen, imported]).", "read");
+
+		ai.register("set_deck_timecode", [
+			source = "enum(onair,master,deck): The deck that gives the timecode: on-air follow, the tempo master, or the deck below.",
+			deck = "int(1,6): With source deck: the deck.",
+			rate = "enum(24,25,29.97df,30): The frame rate.",
+			latency_ms = "float(-2000,2000): + sends the timecode earlier.",
+			hold = "int(0,1): A paused deck goes on sending its frame.",
+			artnet = "int(0,1): Art-Net timecode on.",
+			artnet_ip = "string(): The desk or a broadcast (2.255.255.255).",
+			artnet_port = "int(1,65535): Art-Net port (6454).",
+			ltc = "int(0,1): LTC on an audio output.",
+			ltc_device = "string(): The audio output (empty: the default).",
+			ltc_level_db = "float(-60,0): The level of the LTC.",
+			mtc = "int(0,1): MTC on a MIDI output.",
+			mtc_device = "string(): The MIDI output of the MTC.",
+			tcnet = "int(0,1): VibeVJ as the TCNet master node.",
+			tcnet_layers = "int(1,8): Decks 1..n as layers.",
+			tcnet_name = "string(): The node name (8 characters).",
+			tcnet_iface = "string(): The network card of TCNet (empty: all).",
+			tcnet_timecode = "int(0,1): The SMPTE time of the layers with the track offsets (0: the position).",
+		], [this](args){
+			if(!this.deck_tc)
+				return this.deck_timecode_json();
+			top = std.json();
+			for(k : ["source", "deck", "rate", "latency_ms", "hold"]) {
+				if(args.has(k))
+					top[k] = k == "source" || k == "rate" ? std.string(args[k]) : (k == "latency_ms" ? std.float(args[k]) : std.int(args[k]));
+			}
+			if(top.size() > 0)
+				this.deck_tc.set_fields(top);
+			for(part : ["artnet", "ltc", "mtc", "tcnet"]) {
+				fields = std.json();
+				if(args.has(part))
+					fields.on = std.int(args[part]);
+				for(k, v : args) {
+					if(k.find(part + "_") == 0)
+						fields[k.substr(std.len(part) + 1, std.len(k) - std.len(part) - 1)] = v;
+				}
+				if(fields.size() > 0)
+					this.deck_tc.set_part(part, fields);
+			}
+			this.update_badge();
+			return this.deck_timecode_json();
+		}, "Sets the timecode from the decks and TCNet (values left out stay). The status comes every 50 ms: read it with get_deck_timecode a moment later.");
+
+		ai.register("set_track_offset", [
+			index = "int(): The entry of the track list (get_deck_timecode tracks.entries); -1: add the track below.",
+			title = "string(): With index -1: the title of the track to add (or find).",
+			artist = "string(): With index -1: its artist.",
+			duration = "float(): With index -1: its length in seconds (0: any).",
+			offset = "string(): The timecode where the track starts, hh:mm:ss:ff; empty: none (the unlisted offset).",
+			unlisted = "string(): The offset of the tracks without one (default 23:00:00:00).",
+			auto_fill = "int(0,1): 1: every track of the list gets an offset one hour apart in list order.",
+			remove = "int(0,1): 1: remove the entry index.",
+		], [this](args){
+			if(!this.deck_tc)
+				return this.deck_timecode_json();
+			out = this.deck_tc.out;
+			i = args.has("index") ? std.int(args.index) : -2;
+			if(i == -1) {
+				if(!args.has("title") || std.string(args.title).trim() == "")
+					return [ok = false, error = "index -1 needs a title."];
+				i = out.add_track(std.string(args.title), std.string(args.artist ?? ""), std.float(args.duration ?? 0.0));
+			}
+			if(args.has("remove") && std.int(args.remove) && i >= 0)
+				out.remove_track(i);
+			else if(args.has("offset") && i >= 0 && !this.deck_tc.set_offset(i, std.string(args.offset)))
+				return [ok = false, error = "offset must be hh:mm:ss:ff or seconds, index an entry of the list."];
+			if(args.has("unlisted") && !out.set_unlisted(std.string(args.unlisted)))
+				return [ok = false, error = "unlisted must be hh:mm:ss:ff or seconds."];
+			if(args.has("auto_fill") && std.int(args.auto_fill))
+				out.auto_fill();
+			this.deck_tc.refresh_tracks(true);
+			this.deck_tc.changed();
+			return [ok = true, index = i, tracks = out.tracks()];
+		}, "Edits the track offsets of the timecode from the decks: the timecode where a track starts (an entry by index, or a new one by title, artist, duration), the unlisted offset, auto-fill, remove.");
+
+		ai.register("import_track_offsets", [
+			path = "string(): A rekordbox playlist: a txt export (tab separated, Track Title / Artist / Time) or rekordbox.xml.",
+			playlist = "string(): rekordbox.xml: the name of the playlist (empty: the first).",
+			auto_fill = "int(0,1): 1: afterwards every track gets an offset one hour apart in list order.",
+		], [this](args){
+			if(!this.deck_tc)
+				return this.deck_timecode_json();
+			r = this.deck_tc.import_playlist(std.string(args.path ?? ""), std.string(args.playlist ?? ""));
+			if(r.ok && args.has("auto_fill") && std.int(args.auto_fill)) {
+				this.deck_tc.out.auto_fill();
+				this.deck_tc.refresh_tracks(true);
+			}
+			return [ok = r.ok, result = r, tracks = this.deck_tc.out.tracks()];
+		}, "Adds the tracks of a rekordbox playlist to the track offsets of the timecode from the decks (new ones at the end in the order of the playlist; known ones keep their offset).");
+
 		ai.register("get_timecode", [], [this](args){
 			return this.status_json();
 		}, "The timecode / clock sync of the main timeline: on (chasing), source (mtc, clock or ltc), device (the MIDI input, empty: any), offset (the timecode at beat 0), position (the cursor of the last frame), frame_age_seconds (how long ago that frame moved it), fps (the frames a second the chase steps with), playing (the timeline plays), bpm, running (the source plays), timecode (MTC or LTC coming in: time in seconds, running, rate, text, locates, device; None before any), clock (MIDI clock coming in: bpm, running, position in beats, clock, locates, device; None before any), ltc (the LTC the audio analysis reads), target_beat (where the cursor goes, read now: frame_age_seconds after position), error_seconds (how far the cursor is off after the step of the last frame), output (what VibeVJ sends: device, clock, mtc, rate, sent = counts of the messages), test (the test timecode VibeVJ sends).", "read");
 
 		ai.register("set_timecode", [
 			on = "int(0,1): Chase (1) or not (0): the timeline plays, stops and jumps with the source (MIDI clock: its tempo too).",
-			source = "enum(mtc,clock,ltc): What it chases: MIDI Time Code or MIDI clock from the MIDI input, or LTC the Audio Input Analysis generator reads in the sound.",
+			source = "enum(mtc,clock,ltc,link): What it chases: MIDI Time Code or MIDI clock from the MIDI input, LTC the Audio Input Analysis generator reads in the sound, or the Ableton Link session (tempo and bar).",
 			device = "string(): The MIDI input MTC / MIDI clock comes from (a name of the MIDI devices); empty: any input.",
 			offset = "string(): The timecode at beat 0, hh:mm:ss:ff or seconds (MTC, LTC and the MTC sent).",
 		], [this](args){
 			if(args.has("source") && !this.set_source(std.string(args.source)))
-				return [ok = false, error = "source must be mtc, clock or ltc."];
+				return [ok = false, error = "source must be mtc, clock, ltc or link."];
 			if(args.has("device"))
 				this.set_device(std.string(args.device));
 			if(args.has("offset") && !this.set_offset(std.string(args.offset)))

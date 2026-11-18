@@ -34,6 +34,8 @@ The harness resolves the target before creating any child tasks.
 
 The resulting file list is a fixed snapshot for the lifetime of the batch.
 
+The selector is relative to the working directory. A selector `glob()` cannot take (an absolute path, a path that leaves the working directory with `..`) is refused with an error before any child is created; it is not an empty target.
+
 ### `goal`
 
 The workload that every child task must complete for its assigned file.
@@ -178,6 +180,11 @@ Questions: 1
 The batch continues processing other items even when individual children fail or require parent input.
 
 The final batch result contains the status and report for every child that was started.
+A result larger than 200 KB (many children with long reports) still has every child with its
+id and status; the middle of long reports is cut and marked, and `result_note` says so
+(`miniagent_tool_cap`: a structured tool result is never cut across its entries).
+
+A child whose run crashed (an exception instead of a `finalize()` report) counts as failed; its report carries the reason of the crash.
 
 ## Question handling
 

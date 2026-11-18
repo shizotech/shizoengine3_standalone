@@ -1,0 +1,411 @@
+//Tempo to lighting desks and Ableton Link: the settings and the status of prolink.tempo_out() (modules/shzmodule_prolink,
+//tempo/tempo_out.h), as a panel that VibeVJ shows in the TC popup of the timeline (timecode.shio) and the DJ Watch program
+//in its tab "Send BPM" (_standalones/djwatch_standalone). Both load this file at run time with std.module().load_file:
+//with a prolink module built before tempo_out existed it does not compile (a namespace function it lacks is a compile
+//error of the whole file), then only this panel is missing.
+//The sender runs on a thread of the module; the panel only sets it up and shows what it does:
+//- Ableton Link: leads the session with the tempo and the bar of the clock (or follows it: set_link_follow)
+//- OSC tempo: a float to ip:port/address (Resolume, QLC+, any OSC receiver)
+//- grandMA3 / onPC: a command line over OSC (/cmd), default "Master 3.1 At BPM {bpm}"
+//- grandMA2 / onPC: Telnet (port 30000) with login, default "SpecialMaster 3.16 At {bpm}" (whole numbers)
+//- Daslight / ChamSys MagicQ: an OSC tap on every beat to a list of addresses
+//- OS2L (the protocol of VirtualDJ; the Wolfmix software WTOOLS): a beat message on every beat over TCP
+import nanogui;
+import prolink;
+
+TEMPO_TARGETS = ["link", "osc", "ma3", "ma2", "daslight", "chamsys", "os2l"];
+TEMPO_TARGET_NAMES = ["Ableton Link", "OSC tempo (Resolume, QLC+ …)", "grandMA3 / onPC (OSC)", "grandMA2 / onPC (Telnet)",
+	"Daslight (tap on every beat)", "ChamSys MagicQ (tap on every beat)", "OS2L (Wolfmix WTOOLS)"];
+//The field of address / command of each target: its placeholder and tooltip ("" = none)
+TEMPO_TEXT_FIELD = [link = "", osc = "address", ma3 = "command", ma2 = "command", daslight = "address", chamsys = "address", os2l = ""];
+
+//The settings of a new project: everything off
+tempo_defaults() {
+	return [
+		link = [on = 0, phase = 1, start_stop = 0],
+		osc = [on = 0, ip = "127.0.0.1", port = 7000, address = "/bpm"],
+		ma3 = [on = 0, ip = "", port = 8000, command = "Master 3.1 At BPM {bpm}"],
+		ma2 = [on = 0, ip = "", port = 30000, user = "administrator", password = "admin", command = "SpecialMaster 3.16 At {bpm}"],
+		daslight = [on = 0, ip = "127.0.0.1", port = 8000, address = "/tap"],
+		chamsys = [on = 0, ip = "", port = 8000, address = "/tap"],
+		os2l = [on = 0, ip = "127.0.0.1", port = 5000],
+	];
+}
+
+tempo_index(list, v) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == v)
+			return i;
+	}
+	return -1;
+}
+
+class tempo_panel
+{
+	out = None;            //prolink.tempo_out()
+	cfg = None;            //the settings, in the form tempo_out.configure() takes
+	shown = 0;             //the index of the target the fields show
+	link_follow = false;   //the timeline chases the Link session: the peer follows instead of leading
+	on_change = None;      //fn() after the user changed a setting (the DJ Watch program saves then)
+	last_status = None;
+	ticks = 0;
+	names_shown = "";
+	managed target_box = None;
+	managed on_btn = None;
+	managed test_btn = None;
+	managed search_btn = None;
+	managed phase_btn = None;
+	managed start_stop_btn = None;
+	managed address_row = None;
+	managed ip_box = None;
+	managed port_box = None;
+	managed text_box = None;
+	managed login_row = None;
+	managed user_box = None;
+	managed pass_box = None;
+	managed status_label = None;
+	parent = None;
+
+	//Builds the fields into a widget with a vertical layout, `width` wide
+	__init__(area, width) {
+		parent = area;
+		out = prolink.tempo_out();
+		cfg = tempo_defaults();
+		target_box = area.combobox().fixed_width(width).fixed_height(26)
+			.tooltip("Where the tempo and the beats go: pick a target, switch it on with Send. Several can be on at once (\"· on\" after their names)");
+		target_box.on_change([this](index, text){
+			if(index >= 0 && index < TEMPO_TARGETS.size())
+				this.show_target(index);
+		});
+		row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		on_btn = row.pushbutton("Send").fixed_width(70).tooltip("Send to this target");
+		on_btn.on_change([this](v){
+			this.set_field("on", v ? 1 : 0);
+		});
+		test_btn = row.button("Send test").fixed_width(90)
+			.tooltip("A test to check the connection and the mapping on the desk: the tempo once (120 BPM when there is none), or eight taps / beats at 120 BPM");
+		test_btn.on_click([this](){
+			this.test();
+		});
+		search_btn = row.button("Search").fixed_width(80)
+			.tooltip("Look for a grandMA2 (console or onPC) on this computer and in the local networks: its Telnet port 30000 answers. Takes a few seconds; nothing is sent but the connect");
+		search_btn.on_click([this](){
+			this.search();
+		});
+		phase_btn = row.pushbutton("Bar").fixed_width(60)
+			.tooltip("Lead the bar phase too, not only the tempo: the other Link programs play their bars on the bars of the timeline (quantum 4)");
+		phase_btn.on_change([this](v){
+			this.set_field("phase", v ? 1 : 0);
+		});
+		start_stop_btn = row.pushbutton("Start/Stop").fixed_width(90)
+			.tooltip("Start / stop sync: Play and Stop go to the Link session (programs with start / stop sync on start and stop with it)");
+		start_stop_btn.on_change([this](v){
+			this.set_field("start_stop", v ? 1 : 0);
+		});
+		address_row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		ip_box = address_row.textbox("").editable(true).alignment("left").fixed_width(math.max(100, width - 80)).placeholder("IP address")
+			.tooltip("The IPv4 address of the desk or program (127.0.0.1: this computer). Enter to take it");
+		ip_box.on_change([this](text){
+			this.set_field("ip", std.string(text).trim());
+		});
+		port_box = address_row.textbox("").editable(true).alignment("left").fixed_width(76).placeholder("Port")
+			.tooltip("The port it listens on (OSC: UDP, grandMA2 and OS2L: TCP)");
+		port_box.on_change([this](text){
+			v = std.int(std.string(text).trim());
+			if(v > 0 && v < 65536)
+				this.set_field("port", v);
+			else
+				this.show_target(this.shown);
+		});
+		text_box = area.textbox("").editable(true).alignment("left").fixed_width(width).fixed_height(26);
+		text_box.on_change([this](text){
+			name = TEMPO_TARGETS[this.shown];
+			field = TEMPO_TEXT_FIELD[name];
+			if(field != "")
+				this.set_field(field, std.string(text));
+		});
+		login_row = area.widget().fixed_width(width).fixed_height(26).layout(nanogui.layout_horizontal());
+		user_box = login_row.textbox("").editable(true).alignment("left").fixed_width(math.floor(width / 2)).placeholder("User")
+			.tooltip("A user of the show file on the desk (every grandMA2 show has administrator with the password admin). Case sensitive");
+		user_box.on_change([this](text){
+			this.set_field("user", std.string(text).trim());
+		});
+		pass_box = login_row.textbox("").editable(true).alignment("left").fixed_width(math.floor(width / 2)).placeholder("Password")
+			.tooltip("The password of that user");
+		pass_box.on_change([this](text){
+			this.set_field("password", std.string(text));
+		});
+		status_label = area.label("").font_size(13).fixed_width(width).fixed_height(20);
+		apply();
+		show_target(0);
+	}
+
+	// =========================================================================
+	// Settings
+	// =========================================================================
+
+	//What tempo_out.configure() gets: the settings, with the Link peer following while the timeline chases it
+	apply() {
+		c = std.json();
+		for(k, v : cfg)
+			c[k] = v;
+		c.link = [on = (cfg.link.on && !link_follow) ? 1 : 0, follow = link_follow ? 1 : 0, phase = cfg.link.phase, start_stop = cfg.link.start_stop];
+		out.configure(c);
+	}
+
+	set_link_follow(v) {
+		if(link_follow == (v ? true : false))
+			return None;
+		link_follow = v ? true : false;
+		apply();
+		show_status(true);
+	}
+
+	//One field of the target shown
+	set_field(field, value) {
+		name = TEMPO_TARGETS[shown];
+		t = cfg[name];
+		if(t[field] == value)
+			return None;
+		t[field] = value;
+		apply();
+		show_target(shown);
+		if(on_change)
+			on_change();
+	}
+
+	//Settings of one target from outside (MCP): [on, ip, port, address, command, user, password, phase, start_stop]
+	set_target(name, fields) {
+		i = tempo_index(TEMPO_TARGETS, name);
+		if(i < 0)
+			return false;
+		t = cfg[name];
+		for(k, v : fields) {
+			if(k == "port")
+				t.port = std.int(v);
+			else if(k == "on" || k == "phase" || k == "start_stop")
+				t[k] = std.int(v) ? 1 : 0;
+			else
+				t[k] = std.string(v);
+		}
+		apply();
+		show_target(i); //the fields show what was set
+		if(on_change)
+			on_change();
+		return true;
+	}
+
+	save_state() {
+		return cfg;
+	}
+
+	//Saved settings over the defaults (a key it does not know stays out)
+	load_state(st) {
+		cfg = tempo_defaults();
+		if(st) {
+			for(name, saved : st) {
+				if(!cfg.has(name) || !std.is_json(saved))
+					continue;
+				t = cfg[name];
+				for(k, v : saved)
+					t[k] = v;
+			}
+		}
+		apply();
+		show_target(shown);
+	}
+
+	any_on() {
+		for(name : TEMPO_TARGETS) {
+			if(cfg[name].on)
+				return true;
+		}
+		return false;
+	}
+
+	//"Link · grandMA2": the targets that are on
+	summary() {
+		text = "";
+		for(i = 0; i < TEMPO_TARGETS.size(); i++) {
+			if(cfg[TEMPO_TARGETS[i]].on)
+				text += (text == "" ? "" : " · ") + TEMPO_TARGET_NAMES[i].split(" (")[0];
+		}
+		return text;
+	}
+
+	// =========================================================================
+	// The clock
+	// =========================================================================
+
+	//Every frame: where the clock is ([playing, bpm, beat, exact]; see tempo_out.update)
+	update(state) {
+		out.update(state);
+	}
+
+	//The clock from a deck of a prolink device (DJ Watch); None ends it
+	follow_deck(device, deck) {
+		out.follow_deck(device, deck);
+	}
+
+	link() {
+		return out.link();
+	}
+
+	status() {
+		return out.status();
+	}
+
+	test() {
+		name = TEMPO_TARGETS[shown];
+		if(!cfg[name].on) {
+			status_label.caption("Switch it on first (Send)");
+			return false;
+		}
+		if(name == "link") {
+			status_label.caption("Ableton Link has no test: the status shows the session");
+			return false;
+		}
+		return out.test(name);
+	}
+
+	//A test to a target by name (MCP); false when it is off or unknown
+	test_target(name) {
+		i = tempo_index(TEMPO_TARGETS, name);
+		if(i < 0 || name == "link" || !cfg[name].on)
+			return false;
+		return out.test(name);
+	}
+
+	search() {
+		out.scan_ma2();
+		status_label.caption("Looking for a grandMA2…");
+	}
+
+	// =========================================================================
+	// Showing
+	// =========================================================================
+
+	//The fields of one target
+	show_target(index) {
+		shown = index;
+		name = TEMPO_TARGETS[index];
+		t = cfg[name];
+		if(target_box.selected() != index)
+			target_box.selected(index);
+		is_link = name == "link";
+		if(on_btn.pushed() != (t.on ? true : false))
+			on_btn.pushed(t.on ? true : false);
+		test_btn.visible(!is_link);
+		search_btn.visible(name == "ma2");
+		phase_btn.visible(is_link);
+		start_stop_btn.visible(is_link);
+		if(is_link) {
+			if(phase_btn.pushed() != (t.phase ? true : false))
+				phase_btn.pushed(t.phase ? true : false);
+			if(start_stop_btn.pushed() != (t.start_stop ? true : false))
+				start_stop_btn.pushed(t.start_stop ? true : false);
+		}
+		address_row.visible(!is_link);
+		if(!is_link) {
+			if(ip_box.value() != t.ip)
+				ip_box.value(t.ip);
+			if(port_box.value() != std.string(t.port))
+				port_box.value(std.string(t.port));
+		}
+		field = TEMPO_TEXT_FIELD[name];
+		text_box.visible(field != "");
+		if(field == "address") {
+			text_box.placeholder(name == "osc" ? "OSC address, e.g. /bpm" : "OSC addresses, e.g. /tap, /tap2");
+			text_box.tooltip(name == "osc" ? "The OSC address the tempo goes to, as a float (BPM)" :
+				"The OSC addresses that get a tap on every beat, separated by commas (" + (name == "daslight" ? "Daslight: the value 255, then 0 after 30 ms" : "ChamSys: a message without a value; map it to Tap to Time") + ")");
+		}
+		else if(field == "command") {
+			text_box.placeholder("Command, {bpm} = the tempo");
+			text_box.tooltip(name == "ma2" ? "The command line of the grandMA2; {bpm} is the tempo in whole numbers (the MA2 command line takes no fractions). Default: SpecialMaster 3.16 At {bpm} (speed master 16)" :
+				"The command line sent to /cmd of the grandMA3; {bpm} is the tempo with one decimal. Default: Master 3.1 At BPM {bpm}");
+		}
+		if(field != "" && text_box.value() != t[field])
+			text_box.value(t[field]);
+		login_row.visible(name == "ma2");
+		if(name == "ma2") {
+			if(user_box.value() != t.user)
+				user_box.value(t.user);
+			if(pass_box.value() != t.password)
+				pass_box.value(t.password);
+		}
+		show_names();
+		relayout();
+		show_status(true);
+	}
+
+	//Fields shown or hidden: the area and the widgets around it (a collapsable of the DJ Watch program) take the new height
+	relayout() {
+		w = parent;
+		for(i = 0; i < 3 && w; i++) {
+			w.refresh_layout();
+			try {
+				w = w.parent();
+			}
+			catch(e) {
+				w = None;
+			}
+		}
+	}
+
+	//The target names in the box, "· on" after those that send
+	show_names() {
+		names = [];
+		key = "";
+		for(i = 0; i < TEMPO_TARGETS.size(); i++) {
+			on = cfg[TEMPO_TARGETS[i]].on ? true : false;
+			names.push_back(TEMPO_TARGET_NAMES[i] + (on ? "  · on" : ""));
+			key += on ? "1" : "0";
+		}
+		if(key == names_shown)
+			return None;
+		names_shown = key;
+		target_box.items(names);
+		target_box.selected(shown);
+	}
+
+	//Every frame (the status of the sender changes every 100 ms)
+	tick() {
+		ticks++;
+		if(ticks % 6 == 0)
+			show_status(false);
+	}
+
+	show_status(now) {
+		if(!now && !parent.visible())
+			return None;
+		st = out.status();
+		last_status = st;
+		name = TEMPO_TARGETS[shown];
+		text = "";
+		if(st && st.targets && st.targets.has(name))
+			text = st.targets[name].text;
+		if(name == "ma2" && st && st.scan) {
+			if(st.scan.running)
+				text = "Looking for a grandMA2…";
+			else if(st.scan.done && search_btn.visible() && st.scan.found.size() > 0 && cfg.ma2.ip == "") {
+				//The first desk found goes into the field
+				for(f : st.scan.found) {
+					if(f.sure) {
+						set_field("ip", f.host);
+						break;
+					}
+				}
+			}
+		}
+		if(status_label.caption() != text) {
+			status_label.caption(text);
+			status_label.tooltip(text);
+		}
+	}
+
+	//The grandMA2 search: [running, done, found]
+	scan_result() {
+		st = out.status();
+		return st ? st.scan : None;
+	}
+}

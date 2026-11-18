@@ -1,0 +1,115 @@
+#include "../../web_ui"
+
+import curl;
+
+TEST_PORT = 13348;
+ROOT = __DIR__ + "/.selftest_session_timeout";
+
+passed = 0;
+failed = 0;
+
+check(name, cond, info = "") {
+    if(cond) {
+        passed++;
+        std.print("  PASS  ", name);
+    }
+    else {
+        failed++;
+        std.print("  FAIL  ", name, "  -> ", info);
+    }
+}
+
+class StubHost {
+    running = true;
+    _receptionist_active = false;
+    request_queue = [];
+    worker_threads = [];
+    receptionist = None;
+    tasks = [];
+    tasks_scheduled = [];
+    tasks_finished = [];
+    tasks_failed = [];
+    listeners = [];
+    turns = 0;
+    peers = None;
+    gateway = None;
+    name = "StubNode";
+    description = "the node of the self-test";
+
+    on_notify(cb) {}
+    on_task_finished(cb) {}
+    add_task_finished_listener(cb) { listeners.push_back(cb); }
+
+    request(prompt, on_finish_cb = None, on_action_cb = None) {
+        turns++;
+        _receptionist_active = true;
+        std.sleep(100);
+        _receptionist_active = false;
+        return [ok = true, reports = [[report = "done"]]];
+    }
+
+    get_overview() {
+        return [tasks = tasks, tasks_scheduled = tasks_scheduled, tasks_finished = tasks_finished, tasks_failed = tasks_failed];
+    }
+
+    add_task(name, goal, role = "adaptive") {
+        id = std.random_hash(16);
+        tasks_scheduled.push_back([name = name, task = goal, taskid = id, state = "planned", role = role]);
+        return id;
+    }
+
+    stop_task(taskid) { return false; }
+    update_task(taskid, message) { return false; }
+    inspect_task(taskid) {
+        return [ok = false, taskid = taskid, name = "", state = "lost", active = json.bool(false), report = "", error = "not found", token_usage = 0, last_update_ms = 0];
+    }
+}
+
+class FakePeers {
+    rev = 1;
+    rec = [id = "fake", name = "FakeBox", kind = "node", description = "", model = "", goals = false, api = true, workspaces = 1, online = true, last_seen = 0];
+    last_timeout = 0;
+
+    list() { return [rec]; }
+
+    call(id, method, path, body = None, query = None, timeout = 0) {
+        last_timeout = std.int(timeout);
+        return [ok = true, status_code = 200, body = std.string([ok = json.bool(true), data = [id = "s1", chat_history = []]])];
+    }
+}
+
+base = "http://127.0.0.1:" + std.string(TEST_PORT);
+
+http(method, path, body = "", timeout_ms = 5000) {
+    managed c = curl.curl();
+    t0 = std.millis();
+    res = c.request(method, base + path, std.string(body), ["Content-Type" = "application/json"], timeout_ms);
+    res.ms = std.millis() - t0;
+    return res;
+}
+
+host = StubHost();
+host.peers = FakePeers();
+cfg = [url = "http://127.0.0.1:9", name = "stub-model", token = "", max_tokens = 8000, max_running_agents = 0];
+registry = WorkspaceRegistry("", "", ROOT + "/workspaces", ROOT + "/projects");
+ui = web_ui_start(host, cfg, [port = TEST_PORT, api_token = ""], registry);
+
+if(!ui) {
+    std.print("FAIL: the web interface did not start");
+    std.exitprocess(1);
+}
+
+r = http("GET", "/api/nodes/fake/api/sessions/s1", "", 10000);
+check("remote session history fetch gets 60 s", r.http_code == 200 && host.peers.last_timeout == 60000,
+    std.string(r.http_code) + " timeout=" + std.string(host.peers.last_timeout) + " " + std.string(r.body).substr(0, 100));
+
+r = http("GET", "/api/nodes/fake/api/workspaces", "", 10000);
+check("normal remote API keeps 15 s", r.http_code == 200 && host.peers.last_timeout == 15000,
+    std.string(r.http_code) + " timeout=" + std.string(host.peers.last_timeout));
+
+r = http("GET", "/api/nodes/fake/api/live?since=0&wait=1200", "", 10000);
+check("long-poll keeps wait + control timeout", r.http_code == 200 && host.peers.last_timeout == 6200,
+    std.string(r.http_code) + " timeout=" + std.string(host.peers.last_timeout));
+
+std.print(std.string(passed) + " passed, " + std.string(failed) + " failed");
+std.exitprocess(failed ? 1 : 0);

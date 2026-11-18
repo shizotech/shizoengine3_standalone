@@ -25,12 +25,17 @@ FFmpeg 9.0.2 (libavformat / libavcodec 63, libavutil 61, libswscale 10,
 libswresample 7), the LGPL shared builds of
 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (release
 `autobuild-2026-10-17-20-51`, `ffmpeg-n9.0.2-28-g669f5ab083-<platform>-lgpl-shared-9.0`).
+BtbN deleted that build on 2026-11-02 and the mirror release was never made, so
+the release repo is the only source now (#468, below).
 They are configured without `--enable-gpl` / `--enable-nonfree`, but with
 `--enable-version3`, so they are **LGPL v3**.
 
 - Windows x64, Linux x64, Linux arm64: the release ships them in
   `packages/nanogui/native/<platform>/ffmpeg/` (#327).
   `compile_scripts/fetch_ffmpeg.shio` (functions in `ffmpeg_fetch.shio`)
+  first takes the libraries from the release repo (the gitlink `release/`,
+  filled by `_testing/fetch_release.sh`) when all are there and their
+  `README.txt` names the pinned hash (#468). Otherwise it
   downloads the pinned archive, checks its SHA-256 and unpacks only
   `avformat-63.dll`, `avcodec-63.dll`, `avutil-61.dll`, `swscale-10.dll`,
   `swresample-7.dll` (Linux: `libavformat.so.63`, ... under their soname, 120 MB
@@ -39,8 +44,10 @@ They are configured without `--enable-gpl` / `--enable-nonfree`, but with
   call it before the bundles are made; a wrong hash stops the release. Nothing
   is downloaded again while `README.txt` names the same hash. The binaries are
   never committed to this repository.
-- macOS: `brew install ffmpeg` (Homebrew's `ffmpeg` is 9.x; once it moves on,
-  `brew install ffmpeg@9`, both are searched).
+- macOS arm64: `shzscript_macos/build_ffmpeg.sh` builds the same FFmpeg 9.0.2
+  from pinned sources as LGPL, with VideoToolbox and the HAP encoder (#465, #606).
+  `bundle.sh` copies it to `packages/nanogui/native/macos_arm64/ffmpeg/`.
+  Homebrew's `ffmpeg` is GPL and has no HAP, so the release does not use it.
 - Anywhere: `SHZ_FFMPEG_DIR` points nanogui at another folder with the same
   major versions. `nanogui.video_available()` and `nanogui.video_version()` tell
   whether they were found.

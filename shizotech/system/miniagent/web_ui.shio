@@ -1,16 +1,17 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  web_ui.shio — the web interface of a Node: shz miniagent --web
+//  web_ui.shio — the web interface of a Node: shz miniagent --node --web
 //
-//      shz miniagent --web [--port 13337] [--api-token secret]
-//      shz miniagent.node --web ...                   (the same)
+//      shz miniagent --node --web [--port 13337] [--api-token secret]
 //
 //  One HTTP server on the Node:
-//    /                       the dashboard (web/index.html): chat with the
-//                            receptionist and the workspace tasks
+//    /                       the dashboard (web/index.html): the nodes of the
+//                            network, their workspaces, sessions, tasks and
+//                            architecture graphs
 //    /api/...                the Node JSON API (node_api.shio, node_api.md)
-//    /api/adminagent...      the chat protocol of the dashboard, run on the
-//                            Node's receptionist connector
 //    /api/workspaces...      WorkspaceRegistry routes (workspaces.shio)
+//    /api/nodes              this node and the other AI nodes on ShizoNet
+//    /api/nodes/<id>/api/... the same API of another node: the request goes to
+//                            that node over ShizoNet (ai_api), never over HTTP
 //
 //  Every page works offline: no CDN, everything is in web/.
 //  With --api-token the pages ask for the token once (kept in the browser).
@@ -22,6 +23,8 @@
  
 #include "node_api"
 #include "workspaces"
+#include "node_peers"
+#include "gateway_config"
 
 WEB_UI_DEFAULT_PORT = 13337;
 WEB_UI_ROOT = __DIR__ + "/web";
@@ -89,139 +92,220 @@ web_ui_parse(args) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  /api/adminagent: the chat protocol of the dashboard on the Node's receptionist
+//  The other nodes: /api/nodes and the proxy /api/nodes/<id>/api/...
+//
+//  The page talks to its own node only. A call for another node is handed to
+//  that node over ShizoNet (NodePeers.call -> ai_api) and its answer goes back
+//  unchanged, so every route of the API works for every node on the network:
+//  workspaces, sessions, tasks, goals, the architecture graph.
+//  These routes are HTTP only (they are not in the ApiRouter table): a node
+//  does not forward calls for a third node.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// a receptionist action -> the delta of the chat page (None: not shown)
-web_ui_chat_delta(action) {
-	if(!std.is_json(action))
-		return None;
+WEB_UI_REMOTE_EVENTS_WAIT_MS = 3000;    // long-poll of a remote session's events
+WEB_UI_REMOTE_EVENTS_FAILS = 5;         // failed polls in a row that end a remote stream
+WEB_UI_SESSION_LOAD_TIMEOUT_MS = 60000; // GET /api/sessions/<id> reads the whole chat history
 
-	if(action.has("text") && action.text)
-		return [agent = "planner", text = std.string(action.text)];
+web_ui_node_self(node, cfg) {
+    name = "Node";
+    description = "";
+    model = "";
+    goals = false;
+    running = 0;
 
-	// a tool call arrives twice: as "tool" (the model's call) and as "tool_start"
-	// (the harness runs it); the chat shows it once
-	tool = None;
-	if(action.has("tool_start") && std.is_json(action.tool_start))
-		tool = action.tool_start;
+    try { name = node.node_name(); } catch(e) {
+        try { name = std.string(node.name ?? "Node"); } catch(e2) {}
+    }
+    try { description = std.string(node.description ?? ""); } catch(e) {}
+    try { model = std.string(cfg.name ?? ""); } catch(e) {}
+    try { goals = node.goals ? true : false; } catch(e) {}
+    try { running = node.get_overview().tasks.size(); } catch(e) {}
 
-	if(!tool || !tool.has("name"))
-		return None;
-
-	name = std.string(tool.name);
-	args = tool.has("args") && std.is_json(tool.args) ? tool.args : std.json();
-
-	if(name == "finish" && args.has("summary"))
-		return [agent = "planner", text = "\n\n" + std.string(args.summary)];
-
-	text = "\n> [TOOL] " + name;
-	if(args.has("name") && args.name)
-		text += " `" + std.string(args.name) + "`";
-	else if(args.has("path") && args.path)
-		text += " `" + std.string(args.path) + "`";
-	return [agent = "planner", text = text + "\n\n"];
+    return [
+        id = "local",
+        name = name,
+        kind = "node",
+        local = json.bool(true),
+        online = json.bool(true),
+        ip = "",
+        description = description,
+        model = model,
+        busy = json.bool(running > 0),
+        tasks_running = running,
+        goals = json.bool(goals),
+        api = json.bool(true),
+    ];
 }
 
-web_ui_chat_routes(server, node, api_token) {
-	sessions = [];		// client ip -> [token, queue, status]
+web_ui_peers(node) {
+    try {
+        if(node && !std.is_none(node.peers))
+            return node.peers;
+    } catch(e) {}
 
-	server.route("POST", "^/api/adminagent$", [node, sessions, api_token](req, writer) {
-		if(!node_api_authorized(req, api_token))
-			return node_api_err("Unauthorized", 401);
+    return None;
+}
 
-		body = node_api_body(req);
-		prompt = node_api_get(body, "prompt");
-		if(!prompt.strip())
-			return node_api_err("Missing 'prompt'");
+web_ui_reply(code, text) {
+    return [status_code = code, headers = node_api_headers(), body = std.string(text)];
+}
 
-		client = std.string(req.client_ip);
-		token = node_api_get(body, "session_id");
-		if(!token)
-			token = std.random_hash(16);
+// GET /api/nodes/<id>/api/sessions/<sid>/stream: the events of a session of another
+// node as server sent events. The node is asked for the events after the last one
+// (a long-poll over ShizoNet), so the page uses the same EventSource for every node.
+web_ui_remote_stream(peers, node_id, sid, req, writer) {
+    if(!writer.write_header(200, "text/event-stream", node_api_headers([
+        "Content-Type" = "text/event-stream; charset=utf-8",
+        "Cache-Control" = "no-cache",
+        "Connection" = "keep-alive",
+        "X-Accel-Buffering" = "no",
+    ])))
+        return;
 
-		sessions[client] = [token = token, queue = [], status = "generating", started = std.millis()];
+    writer.write_sse(std.string([session_id = sid, status = "connected"]), "status");
 
-		run = [node, sessions, client, token, prompt]() {
-			on_action = [sessions, client, token](action) {
-				if(!sessions.has(client) || sessions[client].token != token)
-					return;
-				d = web_ui_chat_delta(action);
-				if(d)
-					sessions[client].queue.push_back(d);
-			};
-			result = None;
-			try {
-				result = node.request(prompt, None, on_action);
-			}
-			catch(e) {
-				result = [ok = false, error = std.string(e)];
-			}
-			if(!sessions.has(client) || sessions[client].token != token)
-				return;
-			// the report of the turn closes the answer (the finish summary is
-			// streamed already, so only a turn without one adds its report)
-			if(std.is_json(result) && !result.ok) {
-				txt = std.string(result.error ?? "the turn failed");
-				if(std.is_json(result.reports) && result.reports.size())
-					txt = std.string(result.reports[0].report);
-				sessions[client].queue.push_back([agent = "planner", text = "\n\n" + txt]);
-			}
-			sessions[client].status = "done";
-		};
-		std.thread(run).run();
+    since = node_api_int(req.query_params, "since", 0);
+    fails = 0;
+    last_ping = std.millis();
 
-		return [status_code = 200, headers = node_api_headers(), body = std.string([ok = 1, session_id = token])];
-	});
+    for(writer.is_client_alive()) {
+        r = peers.call(node_id, "GET", "/api/sessions/" + sid + "/events",
+            None, [since = std.string(since), wait = std.string(WEB_UI_REMOTE_EVENTS_WAIT_MS)],
+            WEB_UI_REMOTE_EVENTS_WAIT_MS + AI_TIMEOUT_CONTROL);
 
-	server.route("POST", "^/api/adminagent/poll$", [sessions, api_token](req, writer) {
-		if(!node_api_authorized(req, api_token))
-			return node_api_err("Unauthorized", 401);
+        data = None;
 
-		body = node_api_body(req);
-		client = std.string(req.client_ip);
-		reply = [ok = true, status = "done"];
+        if(r.ok && r.status_code == 200) {
+            try {
+                parsed = std.json(r.body, true);
 
-		if(sessions.has(client)) {
-			s = sessions[client];
-			if(s.token != node_api_get(body, "session_id")) {
-				reply = [ok = false, status = "error", error = "unknown session"];
-			}
-			else if(s.queue.size()) {
-				d = s.queue[0];
-				s.queue.erase(0);
-				// consecutive text of the same agent in one delta
-				for(s.queue.size() && s.queue[0].agent == d.agent) {
-					d.text += s.queue[0].text;
-					s.queue.erase(0);
-				}
-				reply = [ok = true, status = "generating", delta = d];
-			}
-			else if(s.status == "done") {
-				sessions.erase(client);
-				reply = [ok = true, status = "done"];
-			}
-			else
-				reply = [ok = true, status = "waiting"];
-		}
+                if(std.is_json(parsed) && parsed.ok && std.is_json(parsed.data))
+                    data = parsed.data;
+            } catch(e) {
+                data = None;
+            }
+        }
 
-		return [status_code = 200, headers = node_api_headers(), body = std.string(reply)];
-	});
+        if(!data) {
+            // the session is gone: nothing more will come
+            if(r.status_code == 404) {
+                writer.write_sse(std.string([message = "The session does not exist on that node any more."]), "error");
+                break;
+            }
 
-	server.route("POST", "^/api/adminagent/stop$", [node, sessions, api_token](req, writer) {
-		if(!node_api_authorized(req, api_token))
-			return node_api_err("Unauthorized", 401);
+            fails++;
 
-		client = std.string(req.client_ip);
-		if(sessions.has(client)) {
-			sessions.erase(client);
-			try {
-				node.receptionist.stop();
-			}
-			catch(e) {}
-		}
-		return [status_code = 200, headers = node_api_headers(), body = std.string([ok = true])];
-	});
+            if(fails >= WEB_UI_REMOTE_EVENTS_FAILS) {
+                writer.write_sse(std.string([message = "The node does not answer any more."]), "error");
+                break;
+            }
+
+            std.sleep(500);
+            continue;
+        }
+
+        fails = 0;
+        sent = false;
+
+        if(std.is_json(data.events)) {
+            for(e : data.events) {
+                if(e.seq > since)
+                    since = e.seq;
+
+                payload = e.copy();
+                payload.erase("type");
+                writer.write_sse(payload.compact_string(), std.string(e.type));
+                sent = true;
+            }
+        }
+
+        if(data.terminal)
+            break;
+
+        if(!sent && std.millis() - last_ping > WS_STREAM_PING_MS) {
+            writer.write(": ping\n\n");
+            last_ping = std.millis();
+        }
+    }
+
+    writer.end();
+}
+
+// http: the raw webserver object (the proxy routes are not part of the API table)
+web_ui_node_routes(http, node, cfg, api_token) {
+    http.route("GET", "^/api/nodes$", [node, cfg, api_token](req, writer) {
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        list = [web_ui_node_self(node, cfg)];
+        peers = web_ui_peers(node);
+        rev = 0;
+
+        if(peers) {
+            for(p : peers.list())
+                list.push_back(p);
+
+            rev = peers.rev;
+        }
+
+        return node_api_ok([nodes = list, rev = rev]);
+    });
+
+    http.route("*", "^/api/nodes/([0-9a-zA-Z_-]+)(/api/.*)$", [node, api_token](req, writer) {
+        if(std.string(req.method) == "OPTIONS")
+            return web_ui_reply(204, "");
+
+        if(!node_api_authorized(req, api_token))
+            return node_api_err("Unauthorized", 401);
+
+        node_id = std.string(req.matches[0]);
+        path = std.string(req.matches[1]);
+        peers = web_ui_peers(node);
+
+        if(!peers)
+            return web_ui_reply(503, [ok = json.bool(false), error = "This node is not on ShizoNet."]);
+
+        // the one streaming route: the events of a session, as on the node itself
+        if(path.starts("/api/sessions/") && path.ends("/stream")) {
+            sid = path.removeprefix("/api/sessions/").removesuffix("/stream");
+
+            if(sid && !sid.contains("/")) {
+                web_ui_remote_stream(peers, node_id, sid, req, writer);
+                return;
+            }
+        }
+
+        body = None;
+        raw = std.string(req.body ?? "");
+
+        if(raw.strip())
+            body = raw;
+
+        // a long-poll (/api/live, .../events) may hold the answer back: give it time
+        timeout = AI_TIMEOUT_API;
+        wait_ms = node_api_int(req.query_params, "wait", 0);
+
+        if(wait_ms > 0) {
+            timeout = wait_ms + AI_TIMEOUT_CONTROL;
+        } else if(std.string(req.method) == "GET" && path.starts("/api/sessions/") && !path.ends("/events")) {
+            // opening a session reads its whole chat history: a long one can take much
+            // longer than a normal API call
+            timeout = WEB_UI_SESSION_LOAD_TIMEOUT_MS;
+        }
+
+        // the query of the page, without the token of THIS node
+        query = std.json();
+
+        if(std.is_json(req.query_params)) {
+            for(k, v : req.query_params) {
+                if(std.string(k) != "token")
+                    query[std.string(k)] = std.string(v);
+            }
+        }
+
+        r = peers.call(node_id, std.string(req.method), path, body, query, timeout);
+        return web_ui_reply(std.int(r.status_code), r.body);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +314,7 @@ web_ui_chat_routes(server, node, api_token) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // -> [server, board, runtime], None when the port cannot be bound
+//    server: the ApiRouter around the HTTP server (api_router.shio)
 //    registry: the WorkspaceRegistry to serve; defaults to node.registry.
 //    board: the Node workspace's board (compatibility for node.shio); no legacy
 //           node-level ArchitectureBoard is created here.
@@ -249,9 +334,10 @@ web_ui_start(node, cfg, opts, registry = None) {
 	if(!server)
 		return None;
 
-	web_ui_chat_routes(server, node, token);
+	web_ui_node_routes(server.server, node, cfg, token);
 
 	runtime = workspaces_api_register(server, cfg, token, registry);
+	gateway_api_register(server, node, token);
 
 	board = None;
 	try {

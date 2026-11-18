@@ -1,0 +1,134 @@
+// ═════════════════════════════════════════════════════════════════════════════
+//  util/blind_tester — writes tests from a specification and an API description
+//  without ever seeing the implementation
+//
+//  Created by write_blind_tests of the adaptive role (roles/adaptive/ROLE.shio).
+//  That tool replaces the filesystem of this agent with an fs_path_guard
+//  (roles/SHARED.shio): the read and write tools below reach the test path and
+//  the reference files the caller listed, and nothing else.
+//
+//  The role has NO command, skill or share tools, on purpose: each of them reads
+//  files without asking that view (a shell, a skill module, fileio). Keep it that
+//  way; a tool added here must go through agt.filesystem or it breaks "blind".
+//  A run_tests tool is added by the caller only when it passed a run_command.
+//
+//  finalize() takes the report in fields, so the caller gets one shape: the test
+//  files, the test cases with the behaviour each one checks, the ambiguities of
+//  the specification, what is not covered.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A string or a list of strings as a list of the non-empty ones.
+blind_report_list(value)
+{
+	var list = [];
+
+	if(std.is_none(value))
+		return list;
+
+	if(std.is_string(value)) {
+		if(value.strip())
+			list.push_back(value.strip());
+		return list;
+	}
+
+	if(std.is_json(value)) {
+		for(var i = 0; i < value.size(); i++) {
+			var entry = std.string(value[i]).strip();
+			if(entry)
+				list.push_back(entry);
+		}
+	}
+
+	return list;
+}
+
+add_tools(agt)
+{
+	// Both sets work on agt.filesystem only (the restricted view).
+	agt.add_read_tools();
+	agt.add_write_tools();
+
+	agt.add_tool(
+		"finalize",
+		"End the run and hand the report to the caller. Use it exactly once, as the last action.",
+		[
+			signal = ["finished", "failed", "question"],
+			summary = "&string(): Two or three sentences: what is covered and the state of the tests. For 'question': the question. For 'failed': why.",
+			test_files = "uarray(string): Every test file you wrote or changed (paths as you wrote them).",
+			test_cases = "uarray(string): One entry per test: '<test name>: <the behaviour it checks>'.",
+			spec_ambiguities = "uarray(string): Every gap, ambiguity or contradiction of the specification / API, each with the reading your tests assume.",
+			not_covered = "uarray(string): Promised behaviour you did not test, and why.",
+			run_result = "string(): What run_tests reported for the final version. Leave it out when you could not run the tests.",
+		],
+		[](agt, args)
+		{
+			var signal = std.is_none(args.signal) ? "" : std.string(args.signal).strip().lowercase();
+
+			if(signal != "finished" && signal != "failed" && signal != "question") {
+				return [
+					ok = false,
+					error = "Unknown signal '" + signal + "': the run was NOT ended.",
+					valid_signals = ["finished", "failed", "question"],
+					hint = "Call finalize again with one of the valid signals.",
+				];
+			}
+
+			var summary = std.is_none(args.summary) ? "" : std.string(args.summary).strip();
+
+			if(!summary)
+				return [ok = false, error = "Missing 'summary': the run was NOT ended.", hint = "Call finalize again with the summary (for 'question' the question, for 'failed' the reason)."];
+
+			// A hand-over of the harness (context compaction) carries text only.
+			if(agt.internal_run) {
+				agt.finalize_run(signal, summary, true);
+				return "Finalize signal sent, the turn ends.";
+			}
+
+			var files = blind_report_list(args.test_files);
+			var cases = blind_report_list(args.test_cases);
+
+			if(signal == "finished") {
+				if(!files.size())
+					return [ok = false, error = "'test_files' is empty: the run was NOT ended.", hint = "A finished run names the test files it wrote. If you wrote none, write the tests first, or end with 'failed' / 'question'."];
+
+				for(var i = 0; i < files.size(); i++) {
+					var found = false;
+					var refused = "";
+
+					// the restricted view answers a path outside the test path with an exception
+					try {
+						found = agt.filesystem.exists(files[i]) && !agt.filesystem.is_directory(files[i]) && !agt.filesystem.empty(files[i]);
+					}
+					catch(e) {
+						refused = std.string(e).strip();
+					}
+
+					if(!found) {
+						return [
+							ok = false,
+							error = "The test file '" + files[i] + "' " + (refused ? "is not one of your paths (" + refused + ")" : "does not exist or is empty") + ": the run was NOT ended.",
+							hint = "List the test files exactly as you wrote them (the paths you passed to write_file), then call finalize again.",
+						];
+					}
+				}
+
+				if(!cases.size())
+					return [ok = false, error = "'test_cases' is empty: the run was NOT ended.", hint = "List every test you wrote as '<test name>: <the behaviour it checks>', then call finalize again."];
+			}
+
+			agt.finalize_run(signal, [
+				summary = summary,
+				test_files = files,
+				test_cases = cases,
+				spec_ambiguities = blind_report_list(args.spec_ambiguities),
+				not_covered = blind_report_list(args.not_covered),
+				run_result = std.is_none(args.run_result) ? "" : std.string(args.run_result).strip(),
+			], true);
+
+			return "Finalize signal sent, the run ends; wait for further instructions.";
+		}
+	);
+
+	// finalize is this role's exit: without it the harness asks the model again.
+	agt.use_finalize = true;
+}

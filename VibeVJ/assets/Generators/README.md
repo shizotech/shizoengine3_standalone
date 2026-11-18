@@ -14,11 +14,11 @@ Generators are the core processing units of the VJ application. They can generat
 | **Sources** | Pictures made by a script (not a shader) | Text |
 | **Audio** | Audio analysis that drives everything else | AudioInputAnalysis |
 | **Input** | Video devices of this computer (webcams, capture cards; on macOS the screens) | Camera |
-| **Network** | Art-Net in and out, video in (NDI, Spout), CDJs over Pro DJ Link | ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks |
-| **Utility** | Pads, button fields, envelopes and small helpers | XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld, Control-Button-Matrix, EnvelopeOutput, StepChaser, LoopTrigger, control4, quantize, textbox, value_text, Chat, broken |
+| **Network** | Art-Net in and out, video in (NDI, Spout), CDJs over Pro DJ Link, DJ events as MIDI | ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks, DJMidiOut |
+| **Utility** | Pads, button fields, envelopes and small helpers | XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld, Control-Button-Matrix, EnvelopeOutput, StepChaser, LoopTrigger, control4, quantize, textbox, value_text, Chat, Director, broken |
 | **output** | Masks for an output | RGBMask (`legacy/` holds VideoToRGB, no longer in the asset list) |
 | **ExampleBasics** | Code examples for asset authors | custom_drawing_ui_controls |
-| **Python** | Python scripts (`Name.py/src/__init__.py`, #853): controls from `#@` comments, a picture in, values and a picture out. Wiki page Python-Generators | LFO, AverageColour, Threshold, Edges (numpy: a dependency in asset.json) |
+| **Python** | Python scripts (`Name.py/src/__init__.py`, #853): controls from `#@` comments, a picture in, values and a picture out. Wiki page Python-Generators | LFO, AverageColour, Threshold, Edges, CrowdMotion (numpy: a dependency in asset.json) |
 | **Native** | Native assets: a C ABI plugin instead of a script (#201, `src/__init__.native`) | Life, Dither |
 
 `Utility/broken.asset` fails on purpose: it shows what the error report of a broken asset looks like (the Linux smoke
@@ -34,13 +34,13 @@ Generators/
 ├── Sources/         Text
 ├── Audio/           AudioInputAnalysis
 ├── Input/           Camera
-├── Network/         ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks
+├── Network/         ArtnetReceiver, ArtnetSender, NDIReceiver, SpoutReceiver, ProlinkBridge, ProlinkDecks, DJMidiOut
 ├── Utility/         XYPad, XYPathPad, XYPositions, CurvePad, ColorSelector, Button-Feld,
 │                    Control-Button-Matrix, EnvelopeOutput, StepChaser, LoopTrigger, control4,
-│                    quantize, textbox, value_text, Chat, broken
+│                    quantize, textbox, value_text, Chat, Director, broken
 ├── output/          RGBMask, legacy/VideoToRGB
 ├── ExampleBasics/   custom_drawing_ui_controls
-└── Python/          LFO, AverageColour, Threshold, Edges
+└── Python/          LFO, AverageColour, Threshold, Edges, CrowdMotion
 └── Native/          Life, Dither
 ```
 
@@ -94,12 +94,18 @@ Handle network-based input/output:
 - **ArtnetReceiver / ArtnetSender**: DMX512 over Ethernet (Art-Net) in and out
 - **NDIReceiver / SpoutReceiver**: video from other programs (NDI on every system, Spout on Windows)
 - **ProlinkBridge / ProlinkDecks**: CDJ data (Pioneer Pro DJ Link) from DJ Watch (the ESP32 formerly called prolink-bridge) or, without it, through a network card of this computer, and a deck view of it
+- **DJMidiOut**: the beats, phrases, drops, track loads and values of a deck as MIDI notes and controllers to a MIDI output, and the SoundSwitch preset (bank select + AutoLoop per phrase); reads the device of a ProlinkBridge / ProlinkDecks
 
 ### Output Generators
 - **RGBMask**: shapes that mask an output. The LED mapping lives in `assets/Mapping/` (LEDMapper, MapLab).
 
 ### Utility Generators
 Provide helper functionality and debugging tools.
+- **Director**: an AI model on an OpenAI-compatible API (Ollama, LM Studio, vLLM, a cloud API; vision models get a
+  picture) answers typed questions about the show (intensity 0..1, strobe yes / no, a palette and a scene of a list),
+  each with a confidence, from the Pro DJ Link data (track, rekordbox phrase, mood) and linked inputs. Sure answers go to
+  its outputs on the next downbeat. The VJ guides it with a *Behaviour* prompt for the show and a chat of short
+  instructions that run out (minutes, the track). Logic: `engine/director/director.shio`, test `_testing/director.shio`.
 
 ## Notes
 

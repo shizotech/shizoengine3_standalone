@@ -6,10 +6,12 @@
 //Layout (the LEDMapper's state, compatible with the one before #439, new keys get defaults):
 //  scenes   = [[id, name, enabled, master, groups = [...]]]
 //  group    = [id, name, enabled, device_mac, target, start_universe, start_channel (0-based), channel_gap, wrap_leds,
-//              max_brightness, transform_uv (4 corners 0..1), transform_angle, segments = [...]]
+//              max_brightness, transform_uv (4 corners 0..1), transform_angle, segments = [...],
+//              place3d (#980: where it is on the stage, ledmap_place_default), color_source (LEDMAP_COLOR_SOURCES)]
 //  segment  = [id, name, start_pos, end_pos, control (curve handle), shape ("line" / "curve"), width (LEDs),
 //              height (rows), serpentine, reversed, rgb_type, is_rgbw, universe / channel (-1: after the one before),
-//              custom_device_mac, target]
+//              custom_device_mac, target, path3d (#980: a 3D path on the stage, x, y, z, ...),
+//              points (#980: shape "points", one [x, y] per LED, measured by a camera scan: engine/patch/ledscan.shio)]
 //Positions are 0..1 of the picture (x right, y down).
 //- group.target / segment.target "fixture:<id>": a lamp of the patch; node, universe and address come from it (its first
 //  colour channel), so the LEDMapper follows when the lamp is re-addressed in the fixture setup.
@@ -17,6 +19,14 @@
 //  start of the one before.
 
 using eigen;
+
+def ledmap_place_default();
+
+//Where the colours of a group come from (#980, color_source): the picture where its LEDs are drawn; the picture
+//projected onto its LEDs where they stand on the stage, from the front (x, z), from above (x, y) or from the side
+//(y, z); or the 3D effect of the LEDMapper at their place. Everything but "picture" needs the group on the stage
+LEDMAP_COLOR_SOURCES = ["picture", "front", "top", "side", "effect"];
+LEDMAP_COLOR_SOURCE_LABELS = ["Picture (as drawn)", "Projected from the front", "Projected from above", "Projected from the side", "3D effect"];
 
 LEDMAP_RGB_TYPES = ["Single channel", "RGB", "RBG", "GRB", "GBR", "BRG", "BGR"];
 
@@ -56,7 +66,51 @@ ledmap_normalize_segment(seg) {
 		seg.channel = -1;
 	if(!seg.has("target"))
 		seg.target = "";
+	//#980: a 3D path its LEDs follow on the stage (x, y, z, ... metres in the frame of the object its group hangs on);
+	//[] : none. On the picture it stays the line from start_pos to end_pos
+	if(!seg.has("path3d") || std.type(seg.path3d) != "json")
+		seg.path3d = [];
+	//#980: shape "points": a place of its own for each LED (a strip laid by hand, scanned with a camera); the segment has
+	//as many LEDs as points, one row. Without points it is a line again
+	if(!seg.has("points") || std.type(seg.points) != "json")
+		seg.points = [];
+	if(seg.shape == "points") {
+		if(!seg.points.size())
+			seg.shape = "line";
+		else {
+			seg.width = seg.points.size();
+			seg.height = 1;
+		}
+	}
 	return seg;
+}
+
+//Makes a segment one of shape "points" (pts: [[x, y], ...] or vec2f, 0..1 before the transform of its group): its LEDs
+//there, in that order; start and end the first and the last
+ledmap_set_points(seg, pts) {
+	list = [];
+	for(p : pts)
+		list.push_back([x = std.float(p.x), y = std.float(p.y)]);
+	if(!list.size())
+		return seg;
+	seg.points = list;
+	seg.shape = "points";
+	seg.width = list.size();
+	seg.height = 1;
+	seg.start_pos = [x = list[0].x, y = list[0].y];
+	seg.end_pos = [x = list[-1].x, y = list[-1].y];
+	seg.control = [x = (list[0].x + list[-1].x) / 2.0, y = (list[0].y + list[-1].y) / 2.0];
+	return seg;
+}
+
+//The points of a segment that move when it is moved, mirrored or nudged (each [x, y], changed in place)
+ledmap_segment_movable(seg) {
+	pts = [seg.start_pos, seg.end_pos, seg.control];
+	if(seg.shape == "points") {
+		for(i = 0; i < seg.points.size(); i++)
+			pts.push_back(seg.points[i]);
+	}
+	return pts;
 }
 
 ledmap_normalize_group(group) {
@@ -89,7 +143,56 @@ ledmap_normalize_group(group) {
 		group.segments = [];
 	for(i = 0; i < group.segments.size(); i++)
 		ledmap_normalize_segment(group.segments[i]);
+	//Where its colours come from (#980): the picture as drawn, or (on the stage) projected or a 3D effect
+	if(!group.has("color_source") || !LEDMAP_COLOR_SOURCES.has_value(group.color_source))
+		group.color_source = "picture";
+	//Where the group is on the stage (#980, engine/stage/stage_leds.shio): off, or a plane in the world of the stage
+	if(!group.has("place3d") || std.type(group.place3d) != "json")
+		group.place3d = ledmap_place_default();
+	d = ledmap_place_default();
+	for(i = 0; i < d.size(); i++) {
+		k = d.key(i);
+		if(!group.place3d.has(k) || std.is_none(group.place3d[k]))
+			group.place3d[k] = d[i];
+	}
 	return group;
+}
+
+//The place of a group on the stage (#980): on (shown in the 3D views), the middle of its LEDs at x, y, z (metres, the
+//world of the fixture setup), turned rx, ry, rz (degrees), width: metres the width of the picture is on the stage (the
+//height follows the picture's aspect), hangs_on: an object of the stage it moves with ("" : none). Unturned the picture
+//stands upright facing the audience: its x to the right, its top up
+ledmap_place_default() {
+	return [on = 0, x = 0.0, y = 0.0, z = 1.5, rx = 0.0, ry = 0.0, rz = 0.0, width = 2.0, hangs_on = ""];
+}
+
+//The groups that are on the stage, from a build: [id, name, place, offset (first LED of the group in the order the
+//LEDs are sent), count, leds (u, v, ... 0..1 of the picture)]. A group's segments are one after the other in that order
+ledmap_stage_groups(scenes, build) {
+	out = [];
+	by_group = std.json(); //"scene:group" -> its entry
+	for(s : build.slots) {
+		scene = scenes[s.scene];
+		group = scene.groups[s.group];
+		if(!group.place3d.on)
+			continue;
+		k = s.scene + ":" + s.group;
+		if(!by_group.has(k)) {
+			by_group[k] = out.size();
+			out.push_back([id = group.id, name = group.name, place = group.place3d, color_source = group.color_source,
+				offset = s.offset, count = 0, leds = [], paths = []]);
+		}
+		e = out[by_group[k]];
+		e.count = s.offset + s.count - e.offset;
+		seg = group.segments[s.segment];
+		if(seg.path3d.size() >= 6)
+			e.paths.push_back([first = s.offset - e.offset, count = s.count, points = seg.path3d, reversed = seg.reversed]);
+		for(p : s.leds) {
+			e.leds.push_back(p.x);
+			e.leds.push_back(p.y);
+		}
+	}
+	return out;
 }
 
 ledmap_normalize_scene(scene) {
@@ -137,8 +240,25 @@ ledmap_vec(p) {
 	return vec2f(p.x, p.y);
 }
 
-//Point of the path of a segment at t (0..1): a line, or a curve through its handle (quadratic Bezier)
+//Pieces to draw or hit the path of a segment with (ledmap_path_point at i / steps)
+ledmap_path_steps(seg) {
+	if(seg.shape == "points")
+		return math.max(1, seg.points.size() - 1);
+	return seg.shape == "curve" ? 16 : 1;
+}
+
+//Point of the path of a segment at t (0..1): a line, a curve through its handle (quadratic Bezier), or from point to
+//point (shape "points")
 ledmap_path_point(seg, t) {
+	if(seg.shape == "points" && seg.points.size()) {
+		n = seg.points.size();
+		if(n == 1)
+			return ledmap_vec(seg.points[0]);
+		f = math.clamp(t, 0.0, 1.0) * (n - 1);
+		i = math.min(n - 2, std.int(math.floor(f)));
+		f -= i;
+		return ledmap_vec(seg.points[i]) * (1.0 - f) + ledmap_vec(seg.points[i + 1]) * f;
+	}
 	a = ledmap_vec(seg.start_pos);
 	b = ledmap_vec(seg.end_pos);
 	if(seg.shape == "curve") {
@@ -190,6 +310,13 @@ ledmap_chord(seg) {
 //The LED positions of a segment in its own coordinates (0..1 of the picture, before the transform of its group), in
 //the order the data runs: rows (height) side by side, every second row back (serpentine), reversed if reversed
 ledmap_segment_leds(seg) {
+	if(seg.shape == "points" && seg.points.size()) {
+		leds = [];
+		n = seg.points.size();
+		for(i = 0; i < n; i++)
+			leds.push_back(ledmap_vec(seg.points[seg.reversed ? n - 1 - i : i]));
+		return leds;
+	}
 	w = math.max(1, std.int(seg.width));
 	h = math.max(1, std.int(seg.height));
 	path = ledmap_path_even(seg, w);
@@ -289,7 +416,9 @@ ledmap_last_channel(u, c, n, out, wrap) {
 	limit = ledmap_universe_limit(out, wrap);
 	if(wrap && before.channel + out > limit)
 		before = [universe = before.universe + 1, channel = 0];
-	return [universe = before.universe, channel = before.channel + out - 1];
+	//without wrap the bytes of the last LED run on into the next universe (as write() of the node does)
+	last = before.channel + out - 1;
+	return [universe = before.universe + std.int(last / 512), channel = last % 512];
 }
 
 //"U0 · 1" (1-based channel as on a node)

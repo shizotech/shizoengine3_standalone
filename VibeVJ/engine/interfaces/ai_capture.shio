@@ -6,8 +6,13 @@
 //The engine owns one (engine.ai_capture). A generator says which widget is "its picture" with the dispatch command
 //"get_capture_widget" (the Camera: its video, without the panel); without one the picture is its window.
 //
+//A camera of the computer can also be looked through without a Camera generator (#924): device_capture() opens it in a
+//hidden video widget (on the render thread, tick()), takes one picture and closes it again.
+//
 //Works from any thread: widget.capture() renders the widget offscreen after the next frame and waits for it. The PNGs
 //go to .capture/ in the folder of VibeVJ.
+
+import nanogui;
 
 AI_CAPTURE_DIR = ".capture";
 AI_CAPTURE_DEFAULT_WIDTH = 1024;
@@ -15,10 +20,27 @@ AI_CAPTURE_DEFAULT_WIDTH = 1024;
 AI_CAPTURE_DEFAULT_WAIT_MS = 600;
 AI_CAPTURE_MAX_WAIT_MS = 10000;
 AI_CAPTURE_CAMERA_ASSET = "Camera.asset";
+//The test pattern of the Camera generator (FFmpeg's lavfi source, no camera needed): the same name and id
+AI_CAPTURE_TEST_PATTERN = "Test pattern";
+AI_CAPTURE_TEST_ID = "lavfi:testsrc2=size=1280x720:rate=30";
+//A camera opened for one picture: the first picture can take a few seconds (a webcam that wakes up), then its exposure
+//settles for a moment (the first pictures of many webcams are dark)
+AI_CAPTURE_DEVICE_TIMEOUT_MS = 8000;
+AI_CAPTURE_DEVICE_SETTLE_MS = 500;
 
 class AICapture {
 
 	engine = None;
+
+	//The camera opened for one picture (device_capture). The caller sets grab_want, the render thread (tick) opens it
+	//into grab_video, sizes it (grab_sized) and closes it after grab_release; grab_busy until it is closed
+	grab_host = None;
+	grab_video = None;
+	grab_want = None;
+	grab_error = "";
+	grab_sized = false;
+	grab_release = false;
+	grab_busy = false;
 
 	__init__(_engine) {
 		engine = _engine;
@@ -135,10 +157,11 @@ class AICapture {
 	//Looks through a camera: optionally sets lamps to test values first (set_fixture_test of the fixture setup), waits
 	//until the camera can see it, then captures the picture of the camera. Returns the capture plus the camera status and
 	//what the lamps send (fixture_test)
-	camera_capture(live_path = None, test = None, wait_ms = None, width = AI_CAPTURE_DEFAULT_WIDTH, caller = "capture") {
-		g = camera(live_path);
-		cam_path = g.get_live_path();
-		status = g.ai_interface.query("get_camera_status", None, caller);
+	//device: a camera of this computer (devices(): name or id) instead of a Camera generator, see device_capture()
+	camera_capture(live_path = None, test = None, wait_ms = None, width = AI_CAPTURE_DEFAULT_WIDTH, caller = "capture", device = None) {
+		g = device ? None : camera(live_path);
+		cam_path = g ? g.get_live_path() : "";
+		status = g ? g.ai_interface.query("get_camera_status", None, caller) : [ok = false];
 		if(status.ok && !status.value.picture) {
 			s = status.value;
 			std.runtime_error("The camera of " + cam_path + " has no picture: " + (s.status ? s.status : "no camera picked") +
@@ -158,10 +181,199 @@ class AICapture {
 		if(wait > 0)
 			std.sleep(wait);
 
-		shot = capture(cam_path, true, width);
+		shot = g ? capture(cam_path, true, width) : device_capture(device, width);
 		shot.merge(result);
 		if(status.ok)
 			shot.camera = status.value;
 		return shot;
+	}
+
+	//The cameras of this computer (nanogui.camera_devices) and the test pattern: [[name, id, format, shown_by], ...];
+	//shown_by: the live_paths of the Camera generators that show it
+	devices() {
+		shown = [];
+		for(c : cameras()) {
+			if(std.is_json(c.status) && c.status.camera_id) {
+				id = c.status.camera_id;
+				if(!shown.has(id))
+					shown[id] = [];
+				shown[id].push_back(c.live_path);
+			}
+		}
+		list = [];
+		found = nanogui.camera_devices();
+		for(i = 0; found && i < found.size(); i++)
+			list.push_back([name = found[i].name, id = found[i].id, format = found[i].format]);
+		list.push_back([name = AI_CAPTURE_TEST_PATTERN, id = AI_CAPTURE_TEST_ID, format = "lavfi"]);
+		for(i = 0; i < list.size(); i++)
+			list[i].shown_by = shown.has(list[i].id) ? shown[list[i].id] : [];
+		return list;
+	}
+
+	//The id of a camera of devices(): by id or name (any case); empty: the only camera of the computer
+	device_id(camera = None) {
+		list = devices();
+		want = std.string(camera ?? "").strip();
+		if(!want) {
+			real = [];
+			for(d : list) {
+				if(d.id != AI_CAPTURE_TEST_ID)
+					real.push_back(d);
+			}
+			if(real.size() == 1)
+				return real[0].id;
+			if(!real.size())
+				std.runtime_error("This computer has no camera" + (nanogui.camera_available() ? "" : " (" + nanogui.camera_error() + ")") +
+					". '" + AI_CAPTURE_TEST_PATTERN + "' is a test picture.");
+		}
+		else {
+			for(d : list) {
+				if(d.id == want)
+					return d.id;
+			}
+			for(d : list) {
+				if(d.name.lowercase() == want.lowercase())
+					return d.id;
+			}
+		}
+		names = [];
+		for(d : list)
+			names.push_back("'" + d.name + "'");
+		std.runtime_error((want ? "No camera '" + want + "'" : "There are several cameras, pass one") + ". The cameras: " +
+			names.combine_string(", ").removesuffix(", ") + " (vibevj_list_cameras, 'devices').");
+		return None;
+	}
+
+	//The name of a camera id (for the answer)
+	device_name(id) {
+		if(id == AI_CAPTURE_TEST_ID)
+			return AI_CAPTURE_TEST_PATTERN;
+		found = nanogui.camera_devices();
+		for(i = 0; found && i < found.size(); i++) {
+			if(found[i].id == id)
+				return found[i].name;
+		}
+		return id;
+	}
+
+	//One picture of a camera of this computer (devices(): name or id, empty: the only one), without a Camera generator.
+	//A Camera generator that shows this camera already is looked through instead (a camera opens once). Returns what
+	//capture() returns plus camera [name, id, live_path or width, height of the device]
+	device_capture(camera = None, width = AI_CAPTURE_DEFAULT_WIDTH) {
+		id = device_id(camera);
+		name = device_name(id);
+		for(c : cameras()) {
+			if(std.is_json(c.status) && c.status.camera_id == id && c.status.picture) {
+				shot = capture(c.live_path, true, width);
+				shot.camera = [name = name, id = id, live_path = c.live_path];
+				return shot;
+			}
+		}
+
+		//One camera at a time (the chat and MCP clients may ask at once)
+		t0 = std.millis();
+		for(grab_busy && std.millis() - t0 < AI_CAPTURE_DEVICE_TIMEOUT_MS)
+			std.sleep(20);
+		if(grab_busy)
+			std.runtime_error("Another camera picture is being taken, try again.");
+		grab_busy = true;
+		grab_error = "";
+		grab_sized = false;
+		grab_release = false;
+		grab_video = None;
+		grab_want = id;
+
+		error = "";
+		shot = None;
+		try {
+			t0 = std.millis();
+			for(!grab_video && !grab_error && std.millis() - t0 < AI_CAPTURE_DEVICE_TIMEOUT_MS)
+				std.sleep(10);
+			if(grab_error)
+				std.runtime_error("The camera '" + name + "' could not be opened: " + grab_error);
+			if(!grab_video)
+				std.runtime_error("The render loop did not open the camera (is a dialog open?).");
+			t0 = std.millis();
+			for(!grab_sized && std.millis() - t0 < AI_CAPTURE_DEVICE_TIMEOUT_MS)
+				std.sleep(20);
+			if(!grab_sized) {
+				why = grab_video.error();
+				std.runtime_error("The camera '" + name + "' gave no picture within " + (AI_CAPTURE_DEVICE_TIMEOUT_MS / 1000) +
+					" s" + (why ? ": " + why : " (busy in another program?)") + ".");
+			}
+			std.sleep(AI_CAPTURE_DEVICE_SETTLE_MS);
+			w = grab_video.width();
+			h = grab_video.height();
+			scale = 1.0;
+			if(width && std.int(width) > 0)
+				scale = math.clamp(std.float(width) / std.float(w), 0.1, 16.0);
+			fileio.mkdir(AI_CAPTURE_DIR);
+			path = AI_CAPTURE_DIR + "/" + std.random_hash(8) + ".png";
+			size = grab_video.capture(path, scale);
+			if(!size)
+				std.runtime_error("The capture of the camera '" + name + "' failed, see the log of VibeVJ.");
+			absolute = path;
+			try {
+				absolute = fileio.absolute_path(path);
+			}
+			catch(e) {}
+			shot = [path = path, absolute_path = absolute, width = size.x, height = size.y, what = "picture of the camera " + name,
+				camera = [name = name, id = id, width = w, height = h]];
+		}
+		catch(e) {
+			error = std.string(e);
+		}
+		//The render thread closes it and clears grab_busy
+		grab_release = true;
+		if(error)
+			std.runtime_error(error);
+		return shot;
+	}
+
+	//Render thread (engine on_frame_finished): opens, sizes and closes the camera of device_capture
+	tick() {
+		if(!grab_busy)
+			return;
+		if(grab_release) {
+			if(grab_video) {
+				grab_video.close();
+				std.free(grab_video);
+			}
+			grab_video = None;
+			grab_want = None;
+			grab_release = false;
+			grab_busy = false;
+			return;
+		}
+		if(grab_want && !grab_video && !grab_error) {
+			if(!engine.screen) {
+				grab_error = "no window";
+				return;
+			}
+			if(!grab_host)
+				grab_host = engine.screen.widget().visible(false).fixed_size(eigen.vec2f(8, 8));
+			v = grab_host.video("");
+			device = grab_want;
+			options = std.json();
+			if(std.string(device).starts("lavfi:")) {
+				options.format = "lavfi";
+				device = std.string(device).substr(6);
+			}
+			if(!v.open_camera(device, options)) {
+				grab_error = v.error() ? v.error() : "open_camera failed";
+				std.free(v);
+				return;
+			}
+			v.play();
+			grab_video = v;
+			return;
+		}
+		//Its widget as big as its picture, so the capture has the pixels of the camera
+		if(grab_video && !grab_sized && grab_video.valid() && grab_video.width() > 0 && grab_video.height() > 0) {
+			sz = eigen.vec2f(grab_video.width(), grab_video.height());
+			grab_video.fixed_size(sz);
+			grab_video.size(sz);
+			grab_sized = true;
+		}
 	}
 }

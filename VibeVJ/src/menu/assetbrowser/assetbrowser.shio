@@ -52,6 +52,10 @@ class assetbrowser
 	managed preview = None; //the preview of a shader the mouse rests on (#536, shader_preview.shio)
 	managed clip_preview = None; //the same for a video, and the length of the videos in their rows (#460, video_preview.shio)
 	menu_tabs = [];         //[path=, name=]: the tab name of every .menu opened so far (#575, open_menu_asset)
+	//Menus that are kept when their tab closes (#975, menu_keep() of the .menu): path -> [mod=, holder=, tab=]. Closed,
+	//their content waits in menu_parking (hidden) and comes back into the next tab, as it was
+	kept_menus = [];
+	managed menu_parking = None;
 	convert_jobs = [];      //[job=, name=, label=, folder=, source=, replace=, stopped=]; folder: a job of the folder queue
 	convert_btn = None;
 	convert_status = None;
@@ -125,7 +129,7 @@ class assetbrowser
 		}
 		if(convert_queue.size() == 0 && convert_queue_stats.total == 0) {
 			convert_note = "Nothing to convert in " + fileio.file_name(dir);
-			convert_note_until = std.millis() + 8000;
+			convert_note_until = std.millis_steady() + 8000;
 		}
 		convert_refresh = 0;
 	}
@@ -139,7 +143,7 @@ class assetbrowser
 			}
 		}
 		convert_note = "Folder conversion stopped";
-		convert_note_until = std.millis() + 8000;
+		convert_note_until = std.millis_steady() + 8000;
 		convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
 		convert_refresh = 0;
 	}
@@ -187,7 +191,7 @@ class assetbrowser
 			convert_note = convert_note + ", " + std.string(st.skipped) + " left out (in the format already or converted before)";
 		if(st.failed)
 			convert_note = convert_note + ", " + std.string(st.failed) + " failed";
-		convert_note_until = std.millis() + 10000;
+		convert_note_until = std.millis_steady() + 10000;
 		convert_queue_stats = [total = 0, done = 0, skipped = 0, failed = 0];
 		if(filebrowser)
 			filebrowser.refresh();
@@ -234,7 +238,7 @@ class assetbrowser
 				if(entry.folder)
 					convert_queue_stats.failed = convert_queue_stats.failed + 1;
 			}
-			convert_note_until = std.millis() + 8000;
+			convert_note_until = std.millis_steady() + 8000;
 		}
 		convert_jobs = running;
 		pump_convert_queue();
@@ -245,7 +249,7 @@ class assetbrowser
 			if(st.total > 1)
 				text = text + " (folder: " + std.string(std.int(math.min(st.done + st.skipped + st.failed + 1, st.total))) + " of " + std.string(st.total) + ")";
 		}
-		else if(convert_note && std.millis() < convert_note_until)
+		else if(convert_note && std.millis_steady() < convert_note_until)
 			text = convert_note;
 		else
 			convert_note = "";
@@ -941,7 +945,7 @@ class assetbrowser
 
 		//Double click: a .menu runs in a new tab, a text file (code, shader, JSON, Markdown, preset) opens in a code tab.
 		//Pictures, videos, sound and the like are not text: they are dragged onto a view instead
-		filebrowser.on_double_click([main_menu](path){
+		filebrowser.on_double_click([this, main_menu](path){
 			ext = fileio.file_ext(path);
 			if(ext == "menu")
 				return this.open_menu_asset(path);
@@ -1026,7 +1030,7 @@ class assetbrowser
 		asset_tab.on_draw([this](){
 			if(this.convert_jobs.size() == 0 && this.convert_queue.size() == 0 && !this.convert_note)
 				return;
-			now = std.millis();
+			now = std.millis_steady();
 			if(now - this.convert_refresh < 250)
 				return;
 			this.convert_refresh = now;
@@ -1124,7 +1128,8 @@ class assetbrowser
 		fixtures_vec = ctrls_panel.collapsable("Fixtures").anchor_left(0).anchor_right(0).content().layout(nanogui.layout_vertical());
 		fixtures = fixtures_menu(engine, fixtures_vec);		
 		//The setup and the editor of the [[fixture|fixtures]] (#575): they were opened by menu files in
-		//assets/Fixtures, which is unpractical. The buttons live here, next to the lamps they set up.
+		//assets/Fixtures, which is unpractical. The buttons live here, next to the lamps they set up; the Tools button at the
+		//right of the top bar opens them as well (#975, tools_menu.shio)
 		fixture_setup_btn = fixtures_vec.button("Fixture setup").icon(nanogui.icon("th"))
 			.tooltip("Where the lamps of the [[project]] are set up: the [[fixture setup]] with the stage plan, the nodes and the universe map\n[[wiki:Output-and-Devices#set-up-your-lamps]]")
 			.anchor_left(0).anchor_right(0).fixed_height(28);
@@ -1187,6 +1192,25 @@ class assetbrowser
 				return true;
 			}
 		}
+		//A kept menu that was closed (#975): its content comes back into a new tab
+		kept = kept_menus[path] ?? None;
+		if(kept) {
+			new_tab = subviews.add_tab(menu_name, true);
+			kept.holder.move_to(new_tab);
+			kept.holder.visible(true);
+			kept.tab = new_tab;
+			watch_kept_tab(path, new_tab);
+			new_tab.refresh_layout();
+			if(kept.mod.has("menu_shown")) {
+				try {
+					kept.mod.call("menu_shown");
+				}
+				catch(e) {
+					std.warn("Menu " + path + ": " + e);
+				}
+			}
+			return true;
+		}
 		//A local, and every tab frees its own module: one member for all of them destroyed the module of the menu
 		//opened before (its tab went empty) as soon as a second one opened
 		mod = std.module();
@@ -1207,17 +1231,89 @@ class assetbrowser
 		}
 		if(!known)
 			menu_tabs.push_back([path = path, name = menu_name]);
+		keep = false;
+		if(mod.has("menu_keep")) {
+			try {
+				keep = mod.call("menu_keep") ? true : false;
+			}
+			catch(e) {}
+		}
 		new_tab = subviews.add_tab(menu_name, true);
+		//A kept menu is built into a holder of its own, which can leave the tab when it closes
+		parent = keep ? new_tab.widget().anchor(0) : new_tab;
 		try {
-			mod.call("entry", new_tab);
+			mod.call("entry", parent);
 		}
 		catch(e) {
 			std.free(mod);
 			return false;
 		}
+		if(keep) {
+			kept_menus[path] = [mod = mod, holder = parent, tab = new_tab];
+			watch_kept_tab(path, new_tab);
+			return true;
+		}
 		new_tab.on_destroy([mod](){
 			std.free(mod);
 		});
 		return true;
+	}
+
+	//The tab of a menu is about to close (generators.close_tab): a kept menu (#975) moves out of it into the hidden
+	//menu_parking first, so its widgets, its module and the controls in it live on. Returns true for a kept menu
+	park_menu_tab(tab) {
+		for(i = 0; i < kept_menus.size(); i++) {
+			kept = kept_menus[i];
+			if(!kept.tab || kept.tab != tab)
+				continue;
+			if(kept.mod.has("menu_hidden")) {
+				try {
+					kept.mod.call("menu_hidden");
+				}
+				catch(e) {
+					std.warn("Menu " + kept_menus.key(i) + ": " + e);
+				}
+			}
+			if(!menu_parking)
+				menu_parking = window.widget().fixed_size(vec2f(8, 8)).visible(false);
+			kept.holder.visible(false);
+			kept.holder.move_to(menu_parking);
+			kept.tab = None;
+			return true;
+		}
+		return false;
+	}
+
+	//A tab of a kept menu that goes without park_menu_tab (the program closes): its content went with it, the module is
+	//freed and the next open builds the menu again
+	watch_kept_tab(path, tab) {
+		tab.on_destroy([this, path, tab](){
+			kept = this.kept_menus[path] ?? None;
+			if(!kept || !kept.tab || kept.tab != tab)
+				return;
+			this.kept_menus.erase(path);
+			std.free(kept.mod);
+		});
+	}
+
+	//Whether the menu of this path has a tab now (the Tools button marks the open ones)
+	menu_open(path) {
+		kept = kept_menus[path] ?? None;
+		if(kept)
+			return kept.tab ? true : false;
+		menu_name = fileio.pure_name(path);
+		for(i = 0; i < menu_tabs.size(); i++) {
+			if(menu_tabs[i].path == path)
+				menu_name = menu_tabs[i].name;
+		}
+		gm = std.global("engine").menu.generators_menu;
+		if(!gm || !gm.subviews)
+			return false;
+		subviews = gm.subviews;
+		for(i = 0; i < subviews.tab_count(); i++) {
+			if(subviews.tab_name(i) == menu_name)
+				return true;
+		}
+		return false;
 	}
 }

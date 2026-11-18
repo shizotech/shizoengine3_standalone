@@ -56,6 +56,10 @@ the task. The binaries in `x64\Release` still come from the build machine; the c
 
 - Keep an issue away from the worker: `auto-skip`. Answer a `needs-info` question in the issue: the next nightly run
   takes it again.
+- A decision on an issue does not finish it. Close the issue only when the decision leaves no work, or the work is
+  done or tracked in another open issue. Otherwise write the decision as a comment and leave the issue open. An agent
+  asked to *list* issues that need a decision only lists them: it does not answer or close them. On 2026-11-04 about
+  25 issues were closed with "Decision recorded" comments, and 12 of them had to be reopened (2026-11-07).
 - Daily view: #630 (open PRs, what each waits for), #625 (what broke or works again).
 - Pause or change a routine: claude.ai/code/routines; a scheduled task: the "Scheduled" section of the desktop app.
 - The prompts of the routines and of the machines' tasks are the source of their behaviour. Copies are kept in the repo

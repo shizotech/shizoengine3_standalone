@@ -1,0 +1,1012 @@
+//The 3D models of the stage (#980): environment and decoration read from STL, OBJ, 3MF and glTF binary (.glb) files.
+//No UI and no module: the bytes come from fileio.read_file (std.buffer), a 3MF archive is read by stage_zip.shio in a
+//module of its own (import zip), so this file also runs in a plain interpreter (_testing/stage_models.shio).
+//
+//A model (what stage_model_read returns):
+//  [ok, error, format ("stl", "obj", "3mf", "glb"), parts = [part, ...], triangles, bounds = [min = [x, y, z], max]]
+//  part = [name, color ([r, g, b] 0..1, or None: the file gives none), v (x, y, z, ... in metres, z up),
+//          t (three vertex indices per triangle; [] = every three vertices are one triangle)]
+//
+//Units and the up axis: 3MF says its unit and is z up; glTF is metres and y up (turned to z up). STL and OBJ say neither:
+//opts.unit (metres per unit of the file, default 0.001: millimetres, as printing and Fusion write them) and opts.up
+//("z" default for STL, "y" default for OBJ) say it.
+//
+//Needs engine/patch/xml.shio and engine/patch/gdtf_mesh.shio included before it (glTF, matrices).
+
+def stage_stl(buf, name, &m);
+def stage_stl_binary(buf, count, name, &m);
+def stage_stl_ascii(text, name, &m);
+def stage_obj(text, path, &m);
+def stage_mtl_colors(text);
+def stage_numbers(s, n);
+def stage_3mf_file(path, &m);
+def stage_3mf(start, files, &m);
+def stage_3mf_path(p);
+def stage_3mf_object(docs, doc_path, id, mat, scale, name, &m, depth);
+def stage_3mf_matrix(text);
+def stage_3mf_mul(a, b);
+def stage_3mf_det(a);
+def stage_3mf_doc(text);
+def stage_3mf_mesh(text, at, end, &obj, doc);
+def stage_tag(text, at);
+def stage_attr(tag, name);
+def stage_attr_int(tag, name, def);
+def stage_hex_color(s);
+def stage_glb(buf, &m);
+def stage_glb_color(j, mesh);
+def stage_model_place(&m, unit, up);
+def stage_step_mesh(path, &m);
+def stage_edge_chains(points, edges);
+def stage_model_finish(&m);
+
+STAGE_MODEL_EXTS = ["stl", "obj", "3mf", "glb", "step", "stp", "ply", "splat"];
+STAGE_MODEL_ZIP_SCRIPT = __DIR__ + "/stage_zip.shio";
+
+//The units a file without one can be in: [label, metres per unit]
+STAGE_UNITS = [["Millimetres", 0.001], ["Centimetres", 0.01], ["Metres", 1.0], ["Inches", 0.0254]];
+
+stage_model_format(path) {
+	ext = fileio.file_ext(path).lowercase();
+	if(ext == "stp")
+		return "step";
+	//#980: a Gaussian splat scan (.ply as the splatting tools write it, .splat): read by nanogui.splats3d (stage.shio)
+	if(ext == "ply" || ext == "splat")
+		return "splat";
+	return STAGE_MODEL_EXTS.has_value(ext) ? ext : "";
+}
+
+//The file the triangles of a STEP file are kept in (stage_step.shio writes it)
+stage_step_mesh_path(path) {
+	return path + ".stagemesh";
+}
+
+//The unit and up axis a file is read with when nothing else is said
+stage_model_defaults(path) {
+	f = stage_model_format(path);
+	return [unit = 0.001, up = f == "obj" ? "y" : "z"];
+}
+
+stage_model_new(format) {
+	//needs_convert: a STEP file without its .stagemesh; stale: the .stagemesh is of another version of the STEP file
+	return [ok = false, error = "", format = format, parts = [], triangles = 0, bounds = None, needs_convert = false,
+		stale = false];
+}
+
+stage_part_new(name, color = None) {
+	return [name = name, color = color, v = [], t = []];
+}
+
+// =========================================================================
+// Reading
+// =========================================================================
+
+//Reads a model file. opts: [unit, up] for STL and OBJ (stage_model_defaults)
+stage_model_read(path, opts = None) {
+	format = stage_model_format(path);
+	m = stage_model_new(format);
+	if(!format) {
+		m.error = fileio.file_name(path) + ": not a model file VibeVJ reads (STL, OBJ, 3MF, GLB, STEP).";
+		return m;
+	}
+	if(!fileio.is_file(path)) {
+		m.error = fileio.file_name(path) + " does not exist.";
+		return m;
+	}
+	d = stage_model_defaults(path);
+	unit = opts && opts.has("unit") && opts.unit ? std.float(opts.unit) : d.unit;
+	up = opts && opts.has("up") && opts.up ? opts.up : d.up;
+	try {
+		if(format == "stl")
+			stage_stl(fileio.read_file(path), fileio.pure_name(path), m);
+		else if(format == "obj")
+			stage_obj(fileio.read_string(path), path, m);
+		else if(format == "3mf")
+			stage_3mf_file(path, m);
+		else if(format == "glb")
+			stage_glb(fileio.read_file(path), m);
+		else if(format == "step")
+			stage_step_mesh(path, m);
+	}
+	catch(e) {
+		m.error = "Cannot read " + fileio.file_name(path) + ": " + e;
+		m.parts = [];
+		return m;
+	}
+	if(m.error)
+		return m;
+	//(3MF and glTF say their unit and axis: they are in metres, z up already; STEP its unit, not always its up axis)
+	if(format == "stl" || format == "obj")
+		stage_model_place(m, unit, up);
+	else if(format == "step" && up == "y")
+		stage_model_place(m, 1.0, up);
+	stage_model_finish(m);
+	if(!m.triangles && !m.error)
+		m.error = fileio.file_name(path) + " has no triangles.";
+	m.ok = m.error == "";
+	return m;
+}
+
+//Scales the vertices by unit and turns y up into z up: (x, y, z) -> (x, -z, y), a rotation (the winding stays)
+stage_model_place(&m, unit, up) {
+	for(p : m.parts) {
+		v = p.v;
+		for(i = 0; i + 2 < v.size(); i += 3) {
+			x = v[i] * unit;
+			y = v[i + 1] * unit;
+			z = v[i + 2] * unit;
+			if(up == "y") {
+				v[i + 1] = 0.0 - z;
+				v[i + 2] = y;
+			}
+			else {
+				v[i + 1] = y;
+				v[i + 2] = z;
+			}
+			v[i] = x;
+		}
+	}
+}
+
+//Drops empty parts, counts the triangles, works out the bounds
+stage_model_finish(&m) {
+	parts = [];
+	count = 0;
+	lo = [x = 1e30, y = 1e30, z = 1e30];
+	hi = [x = -1e30, y = -1e30, z = -1e30];
+	for(p : m.parts) {
+		n = p.t.size() ? p.t.size() / 3 : p.v.size() / 9;
+		if(n < 1)
+			continue;
+		count += n;
+		v = p.v;
+		for(i = 0; i + 2 < v.size(); i += 3) {
+			lo.x = math.min(lo.x, v[i]);
+			lo.y = math.min(lo.y, v[i + 1]);
+			lo.z = math.min(lo.z, v[i + 2]);
+			hi.x = math.max(hi.x, v[i]);
+			hi.y = math.max(hi.y, v[i + 1]);
+			hi.z = math.max(hi.z, v[i + 2]);
+		}
+		parts.push_back(p);
+	}
+	m.parts = parts;
+	m.triangles = count;
+	m.bounds = count ? [min = lo, max = hi] : None;
+}
+
+// =========================================================================
+// STL (binary or ASCII)
+// =========================================================================
+
+stage_stl(buf, name, &m) {
+	size = buf.size();
+	//binary: 80 bytes header, u32 count, 50 bytes per triangle. An ASCII file starts with "solid" (some binary ones
+	//too: the size decides)
+	count = size >= 84 ? buf.read("u32", 20) : 0;
+	if(size >= 84 && 84 + count * 50 == size) {
+		stage_stl_binary(buf, count, name, m);
+		return;
+	}
+	text = buf.string(0, size);
+	if(text.trim().starts("solid")) {
+		stage_stl_ascii(text, name, m);
+		return;
+	}
+	m.error = name + ": not an STL file (neither binary nor ASCII).";
+}
+
+//A triangle starts at 84 + 50 k: every second one is not aligned to 4 bytes for read("f32"); those are read from a copy
+//of the buffer shifted by 2 bytes
+stage_stl_binary(buf, count, name, &m) {
+	shifted = std.buffer();
+	shifted.append(buf.string(2, buf.size() - 2));
+	p = stage_part_new(name);
+	v = p.v;
+	for(k = 0; k < count; k++) {
+		o = 84 + k * 50 + 12; //(the normal first: the faces are flat anyway)
+		b = buf;
+		if(o % 4 != 0) {
+			b = shifted;
+			o -= 2;
+		}
+		i = o / 4;
+		for(c = 0; c < 9; c++)
+			v.push_back(b.read("f32", i + c));
+	}
+	m.parts.push_back(p);
+}
+
+stage_stl_ascii(text, name, &m) {
+	p = stage_part_new(name);
+	v = p.v;
+	pos = 0;
+	for(true) {
+		at = text.find("vertex", pos);
+		if(at < 0)
+			break;
+		end = text.find("\n", at);
+		if(end < 0)
+			end = text.length();
+		nums = text.substr(at + 6, end - at - 6).trim().split(" ");
+		got = 0;
+		for(s : nums) {
+			if(s.trim() == "")
+				continue;
+			v.push_back(std.float(s.trim()));
+			got++;
+		}
+		for(got < 3) {
+			v.push_back(0.0);
+			got++;
+		}
+		pos = end;
+	}
+	m.parts.push_back(p);
+}
+
+// =========================================================================
+// OBJ (with the colours of its .mtl)
+// =========================================================================
+
+stage_obj(text, path, &m) {
+	all = []; //every vertex of the file: x, y, z, ...
+	colors = std.json(); //material name -> [r, g, b]
+	part = stage_part_new(fileio.pure_name(path));
+	m.parts.push_back(part);
+	//(a part per object / group and material: the vertices it uses are copied into it, renumbered)
+	index = std.json(); //file vertex index -> index in the part
+	lines = text.split("\n");
+	for(raw : lines) {
+		line = raw.trim();
+		if(line.length() < 2 || line[0] == "#")
+			continue;
+		if(line.starts("v ")) {
+			xyz = stage_numbers(line.substr(2), 3);
+			all.push_back(xyz[0]);
+			all.push_back(xyz[1]);
+			all.push_back(xyz[2]);
+		}
+		else if(line.starts("f ")) {
+			ids = [];
+			for(word : line.substr(2).split(" ")) {
+				w = word.trim();
+				if(w == "")
+					continue;
+				slash = w.find("/");
+				n = std.int(slash < 0 ? w : w.substr(0, slash));
+				//1-based; negative: from the end
+				n = n < 0 ? all.size() / 3 + n : n - 1;
+				if(n < 0 || n >= all.size() / 3)
+					continue;
+				key = std.string(n);
+				if(!index.has(key)) {
+					index[key] = part.v.size() / 3;
+					part.v.push_back(all[n * 3]);
+					part.v.push_back(all[n * 3 + 1]);
+					part.v.push_back(all[n * 3 + 2]);
+				}
+				ids.push_back(index[key]);
+			}
+			//a polygon as a fan
+			for(i = 1; i + 1 < ids.size(); i++) {
+				part.t.push_back(ids[0]);
+				part.t.push_back(ids[i]);
+				part.t.push_back(ids[i + 1]);
+			}
+		}
+		else if(line.starts("o ") || line.starts("g ")) {
+			name = line.substr(2).trim();
+			if(part.t.size() || part.v.size()) {
+				part = stage_part_new(name, part.color);
+				m.parts.push_back(part);
+				index = std.json();
+			}
+			else
+				part.name = name;
+		}
+		else if(line.starts("usemtl ")) {
+			mat = line.substr(7).trim();
+			c = colors[mat] ?? None;
+			if(part.t.size()) {
+				part = stage_part_new(part.name, c);
+				m.parts.push_back(part);
+				index = std.json();
+			}
+			else
+				part.color = c;
+		}
+		else if(line.starts("mtllib ")) {
+			lib = fileio.file_dir(path) + "/" + line.substr(7).trim();
+			if(fileio.is_file(lib))
+				colors = stage_mtl_colors(fileio.read_string(lib));
+		}
+	}
+}
+
+//The diffuse colour (Kd) of every material of a .mtl file
+stage_mtl_colors(text) {
+	out = std.json();
+	name = "";
+	for(raw : text.split("\n")) {
+		line = raw.trim();
+		if(line.starts("newmtl "))
+			name = line.substr(7).trim();
+		else if(line.starts("Kd ") && name) {
+			c = stage_numbers(line.substr(3), 3);
+			out[name] = [c[0], c[1], c[2]];
+		}
+	}
+	return out;
+}
+
+//The first n numbers of a line (missing ones 0)
+stage_numbers(s, n) {
+	out = [];
+	for(word : s.split(" ")) {
+		w = word.trim();
+		if(w == "")
+			continue;
+		out.push_back(std.float(w));
+		if(out.size() >= n)
+			break;
+	}
+	for(out.size() < n)
+		out.push_back(0.0);
+	return out;
+}
+
+// =========================================================================
+// 3MF (zip + XML, millimetres by default, z up)
+// =========================================================================
+
+//The XML of the model parts of a 3MF archive, through stage_zip.shio (import zip) in a module of its own
+stage_3mf_file(path, &m) {
+	mod = std.module();
+	try {
+		mod.load_file(STAGE_MODEL_ZIP_SCRIPT);
+	}
+	catch(e) {
+		m.error = "3MF needs the zip package (shizotech/packages/zip): " + e;
+		std.free(mod);
+		return;
+	}
+	r = None;
+	try {
+		r = mod.call("stage_zip_3mf", path);
+	}
+	catch(e) {
+		r = [error = "Cannot read " + fileio.file_name(path) + ": " + e];
+	}
+	std.free(mod);
+	if(r.error) {
+		m.error = r.error;
+		return;
+	}
+	stage_3mf(r.start, r.files, m);
+}
+
+//The model of a 3MF package. start: the path of the root model part ("3D/3dmodel.model"), files: path -> XML text of
+//every .model part (the Production extension of Bambu Studio / MakerWorld keeps the meshes in 3D/Objects/*.model)
+stage_3mf(start, files, &m) {
+	docs = std.json(); //path -> [scale, objects = id -> [name, color, v, t, components], materials = id -> [colors]]
+	for(i = 0; i < files.size(); i++)
+		docs[stage_3mf_path(files.key(i))] = stage_3mf_doc(files[i]);
+	root = docs[stage_3mf_path(start)] ?? None;
+	if(!root) {
+		m.error = "The 3MF file has no model part " + start + ".";
+		return;
+	}
+	for(item : root.build) {
+		mat = stage_3mf_matrix(item.transform);
+		stage_3mf_object(docs, stage_3mf_path(start), item.objectid, mat, root.scale, "", m, 0);
+	}
+}
+
+stage_3mf_path(p) {
+	p = std.string(p);
+	return p.starts("/") ? p.substr(1) : p;
+}
+
+//One object into the model (meshes become parts, components are followed with their transform)
+stage_3mf_object(docs, doc_path, id, mat, scale, name, &m, depth) {
+	doc = docs[doc_path] ?? None;
+	if(!doc || depth > 16)
+		return;
+	obj = doc.objects[std.string(id)] ?? None;
+	if(!obj)
+		return;
+	label = obj.name ? obj.name : (name ? name : "Object " + id);
+	if(obj.v.size()) {
+		p = stage_part_new(label, obj.color);
+		v = obj.v;
+		for(i = 0; i + 2 < v.size(); i += 3) {
+			x = v[i];
+			y = v[i + 1];
+			z = v[i + 2];
+			//3MF transforms are rows: p' = p * M (the last row the translation)
+			p.v.push_back((mat[0] * x + mat[3] * y + mat[6] * z + mat[9]) * scale);
+			p.v.push_back((mat[1] * x + mat[4] * y + mat[7] * z + mat[10]) * scale);
+			p.v.push_back((mat[2] * x + mat[5] * y + mat[8] * z + mat[11]) * scale);
+		}
+		if(stage_3mf_det(mat) < 0.0) {
+			for(i = 0; i + 2 < obj.t.size(); i += 3) {
+				p.t.push_back(obj.t[i]);
+				p.t.push_back(obj.t[i + 2]);
+				p.t.push_back(obj.t[i + 1]);
+			}
+		}
+		else
+			p.t = obj.t;
+		m.parts.push_back(p);
+	}
+	for(c : obj.components) {
+		target = c.path ? stage_3mf_path(c.path) : doc_path;
+		stage_3mf_object(docs, target, c.objectid, stage_3mf_mul(stage_3mf_matrix(c.transform), mat), scale, label, m, depth + 1);
+	}
+}
+
+//"m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32" -> 12 numbers; identity when empty
+stage_3mf_matrix(text) {
+	if(!text)
+		return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+	return stage_numbers(text, 12);
+}
+
+//a * b of two 3MF (row) matrices: a first, then b
+stage_3mf_mul(a, b) {
+	out = [];
+	for(r = 0; r < 4; r++) {
+		for(c = 0; c < 3; c++) {
+			s = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+			if(r == 3)
+				s += b[9 + c];
+			out.push_back(s);
+		}
+	}
+	return out;
+}
+
+stage_3mf_det(a) {
+	return a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+}
+
+STAGE_3MF_UNITS = [micron = 0.000001, millimeter = 0.001, centimeter = 0.01, inch = 0.0254, foot = 0.3048, meter = 1.0];
+
+//One .model part: a scan for the elements it needs (a mesh has 100 000s of vertices: no tree of the whole document)
+stage_3mf_doc(text) {
+	doc = [scale = 0.001, objects = std.json(), materials = std.json(), build = []];
+	at = text.find("<model");
+	if(at >= 0) {
+		tag = stage_tag(text, at);
+		u = stage_attr(tag, "unit");
+		if(u && STAGE_3MF_UNITS.has(u))
+			doc.scale = STAGE_3MF_UNITS[u];
+	}
+	//colours: basematerials (displaycolor) and colorgroups (color)
+	for(kind : [["basematerials", "base", "displaycolor"], ["m:colorgroup", "m:color", "color"], ["colorgroup", "color", "color"]]) {
+		pos = 0;
+		for(true) {
+			at = text.find("<" + kind[0], pos);
+			if(at < 0)
+				break;
+			tag = stage_tag(text, at);
+			end = text.find("</" + kind[0], at);
+			if(end < 0)
+				end = text.length();
+			group = [];
+			p = at + tag.length();
+			for(true) {
+				e = text.find("<" + kind[1] + " ", p);
+				if(e < 0 || e > end)
+					break;
+				etag = stage_tag(text, e);
+				group.push_back(stage_hex_color(stage_attr(etag, kind[2])));
+				p = e + etag.length();
+			}
+			doc.materials[stage_attr(tag, "id")] = group;
+			pos = end;
+		}
+	}
+	//objects
+	pos = 0;
+	for(true) {
+		at = text.find("<object", pos);
+		if(at < 0)
+			break;
+		tag = stage_tag(text, at);
+		end = tag.ends("/>") ? at + tag.length() : text.find("</object>", at);
+		if(end < 0)
+			end = text.length();
+		obj = [name = stage_attr(tag, "name"), color = None, v = [], t = [], components = []];
+		pid = stage_attr(tag, "pid");
+		if(pid && doc.materials.has(pid)) {
+			g = doc.materials[pid];
+			pi = stage_attr_int(tag, "pindex", 0);
+			if(pi >= 0 && pi < g.size())
+				obj.color = g[pi];
+		}
+		stage_3mf_mesh(text, at, end, obj, doc);
+		//components (another object, maybe in another part: p:path)
+		p = at;
+		for(true) {
+			c = text.find("<component ", p);
+			if(c < 0 || c > end)
+				break;
+			ctag = stage_tag(text, c);
+			obj.components.push_back([objectid = stage_attr(ctag, "objectid"), transform = stage_attr(ctag, "transform"),
+				path = stage_attr(ctag, "p:path")]);
+			p = c + ctag.length();
+		}
+		doc.objects[stage_attr(tag, "id")] = obj;
+		pos = end;
+	}
+	//build items
+	b = text.find("<build");
+	if(b >= 0) {
+		p = b;
+		for(true) {
+			c = text.find("<item ", p);
+			if(c < 0)
+				break;
+			itag = stage_tag(text, c);
+			doc.build.push_back([objectid = stage_attr(itag, "objectid"), transform = stage_attr(itag, "transform")]);
+			p = c + itag.length();
+		}
+	}
+	return doc;
+}
+
+//The vertices and triangles of the <mesh> of an object between at and end. A triangle with its own colour (pid / p1 of
+//a colour group) colours the object when it has none: one colour per object, the first one met
+stage_3mf_mesh(text, at, end, &obj, doc) {
+	ms = text.find("<mesh", at);
+	if(ms < 0 || ms > end)
+		return;
+	p = ms;
+	for(true) {
+		e = text.find("<vertex ", p);
+		if(e < 0 || e > end)
+			break;
+		close = text.find(">", e);
+		tag = text.substr(e, close - e + 1);
+		obj.v.push_back(std.float(stage_attr(tag, "x")));
+		obj.v.push_back(std.float(stage_attr(tag, "y")));
+		obj.v.push_back(std.float(stage_attr(tag, "z")));
+		p = close;
+	}
+	for(true) {
+		e = text.find("<triangle ", p);
+		if(e < 0 || e > end)
+			break;
+		close = text.find(">", e);
+		tag = text.substr(e, close - e + 1);
+		obj.t.push_back(std.int(stage_attr(tag, "v1")));
+		obj.t.push_back(std.int(stage_attr(tag, "v2")));
+		obj.t.push_back(std.int(stage_attr(tag, "v3")));
+		if(std.is_none(obj.color)) {
+			tp = stage_attr(tag, "pid");
+			if(tp && doc.materials.has(tp)) {
+				g = doc.materials[tp];
+				pi = stage_attr_int(tag, "p1", 0);
+				if(pi >= 0 && pi < g.size())
+					obj.color = g[pi];
+			}
+		}
+		p = close;
+	}
+}
+
+//The text of the tag that starts at `at` ("<object id=... >")
+stage_tag(text, at) {
+	close = text.find(">", at);
+	return close < 0 ? text.substr(at) : text.substr(at, close - at + 1);
+}
+
+//An attribute of a tag text, "" when it has none
+stage_attr(tag, name) {
+	for(q : ["\"", "'"]) {
+		k = tag.find(" " + name + "=" + q);
+		if(k < 0)
+			k = tag.find("\t" + name + "=" + q);
+		if(k < 0)
+			k = tag.find("\n" + name + "=" + q);
+		if(k < 0)
+			continue;
+		s = k + name.length() + 3;
+		e = tag.find(q, s);
+		return e < 0 ? "" : tag.substr(s, e - s);
+	}
+	return "";
+}
+
+//An integer attribute, def when the tag has none
+stage_attr_int(tag, name, def) {
+	a = stage_attr(tag, name);
+	return a == "" ? def : std.int(a);
+}
+
+STAGE_HEX = "0123456789abcdef";
+
+//"#RRGGBB" or "#RRGGBBAA" -> [r, g, b] 0..1, None when it is not one
+stage_hex_color(s) {
+	s = std.string(s).trim().lowercase();
+	if(!s.starts("#") || s.length() < 7)
+		return None;
+	out = [];
+	for(i = 0; i < 3; i++) {
+		hi = STAGE_HEX.find(s.substr(1 + i * 2, 1));
+		lo = STAGE_HEX.find(s.substr(2 + i * 2, 1));
+		if(hi < 0 || lo < 0)
+			return None;
+		out.push_back((hi * 16 + lo) / 255.0);
+	}
+	return out;
+}
+
+// =========================================================================
+// glTF binary (.glb): one part per node with a mesh, metres, y up -> z up
+// =========================================================================
+
+stage_glb(buf, &m) {
+	if(buf.size() < 28 || buf.read("u32", 0) != 0x46546C67) {
+		m.error = "Not a glTF binary file (.glb).";
+		return;
+	}
+	json_len = buf.read("u32", 3);
+	j = std.json(buf.string(20, json_len));
+	bin = 20 + json_len + 8;
+	scene = j.has("scenes") && j.scenes.size() ? j.scenes[j.has("scene") ? j.scene : 0] : None;
+	roots = [];
+	if(scene && scene.has("nodes"))
+		roots = scene.nodes;
+	else if(j.has("nodes")) {
+		for(i = 0; i < j.nodes.size(); i++)
+			roots.push_back(i);
+	}
+	stack = [];
+	for(r : roots)
+		stack.push_back([node = r, m = gdtf_mat_identity(), depth = 0]);
+	for(stack.size()) {
+		e = stack[-1];
+		stack.pop_back();
+		if(e.depth > 32 || e.node >= j.nodes.size())
+			continue;
+		n = j.nodes[e.node];
+		mat = gdtf_mat_mul(e.m, gdtf_mat_node(n));
+		if(n.has("mesh") && j.has("meshes") && n.mesh < j.meshes.size()) {
+			mesh = j.meshes[n.mesh];
+			name = n.has("name") ? n.name : (mesh.has("name") ? mesh.name : "Mesh " + n.mesh);
+			part = stage_part_new(name, stage_glb_color(j, mesh));
+			out = [v = [], t = []];
+			gdtf_glb_mesh(buf, j, bin, mesh, mat, out);
+			part.v = out.v;
+			part.t = out.t;
+			m.parts.push_back(part);
+		}
+		if(n.has("children")) {
+			for(c : n.children)
+				stack.push_back([node = c, m = mat, depth = e.depth + 1]);
+		}
+	}
+	for(p : m.parts) {
+		v = p.v;
+		for(i = 0; i + 2 < v.size(); i += 3) {
+			y = v[i + 1];
+			v[i + 1] = 0.0 - v[i + 2];
+			v[i + 2] = y;
+		}
+	}
+}
+
+//The base colour of the material of the first primitive (linear in glTF, as the 3D view takes it)
+stage_glb_color(j, mesh) {
+	if(!mesh.has("primitives") || !mesh.primitives.size() || !mesh.primitives[0].has("material") || !j.has("materials"))
+		return None;
+	mi = mesh.primitives[0].material;
+	if(mi >= j.materials.size())
+		return None;
+	mat = j.materials[mi];
+	if(mat.has("pbrMetallicRoughness") && mat.pbrMetallicRoughness.has("baseColorFactor")) {
+		c = mat.pbrMetallicRoughness.baseColorFactor;
+		return [c[0], c[1], c[2]];
+	}
+	return None;
+}
+
+// =========================================================================
+// STEP: the .stagemesh the converter wrote next to it (engine/stage/stage_step.shio)
+// =========================================================================
+
+stage_step_mesh(path, &m) {
+	side = stage_step_mesh_path(path);
+	if(!fileio.is_file(side)) {
+		m.needs_convert = true;
+		m.error = fileio.file_name(path) + " is not converted yet: a STEP file is converted once (Convert in the Stage menu).";
+		return;
+	}
+	d = fileio.read_json(side);
+	if(std.type(d) != "json" || !d.has("parts") || (d.format ?? "") != "vibevj-stagemesh") {
+		m.needs_convert = true;
+		m.error = fileio.file_name(side) + " is not a converted STEP file: convert it again.";
+		return;
+	}
+	for(p : d.parts) {
+		c = p.color ?? None;
+		color = std.is_none(c) || std.type(c) != "json" || c.size() < 3 ? None : [c[0], c[1], c[2]];
+		part = stage_part_new(p.name ?? "Body", color);
+		part.v = p.v;
+		part.t = p.t;
+		m.parts.push_back(part);
+	}
+	//another version of the STEP file than the one converted: shown as it was, Convert makes it new
+	m.stale = std.string(fileio.hash(path)) != std.string(d.hash ?? "");
+}
+
+// =========================================================================
+// Edges for LEDs (#980): where faces meet at a sharp angle, or where a mesh ends, joined into chains
+// =========================================================================
+
+STAGE_EDGE_ANGLE = 30.0; //degrees between two faces from which their common edge counts
+STAGE_EDGE_WELD = 0.0001; //metres: vertices this close are one (an STL has every corner three times)
+
+//The edges of a model: [[part (index), closed (a loop), points = [x, y, z, ...] in the frame of the model], ...]
+stage_model_edges(m, angle = STAGE_EDGE_ANGLE) {
+	out = [];
+	limit = math.cos(angle * math.PI / 180.0);
+	for(pi = 0; pi < m.parts.size(); pi++) {
+		part = m.parts[pi];
+		v = part.v;
+		t = part.t;
+		if(!t.size()) {
+			t = [];
+			for(i = 0; i < v.size() / 3; i++)
+				t.push_back(i);
+		}
+		//welded vertices: a key per position
+		ids = std.json();
+		pos = []; //welded id -> [x, y, z]
+		map = []; //vertex -> welded id
+		for(i = 0; i + 2 < v.size(); i += 3) {
+			k = std.string(math.round(v[i] / STAGE_EDGE_WELD)) + "," + std.string(math.round(v[i + 1] / STAGE_EDGE_WELD)) + "," +
+				std.string(math.round(v[i + 2] / STAGE_EDGE_WELD));
+			if(!ids.has(k)) {
+				ids[k] = pos.size();
+				pos.push_back([v[i], v[i + 1], v[i + 2]]);
+			}
+			map.push_back(ids[k]);
+		}
+		//each edge (a, b with a < b) and the normals of its faces
+		faces = std.json(); //"a:b" -> [a, b, normals = [[x, y, z], ...]]
+		for(i = 0; i + 2 < t.size(); i += 3) {
+			a = map[t[i]];
+			b = map[t[i + 1]];
+			c = map[t[i + 2]];
+			if(a == b || b == c || a == c)
+				continue;
+			pa = pos[a];
+			pb = pos[b];
+			pc = pos[c];
+			ux = pb[0] - pa[0];
+			uy = pb[1] - pa[1];
+			uz = pb[2] - pa[2];
+			wx = pc[0] - pa[0];
+			wy = pc[1] - pa[1];
+			wz = pc[2] - pa[2];
+			nx = uy * wz - uz * wy;
+			ny = uz * wx - ux * wz;
+			nz = ux * wy - uy * wx;
+			l = math.sqrt(nx * nx + ny * ny + nz * nz);
+			if(l <= 0.0)
+				continue;
+			n = [nx / l, ny / l, nz / l];
+			for(e : [[a, b], [b, c], [c, a]]) {
+				lo = math.min(e[0], e[1]);
+				hi = math.max(e[0], e[1]);
+				k = lo + ":" + hi;
+				if(!faces.has(k))
+					faces[k] = [a = lo, b = hi, normals = []];
+				faces[k].normals.push_back(n);
+			}
+		}
+		edges = [];
+		for(i = 0; i < faces.size(); i++) {
+			f = faces[i];
+			ns = f.normals;
+			sharp = ns.size() != 2;
+			if(!sharp) {
+				d = ns[0][0] * ns[1][0] + ns[0][1] * ns[1][1] + ns[0][2] * ns[1][2];
+				sharp = d < limit;
+			}
+			if(sharp)
+				edges.push_back([f.a, f.b]);
+		}
+		for(ch : stage_edge_chains(pos, edges)) {
+			ch.part = pi;
+			out.push_back(ch);
+		}
+	}
+	return out;
+}
+
+//Edges (pairs of point ids) joined into chains: a chain runs from a point where it does not go on as one line (an
+//end, a corner of three edges) to the next one; a ring without such points is one closed chain
+stage_edge_chains(points, edges) {
+	adj = std.json(); //point id -> [edge indices]
+	for(i = 0; i < edges.size(); i++) {
+		for(p : edges[i]) {
+			k = std.string(p);
+			if(!adj.has(k))
+				adj[k] = [];
+			adj[k].push_back(i);
+		}
+	}
+	used = std.json();
+	chains = [];
+	walk = [](start, first, adj, edges, used) {
+		ids = [start];
+		cur = start;
+		e = first;
+		for(true) {
+			used[std.string(e)] = true;
+			ed = edges[e];
+			nxt = ed[0] == cur ? ed[1] : ed[0];
+			ids.push_back(nxt);
+			cur = nxt;
+			around = adj[std.string(cur)];
+			if(around.size() != 2)
+				break;
+			e2 = around[0] == e ? around[1] : around[0];
+			if(used.has(std.string(e2)))
+				break;
+			e = e2;
+		}
+		return ids;
+	};
+	//from every end or corner first, then the rings that are left
+	for(pass = 0; pass < 2; pass++) {
+		for(i = 0; i < adj.size(); i++) {
+			pid = std.int(adj.key(i));
+			around = adj[i];
+			if(pass == 0 && around.size() == 2)
+				continue;
+			for(e : around) {
+				if(used.has(std.string(e)))
+					continue;
+				ids = walk(pid, e, adj, edges, used);
+				pts = [];
+				for(id : ids) {
+					pts.push_back(points[id][0]);
+					pts.push_back(points[id][1]);
+					pts.push_back(points[id][2]);
+				}
+				chains.push_back([part = 0, closed = ids[0] == ids[-1], points = pts]);
+			}
+		}
+	}
+	return chains;
+}
+
+//The length of a polyline (x, y, z, ...)
+stage_path_length(pts) {
+	l = 0.0;
+	for(i = 3; i + 2 < pts.size(); i += 3) {
+		dx = pts[i] - pts[i - 3];
+		dy = pts[i + 1] - pts[i - 2];
+		dz = pts[i + 2] - pts[i - 1];
+		l += math.sqrt(dx * dx + dy * dy + dz * dz);
+	}
+	return l;
+}
+
+//The point at fraction f (0..1) of the length of a polyline: [x, y, z]
+stage_path_point(pts, f, total = -1.0) {
+	if(pts.size() < 3)
+		return [x = 0.0, y = 0.0, z = 0.0];
+	if(total < 0.0)
+		total = stage_path_length(pts);
+	want = math.clamp(f, 0.0, 1.0) * total;
+	run = 0.0;
+	for(i = 3; i + 2 < pts.size(); i += 3) {
+		dx = pts[i] - pts[i - 3];
+		dy = pts[i + 1] - pts[i - 2];
+		dz = pts[i + 2] - pts[i - 1];
+		l = math.sqrt(dx * dx + dy * dy + dz * dz);
+		if(run + l >= want && l > 0.0) {
+			k = (want - run) / l;
+			return [x = pts[i - 3] + dx * k, y = pts[i - 2] + dy * k, z = pts[i - 1] + dz * k];
+		}
+		run += l;
+	}
+	return [x = pts[pts.size() - 3], y = pts[pts.size() - 2], z = pts[pts.size() - 1]];
+}
+
+//An outline from chain index on (#980, a click on an edge in the Stage menu): at each corner it goes on with the chain
+//that turns the least and keeps to the plane it runs in (a side of a hexagon -> the next side, not the edge down the
+//frame), both ways, until it is back where it started. [closed, points = [x, y, z, ...]]
+stage_edge_loop(chains, index) {
+	same = [](a, b) {
+		return math.abs(a[0] - b[0]) < 1e-6 && math.abs(a[1] - b[1]) < 1e-6 && math.abs(a[2] - b[2]) < 1e-6;
+	};
+	pt = [](c, k) {
+		return [c.points[k * 3], c.points[k * 3 + 1], c.points[k * 3 + 2]];
+	};
+	norm = [](d) {
+		l = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+		return l > 0.0 ? [d[0] / l, d[1] / l, d[2] / l] : [0.0, 0.0, 0.0];
+	};
+	used = std.json();
+	used[std.string(index)] = true;
+	first = chains[index];
+	path = []; //points as [x, y, z]
+	for(k = 0; k < first.points.size() / 3; k++)
+		path.push_back(pt(first, k));
+	if(first.closed)
+		return [closed = true, points = first.points];
+	closed = false;
+	for(side = 0; side < 2 && !closed; side++) {
+		for(guard = 0; guard < chains.size(); guard++) {
+			n = path.size();
+			end = path[n - 1];
+			dir = norm([end[0] - path[n - 2][0], end[1] - path[n - 2][1], end[2] - path[n - 2][2]]);
+			//the plane it runs in: from its last turn, if it has one
+			plane = None;
+			for(k = n - 2; k >= 1 && !plane; k--) {
+				a = norm([path[k][0] - path[k - 1][0], path[k][1] - path[k - 1][1], path[k][2] - path[k - 1][2]]);
+				c = [a[1] * dir[2] - a[2] * dir[1], a[2] * dir[0] - a[0] * dir[2], a[0] * dir[1] - a[1] * dir[0]];
+				if(c[0] * c[0] + c[1] * c[1] + c[2] * c[2] > 1e-6)
+					plane = norm(c);
+			}
+			best = -1;
+			best_dot = -2.0;
+			best_rev = false;
+			for(j = 0; j < chains.size(); j++) {
+				if(used.has(std.string(j)) || chains[j].closed || chains[j].part != first.part)
+					continue;
+				ch = chains[j];
+				m = ch.points.size() / 3;
+				rev = false;
+				if(same(pt(ch, 0), end))
+					rev = false;
+				else if(same(pt(ch, m - 1), end))
+					rev = true;
+				else
+					continue;
+				nxt = rev ? pt(ch, m - 2) : pt(ch, 1);
+				d = norm([nxt[0] - end[0], nxt[1] - end[1], nxt[2] - end[2]]);
+				if(plane && math.abs(d[0] * plane[0] + d[1] * plane[1] + d[2] * plane[2]) > 0.05)
+					continue; //leaves the plane
+				dot = d[0] * dir[0] + d[1] * dir[1] + d[2] * dir[2];
+				if(dot > best_dot) {
+					best_dot = dot;
+					best = j;
+					best_rev = rev;
+				}
+			}
+			if(best < 0)
+				break;
+			used[std.string(best)] = true;
+			ch = chains[best];
+			m = ch.points.size() / 3;
+			for(k = 1; k < m; k++)
+				path.push_back(pt(ch, best_rev ? m - 1 - k : k));
+			if(same(path[path.size() - 1], path[0])) {
+				closed = true;
+				break;
+			}
+		}
+		if(!closed) {
+			//the other way: turn the path around
+			back = [];
+			for(k = path.size() - 1; k >= 0; k--)
+				back.push_back(path[k]);
+			path = back;
+		}
+	}
+	out = [];
+	for(p : path) {
+		out.push_back(p[0]);
+		out.push_back(p[1]);
+		out.push_back(p[2]);
+	}
+	return [closed = closed, points = out];
+}

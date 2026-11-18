@@ -1,0 +1,129 @@
+//STEP files on the stage (#980): converted once into a .stagemesh next to the STEP file, which stage_models.shio reads
+//like any other model. The conversion is OpenCASCADE (cadquery-ocp) in Python: step_import.py/src/__init__.py, run by
+//the Python server (engine/python/python_server.shio) in an environment uv makes the first time
+//(engine/python/py_env.shio, step_import.py/asset.json: about 170 MB to download, 1.2 GB on disk, shared by every
+//project). A machine that has the .stagemesh (it travels with the STEP file) shows the model without that environment.
+//
+//  stage_step_env_ready()            the environment is built (no question, no download)
+//  stage_step_convert(path, tol)     starts a job on a thread (or returns the one that runs); tol in millimetres
+//  stage_step_job(path)              [path, state, status, progress, error, result]; state: "env" (the environment
+//                                    is made: status / progress of uv), "converting", "done", "error"
+//
+//Everything that waits (uv, the hash of the file, the Python call) runs on the thread: the UI only reads the job, so
+//no fileio call ends up in a draw callback (#980, see stage.shio).
+
+#include "../python/py_env"
+#include "../python/python_server"
+
+def stage_step_run(&job);
+def stage_step_fail(&job, error, detail);
+
+STAGE_STEP_SCRIPT = __DIR__ + "/step_import.py/src/__init__.py";
+STAGE_STEP_TOLERANCES = [["Coarse (1 mm)", 1.0], ["Normal (0.3 mm)", 0.3], ["Fine (0.1 mm)", 0.1]];
+STAGE_STEP_DEFAULT_TOLERANCE = 0.3;
+STAGE_STEP_SIZE = "about 170 MB to download once, 1.2 GB on disk";
+STAGE_STEP_TIMEOUT = 900000; //ms a conversion may take (a big assembly)
+
+stage_step_jobs() {
+	g = std.global("stage_step_jobs");
+	jobs = g.get();
+	if(std.is_none(jobs)) {
+		g.set(std.json());
+		jobs = g.get();
+	}
+	return jobs;
+}
+
+stage_step_job(path) {
+	return stage_step_jobs()[path] ?? None;
+}
+
+//Whether a job runs (any file)
+stage_step_busy() {
+	jobs = stage_step_jobs();
+	for(i = 0; i < jobs.size(); i++) {
+		s = jobs[i].state;
+		if(s == "env" || s == "converting")
+			return true;
+	}
+	return false;
+}
+
+//The environment of the converter is there (or configs/python.json names a Python for everything): converting starts
+//without a download. Asks the file system: not while drawing
+stage_step_env_ready() {
+	cfg = pyenv_config();
+	if(cfg.has("python") && cfg["python"])
+		return true;
+	spec = pyenv_spec(STAGE_STEP_SCRIPT);
+	py = spec.python ? spec.python : PYENV_DEFAULT_PYTHON;
+	return pyenv_ready(pyenv_cache_root(cfg), pyenv_key(py, spec.dependencies)) ? true : false;
+}
+
+stage_step_convert(path, tolerance = STAGE_STEP_DEFAULT_TOLERANCE) {
+	jobs = stage_step_jobs();
+	old = jobs[path] ?? None;
+	if(old && (old.state == "env" || old.state == "converting"))
+		return old;
+	jobs[path] = [path = path, state = "env", status = "Preparing OpenCASCADE", progress = "", error = "", detail = "",
+		result = None, tolerance = tolerance];
+	job = jobs[path];
+	worker = std.thread([job]() {
+		stage_step_run(job);
+	});
+	worker.run();
+	return job;
+}
+
+stage_step_fail(&job, error, detail = "") {
+	job.error = error;
+	job.detail = detail;
+	job.state = "error";
+}
+
+stage_step_run(&job) {
+	try {
+		e = pyenv_for_script(STAGE_STEP_SCRIPT);
+		for(e.state == "building") {
+			pyenv_poll(e);
+			job.status = e.status_text;
+			job.progress = e.progress;
+			std.sleep(200);
+		}
+		if(e.state == "error" || e.state == "fallback") {
+			msg = e.error ? e.error : "uv could not make the environment";
+			pyenv_forget(e);
+			stage_step_fail(job, "OpenCASCADE could not be installed: " + msg, e.detail);
+			return;
+		}
+		python = e.python;
+		job.state = "converting";
+		job.status = "Converting " + fileio.file_name(job.path);
+		job.progress = "";
+		src = fileio.absolute_path(job.path);
+		file_hash = std.string(fileio.hash(job.path));
+		server = PythonServer(STAGE_STEP_SCRIPT, [python = python, timeout = STAGE_STEP_TIMEOUT, start_timeout = 120000]);
+		if(!server.start()) {
+			stage_step_fail(job, "The converter did not start: " + server.last_error());
+			server.stop();
+			return;
+		}
+		r = server.call("convert", [src, src + ".stagemesh", file_hash, job.tolerance], None, [timeout = STAGE_STEP_TIMEOUT]);
+		server.stop();
+		if(!r.ok) {
+			stage_step_fail(job, r.error ? r.error : r.kind, r.traceback ?? "");
+			return;
+		}
+		job.result = r.result;
+		//(the .stagemesh is new: every model is read again, the views build them again)
+		stage_models_refresh();
+		eng = std.global("engine").get();
+		if(!std.is_none(eng) && eng)
+			eng.stage_changed();
+		job.status = "";
+		job.state = "done";
+	}
+	catch(err) {
+		stage_step_fail(job, "The conversion failed: " + err);
+	}
+}

@@ -34,6 +34,8 @@
   };
 
   const $ = (id) => document.getElementById(id);
+  // ?workspace=<id>: the workspace; ?node=<id>: another node of the network (NodeApi puts
+  // the node prefix in front of every call, see components/nodeapi.js)
   const workspaceId = new URLSearchParams(window.location.search).get('workspace');
   const apiBase = workspaceId ? '/api/workspaces/' + encodeURIComponent(workspaceId) + '/architecture' : '/api/architecture';
   const api = (path = '') => apiBase + path;

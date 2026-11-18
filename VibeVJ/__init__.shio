@@ -6,6 +6,12 @@
 #include "engine/patch/dmx"
 #include "engine/patch/patch_ai"
 #include "engine/patch/desk_runtime"
+#include "engine/stage/stage"
+//#980: the splats of a scan on the stage are read by nanogui.splats3d (engine/stage/stage.shio stays without the module)
+std.global("stage_splat_loader").set([]() { return nanogui.splats3d(); });
+#include "engine/stage/stage_step"
+#include "engine/stage/stage_ai"
+#include "engine/stage/stage_leds"
 #include "engine/interfaces/ai_capture"
 #include "engine/blackout"
 #include "src/menu/menu"
@@ -46,6 +52,15 @@ class shizoengine
 	patch_revision = 0;
 	//A change of the patch from another thread (an AI query): patch_changed() runs at the end of the frame
 	patch_change_pending = false;
+	//The stage (#980, engine/stage/stage.shio): the 3D models of the room, the set and the decoration. Pure data, saved
+	//as stage.json; stage_revision goes up with every change (stage_changed), the 3D views follow it
+	managed stage = stage_new();
+	stage_revision = 0;
+	//The LEDs of the LEDMappers on the stage (engine/stage/stage_leds.shio): LEDMapper id -> its groups with a place
+	stage_leds = [];
+	stage_leds_revision = 0;
+	//The stage for AI agents: queries of the live_path "stage" (engine/stage/stage_ai.shio)
+	managed stage_ai = None;
 	//What else sends DMX (the LEDMappers), to find channels written twice (engine/patch/dmx.shio)
 	dmx_users = [];
 	dmx_revision = 0;
@@ -83,17 +98,18 @@ class shizoengine
 
 	//Autosave (AUTOSAVE_DIR): minutes between two autosaves, 0 is off (Settings > Project, kept in the style file)
 	autosave_minutes = AUTOSAVE_DEFAULT;
-	autosave_last = 0;      //std.millis() of the last save, autosave or load
+	autosave_last = 0;      //std.millis_steady() of the last save, autosave or load
 	autosave_ready = false; //only after the start up asked about an old autosave: before, it must not be overwritten
 
 	__init__() {
-		autosave_last = std.millis();
+		autosave_last = std.millis_steady();
 	
 		engine_global = std.global("engine");
 		engine_global.set(this);
 
 		//In engine.ai_interfaces from the start: the Chat and the MCP server can change the fixture setup
 		patch_ai = patch_ai_create(this);
+		stage_ai = stage_ai_create(this);
 		desk = desk_runtime(this);
 		ai_capture = AICapture(this);
 	
@@ -304,6 +320,10 @@ class shizoengine
 			if(this.env.debug_input)
 				this.env.debug_input.tick();
 
+			//A camera an AI agent looks through without a Camera generator (vibevj_camera_capture 'camera', #924)
+			if(this.ai_capture)
+				this.ai_capture.tick();
+
 			//A project load / save of the MCP server (vibevj_load_project, vibevj_save_project, #634)
 			if(this.env.mcp_render_step)
 				vibevj_mcp_project_tick(this);
@@ -383,7 +403,7 @@ class shizoengine
 		//An autosave that is still there: VibeVJ did not close properly last time. Restore it, or the last project
 		if(!restore_autosave() && fileio.exists("engine/last_project.dat"))
 			load_project(fileio.read_string("engine/last_project.dat"));
-		autosave_last = std.millis();
+		autosave_last = std.millis_steady();
 		autosave_ready = true;
 	}
 	
@@ -437,7 +457,7 @@ class shizoengine
 		//The project on disk is up to date: the autosave is not needed any more
 		if(written) {
 			autosave_remove();
-			autosave_last = std.millis();
+			autosave_last = std.millis_steady();
 		}
 		else
 			std.error("The project " + project_env.name + " was not saved completely, the autosave is kept");
@@ -450,25 +470,31 @@ class shizoengine
 	//Writes every file of the open project into dir: the patch, one file per save hook, the controls and the format.
 	//Save writes into projects/<name>, the autosave into AUTOSAVE_DIR. Every file is written atomically (<file>.tmp, then
 	//renamed): a crash while saving keeps the file of the last save instead of a truncated one, which loaded as an
-	//empty project. Returns false when a file could not be written.
+	//empty project. The files are written compact (#200): nobody edits them by hand, and controls.json pretty-printed was
+	//mostly indentation. Returns false when a file could not be written.
 	write_project(dir) {
 		all_written = true;
-		if(patch && !fileio.write_json(dir + "/fixture_setup.json", patch, false, true))
+		if(patch && !fileio.write_json(dir + "/fixture_setup.json", patch, true, true))
+			all_written = false;
+		//(a project without a stage gets no file; one that had one writes the empty stage)
+		if(stage && (stage.objects.size() || fileio.exists(dir + "/stage.json")) && !fileio.write_json(dir + "/stage.json", stage, true, true))
 			all_written = false;
 
 		for(i = 0; i < save_hooks.size(); i++) {
 			hook_name = save_hooks.key(i);
 			try {
 				hook_data = save_hooks[i]();
-				if(!fileio.write_json(dir + "/" + hook_name + ".json", hook_data, false, true))
+				if(!fileio.write_json(dir + "/" + hook_name + ".json", hook_data, true, true))
 					all_written = false;
 			}
 			catch(e) {
+				//Its file was not written: the save is not complete (the autosave stays, an autosave is not swapped in)
 				std.error("Cannot run save hook: " + save_hooks.key(i) + ": " + e);
+				all_written = false;
 			}
 		}
 
-		if(!fileio.write_json(dir + "/controls.json", nanogui.serialize_controls(), false, true))
+		if(!fileio.write_json(dir + "/controls.json", nanogui.serialize_controls(), true, true))
 			all_written = false;
 		write_project_format(dir);
 		return all_written;
@@ -486,30 +512,30 @@ class shizoengine
 		//Not in show mode: the show is built, it is only played, and a save there could make a frame late. The time
 		//starts again, so the first autosave comes a full interval after leaving show mode
 		if(nanogui.show_mode()) {
-			autosave_last = std.millis();
+			autosave_last = std.millis_steady();
 			return;
 		}
-		if(std.millis() - autosave_last < autosave_minutes * 60000)
+		if(std.millis_steady() - autosave_last < autosave_minutes * 60000)
 			return;
 		autosave_now();
 	}
 
 	autosave_now() {
-		autosave_last = std.millis();
+		autosave_last = std.millis_steady();
 		if(save_in_progress || load_in_progress)
 			return false;
 		save_in_progress = true;
 		ok = false;
 		next = AUTOSAVE_DIR + "_next";
 		try {
-			started = std.millis();
+			started = std.millis_steady();
 			remove_if_exists(next);
 			if(!write_project(next))	//an incomplete autosave never takes the place of the last complete one
 				std.runtime_error("a file of the project could not be written");
-			fileio.write_json(next + "/autosave.json", [name = std.global("project").name ?? "", time = std.date("%Y-%m-%d %H:%M")]);
+			fileio.write_json(next + "/autosave.json", [name = std.global("project").name ?? "", time = std.date("%Y-%m-%d %H:%M")], true);
 			remove_if_exists(AUTOSAVE_DIR);
 			ok = fileio.rename(next, AUTOSAVE_DIR) ? true : false;
-			env.last_autosave_ms = std.millis() - started;
+			env.last_autosave_ms = std.millis_steady() - started;
 			std.print("Autosave took ", env.last_autosave_ms, " ms");
 		}
 		catch(e) {
@@ -530,6 +556,16 @@ class shizoengine
 	//Start up: an autosave that is still there is offered. true when it was loaded
 	restore_autosave() {
 		info_file = AUTOSAVE_DIR + "/autosave.json";
+		//VibeVJ ended between "remove the old autosave" and "rename the new one" of autosave_now(): the new one is
+		//complete (autosave.json is written last) and is the only one left. It takes its place now
+		next = AUTOSAVE_DIR + "_next";
+		if(!fileio.exists(info_file) && fileio.exists(next + "/autosave.json")) {
+			try {
+				remove_if_exists(AUTOSAVE_DIR);
+				fileio.rename(next, AUTOSAVE_DIR);
+			}
+			catch(e) {}
+		}
 		if(!fileio.exists(info_file))
 			return false;
 		info = [];
@@ -550,8 +586,10 @@ class shizoengine
 			autosave_remove();
 			return false;
 		}
-		//It stays until the next save: VibeVJ can stop again before that
-		return load_project(name, "projects", AUTOSAVE_DIR);
+		//It stays until the next save: VibeVJ can stop again before that.
+		//true also when not all of it could be loaded: the last project is not loaded on top of it
+		load_project(name, "projects", AUTOSAVE_DIR);
+		return true;
 	}
 	
 	//The interface size that suits the monitor the window of VibeVJ is on, until one is chosen in Settings > Appearance.
@@ -674,6 +712,7 @@ class shizoengine
 	//Save asks for one, so the template itself is never overwritten
 	//from_dir: read the files from this folder instead (the autosave), the project is called name ("": no name)
 	load_project(name, folder = "projects", from_dir = None) {
+		env.last_load_error = None;
 		if(save_in_progress || load_in_progress)
 			return false;
 
@@ -728,10 +767,14 @@ class shizoengine
 		
 		load_in_progress = true;
 		
-		load_timer = std.millis();
+		load_timer = std.millis_steady();
 		if(blackout)
 			blackout.loading = true;
 		
+		//What went wrong while loading, None when all of it came in. A project that was not loaded completely loses its
+		//name below, so that Save, Quit and the autosave do not write the half-loaded state over the files on disk
+		load_error = None;
+		//The patch on its own: an error in it does not keep the views, the timeline and the controls from loading
 		try {
 			//A project without lamps starts with an empty patch, not with the lamps of the project before
 			if(fileio.exists(project_dir + "/fixture_setup.json"))
@@ -739,7 +782,26 @@ class shizoengine
 			else
 				patch = patch_new();
 			patch_changed();
-			
+		}
+		catch(e) {
+			load_error = "the fixture setup: " + e;
+			std.error("Cannot load the fixture setup of " + name + ": " + e);
+		}
+
+		//The stage (#980) on its own as well: a project without one starts with an empty stage
+		try {
+			if(fileio.exists(project_dir + "/stage.json"))
+				stage = stage_normalize(migrate_project_file("stage", fileio.read_json(project_dir + "/stage.json"), format));
+			else
+				stage = stage_new();
+			stage_changed();
+		}
+		catch(e) {
+			load_error = "the stage: " + e;
+			std.error("Cannot load the stage of " + name + ": " + e);
+		}
+
+		try {
 			managed load_threads = [];
 			
 			for(i = 0; i < load_hooks.size(); i++) {
@@ -775,16 +837,19 @@ class shizoengine
 				this.scale_widget.scale(ui_settings.filebrowser_scale);
 			*/
 		}
-		catch(e) {}
+		catch(e) {
+			load_error = load_error ?? std.string(e);
+			std.error("Cannot load the project " + name + ": " + e);
+		}
 		
 		//The Blackout button was saved with the project: the outputs stay as they were before the load
 		if(blackout) {
 			blackout.loading = false;
 			blackout.sync();
 		}
-		std.print("Loading took: ", (std.millis() - load_timer) / 1000.0, " seconds.");
+		std.print("Loading took: ", (std.millis_steady() - load_timer) / 1000.0, " seconds.");
 		//The first autosave of this project comes a full interval later
-		autosave_last = std.millis();
+		autosave_last = std.millis_steady();
 		
 		screen.status_overlay("");
 		
@@ -792,7 +857,24 @@ class shizoengine
 		//ctx.fps(tmp_fps);
 		
 		load_in_progress = false;
-		
+
+		//Not all of it came in (the error used to be swallowed: the project showed up empty under its name, and the next
+		//Save, Quit or autosave wrote that over it). Without a name Save asks for one and the files on disk stay
+		//env.last_load_error: for a caller that cannot show a dialog (the MCP bridge sets env.load_quiet: a dialog waits
+		//for a person, its call would hang until someone clicks)
+		env.last_load_error = load_error;
+		if(load_error) {
+			if(!unnamed) {
+				project_env.name = None;
+				project_env.label.text(name + " (not loaded completely)");
+			}
+			try {
+				if(!env.load_quiet)
+					screen.modal_yes_no("Project " + name + " could not be loaded completely (" + load_error + ").\nIt is open without a name: Save asks for one, the files of " + name + " stay as they are. The Log has the details.", "Load project");
+			}
+			catch(e) {}
+			return false;
+		}
 		return true;
 	}
 
@@ -804,7 +886,17 @@ class shizoengine
 	}
 
 	//Call after any change of the patch (lamps, addresses, groups, nodes)
+	//The stage changed (engine/stage/stage.shio): the 3D views build what changed
+	stage_changed() {
+		stage_revision++;
+		//#980: lamps that hang on an object of the stage go with it
+		if(stage_lamps_follow(stage, patch))
+			patch_revision++;
+	}
+
 	patch_changed() {
+		//#980: a lamp that hangs on the stage and was moved: its place on its object again
+		stage_lamps_follow(stage, patch);
 		patch_revision++;
 		//Nodes added by hand by their IP: known to shizonet, so data is sent to them before (or without) an ArtPoll reply
 		for(i = 0; i < patch.nodes.size(); i++) {

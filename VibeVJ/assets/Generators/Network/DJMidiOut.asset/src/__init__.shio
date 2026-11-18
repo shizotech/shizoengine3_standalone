@@ -1,0 +1,494 @@
+// DJMidiOut generator: what the DJ does as MIDI notes and controllers, for lighting programs, cheap DMX controllers and
+// SoundSwitch. Reads the decks of the DJ network from a Prolink Bridge or Prolink Decks generator (their device in
+// std.global("prolink_sources"), as the video sync does; this generator opens no connection of its own and never takes
+// their events()), so one of them must run. The DJ Watch program loads it as its tab "MIDI out".
+//
+// - Output: a MIDI output of nanogui (a port of the system, a virtual port like loopMIDI / IAC for another program, or a
+//   virtual device of the app). Nothing goes out while it is Off.
+// - Deck (ID "FOLLOW DECK"): the deck the values and the beats follow. Auto = device.lead(): the tempo master, else the
+//   deck on air and playing (debounced in the prolink module), or a fixed deck 1-6.
+// - Notes (a pulse: note on with velocity 127, note off after Note length): beat, downbeat, phrase change, phrase kind
+//   (base note + the code of the phrase: Intro 0, Verse 1-6, Bridge 7, Drop 8, Buildup 9, Down 10, Outro 11, like
+//   autoblink's map; a Break is Bridge or Down by rekordbox' kind of the phrase), drop (a Drop phrase begins), buildup,
+//   track load (a new track on any deck 1-6), cue reached (the deck reaches a memory cue).
+// - Controllers (CC, sent only when the value changes, each at most 60 times a second): BPM coarse (BPM - 50, so 50-177),
+//   BPM fine (hundredths), pitch (64 = 0 %, a step 0.25 %), bar phase, beat phase, playing, master deck (its number),
+//   phrase kind (code x 10, 127 = none), phrase progress, beats to the next phrase, and per deck 1-6 Low / Mid / High of
+//   the waveform at the playhead (CC base + deck - 1).
+// - Each line can be switched off, its channel (1-16) and number (0-127) changed; Send sends it once (to map it in the
+//   receiving program).
+// - SoundSwitch: it maps MIDI from a virtual controller to its AutoLoops (tempo from Ableton Link: Send BPM / the TC
+//   popup). Per phrase exactly one bank select (channel 16, notes 60-63 = bank 1-4) and one AutoLoop pulse (channel
+//   13-16 for bank 1-4, notes 64-95 = AutoLoop 1-32); which AutoLoop each phrase kind starts is set per kind. Send sends
+//   the pair of that kind now: press it while SoundSwitch's "Map" waits for a message.
+// Timing: the script reads the decks every frame, so a beat note goes out within half a frame of the beat (the next beat
+// is sent early when it is due before the next frame): about ±8 ms at 60 frames a second, plus the network. For a tight
+// tempo use Ableton Link (Send BPM). The MIDI devices are in the nanogui module, the beat clock of the tempo sender in
+// the prolink module: the two cannot reach each other, so the notes are timed here.
+import nanogui;
+import prolink;
+
+using eigen;
+
+// The lines: key, note or CC, caption, default channel and number, tooltip
+NOTE_ROWS = [
+	[tag = "beat", name = "Beat", ch = 1, num = 36, tip = "A pulse on every beat of the deck"],
+	[tag = "downbeat", name = "Downbeat", ch = 1, num = 37, tip = "A pulse on the first beat of every bar"],
+	[tag = "phrase", name = "Phrase change", ch = 1, num = 38, tip = "A pulse when a new phrase begins (rekordbox phrases, else the sections found in the waveform)"],
+	[tag = "kind", name = "Phrase kind", ch = 1, num = 40, tip = "A pulse on this note + the code of the new phrase: Intro 0, Verse 1-6, Bridge 7, Drop 8, Buildup 9, Down 10, Outro 11"],
+	[tag = "drop", name = "Drop", ch = 1, num = 52, tip = "A pulse when a Drop phrase begins"],
+	[tag = "buildup", name = "Buildup", ch = 1, num = 53, tip = "A pulse when a Buildup begins"],
+	[tag = "load", name = "Track load", ch = 1, num = 54, tip = "A pulse when a deck 1-6 loads a track"],
+	[tag = "cue", name = "Cue reached", ch = 1, num = 55, tip = "A pulse when the deck reaches a memory cue (e.g. the drop the DJ marked)"],
+];
+CC_ROWS = [
+	[tag = "bpm", name = "BPM coarse", ch = 1, num = 1, tip = "BPM - 50 as the value: 0 = 50 BPM, 127 = 177 BPM"],
+	[tag = "bpmfine", name = "BPM fine", ch = 1, num = 2, tip = "The hundredths of the BPM, 0-99"],
+	[tag = "pitch", name = "Pitch", ch = 1, num = 3, tip = "64 = 0 %, a step is 0.25 % (±16 %)"],
+	[tag = "bar", name = "Bar phase", ch = 1, num = 4, tip = "0-127 through the bar"],
+	[tag = "beatphase", name = "Beat phase", ch = 1, num = 5, tip = "0-127 through the beat"],
+	[tag = "playing", name = "Playing", ch = 1, num = 6, tip = "127 while the deck plays, else 0"],
+	[tag = "master", name = "Master deck", ch = 1, num = 7, tip = "The number of the tempo master deck, 0 = none"],
+	[tag = "kindcc", name = "Phrase kind", ch = 1, num = 20, tip = "The code of the phrase x 10 (Intro 0, Verse 10-60, Bridge 70, Drop 80, Buildup 90, Down 100, Outro 110), 127 = none"],
+	[tag = "progress", name = "Phrase progress", ch = 1, num = 21, tip = "0-127 from the start to the end of the phrase"],
+	[tag = "left", name = "Beats left", ch = 1, num = 22, tip = "Beats to the next phrase, at most 127"],
+	[tag = "low", name = "Low (decks 1-6)", ch = 1, num = 30, tip = "The bass of the waveform at the playhead of deck n on CC number + n - 1"],
+	[tag = "mid", name = "Mid (decks 1-6)", ch = 1, num = 36, tip = "The mids of deck n on CC number + n - 1"],
+	[tag = "high", name = "High (decks 1-6)", ch = 1, num = 42, tip = "The highs of deck n on CC number + n - 1"],
+];
+// SoundSwitch: the phrase kinds (groups of the prolink module) and the AutoLoop each starts by default
+SS_ROWS = [
+	[tag = "intro", name = "Intro", bank = 1, loop = 1],
+	[tag = "verse", name = "Verse", bank = 1, loop = 2],
+	[tag = "break", name = "Break", bank = 1, loop = 3],
+	[tag = "buildup", name = "Buildup", bank = 1, loop = 4],
+	[tag = "drop", name = "Drop", bank = 1, loop = 5],
+	[tag = "outro", name = "Outro", bank = 1, loop = 6],
+];
+NDECKS = 6;
+CC_MIN_MS = 1000.0 / 60.0;
+
+managed status = None;
+managed out_box = None;
+out_name = None;      // controltext "OUTPUT DEVICE": the name of the output, "" = off
+send_on = None;
+follow = None;
+note_ms = None;
+ss_on = None;
+rows = std.json();    // key -> [kind, on, ch, num]
+ss = std.json();      // phrase group -> [bank, loop]
+outputs = [];
+
+out_dev = None;
+out_dev_name = "";
+frame_n = 0;
+last_frame_ms = 0.0;
+frame_ms = 16.7;
+pending_off = [];     // [at, ch, num]
+cc_sent = std.json(); // "ch:num" -> [v, at]
+notes_sent = 0;
+ccs_sent = 0;
+last_text = "";
+last_event = "";
+
+// What was seen last (events come from comparing the state of the decks from frame to frame)
+seen_deck = 0;
+seen_beat = -1;
+early_beat = -1;      // the beat sent ahead of time (due before the next frame)
+seen_phase = -1.0;
+seen_phrase = None;   // None = not seen yet: the first phrase is no change (a project loaded while the DJ plays)
+seen_btp = -1;
+seen_cue_ms = -1.0;
+seen_tracks = [];
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+dispatcher(generator, cmd, value) {
+
+}
+
+// The device of a Prolink Bridge / Prolink Decks generator, a connected one first; None if none runs
+prolink_source() {
+	sources = std.global("prolink_sources").get();
+	if(!sources)
+		return None;
+	found = None;
+	for(key, dev : sources) {
+		if(!dev)
+			continue;
+		if(dev.connected())
+			return dev;
+		if(!found)
+			found = dev;
+	}
+	return found;
+}
+
+// autoblink's codes: Intro 0, Verse 1-6, Bridge 7, Chorus (Drop) 8, Up (Buildup) 9, Down 10, Outro 11; -1 = none.
+// `kind` is rekordbox' own kind of the phrase (phraseKind of the deck): it tells Down (a break of a high mood track)
+// from Bridge (mid / low mood), which both are "Break" in `name`. Without it (older module) Break is 7.
+phrase_code(name, kind = "") {
+	if(!name)
+		return -1;
+	if(kind == "Down")
+		return 10;
+	if(kind == "Bridge")
+		return 7;
+	if(name == "Intro")
+		return 0;
+	if(name.find("Verse") == 0) {
+		n = std.int(name.substr(5).strip());
+		return n >= 1 && n <= 6 ? n : 1;
+	}
+	if(name == "Break")
+		return 7;
+	if(name == "Drop")
+		return 8;
+	if(name == "Buildup")
+		return 9;
+	if(name == "Outro")
+		return 11;
+	return -1;
+}
+
+clamp7(v) {
+	return math.clamp(std.int(math.round(v)), 0, 127);
+}
+
+// ---- Sending ----
+
+device_ok() {
+	name = out_name ? out_name.value() : "";
+	if(name == "" || !send_on.value())
+		return false;
+	if(name != out_dev_name || (!out_dev && frame_n % 60 == 0)) {
+		out_dev = nanogui.midi_device(name);
+		out_dev_name = name;
+	}
+	return out_dev ? true : false;
+}
+
+pulse(ch, num, why) {
+	if(!device_ok())
+		return false;
+	now = std.millis();
+	out_dev.send_note_on(num, 127, ch - 1);
+	pending_off.push_back([at = now + note_ms.value(), ch = ch, num = num]);
+	notes_sent++;
+	last_event = why + ": note " + std.string(num) + " ch " + std.string(ch);
+	return true;
+}
+
+// A note line (when it is on); offset is added to its number (phrase kind)
+note(key, offset, why) {
+	r = rows[key];
+	if(!r.on.value())
+		return false;
+	return pulse(r.ch.value(), math.clamp(r.num.value() + offset, 0, 127), why);
+}
+
+cc_raw(ch, num, value, force) {
+	if(!device_ok())
+		return false;
+	k = std.string(ch) + ":" + std.string(num);
+	now = std.millis();
+	last = cc_sent[k];
+	if(!force && last && last.v == value)
+		return false;
+	if(!force && last && now - last.at < CC_MIN_MS)
+		return false; // changed, but too soon: the next frame sends it
+	out_dev.send_control_change(num, value, ch - 1);
+	cc_sent[k] = [v = value, at = now];
+	ccs_sent++;
+	return true;
+}
+
+cc(key, offset, value) {
+	r = rows[key];
+	if(!r.on.value())
+		return false;
+	return cc_raw(r.ch.value(), math.clamp(r.num.value() + offset, 0, 127), clamp7(value), false);
+}
+
+release_notes(force) {
+	if(pending_off.size() == 0)
+		return None;
+	now = std.millis();
+	keep = [];
+	for(p : pending_off) {
+		if(force || now >= p.at) {
+			if(out_dev)
+				out_dev.send_note_off(p.num, 0, p.ch - 1);
+		}
+		else
+			keep.push_back(p);
+	}
+	pending_off = keep;
+}
+
+// SoundSwitch: one bank select and one AutoLoop pulse for the phrase group
+soundswitch(group, why) {
+	if(!ss_on.value() || !ss.has(group))
+		return false;
+	s = ss[group];
+	bank = math.clamp(s.bank.value(), 1, 4);
+	loop = math.clamp(s.loop.value(), 1, 32);
+	ok = pulse(16, 59 + bank, why + " bank");
+	ok = pulse(12 + bank, 63 + loop, why + " AutoLoop " + std.string(loop)) && ok;
+	return ok;
+}
+
+// Send of a line: notes a pulse, CCs the value 64 (enough for the learn of most programs)
+send_row(key) {
+	r = rows[key];
+	if(r.kind == "note")
+		return pulse(r.ch.value(), r.num.value(), "Send");
+	return cc_raw(r.ch.value(), r.num.value(), 64, true);
+}
+
+// ---- Building ----
+
+fill_outputs() {
+	names = ["Off: send nothing"];
+	outputs = [""];
+	n = nanogui.midi_device_count();
+	for(i = 0; i < n; i++) {
+		name = nanogui.midi_device_name(i);
+		found = false;
+		for(o : outputs)
+			if(o == name)
+				found = true;
+		if(!found) {
+			names.push_back(name);
+			outputs.push_back(name);
+		}
+	}
+	cur = out_name.value();
+	sel = 0;
+	for(i = 0; i < outputs.size(); i++)
+		if(outputs[i] == cur)
+			sel = i;
+	if(cur != "" && sel == 0) {
+		names.push_back(cur + " (not connected)");
+		outputs.push_back(cur);
+		sel = outputs.size() - 1;
+	}
+	out_box.items(names);
+	out_box.selected(sel);
+}
+
+// One line: on / off with the caption, channel, number, Send
+add_row(parent, kind, r) {
+	id = (kind == "note" ? "NOTE " : "CC ") + r.tag.uppercase();
+	row = parent.widget().fixed_height(28).fixed_width(392);
+	on = row.controlbutton(id + " ON").caption(r.name).push(1).value(1).tooltip(r.tip).anchor_left(0).anchor_top(2).fixed_width(150).fixed_height(24);
+	ch = row.controlint(id + " CH").caption("Ch").min(1).max(16).value(r.ch).tooltip("MIDI channel 1-16").anchor_left(154).anchor_top(2).fixed_width(84).fixed_height(24);
+	num = row.controlint(id + " NUM").caption(kind == "note" ? "Note" : "CC").min(0).max(127).value(r.num).tooltip(kind == "note" ? "Note number 0-127" : "Controller number 0-127").anchor_left(242).anchor_top(2).fixed_width(96).fixed_height(24);
+	btn = row.button("Send").tooltip("Sends this once, to map it in the receiving program").anchor_left(342).anchor_top(2).fixed_width(50).fixed_height(24);
+	key = r.tag;
+	btn.on_click([key]() { send_row(key); });
+	rows[r.tag] = [kind = kind, on = on, ch = ch, num = num];
+}
+
+add_ss_row(parent, r) {
+	id = "SS " + r.tag.uppercase();
+	row = parent.widget().fixed_height(28).fixed_width(392);
+	row.label(r.name).anchor_left(0).anchor_top(4).fixed_width(90).fixed_height(22);
+	bank = row.controlint(id + " BANK").caption("Bank").min(1).max(4).value(r.bank).tooltip("Bank 1-4: bank select note 60-63 on channel 16, the AutoLoop on channel 13-16").anchor_left(94).anchor_top(2).fixed_width(110).fixed_height(24);
+	loop = row.controlint(id + " LOOP").caption("AutoLoop").min(1).max(32).value(r.loop).tooltip("AutoLoop 1-32 of the bank: note 64-95").anchor_left(208).anchor_top(2).fixed_width(130).fixed_height(24);
+	btn = row.button("Send").tooltip("Sends the bank select and this AutoLoop now: press it while SoundSwitch waits in Map").anchor_left(342).anchor_top(2).fixed_width(50).fixed_height(24);
+	group = r.tag;
+	btn.on_click([group]() { soundswitch(group, "Send " + group); });
+	ss[r.tag] = [bank = bank, loop = loop];
+}
+
+entry(generator, area) {
+	generator.window.fixed_size(vec2f(430, 620));
+	top_area = area.vscroll().anchor(0).anchor_bottom(0);
+	area = top_area.content().layout(nanogui.layout_vertical());
+
+	status = area.label("Choose a MIDI output").fixed_height(24);
+	send_on = area.controlbutton("SEND MIDI").caption("Send MIDI").push(1).value(1).tooltip("Sends the notes and controllers below while on\n[[wiki:Output-and-Devices#dj-midi-out]]");
+	area.label("MIDI output").fixed_height(20);
+	out_box = area.combobox().fixed_height(26).tooltip("The MIDI output: a port of this computer, a virtual port (loopMIDI, IAC) for another program, or Off");
+	out_name = area.controltext("OUTPUT DEVICE").caption("Output device").value("").visible(false);
+	out_box.on_open([]() { fill_outputs(); });
+	out_box.on_change([](index, text) {
+		if(index >= 0 && index < outputs.size())
+			out_name.value(outputs[index]);
+	});
+	follow = area.controlcombo("FOLLOW DECK").caption("Deck").items(["Auto", "1", "2", "3", "4", "5", "6"]).segmented(true); //index-based: 0 = auto, n = deck n
+	follow.tooltip("The deck the beats and values follow. Auto: the tempo master, else the deck on air and playing\n[[wiki:Lighting-Desk#which-deck-gives-the-tempo]]");
+	note_ms = area.controlfloat("NOTE MS").caption("Note length").unit("ms").min(5).max(1000).value(50).tooltip("How long a note stays on before its note off");
+
+	notes = area.collapsable("Notes").expanded(true).content().layout(nanogui.layout_vertical());
+	for(r : NOTE_ROWS)
+		add_row(notes, "note", r);
+	ccs = area.collapsable("Controllers (CC)").content().layout(nanogui.layout_vertical());
+	for(r : CC_ROWS)
+		add_row(ccs, "cc", r);
+
+	ss_box = area.collapsable("SoundSwitch").content().layout(nanogui.layout_vertical());
+	ss_on = ss_box.controlbutton("SOUNDSWITCH").caption("SoundSwitch").push(1).value(0)
+		.tooltip("Per phrase one bank select (channel 16, notes 60-63) and one AutoLoop pulse (channel 13-16, notes 64-95). Map them in SoundSwitch with its Map button and Send below");
+	for(r : SS_ROWS)
+		add_ss_row(ss_box, r);
+	ss_box.label("Tempo for SoundSwitch: Ableton Link (Send BPM / the TC popup).").fixed_height(22);
+
+	for(i = 0; i < NDECKS; i++)
+		seen_tracks.push_back(None);
+	fill_outputs();
+}
+
+// Everything off when the generator goes: no note may hang
+on_free() {
+	release_notes(true);
+}
+
+set_status(text) {
+	if(text != last_text) {
+		last_text = text;
+		status.caption(text);
+	}
+}
+
+// ---- Every frame ----
+
+update(generator, tl_pos, pos_delta) {
+	frame_n++;
+	now = std.millis();
+	if(last_frame_ms > 0)
+		frame_ms = frame_ms * 0.9 + math.clamp(now - last_frame_ms, 1.0, 200.0) * 0.1;
+	last_frame_ms = now;
+	release_notes(false);
+
+	dev = prolink_source();
+	if(!dev) {
+		set_status("No DJ data: add a Prolink Bridge or Prolink Decks generator");
+		return None;
+	}
+	if(!device_ok()) {
+		name = out_name.value();
+		set_status(name == "" ? "Choose a MIDI output" : (!send_on.value() ? "Off" : name + " is not connected"));
+		// Keep the state current, so switching on sends no stale events
+	}
+
+	want = follow.value();
+	m = want > 0 ? dev.player(want) : dev.lead(0);
+	if(m && want > 0 && !(m.effectiveBpm > 0))
+		m = None;
+	deck_n = m ? m.n : 0;
+	if(deck_n != seen_deck) {
+		seen_deck = deck_n;
+		seen_beat = -1;
+		early_beat = -1;
+		seen_cue_ms = -1.0;
+	}
+
+	if(m) {
+		bpm = m.effectiveBpm;
+		// Beats: the beat number of the deck; one due before the next frame goes out now (half a frame early at most)
+		if(m.playing && bpm > 0) {
+			beat_now = m.beat ?? -1;
+			bib = m.beatInBar ?? 0;
+			if(beat_now >= 1) {
+				if(beat_now != seen_beat) {
+					if(seen_beat >= 1 && early_beat != beat_now) {
+						note("beat", 0, "Beat");
+						if(bib == 1)
+							note("downbeat", 0, "Downbeat");
+					}
+					seen_beat = beat_now;
+				}
+				to_next_ms = (1.0 - m.beatPhase) * 60000.0 / bpm;
+				if(to_next_ms < frame_ms * 0.5 && early_beat != beat_now + 1) {
+					early_beat = beat_now + 1;
+					note("beat", 0, "Beat");
+					if(bib == 4)
+						note("downbeat", 0, "Downbeat");
+				}
+			}
+			else {
+				// No beat numbers (some sources): the beat phase wraps
+				if(seen_phase >= 0 && m.beatPhase < seen_phase - 0.5) {
+					note("beat", 0, "Beat");
+					if(bib == 1)
+						note("downbeat", 0, "Downbeat");
+				}
+			}
+			seen_phase = m.beatPhase;
+		}
+
+		// Phrases: a new name, or the same name again (beats to the next phrase jumped up)
+		phrase_now = m.phrase ?? "";
+		btp = m.beatsToPhrase ?? -1;
+		if(std.is_none(seen_phrase))
+			seen_phrase = phrase_now;
+		else if(phrase_now != "" && (phrase_now != seen_phrase || (seen_btp >= 0 && btp > seen_btp + 1))) {
+			code = phrase_code(phrase_now, m.phraseKind ?? "");
+			group = m.phraseGroup ?? "";
+			note("phrase", 0, "Phrase " + phrase_now);
+			if(code >= 0)
+				note("kind", code, "Phrase kind " + phrase_now);
+			if(group == "drop")
+				note("drop", 0, "Drop");
+			if(group == "buildup")
+				note("buildup", 0, "Buildup");
+			soundswitch(group, "SoundSwitch " + phrase_now);
+			seen_phrase = phrase_now;
+		}
+		else
+			seen_phrase = phrase_now;
+		seen_btp = btp;
+
+		// A memory cue reached: the time since it was reached starts again
+		since = m.sinceCueMs ?? -1.0;
+		if(since >= 0 && since < 1000 && (seen_cue_ms < 0 || since < seen_cue_ms))
+			note("cue", 0, "Cue reached");
+		seen_cue_ms = since;
+
+		cc("bpm", 0, math.clamp(math.floor(bpm) - 50, 0, 127));
+		cc("bpmfine", 0, math.clamp(math.round((bpm - math.floor(bpm)) * 100), 0, 99));
+		cc("pitch", 0, 64 + (m.pitch ?? 0.0) * 4.0);
+		cc("bar", 0, m.barPhase * 127.0);
+		cc("beatphase", 0, m.beatPhase * 127.0);
+		cc("playing", 0, m.playing ? 127 : 0);
+		code_cc = phrase_code(m.phrase ?? "", m.phraseKind ?? "");
+		cc("kindcc", 0, code_cc >= 0 ? code_cc * 10 : 127);
+		cc("progress", 0, (m.phraseRamp ?? 0.0) * 127.0);
+		cc("left", 0, math.max(0, btp));
+	}
+	master = dev.master();
+	cc("master", 0, master ? master.n : 0);
+
+	// Per deck: track loads and the levels
+	levels = rows.low.on.value() || rows.mid.on.value() || rows.high.on.value();
+	if(levels || rows.load.on.value()) {
+		for(i = 0; i < NDECKS; i++) {
+			p = dev.player(i + 1);
+			tid = p && p.track ? std.string(p.track.id ?? "") : "";
+			if(!std.is_none(seen_tracks[i]) && tid != "" && tid != seen_tracks[i])
+				note("load", 0, "Track load deck " + std.string(i + 1));
+			seen_tracks[i] = tid;
+			if(p && p.present && levels) {
+				cc("low", i, (p.low ?? 0.0) * 127.0);
+				cc("mid", i, (p.mid ?? 0.0) * 127.0);
+				cc("high", i, (p.high ?? 0.0) * 127.0);
+			}
+		}
+	}
+
+	if(out_dev && send_on.value() && out_name.value() != "") {
+		text = "Sends to " + out_name.value() + (deck_n ? " · deck " + std.string(deck_n) : " · no deck plays") + " · " +
+			std.string(notes_sent) + " notes, " + std.string(ccs_sent) + " CCs";
+		if(last_event != "" && frame_n % 15 == 0)
+			set_status(text + " · " + last_event);
+		else if(frame_n % 15 == 0)
+			set_status(text);
+	}
+}
+
+// For tests and agents: what went out
+stats() {
+	return [notes = notes_sent, ccs = ccs_sent, last = last_event, deck = seen_deck, output = out_name ? out_name.value() : ""];
+}

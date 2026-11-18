@@ -112,6 +112,7 @@ display like any picture, as big as the project. *Text* holds the words: `|` sta
 | *value_text* | Shows the value linked into *Input* as text, numbers with up to three decimals. |
 | *textbox* | A note. It is saved with the project. |
 | *Chat* | The AI chat of the sidebar as a window. |
+| *Director* | An AI model decides with the music: *Intensity*, *Strobe*, *Palette* and *Scene* from the CDJ data, each only when it is sure enough. See [Director](#director). |
 
 ### Show controls
 
@@ -127,6 +128,43 @@ Each control is a normal control of the program: [link](Linking.md#make-a-link) 
 options (tab *Main*, the name field), set its range and envelope there. Several surfaces make a show UI: put them into
 the areas or tabs of a view tab, or as windows into a Patchview. The surface, its controls and their values are saved
 with the project.
+
+### Director
+
+*Director* (`Generators` › `Utility`) lets an AI model make decisions for your show while the DJ plays. It does not
+write text: it answers a few fixed questions, each with how sure it is.
+
+- *Intensity*: how intense the visuals should be, 0 calm to 1 peak.
+- *Strobe*: 1 when strobe and flash effects should be on, until the next decision.
+- *Palette* and *Scene*: which of your *Palettes* and *Scenes* (under *Questions*, comma separated) fits now: 0 for the
+  first, 1 for the second, … [Link](Linking.md#make-a-link) them into the *Index* of *Select* or into what switches
+  your looks.
+- *Confidence* shows how sure the model was; *Decided* flashes when an answer was applied.
+
+What the model knows: the track, key, genre and phrase of the master deck (with a *ProlinkBridge* in the project:
+intro, build-up, drop, … from rekordbox), the beats to the next cue, the levels, what you link into *Energy*, *Break*
+and *Crowd* under *Inputs* (link *Motion* of *CrowdMotion*, `Generators` › `Python`, with a camera on the crowd
+into *Crowd*: see [Python generators](Python-Generators.md#the-examples)), what it decided before, and what you tell it:
+
+- *Behaviour* (opens with a click): the rules for the whole show, in your words, as many lines as you like. "Dark
+  techno night. Little colour, mostly cold. Strobe only on drops. Never red. Calm in breaks." It is saved with the
+  project.
+- The chat under *Decide now*: a short instruction for now, "keep it dark until the drop", "no strobe", "more colour".
+  The small field next to it says for how long: `10` (minutes), `30s`, `1.5h`, `track` (until the DJ plays the next
+  track) or `show` (until you remove it). Left empty, *Default time* holds (5 minutes at the start). Enter or *Send*
+  sends it, a click elsewhere does not. The model is asked at once, and its answer says in one sentence what it does
+  (the newest line is on top). The instructions that hold are listed under it with the time they have left; × removes
+  one. The newest instruction wins over older ones and over *Behaviour*. The chat is not saved.
+
+It asks on every new phrase (*On every phrase*), every few bars (*Every bars*) or when you press *Decide now*, at most
+every *At most every* seconds. The answer is applied on the next downbeat. *Mode*: *Off*, *Suggest* (it only shows the
+answers) or *Auto* (it sets the outputs). An answer below *Confidence* (under *Model*) changes nothing.
+
+The model (under *Model*): any server with an OpenAI-compatible API. On your own computer, without internet at the
+venue: Ollama (`http://localhost:11434/v1`), LM Studio (`http://localhost:1234/v1`) or vLLM
+(`http://localhost:8000/v1`), with the name of the model in *Model*. A model that sees can get a *Picture* with every
+request: the VibeVJ window or the picture of a *Camera* generator. It starts with the server and model of the
+[Chat](The-Screen.md#chat-tab). *Log decisions* writes every decision to the folder `VibeVJ/director` of your user folder.
 
 ## FFGL plugins
 
@@ -188,6 +226,7 @@ Native code runs with the full rights of VibeVJ: only use native assets you trus
 | *ArtnetSender*, *ArtnetReceiver* | Single Art-Net channels out and in: [Art-Net](Output-and-Devices.md#art-net). |
 | *NDIReceiver*, *SpoutReceiver* | Video from other programs (Spout on Windows, Syphon on macOS): [Receiving video](Output-and-Devices.md#receiving-video). |
 | *ProlinkBridge*, *ProlinkDecks* | Tempo, beat and waveforms of CDJs: [Prolink](Output-and-Devices.md#prolink-cdjs). |
+| *DJMidiOut* | What the DJ does as MIDI notes and controllers, and for SoundSwitch: [DJ MIDI out](Output-and-Devices.md#dj-midi-out). |
 
 ## Generators › output
 

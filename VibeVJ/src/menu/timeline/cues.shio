@@ -1,12 +1,12 @@
 //Cues of a show (#680, step 5): markers on the ruler of a timeline (the main timeline or a song of the show, shows.shio)
 //that do something when the playhead passes them while it plays: launch a clip or a column of a Clipview, run a
-//command line of the lighting desk (a cue of a cue stack: "goto 3 stack Main"), send a MIDI message, start or stop a
+//command line of the lighting desk (a cue of a cue stack: "goto 3 stack Main"), send a MIDI or an OSC message, start or stop a
 //loop timeline, go to another song, or run any AI query of a generator. The cues are data of their timeline
 //(timeline_clips: add_cue, fire_cues, saved with its clips); this file has what runs them and the editor in the Clip
 //panel (a click on the flag of a cue shows it).
 
-TL_CUE_TYPES = ["clip", "column", "desk", "midi", "loop", "song", "query"];
-TL_CUE_TYPE_NAMES = ["Clipview: launch a clip", "Clipview: launch a column", "Lighting desk: a command", "MIDI: send a message", "Loop timeline: start / stop", "Song: go to a song", "AI query of a generator"];
+TL_CUE_TYPES = ["clip", "column", "desk", "midi", "loop", "song", "query", "osc"];
+TL_CUE_TYPE_NAMES = ["Clipview: launch a clip", "Clipview: launch a column", "Lighting desk: a command", "MIDI: send a message", "Loop timeline: start / stop", "Song: go to a song", "AI query of a generator", "OSC: send a message"];
 TL_CUE_COLORS = [
 	clip = vec4f(0.95, 0.62, 0.18, 1.0),
 	column = vec4f(0.95, 0.62, 0.18, 1.0),
@@ -15,6 +15,7 @@ TL_CUE_COLORS = [
 	loop = vec4f(0.45, 0.88, 0.55, 1.0),
 	song = vec4f(0.85, 0.60, 0.95, 1.0),
 	query = vec4f(0.80, 0.80, 0.82, 1.0),
+	osc = vec4f(0.45, 0.80, 0.95, 1.0),
 ];
 
 //A number as short text: up to 3 decimals, no trailing zeros ("7", "7.25", "127.5")
@@ -66,8 +67,61 @@ tl_cue_text(action) {
 		return "go to song " + std.string(action.song ?? "");
 	if(t == "query")
 		return std.string(action.query ?? "") + " on " + std.string(action.live_path ?? "");
+	if(t == "osc")
+		return "OSC " + std.string(action.message ?? "");
 	return t;
 }
+
+//"128", "-3", "0.5": a number for OSC
+tl_osc_is_number(v) {
+	t = std.string(v);
+	if(t == "" || t == "-" || t == ".")
+		return false;
+	dots = 0;
+	for(i = 0; i < t.size(); i++) {
+		c = t.substr(i, 1);
+		if(c == ".")
+			dots++;
+		else if(!(c >= "0" && c <= "9") && !(i == 0 && c == "-"))
+			return false;
+	}
+	return dots <= 1;
+}
+
+//An OSC message as text: "<ip>[:<port>] <address> [values ...]", e.g. "192.168.1.20:7000 /composition/tempo 128.0".
+//Values: whole numbers go as int, numbers with a point as float, the rest as strings. Port 8000 when none is given.
+//Returns [ok, ip, port, address, args (json list), error].
+tl_osc_parse(text) {
+	words = std.string(text ?? "").trim().split(" ");
+	parts = [];
+	for(w : words)
+		if(std.string(w) != "")
+			parts.push(std.string(w));
+	if(parts.size() < 2)
+		return [ok = false, error = "OSC: <ip>[:port] /address [values]"];
+	host = parts[0];
+	port = 8000;
+	colon = host.find(":");
+	if(colon >= 0) {
+		port = std.int(std.float(host.substr(colon + 1)));
+		host = host.substr(0, colon);
+	}
+	address = parts[1];
+	if(!address.starts("/"))
+		return [ok = false, error = "OSC: the address starts with / (" + address + ")."];
+	if(port <= 0 || port > 65535)
+		return [ok = false, error = "OSC: no valid port."];
+	args = [];
+	for(i = 2; i < parts.size(); i++) {
+		v = parts[i];
+		if(tl_osc_is_number(v))
+			args.push(v.find(".") >= 0 ? std.float(v) : std.int(std.float(v)));
+		else
+			args.push(v);
+	}
+	return [ok = true, ip = host, port = port, address = address, args = args, error = ""];
+}
+
 
 //A byte of a MIDI message as text: hex ("90", "3C", "0x7F")
 tl_hex_byte(text) {
@@ -171,6 +225,21 @@ tl_cue_run(action, timeline) {
 			if(!dev)
 				return [ok = false, error = "No MIDI device " + name + "."];
 			dev.send_message(bytes[0], bytes[1], bytes[2]);
+			return [ok = true];
+		}
+		if(t == "osc") {
+			m = tl_osc_parse(action.message ?? "");
+			if(!m.ok)
+				return [ok = false, error = m.error];
+			net = std.global("engine").net; //the ShizoNet server of the program (its Art-Net and OSC)
+			if(!net)
+				return [ok = false, error = "OSC: no network (ShizoNet) in this program."];
+			msg = std.json();
+			msg[m.address] = m.args.size() == 1 ? m.args[0] : m.args;
+			if(m.args.size() == 0)
+				msg[m.address] = [];
+			if(!net.send_osc(m.ip, msg, m.port))
+				return [ok = false, error = "OSC: not sent to " + m.ip + ":" + m.port + "."];
 			return [ok = true];
 		}
 		if(t == "loop") {
@@ -341,7 +410,7 @@ class timeline_cue_editor
 			text = "";
 			if(t == "desk")
 				text = a.command ?? "";
-			else if(t == "midi")
+			else if(t == "midi" || t == "osc")
 				text = a.message ?? "";
 			else if(t == "loop")
 				text = a.loop ?? "";
@@ -443,7 +512,7 @@ class timeline_cue_editor
 		if(busy || !owner || !owner.cues.has(cue_id))
 			return;
 		t = std.string(owner.cues[cue_id].action.type ?? "");
-		field_name = t == "desk" ? "command" : (t == "midi" ? "message" : (t == "loop" ? "loop" : (t == "song" ? "song" : "query")));
+		field_name = t == "desk" ? "command" : ((t == "midi" || t == "osc") ? "message" : (t == "loop" ? "loop" : (t == "song" ? "song" : "query")));
 		f = std.json();
 		f[field_name] = text;
 		changed_action(f);

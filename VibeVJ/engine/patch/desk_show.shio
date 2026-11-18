@@ -1,0 +1,876 @@
+//Shows per track for the lighting desk (#719): cues at beats of the DJ's tracks, rules on the names of the DJ's
+//rekordbox cues and on phrases, actions some beats ahead of a drop, safety limits of cue stacks and the cue call. Pure
+//logic, without UI and without the decks: engine/patch/desk_runtime.shio reads the decks (DJ Link) every frame and runs
+//what this finds. Tested in _testing/desk_show.shio.
+//
+//Needs engine/patch/desk.shio included before it.
+//
+//  show = [tracks = [[id, signature, title, artist, dur, enabled, lock_phrases,
+//                     cues = [[id, name, beat, end_beat, crew, action, end_action, enter_action, late]]]],
+//          name_rules = [[id, pattern, kinds, players, crew, action, on]],
+//          phrase_rules = [[id, name, phrase, players, mood, bars_min, bars_max, bpm_min, bpm_max, weight, solo, crew,
+//                           action, on]],
+//          lookahead = [[id, name, target, beats, players, crew, action, on]],
+//          limits = [[id, stack, max_on, min_gap, duty, window, special]],
+//          crews = ["Lighting", ...], backoff_bars, stop_after, standby_beats]
+//
+//- A track of the show is found by its signature (track(id).signature of the prolink module: the same file on any USB
+//  stick), else by title, artist and duration (within 1.5 s): another player model can give another waveform.
+//- Positions are beats of the track with their fraction, as the beat grid counts them (beat 1 = the first beat; 33.5 =
+//  half way from beat 33 to 34). The position of a deck: its beat + beatPhase.
+//- What happens between two frames (desk_show_step): a cue starts when the playhead plays through its first beat (from
+//  the position of the last frame up to the position now, at most DESK_SHOW_MAX_STEP beats further, while the deck
+//  plays). A jump back plays the cues after it again (re-armed), a jump forward starts none of the cues it skips, a
+//  paused deck starts none (a cue with `late` starts when the deck starts playing inside it). Entered and exited follow
+//  where the playhead is, also while paused and after jumps; the end action of a cue runs when the playhead leaves a
+//  cue that started (the end beat, a jump out of it, another track).
+//- enabled (a track) / players (a rule): "master" (the tempo master deck), "onair" (the channel is open on the mixer,
+//  needs a DJM), "always" (any deck that plays), "never".
+//- Phrase triggers: for a new phrase of a deck every trigger that fits (players, phrase, mood, length in bars, BPM) can
+//  run; one is picked at random by weight. A solo trigger runs alone, a blend trigger with all other blend triggers that
+//  fit. A track with cues of its own (lock_phrases, on by default) runs no phrase triggers and no look-ahead on phrases.
+//- Look-ahead: an action `beats` before each target of a track: a drop, a buildup, a break, any new phrase, a memory
+//  cue or a track cue (fog 16 beats before the drop, a blackout 1 beat before).
+//- Limits of a stack: max on-time (s), min gap between two starts by the automation (s), duty cycle (on-time / window).
+//  A special (CO2, pyro, ...) is never started by the automation until it is armed (not saved: disarmed after a load).
+//- Actions: [type = "stack", stack = <stack id>, op = "go" | "goto" | "off", cue = <number>] or what a timeline cue
+//  does (src/menu/timeline/cues.shio: clip, column, desk, midi, osc, loop, song, query).
+
+def desk_show_bar_text(beat);
+def desk_show_info_dur(info);
+
+DESK_SHOW_SCOPES = ["master", "onair", "always", "never"];
+DESK_SHOW_SCOPE_LABELS = ["Master deck", "On air", "Any deck", "Never"];
+DESK_SHOW_CREWS = ["Lighting", "Video", "SFX", "Laser"];
+DESK_SHOW_MAX_STEP = 6.0;     //beats the playhead may move in one frame and still play through (more: a jump)
+DESK_SHOW_JITTER = 0.5;       //a playhead less than this behind the last frame did not jump back (late beat packets)
+DESK_SHOW_CUE_BEATS = 16.0;   //the length of a new track cue (4 bars)
+DESK_SHOW_KINDS = ["all", "memory", "hot"];
+DESK_SHOW_KIND_LABELS = ["Memory and hot cues", "Memory cues", "Hot cues"];
+DESK_SHOW_TARGETS = ["drop", "buildup", "break", "phrase", "memory", "cue"];
+DESK_SHOW_TARGET_LABELS = ["Drop", "Buildup", "Break", "Any new phrase", "Memory cue", "Track cue"];
+DESK_SHOW_PHRASES = ["", "intro", "verse", "buildup", "drop", "break", "outro"];
+DESK_SHOW_PHRASE_LABELS = ["Any phrase", "Intro", "Verse", "Buildup", "Drop", "Break", "Outro"];
+DESK_SHOW_MOODS = ["", "high", "mid", "low"];
+DESK_SHOW_MOOD_LABELS = ["Any mood", "High", "Mid", "Low"];
+
+// =========================================================================
+// The data (show of desk.json)
+// =========================================================================
+
+desk_show_new() {
+	return [tracks = [], name_rules = [], phrase_rules = [], lookahead = [], limits = [], crews = DESK_SHOW_CREWS.copy(),
+		backoff_bars = 4.0, stop_after = 3.0, standby_beats = 16.0];
+}
+
+//A show of a desk.json, with what is missing filled in
+desk_show_normalize(sh) {
+	if(!sh || std.type(sh) != "json")
+		sh = desk_show_new();
+	for(k : ["tracks", "name_rules", "phrase_rules", "lookahead", "limits"]) {
+		if(!sh.has(k) || std.type(sh[k]) != "json")
+			sh[k] = [];
+	}
+	if(!sh.has("crews") || std.type(sh.crews) != "json" || !sh.crews.size())
+		sh.crews = DESK_SHOW_CREWS.copy();
+	if(!sh.has("backoff_bars"))
+		sh.backoff_bars = 4.0;
+	if(!sh.has("stop_after"))
+		sh.stop_after = 3.0;
+	if(!sh.has("standby_beats"))
+		sh.standby_beats = 16.0;
+	for(t : sh.tracks) {
+		if(!t.has("cues") || std.type(t.cues) != "json")
+			t.cues = [];
+	}
+	return sh;
+}
+
+//Has the show anything to run (only then the decks are read every frame)
+desk_show_used(sh) {
+	return sh && (sh.tracks.size() > 0 || sh.name_rules.size() > 0 || sh.phrase_rules.size() > 0 || sh.lookahead.size() > 0);
+}
+
+desk_show_by_id(list, id) {
+	for(e : list) {
+		if(e.id == id)
+			return e;
+	}
+	return None;
+}
+
+desk_show_remove_id(list, id) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i].id == id) {
+			list.erase(i);
+			return true;
+		}
+	}
+	return false;
+}
+
+//A new rule of a list ("name_rules", "phrase_rules", "lookahead", "limits") with its defaults
+desk_show_rule_new(kind) {
+	id = std.random_hash();
+	if(kind == "name_rules")
+		return [id = id, pattern = "DROP", kinds = "all", players = "master", crew = "Lighting", action = None, on = true];
+	if(kind == "phrase_rules")
+		return [id = id, name = "Phrase trigger", phrase = "drop", players = "master", mood = "", bars_min = 0.0, bars_max = 0.0,
+			bpm_min = 0.0, bpm_max = 0.0, weight = 100.0, solo = true, crew = "Lighting", action = None, on = true];
+	if(kind == "lookahead")
+		return [id = id, name = "Before the drop", target = "drop", beats = 16.0, players = "master", crew = "Lighting", action = None, on = true];
+	if(kind == "limits")
+		return [id = id, stack = "", max_on = 10.0, min_gap = 2.0, duty = 0.5, window = 60.0, special = false];
+	return None;
+}
+
+// =========================================================================
+// Tracks
+// =========================================================================
+
+desk_show_norm_text(v) {
+	return std.string(v ?? "").lowercase().trim();
+}
+
+//The show of a track: by signature, else by title, artist and duration. None when the show has none
+desk_show_find_track(sh, sig, title, artist, dur) {
+	sig = std.string(sig ?? "");
+	if(sig) {
+		for(t : sh.tracks) {
+			if(std.string(t.signature ?? "") == sig)
+				return t;
+		}
+	}
+	title = desk_show_norm_text(title);
+	artist = desk_show_norm_text(artist);
+	if(!title)
+		return None;
+	dur = std.float(dur ?? 0);
+	for(t : sh.tracks) {
+		if(desk_show_norm_text(t.title) == title && desk_show_norm_text(t.artist) == artist && math.abs(std.float(t.dur ?? 0) - dur) <= 1.5)
+			return t;
+	}
+	return None;
+}
+
+//The show of the track of track(id) (info of the prolink module) or None
+desk_show_track_of(sh, info) {
+	if(!info)
+		return None;
+	return desk_show_find_track(sh, info.signature ?? "", info.title ?? "", info.artist ?? "", desk_show_info_dur(info));
+}
+
+//The duration of a track in seconds (meta "dur", else durationMs)
+desk_show_info_dur(info) {
+	if(!info)
+		return 0.0;
+	if(info.has("dur") && info.dur)
+		return std.float(info.dur);
+	return std.float(info.durationMs ?? 0) / 1000.0;
+}
+
+//A new show of a track (the track of track(id)); it is added to the show
+desk_show_track_add(sh, info) {
+	t = [id = std.random_hash(), signature = std.string(info.signature ?? ""), title = std.string(info.title ?? ""),
+		artist = std.string(info.artist ?? ""), dur = desk_show_info_dur(info), enabled = "master", lock_phrases = true, cues = []];
+	sh.tracks.push_back(t);
+	return sh.tracks[-1];
+}
+
+desk_show_cue_new(beat, end_beat = -1.0, name = "", crew = "Lighting") {
+	beat = math.max(1.0, std.float(beat));
+	end_beat = std.float(end_beat);
+	if(end_beat <= beat)
+		end_beat = beat + DESK_SHOW_CUE_BEATS;
+	return [id = std.random_hash(), name = name ? name : "Cue at " + desk_show_bar_text(beat), beat = beat, end_beat = end_beat,
+		crew = crew, action = None, end_action = None, enter_action = None, late = false];
+}
+
+//A cue into the cues of a track show, in the order of its beat. Returns it
+desk_show_cue_insert(entry, cue) {
+	pos = entry.cues.size();
+	for(pos > 0 && std.float(entry.cues[pos - 1].beat) > std.float(cue.beat))
+		pos--;
+	entry.cues.insert(pos, cue);
+	return entry.cues[pos];
+}
+
+//The beats of a cue: [b, e] (a cue without a length lasts one beat)
+desk_show_cue_range(c) {
+	b = std.float(c.beat ?? 1.0);
+	e = std.float(c.end_beat ?? 0.0);
+	if(e <= b)
+		e = b + 1.0;
+	return [b = b, e = e];
+}
+
+//"bar 9.1": the bar (from 1) and the beat in it (1-4) of a beat of the track, as a DJ counts
+desk_show_bar_text(beat) {
+	n = std.int(math.floor(std.float(beat) + 0.0001)) - 1;
+	if(n < 0)
+		n = 0;
+	return "bar " + std.int(math.floor(n / 4.0) + 1) + "." + (n % 4 + 1);
+}
+
+//Where a rekordbox cue (track(id).cues) is in beats: its beat from the module, else from its ms and the BPM. -1: unknown
+desk_show_rb_beat(c, info) {
+	if(c.has("beat") && !std.is_none(c.beat))
+		return std.float(c.beat);
+	bpm = std.float(info.bpm ?? 0);
+	if(bpm <= 0.0)
+		return -1.0;
+	return 1.0 + std.float(c.ms ?? 0) * bpm / 60000.0;
+}
+
+//Does a rekordbox cue (kind memory, loop, hot, hotloop) count for kinds ("all", "memory", "hot")
+desk_show_kind_ok(kinds, kind) {
+	kinds = std.string(kinds ?? "all");
+	kind = std.string(kind ?? "");
+	if(kinds == "memory")
+		return kind == "memory" || kind == "loop";
+	if(kinds == "hot")
+		return kind == "hot" || kind == "hotloop";
+	return true;
+}
+
+//The rekordbox cues of a track as cues of its show (kinds: "all", "memory", "hot"), not where a cue of the show already
+//starts. Returns how many it added
+desk_show_import(entry, info, kinds = "all", crew = "Lighting") {
+	if(!info || !info.has("cues") || std.type(info.cues) != "json")
+		return 0;
+	n = 0;
+	for(i, c : info.cues) {
+		if(!desk_show_kind_ok(kinds, c.kind))
+			continue;
+		b = desk_show_rb_beat(c, info);
+		if(b < 1.0)
+			continue;
+		taken = false;
+		for(have : entry.cues) {
+			if(math.abs(std.float(have.beat) - b) < 0.01)
+				taken = true;
+		}
+		if(taken)
+			continue;
+		name = std.string(c.comment ?? "");
+		if(!name)
+			name = (c.hot ? "Hot " + std.string(c.hot) : "Memory " + (i + 1));
+		e = c.has("endBeat") && !std.is_none(c.endBeat) ? std.float(c.endBeat) : -1.0;
+		desk_show_cue_insert(entry, desk_show_cue_new(b, e, name, crew));
+		n++;
+	}
+	return n;
+}
+
+// =========================================================================
+// Names of the DJ's cues
+// =========================================================================
+
+//Does text match a pattern with * (any characters) and ? (one); case does not count
+desk_show_glob(pattern, text) {
+	p = std.string(pattern).lowercase();
+	t = std.string(text).lowercase();
+	pi = 0;
+	ti = 0;
+	star = -1;
+	mark = 0;
+	for(ti < t.length()) {
+		if(pi < p.length() && (p[pi] == "?" || p[pi] == t[ti])) {
+			pi++;
+			ti++;
+		}
+		else if(pi < p.length() && p[pi] == "*") {
+			star = pi;
+			mark = ti;
+			pi++;
+		}
+		else if(star >= 0) {
+			pi = star + 1;
+			mark++;
+			ti = mark;
+		}
+		else
+			return false;
+	}
+	for(pi < p.length() && p[pi] == "*")
+		pi++;
+	return pi == p.length();
+}
+
+//Does the name (comment) of a rekordbox cue match a pattern: the whole name or one of its words ("DROP" matches
+//"drop", "@strobe" matches "build @strobe @fog")
+desk_show_name_matches(pattern, comment) {
+	p = std.string(pattern ?? "").trim();
+	c = std.string(comment ?? "").trim();
+	if(!p || !c)
+		return false;
+	if(desk_show_glob(p, c))
+		return true;
+	for(w : c.split(" ")) {
+		if(w && desk_show_glob(p, w))
+			return true;
+	}
+	return false;
+}
+
+// =========================================================================
+// Decks between two frames
+// =========================================================================
+
+//Does a deck count for a scope (enabled of a track, players of a rule). deck: [master, on_air, ...]
+desk_show_deck_ok(deck, scope) {
+	scope = std.string(scope ?? "master");
+	if(scope == "never")
+		return false;
+	if(scope == "master")
+		return deck.master ? true : false;
+	if(scope == "onair")
+		return deck.on_air ? true : false;
+	return true;
+}
+
+//What a deck remembers between frames (not saved)
+desk_show_tracker_new() {
+	return [track = "", pos = -1.0, playing = false, inside = std.json()];
+}
+
+//Does a track show lock out phrase triggers (it has cues and lock_phrases is on)
+desk_show_locks_phrases(entry) {
+	return entry && entry.cues.size() > 0 && (entry.lock_phrases ??? true) ? true : false;
+}
+
+//The beats a look-ahead rule aims at in a track (before the beats of the rule): drops, buildups, breaks, new phrases,
+//memory cues or track cues
+desk_show_targets(target, entry, info, locked) {
+	out = [];
+	target = std.string(target ?? "drop");
+	if(target == "cue") {
+		if(entry) {
+			for(c : entry.cues)
+				out.push_back(std.float(c.beat));
+		}
+		return out;
+	}
+	if(!info)
+		return out;
+	if(target == "memory") {
+		if(info.has("cues") && std.type(info.cues) == "json") {
+			for(c : info.cues) {
+				if(desk_show_kind_ok("memory", c.kind))
+					out.push_back(desk_show_rb_beat(c, info));
+			}
+		}
+		return out;
+	}
+	if(locked || !info.has("phrases") || std.type(info.phrases) != "json")
+		return out;
+	for(i, ph : info.phrases) {
+		if(i == 0)
+			continue; //the first phrase starts the track: nothing to be ahead of
+		group = std.string(ph.group ?? "");
+		if(!group)
+			group = desk_phrase_group(ph.name ?? "");
+		if(target == "phrase" || group == target)
+			out.push_back(std.float(ph.beat ?? 0));
+	}
+	return out;
+}
+
+//The cues the playhead is in when a deck gets a track (entered without starting)
+desk_show_enter_at(tr, deck, entry, pos, out) {
+	if(!entry || pos < 1.0)
+		return;
+	ok = desk_show_deck_ok(deck, entry.enabled ?? "master");
+	for(c : entry.cues) {
+		r = desk_show_cue_range(c);
+		if(pos >= r.b && pos < r.e) {
+			tr.inside[c.id] = [cue = c, started = false];
+			if(ok)
+				out.push_back([type = "enter", cue = c]);
+		}
+	}
+}
+
+//What happened on a deck since the last frame. tr: desk_show_tracker_new() of the deck (changed here). deck: [n, pos
+//(beat + beatPhase, -1 unknown), playing (really playing: moving), on_air, master, bpm, track (its id, "" none)].
+//entry: the show of its track or None. info: track(id) of the prolink module or None. sh: the show.
+//Returns a list of [type = "enter" | "start" | "exit", cue, late, started], [type = "name", rule, rb (the rekordbox cue)],
+//[type = "phrase", phrase, index] and [type = "ahead", rule, at (the beat of the target)]
+desk_show_step(tr, deck, entry, info, sh) {
+	out = [];
+	tid = std.string(deck.track ?? "");
+	p1 = std.float(deck.pos ??? -1.0);
+	playing = deck.playing ? true : false;
+	if(tid != tr.track) {
+		for(k, v : tr.inside)
+			out.push_back([type = "exit", cue = v.cue, started = v.started]);
+		tr.track = tid;
+		tr.inside = std.json();
+		tr.pos = p1;
+		tr.playing = playing;
+		desk_show_enter_at(tr, deck, entry, p1, out);
+		return out;
+	}
+	p0 = std.float(tr.pos);
+	valid = p0 >= 1.0 && p1 >= 1.0;
+	//a little behind while it plays: a beat packet after the status (#djlink), keep the position of the last frame
+	if(valid && playing && tr.playing && p1 < p0 && p0 - p1 < DESK_SHOW_JITTER)
+		return out;
+	through = valid && tr.playing && playing && p1 >= p0 && p1 - p0 <= DESK_SHOW_MAX_STEP;
+	starts_playing = valid && playing && !tr.playing;
+	locked = desk_show_locks_phrases(entry);
+
+	//the cues of the track's show
+	ids = std.json();
+	if(entry) {
+		scope_ok = desk_show_deck_ok(deck, entry.enabled ?? "master");
+		for(c : entry.cues) {
+			ids[c.id] = true;
+			r = desk_show_cue_range(c);
+			was = tr.inside.has(c.id);
+			now_in = p1 >= r.b && p1 < r.e;
+			crossed = through && p0 < r.b && p1 >= r.b;
+			if(now_in && !was) {
+				tr.inside[c.id] = [cue = c, started = false];
+				if(scope_ok)
+					out.push_back([type = "enter", cue = c]);
+			}
+			if(crossed && scope_ok) {
+				out.push_back([type = "start", cue = c, late = false]);
+				if(now_in)
+					tr.inside[c.id].started = true;
+				else
+					out.push_back([type = "exit", cue = c, started = true]); //played through all of it in one frame
+			}
+			else if(now_in && starts_playing && scope_ok && (c.late ?? false) && !tr.inside[c.id].started) {
+				out.push_back([type = "start", cue = c, late = true]);
+				tr.inside[c.id].started = true;
+			}
+			if(was && !now_in) {
+				v = tr.inside[c.id];
+				tr.inside.erase(c.id);
+				out.push_back([type = "exit", cue = v.cue, started = v.started]);
+			}
+		}
+	}
+	//cues deleted from the show while the playhead was in them
+	for(i = tr.inside.size() - 1; i >= 0; i--) {
+		k = tr.inside.key(i);
+		if(!ids.has(k)) {
+			v = tr.inside[i];
+			tr.inside.erase(k);
+			out.push_back([type = "exit", cue = v.cue, started = v.started]);
+		}
+	}
+
+	if(through && info) {
+		//rekordbox cues with a name a rule waits for
+		if(sh.name_rules.size() && info.has("cues") && std.type(info.cues) == "json") {
+			for(c : info.cues) {
+				b = desk_show_rb_beat(c, info);
+				if(b < 1.0 || !(p0 < b && p1 >= b))
+					continue;
+				for(rule : sh.name_rules) {
+					if(!(rule.on ??? true) || !desk_show_deck_ok(deck, rule.players ?? "master"))
+						continue;
+					if(desk_show_kind_ok(rule.kinds ?? "all", c.kind) && desk_show_name_matches(rule.pattern, c.comment))
+						out.push_back([type = "name", rule = rule, rb = c]);
+				}
+			}
+		}
+		//new phrases
+		if(!locked && info.has("phrases") && std.type(info.phrases) == "json") {
+			for(i, ph : info.phrases) {
+				b = std.float(ph.beat ?? 0);
+				if(p0 < b && p1 >= b)
+					out.push_back([type = "phrase", phrase = ph, index = i]);
+			}
+		}
+	}
+	//look-ahead
+	if(through) {
+		for(rule : sh.lookahead) {
+			if(!(rule.on ??? true) || !desk_show_deck_ok(deck, rule.players ?? "master"))
+				continue;
+			ahead = std.float(rule.beats ?? 0.0);
+			for(b : desk_show_targets(rule.target, entry, info, locked)) {
+				at = b - ahead;
+				if(p0 < at && p1 >= at)
+					out.push_back([type = "ahead", rule = rule, at = b]);
+			}
+		}
+	}
+	tr.pos = p1;
+	tr.playing = playing;
+	return out;
+}
+
+// =========================================================================
+// Phrase triggers
+// =========================================================================
+
+//The group of a phrase of track(id).phrases ("drop", "verse", ...)
+desk_show_phrase_group_of(ph) {
+	g = std.string(ph.group ?? "");
+	return g ? g : desk_phrase_group(ph.name ?? "");
+}
+
+//Does a phrase trigger fit a new phrase of a deck: on, players, the phrase, the mood of the track, the length of the
+//phrase in bars (0: no limit), the BPM of the deck (0: no limit)
+desk_show_phrase_fits(rule, deck, ph, info) {
+	if(!(rule.on ??? true) || !desk_show_deck_ok(deck, rule.players ?? "master"))
+		return false;
+	want = std.string(rule.phrase ?? "");
+	if(want && desk_show_phrase_group_of(ph) != want && desk_show_norm_text(ph.name) != want)
+		return false;
+	mood = std.string(rule.mood ?? "");
+	if(mood && std.string(info ? info.mood ?? "" : "") != mood)
+		return false;
+	bars = (std.float(ph.endBeat ?? ph.beat ?? 0) - std.float(ph.beat ?? 0)) / 4.0;
+	if(std.float(rule.bars_min ?? 0) > 0.0 && bars < std.float(rule.bars_min))
+		return false;
+	if(std.float(rule.bars_max ?? 0) > 0.0 && bars > std.float(rule.bars_max))
+		return false;
+	bpm = std.float(deck.bpm ?? 0);
+	if(std.float(rule.bpm_min ?? 0) > 0.0 && bpm < std.float(rule.bpm_min))
+		return false;
+	if(std.float(rule.bpm_max ?? 0) > 0.0 && bpm > std.float(rule.bpm_max))
+		return false;
+	return true;
+}
+
+//The phrase triggers that run for a new phrase: one of those that fit is picked by weight (rnd 0..1); a solo one runs
+//alone, a blend one together with every other blend one that fits
+desk_show_pick_phrase(sh, deck, ph, info, rnd) {
+	fits = [];
+	total = 0.0;
+	for(rule : sh.phrase_rules) {
+		if(desk_show_phrase_fits(rule, deck, ph, info)) {
+			fits.push_back(rule);
+			total += math.clamp(std.float(rule.weight ?? 100.0), 1.0, 1000.0);
+		}
+	}
+	if(!fits.size())
+		return [];
+	at = math.clamp(std.float(rnd), 0.0, 0.999999) * total;
+	picked = fits[-1];
+	for(rule : fits) {
+		w = math.clamp(std.float(rule.weight ?? 100.0), 1.0, 1000.0);
+		if(at < w) {
+			picked = rule;
+			break;
+		}
+		at -= w;
+	}
+	if(picked.solo ??? true)
+		return [picked];
+	out = [];
+	for(rule : fits) {
+		if(!(rule.solo ??? true))
+			out.push_back(rule);
+	}
+	return out;
+}
+
+// =========================================================================
+// Limits of stacks (strobes, blinders, specials)
+// =========================================================================
+
+desk_limit_of(sh, stack_id) {
+	for(l : sh.limits) {
+		if(l.stack == stack_id)
+			return l;
+	}
+	return None;
+}
+
+//What the runtime keeps of a stack with a limit: when it went on (-1: off), when it went off, its times on
+desk_limit_state_new() {
+	return [on_ms = -1, off_ms = -1000000000, spans = []];
+}
+
+//The stack is on or off now (each frame): keeps when it went on and off, the spans of the last window seconds
+desk_limit_note(st, on, now_ms, window_s) {
+	if(on && st.on_ms < 0)
+		st.on_ms = now_ms;
+	else if(!on && st.on_ms >= 0) {
+		st.spans.push_back([st.on_ms, now_ms]);
+		st.on_ms = -1;
+		st.off_ms = now_ms;
+	}
+	keep = now_ms - std.float(window_s) * 1000.0;
+	for(st.spans.size() && st.spans[0][1] < keep)
+		st.spans.erase(0);
+}
+
+//Seconds the stack was on in the last window seconds
+desk_limit_on_seconds(st, now_ms, window_s) {
+	from = now_ms - std.float(window_s) * 1000.0;
+	ms = 0.0;
+	for(s : st.spans)
+		ms += math.max(0.0, s[1] - math.max(s[0], from));
+	if(st.on_ms >= 0)
+		ms += now_ms - math.max(st.on_ms, from);
+	return ms / 1000.0;
+}
+
+//May the automation start the stack now: "" yes, else why not
+desk_limit_may_start(limit, st, now_ms, armed) {
+	if(!limit)
+		return "";
+	if((limit.special ?? false) && !armed)
+		return "disarmed (special)";
+	if(st.on_ms >= 0)
+		return "";
+	gap = std.float(limit.min_gap ?? 0.0);
+	if(gap > 0.0 && now_ms - st.off_ms < gap * 1000.0)
+		return "min gap " + desk_num_text(gap) + " s";
+	duty = std.float(limit.duty ?? 0.0);
+	window = math.max(1.0, std.float(limit.window ?? 60.0));
+	if(duty > 0.0 && desk_limit_on_seconds(st, now_ms, window) >= duty * window)
+		return "duty cycle " + std.int(math.round(duty * 100.0)) + " % of " + desk_num_text(window) + " s";
+	return "";
+}
+
+//Must the stack go off now: "" no, else why
+desk_limit_must_stop(limit, st, now_ms) {
+	if(!limit || st.on_ms < 0)
+		return "";
+	max_on = std.float(limit.max_on ?? 0.0);
+	if(max_on > 0.0 && now_ms - st.on_ms >= max_on * 1000.0)
+		return "max on-time " + desk_num_text(max_on) + " s";
+	duty = std.float(limit.duty ?? 0.0);
+	window = math.max(1.0, std.float(limit.window ?? 60.0));
+	if(duty > 0.0 && desk_limit_on_seconds(st, now_ms, window) > duty * window)
+		return "duty cycle " + std.int(math.round(duty * 100.0)) + " % of " + desk_num_text(window) + " s";
+	return "";
+}
+
+//How long the automation leaves a stack alone after the operator touched it: bars at a BPM, in ms
+desk_show_backoff_ms(bars, bpm) {
+	return std.float(bars) * 4.0 * 60000.0 / math.max(1.0, std.float(bpm));
+}
+
+// =========================================================================
+// Cue call: what comes next on the master deck, per crew
+// =========================================================================
+
+//"4.0" (4 bars), "1.3" (1 bar and 3 beats): beats as bars.beats, rounded up to whole beats
+desk_show_bars_text(beats) {
+	n = std.int(math.ceil(math.max(0.0, std.float(beats)) - 0.0001));
+	return std.string(std.int(math.floor(n / 4.0))) + "." + std.string(n % 4);
+}
+
+//"standby" (within standby beats), "3", "2", "1" (the last beats), "go" (the beat it is on), "" (further away)
+desk_show_call_state(beats, standby) {
+	b = std.float(beats);
+	if(b <= 0.0)
+		return b > -1.0 ? "go" : "";
+	if(b <= 1.0)
+		return "1";
+	if(b <= 2.0)
+		return "2";
+	if(b <= 3.0)
+		return "3";
+	return b <= std.float(standby) ? "standby" : "";
+}
+
+//What comes on a deck: [[crew, what, beat]] (track cues, named rekordbox cues of a rule, look-ahead, phrases a phrase
+//trigger fits), for the crews of their rules and cues
+desk_show_upcoming(sh, deck, entry, info) {
+	out = [];
+	locked = desk_show_locks_phrases(entry);
+	if(entry && desk_show_deck_ok(deck, entry.enabled ?? "master")) {
+		for(c : entry.cues)
+			out.push_back([crew = std.string(c.crew ?? "Lighting"), what = std.string(c.name ?? ""), beat = std.float(c.beat)]);
+	}
+	if(info && info.has("cues") && std.type(info.cues) == "json") {
+		for(c : info.cues) {
+			for(rule : sh.name_rules) {
+				if((rule.on ??? true) && desk_show_deck_ok(deck, rule.players ?? "master") && desk_show_kind_ok(rule.kinds ?? "all", c.kind) && desk_show_name_matches(rule.pattern, c.comment))
+					out.push_back([crew = std.string(rule.crew ?? "Lighting"), what = std.string(c.comment), beat = desk_show_rb_beat(c, info)]);
+			}
+		}
+	}
+	for(rule : sh.lookahead) {
+		if(!(rule.on ??? true) || !desk_show_deck_ok(deck, rule.players ?? "master"))
+			continue;
+		for(b : desk_show_targets(rule.target, entry, info, locked))
+			out.push_back([crew = std.string(rule.crew ?? "Lighting"), what = std.string(rule.name ?? ""), beat = b - std.float(rule.beats ?? 0.0)]);
+	}
+	if(!locked && info && info.has("phrases") && std.type(info.phrases) == "json") {
+		for(i, ph : info.phrases) {
+			if(i == 0)
+				continue;
+			for(rule : sh.phrase_rules) {
+				if(desk_show_phrase_fits(rule, deck, ph, info))
+					out.push_back([crew = std.string(rule.crew ?? "Lighting"), what = std.string(ph.name ?? ""), beat = std.float(ph.beat ?? 0)]);
+			}
+		}
+	}
+	return out;
+}
+
+//A row of the cue call: the next item after pos (one that passed less than a beat ago is still "go")
+desk_show_call_row(crew, items, pos, standby) {
+	best = None;
+	for(it : items) {
+		if(it.beat > pos - 1.0 && (!best || it.beat < best.beat))
+			best = it;
+	}
+	if(!best)
+		return [crew = crew, what = "", beats = -1.0, text = "-", state = ""];
+	left = best.beat - pos;
+	return [crew = crew, what = best.what, beats = math.round(left * 100.0) / 100.0, text = desk_show_bars_text(left),
+		state = desk_show_call_state(left, standby), at = desk_show_bar_text(best.beat)];
+}
+
+//The cue call of a deck: per crew of the show the next thing and how far it is (bars.beats), and the next phrase.
+//[deck, title, pos, bar (text), phrase (the phrase now), rows = [[crew, what, beats, text, state, at]], next_phrase = row]
+desk_show_cue_call(sh, deck, entry, info) {
+	pos = std.float(deck.pos ??? -1.0);
+	items = pos >= 1.0 ? desk_show_upcoming(sh, deck, entry, info) : [];
+	standby = std.float(sh.standby_beats ?? 16.0);
+	rows = [];
+	for(crew : sh.crews) {
+		mine = [];
+		for(it : items) {
+			if(it.crew == crew)
+				mine.push_back(it);
+		}
+		rows.push_back(desk_show_call_row(crew, mine, pos, standby));
+	}
+	phrases = [];
+	now_phrase = "";
+	if(pos >= 1.0 && info && info.has("phrases") && std.type(info.phrases) == "json") {
+		for(i, ph : info.phrases) {
+			b = std.float(ph.beat ?? 0);
+			if(pos >= b && pos < std.float(ph.endBeat ?? b))
+				now_phrase = std.string(ph.name ?? "");
+			if(i > 0)
+				phrases.push_back([crew = "Phrase", what = std.string(ph.name ?? ""), beat = b]);
+		}
+	}
+	return [deck = deck.n ?? 0, title = info ? std.string(info.title ?? "") : "", pos = math.round(pos * 100.0) / 100.0,
+		bar = pos >= 1.0 ? desk_show_bar_text(pos) : "", playing = deck.playing ? true : false, phrase = now_phrase,
+		show = entry ? true : false, rows = rows, next_phrase = desk_show_call_row("Phrase", phrases, pos, standby)];
+}
+
+// =========================================================================
+// Actions as text (the Track cues editor): go Main, goto 3 Main, off Main, clip 1 2, column 3, desk <command>,
+// midi 90 3C 7F @ <device>, osc <ip>[:port] /address [values], song <name>, loop start|stop <name>
+// =========================================================================
+
+desk_action_text(d, a) {
+	if(!a || std.type(a) != "json" || !a.has("type"))
+		return "";
+	t = std.string(a.type);
+	if(t == "stack") {
+		s = desk_stack(d, a.stack ?? "");
+		name = s ? s.name : "(deleted stack)";
+		if(name.find(" ") >= 0)
+			name = "\"" + name + "\"";
+		op = std.string(a.op ?? "go");
+		if(op == "goto")
+			return "goto " + desk_num_text(a.cue ?? 1) + " " + name;
+		return op + " " + name;
+	}
+	if(t == "clip")
+		return "clip " + std.int(a.row ?? 0) + " " + std.int(a.col ?? 0);
+	if(t == "column")
+		return "column " + std.int(a.col ?? 0);
+	if(t == "desk")
+		return "desk " + std.string(a.command ?? "");
+	if(t == "midi")
+		return "midi " + std.string(a.message ?? "") + (a.device ?? "" ? " @ " + std.string(a.device) : "");
+	if(t == "osc")
+		return "osc " + std.string(a.message ?? "");
+	if(t == "song")
+		return "song " + std.string(a.song ?? "");
+	if(t == "loop")
+		return "loop " + ((a.run ??? 1) ? "start " : "stop ") + std.string(a.loop ?? "");
+	if(t == "query")
+		return "query " + std.string(a.query ?? "") + " @ " + std.string(a.live_path ?? "");
+	return t;
+}
+
+//An action from its text: [ok, action (None: nothing), error]
+desk_action_parse(d, text) {
+	text = std.string(text ?? "").trim();
+	if(!text)
+		return [ok = true, action = None, error = ""];
+	words = desk_tokens(text);
+	w0 = std.string(words[0]).lowercase();
+	rest_at = text.find(" ");
+	rest = rest_at >= 0 ? text.substr(rest_at + 1).trim() : "";
+	if(w0 == "go" || w0 == "goto" || w0 == "off") {
+		i = 1;
+		number = 1.0;
+		if(w0 == "goto") {
+			if(words.size() < 2 || !desk_is_number(words[1]))
+				return [ok = false, action = None, error = "goto <cue number> <stack>"];
+			number = std.float(words[1]);
+			i = 2;
+		}
+		if(i < words.size() && std.string(words[i]).lowercase() == "stack")
+			i++;
+		ref = "";
+		for(k = i; k < words.size(); k++)
+			ref += (k > i ? " " : "") + words[k];
+		if(!ref)
+			return [ok = false, action = None, error = w0 + " <stack>: which cue stack?"];
+		s = desk_find_stack(d, ref);
+		if(!s)
+			return [ok = false, action = None, error = "No cue stack " + ref];
+		a = [type = "stack", stack = s.id, op = w0];
+		if(w0 == "goto")
+			a.cue = number;
+		return [ok = true, action = a, error = ""];
+	}
+	if(w0 == "clip") {
+		if(words.size() < 3 || !desk_is_number(words[1]) || !desk_is_number(words[2]))
+			return [ok = false, action = None, error = "clip <row> <column>"];
+		return [ok = true, action = [type = "clip", view = "", row = std.int(std.float(words[1])), col = std.int(std.float(words[2]))], error = ""];
+	}
+	if(w0 == "column") {
+		if(words.size() < 2 || !desk_is_number(words[1]))
+			return [ok = false, action = None, error = "column <column>"];
+		return [ok = true, action = [type = "column", view = "", col = std.int(std.float(words[1]))], error = ""];
+	}
+	if(w0 == "desk") {
+		if(!rest)
+			return [ok = false, action = None, error = "desk <command line>"];
+		return [ok = true, action = [type = "desk", command = rest], error = ""];
+	}
+	if(w0 == "midi") {
+		at = rest.find("@");
+		msg = (at >= 0 ? rest.substr(0, at) : rest).trim();
+		dev = at >= 0 ? rest.substr(at + 1).trim() : "";
+		if(!msg)
+			return [ok = false, action = None, error = "midi 90 3C 7F @ <device>"];
+		return [ok = true, action = [type = "midi", message = msg, device = dev], error = ""];
+	}
+	if(w0 == "osc") {
+		// The message is checked when it runs (tl_osc_parse of the timeline cues); here only its shape
+		if(words.size() < 3 || !std.string(words[2]).starts("/"))
+			return [ok = false, action = None, error = "osc <ip>[:port] /address [values]"];
+		return [ok = true, action = [type = "osc", message = rest], error = ""];
+	}
+	if(w0 == "song") {
+		if(!rest)
+			return [ok = false, action = None, error = "song <name>"];
+		return [ok = true, action = [type = "song", song = rest], error = ""];
+	}
+	if(w0 == "loop") {
+		if(words.size() < 3)
+			return [ok = false, action = None, error = "loop start|stop <name>"];
+		run = std.string(words[1]).lowercase() == "stop" ? 0 : 1;
+		return [ok = true, action = [type = "loop", loop = rest.substr(rest.find(" ") + 1).trim(), run = run], error = ""];
+	}
+	return [ok = false, action = None, error = "Actions: go <stack>, goto <n> <stack>, off <stack>, clip <row> <col>, column <col>, desk <command>, midi <hex> @ <device>, osc <ip>[:port] /address [values], song <name>, loop start|stop <name>"];
+}
+
+//The stack an action starts or stops (for limits and back-off): its id, "" for other actions
+desk_action_stack(a) {
+	return a && std.type(a) == "json" && (a.type ?? "") == "stack" ? std.string(a.stack ?? "") : "";
+}

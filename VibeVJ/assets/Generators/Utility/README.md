@@ -27,6 +27,7 @@ that show or shape a value.
 | **textbox.asset** | A text field; its text is saved with the project |
 | **value_text.asset** | Shows the value of its input as text |
 | **Chat.asset** | The chat of the sidebar as a generator |
+| **Director.asset** | An AI model (OpenAI-compatible API, local or cloud) decides intensity, strobe, palette and scene from the DJ data, with a confidence each, guided by a behaviour prompt and a chat of short instructions; outputs to link (`engine/director/director.shio`) |
 | **broken.asset** | Fails on purpose: an example of the error report of a broken asset |
 
 ## Usage

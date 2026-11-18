@@ -25,6 +25,9 @@ the ESP32 firmware) and `shz_builtin_shizonet.cpp` (the script API).
   to the script thread.
 - the **send thread** owns the socket for sending. Every destination has its own queue and pacing: every 64 packets a
   diagnostic request asks how many arrived, lost packets slow the destination down, clean runs speed it up again.
+  A destination that does not answer a diagnostic request for 1 s is asked again until it answers; meanwhile its
+  regular packets are dropped instead of queued (a device that comes back gets live data, not the outage replayed;
+  reliable transfers resend what was lost) and the send thread sleeps instead of spinning (#933).
 - the **script thread** (`update()`) handles what was received, the handshake and the timers, and queues packets.
 
 Backpressure: every destination has a budget of queued packets (about 20 ms at its current rate,
@@ -39,6 +42,9 @@ Microcontrollers have no threads of their own: lwIP hands the packets over in it
 A device is created when it is first seen and **never deleted when it disconnects**: it goes *offline* and keeps its
 object, settings and static buffers. Offline devices are freed after a day (not the ones added by script). Offline
 devices with a known IP are polled directly, so they are found again in other subnets as well.
+
+Only what a device sends keeps it online (beacon replies, alive checks, acks, its data). Without that it goes offline
+after its timeout (10 s) and one unanswered alive check (10 s more), also while static buffers are streamed to it (#933).
 
 States: `offline` → `auth` (auth request sent) → `init` (init commands and device info) → `online`.
 

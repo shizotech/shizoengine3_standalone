@@ -14,6 +14,17 @@
 //      value into a variable first, so the limit holds with older shz builds too.
 //    * file_task_batch captured the loop variable by reference: items ran twice
 //      and others never (reported as failed).
+//    * this test itself went stale (2026-11-17): miniagent.task() got a compaction
+//      preflight, llm_api.context.token_count_prompt(prompt), which runs whenever
+//      model_config.max_tokens is set (the default) and BEFORE the try block of
+//      task(). The stub's context was a plain JSON without that method, so task()
+//      threw before the stub ran; the task tools caught the exception and dropped
+//      it, and every child came back as "runs=0" / "did not emit a finalize()
+//      report" (7 passed, 6 failed). The stub now has the context shape of
+//      generic_agent (as in stop_propagation_test), and the task tools put the
+//      reason of a crashed child into its report instead of dropping it.
+//
+//  The batch items live in a temp folder below std.user_path() (removed at the end).
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "../miniagent"
@@ -32,20 +43,28 @@ check(name, cond, info = "") {
 	}
 }
 
-meter = [now = 0, peak = 0, runs = 0, items = []];
+meter = [now = 0, peak = 0, runs = 0, items = [], crash = ""];
 
 meter_reset() {
 	meter.now = 0;
 	meter.peak = 0;
 	meter.runs = 0;
 	meter.items = [];
+	meter.crash = "";
+}
+
+// The context of the stub: what miniagent.task() and fork use of generic_agent.context.
+// task() asks it for the token count of the prompt before every run (compaction preflight).
+class meter_context {
+	body = [messages = []];		// fork imports the parent's history into it
+	token_count_prompt(prompt) { return 0; }
 }
 
 // generating = inside task(): counted, held for a moment, then the task is finished
 class meter_api {
 	owner = None;
 	stops = 0;
-	context = [body = [messages = []]];	// fork imports the parent's history into it
+	context = meter_context();
 
 	__init__(_owner) { owner = _owner; }
 
@@ -67,6 +86,10 @@ class meter_api {
 		if(t)
 			meter.items.push_back(t.assigned_item ?? t.name);
 		cs.release();
+
+		// a run that dies (the model endpoint is gone, a broken context, ...)
+		if(meter.crash)
+			std.runtime_error(meter.crash);
 
 		if(t) {
 			t.finished = true;
@@ -109,15 +132,21 @@ check("the root takes a slot of a ModelConfig limit", root_slot.held && root_slo
 	"held=" + std.string(root_slot.held) + " limit=" + std.string(root_slot.limit) + " in use=" + std.string(agent_slots_in_use()));
 
 // ── file_task_batch: 6 items, never more than LIMIT generating ──────────────
-dir = "tests/_role_slots_tmp";
+// The target of a batch is relative to the working directory (fileio.glob), so the
+// test moves into its temp folder for the batch calls and back afterwards.
+start_dir = fileio.absolute_path(".");
+dir = fileio.absolute_path(std.user_path() + "/miniagent/role_slots_test_" + std.random_hash(8));
+fileio.mkdir(dir + "/items");
 names = [];
 for(i = 0; i < 6; i++) {
-	names.push_back(dir + "/item" + i + ".txt");
-	fileio.write_string(names[-1], "x");
+	names.push_back("items/item" + i + ".txt");
+	fileio.write_string(dir + "/" + names[-1], "x");
 }
 
+std.cd(dir);
+
 meter_reset();
-r = call(root, "file_task_batch", [target = dir + "/*.txt", goal = "process the item"]);
+r = call(root, "file_task_batch", [target = "items/*.txt", goal = "process the item"]);
 
 check("batch: every item ran", meter.runs == 6 && r.total == 6, "runs=" + std.string(meter.runs) + " total=" + std.string(r.total));
 check("batch: every item finished", r.finished == 6 && r.failed == 0, "finished=" + std.string(r.finished) + " failed=" + std.string(r.failed));
@@ -135,9 +164,25 @@ check("batch: at most max_running_agents generate", meter.peak <= LIMIT, "peak="
 check("batch: items ran in parallel", meter.peak == LIMIT, "peak=" + std.string(meter.peak));
 check("batch: the slots are back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
 
-for(i = 0; i < names.size(); i++)
-	fileio.remove(names[i]);
+// a target glob() does not take is an error, not "matched no files"
+meter_reset();
+r = call(root, "file_task_batch", [target = dir + "/items/*.txt", goal = "process the item"]);
+check("batch: an absolute target is refused with a reason", std.is_json(r) && r.has("ok") && !r.ok && std.string(r.error).contains("absolute") && meter.runs == 0, std.string(r));
+r = call(root, "file_task_batch", [target = "../*.txt", goal = "process the item"]);
+check("batch: a target outside the working directory is refused", std.is_json(r) && r.has("ok") && !r.ok && std.string(r.error).contains("outside the working directory"), std.string(r));
+r = call(root, "file_task_batch", [target = "items/*.nothing", goal = "process the item"]);
+check("batch: a target that matches nothing is still a finished batch", std.is_json(r) && r.total == 0 && r.status == "BATCH finished", std.string(r));
+
+// ── a child whose run throws: the reason reaches the parent ─────────────────
+meter_reset();
+meter.crash = "the model endpoint is unreachable";
+r = call(root, "file_task_batch", [target = "items/item0.txt", goal = "process the item"]);
+check("batch: a crashed item is failed and says why", r.total == 1 && r.failed == 1 && std.string(r.results[0].report).contains("the model endpoint is unreachable"), std.string(r));
+check("batch: the slot of a crashed item is back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+std.cd(start_dir);
 fileio.remove(dir);
+check("the temp folder is gone", !fileio.exists(dir), dir);
 
 // ── fork: 4 siblings ──────────────────────────────────────────────────────────
 meter_reset();
@@ -151,6 +196,29 @@ meter_reset();
 r = call(root, "start_task", [name = "t", goal = "g", context = "", contract = "", effort = "low"]);
 check("start_task: the child ran and reported", meter.runs == 1 && r.report == "ok", std.string(r));
 check("start_task: no extra pool slot", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+// calls that cannot work say so, and start nobody
+meter_reset();
+r = call(root, "start_task", [name = "t", context = "", contract = "", effort = "low"]);
+check("start_task: a missing goal is an error", std.is_json(r) && r.has("ok") && !r.ok && std.string(r.error).contains("Missing 'goal'") && meter.runs == 0, std.string(r));
+r = call(root, "fork", [tool_call = [id = "call_x"]]);
+check("fork: missing tasks are an error", std.is_json(r) && r.has("ok") && !r.ok && std.string(r.error).contains("Missing 'tasks'") && meter.runs == 0, std.string(r));
+
+meter_reset();
+meter.crash = "the model endpoint is unreachable";
+r = call(root, "start_task", [name = "t", goal = "g", context = "", contract = "", effort = "low"]);
+check("start_task: a crashed child is failed and says why", r.finish_reason == "failed" && std.string(r.report).contains("the model endpoint is unreachable"), std.string(r));
+check("start_task: the slot of a crashed child is back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+
+r2 = call(root, "continue_task", [task_id = r.task_id, response = "try again"]);
+check("continue_task: a crash says why too", r2.finish_reason == "failed" && std.string(r2.report).contains("the model endpoint is unreachable"), std.string(r2));
+r2 = call(root, "continue_task", [task_id = "task_nope", response = "x"]);
+check("continue_task: an unknown id lists the known tasks", std.is_json(r2) && r2.has("ok") && !r2.ok && std.string(r2.known_tasks).contains(r.task_id), std.string(r2));
+
+r = call(root, "fork", [tasks = ["a", "b"], tool_call = [id = "call_2"]]);
+check("fork: a crashed sibling says why", std.string(r.results[0].report).contains("the model endpoint is unreachable") && std.string(r.results[1].report).contains("the model endpoint is unreachable"), std.string(r));
+check("fork: the slots of crashed siblings are back", agent_slots_in_use() == 1, std.string(agent_slots_in_use()));
+meter_reset();
 
 root_slot.release();
 check("all slots released", agent_slots_in_use() == 0, std.string(agent_slots_in_use()));

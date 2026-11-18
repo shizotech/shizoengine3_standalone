@@ -46,12 +46,31 @@ engine/
 ├── patch/                         # The fixture setup as data (#439), no UI
 │   ├── patch.shio                 # Lamps (node > universe > address), groups, nodes: engine.patch
 │   ├── ledmap.shio                # LED positions and DMX addresses of the LEDMapper
+│   ├── ledscan.shio               # Camera scan of the LEDs' places (#980): the spot on the GPU, the scan step by step
+│   │                              # and the spot of one LED through a material (its spread and light: Stage › Materials)
 │   ├── dmx.shio                   # Who sends to which channels, channels written twice (#440)
 │   ├── patch_ai.shio              # The fixture setup's AI queries: engine.patch_ai, live_path fixture_setup (#440)
 │   ├── fx.shio                    # What the Phaser computes: attributes, shapes, colours, the blend of phasers (#655)
 │   ├── desk.shio                  # The lighting desk as logic (#719): programmer, palettes, cue stacks, command line
 │   ├── desk_runtime.shio          # engine.desk: sends the desk every frame, desk.json, AI queries (live_path desk)
-│   └── palette.shio
+│   ├── palette.shio
+│   ├── stage3d.shio / stage3d_draw.shio  # The stage in 3D: camera, beams (#655); drawn with nvg (the Phaser)
+│   └── stage3d_scene.shio         # The 3D view on a nanogui.view3d (#686): lamps, GDTF models, the models of the stage (#980)
+├── stage/                         # The stage (#980): the room, the set and the decoration in 3D, no UI
+│   ├── stage.shio                 # Objects (model file, screen / LED wall, scan of the venue, place, turn, scale, parent): engine.stage, stage.json;
+│   │                              # the models read once on a thread (stage_model_get), never while drawing
+│   ├── stage_models.shio          # Model files: STL, OBJ (+ .mtl), 3MF (Bambu components too), GLB -> parts in metres, z up
+│   │                              # and their sharp edges / outlines (LED strips along them)
+│   ├── stage_zip.shio             # Reads a 3MF archive (import zip), loaded in a module of its own
+│   ├── stage_ai.shio              # The queries of the live_path "stage" (MCP, Chat vibevj_stage): engine.stage_ai
+│   ├── stage_leds.shio            # LEDMapper groups on the stage: engine.stage_leds (each LEDMapper publishes its placed
+│   │                              # groups and its shader), their LEDs in the world; drawn as glow points (stage3d_scene)
+│   ├── stage_step.shio            # STEP: converted once on a thread (uv environment + Python server) into
+│   │                              # <file>.stagemesh next to it, which stage_models.shio reads
+│   └── step_import.py/            # The converter (OpenCASCADE, cadquery-ocp): asset.json declares it for py_env.shio
+├── menus/                         # The single-use menus of the Tools button (#975), kept when their tab closes
+│   ├── fixtures/                  # setup.menu (the fixture setup), editor.menu (the fixture editor)
+│   └── stage/                     # stage.menu: the Stage menu (#980); stage_check.shio its GUI check
 ├── python/                        # The Python server (#853, docs/python-server.md): a Python script in a process of its own
 │   ├── python_server.shio         # The host: PythonServer (start, call, call_async, events, stop, restart)
 │   ├── shz_python_server.py       # The Python side: frames over stdin / stdout, shared memory for binary data
@@ -141,6 +160,11 @@ on the render thread, and return when it is done and the layout has settled, wit
 meanwhile (#634: the smoke tests load and save without restarts and the dialog). A name is one folder of `projects/`
 (no `/`, `\`, `:` or leading dot). "Pause" rejects every request, "Allow changes" off rejects every write, these two
 tools included.
+
+The server listens on every network (shows without internet, agents on other machines). An optional access token
+(#931, `"token"` in `configs/mcp_server.json`, the *Token* row of the tab; empty = off, the default): set, a client
+that is not on this computer (`client_ip` not 127.x / ::1) needs `Authorization: Bearer <token>` or `?token=<token>`,
+else POST, DELETE and the SSE stream answer 401 (`VibeVJMCPServer.authorized`). Clients on this computer need none.
 
 The query tools follow `engine.ai_interfaces`: the bridge rebuilds them when `engine.ai_interfaces_revision` changed,
 from a watcher thread once a second **and** before every `tools/list` and every `tools/call` of a name it does not have

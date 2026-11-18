@@ -4,15 +4,19 @@
 //  #include "node_api"
 //
 //  api = node_api_start(host, cfg, port, api_token = "", web_root = "");
-//                                                    // returns the webserver object
+//                                                    // returns the ApiRouter (api_router.shio)
+//                                                    // around the HTTP server
 //                                                    // web_root: pages served at /,
 //                                                    // the API index moves to /api
 //  api.stop();
 //
+//  api = ApiRouter();                                // no HTTP: the route table only
+//  node_api_register(api, host, cfg, 0, api_token);  // (a node without --web; other nodes
+//                                                    // reach the routes over ShizoNet)
+//
 //  `host` is a Node() (see node.shio): the WorkspaceRegistry, the node's own
-//  Workspace, the receptionist connector and the ShizoNet service. This module
-//  exposes it as a plain JSON web API so a node can be driven from any machine
-//  in the network.
+//  Workspace and the ShizoNet service. This module exposes it as a plain JSON
+//  web API so a node can be driven from any machine in the network.
 //
 //  Every answer uses the same envelope (as the miniagent dashboard API):
 //
@@ -30,7 +34,9 @@
 //   POST    /api/task                       {name, goal, workspace?} -> {taskid, name}
 //   PUT     /api/task/<id>                  {message}      -> follow-up for a task
 //   DELETE  /api/task/<id>                                   -> stop a task
-//   POST    /api/request                    {prompt}       -> {request_id}
+//   POST    /api/request                    {prompt, workspace?} -> {request_id}
+//                                           one worker turn in a workspace (the node's own
+//                                           by default), answered through poll / stream
 //   POST    /api/request/poll               {request_id}   -> {status, delta|result}
 //   GET     /api/request/stream?request_id=<id>             -> SSE delta stream
 //   POST    /api/request/stop               {request_id}   -> abort the turn
@@ -38,8 +44,7 @@
 //   GET     /api/events                     (?since=<ms> task lifecycle events)
 //   POST    /api/shutdown                                      -> stop the node
 //
-//  Request lifecycle: "queued" -> "generating" -> "waiting" -> "done" | "error",
-//  the same contract the dashboard chat client uses for /api/adminagent.
+//  Request lifecycle: "queued" -> "generating" -> "waiting" -> "done" | "error".
 //
 //  api_token: when non-empty every endpoint except /api/health requires
 //  "Authorization: Bearer <token>" or "X-Api-Token: <token>".
@@ -50,9 +55,11 @@
 //      curl http://host:13337/api/tasks
 // ═════════════════════════════════════════════════════════════════════════════
 
+#include "api_router"
+
 import webserver;
 
-NODE_API_VERSION = "1.0.0";
+NODE_API_VERSION = "1.1.0";
 NODE_API_MAX_KEPT = 200;
 NODE_API_STREAM_POLL_MS = 50;
 NODE_API_STREAM_PING_MS = 15000;
@@ -226,21 +233,36 @@ node_api_tasks(host) {
 //  Server
 // ─────────────────────────────────────────────────────────────────────────────
 
-// web_root: a folder of web pages served at / (shz miniagent --web, web_ui.shio);
+def node_api_register(server, host, cfg, port, api_token, api_at_root);
+
+// web_root: a folder of web pages served at / (shz miniagent --node --web, web_ui.shio);
 // the API index moves to /api then. web_protect optionally filters static files.
+// -> the ApiRouter around the started HTTP server, None when the port is taken
 node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = None) {
     port = std.int(port);
-    api_token = std.string(api_token);
     web_root = std.string(web_root ?? "");
 
-    server = webserver.http_server(port);
+    server = ApiRouter(webserver.http_server(port));
 
-    if(web_root) {
-        if(web_protect)
-            server.static("", web_root, web_protect);
-        else
-            server.static("", web_root);
+    if(web_root)
+        server.static("", web_root, web_protect);
+
+    node_api_register(server, host, cfg, port, api_token, web_root ? true : false);
+
+    if(!server.start()) {
+        std.error("node_api: cannot start the HTTP server on port ", port, ".");
+        return None;
     }
+
+    return server;
+}
+
+// Registers the node routes on an ApiRouter (with or without an HTTP server behind it).
+// api_at_root = false: the index is served at "/", true: at "/api" (web pages own "/").
+node_api_register(server, host, cfg, port = 0, api_token = "", api_at_root = false) {
+    port = std.int(port);
+    api_token = std.string(api_token ?? "");
+    web_root = api_at_root ? "web" : "";
 
     // API state. All of these are shared by reference with the route lambdas.
     requests = [];          // request_id -> request state
@@ -372,21 +394,27 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
                 workspace_stats = host.registry.manager.stats();
         } catch(e) {}
 
-        receptionist_active = false;
-        receptionist_queued = 0;
+        // open direct requests of this node (Node.request: one worker turn each)
+        requests_active = 0;
         try {
-            if(host.receptionist) {
-                receptionist_active = host.receptionist._active ? true : false;
-                receptionist_queued = host.receptionist.queue.size();
-            } else {
-                receptionist_active = host._receptionist_active ? true : false;
-                receptionist_queued = host.request_queue.size();
+            requests_active = std.int(host.requests_active());
+        } catch(e) {
+            try {
+                requests_active = host._receptionist_active ? 1 : 0;
+            } catch(e2) {
+                requests_active = 0;
             }
+        }
+
+        description = "";
+        try {
+            description = node_api_str(host.description, "");
         } catch(e) {}
 
         return node_api_ok([
             node = [
                 name = node_name,
+                description = description,
                 version = NODE_API_VERSION,
                 port = port,
                 running = json.bool(host.running),
@@ -399,10 +427,6 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
                 max_tokens = cfg.max_tokens,
                 max_running_agents = cfg.max_running_agents,
             ],
-            receptionist = [
-                active = json.bool(receptionist_active),
-                queued = receptionist_queued,
-            ],
             workers = workers,
             workspace_stats = workspace_stats,
             tasks = [
@@ -413,6 +437,7 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
             ],
             requests = [
                 open = requests.size(),
+                active = requests_active,
                 total = counters.requests_total,
                 done = counters.requests_done,
                 error = counters.requests_error,
@@ -422,7 +447,7 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
         ]);
     });
 
-    // GET /api/overview — raw overview (what the receptionist sees)
+    // GET /api/overview — raw overview: the tasks of every workspace, by state
     server.route("GET", "^/api/overview$", [host, api_token](req, writer) {
         if(!node_api_authorized(req, api_token))
             return node_api_err("Unauthorized", 401);
@@ -505,9 +530,14 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
         if(taskid.empty())
             return node_api_err("add_task refused (empty taskid)", 503);
 
-        reply = [taskid = taskid, name = name, state = "planned"];
-        if(workspace)
-            reply.workspace_id = workspace;
+        state = "planned";
+         info = host.inspect_task(taskid);
+         if(std.is_json(info) && info.ok && !std.is_none(info.state))
+             state = node_api_str(info.state, "planned");
+
+         reply = [taskid = taskid, name = name, state = state];
+         if(workspace)
+             reply.workspace_id = workspace;
 
         return node_api_ok(reply);
     });
@@ -561,11 +591,17 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
         if(prompt.strip().empty())
             return node_api_err("Missing 'prompt'");
 
+        workspace = node_api_get(body, "workspace");
+        if(workspace.empty())
+            workspace = node_api_get(body, "workspace_id");
+        workspace = workspace.strip();
+
         request_id = std.random_hash(24);
 
         requests[request_id] = [
             id = request_id,
             prompt = prompt,
+            workspace = workspace,
             status = "queued",
             queue = [],
             result = None,
@@ -577,7 +613,7 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
 
         counters.requests_total++;
 
-        run_request = [host, requests, counters, request_id, prompt]() {
+        run_request = [host, requests, counters, request_id, prompt, workspace]() {
             on_action = [requests, request_id](action) {
                 if(!requests.has(request_id))
                     return;
@@ -594,7 +630,13 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
             };
 
             try {
-                result = host.request(prompt, on_finish, on_action);
+                result = None;
+
+                // a host that takes no workspace (a stub, an older host) gets the plain call
+                if(workspace)
+                    result = host.request(prompt, on_finish, on_action, workspace);
+                else
+                    result = host.request(prompt, on_finish, on_action);
 
                 if(requests.has(request_id)) {
                     requests[request_id].result = result;
@@ -663,7 +705,7 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
     });
 
     // GET /api/request/stream?request_id=<id> — server sent events
-    server.route("GET", "^/api/request/stream$", [requests, api_token](req, writer) {
+    api_route_stream(server, "GET", "^/api/request/stream$", [requests, api_token](req, writer) {
         request_id = node_api_get(req.query_params, "request_id");
 
         if(!node_api_authorized(req, api_token)) {
@@ -763,12 +805,23 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
         requests[request_id].result = None;
         requests.erase(request_id);
 
-        // The receptionist is a single shared agent: stopping it ends the current
-        // turn of this node, exactly like the dashboard stop endpoint.
+        // Stop the worker turn of the request. A host without stop_request (a stub,
+        // an older host with a receptionist agent) gets the legacy call.
+        stopped = false;
         try {
-            host.receptionist.stop();
+            if(std.is_function(host.stop_request)) {
+                host.stop_request();
+                stopped = true;
+            }
         }
         catch(e) {}
+
+        if(!stopped) {
+            try {
+                host.receptionist.stop();
+            }
+            catch(e) {}
+        }
 
         return node_api_ok([request_id = request_id, status = "stopped"]);
     });
@@ -815,11 +868,6 @@ node_api_start(host, cfg, port, api_token = "", web_root = "", web_protect = Non
 
         return node_api_ok([status = "stopping"]);
     });
-
-    if(!server.start()) {
-        std.error("node_api: cannot start the HTTP server on port ", port, ".");
-        return None;
-    }
 
     return server;
 }

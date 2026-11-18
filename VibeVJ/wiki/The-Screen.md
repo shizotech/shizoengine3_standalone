@@ -62,7 +62,7 @@ macOS instead (see [On a Mac](#on-a-mac) below):
 ![The left end of the top bar: sidebar button, settings, help, undo and redo, then the view tabs and +](media/top-bar.png)
 
 ```
-[sidebar] [⚙] [?] [🔔] | [undo] [redo] | [back] | [Views] [View 2] [+]  … free space …  project name [window buttons]
+[sidebar] [⚙] [?] [🔔] | [undo] [redo] | [back] | [Views] [View 2] [+]  … free space …  project name [tools] [window buttons]
 ```
 
 - **Sidebar button:** at the left edge. It shows or hides the sidebar; its chevron points where the sidebar goes.
@@ -84,10 +84,27 @@ macOS instead (see [On a Mac](#on-a-mac) below):
 - **Free space:** moves the window, see [The program window](#the-program-window).
 - **Project name:** at the right, left of the window buttons. An unnamed project shows *&lt;New Project&gt;*. New,
   open and save are in the [Projects tab](#projects-tab) of the sidebar.
+- **Tools (toolbox):** right of the project name. See [Tools](#tools).
 - **Window buttons:** see [The program window](#the-program-window).
 
 Views are not chosen in the top bar. An empty area offers them, a filled one has them in its menu: see
 [Views and tabs](#views-and-tabs).
+
+### Tools
+
+The toolbox button at the right end of the top bar lists the menus there is one of in the program: they are not a view
+and not an asset, and not every project needs them, but when one does they are one click away.
+
+- **Fixture setup:** the lamps of the project, the stage plan and the 3D view. See
+  [Set up your lamps](Output-and-Devices.md#set-up-your-lamps).
+- **Stage:** the room, the set and the decoration in 3D, from model files. See [Stage](Stage.md).
+- **Fixture editor:** make a fixture type. See [Make a fixture file](Output-and-Devices.md#make-a-fixture-file).
+
+A click opens the menu in a view tab of its own, or brings its tab to the front; the list marks the ones that are open.
+Closing the tab of one only hides it: the next time it opens as you left it (the selection, the view, the 3D camera, the
+programmer). A new project or changed fixture files are picked up when it opens again. The command palette (Ctrl + K)
+finds them too, and on a Mac they are in the menu *Tools*. *Devices* › *Fixtures* in the sidebar still has buttons for
+both.
 
 ### The Help window
 
@@ -198,9 +215,22 @@ The chat works on the generator you clicked last, and on the [fixture setup](Out
 without a click: its lamps, groups, nodes and DMX addresses, and the channels that are used twice. An AI tool on the
 *MCP* tab gets the same (the generator `fixture_setup` in its list).
 
+### MCP tab
+
+*Start server* runs a server for AI tools outside VibeVJ (for example Claude); *Endpoint* is the address to give the
+tool. Any computer in the network can connect. *Allow changes* off lets the tools only read, *Pause* rejects
+everything.
+
+*Token* is optional and empty by default. When you type one, AI tools on other computers have to send it (header
+`Authorization: Bearer <token>`, or `?token=<token>` at the end of the address); tools on this computer need none.
+Use it when the network is shared with people who should not control the show.
+
 With a model that can see pictures, the chat can look too: at the screen, at a generator, and through a *Camera*
 generator, also right after it set lamps to test values (see
-[With the AI and a camera](Output-and-Devices.md#set-up-your-lamps)).
+[With the AI and a camera](Output-and-Devices.md#set-up-your-lamps)). It also lists the webcams of the computer and
+takes a picture of one without a *Camera* generator: the camera is opened for that picture and closed again. An AI tool
+on the *MCP* tab gets each picture as an image and as a PNG file in `.capture/` of the VibeVJ folder (its path is in
+the answer), for a tool that cannot take images.
 
 ## Views and tabs
 

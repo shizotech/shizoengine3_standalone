@@ -8,6 +8,12 @@
 //  working directory, a folder that stayed in every project. sh and python now get
 //  the script as one argument (sh -c, python -c); only batch / PowerShell need a
 //  file, and that goes to the system temp directory (Windows).
+//
+//  Also: an over-long output keeps its head AND its tail (the errors are at the
+//  end; only the head was kept) and says how many bytes were dropped, and a
+//  command that cannot be started says why.
+//
+//  The commands run in a temp folder below std.user_path() (removed at the end).
 // ═════════════════════════════════════════════════════════════════════════════
 
 #include "../miniagent"
@@ -34,7 +40,8 @@ std.print("command_tools_test\n");
 
 managed agt = miniagent(ModelConfig(), "adaptive");
 
-WORK = "tests/_command_tools_tmp";
+BASE = fileio.absolute_path(std.user_path() + "/miniagent/command_tools_test_" + std.random_hash(8));
+WORK = BASE + "/work";
 fileio.mkdir(WORK);
 
 // ── a multi-line sh script: state carries from line to line ─────────────────
@@ -45,7 +52,7 @@ r = call(agt, "command_start", [
 ]);
 check("a multi-line sh script runs as one script", r.ok && r.state == "EXITED" && r.exit_code == 0 &&
 	std.string(r.output).contains("answer 42"), std.string(r));
-check("cwd is honoured", std.string(r.output).contains("dir tests"), std.string(r.output));
+check("cwd is honoured", std.string(r.output).contains("dir " + fileio.file_name(BASE)), std.string(r.output));
 check("no .shz_cmd folder in the working directory", !fileio.exists(WORK + "/.shz_cmd"), "");
 check("no .shz_cmd folder in the current directory", !fileio.exists(".shz_cmd"), "");
 
@@ -92,7 +99,87 @@ check("still no .shz_cmd folder", !fileio.exists(WORK + "/.shz_cmd") && !fileio.
 r = call(agt, "command_start", [command = "echo one && echo two", timeout = -1, cwd = WORK]);
 check("a single line goes to the shell", r.ok && std.string(r.output).contains("one") && std.string(r.output).contains("two"), std.string(r));
 
-fileio.remove(WORK);
+// ── an over-long output: head and tail, and how much was dropped ────────────
+// about 190 KB on stdout, then the error on stderr and a failing exit code
+r = call(agt, "command_start", [
+	command = "awk 'BEGIN{for(i=0;i<4000;i++) print \"row \" i \" some padding text to fill up the line\"}'\necho 'FINAL ERROR: the build broke' >&2\nexit 3",
+	timeout = -1,
+	cwd = WORK,
+]);
+out = std.string(r.output);
+check("an over-long output is cut, the command result stays", r.ok && r.state == "EXITED" && r.exit_code == 3 && r.truncated, std.string(r.exit_code));
+check("the head of the output is kept", out.starts("row 0 some padding"), out.substr(0, 60));
+check("the tail of the output is kept (the error at the end)", out.contains("FINAL ERROR: the build broke") && out.contains("row 3999 "), out.substr(math.max(0, out.size() - 120), 120));
+check("the cut is marked where it happened", out.contains("bytes dropped here") && !out.contains("row 2000 "), "");
+check("the result is bounded", out.size() <= cmd_max_output_bytes + 200, std.string(out.size()));
+check("the dropped bytes are counted", r.dropped_bytes > 100000 && r.total_output_bytes > 180000 &&
+	r.total_output_bytes - r.dropped_bytes <= cmd_max_output_bytes && std.string(r.truncation_note).contains(std.string(r.dropped_bytes)),
+	"dropped=" + std.string(r.dropped_bytes) + " total=" + std.string(r.total_output_bytes));
+
+// more than a wait keeps at all (cmd_max_collect_bytes): still head and tail
+r = call(agt, "command_start", [
+	command = "awk 'BEGIN{for(i=0;i<30000;i++) print \"row \" i \" some padding text to fill up the line\"}'\necho LAST-LINE",
+	timeout = -1,
+	cwd = WORK,
+]);
+out = std.string(r.output);
+check("a very chatty command: head and tail survive the wait", r.ok && r.exit_code == 0 && r.truncated && out.starts("row 0 some padding") &&
+	out.contains("LAST-LINE") && out.contains("row 29999 "), out.substr(0, 40) + " ... " + out.substr(math.max(0, out.size() - 60), 60));
+check("a very chatty command: bounded, all dropped bytes counted", out.size() <= cmd_max_output_bytes + 200 && r.total_output_bytes > 1300000 &&
+	r.total_output_bytes - r.dropped_bytes <= cmd_max_output_bytes, "dropped=" + std.string(r.dropped_bytes) + " total=" + std.string(r.total_output_bytes));
+
+r = call(agt, "command_start", [command = "echo short", timeout = -1, cwd = WORK]);
+check("a short output is not marked", r.ok && !r.truncated && !r.has("dropped_bytes") && std.string(r.output).contains("short"), std.string(r));
+
+// ── a command that cannot be started says why ───────────────────────────────
+r = call(agt, "command_start", [command = "echo hi", timeout = -1, cwd = WORK + "/no_such_dir"]);
+check("a missing cwd is named", std.is_json(r) && !r.ok && std.string(r.error).contains("no_such_dir") && std.string(r.error).contains("does not exist"), std.string(r));
+r = call(agt, "command_start", [timeout = -1, cwd = WORK]);
+check("a missing command is named", std.is_json(r) && !r.ok && std.string(r.error).contains("Missing 'command'"), std.string(r));
+r = call(agt, "command_start", [command = "definitely_not_a_command_xyz --version", timeout = -1, cwd = WORK]);
+check("an unknown program is the shell's exit code, not a tool failure", r.ok && r.state == "EXITED" && r.exit_code != 0, std.string(r));
+
+// ── sessions ────────────────────────────────────────────────────────────────
+r = call(agt, "command_read", [session_id = 987654]);
+check("an unknown session lists the active ones", std.is_json(r) && !r.ok && std.string(r.error).contains("987654") && std.is_json(r.active_sessions) &&
+	std.string(r.hint).size() > 0, std.string(r));
+
+r = call(agt, "command_start", [command = "read answer\necho \"got $answer\"", timeout = 100, cwd = WORK]);
+if(r.ok && r.state == "RUNNING") {
+	sid = r.session_id;
+	i = call(agt, "command_input", [session_id = sid, input = "yes", send_newline = 1]);
+	check("input reaches the session", i.ok && i.bytes_written == 4, std.string(i));
+	w = call(agt, "command_wait", [session_id = sid]);
+	check("the session answers and ends", w.ok && w.state == "EXITED" && std.string(w.output).contains("got yes"), std.string(w));
+	i = call(agt, "command_input", [session_id = sid, input = "again", send_newline = 1]);
+	check("input to an ended session is an error with a reason", !i.ok && std.string(i.error).contains(std.string(sid)), std.string(i));
+}
+else
+	check("a script waiting for input becomes a session", false, std.string(r));
+
+// closing stdin without any input (the 'input' parameter left out)
+r = call(agt, "command_start", [command = "cat", timeout = 100, cwd = WORK]);
+if(r.ok && r.state == "RUNNING") {
+	i = call(agt, "command_input", [session_id = r.session_id, send_newline = 0, close_stdin = 1]);
+	check("close_stdin works without input", std.is_json(i) && i.ok && i.stdin_closed, std.string(i));
+	w = call(agt, "command_wait", [session_id = r.session_id, timeout = 5000]);
+	check("the process ends when its stdin is closed", w.ok && w.state == "EXITED" && w.exit_code == 0, std.string(w));
+}
+else
+	check("cat becomes a session", false, std.string(r));
+
+// ── cmd_run_to_end: one command, no session ─────────────────────────────────
+r = cmd_run_to_end(agt, "echo one\necho two\nexit 4", WORK, 20000);
+check("cmd_run_to_end returns exit code and output", r.ok && r.state == "EXITED" && r.exit_code == 4 && std.string(r.output).contains("one") && std.string(r.output).contains("two"), std.string(r));
+r = cmd_run_to_end(agt, "echo started\nsleep 30", WORK, 300);
+check("cmd_run_to_end kills a command that runs too long", !r.ok && r.state == "KILLED" && std.string(r.error).contains("killed") && std.string(r.output).contains("started"), std.string(r));
+r = cmd_run_to_end(agt, "cat\necho after-cat", WORK, 20000);
+check("cmd_run_to_end closes stdin (nothing can wait for input)", r.ok && r.exit_code == 0 && std.string(r.output).contains("after-cat"), std.string(r));
+l = call(agt, "command_list_sessions", []);
+check("no session is left behind", l.ok && l.total_sessions == 0, std.string(l));
+
+fileio.remove(BASE);
+check("the temp folder is gone", !fileio.exists(BASE), BASE);
 
 std.print("\n", passed, " passed, ", failed, " failed");
 if(failed)

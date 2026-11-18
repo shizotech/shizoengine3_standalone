@@ -1,0 +1,4011 @@
+//The Stage menu (#980): the room, the set and the decoration in 3D. Opened by the Tools button of the top bar
+//(src/menu/tools_menu.shio), kept when its tab closes (stage.menu).
+//
+//  +---------------------------------------------------------------------------------------------+
+//  | toolbar: Add  Duplicate  Remove | Floor | Fit  Lamps |                               status   |
+//  +----------------+-------------------------------------------------------+--------------------+
+//  | Model files    |                                                       | Object             |
+//  |  (assets/Stage)|                 the stage in 3D                       |  name, file,       |
+//  | Import a file  |       (models, and the lamps of the fixture setup)    |  position, turn,   |
+//  | Objects        |                                                       |  scale, unit, up,  |
+//  |                |                                                       |  hangs on, visible |
+//  +----------------+-------------------------------------------------------+--------------------+
+//
+//Everything it changes is in engine.stage (engine/stage/stage.shio); engine.stage_changed() tells the 3D views. The
+//models are read by engine/stage/stage_models.shio on a thread and drawn by engine/patch/stage3d_scene.shio, the
+//same 3D view the fixture setup has. Model files are STL, OBJ, 3MF and glTF binary (.glb); STEP comes next (#980).
+
+import nanogui;
+
+using eigen;
+using nanogui;
+
+#include "engine/patch/patch"
+#include "engine/patch/stage3d"
+#include "engine/patch/palette"
+#include "engine/stage/stage"
+#include "engine/stage/stage_step"
+#include "engine/stage/stage_leds"
+#include "engine/patch/stage3d_scene"
+#include "engine/patch/ledscan"
+
+STAGE_ROW = 28;
+STAGE_LEFT_W = 260;
+STAGE_RIGHT_W = 290;
+STAGE_TOOLBAR_H = 32;
+STAGE_DIR = "assets/Stage";
+STAGE_ROTATE_STEP = 15; //degrees, R / Shift+R
+STAGE_SNAP = 0.05; //metres a dragged object snaps to with Snap on
+STAGE_MEASURE_FRAMES = 8; //#980: frames averaged for a measure of a material
+STAGE_TOOL_SIZE = 0.16;  //the arrows and rings of the move and turn tools: this part of the distance to the camera
+STAGE_TOOL_HIT = 9.0;    //pixels a click may be away from an arrow or a ring
+STAGE_AXIS_COLORS = [vec4f(0.94, 0.33, 0.31, 1.0), vec4f(0.40, 0.80, 0.35, 1.0), vec4f(0.33, 0.55, 0.98, 1.0)];
+STAGE_AXIS_NAMES = ["x", "y", "z"];
+STAGE_PALETTE_BTN = 30.0; //the tool palette in the 3D view (#980): pixels of a button, the gap, the margin
+STAGE_PALETTE_GAP = 3.0;
+STAGE_PALETTE_MARGIN = 10.0;
+STAGE_PALETTE_STEP_W = 48.0; //the button of the steps (its text is wider than an icon)
+STAGE_BUILD_MENU_W = 410; //the popup of the Build button
+//#980: the steps of the turn and move tools, C / Shift+C (0: free, no snapping), as the angle snap of a rocket workshop
+STAGE_ANGLE_STEPS = [0, 1, 5, 15, 30, 45, 90];
+STAGE_MOVE_STEPS = [0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0];
+
+//GLFW
+STAGE_KEY_DELETE = 261;
+STAGE_KEY_BACKSPACE = 259;
+STAGE_KEY_ESCAPE = 256;
+STAGE_KEY_A = 65;
+STAGE_KEY_D = 68;
+STAGE_KEY_G = 71;
+STAGE_KEY_X = 88;
+STAGE_KEY_M = 77;
+STAGE_MEASURE_SNAP = 12.0; //#980: pixels a measuring point snaps to a joint or a corner of an object
+STAGE_PLAN_DIR = "screenshots"; //#980: where Save the plan writes its PNG (as the shader screenshots)
+STAGE_ICON_FOLDER = 0xf07b;
+STAGE_ICON_FOLDER_OPEN = 0xf07c;
+STAGE_ICON_FOLDER_PLUS = 0xf65e;
+STAGE_ICON_CARET_RIGHT = 0xf0da;
+STAGE_ICON_CARET_DOWN = 0xf0d7;
+STAGE_KEY_F = 70;
+STAGE_KEY_R = 82;
+STAGE_KEY_1 = 49;
+STAGE_KEY_2 = 50;
+STAGE_KEY_3 = 51;
+STAGE_KEY_C = 67;
+STAGE_MOD_SHIFT = 1;
+STAGE_MOD_CTRL = 2;
+STAGE_MOD_ALT = 4;
+
+//The distance (pixels) from p to the segment a-b on the screen
+//Where v is in list, -1 when it is not
+stage_ui_index(list, v) {
+	for(i = 0; i < list.size(); i++) {
+		if(list[i] == v)
+			return i;
+	}
+	return -1;
+}
+
+//The greatest common divisor (the aspect of an LED wall: 768 x 384 -> 2:1)
+stage_ui_gcd(a, b) {
+	a = math.abs(std.int(a));
+	b = math.abs(std.int(b));
+	for(b > 0) {
+		t = a % b;
+		a = b;
+		b = t;
+	}
+	return math.max(1, a);
+}
+
+stage_ui_segment_distance(p, a, b) {
+	d = b - a;
+	l2 = d.x * d.x + d.y * d.y;
+	t = l2 > 0.0 ? math.clamp(((p.x - a.x) * d.x + (p.y - a.y) * d.y) / l2, 0.0, 1.0) : 0.0;
+	q = a + d * t;
+	return (p - q).length();
+}
+
+class stage_editor {
+
+	engine = None;
+
+	managed root = None;
+	managed toolbar = None;
+	managed status_label = None;
+	managed lamps_btn = None;
+	managed sim_btn = None;
+	managed led_holder = None;
+	led_list = None; //rebuilt with fresh_box
+	led_list_key = -1; //the revision of the LEDs the list shows
+	managed snap_btn = None;
+
+	managed left_content = None;
+	managed file_browser = None;
+	managed file_label = None;
+	managed import_path = None;
+	managed object_holder = None;
+	object_list = None; //rebuilt with fresh_box
+	sel_folder = "";    //#980: the folder clicked in the list (its contents are the selection)
+	list_rows = [];     //#980: [button, "object" / "folder", id] of the rows of the list (their selection marked in place)
+	snap_at = None;     //#980: where a dragged truss / tower joined another one (drawn as a ring), None: not joined
+	sym_mode = "off";   //#980: the symmetry new pieces get (STAGE_SYM_MODES), X / Shift+X
+	drag_copies = [];   //#980: the copies an Alt+drag drags (removed again when it is canceled)
+	drag_prev_sel = []; //#980: the selection before an Alt+drag
+	box_add = false;    //#980: a box selection adds to the selection (Shift)
+	drag_rest = std.json(); //#980: the dragged objects that stood on the floor or on something (they go onto what is under them)
+	undo_from = None;   //#980: the stage as the last undo step left it (stage_undo_snapshot), None: not taken yet
+	undo_stage = None;  //(the stage it belongs to: another project starts afresh)
+	sel_lamps = [];     //#980: the lamps of the fixture setup selected here (their ids)
+	lamp_origin = std.json(); //#980: id -> [x, y, z] of the dragged lamps when the drag started
+	lamp_level = 0.0;   //the height a lamp is dragged at
+	lamp_grab = None;
+	placing = "";       //#980: an object just added from Add that follows the mouse until a click puts it down
+	row_open = false;   //#980: the Row section of the inspector open
+	measures = [];      //#980: the tape measure: [[a, b], ...] (points of the world) until cleared; not saved
+	measure_a = None;   //the first point of the one being measured
+	measure_hover = None; //the mouse in the view (the other end while measuring)
+	plan_capture = false; //#980: Save the plan is drawing: no palette, hints, gizmos
+	plan_saved = None;  //#980: where the last plan went ("" : it failed), shown in the status once
+	plan_error = "";
+	row_count = 4;      //#980: a row of copies: how many (with the first), along which own axis, how far apart (0: touching)
+	row_axis = 0;
+	row_step = 0.0;
+	step_name = "";     //#980: the name of the next undo step ("Stage: add Truss"), "" : "Stage"
+	list_press = None;  //#980: the row pressed last: [kind, id, ids (the objects it carries when dragged)]
+	managed object_count_label = None;
+
+	managed view = None; //the 3D view (nanogui.view3d)
+	scene = None;        //what it shows (stage3d_scene)
+
+	managed inspector_holder = None;
+	inspector = None;
+
+	selected = [];  //ids of the selected objects
+	add_file = "";  //the model file picked in the list on the left
+
+	drag_mode = ""; //"move", "lift", "box", "view_turn" (right button), "pan" (middle), "orbit" (left, show mode)
+	drag_start = None;
+	drag_now = None;
+	drag_moved = false;
+	drag_level = 0.0;
+	drag_grab = None;
+	drag_pick = "";
+	drag_origin = []; //id -> [x, y, z] when a move started
+	//#980: the move and turn tools (keys 1, 2, 3 as in a spacecraft editor; F: the world's axes or the object's own)
+	tool = "select";      //"select", "move", "turn"
+	tool_local = false;   //the arrows / rings along the object's own axes
+	tool_hover = -1;      //the arrow / ring under the mouse
+	tool_axis = -1;       //the one dragged
+	tool_axes = [];       //the axes and the pivot when the drag started
+	tool_pivot = None;
+	tool_orig = std.json(); //id -> [x, y, z, rx, ry, rz] when the drag started
+	tool_size = 1.0;      //metres of the arrows / rings when the drag started
+	tool_grab_t = 0.0;    //where on the ring it was grabbed (radians around its axis)
+	tool_dir = None;      //pixels the grabbed point moves on the screen per radian of a turn (the ring's tangent)
+	angle_step = 3;       //STAGE_ANGLE_STEPS: 15°
+	move_step = 2;        //STAGE_MOVE_STEPS: 5 cm
+	tool_value = 0.0;     //metres or degrees of the drag, shown
+	tool_typed = "";      //#980: a number typed while dragging an arrow / ring ("1.5", "-90"): the value, not the mouse
+	palette_hover = -1;   //the button of the tool palette under the mouse
+
+	seen_revision = -1;
+	info_shown = ""; //the model key whose information the inspector shows (it is built again once the model is read)
+	step_seen = ""; //the state of the STEP job of the selected object the inspector shows
+	step_status = None; //its status and the last line of uv while a STEP file is converted
+	step_progress = None;
+	step_tolerance = 1; //index into STAGE_STEP_TOLERANCES for Convert
+	//#980: LEDs along the edges of a model
+	edges_for = "";      //the object whose edges are shown ("" : none)
+	//#980: aligning a scan: clicks on it in the 3D view ("floor": three points of its floor, "measure": two points)
+	scan_mode = "";
+	scan_for = "";
+	scan_points = [];
+	scan_items = [];
+	scan_note = "";
+	scan_measured = 0.0;
+	scan_real = 1.0;
+	//#980: measuring a material with a camera (one LED behind a test piece at known distances)
+	mm_open = false;
+	mm_for = "";          //the object whose body gets the result
+	mm_part = "";         //that body
+	mm_camera = "";       //live_path of the generator the picture comes from ("": the only Camera)
+	mm_cam_paths = [];
+	mm_width_cm = 20.0;   //how wide the camera's picture is at the surface of the piece
+	mm_dist_mm = 10.0;    //the LED's distance from the surface for the next measure
+	mm_gpu = None;        //LedBlobGpu while measuring
+	mm_state = "";        //"dark", "bare", "point" while frames are taken
+	mm_count = 0;
+	mm_samples = [];
+	mm_dark = false;      //a dark picture is held
+	mm_bare = None;       //the flux of the LED without the piece
+	mm_points = [];       //[[distance m, sigma m, flux], ...]
+	mm_note = "";
+	mm_name = "";
+	mm_aspect = 1.7778;   //width / height of the camera's picture
+	edge_items = [];     //their line items in the 3D view
+	edge_root = -1;      //the item they hang on (the object's; another one after the view was built again: new lines)
+	edge_note = "";      //what the last click on an edge did
+	leds_per_m = 60.0;
+	mapper_index = 0;    //which LEDMapper gets the strips (stage_mappers())
+
+	__init__(parent) {
+		engine = std.global("engine");
+		if(!fileio.exists(STAGE_DIR))
+			fileio.mkdir(STAGE_DIR);
+		root = parent.widget().anchor(0);
+
+		build_toolbar();
+		build_left();
+		build_right();
+		build_center();
+
+		seen_revision = engine.stage_revision;
+		refresh_all();
+		fit_view();
+	}
+
+	the_stage() {
+		return engine.stage;
+	}
+
+	//Kept menu (stage.menu): shown again; another project may be open, files may have come
+	shown() {
+		if(file_browser)
+			file_browser.refresh();
+		//#980: the measured materials (assets/Stage/Materials)
+		stage_materials_load();
+		keep = [];
+		for(id : selected) {
+			if(stage_find(the_stage(), id))
+				keep.push_back(id);
+		}
+		selected = keep;
+		//(a model file may have changed: it is read again)
+		stage_models_reload();
+		engine.stage_changed();
+		refresh_all();
+	}
+
+	//A new empty box in holder for content that is built again: the old one is freed (later, by the screen)
+	fresh_box(holder, old) {
+		if(old)
+			std.free(old);
+		return holder.widget().layout(nanogui.layout_vertical());
+	}
+
+	section_title(parent, text) {
+		return parent.label(text).fixed_height(STAGE_ROW).bold(true);
+	}
+
+	//A row with a caption on the left
+	field_row(parent, caption) {
+		row = parent.widget().fixed_height(STAGE_ROW + 2);
+		row.label(caption).anchor_left(0).fixed_width(84).fixed_height(STAGE_ROW).text_color(PAL_TEXT_2);
+		return row.widget().anchor_left(84).anchor_right(0).fixed_height(STAGE_ROW);
+	}
+
+	//After a change of the stage from here: the 3D views follow, the lists here too
+	changed(rebuild_inspector = false) {
+		sym_sync_selected();
+		//(the inspector's numbers change without a rebuild: those within a second are one step)
+		record_step("Stage", rebuild_inspector ? "" : "stage-edit");
+		engine.stage_changed();
+		seen_revision = engine.stage_revision;
+		refresh_lists();
+		if(rebuild_inspector)
+			build_inspector();
+		update_status();
+	}
+
+	// =========================================================================
+	// Undo (#980): a change of the stage is a step of the undo history of VibeVJ (Ctrl+Z, the arrows of the top bar).
+	// A drag is one step (recorded when it ends); numbers typed or scrolled in the inspector within a second are one
+	// step; a change from elsewhere (the Chat, MCP) is a step too
+	// =========================================================================
+
+	history() {
+		try {
+			m = engine.menu ? engine.menu.generators_menu : None;
+			return m ? m.undo_history : None;
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//A step from the last one to now, when the stage changed. name: what it was; key: steps with the same key within a
+	//second are one (the inspector's numbers)
+	record_step(name = "Stage", key = "") {
+		s = the_stage();
+		if(!s)
+			return;
+		now = stage_undo_snapshot(s);
+		if(!undo_from || undo_stage != s) {
+			undo_from = now;
+			undo_stage = s;
+			return;
+		}
+		h = history();
+		//(an undo / redo of the stage itself, a project that loads, show mode: the new state is the start, no step)
+		if(!h || h.busy || engine.load_in_progress || nanogui.show_mode() || stage_undo_restored(engine)) {
+			undo_from = now;
+			return;
+		}
+		if(now.compact_string() == undo_from.compact_string())
+			return;
+		before = undo_from;
+		undo_from = now;
+		if(step_name) {
+			name = step_name;
+			key = "";
+		}
+		step_name = "";
+		eng = engine;
+		redo = [eng, now]() { stage_undo_apply(eng, now); };
+		if(key && h.extend(key, redo))
+			return;
+		h.push(name, [eng, before]() { stage_undo_apply(eng, before); }, redo, key);
+	}
+
+	refresh_all() {
+		//#980: the start of the undo steps (or a change made while the menu was away)
+		record_step("Stage (Chat)");
+		//(another project may have another setting)
+		if(sim_btn)
+			sim_btn.pushed(the_stage().simulation ? true : false);
+		refresh_lists();
+		build_inspector();
+		update_status();
+	}
+
+	// =========================================================================
+	// Toolbar
+	// =========================================================================
+
+	build_toolbar() {
+		toolbar = root.widget().anchor_left(0).anchor_right(0).anchor_top(0).fixed_height(STAGE_TOOLBAR_H);
+		x = 4;
+		//#980: one Add: the model file picked on the left, an LED wall or a screen, the pieces made from their measures
+		//(trusses, decks, ...). What is added follows the mouse until a click puts it down
+		build_btn = toolbar.button_popup("Add").icon(nanogui.icon("plus")).side("bottom").anchor_left(x).anchor_top(2).fixed_width(84).fixed_height(STAGE_ROW);
+		build_btn.tooltip("Add to the stage: the model file picked on the left, an LED wall or a screen, trusses, stage decks, stairs, ground support, stands, speakers, barriers, curtains, a DJ booth. It follows the mouse: click where it goes (Escape: not)\n[[wiki:Stage#trusses-decks-and-more]]");
+		build_btn.on_screen(true).autoclose(true);
+		menu = build_btn.popup().content().layout(nanogui.layout_vertical());
+		menu.fixed_width(STAGE_BUILD_MENU_W);
+		first = [[label = "Model file", items = [["The one picked on the left", "model"]]],
+			[label = "Screen", items = [["LED wall", "led"], ["Screen", "screen"]]]];
+		for(r : first) {
+			row = menu.widget().fixed_height(STAGE_ROW).fixed_width(STAGE_BUILD_MENU_W);
+			row.label(r.label).anchor_left(6).fixed_width(126).fixed_height(STAGE_ROW).text_color(PAL_TEXT_2);
+			bx = 134;
+			for(it : r.items) {
+				what = it[1];
+				bw = what == "model" ? 220 : 80;
+				b = row.button(it[0]).anchor_left(bx).anchor_top(2).fixed_width(bw).fixed_height(STAGE_ROW - 4);
+				b.on_click([this, build_btn, what]() {
+					build_btn.close();
+					if(what == "model")
+						this.add_picked(true);
+					else
+						this.add_screen(what, true);
+				});
+				bx += bw + 3;
+			}
+		}
+		for(r : STAGE_BUILD_LIBRARY) {
+			row = menu.widget().fixed_height(STAGE_ROW).fixed_width(STAGE_BUILD_MENU_W);
+			row.label(r.label).anchor_left(6).fixed_width(126).fixed_height(STAGE_ROW).text_color(PAL_TEXT_2);
+			bx = 134;
+			for(it : r.items) {
+				type = r.type;
+				cfg = it[1];
+				b = row.button(it[0]).anchor_left(bx).anchor_top(2).fixed_width(52).fixed_height(STAGE_ROW - 4);
+				b.on_click([this, build_btn, type, cfg]() {
+					build_btn.close();
+					this.add_build(type, cfg, true);
+				});
+				bx += 55;
+			}
+		}
+		x += 88;
+		dup = toolbar.button("").icon(nanogui.icon("copy")).anchor_left(x).anchor_top(2).fixed_width(STAGE_ROW).fixed_height(STAGE_ROW);
+		dup.tooltip("Duplicate the selected objects, with what hangs on them (Ctrl+D)");
+		dup.on_click([this]() { this.duplicate_selected(); });
+		x += 32;
+		rem = toolbar.button("").icon(nanogui.icon("trash")).anchor_left(x).anchor_top(2).fixed_width(STAGE_ROW).fixed_height(STAGE_ROW);
+		rem.tooltip("Remove the selected objects and what hangs on them (Delete). The model files stay");
+		rem.on_click([this]() { this.remove_selected(); });
+		x += 40;
+		floor = toolbar.button("Floor").icon(nanogui.icon("arrow_down")).anchor_left(x).anchor_top(2).fixed_width(80).fixed_height(STAGE_ROW);
+		floor.tooltip("Put the selected objects onto the floor: their lowest point at height 0 (a model from CAD often has its origin somewhere else)");
+		floor.on_click([this]() { this.to_floor(); });
+		x += 88;
+		snap_btn = toolbar.pushbutton("Snap").icon(nanogui.icon("th")).anchor_left(x).anchor_top(2).fixed_width(80).fixed_height(STAGE_ROW).pushed(true);
+		snap_btn.tooltip("Objects you drag snap to 5 cm");
+		x += 84;
+		fit = toolbar.button("Fit").icon(nanogui.icon("expand")).anchor_left(x).anchor_top(2).fixed_width(70).fixed_height(STAGE_ROW);
+		fit.tooltip("Show the selected objects, or everything when nothing is selected (F). Right mouse button: turn, middle mouse button: move, scroll: zoom");
+		fit.on_click([this]() { this.fit_view(); });
+		x += 74;
+		//#980: plan views: from above, the front (the audience), the side; 3D again
+		vw = toolbar.button_popup("View").icon(nanogui.icon("eye")).side("bottom").anchor_left(x).anchor_top(2).fixed_width(80).fixed_height(STAGE_ROW);
+		vw.tooltip("Look from above (a plan), from the front (the audience), from the side, or in 3D again (numpad 7, 1, 3, 0), at the selected objects or everything");
+		vw.on_screen(true).autoclose(true);
+		vmenu = vw.popup().content().layout(nanogui.layout_vertical());
+		vmenu.fixed_width(150);
+		for(v : [["top", "Top (plan)  7"], ["front", "Front  1"], ["side", "Side  3"], ["3d", "3D  0"], ["save", "Save the plan (PNG)"]]) {
+			name = v[0];
+			b = vmenu.button(v[1]).fixed_height(STAGE_ROW);
+			b.on_click([this, vw, name]() {
+				vw.close();
+				if(name == "save")
+					this.save_plan();
+				else
+					this.set_view(name);
+			});
+		}
+		x += 84;
+		lamps_btn = toolbar.pushbutton("Lamps").icon(nanogui.icon("eye")).anchor_left(x).anchor_top(2).fixed_width(90).fixed_height(STAGE_ROW).pushed(true);
+		lamps_btn.tooltip("Show the lamps of the [[fixture setup]] too, with their beams as they are sent");
+		x += 94;
+		sim_btn = toolbar.pushbutton("Simulation").icon(nanogui.icon("adjust")).anchor_left(x).anchor_top(2).fixed_width(120).fixed_height(STAGE_ROW)
+			.pushed(the_stage().simulation ? true : false);
+		sim_btn.tooltip("The light of the LEDs on the stage as it looks (a glow around each LED). Off: small dots in their colours. Saved with the project; switch it off for the show, the GPU is for the visuals then\n[[wiki:Stage#simulation]]");
+		sim_btn.on_change([this](v) {
+			this.the_stage().simulation = v ? 1 : 0;
+			this.changed(false);
+		});
+		x += 132;
+		status_label = toolbar.label("").alignment("right").text_color(PAL_TEXT_3)
+			.anchor_left(x + 8).anchor_right(10).anchor_top(2).fixed_height(STAGE_ROW);
+	}
+
+	update_status() {
+		s = the_stage();
+		tris = 0;
+		problems = 0;
+		pending = 0;
+		unconverted = 0;
+		for(o : s.objects) {
+			m = stage_model_get(o);
+			if(std.is_none(m))
+				pending++;
+			else if(m.needs_convert)
+				unconverted++;
+			else if(!m.ok)
+				problems++;
+			else
+				tris += m.triangles;
+		}
+		text = s.objects.size() == 1 ? "1 object" : s.objects.size() + " objects";
+		led_n = scene ? scene.led_count() : 0;
+		if(led_n)
+			text += " · " + led_n + " LEDs";
+		if(tris)
+			text += " · " + tris + " triangles";
+		if(pending)
+			text += " · reading " + pending;
+		if(unconverted)
+			text += " · " + unconverted + " STEP to convert";
+		if(stage_step_busy())
+			text += " · converting STEP";
+		if(problems)
+			text += " · " + problems + " cannot be read";
+		if(!std.is_none(plan_saved))
+			text = plan_saved ? "Plan saved: " + plan_saved : "The plan could not be saved (see the log)";
+		status_label.caption(text).text_color(problems ? PAL_DANGER : PAL_TEXT_3);
+	}
+
+	// =========================================================================
+	// Left: the model files, the objects
+	// =========================================================================
+
+	build_left() {
+		left = root.widget().anchor_left(0).anchor_top(STAGE_TOOLBAR_H).anchor_bottom(0).fixed_width(STAGE_LEFT_W);
+		left_content = left.vscroll().anchor(0).content().layout(nanogui.layout_vertical()).fixed_width(STAGE_LEFT_W - 12);
+
+		section_title(left_content, "Model files");
+		file_browser = left_content.filebrowser(STAGE_DIR).fixed_height(200);
+		file_browser.extensions([".stl", ".obj", ".3mf", ".glb", ".step", ".stp"]);
+		file_browser.tooltip("The 3D models in assets/Stage: STL, OBJ, 3MF, glTF binary (.glb), STEP (converted once). Click one, then Add; double-click or drag it into the 3D view to put it there.\n[[wiki:Stage#model-files]]");
+		file_browser.on_click([this](path) {
+			rel = fileio.relative_path_cwd(path);
+			if(fileio.is_file(rel) && stage_model_format(rel)) {
+				this.add_file = std.string(rel).replace("\\", "/");
+				this.file_label.caption(fileio.file_name(rel)).text_color(PAL_TEXT_2);
+			}
+		});
+		file_browser.on_double_click([this](path) {
+			rel = fileio.relative_path_cwd(path);
+			if(fileio.is_file(rel) && stage_model_format(rel))
+				this.add_model(std.string(rel).replace("\\", "/"), None);
+		});
+		file_label = left_content.label("Pick a model file").fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+
+		//A file from anywhere: copied into assets/Stage, then put on the stage
+		row = left_content.widget().fixed_height(STAGE_ROW + 4);
+		import_path = row.textbox("").anchor_left(0).anchor_right(70).fixed_height(STAGE_ROW).placeholder("Path of a model file");
+		import_path.tooltip("A model file from anywhere on the computer (STL, OBJ with its .mtl, 3MF, GLB): Import copies it into assets/Stage and puts it on the stage.\n[[wiki:Stage#model-files]]");
+		imp = row.button("Import").anchor_right(0).fixed_width(66).fixed_height(STAGE_ROW);
+		imp.on_click([this]() { this.import_file(this.import_path.value()); });
+
+		//#980: the objects in folders; a new folder takes the selected objects
+		head = left_content.widget().fixed_height(STAGE_ROW);
+		object_count_label = head.label("Objects (0)").bold(true).anchor_left(0).anchor_right(STAGE_ROW + 4).fixed_height(STAGE_ROW);
+		nf = head.button("").icon(STAGE_ICON_FOLDER_PLUS).anchor_right(0).fixed_width(STAGE_ROW).fixed_height(STAGE_ROW);
+		nf.tooltip("New folder (Ctrl+G): the selected objects go into it; a folder clicked: a new folder in it. A folder shows or hides all in it with its eye\n[[wiki:Stage#folders]]");
+		nf.on_click([this]() { this.new_folder(); });
+		//a row dragged onto the head: out of every folder
+		head.on_dragdrop_hover([this](payload, pos) { return this.list_drop_ok(""); });
+		head.on_dragdrop([this](payload, pos) { return this.list_drop(""); });
+		object_holder = left_content.widget().layout(nanogui.layout_vertical());
+
+		//The groups of LEDMappers that have a place on the stage (their inspector there: On the stage)
+		section_title(left_content, "LEDs on the stage");
+		led_holder = left_content.widget().layout(nanogui.layout_vertical());
+	}
+
+	refresh_lists() {
+		s = the_stage();
+		object_list = fresh_box(object_holder, object_list);
+		list_rows = [];
+		object_count_label.caption("Objects (" + s.objects.size() + ")");
+		if(!s.objects.size())
+			object_list.label("None yet. Add a model file above.").fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+		//#980: folders first (their contents below them when open), then the objects; what hangs on an object below it
+		rows = [];
+		list_folder(s, "", 0, rows);
+		for(e : rows) {
+			if(e.f)
+				folder_row(s, e.f, e.depth);
+			else
+				object_row(s, e.o, e.depth);
+		}
+		object_holder.refresh_layout();
+		refresh_led_list();
+		left_content.parent().refresh_layout();
+	}
+
+	//The rows of folder fid ("" : the top) into rows: its folders (and, when open, what is in them), its objects with
+	//what hangs on them (in the same folder) below them
+	list_folder(s, fid, depth, rows) {
+		if(depth > 32)
+			return;
+		for(f : stage_subfolders(s, fid)) {
+			rows.push_back([f = f, depth = depth]);
+			if(f.open)
+				list_folder(s, f.id, depth + 1, rows);
+		}
+		stack = [];
+		top = [];
+		for(o : s.objects) {
+			if(o.folder != fid)
+				continue;
+			p = o.parent ? stage_find(s, o.parent) : None;
+			if(!p || p.folder != fid)
+				top.push_back(o);
+		}
+		for(i = top.size() - 1; i >= 0; i--)
+			stack.push_back([o = top[i], depth = depth]);
+		for(stack.size()) {
+			e = stack[-1];
+			stack.pop_back();
+			rows.push_back([f = None, o = e.o, depth = e.depth]);
+			kids = stage_children(s, e.o.id);
+			for(i = kids.size() - 1; i >= 0; i--) {
+				if(kids[i].folder == fid)
+					stack.push_back([o = kids[i], depth = e.depth + 1]);
+			}
+		}
+	}
+
+	folder_row(s, f, depth) {
+		fid = f.id;
+		indent = math.min(depth, 8) * 14;
+		row = object_list.widget().fixed_height(STAGE_ROW);
+		caret = row.button("").icon(f.open ? STAGE_ICON_CARET_DOWN : STAGE_ICON_CARET_RIGHT).anchor_left(indent).fixed_width(16)
+			.fixed_height(STAGE_ROW).transparent(true);
+		caret.tooltip(f.open ? "Close the folder in the list" : "Open the folder in the list");
+		caret.on_click([this, fid]() { this.toggle_folder_open(fid); });
+		outer = stage_folder_shown(s, f.folder);
+		eye = row.button("").icon(nanogui.icon(f.visible ? "eye" : "eye_slash")).anchor_left(indent + 16).fixed_width(STAGE_ROW)
+			.fixed_height(STAGE_ROW).transparent(true);
+		if(!outer)
+			eye.text_color(PAL_TEXT_3);
+		eye.tooltip(f.visible ? (outer ? "Shown: click to hide everything in it" : "On, but a folder it is in is hidden") : "Hidden with all in it: click to show");
+		eye.on_click([this, fid]() { this.toggle_folder_visible(fid); });
+		n = stage_folder_contents(s, fid).objects.size();
+		btn = row.pushbutton(f.name + "  (" + n + ")").icon(f.open ? STAGE_ICON_FOLDER_OPEN : STAGE_ICON_FOLDER).alignment("left")
+			.anchor_left(indent + 16 + STAGE_ROW).anchor_right(0).fixed_height(STAGE_ROW).latched_style("selection");
+		btn.pushed(folder_selected() == fid);
+		btn.tooltip("Click: select all in it (to move or turn them together, and its settings on the right). Drag it onto another folder to put it in there; drop objects or folders on it to put them in it");
+		btn.on_change([this, fid](v) {
+			this.list_press = ["folder", fid, []];
+			this.select_folder(fid);
+		});
+		btn.dragdrop_enabled(true);
+		btn.on_dragdrop_hover([this, fid](payload, pos) { return this.list_drop_ok(fid); });
+		btn.on_dragdrop([this, fid](payload, pos) { return this.list_drop(fid); });
+		list_rows.push_back([btn, "folder", fid]);
+	}
+
+	object_row(s, o, depth) {
+		id = o.id;
+		indent = math.min(depth, 8) * 14 + (o.folder ? 16 : 0);
+		row = object_list.widget().fixed_height(STAGE_ROW);
+		outer = stage_folder_shown(s, o.folder);
+		eye = row.button("").icon(nanogui.icon(o.visible ? "eye" : "eye_slash")).anchor_left(indent).fixed_width(STAGE_ROW)
+			.fixed_height(STAGE_ROW).transparent(true);
+		if(!outer)
+			eye.text_color(PAL_TEXT_3);
+		eye.tooltip(o.visible ? (outer ? "Shown: click to hide it in the 3D views" : "On, but its folder is hidden") : "Hidden: click to show it");
+		eye.on_click([this, id]() { this.toggle_visible(id); });
+		btn = row.pushbutton(o.name).alignment("left").anchor_left(indent + STAGE_ROW).anchor_right(0).fixed_height(STAGE_ROW)
+			.latched_style("selection");
+		btn.pushed(selected.has_value(id));
+		if(!outer || !o.visible)
+			btn.text_color(PAL_TEXT_3);
+		err = scene ? scene.stage_error(id) : "";
+		mod = stage_model_get(o);
+		if(mod && (mod.needs_convert || mod.stale)) {
+			btn.text_color(PAL_CUE);
+			btn.tooltip(mod.needs_convert ? "A STEP file: convert it once (inspector on the right)" : "The STEP file changed since it was converted");
+		}
+		else if(err) {
+			btn.text_color(PAL_DANGER);
+			btn.tooltip(err);
+		}
+		else
+			btn.tooltip(o.kind == "build" ? stage_build_text(o) : o.source);
+		btn.on_change([this, id](v) {
+			add = this.engine.screen.modifier_shift() || this.engine.screen.modifier_ctrl();
+			//pressed on one of several selected: they stay selected and are dragged together
+			if(!add && this.selected.size() > 1 && this.selected.has_value(id)) {
+				this.list_press = ["object", id, this.selected.copy()];
+				this.mark_list_selection();
+				return;
+			}
+			this.list_press = ["object", id, [id]];
+			this.select_ids([id], add, true);
+		});
+		//#980: dragged onto a folder (or onto an object in a folder: into that one, onto the head: out of folders)
+		btn.dragdrop_enabled(true);
+		folder = o.folder;
+		btn.on_dragdrop_hover([this, folder](payload, pos) { return this.list_drop_ok(folder); });
+		btn.on_dragdrop([this, folder](payload, pos) { return this.list_drop(folder); });
+		list_rows.push_back([btn, "object", id]);
+	}
+
+	//#980: a dragged truss or tower joins the nearest free node (with Snap on): the objects that move a little further.
+	//The reach grows with the distance of the camera (about as many pixels at any zoom)
+	apply_snap() {
+		snap_at = None;
+		if(!snap_btn || !snap_btn.pushed())
+			return;
+		s = the_stage();
+		list = moving_objects();
+		ids = std.json();
+		for(o : list)
+			ids[o.id] = true;
+		skip = std.json();
+		for(o : list) {
+			for(m : stage_sym_members(s, o.sym_group)) {
+				if(!ids.has(m.id))
+					skip[m.id] = true;
+			}
+		}
+		j = stage_snap(s, ids, math.clamp(view.camera().distance * 0.03, 0.08, 0.6), skip);
+		if(!j)
+			return;
+		for(o : list)
+			stage_move_object(s, o, j.delta);
+		snap_at = j.at;
+	}
+
+	// =========================================================================
+	// Placing (#980): what Add puts on the stage follows the mouse (on what stands there, snapped to the grid and to
+	// the joints) until a click puts it down; Escape or the right button takes it away again
+	// =========================================================================
+
+	start_placing(id) {
+		placing = id;
+	}
+
+	place_at(p) {
+		s = the_stage();
+		o = stage_find(s, placing);
+		if(!o) {
+			placing = "";
+			return;
+		}
+		f = view.hit_level(p, 0.0);
+		if(!f)
+			return;
+		c = stage_object_pivot(s, o);
+		stage_move_object(s, o, [x = f.x - c.x, y = f.y - c.y, z = 0.0]);
+		if(!o.parent) {
+			o.x = snap(o.x);
+			o.y = snap(o.y);
+		}
+		skip = std.json();
+		for(m : stage_sym_members(s, o.sym_group))
+			skip[m.id] = true;
+		stage_put_on_ground(s, o, skip);
+		apply_snap();
+		sym_sync_selected();
+		engine.stage_changed();
+	}
+
+	//The click: it stays where it is
+	finish_placing() {
+		o = stage_find(the_stage(), placing);
+		placing = "";
+		if(o) {
+			step_name = "Stage: place " + o.name;
+			snap_at = None;
+			changed(true);
+		}
+	}
+
+	//Escape, the right button: what was being placed goes again (with its symmetry counterparts)
+	cancel_placing() {
+		s = the_stage();
+		o = stage_find(s, placing);
+		placing = "";
+		if(!o)
+			return;
+		ids = [o.id];
+		for(m : stage_sym_members(s, o.sym_group)) {
+			if(!ids.has_value(m.id))
+				ids.push_back(m.id);
+		}
+		stage_remove(s, ids);
+		selected = [];
+		step_name = "Stage: not placed";
+		changed(true);
+	}
+
+	// =========================================================================
+	// Lamps on the stage (#980): the lamps of the fixture setup selected and moved here; a hanging lamp dragged under
+	// a truss hangs on it (stage_lamps_follow: it moves with it), a standing one stands on what is under it
+	// =========================================================================
+
+	start_lamp_drag(lid, p, add, lift) {
+		if(add) {
+			if(sel_lamps.has_value(lid)) {
+				keep = [];
+				for(k : sel_lamps) {
+					if(k != lid)
+						keep.push_back(k);
+				}
+				sel_lamps = keep;
+			}
+			else
+				sel_lamps.push_back(lid);
+		}
+		else if(!sel_lamps.has_value(lid))
+			sel_lamps = [lid];
+		if(!add)
+			selected = [];
+		sel_folder = "";
+		mark_list_selection();
+		build_inspector();
+		lamp_origin = std.json();
+		for(id : sel_lamps) {
+			f = patch_find(engine.patch, id);
+			if(f)
+				lamp_origin[id] = [x = f.x, y = f.y, z = f.z ?? 0.0, hangs_on = f.hangs_on ?? "", hang = f.hang ?? None];
+		}
+		f = patch_find(engine.patch, lid);
+		lamp_level = f ? (f.z ?? 0.0) : 0.0;
+		lamp_grab = view.hit_level(p, lamp_level);
+		drag_pick = lid;
+		drag_mode = lift ? "lamplift" : "lamp";
+	}
+
+	//The straight truss (or other object of the stage that lamps hang on: a truss, a circle) whose box is over (x, y)
+	//of the world and above height z: the highest one under which the point is, or None
+	truss_over(x, y) {
+		s = the_stage();
+		best = None;
+		//(within half a metre beside it: a truss is only 30 cm wide; more when the view is far away)
+		mg = math.max(0.5, view.camera().distance * 0.02);
+		for(o : s.objects) {
+			if(o.kind != "build" || o.build.type != "truss" || !stage_object_shown(s, o))
+				continue;
+			m = stage_model_get(o);
+			if(!m || !m.ok || !m.bounds)
+				continue;
+			b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+			if(x < b.min.x - mg || x > b.max.x + mg || y < b.min.y - mg || y > b.max.y + mg)
+				continue;
+			//(a circle: only near its ring, not in its middle)
+			if(o.build.path == "arc") {
+				w = stage_world_matrix(s, o);
+				l = stage_point(stage_mat_inverse(w), [x = x, y = y, z = b.min.z]);
+				if(math.abs(math.sqrt(l.x * l.x + l.y * l.y) - o.build.radius) > o.build.width + mg)
+					continue;
+			}
+			if(!best || b.min.z > best.z)
+				best = [o = o, z = b.min.z];
+		}
+		return best;
+	}
+
+	//Each move of the mouse while lamps are dragged
+	lamp_drag(p) {
+		s = the_stage();
+		if(drag_mode == "lamplift") {
+			cam = view.camera();
+			k = cam.ortho ? cam.distance / view.focal() : cam.distance / view.focal();
+			dz = (drag_start.y - p.y) * k / math.max(0.2, math.cos(cam.pitch));
+			for(i = 0; i < lamp_origin.size(); i++) {
+				f = patch_find(engine.patch, lamp_origin.key(i));
+				if(f)
+					f.z = math.max(0.0, snap(lamp_origin[i].z + dz));
+			}
+			engine.patch_revision++;
+			return;
+		}
+		at = view.hit_level(p, lamp_level);
+		if(!at || !lamp_grab)
+			return;
+		dx = at.x - lamp_grab.x;
+		dy = at.y - lamp_grab.y;
+		for(i = 0; i < lamp_origin.size(); i++) {
+			f = patch_find(engine.patch, lamp_origin.key(i));
+			if(!f)
+				continue;
+			org = lamp_origin[i];
+			f.x = snap(org.x + dx);
+			f.y = snap(org.y + dy);
+			if((f.mount ?? "floor") == "hanging") {
+				t = snap_btn.pushed() ? truss_over(f.x, f.y) : None;
+				if(t) {
+					//under its bottom chord, on its middle line (a straight one), hung on it
+					w = stage_world_matrix(s, t.o);
+					l = stage_point(stage_mat_inverse(w), [x = f.x, y = f.y, z = 0.0]);
+					if(t.o.build.path != "arc")
+						l.y = 0.0;
+					l.z = 0.0;
+					q = stage_point(w, l);
+					f.x = q.x;
+					f.y = q.y;
+					f.z = q.z;
+					if((f.hangs_on ?? "") != t.o.id) {
+						f.hangs_on = t.o.id;
+						f.hang = None;
+					}
+				}
+				else {
+					f.z = org.z;
+					if(f.hangs_on ?? "") {
+						f.hangs_on = "";
+						f.hang = None;
+					}
+				}
+			}
+			else
+				f.z = stage_ground_at(s, f.x, f.y, None);
+		}
+		engine.patch_revision++;
+	}
+
+	selected_lamps() {
+		out = [];
+		for(id : sel_lamps) {
+			f = patch_find(engine.patch, id);
+			if(f)
+				out.push_back(f);
+		}
+		return out;
+	}
+
+	//The settings of the lamps selected here: where they are, how they hang; the rest in the fixture setup
+	build_lamp_section(lamps) {
+		f = lamps[0];
+		ids = sel_lamps.copy();
+		section_title(inspector, lamps.size() == 1 ? "Lamp" : lamps.size() + " lamps");
+		if(lamps.size() == 1) {
+			field_row(inspector, "Name").label(f.name ?? f.id).anchor(0);
+			field_row(inspector, "Type").label(patch_type(f.type).name).anchor(0);
+			triple(inspector, "Position m", [f.x, f.y, f.z ?? 0.0], 0.05, [this, f](k, v) {
+				if(k == 0)
+					f.x = v;
+				else if(k == 1)
+					f.y = v;
+				else
+					f.z = math.max(0.0, v);
+				this.engine.patch_changed();
+			});
+		}
+		mc = field_row(inspector, "Mount").combobox().items(["Standing", "Hanging"]).selected((f.mount ?? "floor") == "hanging" ? 1 : 0).anchor(0);
+		mc.tooltip("Standing on the floor or on something, or hanging from a truss (drag it under one: it hangs on it)");
+		mc.on_change([this, ids](i, t) {
+			for(id : ids) {
+				g = patch_find(this.engine.patch, id);
+				if(g)
+					g.mount = i == 1 ? "hanging" : "floor";
+			}
+			this.engine.patch_changed();
+		});
+		s = the_stage();
+		names = ["Nothing"];
+		oids = [""];
+		at = 0;
+		for(o : s.objects) {
+			if(o.id == (f.hangs_on ?? ""))
+				at = oids.size();
+			names.push_back(o.name);
+			oids.push_back(o.id);
+		}
+		hc = field_row(inspector, "Hangs on").combobox().items(names).selected(at).anchor(0);
+		hc.tooltip("The object of the stage it hangs on: it moves and turns with it. A hanging lamp dragged under a truss hangs on it\n[[wiki:Stage#lamps-on-the-stage]]");
+		hc.on_change([this, ids, oids](i, t) {
+			if(i < 0 || i >= oids.size())
+				return;
+			for(id : ids) {
+				g = patch_find(this.engine.patch, id);
+				if(g) {
+					g.hangs_on = oids[i];
+					g.hang = None;
+				}
+			}
+			this.engine.patch_changed();
+		});
+		inspector.label("Addresses, the fixture type and its channels: in the fixture setup (Tools › Fixture setup).").wrap(true)
+			.fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_3);
+	}
+
+	//#980: the objects that move with a drag and their symmetry counterparts (a json set): not ground, not a joint
+	drag_skip() {
+		s = the_stage();
+		skip = std.json();
+		for(o : moving_objects()) {
+			skip[o.id] = true;
+			for(m : stage_sym_members(s, o.sym_group))
+				skip[m.id] = true;
+		}
+		return skip;
+	}
+
+	//#980: the counterparts follow a piece of a symmetry group that is selected alone in its group (several of one
+	//group selected: they move together, nobody leads)
+	sym_sync_selected() {
+		s = the_stage();
+		count = std.json();
+		list = selected_objects();
+		for(o : list) {
+			if(o.sym_group)
+				count[o.sym_group] = (count[o.sym_group] ?? 0) + 1;
+		}
+		for(o : list) {
+			if(o.sym_group && count[o.sym_group] == 1)
+				stage_sym_sync(s, o);
+		}
+	}
+
+	//X / Shift+X, the palette: the symmetry new pieces get
+	cycle_sym(d) {
+		n = STAGE_SYM_MODES.size();
+		sym_mode = STAGE_SYM_MODES[(stage_build_index(STAGE_SYM_MODES, sym_mode) + d + n) % n];
+	}
+
+	//Escape or the right mouse button while dragging: everything back where it was (an Alt+drag's copies go)
+	cancel_drag() {
+		if(drag_mode == "lamp" || drag_mode == "lamplift") {
+			for(i = 0; i < lamp_origin.size(); i++) {
+				f = patch_find(engine.patch, lamp_origin.key(i));
+				if(!f)
+					continue;
+				org = lamp_origin[i];
+				f.x = org.x;
+				f.y = org.y;
+				f.z = org.z;
+				f.hangs_on = org.hangs_on;
+				f.hang = org.hang;
+			}
+			drag_mode = "cancel";
+			engine.patch_changed();
+			return true;
+		}
+		if(!(drag_mode == "move" || drag_mode == "lift" || drag_mode == "tool"))
+			return false;
+		s = the_stage();
+		if(drag_mode == "tool") {
+			for(i = 0; i < tool_orig.size(); i++) {
+				o = stage_find(s, tool_orig.key(i));
+				if(!o)
+					continue;
+				org = tool_orig[i];
+				for(k : ["x", "y", "z", "rx", "ry", "rz"])
+					o[k] = org[k];
+			}
+			tool_axis = -1;
+		}
+		else {
+			for(i = 0; i < drag_origin.size(); i++) {
+				o = stage_find(s, drag_origin.key(i));
+				if(!o)
+					continue;
+				org = drag_origin[i];
+				o.x = org.x;
+				o.y = org.y;
+				o.z = org.z;
+			}
+		}
+		if(drag_copies.size()) {
+			stage_remove(s, drag_copies);
+			selected = drag_prev_sel;
+			drag_copies = [];
+		}
+		snap_at = None;
+		drag_mode = "cancel";
+		drag_pick = "";
+		changed(true);
+		return true;
+	}
+
+	//The guides of the symmetry while it is on: the mirror line or the spokes, in the frame new pieces get it (that of
+	//what the one selected hangs on, else the stage)
+	draw_sym() {
+		if(sym_mode == "off" || nanogui.show_mode())
+			return;
+		s = the_stage();
+		list = selected_objects();
+		frame = list.size() == 1 && list[0].parent ? stage_parent_world(s, list[0]) : None;
+		r = frame ? 3.0 : 8.0;
+		col = pal_alpha(PAL_CUE, 0.7);
+		lines = [];
+		if(sym_mode == "mirror")
+			lines.push_back([[0.0, 0.0 - r], [0.0, r]]);
+		else {
+			n = stage_sym_count(sym_mode);
+			for(k = 0; k < n; k++) {
+				f = k * math.PI * 2.0 / n;
+				lines.push_back([[0.0, 0.0], [math.cos(f) * r, math.sin(f) * r]]);
+			}
+		}
+		for(l : lines) {
+			pa = [x = l[0][0], y = l[0][1], z = 0.0];
+			pb = [x = l[1][0], y = l[1][1], z = 0.0];
+			a = screen(frame ? stage_point(frame, pa) : pa);
+			b = screen(frame ? stage_point(frame, pb) : pb);
+			if(!a || !b)
+				continue;
+			nvgBeginPath();
+			nvgMoveTo(a);
+			nvgLineTo(b);
+			nvgStrokeColor(col);
+			nvgStrokeWidth(2.0);
+			nvgStroke();
+		}
+	}
+
+	//#980: the point of the world a click at p measures from: a joint or a corner of an object within
+	//STAGE_MEASURE_SNAP pixels, else the surface under the mouse, else the floor. [point, snapped] or None
+	measure_point(p) {
+		s = the_stage();
+		nodes = [];
+		corners = [];
+		for(o : s.objects) {
+			if(!stage_object_shown(s, o))
+				continue;
+			for(n : stage_world_nodes(s, o))
+				nodes.push_back([x = n[0], y = n[1], z = n[2]]);
+			m = stage_model_get(o);
+			if(m && m.ok && m.bounds) {
+				b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+				for(cx : [b.min.x, b.max.x]) {
+					for(cy : [b.min.y, b.max.y]) {
+						for(cz : [b.min.z, b.max.z])
+							corners.push_back([x = cx, y = cy, z = cz]);
+					}
+				}
+			}
+		}
+		//(the joints first: a truss end is a few mm from the corners of its box)
+		for(pts : [nodes, corners]) {
+			best = None;
+			best_d = STAGE_MEASURE_SNAP;
+			for(q : pts) {
+				sq = screen(q);
+				if(!sq)
+					continue;
+				d = (sq - p).length();
+				if(d < best_d) {
+					best_d = d;
+					best = q;
+				}
+			}
+			if(best)
+				return [point = best, snapped = true];
+		}
+		h = view.pick(p, 4.0);
+		if(h)
+			return [point = [x = h.point.x, y = h.point.y, z = h.point.z], snapped = false];
+		f = view.hit_level(p, 0.0);
+		return f ? [point = [x = f.x, y = f.y, z = f.z], snapped = false] : None;
+	}
+
+	measure_click(p) {
+		q = measure_point(p);
+		if(!q)
+			return;
+		if(!measure_a) {
+			measure_a = q.point;
+			return;
+		}
+		measures.push_back([measure_a, q.point]);
+		measure_a = None;
+	}
+
+	//"3.45 m" and "Δx 3.00 · Δy 1.20 · Δz 0.50 m"
+	measure_text(a, b) {
+		dx = b.x - a.x;
+		dy = b.y - a.y;
+		dz = b.z - a.z;
+		return [metres_text(math.sqrt(dx * dx + dy * dy + dz * dz)), "Δx " + metres_text(math.abs(dx)) + " · Δy " + metres_text(math.abs(dy)) + " · Δz " + metres_text(math.abs(dz))];
+	}
+
+	//"3.45 m" (to the cm), "0.35 m"
+	metres_text(v) {
+		cm = std.int(math.round(v * 100.0));
+		return std.string(std.int(cm / 100)) + "." + (cm % 100 < 10 ? "0" : "") + (cm % 100) + " m";
+	}
+
+	draw_measure(a, b, live) {
+		sa = screen(a);
+		sb = screen(b);
+		if(!sa || !sb)
+			return;
+		col = live ? pal_alpha(PAL_CUE, 0.8) : PAL_CUE;
+		nvgBeginPath();
+		nvgMoveTo(sa);
+		nvgLineTo(sb);
+		nvgStrokeColor(col);
+		nvgStrokeWidth(2.0);
+		nvgStroke();
+		for(q : [sa, sb]) {
+			nvgBeginPath();
+			nvgCircle(q, 4.0);
+			nvgFillColor(col);
+			nvgFill();
+		}
+		t = measure_text(a, b);
+		mid = (sa + sb) * 0.5;
+		pal_badge(mid + vec2f(0.0, -12.0), t[0], PAL_CUE, PAL_CANVAS, 12);
+		pal_text(mid + vec2f(0.0, 8.0), t[1], 11, PAL_TEXT, PAL_ALIGN_CENTER_MIDDLE);
+	}
+
+	draw_measures() {
+		for(m : measures)
+			draw_measure(m[0], m[1], false);
+		if(tool != "measure" || plan_capture)
+			return;
+		q = measure_hover ? measure_point(measure_hover) : None;
+		if(q && q.snapped) {
+			sq = screen(q.point);
+			if(sq) {
+				nvgBeginPath();
+				nvgCircle(sq, 8.0);
+				nvgStrokeColor(PAL_CUE);
+				nvgStrokeWidth(2.0);
+				nvgStroke();
+			}
+		}
+		if(measure_a && q)
+			draw_measure(measure_a, q.point, true);
+		else if(measure_a) {
+			sa = screen(measure_a);
+			if(sa) {
+				nvgBeginPath();
+				nvgCircle(sa, 4.0);
+				nvgFillColor(PAL_CUE);
+				nvgFill();
+			}
+		}
+	}
+
+	//#980: without perspective (a plan): the outline of each shown object (the box of its model) and its name, light on
+	//the dark: black decks and speakers can be read on a plan
+	draw_outlines() {
+		if(!view.camera().ortho)
+			return;
+		s = the_stage();
+		for(o : s.objects) {
+			if(!stage_object_shown(s, o))
+				continue;
+			m = stage_model_get(o);
+			if(!m || !m.ok || !m.bounds)
+				continue;
+			w = stage_world_matrix(s, o);
+			b = m.bounds;
+			c = [];
+			for(k = 0; k < 8; k++) {
+				q = screen(stage_point(w, [x = (k & 1) ? b.max.x : b.min.x, y = (k & 2) ? b.max.y : b.min.y, z = (k & 4) ? b.max.z : b.min.z]));
+				if(!q)
+					break;
+				c.push_back(q);
+			}
+			if(c.size() < 8)
+				continue;
+			nvgBeginPath();
+			for(e : [[0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [2, 6], [3, 7]]) {
+				nvgMoveTo(c[e[0]]);
+				nvgLineTo(c[e[1]]);
+			}
+			nvgStrokeColor(pal_alpha(selected.has_value(o.id) ? PAL_ACCENT : PAL_TEXT_2, 0.8));
+			nvgStrokeWidth(1.0);
+			nvgStroke();
+			//(its name inside its top left corner: a booth on the decks does not cover the name of the decks)
+			lo = c[0];
+			for(q : c)
+				lo = vec2f(math.min(lo.x, q.x), math.min(lo.y, q.y));
+			pal_text(lo + vec2f(3.0, 8.0), o.name, 11, PAL_TEXT, PAL_ALIGN_LEFT_MIDDLE);
+		}
+	}
+
+	//#980: without perspective: a scale bar at the bottom right (1, 2, 5, 10, ... m about 120 pixels long)
+	draw_scale() {
+		cam = view.camera();
+		if(!cam.ortho)
+			return;
+		ppm = view.focal() / math.max(cam.distance, 0.001);
+		len = 1.0;
+		for(c : [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]) {
+			if(c * ppm <= 160.0)
+				len = c;
+		}
+		s = view.size();
+		x1 = s.x - 20.0;
+		x0 = x1 - len * ppm;
+		y = s.y - 24.0;
+		nvgBeginPath();
+		nvgMoveTo(vec2f(x0, y - 5.0));
+		nvgLineTo(vec2f(x0, y));
+		nvgLineTo(vec2f(x1, y));
+		nvgLineTo(vec2f(x1, y - 5.0));
+		nvgStrokeColor(PAL_TEXT);
+		nvgStrokeWidth(2.0);
+		nvgStroke();
+		pal_text(vec2f((x0 + x1) / 2.0, y - 12.0), (len < 1.0 ? std.int(math.round(len * 100.0)) + " cm" : std.int(len) + " m"), 12, PAL_TEXT, PAL_ALIGN_CENTER_MIDDLE);
+	}
+
+	//#980: the shown objects whose middle is in the box between two points of the view (their ids)
+	objects_in_box(a, b) {
+		s = the_stage();
+		x0 = math.min(a.x, b.x);
+		x1 = math.max(a.x, b.x);
+		y0 = math.min(a.y, b.y);
+		y1 = math.max(a.y, b.y);
+		ids = [];
+		for(o : s.objects) {
+			if(!stage_object_shown(s, o))
+				continue;
+			q = screen(stage_object_pivot(s, o));
+			if(q && q.x >= x0 && q.x <= x1 && q.y >= y0 && q.y <= y1)
+				ids.push_back(o.id);
+		}
+		return ids;
+	}
+
+	//The box of a Ctrl+drag
+	draw_box() {
+		if(drag_mode != "box" || !drag_moved || !drag_start || !drag_now)
+			return;
+		x0 = math.min(drag_start.x, drag_now.x);
+		y0 = math.min(drag_start.y, drag_now.y);
+		nvgBeginPath();
+		nvgRect(vec2f(x0, y0), vec2f(math.abs(drag_now.x - drag_start.x), math.abs(drag_now.y - drag_start.y)));
+		nvgFillColor(pal_alpha(PAL_ACCENT, 0.12));
+		nvgFill();
+		nvgStrokeColor(PAL_ACCENT);
+		nvgStrokeWidth(1.0);
+		nvgStroke();
+	}
+
+	//While a truss or tower is dragged: the free nodes of the others (small dots), the one it joined (a ring)
+	draw_nodes() {
+		if(!drag_moved || !(drag_mode == "move" || drag_mode == "lift" || (drag_mode == "tool" && tool == "move")))
+			return;
+		s = the_stage();
+		ids = std.json();
+		has = false;
+		for(o : moving_objects()) {
+			ids[o.id] = true;
+			if(o.kind == "build" && stage_build_nodes(o).size())
+				has = true;
+		}
+		if(!has)
+			return;
+		for(n : stage_free_nodes(s, ids)) {
+			q = screen([x = n[0], y = n[1], z = n[2]]);
+			if(!q)
+				continue;
+			nvgBeginPath();
+			nvgCircle(q, 4.0);
+			nvgFillColor(pal_alpha(PAL_ON, 0.55));
+			nvgFill();
+		}
+		if(snap_at) {
+			q = screen(snap_at);
+			if(q) {
+				nvgBeginPath();
+				nvgCircle(q, 11.0);
+				nvgStrokeColor(PAL_ON);
+				nvgStrokeWidth(3.0);
+				nvgStroke();
+				pal_badge(q + vec2f(0.0, -24.0), "joined", PAL_ON, PAL_CANVAS, 11);
+			}
+		}
+	}
+
+	//The selection marked on the rows of the list as they are (a rebuild would free a row that is being dragged)
+	mark_list_selection() {
+		fs = folder_selected();
+		for(r : list_rows)
+			r[0].pushed(r[1] == "object" ? selected.has_value(r[2]) : fs == r[2]);
+	}
+
+	//Whether the row pressed last can be dropped into folder fid ("" : out of folders): a folder not into itself or a
+	//folder in it, and only when something changes
+	list_drop_ok(fid) {
+		if(!list_press || nanogui.show_mode())
+			return false;
+		s = the_stage();
+		if(fid && !stage_find_folder(s, fid))
+			return false;
+		if(list_press[0] == "folder") {
+			id = list_press[1];
+			f = stage_find_folder(s, id);
+			if(!f || f.folder == fid || id == fid)
+				return false;
+			for(g : stage_folder_contents(s, id).folders) {
+				if(g.id == fid)
+					return false;
+			}
+			return true;
+		}
+		for(id : list_press[2]) {
+			o = stage_find(s, id);
+			if(o && o.folder != fid)
+				return true;
+		}
+		return false;
+	}
+
+	//The row pressed last dropped into folder fid: a folder into it, the objects it carries into it
+	list_drop(fid) {
+		if(!list_drop_ok(fid))
+			return false;
+		s = the_stage();
+		if(list_press[0] == "folder")
+			stage_move_folder(s, list_press[1], fid);
+		else {
+			for(id : list_press[2])
+				stage_set_folder(s, id, fid);
+		}
+		f = stage_find_folder(s, fid);
+		if(f)
+			f.open = 1;
+		list_press = None;
+		changed(true);
+		return true;
+	}
+
+	//The folder whose contents are the selection (clicked in the list), "" when there is none
+	folder_selected() {
+		if(!sel_folder)
+			return "";
+		s = the_stage();
+		if(!stage_find_folder(s, sel_folder))
+			return "";
+		c = stage_folder_contents(s, sel_folder).objects;
+		if(c.size() != selected.size())
+			return "";
+		for(o : c) {
+			if(!selected.has_value(o.id))
+				return "";
+		}
+		return sel_folder;
+	}
+
+	//A folder clicked: all in it selected
+	select_folder(fid) {
+		ids = [];
+		for(o : stage_folder_contents(the_stage(), fid).objects)
+			ids.push_back(o.id);
+		selected = ids;
+		sel_folder = fid;
+		mark_list_selection();
+		build_inspector();
+	}
+
+	//Ctrl+G, the folder button: a folder clicked: a new empty folder in it; else a new folder with the selected objects
+	//in it (in the folder they share)
+	new_folder() {
+		if(nanogui.show_mode())
+			return None;
+		s = the_stage();
+		fs = folder_selected();
+		if(fs)
+			return new_subfolder(fs);
+		list = selected_objects();
+		into = list.size() ? list[0].folder : "";
+		for(o : list) {
+			if(o.folder != into)
+				into = "";
+		}
+		f = stage_add_folder(s, "", selected, into);
+		parent = stage_find_folder(s, into);
+		if(parent)
+			parent.open = 1;
+		sel_folder = f.id;
+		changed(true);
+		return f;
+	}
+
+	//A new empty folder in folder fid, opened in the list, clicked (its settings on the right: name it there)
+	new_subfolder(fid) {
+		if(nanogui.show_mode())
+			return None;
+		s = the_stage();
+		parent = stage_find_folder(s, fid);
+		if(!parent)
+			return None;
+		f = stage_add_folder(s, "", [], fid);
+		parent.open = 1;
+		selected = [];
+		sel_folder = f.id;
+		changed(true);
+		return f;
+	}
+
+	toggle_folder_visible(fid) {
+		f = stage_find_folder(the_stage(), fid);
+		if(!f)
+			return;
+		f.visible = f.visible ? 0 : 1;
+		changed(true);
+	}
+
+	toggle_folder_open(fid) {
+		f = stage_find_folder(the_stage(), fid);
+		if(!f)
+			return;
+		f.open = f.open ? 0 : 1;
+		//(opening a folder in the list is no step of the undo history)
+		if(undo_from && undo_stage == the_stage())
+			undo_from = stage_undo_snapshot(the_stage());
+		changed(false);
+		refresh_lists();
+	}
+
+	//The folders as choices: ["None", "Rig", "Rig / Front", ...] and their ids; without folder skip and what is in it
+	folder_choices(skip = "") {
+		s = the_stage();
+		names = ["None"];
+		ids = [""];
+		inside = std.json();
+		if(skip) {
+			inside[skip] = true;
+			for(g : stage_folder_contents(s, skip).folders)
+				inside[g.id] = true;
+		}
+		for(f : s.folders) {
+			if(inside.has(f.id))
+				continue;
+			names.push_back(stage_folder_path(s, f.id));
+			ids.push_back(f.id);
+		}
+		return [names = names, ids = ids];
+	}
+
+	//The settings of the folder clicked (#980): its name, the folder it is in, shown, ungroup, remove with contents
+	build_folder_section(f) {
+		fid = f.id;
+		s = the_stage();
+		section_title(inspector, "Folder");
+		nb = field_row(inspector, "Name").textbox(f.name).anchor(0);
+		nb.on_change([this, fid](text) {
+			g = stage_find_folder(this.the_stage(), fid);
+			if(g && text.trim()) {
+				g.name = text.trim();
+				this.changed(false);
+				this.refresh_lists();
+			}
+		});
+		ch = folder_choices(fid);
+		at = 0;
+		for(i = 0; i < ch.ids.size(); i++) {
+			if(ch.ids[i] == f.folder)
+				at = i;
+		}
+		fc = field_row(inspector, "In folder").combobox().items(ch.names).selected(at).anchor(0);
+		fc.tooltip("A folder in another folder: hidden with it");
+		ids = ch.ids;
+		fc.on_change([this, fid, ids](i, text) {
+			if(i >= 0 && i < ids.size() && stage_move_folder(this.the_stage(), fid, ids[i]))
+				this.changed(true);
+		});
+		vis = field_row(inspector, "Visible").pushbutton(f.visible ? "Shown" : "Hidden").icon(nanogui.icon(f.visible ? "eye" : "eye_slash"))
+			.anchor(0).pushed(f.visible ? true : false);
+		vis.tooltip("Shows or hides everything in it in the 3D views (the objects keep their own eye)");
+		vis.on_change([this, fid](v) { this.toggle_folder_visible(fid); });
+		c = stage_folder_contents(s, fid);
+		inspector.label(c.objects.size() + (c.objects.size() == 1 ? " object" : " objects") +
+			(c.folders.size() ? ", " + c.folders.size() + (c.folders.size() == 1 ? " folder" : " folders") : "") + " in it")
+			.fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+		sub = inspector.widget().fixed_height(STAGE_ROW + 2).button("Subfolder").icon(STAGE_ICON_FOLDER_PLUS).anchor(0).fixed_height(STAGE_ROW);
+		sub.tooltip("A new empty folder in this one (Ctrl+G while the folder is clicked); put objects into it with Folder in their settings");
+		sub.on_click([this, fid]() { this.new_subfolder(fid); });
+		row = inspector.widget().fixed_height(STAGE_ROW + 2);
+		w = (STAGE_RIGHT_W - 12) / 2.0;
+		ug = row.button("Ungroup").icon(STAGE_ICON_FOLDER_OPEN).anchor_left(0).fixed_width(w - 4).fixed_height(STAGE_ROW);
+		ug.tooltip("Removes the folder; what is in it stays, in the folder it was in");
+		ug.on_click([this, fid]() {
+			stage_remove_folder(this.the_stage(), fid, false);
+			this.sel_folder = "";
+			this.changed(true);
+		});
+		rm = row.button("With contents").icon(nanogui.icon("trash")).anchor_left(w).fixed_width(w - 4).fixed_height(STAGE_ROW);
+		rm.tooltip("Removes the folder and everything in it");
+		rm.on_click([this, fid]() {
+			if(nanogui.show_mode())
+				return;
+			stage_remove_folder(this.the_stage(), fid, true);
+			this.sel_folder = "";
+			this.selected = [];
+			this.changed(true);
+		});
+	}
+
+	//The LED groups on the stage: read only here, they are placed in the LEDMapper (a group, On the stage)
+	refresh_led_list() {
+		led_list_key = engine.stage_leds_revision;
+		led_list = fresh_box(led_holder, led_list);
+		leds = engine.stage_leds;
+		n = 0;
+		for(i = 0; i < leds.size(); i++) {
+			m = leds[i];
+			for(g : m.groups) {
+				ext = stage_leds_extent(g, m.aspect);
+				row = led_list.label("· " + g.name + " · " + g.count + " LEDs · " + metres(ext.width) + " × " + metres(ext.height))
+					.fixed_height(STAGE_ROW - 4).text_color(PAL_TEXT_2);
+				row.tooltip("A group of " + m.name + ". Its place: the inspector of the group in the LEDMapper, On the stage");
+				n++;
+			}
+		}
+		if(!n)
+			led_list.label("None. In a LEDMapper: a group, On the stage.").wrap(true).fixed_width(STAGE_LEFT_W - 16).text_color(PAL_TEXT_3);
+		led_holder.refresh_layout();
+	}
+
+	// =========================================================================
+	// Adding and changing objects
+	// =========================================================================
+
+	add_picked(place = false) {
+		if(!add_file) {
+			file_label.caption("Pick a model file first").text_color(PAL_DANGER);
+			return;
+		}
+		add_model(add_file, None);
+		if(place && selected.size() == 1)
+			start_placing(selected[0]);
+	}
+
+	//A model file onto the stage: at (x, y) on the floor, or in the middle of the view (at None)
+	add_model(path, at) {
+		if(nanogui.show_mode())
+			return;
+		x = 0.0;
+		y = 0.0;
+		if(at) {
+			x = at.x;
+			y = at.y;
+		}
+		else {
+			cam = view.camera();
+			x = cam.target.x;
+			y = cam.target.y;
+		}
+		o = stage_add_model(the_stage(), path, snap(x), snap(y), 0.0);
+		selected = [o.id];
+		step_name = "Stage: add " + o.name;
+		stage_sym_create(the_stage(), o, sym_mode);
+		changed(true);
+	}
+
+	//#980: an LED wall in the middle of the view, on the floor
+	add_screen(type = "led", place = false) {
+		if(nanogui.show_mode())
+			return;
+		cam = view.camera();
+		o = stage_add_screen(the_stage(), type == "screen" ? "screen" : "led", snap(cam.target.x), snap(cam.target.y), 0.0);
+		stage_put_on_ground(the_stage(), o, None);
+		selected = [o.id];
+		if(place)
+			placing = o.id;
+		step_name = "Stage: add " + o.name;
+		stage_sym_create(the_stage(), o, sym_mode);
+		changed(true);
+	}
+
+	//#980: copies of an object in a row along one of its own axes: 8 panels along a truss, a row of decks or speakers
+	build_row_section(o) {
+		id = o.id;
+		if(!row_open) {
+			ob = inspector.widget().fixed_height(STAGE_ROW + 2).button("Copies in a row…").icon(nanogui.icon("ellipsis_h")).anchor(0).fixed_height(STAGE_ROW);
+			ob.tooltip("Copies of it in a row, along one of its own axes, or touching (trusses end to end)\n[[wiki:Stage#rows-and-spacing]]");
+			ob.on_click([this]() {
+				this.row_open = true;
+				this.build_inspector();
+			});
+			return;
+		}
+		section_title(inspector, "Row");
+		row = field_row(inspector, "Copies");
+		w = (STAGE_RIGHT_W - 12 - 84) / 3.0;
+		cb = row.intbox().min_value(2).max_value(100).value(row_count).anchor_left(0).fixed_width(w - 4).fixed_height(STAGE_ROW);
+		cb.tooltip("How many in the row, this one with them");
+		cb.value_callback([this](v) { this.row_count = v; });
+		ab = row.combobox().items(["x", "y", "z"]).selected(row_axis).anchor_left(w).fixed_width(w - 4).fixed_height(STAGE_ROW);
+		ab.tooltip("Along which of its own axes (as it is turned): a truss lies along x");
+		ab.on_change([this](i, t) { this.row_axis = math.clamp(i, 0, 2); });
+		sb = row.floatbox().min_value(0.0).max_value(100.0).value(row_step).anchor_left(w * 2).fixed_width(w - 4).fixed_height(STAGE_ROW);
+		sb.step(0.05);
+		sb.tooltip("Metres from one to the next; 0: as big as it is (they touch: trusses end to end, decks edge to edge)");
+		sb.value_callback([this](v) { this.row_step = v; });
+		mk = inspector.widget().fixed_height(STAGE_ROW + 2).button("Make the row").icon(nanogui.icon("ellipsis_h")).anchor(0).fixed_height(STAGE_ROW);
+		mk.tooltip("Copies of it (with what hangs on it) in a row after it\n[[wiki:Stage#rows-and-spacing]]");
+		mk.on_click([this, id]() { this.make_row(id); });
+	}
+
+	make_row(id) {
+		if(nanogui.show_mode())
+			return [];
+		s = the_stage();
+		o = stage_find(s, id);
+		if(!o)
+			return [];
+		step = row_step > 0.0 ? row_step : stage_own_size(o, row_axis);
+		if(std.is_none(step) || step <= 0.0)
+			return [];
+		copies = stage_row(s, o, row_count, step, row_axis);
+		selected = [o.id];
+		for(c : copies)
+			selected.push_back(c.id);
+		step_name = "Stage: row of " + row_count;
+		changed(true);
+		return copies;
+	}
+
+	//#980: a piece of the library in the middle of the view, on the floor, selected
+	add_build(type, cfg = None, place = false) {
+		if(nanogui.show_mode())
+			return None;
+		cam = view.camera();
+		o = stage_add_build(the_stage(), type, cfg, snap(cam.target.x), snap(cam.target.y), 0.0);
+		//#980: on what stands there (a booth onto the decks), not inside it
+		stage_put_on_ground(the_stage(), o, None);
+		selected = [o.id];
+		step_name = "Stage: add " + o.name;
+		stage_sym_create(the_stage(), o, sym_mode);
+		if(place)
+			placing = o.id;
+		changed(true);
+		return o;
+	}
+
+	set_build(id, key, value, rebuild) {
+		ob = stage_find(the_stage(), id);
+		if(!ob || ob.kind != "build")
+			return;
+		ob.build[key] = value;
+		stage_build_defaults(ob);
+		changed(rebuild);
+	}
+
+	//The measures of a piece (#980): rows from STAGE_BUILD_PARAMS of its type (a choice that shows or hides others
+	//builds the rows again)
+	build_build_section(o) {
+		id = o.id;
+		c = o.build;
+		ti = stage_build_index(STAGE_BUILD_TYPES, c.type);
+		section_title(inspector, STAGE_BUILD_NAMES[ti]);
+		inspector.label(stage_build_text(o)).wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_3);
+		tc = field_row(inspector, "Type").combobox().items(STAGE_BUILD_NAMES).selected(ti).anchor(0);
+		tc.tooltip("What it is; another type starts from its defaults");
+		tc.on_change([this, id](i, text) {
+			ob = stage_find(this.the_stage(), id);
+			if(!ob || i < 0 || i >= STAGE_BUILD_TYPES.size() || ob.build.type == STAGE_BUILD_TYPES[i])
+				return;
+			ob.build = [type = STAGE_BUILD_TYPES[i]];
+			stage_build_defaults(ob);
+			this.changed(true);
+		});
+		for(p : STAGE_BUILD_PARAMS[c.type]) {
+			w = p.when ?? None;
+			if(w && c[w[0]] != w[1])
+				continue;
+			k = p.k;
+			row = field_row(inspector, p.label);
+			f = None;
+			if(p.kind == "choice") {
+				labels = [];
+				for(v : p.values)
+					labels.push_back(p.has("labels") ? p.labels[labels.size()] : (STAGE_BUILD_COLOR_LABELS[v] ?? v));
+				vals = p.values;
+				f = row.combobox().items(labels).selected(stage_build_index(vals, c[k])).anchor(0);
+				f.on_change([this, id, k, vals](i, text) {
+					if(i >= 0 && i < vals.size())
+						this.set_build(id, k, vals[i], true);
+				});
+			}
+			else if(p.kind == "int") {
+				f = row.intbox().min_value(std.int(p.min)).max_value(std.int(p.max)).value(c[k]).anchor(0);
+				f.value_callback([this, id, k](v) { this.set_build(id, k, v, false); });
+			}
+			else {
+				f = row.floatbox().min_value(p.min).max_value(p.max).value(c[k]).anchor(0);
+				f.step(p.step);
+				f.value_callback([this, id, k](v) { this.set_build(id, k, v, false); });
+			}
+			if(p.has("tip"))
+				f.tooltip(p.tip);
+		}
+	}
+
+	//The settings of a screen or LED wall (#980): its type, its size (panels or metres), the picture it shows
+	build_screen_section(o) {
+		id = o.id;
+		c = o.screen;
+		section_title(inspector, c.type == "led" ? "LED wall" : "Screen");
+		tc = field_row(inspector, "Type").combobox().items(STAGE_SCREEN_TYPE_LABELS).selected(c.type == "led" ? 0 : 1).anchor(0);
+		tc.tooltip("LED wall: built of panels (cabinets), its size and pixels from them. Screen: a projection screen or a monitor, width and height in metres");
+		tc.on_change([this, id](i, text) { this.set_screen(id, "type", STAGE_SCREEN_TYPES[math.clamp(i, 0, 1)], true); });
+		if(c.type == "led") {
+			pair(inspector, "Panels", [c.cols, c.rows], true, [this, id](k, v) { this.set_screen(id, k == 0 ? "cols" : "rows", v, true); })
+				.tooltip("Panels across and up");
+			pair(inspector, "Panel m", [c.panel_w, c.panel_h], false, [this, id](k, v) { this.set_screen(id, k == 0 ? "panel_w" : "panel_h", v, true); })
+				.tooltip("Width and height of one panel in metres (0.5 × 0.5 is common, 0.5 × 1.0 too)");
+			pair(inspector, "Panel px", [c.panel_px, c.panel_py], true, [this, id](k, v) { this.set_screen(id, k == 0 ? "panel_px" : "panel_py", v, true); })
+				.tooltip("Pixels of one panel (P3.9 on 0.5 m: 128 × 128; P2.6: 192 × 192)");
+		}
+		else {
+			pair(inspector, "Size m", [c.width, c.height], false, [this, id](k, v) { this.set_screen(id, k == 0 ? "width" : "height", v, true); })
+				.tooltip("Width and height of the picture in metres");
+		}
+		z = stage_screen_size(o);
+		text = metres(z.width) + " × " + metres(z.height);
+		if(z.px > 0) {
+			g = stage_ui_gcd(z.px, z.py);
+			text += " · " + z.px + " × " + z.py + " px · " + (z.px / g) + ":" + (z.py / g);
+		}
+		field_row(inspector, "Size").label(text).anchor(0).tooltip("The size of the picture; an LED wall: the pixels its picture needs (the output to send it)");
+		dp = field_row(inspector, "Depth m").floatbox().anchor(0).min_value(0.0).max_value(2.0).value(c.depth);
+		dp.step(0.01);
+		dp.tooltip("How deep the body behind the picture is");
+		dp.value_callback([this, id](v) { this.set_screen(id, "depth", v, false); });
+
+		//the picture: a video router that is on (shaders, videos, outputs: VideoRouter › Enable Router)
+		names = ["None"];
+		at = 0;
+		for(e : stage_picture_sources()) {
+			if(names.has_value(e.name))
+				continue;
+			if(e.name == c.source)
+				at = names.size();
+			names.push_back(e.name);
+		}
+		if(c.source && !at) {
+			at = names.size();
+			names.push_back(c.source + " (not there)");
+		}
+		pic = field_row(inspector, "Picture").combobox().items(names).selected(at).anchor(0);
+		pic.tooltip("What it shows: the picture of a video router (a shader, video or output with VideoRouter › Enable Router on), as it goes to the real wall. Shown with Simulation on");
+		pic.on_change([this, id, names](i, text) {
+			name = i > 0 && i < names.size() ? std.string(names[i]).removesuffix(" (not there)") : "";
+			this.set_screen(id, "source", name, false);
+		});
+		br = field_row(inspector, "Brightness").floatbox().anchor(0).min_value(0.0).max_value(2.0).value(c.brightness);
+		br.step(0.1);
+		br.tooltip("How bright the picture is drawn here (1: as it is)");
+		br.value_callback([this, id](v) { this.set_screen(id, "brightness", v, false); });
+		if(!sim_btn.pushed())
+			inspector.label("The picture shows with Simulation on (the toolbar).").wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_3);
+	}
+
+	// =========================================================================
+	// Measuring a material with a camera (#980)
+	// =========================================================================
+
+	build_measure(o, names) {
+		id = o.id;
+		bodies = [];
+		for(i = 0; i < names.size(); i++)
+			bodies.push_back(names.key(i));
+		//(the first translucent body, else the first one)
+		if(!bodies.has_value(mm_part)) {
+			mm_part = bodies.size() ? bodies[0] : "";
+			for(b : bodies) {
+				if(stage_part_material(o, b).preset != "solid") {
+					mm_part = b;
+					break;
+				}
+			}
+		}
+		section_title(inspector, "Measure a material");
+		inspector.label("A test piece of the material, one LED behind it (lit, e.g. Test of the LEDMapper), a camera in front looking at the piece. The room dark.")
+			.wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_3);
+		bc = field_row(inspector, "For body").combobox().items(bodies).selected(math.max(0, stage_ui_index(bodies, mm_part))).anchor(0);
+		bc.on_change([this, bodies](i, t) { this.mm_part = i >= 0 && i < bodies.size() ? bodies[i] : ""; });
+		cams = ledscan_cameras(engine);
+		items = ["The only Camera"];
+		mm_cam_paths = [""];
+		sel = 0;
+		for(c : cams) {
+			mm_cam_paths.push_back(c.live_path);
+			items.push_back(c.name);
+			if(c.live_path == mm_camera)
+				sel = items.size() - 1;
+		}
+		cc = field_row(inspector, "Camera").combobox().items(items).selected(sel).anchor(0);
+		cc.tooltip("The generator the picture comes from: a Camera generator, or one whose picture is a camera (an NDI receiver)");
+		cc.on_change([this](i, t) {
+			this.mm_camera = i > 0 && i < this.mm_cam_paths.size() ? this.mm_cam_paths[i] : "";
+			this.stop_measure();
+		});
+		wb = field_row(inspector, "Picture cm").floatbox().anchor(0).min_value(0.5).max_value(1000.0).value(mm_width_cm);
+		wb.step(1.0);
+		wb.tooltip("How wide the camera's picture is at the surface of the piece, in cm (hold a ruler there once): the size of the spot comes from it");
+		wb.value_callback([this](v) { this.mm_width_cm = v; });
+		busy = mm_state != "";
+		b1 = inspector.button(mm_dark ? "1. Dark picture again (LED off)" : "1. Dark picture (LED off)").fixed_height(STAGE_ROW).enabled(!busy);
+		b1.on_click([this]() { this.start_measure("dark"); });
+		b2 = inspector.button(std.is_none(mm_bare) ? "2. The LED without the piece" : "2. Without the piece again").fixed_height(STAGE_ROW).enabled(!busy && mm_dark);
+		b2.tooltip("Optional: the LED seen without the material, at the same place: then how much light comes through is measured too");
+		b2.on_click([this]() { this.start_measure("bare"); });
+		db = field_row(inspector, "LED at mm").floatbox().anchor(0).min_value(0.0).max_value(2000.0).value(mm_dist_mm);
+		db.step(1.0);
+		db.tooltip("How far the LED is behind the surface of the piece, in mm (measure from the LED to the front side the camera sees)");
+		db.value_callback([this](v) { this.mm_dist_mm = v; });
+		b3 = inspector.button("3. Measure through the piece").fixed_height(STAGE_ROW).enabled(!busy && mm_dark);
+		b3.tooltip("Takes the spot at this distance. Measure two to four distances (e.g. 5, 10, 20, 40 mm)");
+		b3.on_click([this]() { this.start_measure("point"); });
+		for(p : mm_points) {
+			t = math.round(p[0] * 1000.0) + " mm: spot " + (math.round(p[1] * 10000.0) / 10.0) + " mm";
+			if(!std.is_none(mm_bare))
+				t += ", light " + (math.round(p[2] / mm_bare * 100.0) / 100.0);
+			inspector.label(t).fixed_height(STAGE_ROW - 4).text_color(PAL_TEXT_2);
+		}
+		if(mm_note)
+			inspector.label(mm_note).wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_2);
+		fit = stage_material_fit(mm_points, mm_bare);
+		if(!fit)
+			return;
+		cur = stage_part_material(o, mm_part);
+		tr = std.is_none(fit.transmission) ? (cur.preset == "solid" ? 0.5 : cur.transmission) : fit.transmission;
+		res = "Spread " + (math.round(fit.diffusion * 100.0) / 100.0) + ", light " + (math.round(tr * 100.0) / 100.0) +
+			(std.is_none(fit.transmission) ? " (not measured)" : "") + (mm_points.size() > 1 ? " · off by " + (math.round(fit.fit * 10000.0) / 10.0) + " mm" : "");
+		inspector.label(res).wrap(true).fixed_width(STAGE_RIGHT_W - 16);
+		ub = inspector.button("Use for " + mm_part).fixed_height(STAGE_ROW).enabled(mm_part != "");
+		ub.on_click([this, id, fit, tr]() {
+			ob = stage_find(this.the_stage(), id);
+			if(!ob || !this.mm_part)
+				return;
+			c = stage_part_material(ob, this.mm_part);
+			stage_set_part_material(ob, this.mm_part, c.preset == "solid" ? "acrylic_opal" : c.preset, tr, fit.diffusion);
+			this.mm_note = "Used for " + this.mm_part + ".";
+			this.changed(true);
+		});
+		nb = field_row(inspector, "Name").textbox(mm_name).anchor(0);
+		nb.tooltip("A name for the preset, e.g. PETG white 2 mm, 15 % gyroid");
+		nb.on_change([this](text) { this.mm_name = text.trim(); });
+		sb = inspector.button("Save as a preset").fixed_height(STAGE_ROW);
+		sb.tooltip("Saves it into assets/Stage/Materials: every body can take it from its list, and the file can be given to others");
+		sb.on_click([this, id, fit, tr]() {
+			if(!this.mm_name) {
+				this.mm_note = "Give it a name first.";
+				this.build_inspector();
+				return;
+			}
+			pid = stage_material_save(this.mm_name, tr, fit.diffusion, "", this.mm_points);
+			ob = stage_find(this.the_stage(), id);
+			if(ob && this.mm_part)
+				stage_set_part_material(ob, this.mm_part, pid);
+			this.mm_note = "Saved as " + this.mm_name + " (assets/Stage/Materials), used for " + this.mm_part + ".";
+			this.changed(true);
+		});
+		clr = inspector.button("Clear the measures").fixed_height(STAGE_ROW);
+		clr.on_click([this]() {
+			this.mm_points = [];
+			this.mm_bare = None;
+			this.mm_note = "";
+			this.build_inspector();
+		});
+	}
+
+	//Starts taking frames: "dark" (the reference follows the camera), "bare" or "point" (the spot, averaged)
+	start_measure(what) {
+		if(!mm_gpu) {
+			pic = None;
+			try {
+				pic = ledscan_picture(engine, mm_camera);
+			}
+			catch(e) {
+				mm_note = std.string(e);
+				build_inspector();
+				return;
+			}
+			mm_gpu = LedBlobGpu(root);
+			mm_gpu.source(pic);
+			mm_aspect = ledscan_picture_aspect(pic);
+		}
+		mm_state = what;
+		mm_count = 0;
+		mm_samples = [];
+		mm_note = what == "dark" ? "Taking the dark picture…" : "Measuring…";
+		build_inspector();
+	}
+
+	stop_measure() {
+		if(mm_gpu)
+			mm_gpu.free();
+		mm_gpu = None;
+		mm_state = "";
+		mm_dark = false;
+	}
+
+	//Each frame while measuring (sync3d): the dark picture follows the camera for MEASURE_FRAMES frames; a spot is the
+	//mean of MEASURE_FRAMES frames after the read-back caught up
+	measure_frame() {
+		if(!mm_state || !mm_gpu)
+			return;
+		mm_count++;
+		if(mm_state == "dark") {
+			mm_gpu.dark(true);
+			if(mm_count >= STAGE_MEASURE_FRAMES) {
+				mm_gpu.dark(false);
+				mm_dark = true;
+				mm_state = "";
+				mm_note = "Dark picture taken. Now light the LED.";
+				build_inspector();
+			}
+			return;
+		}
+		if(mm_count <= 4)
+			return;
+		b = mm_gpu.blob();
+		if(b && b.found)
+			mm_samples.push_back(b);
+		if(mm_count < 4 + STAGE_MEASURE_FRAMES)
+			return;
+		what = mm_state;
+		mm_state = "";
+		if(!mm_samples.size()) {
+			mm_note = "No light seen: is the LED on, the camera looking at it, the dark picture taken with the LED off?";
+			build_inspector();
+			return;
+		}
+		sig = 0.0;
+		flux = 0.0;
+		w = mm_width_cm / 100.0;
+		for(b : mm_samples) {
+			sig += ledscan_blob_metres(b, w, mm_aspect);
+			flux += b.flux;
+		}
+		sig /= mm_samples.size();
+		flux /= mm_samples.size();
+		if(what == "bare") {
+			mm_bare = flux;
+			mm_note = "The LED without the piece measured. Now put the piece in front of it.";
+		}
+		else {
+			mm_points.push_back([mm_dist_mm / 1000.0, sig, flux]);
+			mm_note = "";
+		}
+		build_inspector();
+	}
+
+	//The settings of a scan (#980): how many splats, how high, and putting its floor at z = 0 in metres
+	build_scan_section(o) {
+		id = o.id;
+		c = o.splat;
+		section_title(inspector, "Scan");
+		names = ["Low (300 000)", "Medium (1 000 000)", "High (4 000 000)"];
+		keys = ["low", "medium", "high"];
+		qc = field_row(inspector, "Splats").combobox().items(names).selected(c.quality == "low" ? 0 : (c.quality == "high" ? 2 : 1)).anchor(0);
+		qc.tooltip("How many splats are drawn at most (every n-th of a bigger scan): fewer for a slow computer");
+		qc.on_change([this, id, keys](i, t) {
+			ob = stage_find(this.the_stage(), id);
+			if(ob && i >= 0 && i < keys.size()) {
+				ob.splat.quality = keys[i];
+				this.changed(false);
+			}
+		});
+		hb = field_row(inspector, "Up to m").floatbox().anchor(0).min_value(0.0).max_value(100.0).value(c.height);
+		hb.step(0.1);
+		hb.tooltip("Only the splats up to this height above its floor (the ceiling and what hangs from it go): 0 shows all");
+		hb.value_callback([this, id](v) {
+			ob = stage_find(this.the_stage(), id);
+			if(ob) {
+				ob.splat.height = math.max(0.0, v);
+				this.changed(false);
+			}
+		});
+		floor_on = scan_mode == "floor" && scan_for == id;
+		fb = inspector.pushbutton(floor_on ? "Click 3 points of the floor (" + scan_points.size() + ")" : "Floor: click 3 points")
+			.icon(nanogui.icon("arrow_down")).fixed_height(STAGE_ROW).pushed(floor_on);
+		fb.tooltip("Click three points on the floor of the scan, far apart: it is turned and moved so that its floor is level at height 0. Drag to turn the view between the clicks\n[[wiki:Stage#scans-of-the-venue]]");
+		fb.on_change([this, id](v) { this.start_scan_mode(v ? "floor" : "", id); });
+		measure_on = scan_mode == "measure" && scan_for == id;
+		mb = inspector.pushbutton(measure_on ? "Click 2 points (" + scan_points.size() + ")" : "Measure: click 2 points")
+			.icon(nanogui.icon("expand")).fixed_height(STAGE_ROW).pushed(measure_on);
+		mb.tooltip("Click two points of the scan whose real distance you know (a door, the stage edge, a truss): then enter it and Scale makes the scan that big");
+		mb.on_change([this, id](v) { this.start_scan_mode(v ? "measure" : "", id); });
+		if(scan_measured > 0.0 && scan_for == id) {
+			rb = field_row(inspector, "Real m").floatbox().anchor(0).min_value(0.001).max_value(10000.0).value(scan_real);
+			rb.step(0.1);
+			rb.tooltip("The real distance between the two points, in metres");
+			rb.value_callback([this](v) { this.scan_real = v; });
+			sb = inspector.button("Scale to it").fixed_height(STAGE_ROW);
+			sb.on_click([this, id]() { this.scale_scan(id); });
+		}
+		reset = inspector.button("Reset the alignment").fixed_height(STAGE_ROW);
+		reset.tooltip("The scan as its file has it again (its floor, its size)");
+		reset.on_click([this, id]() {
+			ob = stage_find(this.the_stage(), id);
+			if(ob) {
+				ob.splat.align = STAGE_SPLAT_IDENTITY.copy();
+				this.scan_note = "";
+				this.changed(true);
+			}
+		});
+		if(scan_note && scan_for == id)
+			inspector.label(scan_note).wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_2);
+	}
+
+	start_scan_mode(mode, id) {
+		scan_mode = mode;
+		scan_for = id;
+		scan_points = [];
+		scan_measured = 0.0;
+		scan_note = mode == "floor" ? "Click three points of the floor, far apart." : (mode == "measure" ? "Click the two points." : "");
+		clear_scan_marks();
+		edges_for = "";
+		build_inspector();
+	}
+
+	clear_scan_marks() {
+		for(item : scan_items)
+			view.remove(item);
+		scan_items = [];
+	}
+
+	//A click of the alignment: a point of the scan (or of anything, to measure)
+	scan_click(p) {
+		s = the_stage();
+		o = stage_find(s, scan_for);
+		if(!o) {
+			start_scan_mode("", "");
+			return;
+		}
+		h = view.pick(p, 4.0);
+		if(!h || (scan_mode == "floor" && h.tag != "stage:" + o.id)) {
+			scan_note = scan_mode == "floor" ? "That was not on the scan: click its floor." : "Nothing there: click a point of the scan.";
+			build_inspector();
+			return;
+		}
+		pt = [x = h.point.x, y = h.point.y, z = h.point.z];
+		scan_points.push_back(pt);
+		scan_items.push_back(view.add(nanogui.mesh3d().sphere(0.03, 10), [mode = "flat", color = PAL_ACCENT, position = pt, pick = false]));
+		if(scan_mode == "floor" && scan_points.size() == 3) {
+			n = stage_splat_floor(s, o, scan_points, view.camera().eye);
+			scan_mode = "";
+			clear_scan_marks();
+			scan_note = n ? "Its floor is level at height 0 now. Measure two points to give it its real size." : "The three points were on one line: try again, farther apart.";
+			changed(true);
+			return;
+		}
+		if(scan_mode == "measure" && scan_points.size() == 2) {
+			a = scan_points[0];
+			b = scan_points[1];
+			scan_measured = math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z));
+			scan_real = math.round(scan_measured * 1000.0) / 1000.0;
+			scan_mode = "";
+			scan_note = "Measured " + metres(scan_measured) + ". Enter the real distance and click Scale to it.";
+		}
+		build_inspector();
+	}
+
+	scale_scan(id) {
+		s = the_stage();
+		o = stage_find(s, id);
+		if(!o || scan_points.size() < 2)
+			return;
+		f = stage_splat_scale(s, o, scan_points[0], scan_points[1], scan_real);
+		clear_scan_marks();
+		scan_points = [];
+		scan_measured = 0.0;
+		scan_note = f > 0.0 ? "Scaled by " + (math.round(f * 1000.0) / 1000.0) + "." : "The two points were the same.";
+		changed(true);
+	}
+
+	//Two number boxes in a row (ints or floats): on_value(index, value)
+	pair(parent, caption, values, ints, on_value) {
+		row = parent.widget().fixed_height(STAGE_ROW + 2);
+		row.label(caption).anchor_left(0).fixed_width(84).fixed_height(STAGE_ROW).text_color(PAL_TEXT_2);
+		w = (STAGE_RIGHT_W - 12 - 84) / 2.0;
+		for(i = 0; i < 2; i++) {
+			k = i;
+			b = ints ? row.intbox().min_value(1).max_value(8192) : row.floatbox().min_value(0.01).max_value(1000.0);
+			b.anchor_left(84 + i * w).fixed_width(w - 4).fixed_height(STAGE_ROW).value(values[i]);
+			if(!ints)
+				b.step(0.1);
+			b.value_callback([on_value, k](v) { on_value(k, v); });
+		}
+		return row;
+	}
+
+	set_screen(id, key, value, rebuild) {
+		ob = stage_find(the_stage(), id);
+		if(!ob || ob.kind != "screen")
+			return;
+		ob.screen[key] = value;
+		stage_screen_defaults(ob);
+		changed(rebuild);
+	}
+
+	//A file from anywhere: copied into assets/Stage (an .obj with its .mtl), then added
+	import_file(path) {
+		path = std.string(path).trim();
+		if(path.starts("\"") && path.ends("\"") && path.length() > 1)
+			path = path.substr(1, path.length() - 2);
+		if(!path || !fileio.is_file(path)) {
+			file_label.caption("No such file: " + path).text_color(PAL_DANGER);
+			return;
+		}
+		if(!stage_model_format(path)) {
+			file_label.caption("Not a model file (STL, OBJ, 3MF, GLB, STEP)").text_color(PAL_DANGER);
+			return;
+		}
+		dest = STAGE_DIR + "/" + fileio.file_name(path);
+		if(fileio.relative_path_cwd(path) != dest) {
+			try {
+				fileio.copy(path, dest);
+				if(stage_model_format(path) == "obj") {
+					mtl = fileio.file_dir(path) + "/" + fileio.pure_name(path) + ".mtl";
+					if(fileio.is_file(mtl))
+						fileio.copy(mtl, STAGE_DIR + "/" + fileio.file_name(mtl));
+				}
+			}
+			catch(e) {
+				file_label.caption("Cannot copy it: " + e).text_color(PAL_DANGER);
+				return;
+			}
+		}
+		file_browser.refresh();
+		if(engine.filebrowser)
+			engine.filebrowser.refresh();
+		import_path.value("");
+		add_file = dest;
+		file_label.caption(fileio.file_name(dest)).text_color(PAL_TEXT_2);
+		add_model(dest, None);
+	}
+
+	snap(v) {
+		return snap_btn && snap_btn.pushed() ? math.round(v / STAGE_SNAP) * STAGE_SNAP : v;
+	}
+
+	selected_objects() {
+		list = [];
+		s = the_stage();
+		for(id : selected) {
+			o = stage_find(s, id);
+			if(o)
+				list.push_back(o);
+		}
+		return list;
+	}
+
+	//Selects ids; add: to the selection; toggle: an id that is selected already goes out of it
+	select_ids(ids, add, toggle) {
+		sel_folder = "";
+		if(!add)
+			sel_lamps = [];
+		if(!add)
+			selected = [];
+		for(id : ids) {
+			if(selected.has_value(id)) {
+				if(toggle) {
+					keep = [];
+					for(k : selected) {
+						if(k != id)
+							keep.push_back(k);
+					}
+					selected = keep;
+				}
+			}
+			else
+				selected.push_back(id);
+		}
+		mark_list_selection();
+		build_inspector();
+	}
+
+	remove_selected() {
+		if(nanogui.show_mode() || !selected.size())
+			return;
+		//#980: a piece of a symmetry group goes with its counterparts (Detach on the right first to remove one alone)
+		s = the_stage();
+		ids = selected.copy();
+		for(o : selected_objects()) {
+			for(m : stage_sym_members(s, o.sym_group)) {
+				if(!ids.has_value(m.id))
+					ids.push_back(m.id);
+			}
+		}
+		stage_remove(s, ids);
+		selected = [];
+		step_name = "Stage: remove";
+		changed(true);
+	}
+
+	duplicate_selected() {
+		if(nanogui.show_mode() || !selected.size())
+			return;
+		copies = stage_duplicate(the_stage(), selected);
+		step_name = "Stage: duplicate";
+		selected = [];
+		for(c : copies)
+			selected.push_back(c.id);
+		changed(true);
+	}
+
+	toggle_visible(id) {
+		o = stage_find(the_stage(), id);
+		if(!o)
+			return;
+		o.visible = o.visible ? 0 : 1;
+		changed(true);
+	}
+
+	//The lowest point of each selected object (its model where it stands) to height 0
+	to_floor() {
+		s = the_stage();
+		for(o : selected_objects()) {
+			m = stage_model_get(o);
+			if(!m || !m.ok || !m.bounds)
+				continue;
+			b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+			d = stage_world_to_local(s, o, [x = 0.0, y = 0.0, z = 0.0 - b.min.z]);
+			o.x += d.x;
+			o.y += d.y;
+			o.z += d.z;
+		}
+		changed(true);
+	}
+
+	// =========================================================================
+	// Right: the inspector
+	// =========================================================================
+
+	build_right() {
+		right = root.widget().anchor_right(0).anchor_top(STAGE_TOOLBAR_H).anchor_bottom(0).fixed_width(STAGE_RIGHT_W);
+		content = right.vscroll().anchor(0).content().layout(nanogui.layout_vertical()).fixed_width(STAGE_RIGHT_W - 12);
+		inspector_holder = content.widget().layout(nanogui.layout_vertical());
+	}
+
+	//Three number boxes in a row (x, y, z of a position or a turn)
+	triple(parent, caption, values, step, on_value) {
+		row = parent.widget().fixed_height(STAGE_ROW + 2);
+		row.label(caption).anchor_left(0).fixed_width(84).fixed_height(STAGE_ROW).text_color(PAL_TEXT_2);
+		w = (STAGE_RIGHT_W - 12 - 84) / 3.0;
+		boxes = [];
+		for(i = 0; i < 3; i++) {
+			k = i;
+			b = row.floatbox().anchor_left(84 + i * w).fixed_width(w - 4).fixed_height(STAGE_ROW).value(values[i]);
+			b.step(step);
+			b.value_callback([on_value, k](v) { on_value(k, v); });
+			boxes.push_back(b);
+		}
+		return boxes;
+	}
+
+	build_inspector() {
+		inspector = fresh_box(inspector_holder, inspector);
+		list = selected_objects();
+		info_shown = "";
+		fsel = folder_selected();
+		if(fsel)
+			build_folder_section(stage_find_folder(the_stage(), fsel));
+		//#980: lamps selected here
+		sl = selected_lamps();
+		if(list.size() == 0 && sl.size()) {
+			build_lamp_section(sl);
+			inspector_holder.refresh_layout();
+			return;
+		}
+		if(list.size() == 0 && fsel) {
+			inspector_holder.refresh_layout();
+			return;
+		}
+		if(list.size() == 0) {
+			section_title(inspector, "Stage");
+			hints = [
+				"1. Put model files (STL, OBJ, 3MF, GLB, STEP) into assets/Stage, or import one from anywhere with the field on the left.",
+				"2. Double-click a file or drag it into the 3D view: it stands where you drop it.",
+				nanogui.key_text("3. Drag an object to move it, Shift+drag to raise it, R to turn it. Click one to set it exactly here, or move and turn it along an axis with the tools at the bottom left of the view (2, 3)."),
+				"4. Hang an object on another (Hangs on): it moves with it. The fixture setup shows the stage in its 3D view.",
+			];
+			for(h : hints)
+				inspector.label(h).wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_2);
+			inspector_holder.refresh_layout();
+			return;
+		}
+		if(list.size() > 1) {
+			section_title(inspector, list.size() + " objects");
+			inspector.label(nanogui.key_text("Drag one of them to move them all, Shift+drag to raise them, R to turn them. Delete removes them, Ctrl+D duplicates them."))
+				.wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_TEXT_2);
+			//#980: spaced evenly between the first and the last selected
+			db = inspector.widget().fixed_height(STAGE_ROW + 2).button("Distribute evenly").icon(0xf337).anchor(0).fixed_height(STAGE_ROW);
+			db.enabled(list.size() >= 3);
+			db.tooltip("The ones between spaced evenly on the line from the first selected to the last selected (those two stay). Select them in the order of the row\n[[wiki:Stage#rows-and-spacing]]");
+			db.on_click([this]() {
+				if(stage_distribute(this.the_stage(), this.selected_objects())) {
+					this.step_name = "Stage: distribute";
+					this.changed(true);
+				}
+			});
+			inspector_holder.refresh_layout();
+			return;
+		}
+		o = list[0];
+		id = o.id;
+		s = the_stage();
+		section_title(inspector, "Object");
+		name_box = field_row(inspector, "Name").textbox(o.name).anchor(0);
+		name_box.on_change([this, id](text) {
+			ob = stage_find(this.the_stage(), id);
+			if(ob && text.trim()) {
+				ob.name = text.trim();
+				this.changed(false);
+			}
+		});
+		if(o.kind != "screen" && o.kind != "build")
+			field_row(inspector, "File").label(fileio.file_name(o.source)).anchor(0).tooltip(o.source);
+
+		triple(inspector, "Position m", [o.x, o.y, o.z], 0.05, [this, id](k, v) {
+			ob = stage_find(this.the_stage(), id);
+			if(!ob)
+				return;
+			if(k == 0)
+				ob.x = v;
+			else if(k == 1)
+				ob.y = v;
+			else
+				ob.z = v;
+			this.changed(false);
+		});
+		triple(inspector, "Turn °", [o.rx, o.ry, o.rz], 5.0, [this, id](k, v) {
+			ob = stage_find(this.the_stage(), id);
+			if(!ob)
+				return;
+			if(k == 0)
+				ob.rx = v;
+			else if(k == 1)
+				ob.ry = v;
+			else
+				ob.rz = v;
+			this.changed(false);
+		});
+		if(o.kind != "screen" && o.kind != "build") {
+			sc = field_row(inspector, "Scale").floatbox().anchor(0).min_value(0.001).max_value(1000.0).value(o.scale);
+			sc.step(0.1);
+			sc.tooltip("1: as big as the file says (in its unit). 0.5 half as big");
+			sc.value_callback([this, id](v) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob && v > 0.0) {
+					ob.scale = v;
+					this.changed(false);
+				}
+			});
+		}
+
+		//STL and OBJ do not say their unit or up axis, STEP not always its up axis (Fusion: often y up)
+		fmt = stage_model_format(o.source);
+		d = stage_model_defaults(o.source);
+		if(fmt == "stl" || fmt == "obj") {
+			unit = o.unit > 0.0 ? o.unit : d.unit;
+			labels = [];
+			index = 0;
+			for(i = 0; i < STAGE_UNITS.size(); i++) {
+				labels.push_back(STAGE_UNITS[i][0]);
+				if(math.abs(STAGE_UNITS[i][1] - unit) < 1e-9)
+					index = i;
+			}
+			uc = field_row(inspector, "Unit").combobox().items(labels).selected(index).anchor(0);
+			uc.tooltip(fmt.uppercase() + " files do not say their unit: what one unit of the file is. Printing and Fusion write millimetres");
+			uc.on_change([this, id](i, text) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob && i >= 0 && i < STAGE_UNITS.size()) {
+					ob.unit = STAGE_UNITS[i][1];
+					this.changed(true);
+				}
+			});
+		}
+		if(fmt == "stl" || fmt == "obj" || fmt == "step") {
+			up = o.up ? o.up : d.up;
+			ac = field_row(inspector, "Up").combobox().items(["Z up", "Y up"]).selected(up == "y" ? 1 : 0).anchor(0);
+			ac.tooltip("Which axis of the file points up. STL and STEP files are usually z up, OBJ files y up; a STEP file from a Fusion design made y up: Y up");
+			ac.on_change([this, id](i, text) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob) {
+					ob.up = i == 1 ? "y" : "z";
+					this.changed(true);
+				}
+			});
+		}
+
+		//Hangs on: the stage, or an object that does not hang on this one
+		names = ["The stage"];
+		ids = [""];
+		at = 0;
+		for(q : s.objects) {
+			if(q.id == id)
+				continue;
+			loop = false;
+			p = q.parent;
+			for(p && !loop) {
+				if(p == id)
+					loop = true;
+				r = stage_find(s, p);
+				p = r ? r.parent : "";
+			}
+			if(loop)
+				continue;
+			if(q.id == o.parent)
+				at = ids.size();
+			names.push_back(q.name);
+			ids.push_back(q.id);
+		}
+		pc = field_row(inspector, "Hangs on").combobox().items(names).selected(at).anchor(0);
+		pc.tooltip("An object that hangs on another moves, turns and scales with it; its position is then from that object");
+		pc.on_change([this, id, ids](i, text) {
+			if(i >= 0 && i < ids.size() && stage_set_parent(this.the_stage(), id, ids[i]))
+				this.changed(true);
+		});
+		//#980: its symmetry group: the others follow it; Detach takes it out
+		if(o.sym_group) {
+			srow = field_row(inspector, "Symmetry");
+			srow.label(stage_sym_text(s, o)).anchor_left(0).anchor_right(80).fixed_height(STAGE_ROW);
+			det = srow.button("Detach").anchor_right(0).fixed_width(76).fixed_height(STAGE_ROW);
+			det.tooltip("Takes it out of its symmetry group: it no longer follows the others, nor they it");
+			det.on_click([this, id]() {
+				ob = stage_find(this.the_stage(), id);
+				if(ob) {
+					stage_sym_detach(this.the_stage(), ob);
+					this.changed(true);
+				}
+			});
+		}
+		//#980: the folder it is in (order and showing / hiding only)
+		ch = folder_choices();
+		fat = 0;
+		for(i = 0; i < ch.ids.size(); i++) {
+			if(ch.ids[i] == o.folder)
+				fat = i;
+		}
+		fids = ch.ids;
+		fc = field_row(inspector, "Folder").combobox().items(ch.names).selected(fat).anchor(0);
+		fc.tooltip("The folder it is in, in the list on the left: a folder hides or shows all in it. It moves nothing\n[[wiki:Stage#folders]]");
+		fc.on_change([this, id, fids](i, text) {
+			if(i >= 0 && i < fids.size() && stage_set_folder(this.the_stage(), id, fids[i]))
+				this.changed(true);
+		});
+
+		vis = field_row(inspector, "Visible").pushbutton(o.visible ? "Shown" : "Hidden").icon(nanogui.icon(o.visible ? "eye" : "eye_slash"))
+			.anchor(0).pushed(o.visible ? true : false);
+		vis.on_change([this, id](v) { this.toggle_visible(id); });
+
+		if(o.kind == "screen")
+			build_screen_section(o);
+		if(o.kind == "build")
+			build_build_section(o);
+		build_row_section(o);
+		if(o.kind == "splat")
+			build_scan_section(o);
+		else
+			build_edge_section(o);
+
+		//What the model is: read on a thread, the inspector is built again when it is there
+		m = stage_model_get(o);
+		step_status = None;
+		step_progress = None;
+		job = fmt == "step" ? stage_step_job(o.source) : None;
+		step_seen = job ? job.state : "";
+		if(fmt == "step")
+			build_step_section(o, m, job);
+		section_title(inspector, "Model");
+		if(std.is_none(m))
+			inspector.label("Reading…").fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+		else if(!m.ok) {
+			info_shown = stage_model_key(o);
+			if(!m.needs_convert)
+				inspector.label(m.error).wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_DANGER);
+			else
+				inspector.label("Not converted yet").fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+		}
+		else {
+			info_shown = stage_model_key(o);
+			b = m.bounds;
+			//(a scan: as it stands, aligned)
+			if(o.kind == "splat")
+				b = stage_splat_world_box(s, o) ?? stage_world_box(stage_world_matrix(s, o), b);
+			k = o.kind == "splat" ? 1.0 : o.scale;
+			size = (b.max.x - b.min.x) * k;
+			size_y = (b.max.y - b.min.y) * k;
+			size_z = (b.max.z - b.min.z) * k;
+			field_row(inspector, "Size").label(metres(size) + " × " + metres(size_y) + " × " + metres(size_z)).anchor(0)
+				.tooltip("Width (x) × depth (y) × height (z) of the model, scaled, before it is turned");
+			if(o.kind == "splat")
+				field_row(inspector, "Splats").label(std.string(m.splats ?? 0)).anchor(0);
+			if(o.kind != "screen" && o.kind != "splat") {
+				field_row(inspector, "Triangles").label(std.string(m.triangles)).anchor(0);
+				field_row(inspector, "Parts").label(std.string(m.parts.size())).anchor(0);
+				build_materials(o, m);
+			}
+		}
+		inspector_holder.refresh_layout();
+	}
+
+	//The material of each body (#980): solid, or translucent with how much LED light comes through and how far it
+	//spreads (shown with Simulation on, lit by the LEDs on the stage near the object)
+	build_materials(o, m) {
+		section_title(inspector, "Materials");
+		mats = stage_materials_all();
+		labels = [];
+		for(mt : mats)
+			labels.push_back(mt[1]);
+		id = o.id;
+		names = std.json();
+		bodies = 0; //(not "shown": a method of this class, a local of that name would be the method)
+		for(p : m.parts) {
+			//(bodies of the same name share their material: the instances of a part of an assembly)
+			if(names.has(p.name))
+				continue;
+			names[p.name] = true;
+			if(bodies >= 12) {
+				inspector.label("… more bodies").fixed_height(STAGE_ROW - 6).text_color(PAL_TEXT_3);
+				break;
+			}
+			bodies++;
+			part = p.name;
+			cur = stage_part_material(o, part);
+			index = 0;
+			for(i = 0; i < mats.size(); i++) {
+				if(mats[i][0] == cur.preset)
+					index = i;
+			}
+			mc = field_row(inspector, part).combobox().items(labels).selected(index).anchor(0);
+			mc.tooltip("What this body is made of. A translucent one lets the LEDs on the stage behind it shine through, spread by how far they are from it (Simulation on)\n[[wiki:Stage#materials]]");
+			mc.on_change([this, id, part, mats](i, text) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob && i >= 0 && i < mats.size()) {
+					stage_set_part_material(ob, part, mats[i][0]);
+					this.changed(true);
+				}
+			});
+			if(cur.preset == "solid")
+				continue;
+			row = inspector.widget().fixed_height(STAGE_ROW + 2);
+			row.label("Light / spread").anchor_left(0).fixed_width(84).fixed_height(STAGE_ROW).text_color(PAL_TEXT_3);
+			w2 = (STAGE_RIGHT_W - 12 - 84) / 2.0;
+			tb = row.floatbox().anchor_left(84).fixed_width(w2 - 4).fixed_height(STAGE_ROW).min_value(0.0).max_value(1.0).value(cur.transmission);
+			tb.step(0.05);
+			tb.tooltip("How much of the LED light comes through, 0..1");
+			tb.value_callback([this, id, part](v) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob) {
+					c = stage_part_material(ob, part);
+					stage_set_part_material(ob, part, c.preset, v, c.diffusion);
+					this.changed(false);
+				}
+			});
+			db = row.floatbox().anchor_left(84 + w2).fixed_width(w2 - 4).fixed_height(STAGE_ROW).min_value(0.0).max_value(10.0).value(cur.diffusion);
+			db.step(0.05);
+			db.tooltip("How far the light of an LED spreads: the spot gets this many metres wider per metre between the LED and the surface (clear: about 0, opal: about 1)");
+			db.value_callback([this, id, part](v) {
+				ob = stage_find(this.the_stage(), id);
+				if(ob) {
+					c = stage_part_material(ob, part);
+					stage_set_part_material(ob, part, c.preset, c.transmission, v);
+					this.changed(false);
+				}
+			});
+		}
+		//#980: measuring a material with a camera
+		mb = inspector.pushbutton(mm_open && mm_for == id ? "Measuring a material" : "Measure a material with a camera")
+			.icon(0xf030) //(Font Awesome "camera": no name in nanogui.icon)
+			.fixed_height(STAGE_ROW).pushed(mm_open && mm_for == id);
+		mb.tooltip("Measure how much light a material lets through and how far it spreads it: one LED behind a test piece of it, a camera in front, at a few distances\n[[wiki:Stage#measure-a-material]]");
+		mb.on_change([this, id](v) {
+			this.mm_open = v ? true : false;
+			this.mm_for = id;
+			if(!v)
+				this.stop_measure();
+			this.build_inspector();
+		});
+		if(mm_open && mm_for == id)
+			build_measure(o, names);
+	}
+
+	// =========================================================================
+	// LEDs along the edges of a model (#980)
+	// =========================================================================
+
+	//The LEDMappers that can take a strip (their AIInterface has add_path_segment): [[iface, name], ...]
+	stage_mappers() {
+		return stage_leds_mappers(engine);
+	}
+
+	build_edge_section(o) {
+		section_title(inspector, "LEDs along edges");
+		id = o.id;
+		on = edges_for == id;
+		btn = inspector.pushbutton(on ? "Edges shown: click one" : "Show edges").icon(nanogui.icon("project_diagram")).fixed_height(STAGE_ROW)
+			.pushed(on);
+		btn.tooltip("Shows the edges of this model (where its faces meet at a sharp angle). A click on one puts a strip of LEDs along its outline into a LEDMapper (Shift+click: only that piece)\n[[wiki:Stage#leds-along-edges]]");
+		btn.on_change([this, id](v) {
+			this.edges_for = v ? id : "";
+			this.edge_note = "";
+			this.build_inspector();
+		});
+		if(!on)
+			return;
+		lp = field_row(inspector, "LEDs / m").floatbox().anchor(0).min_value(1.0).max_value(500.0).value(leds_per_m);
+		lp.step(1.0);
+		lp.tooltip("How many LEDs a metre the strip has (30, 60, 96, 144 are common)");
+		lp.value_callback([this](v) { this.leds_per_m = v; });
+		mappers = stage_mappers();
+		if(!mappers.size()) {
+			inspector.label("No LEDMapper open: put one into a view first.").wrap(true).fixed_width(STAGE_RIGHT_W - 16).text_color(PAL_CUE);
+			return;
+		}
+		names = [];
+		for(mp : mappers)
+			names.push_back(mp.name);
+		mc = field_row(inspector, "Into").combobox().items(names).selected(math.clamp(mapper_index, 0, names.size() - 1)).anchor(0);
+		mc.tooltip("The LEDMapper that gets the strips: a group Edges of <object> in it, which hangs on this object");
+		mc.on_change([this](i, t) { this.mapper_index = i; });
+		inspector.label(edge_note ? edge_note : "Click an edge in the 3D view.").wrap(true).fixed_width(STAGE_RIGHT_W - 16)
+			.text_color(edge_note ? PAL_TEXT_2 : PAL_TEXT_3);
+	}
+
+	//The lines of the edges of edges_for, hanging on its item in the view (they move with it)
+	sync_edges() {
+		o = edges_for ? stage_find(the_stage(), edges_for) : None;
+		rec = o ? (scene.stage_items[o.id] ?? None) : None;
+		obj_root = rec && rec.built ? rec.root : -1; //(not "root": the managed root widget of this menu)
+		if(obj_root != edge_root) {
+			for(item : edge_items)
+				view.remove(item);
+			edge_items = [];
+			edge_root = -1;
+		}
+		if(!o || obj_root < 0 || edge_items.size())
+			return;
+		chains = stage_model_edges_get(o);
+		if(std.is_none(chains))
+			return;
+		pts = [];
+		for(c : chains) {
+			v = c.points;
+			for(i = 3; i + 2 < v.size(); i += 3) {
+				for(k = -3; k < 3; k++)
+					pts.push_back(v[i + k]);
+			}
+		}
+		if(!pts.size())
+			return;
+		mesh = nanogui.mesh3d().lines(pts);
+		edge_items.push_back(view.add(mesh, [parent = obj_root, mode = "line", color = PAL_ACCENT, pick = false]));
+		edge_root = obj_root;
+	}
+
+	//The chain of edges_for nearest to a point of the view (within 10 pixels): its index, or -1
+	edge_at(p) {
+		o = stage_find(the_stage(), edges_for);
+		chains = o ? stage_model_edges_get(o) : None;
+		if(!chains)
+			return -1;
+		m = stage_world_matrix(the_stage(), o);
+		best = -1;
+		best_d = 10.0;
+		for(ci = 0; ci < chains.size(); ci++) {
+			v = chains[ci].points;
+			prev = None;
+			for(i = 0; i + 2 < v.size(); i += 3) {
+				w = stage_point(m, [x = v[i], y = v[i + 1], z = v[i + 2]]);
+				q = view.project(w);
+				cur = q.ok ? vec2f(q.x, q.y) : None;
+				if(cur && prev) {
+					d = stage_ui_segment_distance(p, prev, cur);
+					if(d < best_d) {
+						best_d = d;
+						best = ci;
+					}
+				}
+				prev = cur;
+			}
+		}
+		return best;
+	}
+
+	edge_near(p) {
+		return edge_at(p) >= 0;
+	}
+
+	//LEDs along the edge under p: its whole outline, or (only) just that chain
+	leds_on_edge(p, only) {
+		o = stage_find(the_stage(), edges_for);
+		ci = edge_at(p);
+		if(!o || ci < 0)
+			return;
+		chains = stage_model_edges_get(o);
+		path = only ? [closed = chains[ci].closed, points = chains[ci].points] : stage_edge_loop(chains, ci);
+		mappers = stage_mappers();
+		if(!mappers.size()) {
+			edge_note = "No LEDMapper open: put one into a view first.";
+			build_inspector();
+			return;
+		}
+		mp = mappers[math.clamp(mapper_index, 0, mappers.size() - 1)];
+		r = mp.iface.query("add_path_segment", [points = path.points, hangs_on = o.id, leds_per_m = leds_per_m,
+			group_name = "Edges of " + o.name], "stage");
+		if(r.ok)
+			edge_note = r.value.leds + " LEDs along " + metres(r.value.length) + (path.closed ? " (closed)" : "") + " into " + mp.name + ", group " + r.value.group + ".";
+		else
+			edge_note = "Not added: " + r.error;
+		build_inspector();
+	}
+
+	//A STEP file is converted once (engine/stage/stage_step.shio): the state of that, Convert, how fine
+	build_step_section(o, m, job) {
+		section_title(inspector, "STEP");
+		path = o.source;
+		w = STAGE_RIGHT_W - 16;
+		if(job && (job.state == "env" || job.state == "converting")) {
+			step_status = inspector.label(job.status + "…").wrap(true).fixed_width(w).text_color(PAL_CUE);
+			step_progress = inspector.label(job.progress).wrap(true).fixed_width(w).text_color(PAL_TEXT_3);
+			return;
+		}
+		if(job && job.state == "error") {
+			e = inspector.label(job.error).wrap(true).fixed_width(w).text_color(PAL_DANGER);
+			if(job.detail)
+				e.tooltip(job.detail);
+		}
+		text = "Converted into triangles; the file next to it (.stagemesh) goes with it, so another computer shows it without converting.";
+		if(m && m.needs_convert)
+			text = "A STEP file is converted into triangles once, with OpenCASCADE (installed the first time, " + STAGE_STEP_SIZE + ").";
+		else if(m && m.stale)
+			text = "The STEP file changed since it was converted: it shows the old version until you convert it again.";
+		inspector.label(text).wrap(true).fixed_width(w).text_color(m && (m.needs_convert || m.stale) ? PAL_CUE : PAL_TEXT_2);
+		labels = [];
+		for(t : STAGE_STEP_TOLERANCES)
+			labels.push_back(t[0]);
+		tc = field_row(inspector, "Detail").combobox().items(labels).selected(step_tolerance).anchor(0);
+		tc.tooltip("How close the triangles follow the curved surfaces: finer is rounder, with more triangles");
+		tc.on_change([this](i, t) { this.step_tolerance = i; });
+		btn = inspector.button(m && m.needs_convert ? "Convert" : "Convert again").icon(nanogui.icon("sync")).fixed_height(STAGE_ROW);
+		btn.on_click([this, path]() { this.convert_step(path); });
+	}
+
+	//Converts a STEP file; the first time it asks before OpenCASCADE is installed
+	convert_step(path) {
+		if(nanogui.show_mode())
+			return;
+		if(!stage_step_env_ready()) {
+			answer = engine.screen.modal_yes_no("STEP files are converted with OpenCASCADE, a CAD library in Python. It is installed once for every project: " +
+				STAGE_STEP_SIZE + ". Install it now and convert " + fileio.file_name(path) + "?", "Install OpenCASCADE?");
+			if(answer != "yes")
+				return;
+		}
+		k = math.clamp(step_tolerance, 0, STAGE_STEP_TOLERANCES.size() - 1);
+		stage_step_convert(path, STAGE_STEP_TOLERANCES[k][1]);
+		build_inspector();
+	}
+
+	//"2.35 m", "48 mm"
+	metres(v) {
+		if(v < 1.0)
+			return std.string(std.int(math.round(v * 1000.0))) + " mm";
+		cm = std.int(math.round(v * 100.0));
+		rest = cm % 100;
+		return std.string(std.int(cm / 100)) + "." + (rest < 10 ? "0" : "") + rest + " m";
+	}
+
+	//"-90°", "+7.5°" (a float would print as -90.000000)
+	degrees(v) {
+		t = std.int(math.round(v * 10.0));
+		a = math.abs(t);
+		return (t > 0 ? "+" : (t < 0 ? "-" : "")) + std.int(a / 10) + (a % 10 != 0 ? "." + (a % 10) : "") + "°";
+	}
+
+	// =========================================================================
+	// The 3D view
+	// =========================================================================
+
+	build_center() {
+		center = root.widget().anchor_left(STAGE_LEFT_W).anchor_right(STAGE_RIGHT_W).anchor_top(STAGE_TOOLBAR_H).anchor_bottom(0);
+		view = center.view3d().anchor(0);
+		view.background(PAL_CANVAS);
+		view.camera([target = [x = 0.0, y = 0.0, z = 1.0], yaw = 0.45, pitch = 0.5, distance = 16.0]);
+		scene = stage3d_scene(view);
+		view.on_prepare([this]() { this.sync3d(); });
+		view.on_draw([this]() { this.draw3d(); });
+		view.on_mouse_button([this](pos, button, down, mods) { return this.button3d(pos, button, down, mods); });
+		view.on_mouse_drag([this](pos, rel, button, mods) { return this.drag3d(pos, rel, button, mods); });
+		view.on_scroll([this](pos, rel) {
+			this.view.zoom(rel.y);
+			return true;
+		});
+		view.on_keyboard([this](key, scancode, action, mods) { return this.key3d(key, action, mods); });
+		//#980: the arrow / ring under the mouse is highlighted
+		view.on_mouse_motion([this](pos, rel, button, mods) {
+			this.palette_hover = this.drag_mode == "" ? this.palette_hit(vec2f(pos.x, pos.y)) : -1;
+			this.measure_hover = vec2f(pos.x, pos.y);
+			if(this.placing)
+				this.place_at(vec2f(pos.x, pos.y));
+			if(this.tool != "select" && this.drag_mode != "tool")
+				this.tool_hover = this.tool_hit(vec2f(pos.x, pos.y));
+			return false;
+		});
+		view.on_dragdrop_hover([this](payload, pos) {
+			return this.dropped_models(payload).size() > 0;
+		});
+		view.on_dragdrop([this](payload, pos) {
+			files = this.dropped_models(payload);
+			for(i = 0; i < files.size(); i++) {
+				at = this.view.hit_level(vec2f(pos.x + i * 20, pos.y), 0.0);
+				this.add_model(files[i], at);
+			}
+			return files.size() > 0;
+		});
+	}
+
+	//The model files in a drop from a file browser (relative to the app, with "/")
+	dropped_models(payload) {
+		list = [];
+		paths = [];
+		if(payload.has("paths") && payload.paths.size())
+			paths = payload.paths;
+		else if(payload.has("path"))
+			paths = [payload.path];
+		for(p : paths) {
+			rel = std.string(fileio.relative_path_cwd(p)).replace("\\", "/");
+			if(fileio.is_file(rel) && stage_model_format(rel))
+				list.push_back(rel);
+		}
+		return list;
+	}
+
+	//Before each picture: the lamps (if shown), the models, the selection; the lists follow changes from elsewhere
+	sync3d() {
+		if(!engine)
+			return;
+		lamps = lamps_btn.pushed() ? engine.patch.fixtures : [];
+		scene.sync(lamps, engine.fixture_menu, sel_lamps, std.json());
+		scene.sync_stage(engine.stage, engine.stage_revision, selected, true);
+		scene.sync_leds(engine, engine.stage, engine.stage_revision, sim_btn.pushed());
+		scene.sync_materials(engine.stage, engine.stage_revision, sim_btn.pushed());
+		scene.sync_screens(engine.stage, sim_btn.pushed());
+		measure_frame();
+		if(engine.stage_leds_revision != led_list_key) {
+			refresh_led_list();
+			left_content.parent().refresh_layout();
+		}
+		if(engine.stage_revision != seen_revision) {
+			seen_revision = engine.stage_revision;
+			//#980: a change from elsewhere (the Chat, an undo) is a step / the new start
+			record_step("Stage (Chat)");
+			if(stage_undo_restored(engine)) {
+				keep = [];
+				for(id : selected) {
+					if(stage_find(the_stage(), id))
+						keep.push_back(id);
+				}
+				selected = keep;
+				sel_folder = "";
+			}
+			sim_btn.pushed(the_stage().simulation ? true : false);
+			refresh_lists();
+			build_inspector();
+		}
+		//a model that was being read is there now: its information, the status, the name in red if it cannot be read
+		if(selected.size() == 1 && !info_shown) {
+			o = stage_find(the_stage(), selected[0]);
+			if(o && !std.is_none(stage_model_get(o))) {
+				build_inspector();
+				refresh_lists();
+			}
+		}
+		sync_edges();
+		//a STEP file being converted: its progress; the inspector is built again when the job ends
+		if(selected.size() == 1) {
+			o = stage_find(the_stage(), selected[0]);
+			job = o && stage_model_format(o.source) == "step" ? stage_step_job(o.source) : None;
+			state = job ? job.state : "";
+			if(state != step_seen)
+				build_inspector();
+			else if(job && step_status) {
+				step_status.caption(job.status + "…");
+				step_progress.caption(job.progress);
+			}
+		}
+		update_status();
+	}
+
+	draw3d() {
+		s = view.size();
+		for(o : selected_objects()) {
+			box = scene.stage_box(o.id);
+			if(box)
+				pal_text(vec2f((box.min.x + box.max.x) / 2.0, box.min.y - 9), o.name, 12, PAL_TEXT, PAL_ALIGN_CENTER_MIDDLE);
+		}
+		hint = "Right mouse button: turn · middle: move · scroll: zoom · drag an object: move it · Shift+drag: up and down · R: turn it · drag the empty stage: select · F: fit";
+		if(tool == "move")
+			hint = "Move tool: drag an arrow · C / Shift+C: steps";
+		else if(tool == "turn")
+			hint = "Turn tool: drag a ring along it · C / Shift+C: steps";
+		else if(tool == "measure")
+			hint = "Tape measure: click two points (they snap to the joints and corners) · Escape: cancel, again: clear all";
+		if(placing) {
+			po = stage_find(the_stage(), placing);
+			hint = "Placing " + (po ? po.name : "") + ": click where it goes · Escape or a right click: not";
+		}
+		if(view.camera().ortho)
+			hint = "No perspective (a plan) · 3D in View: perspective again · " + hint;
+		if(!plan_capture)
+			pal_text(vec2f(8, 12), nanogui.key_text(hint), 12, PAL_TEXT_3, PAL_ALIGN_LEFT_MIDDLE);
+		draw_sym();
+		draw_box();
+		if(!plan_capture)
+			draw_tool();
+		draw_nodes();
+		draw_outlines();
+		draw_measures();
+		draw_scale();
+		if(!plan_capture)
+			draw_palette();
+		if(drag_mode == "lift" && drag_moved && drag_pick) {
+			o = stage_find(the_stage(), drag_pick);
+			if(o)
+				pal_text(vec2f(8, 28), "Height " + metres(math.max(0.0, o.z)), 12, PAL_TEXT, PAL_ALIGN_LEFT_MIDDLE);
+		}
+		if(!the_stage().objects.size())
+			pal_text(vec2f(s.x / 2.0, s.y / 2.0), "Drag a model file here", 16, PAL_TEXT_3, PAL_ALIGN_CENTER_MIDDLE);
+	}
+
+	// =========================================================================
+	// Move and turn tools (#980)
+	// =========================================================================
+
+	set_tool(name) {
+		tool = name;
+		tool_hover = -1;
+	}
+
+	toggle_tool_frame() {
+		tool_local = !tool_local;
+	}
+
+	//The tool palette at the bottom left of the 3D view, as in a rocket workshop: select, move, turn, and the axes
+	//(world / local). Each: [name, icon (Font Awesome), key, what it does, on]
+	palette_items() {
+		return [["select", "\uf245", "1", "Select: drag objects over the floor", tool == "select"],
+			["move", "\uf31e", "2", "Move along an axis: drag an arrow", tool == "move"],
+			["turn", "\uf2f9", "3", "Turn around an axis: drag a ring", tool == "turn"],
+			["frame", tool_local ? "\uf1b2" : "\uf0ac", "F", tool_local ? "Local: the object's own axes (click: the world's)" : "World: the axes of the stage (click: the object's own)", tool_local],
+			["step", step_text(), "C", (tool == "move" ? "Steps of a move" : "Steps of a turn (and of R)") + ": click or C finer / coarser, Shift+click or Shift+C back; free: no snapping", false],
+			["sym", sym_mode == "off" ? "Sym" : STAGE_SYM_TEXT[stage_build_index(STAGE_SYM_MODES, sym_mode)], "X",
+				"Symmetry of new pieces: off, mirrored at the middle, ×2 .. ×8 around it (of the stage, or of what it hangs on). Click or X: next, Shift: back", sym_mode != "off"],
+			["measure", "\uf545", "M", "Tape measure: click two points, it shows how far (and along x, y, z)", tool == "measure"]];
+	}
+
+	//The steps of the tool in use (the angle with the select tool: R turns by it) and its text: "15°", "5 cm", "free"
+	tool_step() {
+		return tool == "move" ? STAGE_MOVE_STEPS[move_step] : STAGE_ANGLE_STEPS[angle_step];
+	}
+
+	step_text() {
+		v = tool_step();
+		if(v <= 0)
+			return "free";
+		if(tool != "move")
+			return std.string(std.int(v)) + "°";
+		return v < 1.0 ? std.string(std.int(math.round(v * 100.0))) + " cm" : std.string(std.int(math.round(v))) + " m";
+	}
+
+	//C (d 1) / Shift+C (d -1): the next steps of the tool in use, round
+	cycle_step(d) {
+		if(tool == "move")
+			move_step = (move_step + d + STAGE_MOVE_STEPS.size()) % STAGE_MOVE_STEPS.size();
+		else
+			angle_step = (angle_step + d + STAGE_ANGLE_STEPS.size()) % STAGE_ANGLE_STEPS.size();
+	}
+
+	//The top left corner of button i (the axes and the steps a bit apart from the tools)
+	palette_pos(i) {
+		y = view.size().y - STAGE_PALETTE_MARGIN - STAGE_PALETTE_BTN;
+		x = STAGE_PALETTE_MARGIN;
+		for(j = 0; j < i; j++)
+			x += palette_w(j) + STAGE_PALETTE_GAP + (j == 2 || j == 5 ? 8.0 : 0.0);
+		return vec2f(x, y);
+	}
+
+	palette_w(i) {
+		return i == 4 || i == 5 ? STAGE_PALETTE_STEP_W : STAGE_PALETTE_BTN;
+	}
+
+	//The button under p, or -1
+	palette_hit(p) {
+		if(nanogui.show_mode())
+			return -1;
+		for(i = 0; i < 7; i++) {
+			q = palette_pos(i);
+			if(p.x >= q.x && p.x < q.x + palette_w(i) && p.y >= q.y && p.y < q.y + STAGE_PALETTE_BTN)
+				return i;
+		}
+		return -1;
+	}
+
+	palette_click(i, mods = 0) {
+		if(i == 6)
+			set_tool(tool == "measure" ? "select" : "measure");
+		else if(i == 5)
+			cycle_sym((mods & STAGE_MOD_SHIFT) ? -1 : 1);
+		else if(i == 4)
+			cycle_step((mods & STAGE_MOD_SHIFT) ? -1 : 1);
+		else if(i == 3)
+			toggle_tool_frame();
+		else
+			set_tool(palette_items()[i][0]);
+	}
+
+	draw_palette() {
+		if(nanogui.show_mode())
+			return;
+		items = palette_items();
+		a = palette_pos(0);
+		b = palette_pos(6);
+		nvgBeginPath();
+		nvgRoundedRect(vec2f(a.x - 4, a.y - 4), vec2f(b.x + palette_w(6) - a.x + 8, STAGE_PALETTE_BTN + 8), 6.0);
+		nvgFillColor(pal_alpha(PAL_RAISED, 0.88));
+		nvgFill();
+		for(i = 0; i < items.size(); i++) {
+			it = items[i];
+			q = palette_pos(i);
+			on = it[4];
+			//the axes do nothing with the select tool: shown dim
+			dim = i == 3 && tool == "select";
+			nvgBeginPath();
+			nvgRoundedRect(q, vec2f(palette_w(i), STAGE_PALETTE_BTN), 4.0);
+			nvgFillColor(on ? PAL_ACCENT : (palette_hover == i ? PAL_LINE_STRONG : PAL_CONTROL));
+			nvgFill();
+			c = vec2f(q.x + palette_w(i) / 2.0, q.y + STAGE_PALETTE_BTN / 2.0 + 1.0);
+			if(i == 4 || i == 5)
+				pal_text(c + vec2f(3.0, 0.0), it[1], 12, on ? PAL_CANVAS : (it[1] == "free" || it[1] == "Sym" ? PAL_TEXT_2 : PAL_TEXT), PAL_ALIGN_CENTER_MIDDLE, "sans-bold");
+			else
+				pal_text(c, it[1], 15, on ? PAL_CANVAS : (dim ? PAL_TEXT_3 : PAL_TEXT), PAL_ALIGN_CENTER_MIDDLE, "icons");
+			pal_text(vec2f(q.x + 3, q.y + 7), it[2], 10, on ? pal_alpha(PAL_CANVAS, 0.85) : PAL_TEXT_2, PAL_ALIGN_LEFT_MIDDLE, "sans-bold");
+		}
+		//what the button under the mouse does, above the palette
+		if(palette_hover >= 0 && palette_hover < items.size()) {
+			it = items[palette_hover];
+			pal_text(vec2f(a.x, a.y - 14), it[3] + "  (" + it[2] + ")", 12, PAL_TEXT, PAL_ALIGN_LEFT_MIDDLE);
+		}
+	}
+
+	//The arrows / rings of the selected object: [pivot, axes, size] (metres) or None
+	tool_state() {
+		if((tool != "move" && tool != "turn") || !selected.size())
+			return None;
+		s = the_stage();
+		o = stage_find(s, selected[0]);
+		if(!o)
+			return None;
+		pivot = stage_object_pivot(s, o);
+		eye = view.camera().eye;
+		d = math.sqrt((eye.x - pivot.x) * (eye.x - pivot.x) + (eye.y - pivot.y) * (eye.y - pivot.y) + (eye.z - pivot.z) * (eye.z - pivot.z));
+		return [pivot = pivot, axes = stage_object_axes(s, o, tool_local), size = math.max(0.05, d * STAGE_TOOL_SIZE)];
+	}
+
+	tool_point(pivot, a, k) {
+		return [x = pivot.x + a.x * k, y = pivot.y + a.y * k, z = pivot.z + a.z * k];
+	}
+
+	screen(p3) {
+		q = view.project(p3);
+		return q.ok ? vec2f(q.x, q.y) : None;
+	}
+
+	//The point at t (radians) on the ring around axis i, in the world; f > 1 outside the ring. A growing t turns
+	//around the axis by the right-hand rule, as stage_rotate_object with a positive angle
+	ring_point(st, i, t, f = 1.0) {
+		u = st.axes[(i + 1) % 3];
+		v = st.axes[(i + 2) % 3];
+		r = st.size * 0.85 * f;
+		c = math.cos(t) * r;
+		n = math.sin(t) * r;
+		return [x = st.pivot.x + u.x * c + v.x * n, y = st.pivot.y + u.y * c + v.y * n, z = st.pivot.z + u.z * c + v.z * n];
+	}
+
+	//The points of the ring around axis i on the screen (None when it is not in front of the camera)
+	tool_ring(st, i) {
+		pts = [];
+		for(k = 0; k <= 48; k++) {
+			q = screen(ring_point(st, i, k / 48.0 * math.PI * 2.0));
+			if(!q)
+				return None;
+			pts.push_back(q);
+		}
+		return pts;
+	}
+
+	//The arrows / rings as drawn: while one is dragged where they were when the drag started (they do not turn away
+	//under the mouse), else those of the selected object
+	tool_shown() {
+		if(tool_axis >= 0 && tool_pivot)
+			return [pivot = tool_pivot, axes = tool_axes, size = tool_size];
+		return tool_state();
+	}
+
+	//The arrow / ring under p: its axis 0..2, -1 for none
+	tool_hit(p) {
+		st = tool_state();
+		if(!st)
+			return -1;
+		best = -1;
+		best_d = STAGE_TOOL_HIT;
+		for(i = 0; i < 3; i++) {
+			d = 1e9;
+			if(tool == "move") {
+				a = screen(st.pivot);
+				b = screen(tool_point(st.pivot, st.axes[i], st.size));
+				if(a && b)
+					d = stage_ui_segment_distance(p, a, b);
+			}
+			else {
+				pts = tool_ring(st, i);
+				for(k = 1; pts && k < pts.size(); k++)
+					d = math.min(d, stage_ui_segment_distance(p, pts[k - 1], pts[k]));
+			}
+			if(d < best_d) {
+				best_d = d;
+				best = i;
+			}
+		}
+		return best;
+	}
+
+	draw_tool() {
+		st = tool_shown();
+		if(!st)
+			return;
+		c = screen(st.pivot);
+		if(!c)
+			return;
+		for(i = 0; i < 3; i++) {
+			active = tool_axis == i || (tool_axis < 0 && tool_hover == i);
+			col = STAGE_AXIS_COLORS[i];
+			if(tool_axis >= 0 && tool_axis != i)
+				col = pal_alpha(col, 0.3);
+			w = active ? 4.0 : 2.5;
+			if(tool == "move") {
+				b = screen(tool_point(st.pivot, st.axes[i], st.size));
+				if(!b)
+					continue;
+				nvgBeginPath();
+				nvgMoveTo(c);
+				nvgLineTo(b);
+				nvgStrokeColor(col);
+				nvgStrokeWidth(w);
+				nvgStroke();
+				d = b - c;
+				l = d.length();
+				if(l > 1.0) {
+					u = d * (1.0 / l);
+					n = vec2f(0.0 - u.y, u.x);
+					tip = b + u * (active ? 16.0 : 13.0);
+					nvgBeginPath();
+					nvgMoveTo(tip);
+					nvgLineTo(b + n * 6.0);
+					nvgLineTo(b - n * 6.0);
+					nvgClosePath();
+					nvgFillColor(col);
+					nvgFill();
+					pal_text(tip + u * 9.0, STAGE_AXIS_NAMES[i], 12, col, PAL_ALIGN_CENTER_MIDDLE);
+				}
+			}
+			else {
+				pts = tool_ring(st, i);
+				if(!pts)
+					continue;
+				nvgBeginPath();
+				nvgMoveTo(pts[0]);
+				for(k = 1; k < pts.size(); k++)
+					nvgLineTo(pts[k]);
+				nvgStrokeColor(col);
+				nvgStrokeWidth(w);
+				nvgStroke();
+			}
+		}
+		nvgBeginPath();
+		nvgCircle(c, 4.0);
+		nvgFillColor(PAL_TEXT);
+		nvgFill();
+		if(tool == "turn" && tool_axis >= 0 && draw_turn(st, c))
+			return;
+		label = (tool_local ? "Local" : "World") + " (F) · " + step_text();
+		if(tool_axis >= 0)
+			label = STAGE_AXIS_NAMES[tool_axis] + " " + (tool == "move" ? (tool_value >= 0.0 ? "+" : "") + metres(tool_value) : degrees(tool_value));
+		if(tool_axis >= 0 && tool_typed)
+			label = STAGE_AXIS_NAMES[tool_axis] + " = " + tool_typed + (tool == "move" ? " m" : "°") + "  (typed)";
+		else if(tool_axis >= 0)
+			label += "  · type a number";
+		pal_text(c + vec2f(12.0, 16.0), label, 12, PAL_TEXT, PAL_ALIGN_LEFT_MIDDLE);
+	}
+
+	//While a ring is dragged: how far it turned, as a slice of the ring from where it was grabbed, the marks of the
+	//steps around it, the angle at the grabbed point (true when drawn)
+	draw_turn(st, c) {
+		i = tool_axis;
+		col = STAGE_AXIS_COLORS[i];
+		step = tool_step();
+		if(step >= 5) {
+			for(j = 0; j * step < 360; j++) {
+				t = tool_grab_t + j * step * math.PI / 180.0;
+				a = screen(ring_point(st, i, t, 1.0));
+				b = screen(ring_point(st, i, t, j % std.int(90 / math.min(90, step) + 0.5) == 0 ? 1.16 : 1.08));
+				if(!a || !b)
+					continue;
+				nvgBeginPath();
+				nvgMoveTo(a);
+				nvgLineTo(b);
+				nvgStrokeColor(pal_alpha(col, j == 0 ? 0.9 : 0.55));
+				nvgStrokeWidth(j == 0 ? 2.5 : 1.5);
+				nvgStroke();
+			}
+		}
+		th = tool_value * math.PI / 180.0;
+		n = math.clamp(std.int(math.abs(tool_value) / 3.0) + 2, 2, 240);
+		arc = [];
+		for(k = 0; k <= n; k++) {
+			q = screen(ring_point(st, i, tool_grab_t + th * k / n));
+			if(!q)
+				return false;
+			arc.push_back(q);
+		}
+		//the slice, the ring's piece along it, the lines from the middle to where it was and where it is
+		nvgBeginPath();
+		nvgMoveTo(c);
+		for(q : arc)
+			nvgLineTo(q);
+		nvgClosePath();
+		nvgFillColor(pal_alpha(col, 0.22));
+		nvgFill();
+		nvgBeginPath();
+		nvgMoveTo(arc[0]);
+		for(k = 1; k < arc.size(); k++)
+			nvgLineTo(arc[k]);
+		nvgStrokeColor(col);
+		nvgStrokeWidth(5.0);
+		nvgStroke();
+		start = arc[0];
+		end = arc[arc.size() - 1];
+		nvgBeginPath();
+		nvgMoveTo(c);
+		nvgLineTo(start);
+		nvgStrokeColor(pal_alpha(PAL_TEXT, 0.35));
+		nvgStrokeWidth(1.5);
+		nvgStroke();
+		nvgBeginPath();
+		nvgMoveTo(c);
+		nvgLineTo(end);
+		nvgStrokeColor(PAL_TEXT);
+		nvgStrokeWidth(2.0);
+		nvgStroke();
+		nvgBeginPath();
+		nvgCircle(end, 5.0);
+		nvgFillColor(col);
+		nvgFill();
+		d = end - c;
+		l = d.length();
+		u = l > 1.0 ? d * (1.0 / l) : vec2f(1.0, 0.0);
+		pal_badge(end + u * 22.0, tool_typed ? STAGE_AXIS_NAMES[i] + " = " + tool_typed + "° (typed)" : STAGE_AXIS_NAMES[i] + " " + degrees(tool_value) + (step > 0 ? "" : " free"), col, PAL_CANVAS, 12);
+		return true;
+	}
+
+	//A drag of an arrow or a ring starts: the axes, the pivot and the objects as they are
+	start_tool_drag(p, axis) {
+		st = tool_state();
+		tool_axis = axis;
+		tool_axes = st.axes;
+		tool_pivot = st.pivot;
+		tool_orig = std.json();
+		for(o : moving_objects())
+			tool_orig[o.id] = [x = o.x, y = o.y, z = o.z, rx = o.rx, ry = o.ry, rz = o.rz];
+		tool_size = st.size;
+		tool_value = 0.0;
+		tool_typed = "";
+		if(tool == "turn")
+			grab_ring(st, axis, p);
+		drag_mode = "tool";
+		drag_start = p;
+		drag_now = p;
+		drag_moved = false;
+	}
+
+	//#980: the number typed while dragging, None when there is none (or only "-" / ".")
+	typed_value() {
+		t = tool_typed.replace(",", ".");
+		if(!t || t == "-" || t == "." || t == "-.")
+			return None;
+		try {
+			return std.float(t);
+		}
+		catch(e) {
+			return None;
+		}
+	}
+
+	//A key while an arrow / ring is dragged: digits, "." / ",", "-" (a sign in front), Backspace. True when taken
+	typed_key(key) {
+		ch = "";
+		if(key >= 48 && key <= 57)
+			ch = std.string(key - 48);
+		else if(key >= 320 && key <= 329)
+			ch = std.string(key - 320);
+		else if(key == 46 || key == 44 || key == 330)
+			ch = ".";
+		else if(key == 45 || key == 333) {
+			tool_typed = tool_typed.substr(0, 1) == "-" ? tool_typed.substr(1, tool_typed.size()) : "-" + tool_typed;
+			tool_drag(drag_now);
+			return true;
+		}
+		else if(key == STAGE_KEY_BACKSPACE) {
+			if(tool_typed.size())
+				tool_typed = tool_typed.substr(0, tool_typed.size() - 1);
+			tool_drag(drag_now);
+			return true;
+		}
+		else
+			return false;
+		if(ch == "." && tool_typed.contains("."))
+			return true;
+		tool_typed += ch;
+		tool_drag(drag_now);
+		engine.stage_changed();
+		return true;
+	}
+
+	//Where on ring i the mouse grabbed it (tool_grab_t) and how that point moves on the screen when it turns
+	//(tool_dir): a drag along the ring then turns it so that the grabbed point follows the mouse, from whatever side
+	//the ring is seen (#980: the angle of the mouse around the middle turned the wrong way on rings seen flat)
+	grab_ring(st, i, p) {
+		pts = tool_ring(st, i);
+		c = screen(st.pivot);
+		best = 0.0;
+		best_d = 1e9;
+		rs = 0.0;
+		for(k = 0; pts && k + 1 < pts.size(); k++) {
+			a = pts[k];
+			ab = pts[k + 1] - a;
+			l2 = ab.x * ab.x + ab.y * ab.y;
+			f = l2 > 1e-9 ? math.clamp(((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2, 0.0, 1.0) : 0.0;
+			q = a + ab * f;
+			d = (p - q).length();
+			if(d < best_d) {
+				best_d = d;
+				best = k + f;
+			}
+			if(c)
+				rs = math.max(rs, (a - c).length());
+		}
+		tool_grab_t = best / 48.0 * math.PI * 2.0;
+		h = 0.02;
+		a0 = screen(ring_point(st, i, tool_grab_t - h));
+		a1 = screen(ring_point(st, i, tool_grab_t + h));
+		dir = a0 && a1 ? (a1 - a0) * (1.0 / (2.0 * h)) : vec2f(0.0, 0.0);
+		//grabbed where the ring runs into the screen (seen flat): its tangent is short, a small drag would turn a lot
+		minl = math.max(20.0, rs * 0.35);
+		l = dir.length();
+		if(l < 1e-6)
+			dir = vec2f(minl, 0.0);
+		else if(l < minl)
+			dir = dir * (minl / l);
+		tool_dir = dir;
+	}
+
+	//Each move of the mouse while an arrow / ring is dragged: the objects from where they were by the whole drag
+	tool_drag(p) {
+		s = the_stage();
+		a = tool_axes[tool_axis];
+		c = screen(tool_pivot);
+		if(!c)
+			return;
+		typed = typed_value();
+		if(!std.is_none(typed))
+			tool_value = typed;
+		else if(tool == "move") {
+			e = screen(tool_point(tool_pivot, a, 1.0));
+			if(!e)
+				return;
+			d = e - c;
+			l2 = d.x * d.x + d.y * d.y;
+			if(l2 < 1e-6)
+				return;
+			m = p - drag_start;
+			t = (m.x * d.x + m.y * d.y) / l2;
+			step = tool_step();
+			if(step > 0.0)
+				t = math.round(t / step) * step;
+			tool_value = t;
+		}
+		else {
+			//the grabbed point follows the mouse along the ring's tangent
+			m = p - drag_start;
+			deg = (m.x * tool_dir.x + m.y * tool_dir.y) / (tool_dir.x * tool_dir.x + tool_dir.y * tool_dir.y) * 180.0 / math.PI;
+			step = tool_step();
+			if(step > 0)
+				deg = math.round(deg / step) * step;
+			tool_value = deg;
+		}
+		for(i = 0; i < tool_orig.size(); i++) {
+			o = stage_find(s, tool_orig.key(i));
+			if(!o)
+				continue;
+			org = tool_orig[i];
+			o.x = org.x;
+			o.y = org.y;
+			o.z = org.z;
+			o.rx = org.rx;
+			o.ry = org.ry;
+			o.rz = org.rz;
+			if(tool == "move")
+				stage_move_object(s, o, [x = a.x * tool_value, y = a.y * tool_value, z = a.z * tool_value]);
+			else if(tool_value != 0.0)
+				stage_rotate_object(s, o, a, tool_value, tool_pivot);
+		}
+		if(tool == "move" && !tool_typed)
+			apply_snap();
+		sym_sync_selected();
+		engine.stage_changed();
+	}
+
+	//Shows the models (their boxes in the world) and the lamps
+	//#980: a plan view of the selection (or everything): "top" from above, "front" from the audience, "side" from the
+	//right, "3d" as the view starts
+	set_view(name) {
+		fit_view();
+		cam = view.camera();
+		yaw = 0.45;
+		pitch = 0.5;
+		if(name == "top") {
+			yaw = 0.0;
+			pitch = 1.5699;
+		}
+		else if(name == "front") {
+			yaw = 0.0;
+			pitch = 0.02;
+		}
+		else if(name == "side") {
+			yaw = math.PI / 2.0;
+			pitch = 0.02;
+		}
+		//(#980: the plans without perspective, true to scale; 3D with it)
+		view.camera([target = cam.target, yaw = yaw, pitch = name == "top" ? 1.5707 : pitch, distance = cam.distance, ortho = name != "3d"]);
+	}
+
+	//#980: the view as a PNG (twice its size, without the palette, the hints and the gizmos) into STAGE_PLAN_DIR. The
+	//capture waits for the next frame (this callback is suspended meanwhile). Returns the path; plan_saved says where
+	//it went ("" : it failed, the reason in plan_error)
+	save_plan() {
+		fileio.mkdir(STAGE_PLAN_DIR);
+		path = STAGE_PLAN_DIR + "/Stage plan " + std.random_hash(6) + ".png";
+		plan_capture = true;
+		size = None;
+		plan_error = "";
+		try {
+			size = view.capture(path, 2.0);
+		}
+		catch(e) {
+			plan_error = std.string(e);
+		}
+		plan_capture = false;
+		plan_saved = size && fileio.exists(path) ? std.string(fileio.absolute_path(path)) : "";
+		return path;
+	}
+
+	//Shows the selected objects (#980: as F in other 3D programs), or everything when nothing is selected
+	fit_view(all = false) {
+		s = the_stage();
+		lo = None;
+		hi = None;
+		sel = all ? [] : selected_objects();
+		for(o : sel.size() ? sel : s.objects) {
+			m = stage_model_get(o);
+			if(!m || !m.ok || !m.bounds)
+				continue;
+			b = stage_world_box(stage_world_matrix(s, o), m.bounds);
+			lo = lo ? [x = math.min(lo.x, b.min.x), y = math.min(lo.y, b.min.y), z = math.min(lo.z, b.min.z)] : b.min;
+			hi = hi ? [x = math.max(hi.x, b.max.x), y = math.max(hi.y, b.max.y), z = math.max(hi.z, b.max.z)] : b.max;
+		}
+		for(f : sel.size() ? [] : engine.patch.fixtures) {
+			z = f.z ?? 0.0;
+			lo = lo ? [x = math.min(lo.x, f.x), y = math.min(lo.y, f.y), z = math.min(lo.z, z)] : [x = f.x, y = f.y, z = z];
+			hi = hi ? [x = math.max(hi.x, f.x), y = math.max(hi.y, f.y), z = math.max(hi.z, z)] : [x = f.x, y = f.y, z = z];
+		}
+		if(!lo) {
+			view.camera([target = [x = 0.0, y = 0.0, z = 1.0], distance = 16.0]);
+			return;
+		}
+		extent = math.max(2.0, math.max(hi.x - lo.x, math.max(hi.y - lo.y, hi.z - lo.z)) + 1.0);
+		view.camera([target = [x = (lo.x + hi.x) / 2.0, y = (lo.y + hi.y) / 2.0, z = (lo.z + hi.z) / 2.0], distance = extent * 1.6]);
+	}
+
+	//The mouse as in CAD programs (Fusion): the right button turns the view, the middle one moves it, the left one only
+	//selects and moves objects (on the empty stage: a box that selects); the wheel zooms
+	button3d(pos, button, down, mods) {
+		p = vec2f(pos.x, pos.y);
+		//#980: placing what Add put on the stage: the left button puts it down (the right one, unmoved: not, below)
+		if(placing && down && button == 0) {
+			place_at(p);
+			finish_placing();
+			drag_mode = "palette";
+			drag_start = None;
+			return true;
+		}
+		//The right button: a drag turns the view. A click without moving takes away what is being placed (#980); while
+		//an object, an arrow or a ring is dragged it puts everything back where it was
+		if(button == 1) {
+			if(down) {
+				if(cancel_drag() || drag_mode == "cancel")
+					return true;
+				view.focus();
+				drag_mode = "view_turn";
+				drag_start = p;
+				drag_now = p;
+				drag_moved = false;
+				return true;
+			}
+			if(drag_mode == "view_turn") {
+				if(!drag_moved && placing)
+					cancel_placing();
+				drag_mode = "";
+				drag_start = None;
+				drag_now = None;
+			}
+			return true;
+		}
+		//The middle button: a drag moves the view
+		if(button == 2) {
+			if(drag_mode != "cancel")
+				drag_mode = down ? "pan" : "";
+			return true;
+		}
+		if(button != 0)
+			return false;
+		//(the left button while the right or the middle one turns or moves the view: nothing)
+		if(drag_mode == "view_turn" || drag_mode == "pan")
+			return true;
+		//#980: a click on the tool palette (on the press; its release is eaten too)
+		if(down && palette_hit(p) >= 0) {
+			palette_click(palette_hit(p), mods);
+			drag_mode = "palette";
+			drag_start = None;
+			return true;
+		}
+		if(!down && drag_mode == "palette") {
+			drag_mode = "";
+			return true;
+		}
+		//#980: aligning a scan: a click (unmoved) takes a point
+		if(scan_mode && !nanogui.show_mode()) {
+			if(down) {
+				drag_mode = "scanpick";
+				drag_start = p;
+				drag_now = p;
+				drag_moved = false;
+				return true;
+			}
+			if(drag_mode == "scanpick") {
+				if(!drag_moved)
+					scan_click(p);
+				drag_mode = "";
+				drag_start = None;
+				drag_now = None;
+				return true;
+			}
+		}
+		//#980: with the edges of an object shown, a click near one of them puts LEDs along it (on the release, unmoved)
+		if(edges_for && !nanogui.show_mode()) {
+			if(down && edge_near(p)) {
+				drag_mode = "edge";
+				drag_start = p;
+				drag_now = p;
+				drag_moved = false;
+				return true;
+			}
+			if(!down && drag_mode == "edge") {
+				if(!drag_moved)
+					leds_on_edge(p, (mods & STAGE_MOD_SHIFT) ? true : false);
+				drag_mode = "";
+				drag_start = None;
+				drag_now = None;
+				return true;
+			}
+		}
+		//#980: the move and turn tools: an arrow / ring under the mouse is dragged
+		if(tool != "select" && !nanogui.show_mode()) {
+			if(down) {
+				h = tool_hit(p);
+				if(h >= 0) {
+					view.focus();
+					start_tool_drag(p, h);
+					return true;
+				}
+			}
+			else if(drag_mode == "tool") {
+				tool_axis = -1;
+				drag_mode = "";
+				drag_start = None;
+				drag_now = None;
+				step_name = tool == "move" ? "Stage: move" : "Stage: turn";
+				changed(true);
+				return true;
+			}
+		}
+		//#980: the tape measure: a click (unmoved) takes a point
+		if(tool == "measure" && !nanogui.show_mode()) {
+			if(down) {
+				view.focus();
+				drag_mode = "measure";
+				drag_start = p;
+				drag_now = p;
+				drag_moved = false;
+				return true;
+			}
+			if(drag_mode == "measure") {
+				if(!drag_moved)
+					measure_click(p);
+				drag_mode = "";
+				drag_start = None;
+				drag_now = None;
+				return true;
+			}
+		}
+		if(down) {
+			view.focus();
+			drag_start = p;
+			drag_now = p;
+			drag_moved = false;
+			add = (mods & STAGE_MOD_SHIFT) || (mods & STAGE_MOD_CTRL);
+			//#980: a lamp of the fixture setup (shown with Lamps): selected and dragged here; hung on the truss it is
+			//dragged under
+			lid = lamps_btn.pushed() && !nanogui.show_mode() ? scene.lamp_at(p) : None;
+			if(lid) {
+				start_lamp_drag(lid, p, add, (mods & STAGE_MOD_SHIFT) ? true : false);
+				return true;
+			}
+			hit = scene.stage_at(p);
+			if(hit && !nanogui.show_mode()) {
+				//Shift+drag: up and down; Shift+click without moving selects more (on the release)
+				if(mods & STAGE_MOD_SHIFT) {
+					drag_mode = "lift";
+					drag_pick = hit;
+				}
+				else {
+					if(!selected.has_value(hit))
+						select_ids([hit], add, false);
+					else if(add) {
+						select_ids([hit], true, true);
+						drag_mode = "";
+						return true;
+					}
+					//#980: Alt+drag: copies of them are dragged, they stay
+					drag_copies = [];
+					if((mods & STAGE_MOD_ALT) && !nanogui.show_mode()) {
+						drag_prev_sel = selected.copy();
+						drag_pick = hit;
+						tops = [];
+						for(o : moving_objects())
+							tops.push_back(o.id);
+						copies = stage_duplicate(the_stage(), tops, 0.0);
+						selected = [];
+						pick = copies.size() ? copies[0].id : hit;
+						for(i = 0; i < copies.size(); i++) {
+							selected.push_back(copies[i].id);
+							drag_copies.push_back(copies[i].id);
+							if(tops[i] == hit)
+								pick = copies[i].id;
+						}
+						hit = pick;
+						changed(true);
+					}
+					drag_mode = "move";
+					drag_pick = hit;
+					//moved at the height of the point that was grabbed
+					h = view.pick(p, 4.0);
+					drag_level = h ? h.point.z : 0.0;
+					drag_grab = view.hit_level(p, drag_level);
+				}
+				drag_origin = [];
+				for(o : selected_objects())
+					drag_origin[o.id] = [x = o.x, y = o.y, z = o.z];
+				o = stage_find(the_stage(), hit);
+				if(o && !drag_origin.has(hit))
+					drag_origin[hit] = [x = o.x, y = o.y, z = o.z];
+				//#980: what stands on something goes onto what it is moved over
+				drag_rest = std.json();
+				if(drag_mode == "move") {
+					skip = drag_skip();
+					for(m : moving_objects()) {
+						if(stage_on_ground(the_stage(), m, skip))
+							drag_rest[m.id] = true;
+					}
+				}
+				return true;
+			}
+			//#980: a drag on the empty stage: a box that selects what is in it (Shift: adds); a click there selects none.
+			//In the show mode (nothing can be selected or moved) the left button turns the view too
+			if(!nanogui.show_mode()) {
+				drag_mode = "box";
+				box_add = (mods & STAGE_MOD_SHIFT) ? true : false;
+				return true;
+			}
+			drag_mode = "orbit";
+			return true;
+		}
+		if(drag_mode == "lamp" || drag_mode == "lamplift") {
+			if(drag_moved) {
+				engine.patch_changed();
+				build_inspector();
+			}
+			drag_mode = "";
+			drag_start = None;
+			drag_now = None;
+			return true;
+		}
+		if(drag_mode == "box") {
+			if(drag_moved)
+				select_ids(objects_in_box(drag_start, drag_now), box_add, false);
+			else if(!((mods & STAGE_MOD_SHIFT) || (mods & STAGE_MOD_CTRL)) && selected.size())
+				select_ids([], false, false);
+		}
+		else if(drag_mode == "orbit" && !drag_moved && !((mods & STAGE_MOD_SHIFT) || (mods & STAGE_MOD_CTRL)) && selected.size())
+			select_ids([], false, false);
+		else if(drag_copies.size() && !drag_moved) {
+			//(Alt+click without moving: no copy on top of the original)
+			stage_remove(the_stage(), drag_copies);
+			selected = drag_prev_sel;
+			changed(true);
+		}
+		else if((drag_mode == "move" || drag_mode == "lift") && drag_moved) {
+			step_name = drag_copies.size() ? "Stage: copy" : "Stage: move";
+			changed(true);
+		}
+		else if(drag_mode == "lift" && drag_pick)
+			select_ids([drag_pick], true, selected.has_value(drag_pick));
+		drag_copies = [];
+		drag_pick = "";
+		drag_mode = "";
+		drag_start = None;
+		drag_now = None;
+		return true;
+	}
+
+	//The objects that move with a drag: the selected ones and the one grabbed; not one whose parent moves too (it goes
+	//with it)
+	moving_objects() {
+		s = the_stage();
+		ids = std.json();
+		for(id : selected)
+			ids[id] = true;
+		if(drag_pick)
+			ids[drag_pick] = true;
+		list = [];
+		for(i = 0; i < ids.size(); i++) {
+			o = stage_find(s, ids.key(i));
+			if(!o)
+				continue;
+			up = o.parent;
+			inside = false;
+			for(up && !inside) {
+				if(ids.has(up))
+					inside = true;
+				q = stage_find(s, up);
+				up = q ? q.parent : "";
+			}
+			if(!inside)
+				list.push_back(o);
+		}
+		return list;
+	}
+
+	drag3d(pos, rel, button, mods) {
+		if(drag_mode == "palette" || drag_mode == "cancel")
+			return true;
+		if(drag_mode == "pan") {
+			view.pan(rel);
+			return true;
+		}
+		if(!drag_start)
+			return false;
+		drag_now = vec2f(pos.x, pos.y);
+		if((drag_now - drag_start).length() > 3.0)
+			drag_moved = true;
+		if(drag_mode == "orbit" || drag_mode == "view_turn") {
+			view.orbit(rel);
+			return true;
+		}
+		if(drag_mode == "box")
+			return true;
+		if(drag_mode == "tool") {
+			tool_drag(drag_now);
+			return true;
+		}
+		if((drag_mode == "lamp" || drag_mode == "lamplift") && drag_moved) {
+			lamp_drag(drag_now);
+			return true;
+		}
+		s = the_stage();
+		if(drag_mode == "lift" && drag_moved) {
+			if(drag_pick && !selected.has_value(drag_pick))
+				select_ids([drag_pick], true, false);
+			cam = view.camera();
+			k = cam.distance / view.focal();
+			dz = (drag_start.y - drag_now.y) * k / math.max(0.2, math.cos(cam.pitch));
+			for(o : moving_objects()) {
+				org = drag_origin[o.id] ?? None;
+				if(!org)
+					continue;
+				d = stage_world_to_local(s, o, [x = 0.0, y = 0.0, z = dz]);
+				o.x = org.x + d.x;
+				o.y = org.y + d.y;
+				o.z = snap(org.z + d.z);
+			}
+			apply_snap();
+			sym_sync_selected();
+			engine.stage_changed();
+			return true;
+		}
+		if(drag_mode == "move" && drag_moved && drag_grab) {
+			at = view.hit_level(drag_now, drag_level);
+			if(!at)
+				return true;
+			dx = at.x - drag_grab.x;
+			dy = at.y - drag_grab.y;
+			for(o : moving_objects()) {
+				org = drag_origin[o.id] ?? None;
+				if(!org)
+					continue;
+				d = stage_world_to_local(s, o, [x = dx, y = dy, z = 0.0]);
+				o.x = snap(org.x + d.x);
+				o.y = snap(org.y + d.y);
+				o.z = org.z + d.z;
+			}
+			//#980: standing on the decks, the booth, ... it is moved over
+			if(drag_rest.size()) {
+				skip = drag_skip();
+				for(o : moving_objects()) {
+					if(drag_rest.has(o.id))
+						stage_put_on_ground(s, o, skip);
+				}
+			}
+			apply_snap();
+			sym_sync_selected();
+			engine.stage_changed();
+			return true;
+		}
+		return true;
+	}
+
+	key3d(key, action, mods) {
+		if(action != 1 && action != 2)
+			return false;
+		//#980: while an arrow / ring is dragged, digits are the value (1.5 m, -90°), not the tools
+		if(drag_mode == "tool" && action == 1 && !(mods & STAGE_MOD_CTRL) && typed_key(key))
+			return true;
+		if(key == STAGE_KEY_R && !nanogui.show_mode()) {
+			//R turns by the angle steps of the palette (C), free: by 15°
+			k = STAGE_ANGLE_STEPS[angle_step] > 0 ? STAGE_ANGLE_STEPS[angle_step] : STAGE_ROTATE_STEP;
+			step = (mods & STAGE_MOD_SHIFT) ? 0 - k : k;
+			for(o : selected_objects()) {
+				r = o.rz + step;
+				for(r > 360.0)
+					r -= 360.0;
+				for(r < -360.0)
+					r += 360.0;
+				o.rz = r;
+			}
+			changed(true);
+			return true;
+		}
+		if(action != 1)
+			return false;
+		if(key == STAGE_KEY_DELETE || key == STAGE_KEY_BACKSPACE) {
+			remove_selected();
+			return true;
+		}
+		if(key == STAGE_KEY_ESCAPE) {
+			//#980: while placing: it goes again; while dragging: back where it was
+			if(placing) {
+				cancel_placing();
+				return true;
+			}
+			if(cancel_drag())
+				return true;
+			//#980: the tape measure: the one being measured, then all
+			if(tool == "measure" && (measure_a || measures.size())) {
+				if(measure_a)
+					measure_a = None;
+				else
+					measures = [];
+				return true;
+			}
+			select_ids([], false, false);
+			return true;
+		}
+		if(key == 327 || key == 321 || key == 323 || key == 320) {
+			set_view(key == 327 ? "top" : (key == 321 ? "front" : (key == 323 ? "side" : "3d")));
+			return true;
+		}
+		if(key == STAGE_KEY_M && !(mods & STAGE_MOD_CTRL)) {
+			set_tool(tool == "measure" ? "select" : "measure");
+			return true;
+		}
+		if(key == STAGE_KEY_X && !(mods & STAGE_MOD_CTRL)) {
+			cycle_sym((mods & STAGE_MOD_SHIFT) ? -1 : 1);
+			return true;
+		}
+		//#980: 1 / 2 / 3: the tools; F: with the move or turn tool the world's or the object's axes, else fit
+		if(!(mods & STAGE_MOD_CTRL) && (key == STAGE_KEY_1 || key == STAGE_KEY_2 || key == STAGE_KEY_3)) {
+			set_tool(key == STAGE_KEY_1 ? "select" : (key == STAGE_KEY_2 ? "move" : "turn"));
+			return true;
+		}
+		//C / Shift+C: finer / coarser steps of the tool in use (the angle: also R), round to free
+		if(key == STAGE_KEY_C && !(mods & STAGE_MOD_CTRL)) {
+			cycle_step((mods & STAGE_MOD_SHIFT) ? -1 : 1);
+			return true;
+		}
+		if(key == STAGE_KEY_F) {
+			if(tool == "move" || tool == "turn")
+				toggle_tool_frame();
+			else
+				fit_view();
+			return true;
+		}
+		if((mods & STAGE_MOD_CTRL) && key == STAGE_KEY_A) {
+			ids = [];
+			for(o : the_stage().objects)
+				ids.push_back(o.id);
+			select_ids(ids, false, false);
+			return true;
+		}
+		if((mods & STAGE_MOD_CTRL) && key == STAGE_KEY_G && !nanogui.show_mode()) {
+			new_folder();
+			return true;
+		}
+		if((mods & STAGE_MOD_CTRL) && key == STAGE_KEY_D) {
+			duplicate_selected();
+			return true;
+		}
+		return false;
+	}
+}

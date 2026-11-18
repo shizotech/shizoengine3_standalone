@@ -7,16 +7,20 @@ class local_file_lock
 	local_files = None;
 	
 	__init__(path) {
-		this.path = path;
+		// "f:" in front: the table has members of its own (ticketid, current), and a file
+		// of that name got the int instead of an entry ("type 'int' has no member 'ticketid'")
+		var key = "f:" + std.string(path);
+
+		this.path = key;
 		this.local_files = std.global("local_files");
 		
 		if(!local_files.locks)
 			local_files.locks = [ticketid=0, current=0];
 		
-		ticketid = local_files.locks[path].ticketid;
-		local_files.locks[path].ticketid++;
+		ticketid = local_files.locks[key].ticketid;
+		local_files.locks[key].ticketid++;
 		
-		for(local_files.locks[path].current != ticketid) {
+		for(local_files.locks[key].current != ticketid) {
 			std.sleep(10);
 		}
 	}
@@ -26,12 +30,753 @@ class local_file_lock
 	}
 }
 
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Tool results
+//
+// Every default tool answers either a useful value (usually [ok = true, ...]) or
+//
+//     [ok = false, error = "<what failed and why>", hint = "<what to do instead>"]
+//
+// so the model can act on a failure without guessing. Results are bounded: a
+// tool cuts what it returns and says so (truncated, the totals, how to get the
+// rest); miniagent.add_tool() caps whatever still comes out too large.
+//
+// No tool prints. A worker talks to its host over stdout, one JSON object per
+// line (workspace_agent.shio): std.print / std.cout in a tool is noise there.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// Limits of one read_file call (bytes are UTF-8 bytes).
+READ_MAX_LINES = 2000;
+READ_MAX_BYTES = 80000;
+READ_MAX_LINE_BYTES = 16000;				// a longer line is cut (minified code, data files)
+READ_MAX_FILE_BYTES = 64 * 1024 * 1024;		// a larger file is not loaded at all
+READ_BINARY_PROBE_BYTES = 8192;				// a zero byte in this prefix: the file is binary
+
+// Entries (files and directories each) of one list_dir call.
+LIST_MAX_ENTRIES = 400;
+LIST_MAX_ENTRIES_RECURSIVE = 200;
+
+// A yes / no parameter however the model wrote it: "true" / "false", a JSON true / false,
+// 1 / 0, "yes" / "no". Missing or anything else: `def`. (`args.x ?? "default"` is not enough:
+// ?? goes by truthiness, so a JSON false or a 0 took the default.)
+agt_flag(value, def)
+{
+	if(std.is_none(value))
+		return def;
+
+	var text = std.string(value).strip().lowercase();
+
+	if(text == "true" || text == "1" || text == "yes")
+		return true;
+
+	if(text == "false" || text == "0" || text == "no")
+		return false;
+
+	return def;
+}
+
+agt_fail(error, hint = "")
+{
+	var failure = [ok = false, error = error];
+
+	if(hint)
+		failure.hint = hint;
+
+	return failure;
+}
+
+// The whitespace characters string.replace_ignoring_whitespace() ignores (isspace).
+agt_whitespace_chars()
+{
+	var bytes = std.buffer();
+	bytes.push(9, 10, 11, 12, 13, 32);
+	return bytes.string();
+}
+
+agt_is_binary(text)
+{
+	var zero = std.buffer();
+	zero.push(0);
+
+	var probe = text;
+	if(probe.size() > READ_BINARY_PROBE_BYTES)
+		probe = probe.substr(0, READ_BINARY_PROBE_BYTES);
+
+	return probe.contains(zero.string());
+}
+
+// Lines of a text the way read_file numbers them: a final line break ends the
+// last line, it does not start another one.
+agt_count_lines(text)
+{
+	if(!text)
+		return 0;
+
+	var normal = text.replace("\r\n", "\n").replace("\r", "\n");
+	var count = normal.count("\n");
+
+	if(!normal.ends("\n"))
+		count++;
+
+	return count;
+}
+
+// UTF-16 BOM: FF FE is little endian, FE FF is big endian.
+agt_utf16_bom(little)
+{
+	var b = std.buffer();
+
+	if(little)
+		b.push(255, 254);
+	else
+		b.push(254, 255);
+
+	return b.string(0, 2);
+}
+
+// Decodes a UTF-16 text (with BOM) to UTF-8. Surrogate pairs become one
+// code point; the BOM itself is skipped.
+agt_utf16_to_utf8(text, little)
+{
+	var bytes = std.buffer();
+	bytes.append(text);
+	var out = std.buffer();
+
+	for(var i = 2; i + 1 < bytes.size(); i += 2) {
+		var lo = 0;
+		var hi = 0;
+
+		if(little) {
+			lo = bytes.read("u8", i);
+			hi = bytes.read("u8", i + 1);
+		}
+		else {
+			lo = bytes.read("u8", i + 1);
+			hi = bytes.read("u8", i);
+		}
+
+		var cu = lo + hi * 256;
+		var cp = cu;
+
+		if(cu >= 55296 && cu <= 56319 && i + 3 < bytes.size()) {
+			var lo2 = 0;
+			var hi2 = 0;
+
+			if(little) {
+				lo2 = bytes.read("u8", i + 2);
+				hi2 = bytes.read("u8", i + 3);
+			}
+			else {
+				lo2 = bytes.read("u8", i + 3);
+				hi2 = bytes.read("u8", i + 2);
+			}
+
+			var cu2 = lo2 + hi2 * 256;
+
+			if(cu2 >= 56320 && cu2 <= 57343) {
+				cp = 65536 + (cu - 55296) * 1024 + (cu2 - 56320);
+				i += 2;
+			}
+		}
+
+		if(cp < 128) {
+			out.push(cp);
+		}
+		else if(cp < 2048) {
+			out.push(192 + std.int(cp / 64), 128 + (cp % 64));
+		}
+		else if(cp < 65536) {
+			out.push(224 + std.int(cp / 4096), 128 + std.int((cp % 4096) / 64), 128 + (cp % 64));
+		}
+		else {
+			out.push(240 + std.int(cp / 262144), 128 + std.int((cp % 262144) / 4096), 128 + std.int((cp % 4096) / 64), 128 + (cp % 64));
+		}
+	}
+
+	return out.string(0, out.size());
+}
+
+// A text file that is UTF-16LE or UTF-16BE (with BOM) is decoded before the
+// binary check, so .md and other text files are not refused just because their
+// bytes contain zeros. Any other text is returned unchanged.
+agt_decode_text(text)
+{
+	if(!text)
+		return text;
+
+	if(text.starts(agt_utf16_bom(true)))
+		return agt_utf16_to_utf8(text, true);
+
+	if(text.starts(agt_utf16_bom(false)))
+		return agt_utf16_to_utf8(text, false);
+
+	return text;
+}
+
+// The byte at `pos` of `text` continues a UTF-8 character (10xxxxxx).
+agt_utf8_is_continuation(text, pos)
+{
+	if(pos <= 0 || pos >= text.size())
+		return false;
+
+	var one = std.buffer();
+	one.append(text.substr(pos, 1));
+
+	return one[0] >= 128 && one[0] < 192;
+}
+
+// The largest cut position <= pos that does not split a UTF-8 character.
+agt_utf8_floor(text, pos)
+{
+	if(pos >= text.size())
+		return text.size();
+
+	var cut = pos;
+	var steps = 0;
+
+	for(cut > 0 && steps < 4 && agt_utf8_is_continuation(text, cut)) {
+		cut--;
+		steps++;
+	}
+
+	return math.max(0, cut);
+}
+
+// The smallest cut position >= pos that does not split a UTF-8 character.
+agt_utf8_ceil(text, pos)
+{
+	if(pos <= 0)
+		return 0;
+
+	var cut = pos;
+	var steps = 0;
+
+	for(cut < text.size() && steps < 4 && agt_utf8_is_continuation(text, cut)) {
+		cut++;
+		steps++;
+	}
+
+	return math.min(text.size(), cut);
+}
+
+// Keeps the head and the tail of an over-long text and says how much was dropped
+// in between: the start shows what ran, the end is where the errors are.
+// also_dropped: bytes the caller already dropped from the middle (counted in the note).
+// Returns [out, truncated, dropped_bytes, total_bytes].
+agt_clip_middle(text, max_bytes, what = "output", also_dropped = 0)
+{
+	var total = text.size();
+
+	if(total <= max_bytes)
+		return [out = text, truncated = also_dropped > 0, dropped_bytes = also_dropped, total_bytes = total + also_dropped];
+
+	var head_len = max_bytes * 3 / 10;
+	var tail_len = max_bytes - head_len;
+
+	var head = text.substr(0, agt_utf8_floor(text, head_len));
+	var tail_start = agt_utf8_ceil(text, total - tail_len);
+	var tail = text.substr(tail_start, total - tail_start);
+
+	// whole lines where a line break is near the cut
+	var head_break = head.rfind("\n");
+	if(head_break > 0 && head_break >= head.size() - 2000)
+		head = head.substr(0, head_break);
+
+	var tail_break = tail.find("\n");
+	if(tail_break >= 0 && tail_break < 2000 && tail_break + 1 < tail.size())
+		tail = tail.substr(tail_break + 1, tail.size() - tail_break - 1);
+
+	var dropped = total - head.size() - tail.size() + also_dropped;
+
+	var marker = "\n...[" + what + " truncated: " + std.string(dropped) + " of " + std.string(total + also_dropped) + " bytes dropped here, the head and the tail are kept]...\n";
+
+	return [out = head + marker + tail, truncated = true, dropped_bytes = dropped, total_bytes = total + also_dropped];
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Paths
+//
+// agt.filesystem is a fileio.container rooted at the working directory. A path
+// that leaves it is not an exception there: the container logs a runtime error
+// and answers None, so a tool would report "does not exist" or do nothing at all.
+// Every file tool therefore checks its paths here first and answers a clear error:
+//
+//   * relative paths only ("x", "./x", "a/../x"); "/x", "\\x", "C:\x" and "~/x" are refused
+//     (with the relative form in the hint when the file is inside the working directory);
+//   * nothing outside the working directory ("../x", a link that leads out);
+//   * nothing a restricted view (agt.env.fs_guard, fs_path_guard below) does not allow.
+//
+// Returns [ok = true, path = <cleaned path>, names_directory] or a failure for the tool to return.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+agt_path_check(agt, raw, mode = "read", what = "path")
+{
+	var given = std.is_none(raw) ? "" : std.string(raw).strip();
+
+	if(!given)
+		return agt_fail("Missing '" + what + "'.", "Give a path relative to the working directory, like './src/file.txt' ('.' is the working directory itself).");
+
+	if(given.contains("\n") || given.contains("\r"))
+		return agt_fail("Invalid path: '" + what + "' contains a line break.", "Give one path, relative to the working directory.");
+
+	// Windows separators are separators on Windows only; elsewhere '\' is a character of a name.
+	if(subprocess.platform() == "windows")
+		given = given.replace("\\", "/");
+
+	var fs = agt.filesystem;
+
+	var first = given.substr(0, 1);
+	var letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	var is_drive = given.size() >= 2 && given.substr(1, 1) == ":" && letters.contains(first);
+
+	if(first == "/" || first == "\\" || is_drive) {
+		var relative_hint = "Use a path relative to the working directory, like './src/file.txt'.";
+
+		// an absolute path of something inside the working directory: name the relative form
+		try {
+			var root_info = fs.file_info(".");
+			var root_path = std.string(root_info["path"]).replace("\\", "/");
+			var wanted = given.replace("\\", "/");
+
+			if(root_path && wanted.starts(root_path + "/"))
+				relative_hint = "This path is inside the working directory: use './" + wanted.substr(root_path.size() + 1, wanted.size() - root_path.size() - 1) + "'.";
+		}
+		catch(e) { }
+
+		return agt_fail("Invalid path '" + given + "': absolute paths are not accepted.", relative_hint);
+	}
+
+	if(first == "~")
+		return agt_fail("Invalid path '" + given + "': '~' is not expanded.", "Use a path relative to the working directory, like './src/file.txt'.");
+
+	if(!fs.is_valid(given))
+		return agt_fail("Invalid path '" + given + "': it leads outside the working directory.", "The file tools only reach the working directory and what is below it; '..' may not climb above it.");
+
+	var guard = agt.env.fs_guard ?? None;
+
+	if(guard) {
+		var refusal = guard.access_error(given, mode);
+
+		if(refusal)
+			return [ok = false, error = refusal, hint = "Stay inside the listed paths. Asking again for the same path gives the same answer."];
+	}
+
+	// "dir/" names a directory: the tools that write a file refuse it (names_directory)
+	var names_directory = given.size() > 1 && given.ends("/");
+
+	for(given.size() > 1 && given.ends("/")) {
+		given = given.removesuffix("/");
+	}
+
+	return [ok = true, path = given, names_directory = names_directory];
+}
+
+// One key for the per-file lock, however the path was written ("./a" and "a").
+agt_lock_key(path)
+{
+	var key = path;
+
+	for(key.starts("./")) {
+		key = key.removeprefix("./");
+	}
+
+	return key;
+}
+
+// The first parent of `path` that exists but is a file ("" when none is in the way).
+agt_parent_blocker(fs, path)
+{
+	var parts = path.split("/");
+	var prefix = "";
+
+	for(var i = 0; i < parts.size() - 1; i++) {
+		var part = parts[i];
+
+		if(i > 0)
+			prefix += "/";
+		prefix += part;
+
+		if(!part || part == "." || part == "..")
+			continue;
+
+		if(fs.exists(prefix) && !fs.is_directory(prefix))
+			return prefix;
+	}
+
+	return "";
+}
+
+agt_parent_dir(path)
+{
+	var cut = path.rfind("/");
+
+	if(cut <= 0)
+		return ".";
+
+	return path.substr(0, cut);
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// fs_path_guard: an allow-list view of a working directory
+//
+// Stands in for agt.filesystem (it has the methods the file tools call) and lets
+// through only what is on its lists: `write_paths` (files or directories that may
+// be read and changed) and `read_paths` (read only). Everything else is refused
+// with a runtime error that names the lists, so a tool that does not ask
+// access_error() first still cannot read or write anything else. Paths are
+// compared in their canonical form (what the container resolves them to): "..",
+// "./" and links that lead out of a listed directory do not get around it.
+//
+// The directories on the way to a listed path may be looked at with exists() /
+// is_directory() / is_file() and nothing more (the tools need that to say why a
+// file cannot be created).
+//
+// Used for the blind test writer (roles/adaptive/ROLE.shio, write_blind_tests):
+//
+//     guard = fs_path_guard(agt.filesystem, ["tests/unit"], ["include/api.h"], "blind test writer", "...");
+//     child.filesystem = guard;      // the jail
+//     child.env.fs_guard = guard;    // lets the tools answer the refusal as a normal error
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+class fs_path_guard
+{
+	base = None;			// the real fileio.container
+	label = "restricted file view";
+	reason = "";			// why the rest is off limits, part of every refusal
+	write_list = [];		// as given: readable and writable
+	read_list = [];			// as given: readable
+	write_roots = [];		// the same, canonical
+	read_roots = [];
+	touched = [];			// path -> true: what was written through this view and is still there
+	writes = 0;				// number of changes made through this view
+	foreign = [];			// canonical path -> why: a file something else wrote (a test run): its
+							// content is not readable through this view until the view writes it itself
+
+	__init__(_base, _write_paths, _read_paths = None, _label = "", _reason = "")
+	{
+		base = _base;
+
+		if(_label)
+			label = _label;
+
+		reason = std.string(_reason ?? "");
+
+		write_list = [];
+		read_list = [];
+		write_roots = [];
+		read_roots = [];
+		touched = [];
+		writes = 0;
+		foreign = [];
+
+		var root_abs = canonical(".");
+
+		if(std.is_json(_write_paths)) {
+			for(var i = 0; i < _write_paths.size(); i++) {
+				var w_abs = canonical(_write_paths[i]);
+
+				if(!w_abs || w_abs == root_abs)
+					std.runtime_error(label + ": '" + std.string(_write_paths[i]) + "' cannot be allowed (it is the working directory itself or outside it)");
+
+				write_list.push_back(tidy(_write_paths[i]));
+				write_roots.push_back(w_abs);
+			}
+		}
+
+		if(std.is_json(_read_paths)) {
+			for(var j = 0; j < _read_paths.size(); j++) {
+				var r_abs = canonical(_read_paths[j]);
+
+				if(!r_abs || r_abs == root_abs)
+					std.runtime_error(label + ": '" + std.string(_read_paths[j]) + "' cannot be allowed (it is the working directory itself or outside it)");
+
+				read_list.push_back(tidy(_read_paths[j]));
+				read_roots.push_back(r_abs);
+			}
+		}
+	}
+
+	tidy(path)
+	{
+		var shown = std.string(path).strip();
+
+		for(shown.starts("./")) {
+			shown = shown.removeprefix("./");
+		}
+		for(shown.size() > 1 && shown.ends("/")) {
+			shown = shown.removesuffix("/");
+		}
+
+		return shown;
+	}
+
+	// What the container resolves a path to ("" when it leaves the container).
+	canonical(path)
+	{
+		var raw = std.is_none(path) ? "" : std.string(path);
+
+		if(!raw || !base.is_valid(raw))
+			return "";
+
+		// '\' separates directories on Windows only. Elsewhere it is a character of a name:
+		// "tests\\blind\\..\\..\\x" would be ONE file in the working directory, and turning it
+		// into '/' for the comparison made it look like a path below tests/blind. A restricted
+		// view has no use for such names: refused.
+		var windows = subprocess.platform() == "windows";
+
+		if(!windows && raw.contains("\\"))
+			return "";
+
+		var info = base.file_info(raw);
+
+		if(!std.is_json(info))
+			return "";
+
+		var abs = std.string(info["path"]);
+
+		if(windows)
+			abs = abs.replace("\\", "/");
+
+		for(abs.size() > 1 && abs.ends("/")) {
+			abs = abs.removesuffix("/");
+		}
+
+		return abs;
+	}
+
+	under(roots, abs)
+	{
+		for(var i = 0; i < roots.size(); i++) {
+			if(abs == roots[i] || abs.starts(roots[i] + "/"))
+				return true;
+		}
+
+		return false;
+	}
+
+	// a directory on the way to a listed path
+	passage(abs)
+	{
+		var prefix = abs + "/";
+
+		for(var i = 0; i < write_roots.size(); i++) {
+			if(write_roots[i].starts(prefix))
+				return true;
+		}
+		for(var j = 0; j < read_roots.size(); j++) {
+			if(read_roots[j].starts(prefix))
+				return true;
+		}
+
+		return false;
+	}
+
+	allowed_text()
+	{
+		var text = "You may read and write: " + write_list.combine_string(", ").removesuffix(", ") + ".";
+
+		if(read_list.size())
+			text += " You may read: " + read_list.combine_string(", ").removesuffix(", ") + ".";
+
+		return text;
+	}
+
+	// A file that was not written through this view (set_foreign after a test run): the
+	// view may see that it is there, not what is in it.
+	set_foreign(path, why)
+	{
+		var abs = canonical(path);
+
+		if(abs)
+			foreign[abs] = std.string(why);
+	}
+
+	// "" when the access is allowed, else the refusal. mode: "read" (the entry: listing,
+	// size), "content" (what is in the file), "write" or "stat".
+	access_error(path, mode = "read")
+	{
+		var abs = canonical(path);
+		var allowed = false;
+
+		if(abs && mode == "content" && foreign.has(abs))
+			return label + ": reading '" + std.string(path) + "' is not allowed: " + foreign[abs] + ". Remove it, or write the file yourself.";
+
+		if(abs) {
+			if(mode == "write") {
+				allowed = under(write_roots, abs);
+			}
+			else {
+				allowed = under(write_roots, abs) || under(read_roots, abs);
+
+				if(!allowed && mode == "stat")
+					allowed = passage(abs);
+			}
+		}
+
+		if(allowed)
+			return "";
+
+		var refusal = label + ": " + (mode == "write" ? "writing" : "reading") + " '" + std.string(path) + "' is not allowed";
+
+		if(reason)
+			refusal += " (" + reason + ")";
+
+		return refusal + ". " + allowed_text();
+	}
+
+	need(path, mode)
+	{
+		var refusal = access_error(path, mode);
+
+		if(refusal)
+			std.runtime_error(refusal);
+
+		return true;
+	}
+
+	mark(path, present)
+	{
+		var key = tidy(path);
+		var abs = canonical(path);
+
+		// written (or removed) through this view: its content is the view's own again
+		if(abs && foreign.has(abs))
+			foreign.erase(abs);
+
+		writes++;
+
+		if(present)
+			touched[key] = true;
+		else if(touched.has(key))
+			touched.erase(key);
+	}
+
+	// The files written through this view that still exist.
+	touched_files()
+	{
+		var list = [];
+
+		for(var i = 0; i < touched.size(); i++) {
+			var key = touched.key(i);
+
+			if(base.exists(key) && !base.is_directory(key))
+				list.push_back(key);
+		}
+
+		return list;
+	}
+
+	// â”€â”€ what the file tools call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	is_valid(path) { return base.is_valid(path); }
+
+	exists(path) { need(path, "stat"); return base.exists(path); }
+	is_directory(path) { need(path, "stat"); return base.is_directory(path); }
+	is_file(path) { need(path, "stat"); return base.is_file(path); }
+
+	file_info(path) { need(path, "read"); return base.file_info(path); }
+	size(path) { need(path, "read"); return base.size(path); }
+	empty(path) { need(path, "read"); return base.empty(path); }
+	hash(path) { need(path, "content"); return base.hash(path); }
+
+	read_text(path) { need(path, "content"); return base.read_text(path); }
+	read_string(path) { need(path, "content"); return base.read_string(path); }
+	read_file(path) { need(path, "content"); return base.read_file(path); }
+	read_json(path) { need(path, "content"); return base.read_json(path); }
+
+	files(path, recursive = false) { need(path, "read"); return base.files(path, recursive); }
+	dirs(path, recursive = false) { need(path, "read"); return base.dirs(path, recursive); }
+
+	write_text(path, data)
+	{
+		need(path, "write");
+		var done = base.write_text(path, data);
+		if(done)
+			mark(path, true);
+		return done;
+	}
+
+	write_string(path, data = "")
+	{
+		need(path, "write");
+		var done = base.write_string(path, data);
+		if(done)
+			mark(path, true);
+		return done;
+	}
+
+	write_file(path, data)
+	{
+		need(path, "write");
+		var done = base.write_file(path, data);
+		if(done)
+			mark(path, true);
+		return done;
+	}
+
+	write_json(path, data)
+	{
+		need(path, "write");
+		var done = base.write_json(path, data);
+		if(done)
+			mark(path, true);
+		return done;
+	}
+
+	mkdir(path)
+	{
+		need(path, "write");
+		return base.mkdir(path);
+	}
+
+	remove(path)
+	{
+		need(path, "write");
+		var done = base.remove(path);
+		if(done)
+			mark(path, false);
+		return done;
+	}
+
+	move(source, destination)
+	{
+		need(source, "write");
+		need(destination, "write");
+		var done = base.move(source, destination);
+		if(done) {
+			mark(source, false);
+			mark(destination, true);
+		}
+		return done;
+	}
+
+	rename(source, destination)
+	{
+		need(source, "write");
+		need(destination, "write");
+		var done = base.rename(source, destination);
+		if(done) {
+			mark(source, false);
+			mark(destination, true);
+		}
+		return done;
+	}
+
+	copy(source, destination)
+	{
+		need(source, "content");
+		need(destination, "write");
+		var done = base.copy(source, destination);
+		if(done)
+			mark(destination, true);
+		return done;
+	}
+}
+
 agt_add_finalize(
-	agt, 
+	agt,
 	signals = ["continue", "finished", "failed", "question"],
 	description = "Use this at the end of each turn: emit continue, finished, failed or question with the report.\nIf your context is exhausted or after long continous runs with alot of work left, call this tool with a 'continue' signal and a handover report to continue with a fresh context (erases all history including the user messages, must include the goal/initial user task when 'continue'!)."
 ) {
-	
+
 	//Use this for generic agent loops
 	agt.add_tool(
 		"finalize",
@@ -40,9 +785,38 @@ agt_add_finalize(
 			signal = signals,
 			result = "&string(): What to report",
 		],
-		[](agt, args)
-		{		
-			agt.finalize_run(args.signal, args.result, true); 			
+		[signals](agt, args)
+		{
+			// The parents compare the signal as it is ("finished", "question", ...): a signal
+			// in another case or a made-up one would count as a failed task there, so it is
+			// normalised here and anything else is refused while the turn can still be ended properly.
+			var signal = std.is_none(args.signal) ? "" : std.string(args.signal).strip().lowercase();
+			var known = false;
+
+			for(var i = 0; i < signals.size(); i++) {
+				if(signals[i] == signal)
+					known = true;
+			}
+
+			if(!known) {
+				return [
+					ok = false,
+					error = "Unknown signal '" + signal + "': the turn was NOT ended.",
+					valid_signals = signals,
+					hint = "Call finalize again with one of the valid signals.",
+				];
+			}
+
+			var has_report = args.has("result") && !std.is_none(args.result) && std.string(args.result).strip() != "";
+
+			if(!has_report) {
+				return agt_fail(
+					"Missing 'result': the turn was NOT ended.",
+					"Call finalize again with the report in 'result'. It is the only thing the reader of this turn gets."
+				);
+			}
+
+			agt.finalize_run(signal, args.result, true);
 			return "Finalize signal sent, the turn ends; wait for further instructions.";
 		}
 	);
@@ -52,189 +826,332 @@ agt_add_read_tools(agt) {
 
 	agt.add_tool(
 		"list_dir",
-		"FILE OPERATION - Query files in the current directory",
+		"FILE OPERATION - List the files and directories of a directory. A long listing is cut (truncated = true, with the total counts).",
 		[
 			path = "&string(): Path to query, use '.' for the current working directory",
 			recursive = ["true", "false"],
 		],
 		[](agt, args)
 		{
-			if(args.path.starts("/"))
-				return "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !";
-			
-			fs = agt.filesystem;
+			var wanted = std.is_none(args.path) ? "" : std.string(args.path).strip();
+			if(!wanted)
+				wanted = ".";
 
-			args.path = args.path.removesuffix("/");
-		
-			if(!fs.exists(args.path))
-				return "The directory does not exist.";
-		
-			dirs = fs.dirs(args.path, args.recursive == "true"); 
-			files = fs.files(args.path, args.recursive == "true"); //Filter out large log files and other stuff
-			
-			dirs_cleaned = [];
-			files_cleaned = [];
-			
-			//Filter out logfiles
-			for(i = 0; i < dirs.size(); i++) {
-				//Kind of obsolete, also make the model know that there is a git folder, unless recursive
-				
-				if(dirs[i].contains(".git") && args.recursive == "true")
+			var chk = agt_path_check(agt, wanted, "read");
+			if(!chk.ok)
+				return chk;
+
+			var dir = chk.path;
+			var fs = agt.filesystem;
+
+			if(!fs.exists(dir))
+				return agt_fail("The directory '" + dir + "' does not exist.", "List its parent directory (or '.') to see what is there.");
+
+			if(!fs.is_directory(dir))
+				return agt_fail("'" + dir + "' is a file, not a directory.", "Use read_file or file_info for a file.");
+
+			var recursive = agt_flag(args.recursive, false);
+
+			var found_dirs = fs.dirs(dir, recursive);
+			var found_files = fs.files(dir, recursive);
+
+			var dir_names = [];
+			var file_names = [];
+			var git_skipped = false;
+
+			for(var i = 0; i < found_dirs.size(); i++) {
+				var d = std.string(found_dirs[i]);
+
+				// a recursive listing names a .git directory but not what is inside it
+				if(recursive && (d.starts(".git/") || d.contains("/.git/"))) {
+					git_skipped = true;
 					continue;
-				
-				//if(dirs[i].contains(".agent") || dirs[i].contains(".backup") || dirs[i].contains(".git"))
-				//	continue;
-				dirs_cleaned.push_back(dirs[i]);
-			}
-			for(i = 0; i < files.size(); i++) {		
-				//if(files[i].contains(".agent") || files[i].contains(".backup") || files[i].contains(".git"))
-				//	continue;
-				files_cleaned[files[i]] = [size=fs.size(args.path + "/" + files[i])];
-			}
-			
-			truncated = false;
-			total_files = files_cleaned.size();
-			total_dirs = dirs_cleaned.size();
-			
-			if(args.recursive == "true") {
-				for(files_cleaned.size() > 50) {
-					files_cleaned.erase(files_cleaned.size()-1);
-					truncated = true;
 				}
-				for(dirs_cleaned.size() > 50) {
-					dirs_cleaned.erase(dirs_cleaned.size()-1);
-					truncated = true;
-				}
+
+				dir_names.push_back(d);
 			}
-			//Todo: find reasonable limits for non-recursive
-			
-			has_files = files_cleaned ? "true" : "false";
-			has_dirs = dirs_cleaned ? "true" : "false";
-			
-			result = [
-				has_files = has_files,
-				has_directories = has_dirs,
+
+			for(var j = 0; j < found_files.size(); j++) {
+				var f = std.string(found_files[j]);
+
+				if(recursive && (f.starts(".git/") || f.contains("/.git/"))) {
+					git_skipped = true;
+					continue;
+				}
+
+				file_names.push_back(f);
+			}
+
+			if(dir_names.size() > 1)
+				dir_names.sort();
+			if(file_names.size() > 1)
+				file_names.sort();
+
+			var max_entries = recursive ? LIST_MAX_ENTRIES_RECURSIVE : LIST_MAX_ENTRIES;
+
+			var total_files = file_names.size();
+			var total_dirs = dir_names.size();
+
+			var dirs_shown = [];
+			var files_shown = [];
+
+			for(var k = 0; k < total_dirs && k < max_entries; k++) {
+				dirs_shown.push_back(dir_names[k]);
+			}
+
+			var shown_files = 0;
+
+			for(var m = 0; m < total_files && m < max_entries; m++) {
+				files_shown[file_names[m]] = [size = fs.size(dir + "/" + file_names[m])];
+				shown_files++;
+			}
+
+			var listing = [
+				path = dir,
+				has_files = total_files ? "true" : "false",
+				has_directories = total_dirs ? "true" : "false",
 				total_files = total_files,
 				total_dirs = total_dirs,
-				dirs = dirs_cleaned,
-				files = files_cleaned,
+				dirs = dirs_shown,
+				files = files_shown,
 			];
-			
-			if(truncated)
-				result.truncation_warning = "Warning: file list was truncated due to too many entries.";
-			
-			return result;
+
+			if(total_files > shown_files || total_dirs > dirs_shown.size()) {
+				listing.truncated = true;
+				listing.shown_files = shown_files;
+				listing.shown_dirs = dirs_shown.size();
+				listing.hint = "Only the first " + std.string(max_entries) + " files and directories (sorted by name) are listed, out of total_files / total_dirs. List a subdirectory" + (recursive ? ", list without recursive," : "") + " or use a command with a filter (find, ls, dir) to see the rest.";
+			}
+
+			if(git_skipped)
+				listing.note = "The content of .git directories is not listed.";
+
+			return listing;
 		}
 	);
 
 	agt.add_tool(
-	  "file_info",
-	  "FILE OPERATION - Get file info",
-	  [
-		path = "&string(): Target file",
-	  ],
-	  [](agt, args)
-	  {
-		if(args.path.starts("/"))
-		  return "Invalid path specified. Use './path/to/file' instead of absolute paths.";
+		"file_info",
+		"FILE OPERATION - Get file info (exists, file or directory, size in bytes, last write time)",
+		[
+			path = "&string(): Target file",
+		],
+		[](agt, args)
+		{
+			var chk = agt_path_check(agt, args.path, "read");
+			if(!chk.ok)
+				return chk;
 
-		fs = agt.filesystem;
+			var fs = agt.filesystem;
 
-		return fs.file_info(args.path);
-	  }
-	);
-	
-	agt.add_tool(
-	  "file_line_count",
-	  "FILE OPERATION - Get file line count",
-	  [
-		path = "&string(): Target file",
-	  ],
-	  [](agt, args)
-	  {
-		if(args.path.starts("/"))
-		  return "Invalid path specified. Use './path/to/file' instead of absolute paths.";
+			if(!fs.exists(chk.path))
+				return agt_fail("'" + chk.path + "' does not exist.", "Check the name with list_dir on its directory.");
 
-		fs = agt.filesystem;
-	
-		return fs.read_string(args.path).count("\n") + 1;
-	  }
+			var info = fs.file_info(chk.path);
+
+			if(!std.is_json(info))
+				return agt_fail("The file info of '" + chk.path + "' cannot be read.", "Check the path with list_dir on its directory.");
+
+			// the path as the tools take it, not the absolute one of this machine
+			info["path"] = chk.path;
+			info.type = info.is_directory ? "directory" : "file";
+
+			return info;
+		}
 	);
 
 	agt.add_tool(
-	  "read_file",
-	  "FILE OPERATION - Read raw file content",
-	  [
-		path = "&string(): Target file",
-		include_line_numbers = ["true", "false"],
-		start_line = "int(1): OPTIONAL start line",
-		end_line = "int(1): OPTIONAL end line"
-	  ],
-	  [](agt, args)
-	  {
-		if(args.path.starts("/"))
-		  return "Invalid path specified. Use './path/to/file' instead of absolute paths.";
-		
-		managed _lock = local_file_lock(args.path);
-		
-		fs = agt.filesystem;
-		
-		if(!fs.exists(args.path)) {
-		  return [
-			ok = false,
-			error = "file doesnt exist"
-		  ];
+		"file_line_count",
+		"FILE OPERATION - Get file line count",
+		[
+			path = "&string(): Target file",
+		],
+		[](agt, args)
+		{
+			var chk = agt_path_check(agt, args.path, "content");
+			if(!chk.ok)
+				return chk;
+
+			var fs = agt.filesystem;
+
+			if(!fs.exists(chk.path))
+				return agt_fail("The file '" + chk.path + "' does not exist.", "Check the name with list_dir on its directory.");
+
+			if(fs.is_directory(chk.path))
+				return agt_fail("'" + chk.path + "' is a directory, not a file.", "Use list_dir for a directory.");
+
+			var size_bytes = fs.size(chk.path);
+
+			if(size_bytes > READ_MAX_FILE_BYTES)
+				return agt_fail("'" + chk.path + "' has " + std.string(size_bytes) + " bytes, too large to load.", "Count its lines with a command (wc -l, find /c /v \"\").");
+
+			var text = agt_decode_text(fs.read_text(chk.path));
+
+			if(!text) {
+				if(size_bytes > 0)
+					return agt_fail("'" + chk.path + "' could not be read.", "Check its permissions with a command.");
+
+				return [ok = true, lines = 0, status = "file is empty"];
+			}
+
+			if(agt_is_binary(text))
+				return agt_fail("'" + chk.path + "' is a binary file (" + std.string(size_bytes) + " bytes): it has no lines.", "Use file_info for its size.");
+
+			return agt_count_lines(text);
 		}
-		
-		txt = fs.read_text(args.path);
-		
-		if(!txt) {
-		  return [
-			ok = true,
-			status = "file is empty"
-		  ];
+	);
+
+	agt.add_tool(
+		"read_file",
+		"FILE OPERATION - Read a text file. One call returns at most " + std.string(READ_MAX_LINES) + " lines / " + std.string(READ_MAX_BYTES) + " bytes; a longer file comes back with truncated = true: read on with start_line / end_line (1-based, inclusive).",
+		[
+			path = "&string(): Target file",
+			include_line_numbers = ["true", "false"],
+			start_line = "int(1): OPTIONAL start line",
+			end_line = "int(1): OPTIONAL end line"
+		],
+		[](agt, args)
+		{
+			var chk = agt_path_check(agt, args.path, "content");
+			if(!chk.ok)
+				return chk;
+
+			var file = chk.path;
+			var fs = agt.filesystem;
+
+			managed _lock = local_file_lock(agt_lock_key(file));
+
+			if(!fs.exists(file))
+				return agt_fail("The file '" + file + "' does not exist.", "Check the name with list_dir on its directory.");
+
+			if(fs.is_directory(file))
+				return agt_fail("'" + file + "' is a directory, not a file.", "Use list_dir for a directory.");
+
+			var size_bytes = fs.size(file);
+
+			if(size_bytes > READ_MAX_FILE_BYTES) {
+				return [
+					ok = false,
+					error = "'" + file + "' has " + std.string(size_bytes) + " bytes, too large to load.",
+					size_bytes = size_bytes,
+					hint = "Look at parts of it with a command (head, tail, sed -n '10,20p', grep, Select-String).",
+				];
+			}
+
+			var text = agt_decode_text(fs.read_text(file));
+
+			if(!text) {
+				if(size_bytes > 0)
+					return agt_fail("'" + file + "' could not be read.", "Check its permissions with a command.");
+
+				return [
+					ok = true,
+					status = "file is empty",
+					content = "",
+					total_lines = 0,
+				];
+			}
+
+			if(agt_is_binary(text)) {
+				return [
+					ok = false,
+					error = "'" + file + "' is a binary file (" + std.string(size_bytes) + " bytes): its content is not text and is not shown.",
+					binary = true,
+					size_bytes = size_bytes,
+					hint = "Use file_info for its size, or inspect it with a command made for its format (file, xxd, strings, an image or archive tool).",
+				];
+			}
+
+			text = text.replace("\r\n", "\n").replace("\r", "\n");
+
+			var lines = text.split("\n");
+			var ends_with_break = text.ends("\n");
+
+			// "a\nb\n" is two lines: the final line break ends the last line
+			if(ends_with_break)
+				lines.erase(lines.size() - 1);
+
+			var total = lines.size();
+
+			var numbered = agt_flag(args.include_line_numbers, false);
+
+			var first = 1;
+			var last = total;
+
+			if(args.start_line ?? false)
+				first = std.int(args.start_line);
+			if(args.end_line ?? false)
+				last = std.int(args.end_line);
+
+			if(first < 1)
+				first = 1;
+
+			if(first > total) {
+				return [
+					ok = false,
+					error = "start_line " + std.string(first) + " is beyond the end of '" + file + "': it has " + std.string(total) + " lines.",
+					total_lines = total,
+					hint = "Use a start_line from 1 to " + std.string(total) + ".",
+				];
+			}
+
+			if(last < first)
+				return agt_fail("end_line " + std.string(last) + " is before start_line " + std.string(first) + ".", "Give an end_line >= start_line, or leave end_line out.");
+
+			if(last > total)
+				last = total;
+
+			var content = "";
+			var shown_last = first - 1;
+			var cut_lines = 0;
+
+			for(var n = first; n <= last; n++) {
+				if(n - first >= READ_MAX_LINES)
+					break;
+
+				var line = lines[n - 1];
+
+				if(line.size() > READ_MAX_LINE_BYTES) {
+					var keep = agt_utf8_floor(line, READ_MAX_LINE_BYTES);
+					line = line.substr(0, keep) + " ...[line cut: " + std.string(lines[n - 1].size()) + " bytes, " + std.string(keep) + " shown]";
+					cut_lines++;
+				}
+
+				var piece = numbered ? (std.string(n) + "| " + line + "\n") : (line + "\n");
+
+				// the first line always fits (a line is at most READ_MAX_LINE_BYTES): every call makes progress
+				if(n > first && content.size() + piece.size() > READ_MAX_BYTES)
+					break;
+
+				content += piece;
+				shown_last = n;
+			}
+
+			// byte exact where nothing was added: no line break after a last line that has none
+			if(!numbered && shown_last == total && !ends_with_break)
+				content = content.substr(0, content.size() - 1);
+
+			var answer = [
+				ok = true,
+				content = content,
+				start_line = first,
+				end_line = shown_last,
+				total_lines = total,
+			];
+
+			if(shown_last < last) {
+				answer.truncated = true;
+				answer.next_start_line = shown_last + 1;
+				answer.hint = "Lines " + std.string(first) + "-" + std.string(shown_last) + " of " + std.string(total) + " are shown (one call returns at most " + std.string(READ_MAX_LINES) + " lines / " + std.string(READ_MAX_BYTES) + " bytes). Read on with start_line = " + std.string(shown_last + 1) + ".";
+			}
+
+			if(cut_lines) {
+				answer.long_lines_cut = cut_lines;
+				answer.long_lines_hint = "Lines longer than " + std.string(READ_MAX_LINE_BYTES) + " bytes are cut and marked. Do not copy a cut line into replace_string; get the rest of such a line with a command (cut -c, a small script).";
+			}
+
+			return answer;
 		}
-
-		txt = txt.replace("\r\n", "\n").replace("\r", "\n");
-
-		has_line_numbers = std.string(args.include_line_numbers ?? "false").lowercase() == "true";
-		has_line_start = args.start_line ?? false;
-		has_line_end = args.end_line ?? false;
-
-		if(has_line_numbers || has_line_start || has_line_end) {
-
-		  lines = txt.split("\n");
-		  txt = "";
-
-		  for(i = 0; i < lines.size(); i++) {
-
-			if(has_line_start && (i+1) < args.start_line)
-			  continue;
-
-			if(has_line_end && (i+1) > args.end_line)
-			  continue;
-
-			if(has_line_numbers)
-			  txt += (i+1) + "| ";
-
-			txt += lines[i] + "\n";
-		  }
-		}
-		
-		num_lines = txt.count("\n") + 1;
-
-		if(num_lines > 10000) {
-			return [
-			  ok = false,
-			  error = "File is too big to be read at whole.",
-		    ];
-		}
-
-		return [
-		  ok = true,
-		  content = txt
-		];
-	  }
 	);
 }
 
@@ -493,54 +1410,349 @@ agt_add_code_read_tools(agt) {
 	);
 }
 
+
+// â”€â”€ replace_string: what the model gets when the edit cannot be applied â”€â”€â”€â”€â”€â”€
+
+agt_cut_text(text, max_bytes)
+{
+	if(text.size() <= max_bytes)
+		return text;
+
+	return text.substr(0, agt_utf8_floor(text, max_bytes)) + "...";
+}
+
+// Where `needle` occurs in `text` when all whitespace is ignored (the matching of
+// string.replace_ignoring_whitespace(), which replaces every such occurrence).
+// Returns [count, lines]: the number of occurrences and the line each one starts on
+// (the first `max_lines` of them).
+agt_ws_matches(text, needle, max_lines = 20)
+{
+	var ws = agt_whitespace_chars();
+	var flat_needle = needle.removechars(ws);
+
+	if(!flat_needle)
+		return [count = 0, lines = []];
+
+	var flat_text = text.removechars(ws);
+	var file_lines = text.split("\n");
+
+	var count = 0;
+	var found = [];
+
+	var line_index = 0;
+	var before = 0;		// characters (without whitespace) in front of the line line_index
+	var line_len = file_lines[0].removechars(ws).size();
+
+	var pos = flat_text.find(flat_needle);
+
+	for(pos >= 0) {
+		count++;
+
+		if(found.size() < max_lines) {
+			for(line_index < file_lines.size() - 1 && before + line_len <= pos) {
+				before += line_len;
+				line_index++;
+				line_len = file_lines[line_index].removechars(ws).size();
+			}
+
+			found.push_back(line_index + 1);
+		}
+
+		pos = flat_text.find(flat_needle, pos + flat_needle.size());
+	}
+
+	return [count = count, lines = found];
+}
+
+// target_text is nowhere in the file: say where it comes closest and what differs,
+// so the next call can carry the text as the file has it.
+agt_replace_not_found(file, old_content, target)
+{
+	var ws = agt_whitespace_chars();
+
+	var failure = [
+		ok = false,
+		error = "target_text was not found in '" + file + "': nothing was changed. Whitespace is ignored, everything else has to match exactly.",
+	];
+
+	var file_lines = old_content.replace("\r\n", "\n").replace("\r", "\n").split("\n");
+	var raw_lines = target.replace("\r\n", "\n").replace("\r", "\n").split("\n");
+
+	// the lines of the target that carry text
+	var wanted = [];
+	var prefixed = 0;
+
+	for(var i = 0; i < raw_lines.size(); i++) {
+		var stripped = raw_lines[i].strip();
+
+		if(!stripped)
+			continue;
+
+		wanted.push_back(stripped);
+
+		// "12| text": the prefix read_file adds with include_line_numbers
+		var bar = stripped.find("|");
+		if(bar > 0 && bar <= 7 && !stripped.substr(0, bar).removechars("0123456789"))
+			prefixed++;
+	}
+
+	if(!wanted.size()) {
+		failure.hint = "target_text holds only whitespace.";
+		return failure;
+	}
+
+	if(prefixed == wanted.size()) {
+		failure.hint = "Every line of target_text starts with a line number ('12| ...'): that prefix comes from read_file and is not in the file. Send the text without it.";
+		return failure;
+	}
+
+	if(target.contains("\\n") && !target.contains("\n")) {
+		failure.hint = "target_text has the two characters '\\n' where the file has real line breaks. Send real line breaks.";
+		return failure;
+	}
+
+	// 1. the first line of the target is in the file: show what follows it there
+	var first_flat = wanted[0].removechars(ws);
+	var anchors = [];
+
+	for(var j = 0; j < file_lines.size() && anchors.size() < 5; j++) {
+		if(file_lines[j].removechars(ws).contains(first_flat))
+			anchors.push_back(j);
+	}
+
+	if(anchors.size()) {
+		var anchor = anchors[0];
+		var file_pos = anchor + 1;
+
+		for(var t = 1; t < wanted.size(); t++) {
+			// blank lines of the file are no difference
+			for(file_pos < file_lines.size() && !file_lines[file_pos].strip()) {
+				file_pos++;
+			}
+
+			var flat_wanted = wanted[t].removechars(ws);
+			var flat_have = file_pos < file_lines.size() ? file_lines[file_pos].removechars(ws) : "";
+			var same = (t == wanted.size() - 1) ? flat_have.starts(flat_wanted) : (flat_have == flat_wanted);
+
+			if(!same) {
+				failure.first_difference = [
+					target_text_line = t + 1,
+					expected = agt_cut_text(wanted[t], 300),
+					file_line = file_pos < file_lines.size() ? file_pos + 1 : 0,
+					found = file_pos < file_lines.size() ? agt_cut_text(file_lines[file_pos].strip(), 300) : "<end of file>",
+				];
+				break;
+			}
+
+			file_pos++;
+		}
+
+		// the text of the file at that place, ready to be copied
+		var from = anchor;
+		var to = math.min(file_lines.size(), anchor + math.min(12, math.max(3, raw_lines.size() + 2)));
+		var excerpt = "";
+
+		for(var x = from; x < to; x++) {
+			excerpt += file_lines[x] + "\n";
+		}
+
+		var anchor_lines = [];
+		for(var y = 0; y < anchors.size(); y++) {
+			anchor_lines.push_back(anchors[y] + 1);
+		}
+
+		failure.first_line_found_at = anchor_lines;
+		failure.file_text = agt_cut_text(excerpt, 2400);
+		failure.file_text_lines = std.string(from + 1) + "-" + std.string(to);
+		failure.hint = "The first line of target_text is in the file (line " + std.string(anchor + 1) + "), the text after it differs. 'file_text' is what the file has there: copy target_text from it.";
+
+		return failure;
+	}
+
+	// 2. no line starts the target: the line that shares most of its words
+	// (the names in the longest line of the target, longer names count more)
+	var words_source = wanted[0];
+
+	for(var w = 1; w < wanted.size(); w++) {
+		if(wanted[w].size() > words_source.size())
+			words_source = wanted[w];
+	}
+
+	var word_list = agt_cut_text(words_source, 2000).regex_replace("[^A-Za-z0-9_]+", " ").split_words().unique();
+	var words = [];
+	var weight_total = 0;
+
+	for(var q = 0; q < word_list.size() && words.size() < 12; q++) {
+		if(word_list[q].size() >= 3) {
+			words.push_back(word_list[q]);
+			weight_total += word_list[q].size();
+		}
+	}
+
+	var best_line = -1;
+	var best_score = 0;
+
+	if(words.size()) {
+		for(var z = 0; z < file_lines.size() && z < 20000; z++) {
+			var score = 0;
+
+			for(var v = 0; v < words.size(); v++) {
+				if(file_lines[z].contains(words[v]))
+					score += words[v].size();
+			}
+
+			if(score > best_score) {
+				best_score = score;
+				best_line = z;
+			}
+		}
+	}
+
+	// worth naming only when it shares more than half of what the target line is made of
+	if(best_line >= 0 && best_score * 2 > weight_total) {
+		failure.closest_line = [
+			line = best_line + 1,
+			text = agt_cut_text(file_lines[best_line].strip(), 300),
+		];
+		failure.hint = "No line of the file starts target_text. The closest line is line " + std.string(best_line + 1) + " ('closest_line'): read that part again (read_file with start_line / end_line) and copy the text as it is there.";
+		return failure;
+	}
+
+	failure.hint = "No line of the file resembles target_text. Read the file again: it may have changed, or this is the wrong file.";
+	return failure;
+}
+
+// Checks shared by move / copy / rename. Returns [ok = true, src, dst, replaced]
+// (dst is where the item really ends up) or the failure for the tool to return.
+agt_transfer_check(agt, args, verb)
+{
+	var done_word = (verb == "copy") ? "copied" : ((verb == "move") ? "moved" : "renamed");
+
+	var s = agt_path_check(agt, args.source, (verb == "copy") ? "read" : "write", "source");
+	if(!s.ok)
+		return s;
+
+	var d = agt_path_check(agt, args.destination, "write", "destination");
+	if(!d.ok)
+		return d;
+
+	var fs = agt.filesystem;
+	var src = s.path;
+	var dst = d.path;
+
+	if(!fs.exists(src))
+		return agt_fail("The source '" + src + "' does not exist: nothing was " + done_word + ".", "Check the name with list_dir on its directory.");
+
+	if(agt_lock_key(src) == agt_lock_key(dst))
+		return agt_fail("Source and destination are the same path: nothing was " + done_word + ".", "Give a different destination.");
+
+	var src_is_dir = fs.is_directory(src);
+	var replaced = false;
+
+	if(fs.exists(dst)) {
+		if(fs.is_directory(dst)) {
+			if(verb == "rename")
+				return agt_fail("The destination '" + dst + "' is an existing directory: nothing was renamed.", "Use move to put the item into that directory, or give a name that is free.");
+
+			if(src_is_dir)
+				return agt_fail("The destination '" + dst + "' is an existing directory: directories are not merged, nothing was " + done_word + ".", "Give a destination path that does not exist yet (for example '" + dst + "/" + fileio.file_name(src) + "'), or remove the destination first.");
+
+			// a file into an existing directory, like cp / mv
+			dst = dst + "/" + fileio.file_name(src);
+		}
+		else if(src_is_dir) {
+			return agt_fail("The destination '" + dst + "' is an existing file and the source is a directory: nothing was " + done_word + ".", "Give a destination path that does not exist yet.");
+		}
+	}
+
+	if(fs.exists(dst)) {
+		if(fs.is_directory(dst))
+			return agt_fail("'" + dst + "' is an existing directory: nothing was " + done_word + ".", "Give a destination path that does not exist yet.");
+
+		var overwrite = agt_flag(args.overwrite, false);
+
+		if(!overwrite) {
+			return [
+				ok = false,
+				error = "The destination '" + dst + "' already exists (" + std.string(fs.size(dst)) + " bytes): nothing was " + done_word + ".",
+				hint = "Give another destination, or pass overwrite = \"true\" to replace that file.",
+			];
+		}
+
+		replaced = true;
+	}
+
+	var blocker = agt_parent_blocker(fs, dst);
+	if(blocker)
+		return agt_fail("'" + blocker + "' is a file, so '" + dst + "' cannot be created below it: nothing was " + done_word + ".", "Give a destination whose parents are directories.");
+
+	return [ok = true, src = src, dst = dst, replaced = replaced];
+}
+
 agt_add_write_tools(agt) {
 	agt.add_tool(
 		"write_file",
-		"FILE OPERATION - Create a new file.",
+		"FILE OPERATION - Create a new file. Refuses to overwrite a file that is not empty.",
 		[
 			path = "&string(): Target file",
 			content = "&string(): Content of the new file",
 		],
 		[](agt, args)
 		{
-			if(args.path.starts("/")) {
-				return [
-					ok = false,
-					error = "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !",
-				];
-			}
-			
-			fs = agt.filesystem;
-			
-			managed _lock = local_file_lock(args.path);
-			
-			if(!fs.empty(args.path)) {
+			var chk = agt_path_check(agt, args.path, "write");
+			if(!chk.ok)
+				return chk;
+
+			var file = chk.path;
+			var fs = agt.filesystem;
+
+			if(chk.names_directory)
+				return agt_fail("'" + file + "/' names a directory: nothing was written.", "Give the path of the file, or use mkdir for a directory.");
+
+			if(!args.has("content") || std.is_none(args.content))
+				return agt_fail("Missing 'content': nothing was written.", "Give the text of the new file in 'content' (an empty string creates an empty file).");
+
+			var file_content = std.string(args.content);
+
+			managed _lock = local_file_lock(agt_lock_key(file));
+
+			if(fs.exists(file) && fs.is_directory(file))
+				return agt_fail("'" + file + "' is a directory: nothing was written.", "Give the path of a file inside it.");
+
+			if(!fs.empty(file)) {
 				return [
 					ok = false,
 					error = "The file exists and is not empty.",
+					size_bytes = fs.size(file),
 					next_steps = "Prefer to use 'replace_string' to make precise edits to files rather than rewriting the entire file from scratch.\nIf you are absolutely sure you want to overwrite the entire file (not recommended) because it is necessary, use 'remove' to remove the file first, then call this tool again.",
 				];
 			}
-			
-			file_content = args.content;
-		
+
+			var blocker = agt_parent_blocker(fs, file);
+			if(blocker)
+				return agt_fail("'" + blocker + "' is a file, so '" + file + "' cannot be created below it: nothing was written.", "Give a path whose parents are directories.");
+
+			var written = fs.write_text(file, file_content);
+
+			if(!written)
+				return agt_fail("Writing '" + file + "' failed: the file system refused it.", "Check the directory with list_dir / file_info (no permission, a full disk or an invalid name), then try again.");
+
 			agt._log_action("write", [
-				path = args.path,
-				prev_content = fs.read_text(args.path),
+				path = file,
+				prev_content = "",
 				new_content = file_content,
 			]);
-			
-			fs.write_text(args.path, file_content);
-			
-			//std.print("Written file: ", args.path);
-			
+
 			return [
 				ok = true,
 				status = "Write was successful.",
+				path = file,
+				bytes_written = file_content.size(),
+				lines_written = agt_count_lines(file_content),
 			];
 		}
 	);
-	
+
 	agt.add_tool(
 		"append_text",
 		"FILE OPERATION - Append text at the end or insert text at the beginning of a file",
@@ -551,43 +1763,65 @@ agt_add_write_tools(agt) {
 		],
 		[](agt, args)
 		{
-			if(args.path.starts("/")) {
-				return [
-					ok = false,
-					error = "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !",
-				];
-			}
-			
-			fs = agt.filesystem;
+			var chk = agt_path_check(agt, args.path, "write");
+			if(!chk.ok)
+				return chk;
 
-			managed _lock = local_file_lock(args.path);
-		
-			old_content = fs.exists(args.path) ? fs.read_text(args.path) : "<new file>";
-				
-			new_content = old_content;
-			
-			if(args.insert_at == "start")
-				new_content = args.content + new_content;
-			else
-				new_content += args.content;
-		
+			var file = chk.path;
+			var fs = agt.filesystem;
+
+			if(chk.names_directory)
+				return agt_fail("'" + file + "/' names a directory: nothing was written.", "Give the path of the file.");
+
+			if(!args.has("content") || std.is_none(args.content))
+				return agt_fail("Missing 'content': nothing was written.", "Give the text to insert in 'content'.");
+
+			var where = std.string(args.insert_at ?? "end").strip().lowercase();
+
+			if(where != "start" && where != "end")
+				return agt_fail("insert_at is '" + where + "': it has to be \"start\" or \"end\". Nothing was written.", "To change text in the middle of a file use replace_string.");
+
+			managed _lock = local_file_lock(agt_lock_key(file));
+
+			var existed = fs.exists(file);
+
+			if(existed && fs.is_directory(file))
+				return agt_fail("'" + file + "' is a directory: nothing was written.", "Give the path of a file inside it.");
+
+			var blocker = agt_parent_blocker(fs, file);
+			if(blocker)
+				return agt_fail("'" + blocker + "' is a file, so '" + file + "' cannot be created below it: nothing was written.", "Give a path whose parents are directories.");
+
+			var old_content = existed ? fs.read_text(file) : "";
+
+			if(std.is_none(old_content))
+				old_content = "";
+
+			var new_content = (where == "start") ? (std.string(args.content) + old_content) : (old_content + std.string(args.content));
+
+			var written = fs.write_text(file, new_content);
+
+			if(!written)
+				return agt_fail("Writing '" + file + "' failed: the file system refused it.", "Check the file with file_info (no permission, a full disk), then try again.");
+
 			agt._log_action("edit", [
-				path = args.path,
-				prev_content = old_content,
+				path = file,
+				prev_content = existed ? old_content : "<new file>",
 				new_content = new_content,
 			]);
-			
-			fs.write_text(args.path, new_content);
-			
-			//std.print("Written file: ", args.path);
-			
+
 			return [
 				ok = true,
 				status = "Edit was successful.",
+				path = file,
+				created = existed ? false : true,
+				inserted_at = where,
+				bytes_total = new_content.size(),
+				lines_total = agt_count_lines(new_content),
 			];
 		}
 	);
-	
+
 	agt.add_tool(
 		"replace_string",
 		"FILE OPERATION - Replace one or multiple occurences of a given string within a text file\nMake sure to NOT include any line numbers returned by read functions!\nThis tool is mostly whitespace insensitive, but the text between the whitespaces must match 100% with what you want to replace.",
@@ -599,96 +1833,86 @@ agt_add_write_tools(agt) {
 		],
 		[](agt, args)
 		{
-			
-			if(args.path.starts("/")) {
-				return [
-					ok = false,
-					error = "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !",
-				];
-			}
+			var chk = agt_path_check(agt, args.path, "write");
+			if(!chk.ok)
+				return chk;
 
-			fs = agt.filesystem;
+			var file = chk.path;
+			var fs = agt.filesystem;
 
-			managed _lock = local_file_lock(args.path);
+			managed _lock = local_file_lock(agt_lock_key(file));
 
-			current_task = agt.env["task"];
-			
-			old_content = "";
-				
-			old_content = fs.read_text(args.path);
-			
+			if(!fs.exists(file))
+				return agt_fail("The file '" + file + "' does not exist: nothing was changed.", "Check the name with list_dir on its directory. A new file is created with write_file.");
+
+			if(fs.is_directory(file))
+				return agt_fail("'" + file + "' is a directory: nothing was changed.", "Give the path of a file.");
+
+			var old_content = fs.read_text(file);
+
 			if(!old_content) {
-				return [
-					ok = false,
-					error = "Could not read the file: " + args.path,
-				];
+				if(fs.size(file) > 0)
+					return agt_fail("'" + file + "' could not be read: nothing was changed.", "Check its permissions with a command.");
+
+				return agt_fail("File is empty: " + file, "There is nothing to replace in an empty file: write its content with write_file or append_text.");
 			}
 
-			if(old_content.empty()) {
-				return [
-					ok = false,
-					error = "File is empty: " + args.path,
-				];
-			}
-			
-			if(!args.target_text) {
-				return [
-					ok = false,
-					error = "Empty 'target_text' parameter.",
-				];
-			}
-			
-			if(!args.replacement_text)
-				args.replacement_text = ""; //Suppose the AI meant that?
-			
-			original = args.target_text.strip();
-			edit = args.replacement_text.strip();
-			
+			if(agt_is_binary(old_content))
+				return agt_fail("'" + file + "' is a binary file: nothing was changed.", "replace_string edits text files only.");
+
+			if(!args.has("target_text") || std.is_none(args.target_text) || std.string(args.target_text).strip() == "")
+				return agt_fail("Empty 'target_text': nothing was changed.", "Give the text to replace in 'target_text', copied from the file (mind the parameter names: path, target_text, replacement_text, replace_all).");
+
+			var original = std.string(args.target_text).strip();
+			var edit = (args.has("replacement_text") && !std.is_none(args.replacement_text)) ? std.string(args.replacement_text).strip() : "";
+
 			agt.report_back("original\n```\n" + original + "\n```\nedit\n```\n" + edit + "\n```\n");
 
-			if(original.empty()){
-				std.print(args);
-				std.print("\nNO_target_text");
+			var matches = agt_ws_matches(old_content, original);
+
+			if(!matches.count)
+				return agt_replace_not_found(file, old_content, original);
+
+			if(matches.count > 1 && !agt_flag(args.replace_all, true)) {
 				return [
 					ok = false,
-					error = "No 'target_text' argument given, make sure to use correct argument names.",
+					error = "target_text occurs " + std.string(matches.count) + " times in '" + file + "' and replace_all is \"false\": nothing was changed.",
+					occurrences = matches.count,
+					lines = matches.lines,
+					hint = "Add surrounding lines to target_text until it matches one place only, or set replace_all to \"true\" to change every occurrence.",
 				];
 			}
-			
-			if(args.replace_all == "false" && old_content.count(original) > 1)
-			{
-				std.print("\nMULTIPLE_CONTENTS");
-				return [
-					ok = false,
-					error = "replace_all was set to false but there are more than one occurences to replace in the target file.\nEmit a bigger piece of the target text to replace and make it less ambigious.",
-				];
-			}
-			
-			if(!old_content.contains_ignoring_whitespaces(original)) {
-				std.print("\nORIGINAL_NOT_FOUND");
-				return [
-					ok = false,
-					error = "The original text provided was not found in the file.\nMake sure to copy the target text you want to replace exactly as it is in the file, without any line numbers.",
-				];
-			}
-			
-			new_content = old_content.replace_ignoring_whitespace(original, edit);
-			
+
+			// keep the line endings of the file
+			if(old_content.contains("\r\n"))
+				edit = edit.replace("\r\n", "\n").replace("\n", "\r\n");
+
+			var new_content = old_content.replace_ignoring_whitespace(original, edit);
+
+			if(new_content == old_content)
+				return agt_fail("The replacement leaves '" + file + "' unchanged: replacement_text equals the text that is there.", "Nothing to do, or send the replacement you meant.");
+
+			var written = fs.write_text(file, new_content);
+
+			if(!written)
+				return agt_fail("Writing '" + file + "' failed: the file system refused it, the file is unchanged.", "Check the file with file_info (no permission, a full disk), then try again.");
+
 			agt._log_action("edit", [
-				path = args.path,
-				prev_content = fs.read_text(args.path),
+				path = file,
+				prev_content = old_content,
 				new_content = new_content,
 			]);
-			
-			fs.write_text(args.path, new_content);
-				
+
 			return [
 				ok = true,
 				status = "Edit was applied successfully.",
+				path = file,
+				replacements = matches.count,
+				lines = matches.lines,
 			];
 		}
 	);
-	
+
 	agt.add_tool(
 		"mkdir",
 		"FILE OPERATION - Create a directory",
@@ -697,146 +1921,204 @@ agt_add_write_tools(agt) {
 		],
 		[](agt, args)
 		{
-			if(args.path.starts("/")) {
-				return [
-					ok = false,
-					error = "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !",
-				];
+			var chk = agt_path_check(agt, args.path, "write");
+			if(!chk.ok)
+				return chk;
+
+			var dir = chk.path;
+			var fs = agt.filesystem;
+
+			if(fs.exists(dir)) {
+				if(fs.is_directory(dir))
+					return [ok = true, status = "The directory already exists.", path = dir];
+
+				return agt_fail("'" + dir + "' exists and is a file: no directory was created.", "Give another name for the directory.");
 			}
-			
-			fs = agt.filesystem;
-			
-			if(fs.mkdir(args.path)) {
-				
-				agt._log_action("mkdir", [
-					path = args.path,
-					existed_before = fs.exists(args.path),
-				]);
-				
-				return "Success";
-			}
-			
-			return "Failed to create directory.";
+
+			var blocker = agt_parent_blocker(fs, dir);
+			if(blocker)
+				return agt_fail("'" + blocker + "' is a file, so '" + dir + "' cannot be created below it.", "Give a path whose parents are directories.");
+
+			if(!fs.mkdir(dir))
+				return agt_fail("The directory '" + dir + "' could not be created: the file system refused it.", "Check the parent directory with list_dir (no permission, or an invalid name).");
+
+			agt._log_action("mkdir", [
+				path = dir,
+				existed_before = false,
+			]);
+
+			return [ok = true, status = "Directory created.", path = dir];
 		}
 	);
-		
+
 	agt.add_tool(
 		"move",
 		"FILE OPERATION - Move a file or directory.",
 		[
 			source = "&string(): Source path.",
 			destination = "&string(): Destination path.",
+			overwrite = "string(): OPTIONAL \"true\" replaces an existing destination file (refused otherwise)",
 		],
 		[](agt, args)
 		{
-			if(args.source.starts("/"))
-				return "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !";
-			
-			fs = agt.filesystem;
-			
-			if(fs.move(args.source, args.destination)) {
-				agt._log_action("move", [
-					source = args.source,
-					destination = args.destination,
-					existed_before = fs.exists(args.destination),
-				]);
-				
-				return "Success";
-			}
-			
-			return "Failed to move file.";
+			var plan = agt_transfer_check(agt, args, "move");
+			if(!plan.ok)
+				return plan;
+
+			var fs = agt.filesystem;
+
+			if(!fs.move(plan.src, plan.dst) || fs.exists(plan.src))
+				return agt_fail("Moving '" + plan.src + "' to '" + plan.dst + "' failed: the file system refused it.", "Check both paths with file_info (no permission, a file in use, a full disk).");
+
+			agt._log_action("move", [
+				source = plan.src,
+				destination = plan.dst,
+				src_path = plan.src,
+				dst_path = plan.dst,
+				existed_before = plan.replaced,
+			]);
+
+			return [ok = true, status = "Moved.", source = plan.src, destination = plan.dst, replaced_existing = plan.replaced];
 		}
 	);
-	
+
 	agt.add_tool(
 		"copy",
 		"FILE OPERATION - Copy a file or directory.",
 		[
 			source = "&string(): Source path.",
 			destination = "&string(): Destination path.",
+			overwrite = "string(): OPTIONAL \"true\" replaces an existing destination file (refused otherwise)",
 		],
 		[](agt, args)
 		{
-			if(args.source.starts("/"))
-				return "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !";
-			
-			fs = agt.filesystem;
-			
-			if(fs.copy(args.source, args.destination)) {
-				agt._log_action("copy", [
-					source = args.source,
-					destination = args.destination,
-					existed_before = fs.exists(args.destination),
-				]);
-				
-				return "Success";
-			}
-			
-			return "Failed to copy file.";
+			var plan = agt_transfer_check(agt, args, "copy");
+			if(!plan.ok)
+				return plan;
+
+			var fs = agt.filesystem;
+
+			if(!fs.copy(plan.src, plan.dst) || !fs.exists(plan.dst))
+				return agt_fail("Copying '" + plan.src + "' to '" + plan.dst + "' failed: the file system refused it.", "Check both paths with file_info (no permission, a full disk).");
+
+			agt._log_action("copy", [
+				source = plan.src,
+				destination = plan.dst,
+				src_path = plan.src,
+				dst_path = plan.dst,
+				existed_before = plan.replaced,
+			]);
+
+			return [ok = true, status = "Copied.", source = plan.src, destination = plan.dst, replaced_existing = plan.replaced];
 		}
 	);
-	
+
 	agt.add_tool(
 		"rename",
 		"FILE OPERATION - Rename a file or directory.",
 		[
 			source = "&string(): Source path.",
 			destination = "&string(): Destination path.",
+			overwrite = "string(): OPTIONAL \"true\" replaces an existing destination file (refused otherwise)",
 		],
 		[](agt, args)
 		{
-			if(args.source.starts("/"))
-				return "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !";
-			
-			fs = agt.filesystem;
-			
-			if(fs.rename(args.source, args.destination)) {
-				agt._log_action("rename", [
-					source = args.source,
-					destination = args.destination,
-				]);
-				
-				return "Success";
-			}
-			
-			return "Failed to rename file.";
+			var plan = agt_transfer_check(agt, args, "rename");
+			if(!plan.ok)
+				return plan;
+
+			var fs = agt.filesystem;
+
+			// rename() needs the parent directory of the new name, move() creates it
+			var renamed = fs.exists(agt_parent_dir(plan.dst)) ? fs.rename(plan.src, plan.dst) : fs.move(plan.src, plan.dst);
+
+			if(!renamed || fs.exists(plan.src))
+				return agt_fail("Renaming '" + plan.src + "' to '" + plan.dst + "' failed: the file system refused it.", "Check both paths with file_info (no permission, a file in use).");
+
+			agt._log_action("rename", [
+				source = plan.src,
+				destination = plan.dst,
+				src_path = plan.src,
+				dst_path = plan.dst,
+			]);
+
+			return [ok = true, status = "Renamed.", source = plan.src, destination = plan.dst, replaced_existing = plan.replaced];
 		}
 	);
-	
+
 	agt.add_tool(
 		"remove",
-		"FILE OPERATION - DANGEROUS Remove a file or directory. Only remove **one item at a time**",
+		"FILE OPERATION - DANGEROUS Remove a file or directory. Only remove **one item at a time**. The first call only asks for confirmation: repeat the same call to remove.",
 		[
 			path = "&string(): Source path.",
 		],
 		[](agt, args)
 		{
-			if(args.path.starts("/"))
-				return "Invalid path specified. Do not use '/path/to' instead use './path/to' ! Always provide paths from the current working directory './' !";
-			
-			if(agt.env.removal_protection != args.path) {
-				agt.env.removal_protection = args.path;
-				return "Removal protection: to confirm the removal of the file, call this tool one more time.";
-			}
-			
-			fs = agt.filesystem;
-			
-			if(!fs.exists(args.path)) {
-				return "Success";
+			var chk = agt_path_check(agt, args.path, "write");
+			if(!chk.ok)
+				return chk;
+
+			var item = chk.path;
+			var fs = agt.filesystem;
+
+			var plain = agt_lock_key(item);
+			if(plain == "." || plain == "")
+				return agt_fail("The working directory itself cannot be removed.", "Remove the items inside it one at a time.");
+
+			if(!fs.exists(item)) {
+				agt.env.removal_protection = "";
+				return agt_fail("'" + item + "' does not exist: nothing was removed.", "Check the name with list_dir on its directory. If it was meant to be gone, it already is.");
 			}
 
-			if(fs.remove(args.path)) {
-				if(!fs.is_directory(args.path)) {
-					agt._log_action("remove_file", [
-						path = args.path,
-						prev_content = fs.read_file(args.path),
-					]);
+			var is_dir = fs.is_directory(item);
+
+			if(agt.env.removal_protection != item) {
+				agt.env.removal_protection = item;
+
+				var what = "the file '" + item + "' (" + std.string(fs.size(item)) + " bytes)";
+
+				if(is_dir) {
+					var inside_files = fs.files(item, true);
+					var inside_dirs = fs.dirs(item, true);
+					what = "the directory '" + item + "' with everything in it (" + std.string(inside_files.size()) + " files, " + std.string(inside_dirs.size()) + " directories)";
 				}
-				
-				return "Success";
+
+				// no `error`: this is the expected first step, not a failed call (a result with
+				// ok = false and an error shows as a failed tool in the session view)
+				return [
+					ok = false,
+					removed = false,
+					confirmation_required = true,
+					message = "Removal protection: nothing was removed yet. This would remove " + what + ".",
+					hint = "To confirm, call remove again with the same path. To keep it, do nothing.",
+				];
 			}
-			
-			return "Failed to remove the item.";
+
+			agt.env.removal_protection = "";
+
+			// what the action log keeps of a removed text file
+			var prev_content = "";
+			if(!is_dir && fs.size(item) <= 1024 * 1024) {
+				// a restricted view may be allowed to remove a file it may not read
+				try {
+					prev_content = fs.read_text(item);
+				}
+				catch(e) {
+					prev_content = "";
+				}
+			}
+
+			if(!fs.remove(item) || fs.exists(item))
+				return agt_fail("'" + item + "' could not be removed: the file system refused it.", "Check it with file_info (no permission, a file in use by a running process).");
+
+			if(!is_dir) {
+				agt._log_action("remove_file", [
+					path = item,
+					prev_content = prev_content,
+				]);
+			}
+
+			return [ok = true, status = is_dir ? "Directory removed." : "File removed.", path = item];
 		}
 	);
 }
@@ -848,18 +2130,18 @@ agt_add_skill_tools(agt) {
 		None,
 		[](agt, args)
 		{
-			skills = agt.list_skills();
+			var skills = agt.list_skills();
 			if(!skills) {
 				return [
 					ok = 0,
 					error = "No skills available.",
 				];
 			}
-			
+
 			return skills;
 		}
 	);
-	
+
 	agt.add_tool(
 		"read_skill",
 		"Read a skill",
@@ -868,21 +2150,35 @@ agt_add_skill_tools(agt) {
 		],
 		[](agt, args)
 		{
-			md = agt.load_skill(args.name);
-			
+			var wanted = std.is_none(args.name) ? "" : std.string(args.name).strip();
+
+			if(!wanted)
+				return agt_fail("Missing 'name'.", "Give the name of a skill from list_skills.");
+
+			var md = agt.load_skill(wanted);
+
 			if(!md) {
+				var names = [];
+				var known = agt.list_skills();
+
+				for(var i = 0; i < known.size(); i++) {
+					names.push_back(known[i].name);
+				}
+
 				return [
 					ok = false,
-					error = "No skill with that name was found.",
+					error = "No skill named '" + wanted + "' was found.",
+					available_skills = names,
+					hint = "Use one of the available skill names exactly as listed.",
 				];
 			}
-			
+
 			return md;
 		}
 	);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Command Sessions
 //
 // Non-blocking process execution for agents (see cli_spec.md).
@@ -892,7 +2188,7 @@ agt_add_skill_tools(agt) {
 //
 // Sessions are stored in the shared global "command_sessions" registry so that
 // they survive across individual tool calls (and across the agent tree).
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // Bounded output buffer: cap how much console output is returned in a single
 // read so a long-running process cannot repeatedly inject its whole history.
@@ -984,48 +2280,79 @@ cmd_wait_for_output(proc, wait_ms, stop_check = None)
 	}
 }
 
-// Maximum amount of output cmd_wait_for_exit keeps buffered while it blocks.
+// Maximum amount of output cmd_wait_for_exit keeps buffered while it blocks:
+// the first cmd_collect_head_bytes (what was started) and the newest rest.
 cmd_max_collect_bytes = 200000;
+cmd_collect_head_bytes = 20000;
 
 // Hard ceiling for a timeout-less wait. A process that never exits must not be able to
 // block an agent indefinitely: the call returns the session still RUNNING and the agent
 // can simply wait again (output stays incremental, nothing is lost).
 cmd_max_wait_ms = 1800000;
 
+// The output cmd_wait_for_exit collected: the kept start, a note where output was
+// dropped, the newest part.
+cmd_join_collected(head, dropped, out)
+{
+	if(!dropped)
+		return head + out;
+
+	return head + "\n...[" + std.string(dropped) + " bytes of output dropped here: the process printed more than a wait keeps]...\n" + out;
+}
+
 // Block until the process exits, collecting everything it prints while waiting.
 // Unlike cmd_wait_for_output this does NOT return early when new output appears.
 // max_ms < 0 waits without a caller timeout (bounded by cmd_max_wait_ms).
 // stop_check is an OPTIONAL predicate: a stopped agent leaves the wait promptly,
 // the process itself is left running (the session stays registered and usable).
-// Returns [output, exited, exit_code, stopped].
+// Returns [output, exited, exit_code, stopped, dropped]: dropped is the number of
+// bytes a chatty process made the wait throw away (the output says where).
 cmd_wait_for_exit(proc, max_ms, stop_check = None)
 {
-	out = "";
-	keep = cmd_max_collect_bytes - 60;
+	var out = "";
+	var head = "";		// the start of the output, set aside when the buffer overflows
+	var dropped = 0;	// bytes dropped between head and out
+	var keep = cmd_max_collect_bytes - cmd_collect_head_bytes;
 
-	deadline = (max_ms < 0) ? std.millis() + cmd_max_wait_ms : std.millis() + max_ms;
+	var deadline = (max_ms < 0) ? std.millis() + cmd_max_wait_ms : std.millis() + max_ms;
 
 	for(1)
 	{
 		if(stop_check && std.is_function(stop_check) && stop_check())
-			return [output = out, exited = false, stopped = true];
+			return [output = cmd_join_collected(head, dropped, out), exited = false, stopped = true, dropped = dropped];
 
 		out += cmd_drain_output(proc);
 
-		// A chatty process must not grow the buffer without bound: drop the oldest output.
+		// A chatty process must not grow the buffer without bound. The start of the output
+		// stays (what was started) and the newest part stays (where it ended, the errors):
+		// the middle goes. (Only the newest part was kept before, the start was lost.)
 		if(out.size() > cmd_max_collect_bytes)
-			out = "...[older output discarded]..." + out.substr(out.size() - keep, keep);
+		{
+			if(!head)
+			{
+				var head_end = agt_utf8_floor(out, cmd_collect_head_bytes);
+				head = out.substr(0, head_end);
+				out = out.substr(head_end, out.size() - head_end);
+			}
 
-		st = proc.status();
+			if(out.size() > keep)
+			{
+				var cut = agt_utf8_ceil(out, out.size() - keep);
+				dropped += cut;
+				out = out.substr(cut, out.size() - cut);
+			}
+		}
+
+		var st = proc.status();
 
 		if(!st.running)
 		{
 			out += cmd_drain_output(proc);
-			return [output = out, exited = true, exit_code = cmd_exit_code(proc, st)];
+			return [output = cmd_join_collected(head, dropped, out), exited = true, exit_code = cmd_exit_code(proc, st), dropped = dropped];
 		}
 
 		if(std.millis() >= deadline)
-			return [output = out, exited = false];
+			return [output = cmd_join_collected(head, dropped, out), exited = false, dropped = dropped];
 
 		std.sleep(25);
 	}
@@ -1042,18 +2369,45 @@ cmd_wait_for_process(proc, wait_ms, stop_check = None)
 	return cmd_wait_for_output(proc, wait_ms, stop_check);
 }
 
-cmd_format_result(out)
+// Bounds the output of one tool result: the head and the tail of an over-long
+// output are kept (errors are usually at the end; only the head was kept before)
+// and the result says how many bytes were dropped. dropped_before: bytes the wait
+// itself already dropped. Returns [out, truncated, dropped_bytes, total_bytes].
+cmd_format_result(out, dropped_before = 0)
 {
-	truncated = false;
+	return agt_clip_middle(std.is_none(out) ? "" : std.string(out), cmd_max_output_bytes, "output", dropped_before);
+}
 
-	if(out.size() > cmd_max_output_bytes)
-	{
-		keep = cmd_max_output_bytes - 40;
-		out = out.substr(0, keep) + "\n...[output truncated]...";
-		truncated = true;
+// Puts the (possibly cut) console output into a tool result.
+cmd_put_output(result, fmt)
+{
+	result.output = fmt.out;
+	result.truncated = fmt.truncated;
+
+	if(fmt.truncated) {
+		result.dropped_bytes = fmt.dropped_bytes;
+		result.total_output_bytes = fmt.total_bytes;
+		result.truncation_note = "The output was too long: its head and its tail are shown, " + std.string(fmt.dropped_bytes) + " bytes in between were dropped. To get all of it, run the command with its output sent to a file (command > out.log 2>&1) and read that file in parts.";
 	}
 
-	return [out = out, truncated = truncated];
+	return result;
+}
+
+// The answer for a session id nobody knows.
+cmd_no_session(store, key)
+{
+	var active = [];
+
+	for(var i = 0; i < store.sessions.size(); i++) {
+		active.push_back(std.int(store.sessions.key(i)));
+	}
+
+	return [
+		ok = false,
+		error = "No active command session with session_id " + key + ". The session may have already exited.",
+		active_sessions = active,
+		hint = active.size() ? "Use one of the active session ids, or start the command again with command_start." : "There is no active session: start the command again with command_start.",
+	];
 }
 
 // Interpreter used when a command is executed from a script file.
@@ -1147,6 +2501,81 @@ cmd_session_cleanup(store, key)
 	return true;
 }
 
+// Runs one command to its end and returns its exit code and output (head and tail
+// kept, at most max_output_bytes). No session is left behind: a command that is
+// still running after timeout_ms is killed, and its stdin is closed from the start
+// (it cannot wait for input). For an agent that may run one fixed command but gets
+// no shell of its own (run_tests of the blind test writer).
+cmd_run_to_end(agt, command, cwd, timeout_ms, max_output_bytes = 0)
+{
+	var store = cmd_sessions_store();
+
+	var session_id = store.next_id;
+	store.next_id++;
+
+	if(!fileio.exists(cwd) || !fileio.is_directory(cwd))
+		return agt_fail("The working directory '" + std.string(cwd) + "' of the command does not exist.");
+
+	var launch = cmd_prepare_command(session_id, command, cwd, "auto");
+
+	var proc = subprocess.process();
+
+	proc.terminate_on_destroy(true);
+	proc.pipes(true, true, true);
+	proc.start(launch.argv, cwd, launch.shell);
+
+	if(!proc.status().started)
+	{
+		if(launch.script)
+			fileio.remove(launch.script);
+
+		return agt_fail("The command could not be started: " + agt_cut_text(launch.label, 300));
+	}
+
+	proc.close_stdin();
+
+	var started_ms = std.millis();
+	var res = cmd_wait_for_exit(proc, timeout_ms, [agt]() { return agt.should_stop(); });
+
+	var timed_out = false;
+
+	if(!res.exited)
+	{
+		// stopped or out of time: nothing may keep running without a session
+		timed_out = !(res.stopped ?? false);
+		proc.kill();
+
+		var kill_deadline = std.millis() + 3000;
+
+		for(std.millis() < kill_deadline && proc.status().running) {
+			std.sleep(20);
+		}
+
+		res.output += cmd_drain_output(proc);
+	}
+
+	if(launch.script)
+		fileio.remove(launch.script);
+
+	var limit = max_output_bytes > 0 ? max_output_bytes : cmd_max_output_bytes;
+	var fmt = agt_clip_middle(std.string(res.output ?? ""), limit, "output", res.dropped ?? 0);
+
+	var result = [
+		ok = res.exited ? true : false,
+		state = res.exited ? "EXITED" : "KILLED",
+		waited_ms = std.millis() - started_ms,
+	];
+
+	if(res.exited)
+		result.exit_code = res.exit_code;
+	else if(timed_out)
+		result.error = "The command did not finish within " + std.string(timeout_ms) + " ms and was killed.";
+	else
+		result.error = "The agent was stopped; the command was killed.";
+
+	return cmd_put_output(result, fmt);
+}
+
 agt_add_command_tools(agt)
 {
 	agt.add_tool(
@@ -1160,19 +2589,29 @@ agt_add_command_tools(agt)
 		],
 		[](agt, args)
 		{
-			store = cmd_sessions_store();
+			var store = cmd_sessions_store();
 
-			cwd = args.cwd ?? ".";
+			var command = (args.has("command") && !std.is_none(args.command)) ? std.string(args.command) : "";
+
+			if(!command.strip())
+				return agt_fail("Missing 'command': nothing was started.", "Give the command line (or a multi-line script) in 'command'.");
+
+			var cwd = std.string(args.cwd ?? ".");
+
+			// A missing working directory is the usual reason a start fails, and the process
+			// module only logs it: say it here.
+			if(!fileio.exists(cwd) || !fileio.is_directory(cwd))
+				return agt_fail("The working directory (cwd) '" + cwd + "' does not exist or is not a directory: nothing was started.", "Give an existing directory, or leave cwd out to run in the working directory.");
 
 			// The id is reserved up front because a multi-line command is stored in a
 			// script file named after the session.
-			session_id = store.next_id;
+			var session_id = store.next_id;
 			store.next_id++;
-			key = std.string(session_id);
+			var key = std.string(session_id);
 
-			launch = cmd_prepare_command(session_id, args.command, cwd, args.script_type ?? "auto");
+			var launch = cmd_prepare_command(session_id, command, cwd, args.script_type ?? "auto");
 
-			proc = subprocess.process();
+			var proc = subprocess.process();
 
 			proc.terminate_on_destroy(true);
 
@@ -1186,13 +2625,15 @@ agt_add_command_tools(agt)
 				if(launch.script)
 					fileio.remove(launch.script);
 
-				return [
-					ok = false,
-					error = "Failed to start command: " + args.command,
-				];
+				return agt_fail(
+					"The command could not be started: " + agt_cut_text(launch.label, 300),
+					launch.shell
+						? "No shell could be started for it. Check that the working directory is readable."
+						: "The program '" + std.string(launch.argv[0]) + "' was not found or cannot be executed. Check its name and the PATH (the interpreter of a script may have another name here, e.g. python3 instead of python: run it as a single-line command instead)."
+				);
 			}
 
-			wait_ms = args.timeout ?? 0;
+			var wait_ms = std.int(args.timeout ?? 0);
 
 			//Always give the process a little bit time to settle
 			if(wait_ms == 0)
@@ -1200,21 +2641,19 @@ agt_add_command_tools(agt)
 
 			//A stopped agent must not block in a command wait: the process keeps
 			//running, the session stays registered, only the wait ends.
-			res = cmd_wait_for_process(proc, wait_ms, [agt]() { return agt.should_stop(); });
-			fmt = cmd_format_result(res.output);
+			var res = cmd_wait_for_process(proc, wait_ms, [agt]() { return agt.should_stop(); });
+			var fmt = cmd_format_result(res.output, res.dropped ?? 0);
 
 			if(res.exited)
 			{
 				if(launch.script)
 					fileio.remove(launch.script);
 
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "EXITED",
 					exit_code = res.exit_code,
-					output = fmt.out,
-					truncated = fmt.truncated,
-				];
+				], fmt);
 			}
 
 			// Still running: register the session and hand out its id.
@@ -1227,17 +2666,15 @@ agt_add_command_tools(agt)
 				script = launch.script,
 			];
 
-			return [
+			return cmd_put_output([
 				ok = true,
 				state = "RUNNING",
 				session_id = session_id,
-				output = fmt.out,
-				truncated = fmt.truncated,
 				stopped = (res.stopped ?? false),
 				note = (res.stopped ?? false)
 					? "The agent was stopped, so the wait ended early. The process was NOT terminated; the session is still registered under this id."
 					: "Process is still running. Use command_read/command_input with this session_id. Do not restart it.",
-			];
+			], fmt);
 		}
 	);
 
@@ -1250,45 +2687,36 @@ agt_add_command_tools(agt)
 		],
 		[](agt, args)
 		{
-			store = cmd_sessions_store();
-			key = std.string(args.session_id);
+			var store = cmd_sessions_store();
+			var key = std.string(args.session_id);
 
 			if(!store.sessions.has(key))
-			{
-				return [
-					ok = false,
-					error = "No active command session with session_id " + key + ". The session may have already exited.",
-				];
-			}
+				return cmd_no_session(store, key);
 
-			proc = store.sessions[key];
+			var proc = store.sessions[key];
 
-			wait_ms = (args.timeout ?? false) ? args.timeout : 0;
+			var wait_ms = (args.timeout ?? false) ? std.int(args.timeout) : 0;
 
-			res = cmd_wait_for_output(proc, wait_ms, [agt]() { return agt.should_stop(); });
-			fmt = cmd_format_result(res.output);
+			var res = cmd_wait_for_output(proc, wait_ms, [agt]() { return agt.should_stop(); });
+			var fmt = cmd_format_result(res.output);
 
 			if(res.exited)
 			{
 				cmd_session_cleanup(store, key);
 
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "EXITED",
 					exit_code = res.exit_code,
-					output = fmt.out,
-					truncated = fmt.truncated,
-				];
+				], fmt);
 			}
 
-			return [
+			return cmd_put_output([
 				ok = true,
 				state = "RUNNING",
 				session_id = args.session_id,
-				output = fmt.out,
-				truncated = fmt.truncated,
 				stopped = (res.stopped ?? false),
-			];
+			], fmt);
 		}
 	);
 
@@ -1301,78 +2729,63 @@ agt_add_command_tools(agt)
 		],
 		[](agt, args)
 		{
-			store = cmd_sessions_store();
-			key = std.string(args.session_id);
+			var store = cmd_sessions_store();
+			var key = std.string(args.session_id);
 
 			if(!store.sessions.has(key))
-			{
-				return [
-					ok = false,
-					error = "No active command session with session_id " + key + ". The session may have already exited.",
-				];
-			}
+				return cmd_no_session(store, key);
 
-			proc = store.sessions[key];
+			var proc = store.sessions[key];
 
-			st = proc.status();
+			var st = proc.status();
 
 			// Already finished: report the final state instead of blocking.
 			if(!st.running)
 			{
-				res = [
-					output = cmd_drain_output(proc),
-					exited = true,
-					exit_code = cmd_exit_code(proc, st),
-				];
-				fmt = cmd_format_result(res.output);
+				var done_fmt = cmd_format_result(cmd_drain_output(proc));
+				var done_code = cmd_exit_code(proc, st);
 				cmd_session_cleanup(store, key);
 
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "EXITED",
 					session_id = args.session_id,
-					exit_code = res.exit_code,
-					output = fmt.out,
-					truncated = fmt.truncated,
+					exit_code = done_code,
 					note = "The process had already exited before the wait request.",
-				];
+				], done_fmt);
 			}
 
-			wait_ms = (args.timeout ?? false) ? args.timeout : -1;
+			var wait_ms = (args.timeout ?? false) ? std.int(args.timeout) : -1;
 
-			started_ms = std.millis();
+			var started_ms = std.millis();
 
-			res = cmd_wait_for_exit(proc, wait_ms, [agt]() { return agt.should_stop(); });
-			fmt = cmd_format_result(res.output);
+			var res = cmd_wait_for_exit(proc, wait_ms, [agt]() { return agt.should_stop(); });
+			var fmt = cmd_format_result(res.output, res.dropped ?? 0);
 
 			if(res.exited)
 			{
 				cmd_session_cleanup(store, key);
 
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "EXITED",
 					session_id = args.session_id,
 					exit_code = res.exit_code,
 					waited_ms = std.millis() - started_ms,
-					output = fmt.out,
-					truncated = fmt.truncated,
-				];
+				], fmt);
 			}
 
 			// Timeout elapsed: the session stays alive and usable.
-			return [
+			return cmd_put_output([
 				ok = true,
 				state = "RUNNING",
 				session_id = args.session_id,
 				waited_ms = std.millis() - started_ms,
-				output = fmt.out,
-				truncated = fmt.truncated,
 				stopped = (res.stopped ?? false),
 				note = (res.stopped ?? false)
 					? "The agent was stopped, so the wait ended early. The process was NOT terminated; the session is still registered under this id."
 					: "The process is still running after the wait timeout. It was not terminated; call command_wait again or use command_read.",
-			];
+			], fmt);
 		}
 	);
 
@@ -1387,52 +2800,53 @@ agt_add_command_tools(agt)
 		],
 		[](agt, args)
 		{
-			store = cmd_sessions_store();
-			key = std.string(args.session_id);
+			var store = cmd_sessions_store();
+			var key = std.string(args.session_id);
 
 			if(!store.sessions.has(key))
-			{
-				return [
-					ok = false,
-					error = "No active command session with session_id " + key + ". The session may have already exited.",
-				];
-			}
+				return cmd_no_session(store, key);
 
-			proc = store.sessions[key];
+			var proc = store.sessions[key];
 
-			st = proc.status();
+			var st = proc.status();
 
 			if(!st.running)
 			{
+				// what the process still printed is not lost with the session
+				var last_fmt = cmd_format_result(cmd_drain_output(proc));
+				var last_code = cmd_exit_code(proc, st, "unknown");
 				cmd_session_cleanup(store, key);
-				return [
+
+				return cmd_put_output([
 					ok = false,
-					error = "The process for this session has already exited.",
-				];
+					error = "The process of this session has already exited (exit code " + std.string(last_code) + "): the input was not sent.",
+					state = "EXITED",
+					exit_code = last_code,
+					hint = "The session is closed. Start the command again with command_start if it should run once more.",
+				], last_fmt);
 			}
-			
-			if(args.send_newline)
-				args.input += "\n";
-			
-			written = proc.write(args.input);
+
+			var input = (args.has("input") && !std.is_none(args.input)) ? std.string(args.input) : "";
+
+			if(args.send_newline ?? false)
+				input += "\n";
+
+			var written = proc.write(input);
 
 			if(written == None)
 			{
-				return [
-					ok = false,
-					error = "Failed to write to the stdin of the session.",
-				];
+				return agt_fail(
+					"Writing to the stdin of the session failed: the input was not sent.",
+					st.stdin_open ? "The process may have closed its input. Read its output with command_read." : "The stdin of this session is closed (close_stdin was sent before): it takes no more input."
+				);
 			}
 
-			close_stdin = (args.close_stdin ?? false) ? true : false;
+			var close_stdin = (args.close_stdin ?? false) ? true : false;
 
 			if(close_stdin)
 			{
 				if(!st.stdin_open)
-					return [
-						ok = false,
-						error = "This session has no open stdin pipe to close.",
-					];
+					return agt_fail("This session has no open stdin pipe to close.", "The input was written, the pipe was already closed.");
 
 				proc.close_stdin();
 			}
@@ -1456,39 +2870,35 @@ agt_add_command_tools(agt)
 		],
 		[](agt, args)
 		{
-			store = cmd_sessions_store();
-			key = std.string(args.session_id);
+			var store = cmd_sessions_store();
+			var key = std.string(args.session_id);
 
 			if(!store.sessions.has(key))
-			{
-				return [
-					ok = false,
-					error = "No active command session with session_id " + key + ". The session may have already exited.",
-				];
-			}
+				return cmd_no_session(store, key);
 
-			proc = store.sessions[key];
+			var proc = store.sessions[key];
 
-			st = proc.status();
+			var st = proc.status();
 
 			if(!st.running)
 			{
-				rc = cmd_exit_code(proc, st, "unknown");
+				var rc = cmd_exit_code(proc, st, "unknown");
+				var gone_fmt = cmd_format_result(cmd_drain_output(proc));
 
 				cmd_session_cleanup(store, key);
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "ALREADY_EXITED",
 					session_id = args.session_id,
 					exit_code = rc,
 					note = "The process had already exited before the kill request.",
-				];
+				], gone_fmt);
 			}
 
-			mode = args.mode ?? "graceful";
-			wait = (args.wait_ms ?? false) ? args.wait_ms : 3000;
+			var mode = args.mode ?? "graceful";
+			var wait = (args.wait_ms ?? false) ? std.int(args.wait_ms) : 3000;
 
-			pid = proc.pid();
+			var pid = proc.pid();
 
 			// Send the appropriate signal
 			if(mode == "force")
@@ -1497,9 +2907,9 @@ agt_add_command_tools(agt)
 				proc.terminate();
 
 			// Wait briefly for the process to acknowledge the signal
-			exited = false;
-			exit_code = None;
-			deadline = std.millis() + wait;
+			var exited = false;
+			var exit_code = None;
+			var deadline = std.millis() + wait;
 
 			for(std.millis() < deadline)
 			{
@@ -1533,34 +2943,31 @@ agt_add_command_tools(agt)
 			}
 
 			// Drain any remaining output
-			remaining_output = cmd_drain_output(proc);
-			fmt = cmd_format_result(remaining_output);
+			var fmt = cmd_format_result(cmd_drain_output(proc));
 
 			cmd_session_cleanup(store, key);
 
 			if(exited)
 			{
-				return [
+				return cmd_put_output([
 					ok = true,
 					state = "KILLED",
 					session_id = args.session_id,
 					pid = pid,
 					mode_used = mode,
 					exit_code = exit_code,
-					output = fmt.out,
-					truncated = fmt.truncated,
-				];
+				], fmt);
 			}
 
-			return [
+			return cmd_put_output([
 				ok = false,
 				state = "STILL_RUNNING",
 				session_id = args.session_id,
 				pid = pid,
 				mode_used = mode,
-				output = fmt.out,
-				error = "The process did not exit within the specified wait time even after kill.",
-			];
+				error = "The process " + std.string(pid) + " did not exit within the wait time, even after a forced kill. The session was removed from the registry.",
+				hint = "End the process by its pid with a command (kill -9 " + std.string(pid) + ", taskkill /F /PID " + std.string(pid) + ").",
+			], fmt);
 		}
 	);
 
@@ -1584,13 +2991,13 @@ agt_add_command_tools(agt)
 
 				if(!st.running)
 				{
-					// Session has exited — drain remaining output and prune
+					// Session has exited â€” drain remaining output and prune
 					cmd_drain_output(proc);
 					pruned_keys.push_back(key);
 				}
 				else
 				{
-					// Still running — collect remaining output
+					// Still running â€” collect remaining output
 					pending_out = cmd_drain_output(proc);
 
 					entry = [
@@ -1638,7 +3045,7 @@ agt_add_command_tools(agt)
 	);
 }
 
-// ── send_file: a document for the owner's chat ───────────────────────────────
+// â”€â”€ send_file: a document for the owner's chat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The node (Megamind) of an agent tree: the agent itself or one of its parents has
 // env.mind (the receptionist and the worker task get it, subagents find it here).
 SHARE_FILE_MAX = 20 * 1024 * 1024;   // Telegram bots can upload 50 MB, the event travels over ShizoNet
@@ -1664,20 +3071,26 @@ agt_add_share_tools(agt) {
 		],
 		[](agt, args)
 		{
-			path = std.string(args.path ?? "");
+			var file = std.string(args.path ?? "").strip();
 
-			if(!path || !fileio.exists(path))
-				return [ok = false, error = "file not found: " + path];
+			if(!file)
+				return agt_fail("Missing 'path': nothing was sent.", "Give the path of the file to send.");
 
-			size = fileio.size(path);
-			if(size > SHARE_FILE_MAX)
-				return [ok = false, error = "the file has " + std.string(size) + " bytes, at most " + std.string(SHARE_FILE_MAX) + " can be sent"];
+			if(!fileio.exists(file))
+				return agt_fail("file not found: " + file, "Write the file first (write_file) or check its name with list_dir, then send it.");
 
-			mind = agt_find_mind(agt);
+			if(fileio.is_directory(file))
+				return agt_fail("'" + file + "' is a directory: only a single file can be sent.", "Pack the directory into an archive with a command and send that file.");
+
+			var bytes = fileio.size(file);
+			if(bytes > SHARE_FILE_MAX)
+				return agt_fail("the file has " + std.string(bytes) + " bytes, at most " + std.string(SHARE_FILE_MAX) + " can be sent", "Send a smaller file: a summary, a part of it or a compressed archive.");
+
+			var mind = agt_find_mind(agt);
 			if(!mind)
-				return [ok = false, error = "this agent does not run on a node, there is no chat to send the file to"];
+				return agt_fail("this agent does not run on a node, there is no chat to send the file to", "Name the path of the file in your finalize result instead.");
 
-			return mind.share_file(path, std.string(args.caption ?? ""));
+			return mind.share_file(file, std.string(args.caption ?? ""));
 		}
 	);
 }

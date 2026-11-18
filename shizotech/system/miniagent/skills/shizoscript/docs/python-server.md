@@ -320,6 +320,12 @@ run; 0 when the environment was found built), `problems`, `note`, `command`. A c
 `requirements.txt` (checked with the script once a second) restarts the generator, which then gets the environment
 of the new set.
 
+**Not only generators.** The STEP import of the stage (#980) uses the same machinery for a script of the engine:
+`_shizoengine3/engine/stage/step_import.py/` is laid out like an asset (`asset.json` with `python.dependencies`
+`cadquery-ocp`, `src/__init__.py`), so `pyenv_for_script()` makes its environment and `PythonServer` runs it; the
+loop that polls the build and calls the server runs on a `std.thread` (`engine/stage/stage_step.shio`). Its test,
+`_testing/stage_step.shio`, prints SKIP while that environment is not built (`--install` builds it, about 170 MB).
+
 `python` of `configs/python.json` stays the override: it wins for every asset, uv is not used (e.g. a conda Python
 with CUDA packages installed by hand).
 

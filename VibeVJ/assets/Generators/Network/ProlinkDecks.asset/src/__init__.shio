@@ -1,9 +1,18 @@
 // ProlinkDecks generator
-// Deck view of the CDJs like ShowKontrol: per deck title, artist, time, BPM and the preview waveform
-// of the whole track, below them the scrolling detail waveforms with beat grid, cues, loops and the
-// phrases of rekordbox (Intro, Break, Buildup, Drop, Outro ... as a colored band at the bottom, if the track was
-// analysed; a rising stretch at the end of a break before a drop is detected from the waveform as Buildup).
-// Settings: DECKS (AUTO = one lane per CDJ that is there, or 1-4 fixed), LAYOUT (panels + lanes, or
+// Deck view of the CDJs like ShowKontrol and the CDJ-3000, drawn in the Shizo UI: per deck a panel with the player
+// number, artwork, title, artist, the BPM (in a light box on the tempo master), tempo, time (big, with the tenths
+// smaller), Master / Send BPM / Sync / MT / key chips, the player model and the preview waveform of the whole track,
+// below them the scrolling detail waveforms with beat grid, cues, loops and the phrases of rekordbox (Intro, Break,
+// Buildup, Drop, Outro ... as a colored band at the bottom, if the track was analysed; a rising stretch at the end of a
+// break before a drop is detected from the waveform as Buildup). The part already played is drawn at half brightness,
+// in the lanes and the previews.
+// A live deck (heard in the room) gets a ring in the Shizo `live` colour around its panel and lane and a chamfered "Live"
+// badge, like a playing clip in the Clipview. Live = the channel is open on the DJM (On Air) when a mixer is on the
+// network (several decks while a mix runs); without a mixer nothing tells it, so then the playing tempo master is live,
+// or the only deck that plays (compute_live()). MT chip: key lock (master tempo) where the player reports it (keyLock,
+// Denon players; Pioneer players do not send it).
+// Settings: DECKS (AUTO = one lane per player that is there, up to 6, or 1-6 fixed; five and six decks put the panels in
+// two rows of three), LAYOUT (panels + lanes, or
 // compact lanes with the infos in each lane), PLAYHEAD (how much of the past is visible), OVERVIEW
 // (whole track as a bar in each lane), TEXT SIZE, OUTPUT (16:9, wider, a strip, Custom = OUTPUT WIDTH x OUTPUT HEIGHT, or
 // Fit window = the shape of the generator window), ZOOM (seconds across the lanes at 1920 px width; wider outputs show more
@@ -15,7 +24,10 @@
 // The view is a routable video output (OUT), and every deck has controls for effects:
 // BPM, BEAT, LOW / MID / HIGH (bass, mids, highs of the waveform at the playhead), PROGRESS,
 // CUE RAMP, PLAYING, ON AIR, PHRASE RAMP (0 at the start of the current phrase .. 1 at its end),
-// BUILDUP (0 .. 1 through a buildup, 0 otherwise) and DROP (1 while a drop plays).
+// BUILDUP (0 .. 1 through a buildup, 0 otherwise) and DROP (1 while a drop plays); sections Deck 1 .. Deck 6. From the
+// DJ mixer FADER, VU and EQ LOW / MID / HIGH of the deck's channel (Pioneer DJM with Mixer data on, Denon mixers:
+// fader). With a mixer that sends its faders, a thin bar at the left edge of each lane shows the channel fader; a deck
+// that seems to play on another channel than its own gets a "Channel n?" hint (prolink device.mixer().hint).
 //
 // Reads DJ Watch (the ESP32 in the DJ network, firmware repo prolink-bridge) through the native module 'prolink'
 // (shzmodule_prolink). It shares the connection with the ProlinkBridge generator when both use the same SOURCE / PORT.
@@ -60,6 +72,14 @@ style_ctrl = None;
 history_ctrl = None;
 history_open_ctrl = None;
 time_ctrl = None;
+mixer_data = None;     // settings: DJM mixer data (bridge identity), enhanced on air, its hold time (as in ProlinkBridge)
+enhanced = None;
+live_hold = None;
+mixer_section = [];
+sent_mixer = -1;       // value last sent to the session, -1 = nothing yet (sent only when on, or after a change)
+sent_enhanced = -1;
+sent_hold = -1.0;
+mixer_info = None;     // device.mixer() of this frame
 
 // Shizo UI tokens (design/tokens.json, version 0.3.0) for the chrome of the view: texts, badges, separators. The same
 // values as UI_* in decks.glsl. The content (waveforms, beat grid, cues, loops, phrases) keeps the colours of the STYLE.
@@ -72,8 +92,9 @@ UI_TEXT = vec4f(237 / 255.0, 237 / 255.0, 237 / 255.0, 1);   // text: titles, va
 UI_TEXT_2 = vec4f(155 / 255.0, 155 / 255.0, 160 / 255.0, 1); // text_2: artist, pitch, labels
 UI_TEXT_3 = vec4f(94 / 255.0, 94 / 255.0, 99 / 255.0, 1);    // text_3: hints, a stopped deck
 UI_LINE_STRONG = vec4f(1, 1, 1, 0.12);                        // line_strong: separators
-UI_ON = vec4f(63 / 255.0, 207 / 255.0, 142 / 255.0, 1);      // on / live: a playing deck, the On air badge
-UI_ON_INK = vec4f(6 / 255.0, 33 / 255.0, 15 / 255.0, 1);     // on_ink: text on an `on` fill
+UI_ON = vec4f(63 / 255.0, 207 / 255.0, 142 / 255.0, 1);      // on: the play sign of a playing deck
+UI_LIVE = vec4f(63 / 255.0, 207 / 255.0, 142 / 255.0, 1);    // live (= on): ring and Live badge of a live deck
+UI_ON_INK = vec4f(6 / 255.0, 33 / 255.0, 15 / 255.0, 1);     // on_ink: text on an `on` / `live` fill
 UI_CUE = vec4f(240 / 255.0, 180 / 255.0, 76 / 255.0, 1);     // cue: comes next (the memory cue in the last 16 beats)
 UI_ACCENT = vec3f(157 / 255.0, 133 / 255.0, 255 / 255.0);    // accent default; the VibeVJ style reads the theme's
 UI_RADIUS_FIELD = 2;    // radius.field (px at 1080 lines): beat squares
@@ -88,18 +109,36 @@ accent3 = UI_ACCENT;    // VibeVJ accent (theme), read every few seconds
 accent_frames = 0;
 theme_widget = None;
 
-// History of played tracks (prolink module, 30 s audible = played)
+// History of played tracks (prolink module: a track counts when it is now playing, or with the rule "Audible 30 s" once it
+// was heard for 30 s; History rule / Now playing / Write playlist set device.history_options())
 hist_items = [];      // oldest first: time, n, title, artist, bpm, key ...
 hist_count = -1;      // device.history_count() when hist_items was fetched
 hist_labels = [];     // the last tracks in the generator window
 hist_info = None;
 HIST_LABELS = 8;
+hist_rule_ctrl = None;  // HISTORY RULE: 0 = now playing, 1 = audible 30 s (index-based)
+np_mode_ctrl = None;    // NOW PLAYING MODE: 0 smart, 1 waits for silence, 2 follows master (index-based)
+playlist_ctrl = None;   // WRITE PLAYLIST
+hist_opts_sent = "";
+HIST_RULES = ["nowplaying", "audible"];
+NP_MODES = ["smart", "silence", "master"];
 hist_open = 1.0;      // 0 = folded to the tab, 1 = open; follows HISTORY OPEN smoothly
 hist_rect = [x = 0.0, y = 0.0, w = 0.0, h = 0.0];  // history column in output pixels (clicks into the view)
 
 // Current layout, computed in update() and used by the shader uniforms and the text overlay alike
-lane_decks = [0, 1, 2, 3];  // deck index (0..3) per lane, -1 = none
+NDECKS = 6;                 // players 1-6 (Pro DJ Link numbers them 1-6; StageLinQ decks 1-4)
+lane_decks = [0, 1, 2, 3, -1, -1];  // deck index (0..5) per lane, -1 = none
 nlanes = 4;
+live_decks = [false, false, false, false, false, false]; // live_of(): heard in the room (ring + Live badge)
+
+// Artwork: device.artwork(n) gives the JPEG of the loaded track. A worker thread writes it to the cache folder, the next
+// frame loads it into the hidden image of the deck (a shader input). The overlay lays out where it goes (art_rects, in
+// output pixels; the shader draws it there one frame later) and draws an empty square while a track has none.
+art_images = [];
+art_ready = [];       // per deck: [path, tid] of a written file waiting to be loaded, or None
+art_dir = "";
+art_serial = 0;       // the files alternate, so a file is never rewritten while the texture reads it
+art_rects = [];
 L = [top = 0.0, info_w = 0.0, right_w = 0.0, pbar = 0.0, scale = 1.0, compact = false, hist_w = 0.0, hist_full = 0.0,
 	u = 1.0, pad_w = 0.0, span = 8.0, head = 0.42];  // u: design scale (design_scale()), pad_w: outer margin,
 	// span: seconds across a lane, head: text part of a panel
@@ -147,6 +186,8 @@ GAP = 0.012;
 PAD = 0.006;
 HEAD = 0.42;            // text part of a panel (fraction of its height; more in flat strips: L.head)
 PANELS_TOP = 0.30;      // height of the panel row
+PANELS_TWO_ROWS = 1.4;  // two rows of panels (five, six decks): the panel area is this much higher
+HEAD_TWO_ROWS = 0.52;   // and the text part takes more of each panel
 PANEL_HEAD_MIN = 70;    // the text part of a panel gets at least this many output pixels (three rows in flat strips)
 PANELS_LEFT = 0.045;    // lane margin left in the panel layout (deck number)
 PANELS_RIGHT = 0.06;    // lane margin right in the panel layout (BPM, pitch)
@@ -192,6 +233,7 @@ ICON_HISTORY = 61914;   // FA_HISTORY 0xf1da: fold / unfold the history column
 ALIGN_LEFT_MIDDLE = 17;
 ALIGN_CENTER_MIDDLE = 18;
 ALIGN_RIGHT_MIDDLE = 20;
+ALIGN_RIGHT_BASELINE = 68;
 
 dispatcher(generator, cmd, value) {
 	if(cmd == "active") {
@@ -217,6 +259,9 @@ open_device() {
 	listen_only.visible(connection_ui && open_source == SOURCE_LAN);
 
 	device.close();
+	sent_mixer = -1;
+	sent_enhanced = -1;
+	sent_hold = -1.0;
 	// New source: its revisions start at 0 again, so upload every texture anew
 	for(d = 0; d < revs.size(); d++)
 		revs[d] = -1;
@@ -234,6 +279,39 @@ source_changed() {
 	if(source.value() != open_source || port_text.value() != open_port)
 		return true;
 	return card_text.value() != open_card || listen_only.value() != open_listen_only;
+}
+
+// Mixer settings into the session, as in ProlinkBridge: the first time only what is on (another generator on the same
+// connection may have switched it on). Mixer data only for the source Network card, never Listen only.
+apply_mixer_settings() {
+	if(!device.connected() || !connection_ui)
+		return None;
+	want = 0;
+	if(open_source == SOURCE_LAN && !open_listen_only && mixer_data.value())
+		want = 1;
+	if(open_source == SOURCE_LAN && want != sent_mixer && (sent_mixer >= 0 || want)) {
+		device.mixer_bridge(want != 0);
+		sent_mixer = want;
+	}
+	else if(sent_mixer < 0)
+		sent_mixer = want;
+	on = enhanced.value() ? 1 : 0;
+	hold = live_hold.value();
+	if((on != sent_enhanced || hold != sent_hold) && (sent_enhanced >= 0 || on)) {
+		device.enhanced_on_air(on != 0, hold);
+		sent_enhanced = on;
+		sent_hold = hold;
+	}
+	else if(sent_enhanced < 0) {
+		sent_enhanced = on;
+		sent_hold = hold;
+	}
+}
+
+value_or_zero(v) {
+	if(std.is_none(v))
+		return 0.0;
+	return v;
 }
 
 // Denon units (StageLinQ) with a running connection, from the "sl" status of the Denon listener of the session
@@ -266,6 +344,11 @@ lan_status() {
 		return "Network card " + card + ": no CDJs or Denon players yet";
 	if(open_listen_only)
 		return "Network card " + card + " (listen only)";
+	if(mixer_info && mixer_info.hint)
+		return mixer_info.hint.msg;
+	bridge = esp.djm;
+	if(bridge && bridge.phase == "silent")
+		return "Network card " + card + " · " + (bridge.name ?? "the DJM") + " sends no mixer data (switch the mixer off and on)";
 	if(denon == 0 && esp.vcdj != "active")
 		return "Network card " + card + ": joining the DJ network…";
 	// A Denon player copies its Engine library (waveforms, cues): show how far
@@ -314,6 +397,14 @@ fmt_time(ms) {
 	if(seconds < 10)
 		s = s + "0";
 	return s + std.string(seconds) + "." + std.string(tenth);
+}
+
+// ms -> "3:07" (whole seconds, for the second time of a panel)
+fmt_time_s(ms) {
+	t = std.int(math.abs(ms) / 1000);
+	minutes = t / 60;
+	seconds = t - minutes * 60;
+	return std.string(minutes) + ":" + (seconds < 10 ? "0" : "") + std.string(seconds);
 }
 
 clip(text, max_chars) {
@@ -380,32 +471,60 @@ ink_on(c) {
 	return lum > 0.18 ? UI_CANVAS : UI_TEXT;
 }
 
-// The badges of a deck: label, shown, fill, text colour
-pill_labels(pl) {
+// Musical key of the loaded track ("8A", "Am"), "" if unknown
+key_of(pl) {
+	// has() and [] : without a "key" member, pl.track.key is the key() function of the json object, not None
+	if(!pl.track || !pl.track.has("key"))
+		return "";
+	k = pl.track["key"];
+	if(std.is_none(k) || k == "")
+		return "";
+	return std.string(k);
+}
+
+// The chips of a deck: label, shown, fill, text colour. Live has its own badge and ring (draw_live_badge()). `keep`:
+// only the first ones (where room is short the key goes first, then MT, Sync, Send BPM; Master stays). Send BPM: this
+// deck gives the tempo to the lighting desks / Ableton Link (sendingBpm of the module: ProlinkBridge "Tempo from",
+// the Send BPM tab of DJ Watch), in the `on` colour: that output is on. MT: key lock (master tempo) is on, neutral like
+// the key.
+PILLS = 5;
+pill_labels(pl, keep = PILLS) {
 	sync_fill = vec4f(accent3.x, accent3.y, accent3.z, 1.0);
-	return [["Master", pl.master, UI_TEXT, UI_CANVAS], ["On air", pl.onAir && mixer_present, UI_ON, UI_ON_INK],
-		["Sync", pl.sync, sync_fill, ink_on(sync_fill)]];
+	key = key_of(pl);
+	sending = !std.is_none(pl.sendingBpm) && pl.sendingBpm;
+	key_lock = !std.is_none(pl.keyLock) && pl.keyLock == true;
+	return [["Master", pl.master && keep > 0, UI_TEXT, UI_CANVAS], ["Send BPM", sending && keep > 1, UI_ON, UI_ON_INK],
+		["Sync", pl.sync && keep > 2, sync_fill, ink_on(sync_fill)], ["MT", key_lock && keep > 3, UI_CONTROL_HOVER, UI_TEXT],
+		["Key " + key, key != "" && keep > 4, UI_CONTROL_HOVER, UI_TEXT]];
 }
 
 // Width draw_pills() will use, without drawing
-pills_width(pl, size) {
-	labels = pill_labels(pl);
+pills_width(pl, size, keep = PILLS) {
+	labels = pill_labels(pl, keep);
 	wd = 0.0;
-	for(i = 0; i < 3; i++) {
+	for(i = 0; i < PILLS; i++) {
 		if(labels[i][1])
 			wd = wd + pill_width(labels[i][0], size) + size * 0.4;
 	}
 	return wd;
 }
 
-// Master, On air and Sync as small badges, right-aligned at x_right; returns the width used. Read from the left they
-// are Master · On air · Sync, like the DJ Watch web UI and the lanes (top to bottom). Each one is a word, so it reads
-// without its colour: Master light, On air in live green, Sync in the accent (it follows the master, like a link).
-draw_pills(x_right, y, pl, size) {
+// How many chips fit between x_left and x_right (PILLS = all)
+pills_fit(pl, size, x_left, x_right) {
+	keep = PILLS;
+	for(keep > 1 && x_right - pills_width(pl, size, keep) < x_left)
+		keep--;
+	return keep;
+}
+
+// Master, Send BPM, Sync, MT and the key as small chips, right-aligned at x_right; returns the width used. Read from the
+// left they are Master · Send BPM · Sync · MT · Key, like the lanes (top to bottom). Each one is a word, so it reads without
+// its colour: Master light, Send BPM in `on`, Sync in the accent (it follows the master, like a link), the key neutral.
+draw_pills(x_right, y, pl, size, keep = PILLS) {
 	x = x_right;
 	hh = size * 1.55;
-	labels = pill_labels(pl);
-	for(i = 2; i >= 0; i--) {
+	labels = pill_labels(pl, keep);
+	for(i = PILLS - 1; i >= 0; i--) {
 		if(!labels[i][1])
 			continue;
 		wd = pill_width(labels[i][0], size);
@@ -428,6 +547,100 @@ fill_tri(a, b, c3, color) {
 	nvgClosePath();
 	nvgFillColor(color);
 	nvgFill();
+}
+
+// "Live" badge with the 60° chamfer of the brand (top left and bottom right cut, radius.chamfer), as a playing clip in
+// the Clipview has it (gridview_item.cpp): left edge at x, centred on y, text size `size`; returns its width
+draw_live_badge(x, y, size) {
+	nvgFontSize(size);
+	nvgFontFace("sans-bold");
+	w = nvgTextBounds(vec2f(0, 0), "Live")[0] + size;
+	h = size * 1.4;
+	ch = h * 0.31;  // 5 of 16 px
+	top = y - h * 0.5;
+	nvgBeginPath();
+	nvgMoveTo(vec2f(x + ch, top));
+	nvgLineTo(vec2f(x + w, top));
+	nvgLineTo(vec2f(x + w, top + h - ch));
+	nvgLineTo(vec2f(x + w - ch, top + h));
+	nvgLineTo(vec2f(x, top + h));
+	nvgLineTo(vec2f(x, top + ch));
+	nvgClosePath();
+	nvgFillColor(UI_LIVE);
+	nvgFill();
+	draw_text(vec2f(x + w * 0.5, y + size * 0.03), "Live", size, "sans-bold", UI_ON_INK, ALIGN_CENTER_MIDDLE);
+	return w;
+}
+
+// Ring around the panel or lane of a live deck (x, y, w x h): 4 px at 1080 lines, the width of a linked edge
+// (size.calm_edge_linked), inside the rectangle so it does not run into the gap
+draw_live_ring(x, y, w, h, lw) {
+	t = 2 * lw;
+	nvgBeginPath();
+	nvgRoundedRect(vec2f(x + t * 0.5, y + t * 0.5), vec2f(w - t, h - t), UI_RADIUS_WINDOW * ui_px);
+	nvgStrokeColor(UI_LIVE);
+	nvgStrokeWidth(t);
+	nvgStroke();
+}
+
+// BPM in a box like on the CDJ-3000: on the tempo master filled light with dark text (as the Master chip), else only
+// an outline. Right-aligned at x_right, centred on y; returns the width of the box.
+draw_bpm_box(x_right, y, bpm_text, size, master) {
+	nvgFontSize(size);
+	nvgFontFace("mono");
+	w = nvgTextBounds(vec2f(0, 0), bpm_text)[0] + size * 0.5;
+	h = size * 1.2;
+	nvgBeginPath();
+	nvgRoundedRect(vec2f(x_right - w, y - h * 0.5), vec2f(w, h), UI_RADIUS_CONTROL * ui_px);
+	if(master) {
+		nvgFillColor(UI_TEXT);
+		nvgFill();
+	}
+	else {
+		nvgStrokeColor(UI_LINE_STRONG);
+		nvgStrokeWidth(math.max(ui_px, 1.0));
+		nvgStroke();
+	}
+	draw_text(vec2f(x_right - w * 0.5, y + size * 0.04), bpm_text, size, "mono", master ? UI_CANVAS : UI_TEXT, ALIGN_CENTER_MIDDLE);
+	return w;
+}
+
+// Player number in a box (control fill), like PLAYER on the CDJ-3000: x, y, w x h
+draw_number_box(x, y, w, h, d, present) {
+	nvgBeginPath();
+	nvgRoundedRect(vec2f(x, y), vec2f(w, h), UI_RADIUS_CONTROL * ui_px);
+	nvgFillColor(UI_CONTROL);
+	nvgFill();
+	draw_text(vec2f(x + w * 0.5, y + h * 0.52), std.string(d + 1), math.min(h * 0.62, w * 0.8), "sans-bold", present ? UI_TEXT : UI_TEXT_3, ALIGN_CENTER_MIDDLE);
+}
+
+// Artwork square of deck d at x, y (size s): the shader draws the picture there (art_rects); without one an empty
+// square in the control tone
+draw_art_box(d, x, y, s) {
+	if(marks[d].art) {
+		art_rects[d] = vec4f(x, y, s, s);
+		return None;
+	}
+	nvgBeginPath();
+	nvgRoundedRect(vec2f(x, y), vec2f(s, s), UI_RADIUS_CONTROL * ui_px);
+	nvgFillColor(UI_CONTROL);
+	nvgFill();
+}
+
+// Time with the tenths smaller, like the CDJ: "-3:07" big and ".4" small, right-aligned at x_right on the baseline
+// row y. text = time_text(); returns the width used.
+draw_time(x_right, y, text, size, color) {
+	dot = text.find(".");
+	if(dot < 0) {
+		draw_text(vec2f(x_right, y), text, size, "mono", color, ALIGN_RIGHT_MIDDLE);
+		return nvgTextBounds(vec2f(0, 0), text)[0];
+	}
+	tail = text.substr(dot);
+	base = y + size * 0.33; // one baseline for both sizes
+	draw_text(vec2f(x_right, base), tail, size * 0.68, "mono", color, ALIGN_RIGHT_BASELINE);
+	tw = nvgTextBounds(vec2f(0, 0), tail)[0];
+	draw_text(vec2f(x_right - tw, base), text.substr(0, dot), size, "mono", color, ALIGN_RIGHT_BASELINE);
+	return tw + nvgTextBounds(vec2f(0, 0), text.substr(0, dot))[0];
 }
 
 // "#e0301e" -> vec4f
@@ -564,9 +777,13 @@ draw_phrase_band(phrases, x0, y, w, h, ms_a, ms_b, now_ms, lw) {
 			continue;
 		alpha = 0.9;
 		if(now_ms >= 0 && ph.endMs <= now_ms)
-			alpha = 0.4;
+			alpha = 0.45;
 		color = phrase_color(ph.group);
-		fill_rect(vec2f(a, y), vec2f(b - a, h), with_alpha(color, alpha));
+		// The played part of the current phrase at half brightness too, like the waveform
+		split = now_ms >= 0 && ph.ms < now_ms && ph.endMs > now_ms ? math.min(math.max(x0 + (now_ms - ms_a) * k, a), b) : a;
+		if(split > a)
+			fill_rect(vec2f(a, y), vec2f(split - a, h), with_alpha(color, 0.45));
+		fill_rect(vec2f(split, y), vec2f(b - split, h), with_alpha(color, alpha));
 		// Light text on dark (and dimmed) fields, dark text otherwise
 		label = UI_CANVAS;
 		if((0.3 * color.x + 0.59 * color.y + 0.11 * color.z) * (alpha + 0.05) < 0.42)
@@ -681,19 +898,21 @@ draw_preview_cues(d, x0, y0, pw, ph, lw) {
 		cue = m.cues[i];
 		x = x0 + cue.ms / m.dur * pw;
 		color = is_loop(cue) ? LOOP_COLOR : hex_color(cue.color, 1.0);
-		fill_rect(vec2f(x - lw * 0.5, y0), vec2f(lw, ph), with_alpha(color, 0.75));
+		if(cue.ms * 0.15 < m.col)
+			color = with_alpha(color, 0.5); // already played, like the dimmed waveform
+		fill_rect(vec2f(x - lw * 0.5, y0), vec2f(lw, ph), with_alpha(color, color.w * 0.75));
 		draw_cue_flag(x, y0, s, cue, color, false);
 	}
 	nvgRestore();
 }
 
-// Which decks get a lane: AUTO = the CDJs 1-4 that are there (in order), otherwise decks 1..n
+// Which decks get a lane: AUTO = the players 1-6 that are there (in order), otherwise decks 1..n
 compute_lanes() {
-	lane_decks = [-1, -1, -1, -1];
+	lane_decks = [-1, -1, -1, -1, -1, -1];
 	n = 0;
 	mode = deck_count.value();
 	if(mode == 0) {
-		for(d = 0; d < 4; d++) {
+		for(d = 0; d < NDECKS; d++) {
 			pl = views[d];
 			if(pl && pl.present) {
 				lane_decks[n] = d;
@@ -721,6 +940,16 @@ design_scale(fw, h) {
 // Line width in output pixels: 2 at 1080 lines, at least 1, narrow outputs limit it by their width (LW in decks.glsl)
 line_width(fw, h) {
 	return math.max(1.0, math.min(h / 540.0, fw / 960.0));
+}
+
+// Panels of the panel row: one row of up to four, five and six decks in two rows of three (each panel keeps a
+// readable width). Same rule as panel_grid() in decks.glsl.
+panel_cols(n) {
+	return n > 4 ? (n + 1) / 2 : n;
+}
+
+panel_rows(n) {
+	return n > 4 ? 2 : 1;
 }
 
 compute_layout() {
@@ -754,12 +983,17 @@ compute_layout() {
 	}
 	else {
 		// Panel row: 30 % of the height, outputs higher than 16:9 no more than their width needs. In flat strips the text
-		// part grows to PANEL_HEAD_MIN (three readable rows), the whole-track waveform below it keeps its height.
-		ph = math.min(PANELS_TOP * h, PANELS_TOP * 1080 * 1.2 * u) - PAD * h;
-		head = math.max(ph * HEAD, math.min(PANEL_HEAD_MIN, h * 0.25));
-		ph = math.min(head + ph * (1 - HEAD), h * 0.45);
+		// part grows to PANEL_HEAD_MIN (three readable rows), the whole-track waveform below it keeps its height. Two rows
+		// of panels (five and six decks) take 40 %, each panel more of it for the texts.
+		rows = panel_rows(nlanes);
+		grow = rows > 1 ? PANELS_TWO_ROWS : 1.0;
+		share = rows > 1 ? HEAD_TWO_ROWS : HEAD;
+		row_gap = GAP * h * (rows - 1);
+		ph = (math.min(PANELS_TOP * grow * h, PANELS_TOP * grow * 1080 * 1.2 * u) - PAD * h - row_gap) / rows;
+		head = math.max(ph * share, math.min(PANEL_HEAD_MIN, h * 0.25));
+		ph = math.min(head + ph * (1 - share), (h * 0.45 * grow - row_gap) / rows);
 		L.head = math.min(head / ph, 0.7);
-		L.top = (ph + PAD * h) / h;
+		L.top = (ph * rows + row_gap + PAD * h) / h;
 		L.info_w = PANELS_LEFT * k;
 		L.right_w = PANELS_RIGHT * k;
 	}
@@ -772,6 +1006,27 @@ compute_layout() {
 	ww = math.max(w - 2 * L.pad_w * fw - (L.info_w + L.right_w) * fw - gap * 0.5, 1.0);
 	ref = ww - (fw - 1920.0 * u);  // the same lane at 1920 px width (the columns keep their pixel widths)
 	L.span = math.max(zoom.value(), 0.1) * ww / math.max(ref, ww * 0.1);
+}
+
+// The channel fader at the mixer: a thin bar (track in `control`, the level in text_2, `on` green while the deck is on
+// air), filled from the bottom. Nothing when the mixer sends no faders.
+draw_fader(pl, x, y, h) {
+	if(!pl || !pl.present || std.is_none(pl.fader))
+		return None;
+	w = math.max(4.0 * ui_px, 2.0);
+	fill_rect(vec2f(x, y), vec2f(w, h), UI_CONTROL);
+	fh = h * math.clamp(pl.fader, 0.0, 1.0);
+	color = UI_TEXT_2;
+	if(pl.onAir)
+		color = UI_ON;
+	fill_rect(vec2f(x, y + h - fh), vec2f(w, fh), color);
+}
+
+// "Channel 3?" in the cue colour at the bottom of the lane of a deck that seems to play on another channel
+draw_mapping_hint(d, x, y, w, size) {
+	if(!mixer_info || !mixer_info.hint || mixer_info.hint.player != d + 1)
+		return None;
+	draw_text(vec2f(x + w * 0.5, y), "Channel " + std.string(mixer_info.hint.channel) + "?", size, "sans-bold", UI_CUE, ALIGN_CENTER_MIDDLE);
 }
 
 // Four squares for the beat in the bar, the current one lit; the one in the downbeat colour of the beat grid
@@ -837,67 +1092,125 @@ title_of(pl) {
 	return "Loading…";
 }
 
-// Infos in the text part of a panel (panel layout): 3 rows
+// The other time in whole seconds, for a second, quieter readout: elapsed while Time display shows the remaining
+// time, remaining otherwise; "" without a position or length
+other_time_text(pl) {
+	track = pl.track;
+	if(!track || std.is_none(pl.positionMs))
+		return "";
+	if(time_ctrl.value() == TIME_ELAPSED)
+		return track.durationMs ? "-" + fmt_time_s(track.durationMs - pl.positionMs) : "";
+	return fmt_time_s(pl.positionMs);
+}
+
+// BPM of a deck for the BPM box: "—" without a track (the player still reports a tempo then)
+bpm_of(pl) {
+	return pl.track ? fmt1(pl.effectiveBpm) : "—";
+}
+
+// Model of the player ("CDJ-3000", "SC6000 A"), "" if unknown
+model_of(pl) {
+	if(std.is_none(pl.name))
+		return "";
+	return std.string(pl.name);
+}
+
+// Infos in the text part of a panel (panel layout), three rows like the screen of a CDJ-3000:
+//   [num] [art] Title ..........................  [BPM]
+//   [   ] [   ] Artist .......  Master Send BPM Sync MT Key   +1.20%
+//   Live  model  beats Cue 16 Drop 12      1:02 ▶ -3:07.4
 draw_panel_text(pl, d, x0, y0, pw, head, c) {
-	// Text size from the height of the panel; narrow panels (four decks, tall outputs) take it from their width
+	// Text size from the height of the panel; narrow panels (five or six decks, tall outputs) take it from their width
 	base = math.min(head * 0.2, pw * 0.05);
 	fs = base * L.scale;
-	num = base * 3.1;
-	nx = x0 + num * 0.75;
-	tx = x0 + num * 1.25;
-	draw_text(vec2f(nx, y0 + head * 0.5), std.string(d + 1), num, "sans-bold", pl && pl.master ? c.text : c.text_2, ALIGN_CENTER_MIDDLE);
-	if(!pl || !pl.present) {
-		draw_text(vec2f(tx, y0 + head * 0.5), "No player", fs, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
+	gap = fs * 0.45;
+	r1 = y0 + head * 0.24;
+	r2 = y0 + head * 0.55;
+	r3 = y0 + head * 0.84;
+	box_y = y0 + head * 0.08;
+	box_h = head * 0.62;    // the number box and the artwork span rows 1 and 2
+	present = pl && pl.present;
+	nx = x0 + math.max(fs * 0.6, 8 * ui_px); // right of the state stripe
+	box_w = math.min(box_h * 0.66, pw * 0.11);
+	draw_number_box(nx, box_y, box_w, box_h, d, present);
+	if(!present) {
+		draw_text(vec2f(nx + box_w + gap * 2, y0 + head * 0.39), "No player", fs, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
 		return None;
 	}
-	rx = x0 + pw - fs * 0.6;
-	bpm_text = fmt1(pl.effectiveBpm);
-	draw_text(vec2f(rx, y0 + head * 0.24), bpm_text, fs * 1.35, "mono", c.text, ALIGN_RIGHT_MIDDLE);
-	bpm_w = nvgTextBounds(vec2f(0, 0), bpm_text)[0];
-	pitch = fmt_pitch(pl.pitch) + "%";
-	draw_text(vec2f(rx, y0 + head * 0.55), pitch, fs * 0.85, "mono", c.text_2, ALIGN_RIGHT_MIDDLE);
-	pitch_w = nvgTextBounds(vec2f(0, 0), pitch)[0];
-	time_str = time_text(pl);
-	draw_text(vec2f(rx, y0 + head * 0.82), time_str, fs * 0.9, "mono", c.text, ALIGN_RIGHT_MIDDLE);
-	time_x = rx - nvgTextBounds(vec2f(0, 0), time_str)[0] - fs * 0.35;
-	time_x = time_x - draw_play_state(time_x, y0 + head * 0.82, fs * 0.55, pl.playing) - fs * 0.6; // left end of time + play state
 
-	// Badges next to the BPM; where they would leave the title too little room (narrow panels) next to the pitch: the
-	// title then reaches up to the BPM and the artist gives way
-	text_w = rx - tx - fs * 6.5;
-	ps = math.max(fs * 0.62, MIN_BADGE);
-	pills_w = pills_width(pl, ps);
-	title_w = text_w - pills_w;
-	artist_w = text_w;
-	if(pills_w > 0 && title_w < fs * 9) {
-		px = rx - pitch_w - fs * 0.5;
-		artist_w = px - pills_w - tx;
-		title_w = rx - bpm_w - fs * 0.6 - tx;
-		draw_pills(px, y0 + head * 0.55, pl, ps);
+	// Right column: BPM box, tempo, time
+	rx = x0 + pw - fs * 0.6;
+	bpm_w = draw_bpm_box(rx, r1, bpm_of(pl), fs * 1.2, pl.master);
+	pitch = fmt_pitch(pl.pitch) + "%";
+	draw_text(vec2f(rx, r2), pitch, fs * 0.85, "mono", c.text_2, ALIGN_RIGHT_MIDDLE);
+	pitch_w = nvgTextBounds(vec2f(0, 0), pitch)[0];
+	time_x = rx - draw_time(rx, r3, time_text(pl), fs * 1.05, c.text) - fs * 0.35;
+	time_x = time_x - draw_play_state(time_x, r3, fs * 0.55, pl.playing) - fs * 0.5; // left end of time + play state
+
+	// Artwork right of the number, as high as the number box; smaller (down to 60 %) or left out where the title would
+	// keep less room than for a few words
+	tx = nx + box_w + gap;
+	art = math.min(box_h, rx - bpm_w - fs * 0.6 - tx - gap - fs * 8);
+	if(art >= box_h * 0.6) {
+		draw_art_box(d, tx, box_y + (box_h - art) * 0.5, art);
+		tx = tx + art + gap;
 	}
-	else
-		draw_pills(rx - bpm_w - fs * 0.5, y0 + head * 0.24, pl, ps);
+	block_end = tx - gap; // number box and artwork; row 3 below them: Live badge and model
+
+	// Title up to the BPM box, artist up to the chips (Master, Sync, Key) left of the tempo
+	ps = math.max(fs * 0.6, MIN_BADGE);
+	chips_x = rx - pitch_w - fs * 0.5;
+	keep = pills_fit(pl, ps, tx, chips_x);
+	artist_w = chips_x - pills_width(pl, ps, keep) - tx;
+	draw_pills(chips_x, r2, pl, ps, keep);
+	title_w = rx - bpm_w - fs * 0.6 - tx;
 	nvgSave();
-	nvgScissor(vec2f(tx, y0), vec2f(math.max(math.max(text_w, title_w), 1.0), head));
-	draw_text(vec2f(tx, y0 + head * 0.24), fit_text(title_of(pl), fs * 1.05, "sans-bold", title_w), fs * 1.05, "sans-bold", c.text, ALIGN_LEFT_MIDDLE);
+	nvgScissor(vec2f(tx, y0), vec2f(math.max(math.max(artist_w, title_w), 1.0), head));
+	draw_text(vec2f(tx, r1), fit_text(title_of(pl), fs * 1.05, "sans-bold", title_w), fs * 1.05, "sans-bold", c.text, ALIGN_LEFT_MIDDLE);
 	if(pl.track && pl.track.artist && artist_w > fs * 2)
-		draw_text(vec2f(tx, y0 + head * 0.55), fit_text(pl.track.artist, fs * 0.85, "sans", artist_w), fs * 0.85, "sans", c.text_2, ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(tx, r2), fit_text(pl.track.artist, fs * 0.85, "sans", artist_w), fs * 0.85, "sans", c.text_2, ALIGN_LEFT_MIDDLE);
 	nvgRestore();
 
-	bx = tx + draw_beats(vec2f(tx, y0 + head * 0.83), fs * 0.6, pl.beatInBar) + fs * 0.6;
+	// Row 3 under the number and the artwork: the Live badge, then the model of the player
+	lx = nx;
+	if(live_decks[d])
+		lx = lx + draw_live_badge(lx, r3, math.max(fs * 0.62, MIN_BADGE)) + gap;
+	model = model_of(pl);
+	if(model != "" && block_end - lx > fs * 2)
+		draw_text(vec2f(lx, r3), fit_text(model, fs * 0.62, "sans", block_end - lx), fs * 0.62, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
+
+	// Row 3 from the title on: beats, cue countdown, phrase, and the other time before the play sign if there is room
+	bx = tx + draw_beats(vec2f(tx, r3), fs * 0.6, pl.beatInBar) + fs * 0.6;
 	cue = cue_text(pl);
 	if(cue != "") {
-		draw_text(vec2f(bx, y0 + head * 0.83), cue, fs * 0.8, "mono", pl.beatsToCue <= 16 ? c.cue : c.text_2, ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(bx, r3), cue, fs * 0.8, "mono", pl.beatsToCue <= 16 ? c.cue : c.text_2, ALIGN_LEFT_MIDDLE);
 		bx = bx + nvgTextBounds(vec2f(0, 0), cue)[0] + fs * 0.7;
 	}
 	phrase = phrase_text(pl);
+	phrase_w = 0.0;
+	if(phrase != "") {
+		nvgFontSize(fs * 0.8);
+		nvgFontFace("sans-bold");
+		phrase_w = nvgTextBounds(vec2f(0, 0), phrase)[0];
+	}
+	other = other_time_text(pl);
+	if(other != "") {
+		nvgFontSize(fs * 0.72);
+		nvgFontFace("mono");
+		other_w = nvgTextBounds(vec2f(0, 0), other)[0];
+		if(time_x - bx - phrase_w - fs * 0.8 > other_w) {
+			draw_text(vec2f(time_x, r3), other, fs * 0.72, "mono", c.text_3, ALIGN_RIGHT_MIDDLE);
+			time_x = time_x - other_w - fs * 0.6;
+		}
+	}
 	room = time_x - bx;
 	if(phrase != "" && room > fs * 2)
-		draw_text(vec2f(bx, y0 + head * 0.83), fit_text(phrase, fs * 0.8, "sans-bold", room), fs * 0.8, "sans-bold", phrase_label_color(pl.phraseGroup), ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(bx, r3), fit_text(phrase, fs * 0.8, "sans-bold", room), fs * 0.8, "sans-bold", phrase_label_color(pl.phraseGroup), ALIGN_LEFT_MIDDLE);
 }
 
-// Infos in the info column of a compact lane: number + BPM, title, artist, beats + cue + pitch + time, and the phrase in
-// a row of its own when the lane is high enough (in the row above otherwise, where it often had no room)
+// Infos in the info column of a compact lane: number + Live + model and chips + BPM, the artwork next to title and
+// artist, beats + cue + pitch + time, and the phrase in a row of its own when the lane is high enough (in the row above
+// otherwise, where it often had no room)
 draw_lane_text(pl, d, x0, y0, iw, lh, h, c) {
 	fs = math.min(math.min(lh * 0.19, 54 * L.u) * L.scale, iw * 0.115); // iw already scales with TEXT SIZE
 	block = fs * 3.9;
@@ -912,28 +1225,44 @@ draw_lane_text(pl, d, x0, y0, iw, lh, h, c) {
 	else
 		block = fs * 1.1; // only the number row
 	y = y0 + math.max((lh - block) * 0.5, fs * 0.2);
-	x = x0 + fs * 0.55;
+	x = x0 + math.max(fs * 0.55, 8 * ui_px);
 	right = x0 + iw - fs * 0.45;
+	r1 = y + fs * 0.55;
 
 	nvgSave();
 	nvgScissor(vec2f(x0, y0), vec2f(iw, lh));
-	draw_text(vec2f(x, y + fs * 0.55), std.string(d + 1), fs * 1.1, "sans-bold", pl && pl.master ? c.text : c.text_2, ALIGN_LEFT_MIDDLE);
+	draw_text(vec2f(x, r1), std.string(d + 1), fs * 1.1, "sans-bold", pl && pl.present ? c.text : c.text_3, ALIGN_LEFT_MIDDLE);
+	nx = x + nvgTextBounds(vec2f(0, 0), std.string(d + 1))[0] + fs * 0.35;
 	if(!pl || !pl.present) {
-		draw_text(vec2f(x + fs * 1.1, y + fs * 0.55), "No player", fs * 0.6, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(nx, r1), "No player", fs * 0.6, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
 		nvgRestore();
 		return None;
 	}
-	bpm_text = fmt1(pl.effectiveBpm);
-	draw_text(vec2f(right, y + fs * 0.55), bpm_text, fs * 1.0, "mono", c.text, ALIGN_RIGHT_MIDDLE);
-	draw_pills(right - nvgTextBounds(vec2f(0, 0), bpm_text)[0] - fs * 0.35, y + fs * 0.55, pl, math.max(fs * 0.36, math.min(MIN_BADGE, fs * 0.6)));
+	ps = math.max(fs * 0.36, math.min(MIN_BADGE, fs * 0.6));
+	bpm_w = draw_bpm_box(right, r1, bpm_of(pl), fs * 0.85, pl.master);
+	chips_x = right - bpm_w - fs * 0.3;
+	if(live_decks[d])
+		nx = nx + draw_live_badge(nx, r1, ps) + fs * 0.3;
+	keep = pills_fit(pl, ps, nx, chips_x);
+	chips_x = chips_x - draw_pills(chips_x, r1, pl, ps, keep);
+	model = model_of(pl);
+	if(model != "" && chips_x - nx > fs * 1.5)
+		draw_text(vec2f(nx, r1), fit_text(model, ps, "sans", chips_x - nx - fs * 0.2), ps, "sans", c.text_3, ALIGN_LEFT_MIDDLE);
 	nvgRestore();
 
+	// Artwork left of title and artist (both rows), when the column is wide enough for it
+	tx = x;
+	art = fs * 1.45;
+	if(right - x > fs * 7) {
+		draw_art_box(d, x, y + fs * 1.3, art);
+		tx = x + art + fs * 0.35;
+	}
 	nvgSave();
-	nvgScissor(vec2f(x, y0), vec2f(math.max(right - x, 1.0), lh));
-	tw = right - x;
-	draw_text(vec2f(x, y + fs * 1.65), fit_text(title_of(pl), fs * 0.62, "sans-bold", tw), fs * 0.62, "sans-bold", c.text, ALIGN_LEFT_MIDDLE);
+	nvgScissor(vec2f(tx, y0), vec2f(math.max(right - tx, 1.0), lh));
+	tw = right - tx;
+	draw_text(vec2f(tx, y + fs * 1.65), fit_text(title_of(pl), fs * 0.62, "sans-bold", tw), fs * 0.62, "sans-bold", c.text, ALIGN_LEFT_MIDDLE);
 	if(pl.track && pl.track.artist)
-		draw_text(vec2f(x, y + fs * 2.4), fit_text(pl.track.artist, fs * 0.52, "sans", tw), fs * 0.52, "sans", c.text_2, ALIGN_LEFT_MIDDLE);
+		draw_text(vec2f(tx, y + fs * 2.4), fit_text(pl.track.artist, fs * 0.52, "sans", tw), fs * 0.52, "sans", c.text_2, ALIGN_LEFT_MIDDLE);
 	nvgRestore();
 
 	row = y + fs * 3.35;
@@ -944,9 +1273,7 @@ draw_lane_text(pl, d, x0, y0, iw, lh, h, c) {
 		bx = bx + nvgTextBounds(vec2f(0, 0), cue)[0] + fs * 0.3;
 	}
 	// Right to left: time, play state, pitch
-	time_str = time_text(pl);
-	draw_text(vec2f(right, row), time_str, fs * 0.48, "mono", c.text_2, ALIGN_RIGHT_MIDDLE);
-	px = right - nvgTextBounds(vec2f(0, 0), time_str)[0] - fs * 0.2;
+	px = right - draw_time(right, row, time_text(pl), fs * 0.52, c.text) - fs * 0.2;
 	px = px - draw_play_state(px, row, fs * 0.3, pl.playing) - fs * 0.3;
 	pitch = fmt_pitch(pl.pitch) + "%";
 	draw_text(vec2f(px, row), pitch, fs * 0.48, "mono", c.text_2, ALIGN_RIGHT_MIDDLE);
@@ -1075,6 +1402,8 @@ draw_overlay() {
 	pad_y = PAD * h;
 	gap = GAP * h;
 	lw = line_width(fw, h);
+	for(k = 0; k < NDECKS; k++)
+		art_rects[k] = vec4f(0, 0, 0, 0); // set again by draw_art_box() for the decks that show their artwork
 	w = fw;
 	if(L.hist_w > 0) {
 		cw = L.hist_w * fw;
@@ -1084,15 +1413,21 @@ draw_overlay() {
 	}
 
 	if(L.top > 0) {
-		pw = (w - 2 * pad_x - (n - 1) * gap) / n;
-		ph = L.top * h - pad_y;
+		cols = panel_cols(n);
+		rows = panel_rows(n);
+		pw = (w - 2 * pad_x - (cols - 1) * gap) / cols;
+		ph = (L.top * h - pad_y - (rows - 1) * gap) / rows;
 		for(i = 0; i < n; i++) {
 			d = lane_decks[i];
 			if(d < 0)
 				continue;
-			draw_panel_text(views[d], d, pad_x + i * (pw + gap), pad_y, pw, ph * L.head, c);
-			draw_preview_phrases(d, pad_x + i * (pw + gap), pad_y + ph * L.head, pw, ph * (1 - L.head), lw);
-			draw_preview_cues(d, pad_x + i * (pw + gap), pad_y + ph * L.head, pw, ph * (1 - L.head), lw);
+			px0 = pad_x + (i % cols) * (pw + gap);
+			py0 = pad_y + (i / cols) * (ph + gap);
+			draw_panel_text(views[d], d, px0, py0, pw, ph * L.head, c);
+			draw_preview_phrases(d, px0, py0 + ph * L.head, pw, ph * (1 - L.head), lw);
+			draw_preview_cues(d, px0, py0 + ph * L.head, pw, ph * (1 - L.head), lw);
+			if(live_decks[d])
+				draw_live_ring(px0, py0, pw, ph, lw);
 		}
 	}
 
@@ -1125,38 +1460,72 @@ draw_overlay() {
 			draw_detail_cues(d, wx, ly, ww, lh, lw);
 		}
 
+		// A live deck: ring around the whole lane (with the BPM column of the panel layout)
+		if(live_decks[d])
+			draw_live_ring(pad_x, ly, w - 2 * pad_x, lh, lw);
+		draw_fader(pl, pad_x + 2.0 * lw + 4.0 * ui_px, ly + lh * 0.12, lh * 0.76); // right of the state stripe (2 line widths)
+		draw_mapping_hint(d, pad_x, ly + lh - math.min(lh * 0.09, 20.0 * L.u), iw, math.max(math.min(lh * 0.1, 22.0 * L.u), MIN_BADGE));
 		if(L.compact) {
 			draw_lane_text(pl, d, pad_x, ly, iw, lh, h, c);
 			continue;
 		}
-		// Panel layout: deck number left, BPM and pitch right
+		// Panel layout: deck number and the Live badge left, BPM (boxed on the tempo master), tempo and chips right
 		fs = math.min(lh * 0.28, 37.8 * L.u) * L.scale;
 		cy = ly + lh * 0.5;
-		draw_text(vec2f(pad_x + iw * 0.5, cy), std.string(d + 1), fs * 1.3, "sans-bold", pl && pl.master ? c.text : c.text_2, ALIGN_CENTER_MIDDLE);
-		if(pl && pl.present) {
-			rx = w - pad_x - L.right_w * fw * 0.5;
-			draw_text(vec2f(rx, cy - fs * 0.45), fmt1(pl.effectiveBpm), fs * 0.8, "mono", c.text, ALIGN_CENTER_MIDDLE);
-			draw_text(vec2f(rx, cy + fs * 0.45), fmt_pitch(pl.pitch) + "%", fs * 0.65, "mono", c.text_2, ALIGN_CENTER_MIDDLE);
-			// Master / On air / Sync under each other, centred under the pitch, if the lane is high enough (Master first:
-			// in a short lane only the first one fits)
-			ps = math.max(fs * 0.36, math.min(MIN_BADGE, fs * 0.6));
-			py = cy + fs * 1.15;
-			if(pl.master && py + ps < ly + lh) {
-				draw_pills(rx + pill_width("Master", ps) * 0.5, py, [onAir = false, master = true, sync = false], ps);
-				py = py + ps * 1.9;
-			}
-			if(pl.onAir && mixer_present && py + ps < ly + lh) {
-				draw_pills(rx + pill_width("On air", ps) * 0.5, py, [onAir = true, master = false, sync = false], ps);
-				py = py + ps * 1.9;
-			}
-			if(pl.sync && py + ps < ly + lh)
-				draw_pills(rx + pill_width("Sync", ps) * 0.5, py, [onAir = false, master = false, sync = true], ps);
+		ps = math.max(fs * 0.36, math.min(MIN_BADGE, fs * 0.6));
+		present = pl && pl.present;
+		badge = present && live_decks[d] && lh > fs * 2.6;
+		ny = badge ? cy - fs * 0.35 : cy;
+		draw_text(vec2f(pad_x + iw * 0.5, ny), std.string(d + 1), fs * 1.3, "sans-bold", present ? c.text : c.text_3, ALIGN_CENTER_MIDDLE);
+		if(badge) {
+			nvgFontSize(ps);
+			nvgFontFace("sans-bold");
+			bw = nvgTextBounds(vec2f(0, 0), "Live")[0] + ps;
+			draw_live_badge(pad_x + (iw - bw) * 0.5, ny + fs * 1.05, ps);
+		}
+		if(!present)
+			continue;
+		rx = w - pad_x - L.right_w * fw * 0.5;
+		nvgFontSize(fs * 0.7);
+		nvgFontFace("mono");
+		bpm_text = bpm_of(pl);
+		bw = nvgTextBounds(vec2f(0, 0), bpm_text)[0] + fs * 0.35;
+		draw_bpm_box(rx + bw * 0.5, cy - fs * 0.45, bpm_text, fs * 0.7, pl.master);
+		draw_text(vec2f(rx, cy + fs * 0.45), fmt_pitch(pl.pitch) + "%", fs * 0.6, "mono", c.text_2, ALIGN_CENTER_MIDDLE);
+		// Master / Send BPM / Sync / MT / Key under each other, centred under the tempo, if the lane is high enough (Master first: in a
+		// short lane only the first one fits)
+		py = cy + fs * 1.15;
+		for(chip : pill_labels(pl)) {
+			if(!chip[1] || py + ps > ly + lh)
+				continue;
+			cw2 = pill_width(chip[0], ps);
+			hh = ps * 1.55;
+			nvgBeginPath();
+			nvgRoundedRect(vec2f(rx - cw2 * 0.5, py - hh * 0.5), vec2f(cw2, hh), math.min(UI_RADIUS_CONTROL * ui_px, hh * 0.5));
+			nvgFillColor(chip[2]);
+			nvgFill();
+			draw_text(vec2f(rx, py), chip[0], ps, "sans-bold", chip[3], ALIGN_CENTER_MIDDLE);
+			py = py + ps * 1.9;
 		}
 	}
 }
 
+// The history settings to the module (they belong to the connection; DJ Watch sets its own, standalone_ui)
+apply_history_options() {
+	if(!connection_ui || !hist_rule_ctrl)
+		return None;
+	opts = [rule = HIST_RULES[math.clamp(hist_rule_ctrl.value(), 0, 1)], mode = NP_MODES[math.clamp(np_mode_ctrl.value(), 0, 2)],
+		live = playlist_ctrl.value() ? true : false];
+	key = std.string(opts) + device.port();
+	if(key == hist_opts_sent)
+		return None;
+	if(device.history_options(opts)) // None while there is no connection yet: again next time
+		hist_opts_sent = key;
+}
+
 // History from the module, fetched again only when it changed
 refresh_history() {
+	apply_history_options();
 	count = device.history_count();
 	if(count == hist_count)
 		return None;
@@ -1382,8 +1751,9 @@ entry(generator, area) {
 	card_text.tooltip("Network card in the DJ network: its name (Windows: \"Ethernet 2\", Linux: eth1, macOS: en7) or its address. Empty: the card on which CDJs show up (Denon players: every card)\n[[wiki:Output-and-Devices#without-dj-watch-network-card]]");
 	listen_only = settings.controlbutton("LISTEN ONLY").tooltip("Network card: send nothing into the DJ network. Then only tempo, beats and on air come in, no titles, waveforms or cues\n[[wiki:Output-and-Devices#without-dj-watch-network-card]]").caption("Listen only").push(1).value(0);
 	listen_only.tooltip("Send nothing into the DJ network: tempo and beats only, no track titles, waveforms or cues\n[[wiki:Output-and-Devices#without-dj-watch-network-card]]");
-	// AUTO = one lane per CDJ that is there; older projects stored 1-4 here, which still means 1-4 lanes
-	deck_count = settings.controlcombo("DECKS").tooltip("Auto: one lane for each CDJ that is there. 1 to 4: that many lanes").caption("Decks").items(["Auto", "1", "2", "3", "4"]); //index-based (0 = auto)
+	// AUTO = one lane per player that is there; older projects stored 1-4 here, which still means 1-4 lanes (5 and 6 were
+	// added at the end in November 2026)
+	deck_count = settings.controlcombo("DECKS").tooltip("Auto: one lane for each player that is there (up to 6). 1 to 6: that many lanes").caption("Decks").items(["Auto", "1", "2", "3", "4", "5", "6"]); //index-based (0 = auto)
 	layout_ctrl = settings.controlcombo("LAYOUT").tooltip("Decks and lanes: panels with title and preview above the waveforms. Lanes only: the infos inside each lane, more room").caption("Layout").items(["Decks and lanes", "Lanes only (compact)"]); //index-based (LAYOUT_LANES = 1)
 	playhead_ctrl = settings.controlfloat("PLAYHEAD (% from left)").tooltip("Where the playhead stands: less shows more of what comes, more shows more of what was").caption("Playhead from left").unit("%").min(10).max(50).value(30);
 	overview_ctrl = settings.controlcombo("OVERVIEW IN LANES").tooltip("The whole track as a bar in each lane. Auto: in the compact layout").caption("Overview in lanes").items(["Auto", "On", "Off"]).segmented(true); //index-based (OVERVIEW_AUTO, …)
@@ -1404,6 +1774,13 @@ entry(generator, area) {
 	style_ctrl = settings.controlcombo("STYLE").tooltip("The colours of the waveforms: CDJ like the players, or VibeVJ in the accent colour\n[[wiki:Output-and-Devices#prolink-cdjs]]").caption("Style").items(["CDJ", "VibeVJ"]).segmented(true); //index-based (STYLE_VIBEVJ = 1)
 	history_ctrl = settings.controlcombo("HISTORY").tooltip("Off, or the played tracks as a column right of the decks").caption("History").items(["Off", "Right column"]).segmented(true); //index-based (HISTORY_COLUMN = 1)
 	history_open_ctrl = settings.controlbutton("HISTORY OPEN").tooltip("Opens or folds the history column (also H, or a click into it)").caption("Show history").push(1).value(1);
+	mixer_data = settings.controlbutton("MIXER DATA").caption("Mixer data (DJM)").push(1).value(0)
+		.tooltip("Network card: this computer also announces itself as a PRO DJ LINK Bridge, so a Pioneer DJM sends its faders, EQ and level meters (FADER, VU, EQ of each deck; the fader bar in the lanes). A DJM decides on the first announcement it sees: if it refuses, switch the mixer off and on\n[[wiki:Output-and-Devices#mixer-data]]");
+	enhanced = settings.controlbutton("ENHANCED ON AIR").caption("Enhanced on air").push(1).value(0)
+		.tooltip("ON AIR: a deck that was on air and keeps playing stays on air through a short fader dip or a sing-along with the fader down (for Hold)\n[[wiki:Output-and-Devices#mixer-data]]");
+	live_hold = settings.controlfloat("LIVE HOLD").caption("Hold").unit("s").min(0).max(120).value(10)
+		.tooltip("How long a playing deck stays on air with its channel closed (Enhanced on air). 0: as long as it plays");
+	mixer_section = [mixer_data, enhanced, live_hold];
 	smoothing = settings.controlslider("Level smoothing").tooltip("How calm Low, Mid and High move. 0: they follow at once").value(0.5);
 	theme_widget = settings;
 	apply_style();
@@ -1422,22 +1799,36 @@ entry(generator, area) {
 		device.history_clear();
 		hist_count = -1;
 	});
+	hist_rule_ctrl = hist.controlcombo("HISTORY RULE").caption("History rule").items(["Now playing", "Audible 30 s"]).segmented(true); //index-based (HIST_RULES)
+	hist_rule_ctrl.tooltip("Now playing: a track counts when it is the one the audience hears (Now playing below). Audible 30 s: once it was heard for 30 s (channel open on the mixer, without one playing)\n[[wiki:Output-and-Devices#history-and-playlist]]");
+	np_mode_ctrl = hist.controlcombo("NOW PLAYING MODE").caption("Now playing").items(["Smart", "Waits for silence", "Follows master"]); //index-based (NP_MODES)
+	np_mode_ctrl.tooltip("Smart: at once when it is the first one heard or the track before was cued or ended, else after 128 beats. Waits for silence: only once nothing else is heard. Follows master: the deck that becomes tempo master\n[[wiki:Output-and-Devices#history-and-playlist]]");
+	playlist_ctrl = hist.controlbutton("WRITE PLAYLIST").caption("Write playlist").push(1).value(0);
+	playlist_ctrl.tooltip("Writes the played tracks while they play to Documents/prolink-history/set-<date>-<time>.csv (start, stop, play time, deck, title, artist, BPM, key); after 30 minutes of silence a new file\n[[wiki:Output-and-Devices#history-and-playlist]]");
 	for(i = 0; i < HIST_LABELS; i++)
 		hist_labels.push_back(hist.label("").visible(false));
 
-	for(d = 0; d < 4; d++) {
+	for(d = 0; d < NDECKS; d++) {
 		name = std.string(d + 1);
 
-		// Hidden image as texture input of the shader
+		// Hidden images as texture inputs of the shader: waveform texture and artwork
 		img = area.image().visible(false);
 		tex = img.texture();
 		tex.pixel_format("rgba").component_format("uint8").flip_y(false).size(vec2i(1, 1));
 		tex.upload_data([0, 0, 0, 0]);
 		shader.input("deck" + name, img);
 		images.push_back(img);
+		art_img = area.image().visible(false);
+		art_tex = art_img.texture();
+		art_tex.pixel_format("rgba").component_format("uint8").flip_y(false).size(vec2i(1, 1));
+		art_tex.upload_data([0, 0, 0, 0]);
+		shader.input("art" + name, art_img);
+		art_images.push_back(art_img);
+		art_ready.push_back(None);
+		art_rects.push_back(vec4f(0, 0, 0, 0));
 		revs.push_back(-1);
 		views.push_back(None);
-		marks.push_back([cues = [], phrases = [], dur = 0.0, col = 0.0, wave = false, preview = false, tid = "", trev = -1]);
+		marks.push_back([cues = [], phrases = [], dur = 0.0, col = 0.0, wave = false, preview = false, tid = "", trev = -1, art = false]);
 
 		group = "deck" + name;
 		section = area.collapsable("Deck " + name);
@@ -1456,6 +1847,11 @@ entry(generator, area) {
 			phrase_ramp = cnt.controlslider("PHRASE RAMP", group).tooltip("0 at the start of the current phrase (rekordbox), 1 at its end").caption("Phrase ramp").as_output(true),
 			buildup = cnt.controlslider("BUILDUP", group).tooltip("Rises from 0 to 1 through a buildup, else 0").caption("Buildup").as_output(true),
 			drop = cnt.controlslider("DROP", group).tooltip("1 while a drop plays, else 0").caption("Drop").as_output(true),
+			fader = cnt.controlslider("FADER", group).tooltip("The fader of this deck's channel at the mixer, 0 to 1 (DJM: Mixer data on; Denon mixers). 0 when the mixer sends no faders").caption("Fader").as_output(true),
+			vu = cnt.controlslider("VU", group).tooltip("The level meter of this deck's channel at the mixer, 0 to 1 (DJM: Mixer data on)").caption("VU").as_output(true),
+			eq_low = cnt.controlslider("EQ LOW", group).tooltip("The low EQ knob of this deck's channel, 0.5 = flat (DJM: Mixer data on)").caption("EQ low").as_output(true),
+			eq_mid = cnt.controlslider("EQ MID", group).tooltip("The mid EQ knob of this deck's channel, 0.5 = flat (DJM-V10: HI MID)").caption("EQ mid").as_output(true),
+			eq_high = cnt.controlslider("EQ HIGH", group).tooltip("The high EQ knob of this deck's channel, 0.5 = flat").caption("EQ high").as_output(true),
 		]);
 	}
 
@@ -1480,9 +1876,71 @@ standalone_ui() {
 	card_text.visible(false);
 	listen_only.visible(false);
 	hist_section.visible(false);
+	for(i = 0; i < mixer_section.size(); i++)
+		mixer_section[i].visible(false);
 	for(i = 0; i < deck_sections.size(); i++)
 		deck_sections[i].visible(false);
 	source.parent().refresh_layout();
+}
+
+// Which decks are live (heard in the room): with a mixer on the network the decks whose channel is open (On Air of the
+// DJM; several while a mix runs). Without one nothing tells it: then the tempo master while it plays, else the only deck
+// that plays; none while several play without a master, or none plays.
+compute_live() {
+	playing = 0;
+	last = -1;
+	for(d = 0; d < NDECKS; d++) {
+		pl = views[d];
+		live_decks[d] = false;
+		if(!pl || !pl.present)
+			continue;
+		if(mixer_present) {
+			live_decks[d] = pl.onAir || pl.live ? true : false; // live: Enhanced on air (through a short fader dip)
+			continue;
+		}
+		if(pl.playing) {
+			playing++;
+			last = d;
+			if(pl.master)
+				live_decks[d] = true;
+		}
+	}
+	// Several playing: only the master (set above)
+	if(!mixer_present && playing == 1)
+		live_decks[last] = true;
+}
+
+// The track of deck d changed (or its data, e.g. the artwork arrived): fetch the artwork. A worker thread writes the
+// JPEG to the cache folder (fileio.write_file() would suspend update()); apply_artwork() loads it on a later frame.
+request_artwork(d, tid) {
+	marks[d].art = false;
+	art_ready[d] = None;
+	if(tid == "")
+		return None;
+	data = device.artwork(d + 1);
+	if(std.is_none(data))
+		return None;
+	if(art_dir == "")
+		art_dir = std.string(std.local_app_cache("VibeVJ", "prolink_artwork")).replace("\\", "/");
+	art_serial++;
+	path = art_dir + "/deck" + std.string(d + 1) + "_" + std.string(art_serial % 2) + ".jpg";
+	writer = std.thread([d, tid, path, data]() {
+		if(fileio.write_file(path, data))
+			art_ready[d] = [path = path, tid = tid];
+	});
+	writer.run();
+}
+
+// A written artwork file of deck d into its texture, if the deck still has that track
+apply_artwork(d) {
+	job = art_ready[d];
+	if(std.is_none(job))
+		return None;
+	art_ready[d] = None;
+	if(job.tid != marks[d].tid)
+		return None;
+	art_images[d].filename(job.path);
+	marks[d].art = art_images[d].width() > 0;
 }
 
 update(generator, tl_pos, pos_delta) {
@@ -1496,18 +1954,23 @@ update(generator, tl_pos, pos_delta) {
 	// Level smoothing: 0 = raw, 1 = slow
 	k = 1.0 - smoothing.value() * 0.9;
 
-	// A DJM on the network (device numbers from 33): only then is "On Air" meaningful
-	mixer_present = false;
+	apply_mixer_settings();
+	mixer_info = device.mixer();
+	// A DJM on the network (device numbers from 33), or mixer data: only then is "On Air" meaningful
+	mixer_present = mixer_info && mixer_info.present;
 	for(m = 33; m <= 36; m++) {
 		mp = device.player(m);
 		if(mp && mp.present)
 			mixer_present = true;
 	}
 
-	preview_styles = [0.0, 0.0, 0.0, 0.0];
-	for(d = 0; d < 4; d++) {
-		pl = device.player(d + 1);
-		views[d] = pl;
+	for(d = 0; d < NDECKS; d++)
+		views[d] = device.player(d + 1);
+	compute_live();
+
+	preview_styles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+	for(d = 0; d < NDECKS; d++) {
+		pl = views[d];
 		uniform_name = std.string(d + 1);
 
 		// New waveform, beat grid or cues: upload the texture again
@@ -1565,7 +2028,11 @@ update(generator, tl_pos, pos_delta) {
 				if(full && full.cues)
 					marks[d].cues = full.cues;
 			}
+			request_artwork(d, tid);
 		}
+		apply_artwork(d);
+		r = art_rects[d];
+		shader.uniform("artr" + uniform_name, marks[d].art ? r : vec4f(0, 0, 0, 0));
 		marks[d].phrases = [];
 		if(pl && pl.track && pl.track.phrases)
 			marks[d].phrases = pl.track.phrases;
@@ -1578,6 +2045,8 @@ update(generator, tl_pos, pos_delta) {
 			ctrl.phrase_ramp.value(0);
 			ctrl.buildup.value(0);
 			ctrl.drop.value(0);
+			ctrl.fader.value(0);
+			ctrl.vu.value(0);
 			continue;
 		}
 
@@ -1590,14 +2059,16 @@ update(generator, tl_pos, pos_delta) {
 		master = 0;
 		if(pl.master)
 			master = 1;
-		// On Air comes from the mixer. Without a mixer on the network a playing deck counts as audible
-		// (ON AIR control for effects); the view then shows no red on-air marks.
+		// The view marks the live decks (compute_live()). The ON AIR control comes from the mixer; without a mixer on the
+		// network every playing deck counts as audible there (for effects).
+		shader.uniform("play" + uniform_name, vec4f(position * 0.15, progress, master, live_decks[d] ? 1 : 0));
 		air = 0;
 		if(pl.onAir && mixer_present)
 			air = 1;
-		shader.uniform("play" + uniform_name, vec4f(position * 0.15, progress, master, air));
 		if(!mixer_present && pl.playing)
 			air = 1;
+		if(pl.live && mixer_present)
+			air = 1; // Enhanced on air: still on air through a short fader dip
 		marks[d].col = position * 0.15;
 
 		ctrl.bpm.value(pl.effectiveBpm);
@@ -1620,9 +2091,15 @@ update(generator, tl_pos, pos_delta) {
 		}
 		ctrl.buildup.value(buildup);
 		ctrl.drop.value(drop);
+		ctrl.fader.value(value_or_zero(pl.fader));
+		ctrl.vu.value(value_or_zero(pl.vu));
+		ctrl.eq_low.value(value_or_zero(pl.eqLow));
+		ctrl.eq_mid.value(value_or_zero(pl.eqMid));
+		ctrl.eq_high.value(value_or_zero(pl.eqHigh));
 	}
 
 	shader.uniform("pstyle", vec4f(preview_styles[0], preview_styles[1], preview_styles[2], preview_styles[3]));
+	shader.uniform("pstyle2", vec2f(preview_styles[4], preview_styles[5]));
 	apply_style();
 	rs = shader.render_size();
 	style_uniforms(line_width(rs.x * 1.0, rs.y * 1.0));
@@ -1635,6 +2112,7 @@ update(generator, tl_pos, pos_delta) {
 	compute_layout();
 	show_zoom(); // also after MIDI, loading a project or a new output size
 	shader.uniform("lanes", vec4f(lane_decks[0], lane_decks[1], lane_decks[2], lane_decks[3]));
+	shader.uniform("lanes2", vec2f(lane_decks[4], lane_decks[5]));
 	shader.uniform("nlanes", nlanes * 1.0);
 	shader.uniform("top", L.top);
 	shader.uniform("head", L.head);
@@ -1648,7 +2126,7 @@ update(generator, tl_pos, pos_delta) {
 
 	if(open_source == SOURCE_LAN) {
 		// device.state() builds every deck: a few times a second is enough for the status line
-		now_ms = std.millis();
+		now_ms = std.millis_steady();
 		if(now_ms - lan_status_ms > 250) {
 			lan_status_ms = now_ms;
 			set_status(lan_status());
